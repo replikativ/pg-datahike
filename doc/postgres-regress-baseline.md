@@ -74,6 +74,17 @@ Two smaller, self-contained ones:
   engine, already Phase 6), and text search (`to_tsquery`,
   `websearch_to_tsquery`).
 
+## Known divergences we accept
+
+- **Row order without ORDER BY.** A materialised relation -- a derived table, a
+  CTE, a set operation, a function used as a relation -- returns its rows in
+  the order the store scans them, not the order its body produced. SQL does not
+  promise an order without ORDER BY, PostgreSQL happens to preserve one, and
+  its expected output records what PostgreSQL happened to do. Preserving it
+  would mean carrying an ordinal on every materialised relation and sorting by
+  it, on a path that is otherwise a scan. Measured cost of not doing it:
+  row-order-only differences are 28 lines of the 88,321 missing.
+
 ## Reproducing
 
 ```bash

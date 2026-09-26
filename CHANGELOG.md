@@ -4,6 +4,23 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A SQL function can be a relation
+
+`SELECT * FROM f(args)` now works for a function this database defines, which is what `inline_set_returning_function` (optimizer/util/clauses.c) does in PostgreSQL: the body is pulled into the range table as a subquery. Here it is rewritten into the derived table it means and materialised the way `FROM (SELECT …) alias` already was, so it joins by value like any other relation.
+
+```sql
+CREATE FUNCTION above(m int) RETURNS SETOF int AS $$ SELECT i FROM t WHERE i > m $$ LANGUAGE sql;
+SELECT * FROM above(1);                              -- column "above"
+SELECT * FROM above(1) AS z;                         -- column "z"
+SELECT x.i FROM t x JOIN pairs(2) z ON z.a = x.i;    -- and in a join
+```
+
+The columns take the names the **declared return type** gives them, not the ones the body happens to use: `RETURNS TABLE (a int, b text)` is `a`/`b`, `RETURNS SETOF <scalar>` is one column named after the call site, and `RETURNS SETOF <table>` keeps the table's own names.
+
+Not only set-returning functions. PostgreSQL puts *any* function in FROM, and a scalar one is a relation of a single row — `SELECT * FROM getrngfunc1(1) AS t1` is one row in PostgreSQL's own `rangefuncs`, and we both refused it and called it set-returning while doing so.
+
+The arguments are substituted into the body's **source** rather than bound as values: a FROM-clause function's arguments are evaluated once, before its rows exist, and the body is materialised by a separate query that no dynamic binding reaches. Substitution is token-driven, so a parameter's name inside a string literal, a comment or a quoted identifier is left alone, and `t.n` stays a qualified reference. An argument used more than once in the body is refused unless it is a literal or a bare column, since writing it twice would evaluate it twice — the hazard `inline_function` declines over.
+
 ### SQL functions run
 
 `CREATE FUNCTION … LANGUAGE sql` was accepted as a silent no-op and every call to one then said the function does not exist. Definitions are stored now, and a call is **inlined** -- which is what PostgreSQL does too: `inline_function` (optimizer/util/clauses.c) substitutes the arguments into the body and never reaches the SQL-function executor for the common case.
