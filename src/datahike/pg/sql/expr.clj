@@ -58,7 +58,9 @@
             [datahike.pg.input :as input]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
+            [datahike.pg.sql.rewrite :as rw]
             [datahike.pg.sql.set-ops :as set-ops]
             [datahike.pg.types :as types]
             [datahike.pg.tsearch :as tsearch]
@@ -456,6 +458,78 @@
         (doto (ParenthesedSelect.)
           (.setSelect ^Select stmt))))
     (catch Throwable _ nil)))
+
+(defn from-sql-function
+  "The stored `LANGUAGE sql` overload of this name and arity for use as
+   a RELATION, or nil.
+
+   Not only set-returning ones: PostgreSQL puts any function in FROM,
+   and a scalar one is a relation of a single row and a single column.
+   `SELECT * FROM getrngfunc1(1) AS t1` is one row in PostgreSQL's own
+   `rangefuncs`, and refusing it was both wrong and worded as though
+   the function were set-returning.
+
+   FROM position has no argument types to resolve with -- the arguments
+   are constant expressions, not typed values -- so a name with several
+   overloads of the same arity resolves to nothing rather than a guess."
+  [db fname arity]
+  (let [cands (function-candidates db fname arity)]
+    (when (= 1 (count cands)) (first cands))))
+
+(defn substitute-function-args
+  "The body with every parameter reference replaced by the SQL text of
+   the matching argument, parenthesised so precedence survives:
+   `SELECT * FROM t WHERE i > n` called as `f(1+1)` becomes
+   `SELECT * FROM t WHERE i > (1+1)`.
+
+   This is `substitute_actual_parameters` (clauses.c) done on the source
+   rather than the AST, because the consumer re-parses it anyway. The
+   tokenizer is the classifier's, so a parameter's name inside a string
+   literal, a comment or a quoted identifier is left alone.
+
+   A name is a parameter only when it stands alone: `t.n` and `n.x` are
+   qualified references, and PostgreSQL would call a bare `n` that is
+   also a column of the body's FROM ambiguous rather than either one.
+
+   Returns nil when an argument is used more than once and is not a bare
+   literal or column -- duplicating it would evaluate it twice, which is
+   the case `inline_function` refuses over."
+  [^String body arg-names arg-exprs]
+  (let [by-name (into {} (keep-indexed (fn [i nm]
+                                         (when nm [(str/lower-case nm) i]))
+                                       arg-names))
+        texts (mapv #(str "(" (str %) ")") arg-exprs)
+        ;; Safe to write more than once: a literal or a bare column
+        ;; reference. Anything else -- a function call, a subquery, an
+        ;; arithmetic expression -- would be EVALUATED twice, which is
+        ;; the hazard `inline_function` declines over. `ast-columns` is
+        ;; not the test: it does not descend into a subselect, so a
+        ;; scalar subquery looked constant.
+        simple? (mapv #(or (instance? Column %)
+                           (instance? LongValue %)
+                           (instance? StringValue %)
+                           (instance? DoubleValue %)
+                           (instance? NullValue %)
+                           (instance? JdbcParameter %))
+                      arg-exprs)
+        uses (atom (vec (repeat (count arg-exprs) 0)))
+        toks (vec (cls/tokenize-all body))
+        spans (keep (fn [[prev t nxt]]
+                      (let [idx (cond
+                                  (= :param (:type t)) (some-> (:idx t) dec)
+                                  (and (= :ident (:type t))
+                                       (not= "." (:text prev))
+                                       (not= "." (:text nxt)))
+                                  (get by-name (str/lower-case (:text t))))]
+                        (when (and idx (< -1 idx (count texts)))
+                          (swap! uses update idx inc)
+                          [(:pos t) (:end t) (nth texts idx)])))
+                    (map vector (cons nil toks) toks (concat (rest toks) [nil])))
+        spans (vec spans)]
+    (when (every? true?
+                  (map-indexed (fn [i n] (or (< n 2) (nth simple? i true)))
+                               @uses))
+      (rw/rewrite body (list (constantly spans))))))
 
 (defn- strict-null-guard
   "A STRICT function is NULL whenever any argument is NULL, whatever its

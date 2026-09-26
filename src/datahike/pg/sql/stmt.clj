@@ -92,7 +92,7 @@
             Addition Subtraction Multiplication Division Concat]
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem AllColumns AllTableColumns OrderByElement
-            GroupByElement Limit Offset Join
+            GroupByElement Limit Offset Join Select
             ParenthesedSelect ParenthesedFromItem SetOperationList
             Values FromItem]
            [net.sf.jsqlparser.statement.insert Insert]
@@ -1234,10 +1234,10 @@
                          db fname)))
        (throw (errors/pg-error
                :feature-not-supported
-               {:message (str "set-returning SQL function " fname
-                              " in a FROM clause")
+               {:message (str "SQL function " fname
+                              " as a relation")
                 :detail (str "The function is defined; producing its rows as a "
-                             "relation is not supported yet.")}))
+                             "relation is not supported for this signature.")}))
 
        :else
        (throw (errors/pg-error
@@ -2362,6 +2362,76 @@
 ;;    per outer row, splice its value at the out-pos, and drop the __corr_
 ;;    columns. `parse-fn` parses the inner SQL per row (sql/parse-sql at
 ;;    Execute, *parse-sql* at parse-time materialisation).
+
+(defn- name-setof-columns!
+  "Give the body's output columns the names the DECLARED return type
+   gives them, not the ones the body happens to use.
+
+     RETURNS TABLE (a int, b text)  ->  a, b
+     RETURNS SETOF <scalar>         ->  one column named after the
+                                        function, or its FROM alias
+     RETURNS SETOF <table>          ->  the body's own names, which are
+                                        already the table's
+
+   `SELECT i FROM t` declared `RETURNS SETOF int` and called as
+   `above(1)` is a column named `above`, not `i`, and `above(1) AS z`
+   names it `z`."
+  [inner ent alias-name]
+  (when (instance? PlainSelect inner)
+    (let [items (vec (.getSelectItems ^PlainSelect inner))
+          ret (read-string (:datahike.pg.function/return-type ent))
+          cols (:columns ret)]
+      (cond
+        ;; RETURNS TABLE (…): rename position by position.
+        (seq cols)
+        (when (= (count cols) (count items))
+          (doseq [[^SelectItem it c] (map vector items cols)]
+            (when-let [n (:name c)] (.setAlias it (Alias. n)))))
+
+        ;; RETURNS SETOF <scalar>: one column, named for the call site.
+        ;; `SELECT *` is never that -- it is a whole row, so a
+        ;; RETURNS SETOF <table> body keeps the table's own names.
+        (and (= 1 (count items))
+             (not (instance? AllColumns (.getExpression ^SelectItem (first items)))))
+        (.setAlias ^SelectItem (first items) (Alias. alias-name))))))
+
+(defn- setof-function->derived-table
+  "A `FROM f(args)` where `f` is a set-returning `LANGUAGE sql` function
+   this database defines: rewrite it into the derived table it means and
+   materialise that.
+
+   PostgreSQL does the same thing in `inline_set_returning_function`
+   (optimizer/util/clauses.c) -- it pulls the function's body up into the
+   range table as a subquery. Here the body's parameters are replaced by
+   the SQL text of the arguments, since a FROM-clause function's
+   arguments are evaluated once, before its rows exist.
+
+   nil when the name is not such a function, when its arguments cannot be
+   substituted safely, or when the body is not a single SELECT; the
+   caller then reports the capability boundary."
+  [^net.sf.jsqlparser.statement.select.TableFunction tf db schema]
+  (when db
+    (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
+          fname (srf-base-name (.getName f))
+          args (vec (or (some-> (.getParameters f) seq) []))]
+      (when-let [ent (expr/from-sql-function db fname (count args))]
+        (let [arg-names (read-string (:datahike.pg.function/arg-names ent))]
+          (when-let [body (expr/substitute-function-args
+                           (:datahike.pg.function/body ent) arg-names args)]
+            (let [inner (try (CCJSqlParserUtil/parse ^String body) (catch Throwable _ nil))]
+              (when (or (instance? PlainSelect inner)
+                        (instance? SetOperationList inner))
+                (let [ps (doto (ParenthesedSelect.)
+                           (.setSelect ^Select inner))
+                      ;; The function's own alias is the relation's name,
+                      ;; as `FROM f(x) AS z` or a bare `FROM f(x)` (whose
+                      ;; relation is named after the function).
+                      alias-name (or (some-> (.getAlias tf) .getName
+                                             str str/trim unquote-ident)
+                                     fname)]
+                  (name-setof-columns! inner ent alias-name)
+                  (.setAlias ps (Alias. alias-name))
+                  (materialize-derived-select! ps db schema))))))))))
 
 (defn correlated-splice
   "Assemble `n-output` columns from `visible` (non-correlation columns in
@@ -3640,9 +3710,16 @@
 
           (and db (instance? net.sf.jsqlparser.statement.select.TableFunction from-item))
           (if-let [{vdb :db vschema :schema vname :name valias :alias}
-                   (when-not (table-function-has-column-reference? from-item)
-                     (table-fn->virtual-table
-                      ^net.sf.jsqlparser.statement.select.TableFunction from-item db))]
+                   (or (when-not (table-function-has-column-reference? from-item)
+                         (table-fn->virtual-table
+                          ^net.sf.jsqlparser.statement.select.TableFunction from-item db))
+                       ;; A set-returning function this database defines is
+                       ;; a derived table: its body, with the arguments
+                       ;; substituted, materialised exactly as
+                       ;; `FROM (SELECT …) alias` already is.
+                       (setof-function->derived-table
+                        ^net.sf.jsqlparser.statement.select.TableFunction from-item
+                        db schema))]
             [vdb vschema vname valias]
             (reject-unmaterialized-table-function! from-item db))
 
@@ -3807,14 +3884,30 @@
                   (conj derived {:join j :alias (or valias vname)})
                   lsrfs])
 
-               ;; A TableFunction must be handled by one of the two branches
+               ;; A set-returning `LANGUAGE sql` function joined to
+               ;; something -- `FROM t JOIN f(2) z ON …`. The same
+               ;; rewrite the FROM-item position does; it joins by value
+               ;; like any other materialised relation.
+               (and db (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
+                    (setof-function->derived-table
+                     ^net.sf.jsqlparser.statement.select.TableFunction rt db schema))
+               (let [{vdb :db vschema :schema vname :name valias :alias}
+                     (setof-function->derived-table
+                      ^net.sf.jsqlparser.statement.select.TableFunction rt db schema)]
+                 [vdb vschema
+                  (cond-> (assoc aliases vname vname)
+                    (and valias (not= valias vname)) (assoc valias vname))
+                  (conj derived {:join j :alias (or valias vname)})
+                  lsrfs])
+
+               ;; A TableFunction must be handled by one of the branches
                ;; above. Falling through used to ignore an unknown function
                ;; in a comma/join position entirely, returning the OUTER rows
                ;; as if the function were not in the query. WITH ORDINALITY
                ;; was worse: its projected columns leaked an unbound ?f_eid
                ;; into the Datalog query. Preserve neither failure mode.
                (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
-               (reject-unmaterialized-table-function! rt)
+               (reject-unmaterialized-table-function! rt db)
 
                (instance? Table rt)
                (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]

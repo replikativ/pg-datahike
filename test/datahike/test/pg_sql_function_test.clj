@@ -223,3 +223,61 @@
       (is (str/includes? (err r) "already exists")))
     (testing "a different argument type at the same arity is a new function"
       (ok! h (create-fn "ex1" "a text" "text" "SELECT $1")))))
+
+;; ============================================================================
+;; Set-returning functions as relations
+;; ============================================================================
+
+(deftest a-setof-function-is-a-relation
+  ;; `FROM f(args)` is rewritten into the derived table it means, which
+  ;; is what PostgreSQL's `inline_set_returning_function` does: it pulls
+  ;; the body into the range table as a subquery. The arguments are
+  ;; substituted into the body's source, because a FROM-clause
+  ;; function's arguments are evaluated once, before its rows exist.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int, s text)")
+    (ok! h "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+    (testing "RETURNS SETOF <scalar> — one column, named for the call site"
+      (ok! h (str "CREATE FUNCTION above(m int) RETURNS SETOF int AS "
+                  dq "SELECT i FROM t WHERE i > m ORDER BY i" dq " LANGUAGE sql"))
+      (let [r (ok! h "SELECT * FROM above(1) ORDER BY 1")]
+        (is (= [["2"] ["3"]] (rows r)))
+        (is (= ["above"] (vec (.columnNames r)))))
+      (testing "an alias renames it"
+        (is (= ["z"] (vec (.columnNames (ok! h "SELECT * FROM above(1) AS z ORDER BY 1"))))))
+      (is (= [["3"]] (rows (ok! h "SELECT count(*) FROM above(0)")))))
+    (testing "RETURNS TABLE (…) — the declared names, not the body's"
+      (ok! h (str "CREATE FUNCTION pairs(m int) RETURNS TABLE (a int, b text) AS "
+                  dq "SELECT i, s FROM t WHERE i >= m ORDER BY i" dq " LANGUAGE sql"))
+      (let [r (ok! h "SELECT * FROM pairs(2) ORDER BY a")]
+        (is (= [["2" "b"] ["3" "c"]] (rows r)))
+        (is (= ["a" "b"] (vec (.columnNames r)))))
+      (is (= [["2"] ["3"]] (rows (ok! h "SELECT a FROM pairs(2) ORDER BY a")))))
+    (testing "RETURNS SETOF <table> keeps the table's own column names"
+      (ok! h (str "CREATE FUNCTION allrows() RETURNS SETOF t AS "
+                  dq "SELECT * FROM t ORDER BY i" dq " LANGUAGE sql"))
+      (let [r (ok! h "SELECT * FROM allrows() ORDER BY i")]
+        (is (= [["1" "a"] ["2" "b"] ["3" "c"]] (rows r)))
+        (is (= ["i" "s"] (vec (.columnNames r))))))
+    (testing "joined to a table, not only as the sole FROM item"
+      (is (= [["2" "2"] ["3" "3"]]
+             (rows (ok! h "SELECT x.i, z.a FROM t x JOIN pairs(2) z ON z.a = x.i ORDER BY 1")))))
+    (testing "an expression argument is substituted, parenthesised"
+      (is (= [["3"]] (rows (ok! h "SELECT * FROM above(1 + 1) ORDER BY 1")))))))
+
+(deftest an-argument-that-cannot-be-duplicated-is-refused
+  ;; The FROM rewrite substitutes the argument's SOURCE, so a parameter
+  ;; used twice writes the argument twice. That is safe for a literal or
+  ;; a column and not for anything that would then be evaluated twice --
+  ;; the hazard `inline_function` declines over.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int)")
+    (ok! h "INSERT INTO t VALUES (1),(2),(3)")
+    (ok! h (str "CREATE FUNCTION twice(m int) RETURNS SETOF int AS "
+                dq "SELECT i FROM t WHERE i > m AND i > m" dq " LANGUAGE sql"))
+    (testing "a literal is fine to write twice"
+      (is (= [["2"] ["3"]] (rows (ok! h "SELECT * FROM twice(1) ORDER BY 1")))))
+    (testing "a subquery is not"
+      (let [r (exec h "SELECT * FROM twice((SELECT min(i) FROM t))")]
+        (is (some? (.error r)))
+        (is (str/includes? (err r) "SQL function twice as a relation"))))))
