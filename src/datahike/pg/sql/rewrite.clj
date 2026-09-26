@@ -338,7 +338,13 @@
     "null" "true" "false" "is" "on"
     "asc" "desc" "cross" "inner" "outer" "left" "right" "full"
     "limit" "offset" "fetch" "for" "of"
-    "by" "into" "values" "returning" "using" "sample"})
+    "by" "into" "values" "returning" "using" "sample"
+    ;; Found by testing every alias PostgreSQL's own regression corpus
+    ;; uses (1057 distinct) against JSqlParser 5.2: these six are the
+    ;; ones it still rejected. `SELECT q1 AS plus, -q1 AS minus FROM
+    ;; INT8_TBL` -- the second statement of the int8 file -- failed on
+    ;; `minus` alone.
+    "constraint" "distinct" "minus" "semi" "unbounded" "unique"})
 
 (defn- inside-cast-parens?
   "True if the token at idx sits inside an unmatched paren group opened
@@ -962,6 +968,114 @@
             [pos end (str "'" (str/replace value "'" "''") "'")]))
         toks))
 
+(defn order-by-using-rule
+  "`ORDER BY x USING <` is PostgreSQL's way of naming the ordering
+   OPERATOR rather than a direction, and JSqlParser has no such clause.
+   For the btree ordering operators it is exactly a direction -- `<` is
+   ASC and `>` is DESC (`<=` / `>=` likewise; PostgreSQL resolves them
+   through the same operator family) -- so the clause is rewritten to
+   the direction it means. Any other operator is left alone, and the
+   parse error that follows is the truthful answer: we cannot order by
+   an arbitrary operator.
+
+   `select`, `select_distinct` and `select_distinct_on` all trip on this
+   in their first statements."
+  [toks]
+  (let [sig (vec (remove #(= :comment (:type %)) toks))
+        n (count sig)]
+    (loop [i 0, in-order-by? false, acc []]
+      (if (>= i n)
+        acc
+        (let [t (nth sig i)
+              kw (kw-text t)]
+          (cond
+            (and (= "order" kw) (= "by" (kw-text (nth sig (inc i) nil))))
+            (recur (+ i 2) true acc)
+
+            ;; ORDER BY ends at the first clause that can follow it.
+            (and in-order-by? (contains? #{"limit" "offset" "fetch" "for" "union"
+                                           "intersect" "except" "window"} kw))
+            (recur (inc i) false acc)
+
+            (and in-order-by? (= "using" kw))
+            (let [op (nth sig (inc i) nil)
+                  dir (case (:text op)
+                        ("<" "<=") "ASC"
+                        (">" ">=") "DESC"
+                        nil)]
+              (if dir
+                (recur (+ i 2) true (conj acc [(:pos t) (:end op) dir]))
+                (recur (inc i) true acc)))
+
+            :else (recur (inc i) in-order-by? acc)))))))
+
+(defn select-into-table-rule
+  "`SELECT … INTO [TABLE|TEMP|UNLOGGED] name … FROM …` creates a table
+   from the result, which is `CREATE TABLE name AS SELECT …` spelled the
+   other way round. JSqlParser has no INTO clause in a SELECT, so the
+   clause is lifted to the front and the statement becomes the CREATE
+   TABLE AS it means.
+
+   Only the top-level form is rewritten: `INSERT … SELECT` has no INTO
+   of this kind, and PL/pgSQL's `SELECT INTO variable` never reaches
+   this layer."
+  [toks]
+  (let [sig (vec (remove #(= :comment (:type %)) toks))
+        n (count sig)
+        first-kw (kw-text (first sig))]
+    (when (= "select" first-kw)
+      (loop [i 1, depth 0]
+        (if (>= i n)
+          []
+          (let [t (nth sig i)
+                kw (kw-text t)]
+            (cond
+              (punct? t "(") (recur (inc i) (inc depth))
+              (punct? t ")") (recur (inc i) (dec depth))
+              (and (zero? depth) (= "from" kw)) []
+              (and (zero? depth) (= "into" kw))
+              ;; `INTO [TABLE|TEMPORARY|TEMP|UNLOGGED] <name>`. The
+              ;; persistence words are kept: they mean the same thing in
+              ;; front of CREATE TABLE, and `INTO TEMP t` is a temporary
+              ;; table however it is spelled.
+              (let [[after mods]
+                    (loop [j (inc i), mods []]
+                      (let [w (kw-text (nth sig j nil))]
+                        (cond
+                          (= "table" w) (recur (inc j) mods)
+                          (contains? #{"temp" "temporary" "unlogged" "local" "global"} w)
+                          (recur (inc j) (conj mods (:text (nth sig j))))
+                          :else [j mods])))
+                    name-tok (nth sig after nil)]
+                (when (and name-tok (= :ident (:type name-tok)))
+                  [;; drop the INTO clause where it stands …
+                   [(:pos t) (:end name-tok) ""]
+                   ;; … and say the same thing in front of the SELECT.
+                   [(:pos (first sig)) (:pos (first sig))
+                    (str "CREATE " (str/join " " mods) (when (seq mods) " ")
+                         "TABLE " (:text name-tok) " AS ")]]))
+              :else (recur (inc i) depth))))))))
+
+(defn adjacent-string-literal-rule
+  "Two string literals separated by a NEWLINE are one string in SQL --
+   `'first line'` then `' - next line'` is `'first line - next line'`.
+   PostgreSQL requires the newline (without one the two are a syntax
+   error); JSqlParser accepts neither. Each adjacent pair is folded, so a
+   run of any length collapses to one literal."
+  [toks]
+  (let [sig (vec (remove #(= :comment (:type %)) toks))
+        n (count sig)]
+    (loop [i 0, acc []]
+      (if (>= i (dec n))
+        acc
+        (let [a (nth sig i)
+              b (nth sig (inc i))]
+          (if (and (= :string (:type a)) (= :string (:type b)))
+            ;; Fold b into a: drop b's opening quote and a's closing one.
+            (recur (inc i)
+                   (conj acc [(dec (:end a)) (inc (:pos b)) ""]))
+            (recur (inc i) acc)))))))
+
 ;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
@@ -978,6 +1092,9 @@
    create-index-anonymous-rule
    select-from-rule
    quote-reserved-alias-rule
+   order-by-using-rule
+   select-into-table-rule
+   adjacent-string-literal-rule
    collate-rule
    operator-paren-rule
    alter-column-drop-default-rule

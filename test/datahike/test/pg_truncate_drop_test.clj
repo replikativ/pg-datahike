@@ -265,3 +265,38 @@
       (is (nil? (.error (exec h "INSERT INTO drop_reuse VALUES (1)"))))
       (is (= [["1"]] (rows (exec h "SELECT * FROM drop_reuse"))))
       (finally (release! h)))))
+
+(deftest drop-table-that-does-not-exist-raises-42p01
+  ;; Without IF EXISTS, a name that resolves to nothing is an error --
+  ;; 42P01, the same code DROP VIEW and DROP SEQUENCE already raised.
+  ;; Silently succeeding hid a typo'd or already-dropped table, and it
+  ;; was the first divergence of PostgreSQL's own `select_into` test.
+  (let [h (fresh-handler)]
+    (try
+      (let [r (exec h "DROP TABLE no_such_table")]
+        (is (some? (.error r)))
+        (is (str/includes? (str (.error r)) "does not exist")))
+      (testing "IF EXISTS is still a no-op success"
+        (is (nil? (.error (exec h "DROP TABLE IF EXISTS no_such_table"))))
+        (is (nil? (.error (exec h "DROP TABLE IF EXISTS a_missing, b_missing")))))
+      (testing "a list is resolved before anything is dropped"
+        (is (nil? (.error (exec h "CREATE TABLE kept(i int)"))))
+        (is (nil? (.error (exec h "INSERT INTO kept VALUES (1)"))))
+        (is (some? (.error (exec h "DROP TABLE kept, no_such_table"))))
+        ;; PostgreSQL leaves `kept` alone: the statement never ran.
+        (is (= [["1"]] (rows (exec h "SELECT i FROM kept")))))
+      (testing "an existing table still drops"
+        (is (nil? (.error (exec h "DROP TABLE kept"))))
+        (is (some? (.error (exec h "SELECT i FROM kept")))))
+      (finally (release! h)))))
+
+(deftest drop-index-that-does-not-exist-words-it-as-postgresql-does
+  (let [h (fresh-handler)]
+    (try
+      (let [r (exec h "DROP INDEX no_such_index")]
+        (is (some? (.error r)))
+        ;; was "unrecognized index \"…\"", the generic :undefined-object
+        ;; wording; PostgreSQL says "does not exist".
+        (is (str/includes? (str (.error r)) "index \"no_such_index\" does not exist")))
+      (is (nil? (.error (exec h "DROP INDEX IF EXISTS no_such_index"))))
+      (finally (release! h)))))

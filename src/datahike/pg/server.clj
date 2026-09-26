@@ -4167,6 +4167,16 @@
                              :detail "timed out waiting for concurrent DDL"})))))
       (rebase-tx-state! conn tx-state))))
 
+(defn- create-table-tag
+  "The CommandComplete tag for a successful CREATE TABLE. `CREATE TABLE
+   … AS SELECT` reports the row count it stored, exactly as the SELECT
+   that produced them would have (`SELECT 3`); a plain CREATE TABLE is
+   `CREATE TABLE`."
+  [parsed]
+  (if (:ctas? parsed)
+    (str "SELECT " (long (or (:ctas-rows parsed) 0)))
+    "CREATE TABLE"))
+
 (defn- table-create-tx-data [db parsed]
   (let [table-name (:table-name parsed)
         {:keys [oids tx-data]} (catalog-objects/reserve-user-oids-tx db 2)
@@ -4287,7 +4297,7 @@
       ;; [nil int4]"), because the guard compares against the schema view,
       ;; which doesn't surface custom :pg/* attrs.
           (and table-name name-conflict? if-not-exists?)
-          [(empty-result "CREATE TABLE") false]
+          [(empty-result (if (:ctas? parsed) "CREATE TABLE AS" "CREATE TABLE")) false]
 
           ;; The current identity lowering uses PostgreSQL's conventional
           ;; table_column_seq name directly.  Until it allocates a numbered
@@ -4306,7 +4316,7 @@
           (:in-tx? @tx-state)
           [(execute-ddl-in-tx tx-state
                               (table-create-tx-data current-db parsed)
-                              "CREATE TABLE")
+                              (create-table-tag parsed))
            true]
 
           :else
@@ -4317,7 +4327,7 @@
                   :committed
                   (catch Exception e e))]
             (cond
-              (= :committed outcome) [(empty-result "CREATE TABLE") true]
+              (= :committed outcome) [(empty-result (create-table-tag parsed)) true]
               (and (catalog-cas-failure? outcome)
                    (< attempt catalog-allocation-max-retries))
               (recur (inc attempt))
@@ -9159,10 +9169,10 @@
           (empty-result "DROP INDEX")
 
           :else
-          (throw
-           (errors/pg-error
-            :undefined-object
-            {:kind "index" :name (:name parsed)}))))
+          ;; PostgreSQL words this "index \"x\" does not exist"; the
+          ;; generic :undefined-object wording is "unrecognized index".
+          (throw (ex-info (str "index \"" (:name parsed) "\" does not exist")
+                          {:error :undefined-object :sqlstate "42704"}))))
       (catch Exception failure
         (classified-error "DROP INDEX error: " failure)))))
 
@@ -9768,8 +9778,12 @@
 (defn- exec-ddl-drop
   "DROP TABLE — single name (:table, JSqlParser path) or a list
    (:tables, classify's :drop-table-multi path). All names are retracted in
-   one transaction; a missing table contributes no tx-data, so IF EXISTS
-   needs no extra branch."
+   one transaction.
+
+   A name that does not exist is an error (42P01) unless IF EXISTS was
+   given, and it is raised before anything is retracted: PostgreSQL
+   resolves every name before dropping any, so `DROP TABLE good, missing`
+   leaves `good` in place."
   [ctx parsed]
   (let [{:keys [conn tx-state temp-tables]} ctx]
     (try
@@ -9782,11 +9796,18 @@
             _ (doseq [table tables
                       :let [object (catalog-objects/object-by-identity
                                     db catalog-objects/pg-class-oid
-                                    catalog-objects/public-namespace-oid table)]
-                      :when (and object
-                                 (not= :table (:datahike.pg.object/kind object)))]
-                (throw (ex-info (str "\"" table "\" is not a table")
-                                {:error :wrong-object-type :sqlstate "42809"})))
+                                    catalog-objects/public-namespace-oid table)]]
+                (cond
+                  (and object (not= :table (:datahike.pg.object/kind object)))
+                  (throw (ex-info (str "\"" table "\" is not a table")
+                                  {:error :wrong-object-type :sqlstate "42809"}))
+
+                  (and (nil? object)
+                       (not (table-exists? db table))
+                       (not (:if-exists? parsed)))
+                  (throw (ex-info (str "table \"" table "\" does not exist")
+                                  {:error :undefined-table :sqlstate "42P01"
+                                   :table table}))))
             _ (doseq [table tables
                       child (map first
                                  (d/q '{:find [?child]
