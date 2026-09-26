@@ -4,6 +4,26 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The server can send a notice
+
+PostgreSQL tells a client about things that are not errors, and the wire layer had no way to say any of them — 1352 `NOTICE` / `WARNING` / `INFO` lines across 73 of PostgreSQL's own regression files went silently missing, and `advisory_lock` sat at 268 of 276 output lines with *every* remaining difference a `WARNING` we could not send.
+
+On the wire a `NoticeResponse` is an `ErrorResponse` with a different type byte, so it shares the same encoder. What it is not is an error: it does not abort the statement and it does not put an open transaction into the failed state. pgjdbc surfaces one as a `SQLWarning`.
+
+A statement collects its notices through `params/notice!` and the handler hangs them on the result, so a notice raised deep in translation or execution reaches the client without the site knowing how. Both protocols carry them, and in the extended one they go into the response buffer rather than straight to the socket — a held statement's `CommandComplete` is drained at Sync, and a notice written directly would jump ahead of an earlier statement's response.
+
+The first things to use it are the `IF EXISTS` / `IF NOT EXISTS` statements that previously passed in silence:
+
+```
+DROP TABLE IF EXISTS nope;        NOTICE:  table "nope" does not exist, skipping
+DROP FUNCTION IF EXISTS f(int);   NOTICE:  function f(pg_catalog.int4) does not exist, skipping
+CREATE TABLE IF NOT EXISTS t (…); NOTICE:  relation "t" already exists, skipping
+```
+
+One notice per missing name, as PostgreSQL emits. The function wording is not a slip: PostgreSQL's *notice* goes through `format_procedure` and prints schema-qualified `pg_type` names, while its *error* for the same function says `f(integer)`. Both are reproduced.
+
+`drop_if_exists` goes from 65% to 69% of PostgreSQL's expected output.
+
 ### A SQL function can be a relation
 
 `SELECT * FROM f(args)` now works for a function this database defines, which is what `inline_set_returning_function` (optimizer/util/clauses.c) does in PostgreSQL: the body is pulled into the range table as a subquery. Here it is rewritten into the derived table it means and materialised the way `FROM (SELECT …) alias` already was, so it joins by value like any other relation.

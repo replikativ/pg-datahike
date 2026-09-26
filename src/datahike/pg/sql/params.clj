@@ -426,6 +426,29 @@
    it to re-parse inner SQL strings for IN / EXISTS subqueries."
   nil)
 
+(def ^:dynamic *notices*
+  "Where a statement collects the NOTICE / WARNING / INFO messages it
+   produces, as an atom holding a vector of
+   `{:severity :sqlstate :message :fields}`. Bound per statement by the
+   handler, which attaches whatever accumulated to the QueryResult; the
+   wire layer then emits one NoticeResponse each, before the statement's
+   own response.
+
+   nil outside a statement, so `notice!` is a no-op there rather than an
+   error -- a notice is never worth failing over."
+  nil)
+
+(defn notice!
+  "Record a notice for the running statement. Severity is PostgreSQL's:
+   NOTICE, WARNING, INFO, DEBUG or LOG."
+  ([severity message] (notice! severity message nil nil))
+  ([severity message sqlstate fields]
+   (when-let [a *notices*]
+     (swap! a conj (cond-> {:severity severity :message message}
+                     sqlstate (assoc :sqlstate sqlstate)
+                     (seq fields) (assoc :fields fields))))
+   nil))
+
 (def ^:dynamic *sql-fn-args*
   "The arguments of the `LANGUAGE sql` function whose body is being
    translated, as `{\"argname\" value, 1 value, …}` — by name and by
