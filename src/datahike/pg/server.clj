@@ -5521,6 +5521,7 @@
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
     :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
     :ddl-create-composite :ddl-create-domain :ddl-drop-domain
+    :ddl-create-function :ddl-drop-function
     ;; Ordinary B-tree CREATE INDEX remains a transaction-compatible
     ;; compatibility declaration. Materialized secondary methods reject a
     ;; buffered/explicit transaction at their narrower execution boundary.
@@ -8174,6 +8175,193 @@
     :datahike.pg.enum/oid oid
     :datahike.pg.enum/values (set values)
     :datahike.pg.enum/values-ordered (clojure.string/join "\n" values)}])
+
+(defn- function-key
+  "What identifies a stored function: its name, its arity and its
+   DECLARED argument types, which is what PostgreSQL overloads on.
+
+   Keying on name and arity alone was not merely a missing overload --
+   `dfunc(int,int)` and `dfunc(text,text)` collided, and a call then
+   inlined whichever body was stored, so `dfunc('Hi','City')` ran
+   `$1 + $2` over two strings and surfaced a JVM ClassCastException."
+  [fn-name arg-types]
+  (str fn-name "/" (count arg-types) "(" (str/join "," arg-types) ")"))
+
+(defn- function-tx-data
+  "Registry tx-data for a CREATE FUNCTION … LANGUAGE sql. One entity per
+   name+arity under `:datahike.pg.function/*`, holding the body text and
+   the signature the call site needs to inline it."
+  [parsed oid]
+  (let [{:keys [fn-name params returns strict? body]} parsed]
+    [;; idempotent schema attrs (safe to re-transact on every CREATE)
+     {:db/ident :datahike.pg.function/key
+      :db/valueType :db.type/string
+      :db/cardinality :db.cardinality/one
+      :db/unique :db.unique/identity}
+     {:db/ident :datahike.pg.function/name
+      :db/valueType :db.type/string
+      :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/oid
+      :db/valueType :db.type/long
+      :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/arity
+      :db/valueType :db.type/long
+      :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/arg-names
+      :db/valueType :db.type/string
+      :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/arg-types
+      :db/valueType :db.type/string
+      :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/return-type
+      :db/valueType :db.type/string
+      :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/setof?
+      :db/valueType :db.type/boolean
+      :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/strict?
+      :db/valueType :db.type/boolean
+      :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/body
+      :db/valueType :db.type/string
+      :db/cardinality :db.cardinality/one}
+     ;; The function itself. Names and types are stored as EDN strings:
+     ;; a vector attribute would need one entity per parameter to keep
+     ;; the order, and nothing queries them individually.
+     {:datahike.pg.function/key (function-key fn-name (mapv :type params))
+      :datahike.pg.function/name fn-name
+      :datahike.pg.function/arity (long (count params))
+      :datahike.pg.function/oid oid
+      :datahike.pg.function/arg-names (pr-str (mapv :name params))
+      :datahike.pg.function/arg-types (pr-str (mapv :type params))
+      :datahike.pg.function/return-type (pr-str returns)
+      :datahike.pg.function/setof? (boolean (:setof? returns))
+      :datahike.pg.function/strict? (boolean strict?)
+      :datahike.pg.function/body body}]))
+
+(defn- existing-function
+  "The stored function entity with exactly this signature, or nil."
+  [db fn-name arg-types]
+  (some-> (d/q '{:find [?e .] :in [$ ?k]
+                 :where [[?e :datahike.pg.function/key ?k]]}
+               db (function-key fn-name arg-types))
+          (->> (d/entity db))))
+
+(defn- functions-by-name+arity
+  "Every stored overload of this name with this many arguments. An
+   `arity` of nil means every overload of the name."
+  [db fn-name arity]
+  (->> (if arity
+         (d/q '{:find [?e] :in [$ ?n ?a]
+                :where [[?e :datahike.pg.function/name ?n]
+                        [?e :datahike.pg.function/arity ?a]]}
+              db fn-name arity)
+         (d/q '{:find [?e] :in [$ ?n]
+                :where [[?e :datahike.pg.function/name ?n]]}
+              db fn-name))
+       (mapv #(d/entity db (first %)))))
+
+(defn- exec-ddl-create-function
+  "CREATE [OR REPLACE] FUNCTION … LANGUAGE sql.
+
+   Only the signature and the body text are stored. The body is parsed
+   and inlined at each CALL site, which is what PostgreSQL's
+   `inline_function` (optimizer/util/clauses.c) does -- so a body that
+   this server cannot translate is an error where it is used, naming the
+   statement the caller wrote, exactly as PostgreSQL reports a body error
+   from the call rather than from the definition."
+  [ctx parsed]
+  (let [{:keys [conn tx-state session-id]} ctx
+        {:keys [fn-name params or-replace?]} parsed]
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
+    (loop [attempt 0]
+      (let [current-db (if (:in-tx? @tx-state)
+                         (:speculative-db @tx-state)
+                         (d/db conn))
+            existing (existing-function current-db fn-name (mapv :type params))]
+        (if (and existing (not or-replace?))
+          (classified-error ""
+                            (ex-info (str "function \"" fn-name "\" already exists "
+                                          "with same argument types")
+                                     {:error :duplicate-function
+                                      :sqlstate "42723"}))
+          (let [{:keys [oid tx-data]}
+                (if existing
+                  {:oid (:datahike.pg.function/oid existing) :tx-data []}
+                  (catalog-objects/reserve-user-oid-tx current-db))
+                create-data (into (vec tx-data) (function-tx-data parsed oid))]
+            (if (:in-tx? @tx-state)
+              (execute-ddl-in-tx tx-state create-data "CREATE FUNCTION")
+              (let [outcome (try
+                              (transact-recorded! conn create-data)
+                              :committed
+                              (catch Exception e e))]
+                (cond
+                  (= :committed outcome) (empty-result "CREATE FUNCTION")
+                  (and (catalog-cas-failure? outcome)
+                       (< attempt catalog-allocation-max-retries))
+                  (recur (inc attempt))
+                  :else (classified-error "CREATE FUNCTION error: " outcome))))))))))
+
+(defn- function-signature
+  "`f(integer, text)` — the way PostgreSQL names a function in an error.
+   Each declared type is resolved to its OID and rendered by its
+   canonical name, so `int` prints as `integer`; a name that resolves to
+   nothing is printed as written."
+  [db fn-name arg-types]
+  (str fn-name "("
+       (str/join ", "
+                 (map (fn [t]
+                        (or (some-> (oid/sql-type-name->oid t db)
+                                    types/oid->pg-name)
+                            t))
+                      arg-types))
+       ")"))
+
+(defn- exec-ddl-drop-function
+  "DROP FUNCTION [IF EXISTS] name(args).
+
+   PostgreSQL resolves the argument list; we resolve on arity, and an
+   argument list that is absent matches the only function of that name."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [fn-name arity arg-types if-exists?]} parsed
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        ;; An exact signature match first (DROP FUNCTION f(int, text)),
+        ;; then every overload of that arity -- our declared-type text
+        ;; need not be spelled the way the DROP spells it (`int` versus
+        ;; `integer`), so an arity match is the fallback.
+        matches (or (when arg-types
+                      (some-> (existing-function db fn-name arg-types) vector))
+                    (functions-by-name+arity db fn-name arity))]
+    (cond
+      (empty? matches)
+      (if if-exists?
+        (empty-result "DROP FUNCTION")
+        (classified-error ""
+                          (ex-info (str "function "
+                                        (if arity
+                                          (function-signature db fn-name arg-types)
+                                          fn-name)
+                                        " does not exist")
+                                   {:error :undefined-function :sqlstate "42883"})))
+
+      (and (nil? arity) (> (count matches) 1))
+      (classified-error ""
+                        (ex-info (str "function name \"" fn-name
+                                      "\" is not unique")
+                                 {:error :ambiguous-function :sqlstate "42725"
+                                  :hint "Specify the argument list to select the function unambiguously."}))
+
+      :else
+      (let [tx-data (mapv (fn [e] [:db/retractEntity (:db/id e)]) matches)]
+        (if (:in-tx? @tx-state)
+          (execute-ddl-in-tx tx-state tx-data "DROP FUNCTION")
+          (let [outcome (try (transact-recorded! conn tx-data) :committed
+                             (catch Exception e e))]
+            (if (= :committed outcome)
+              (empty-result "DROP FUNCTION")
+              (classified-error "DROP FUNCTION error: " outcome))))))))
 
 (defn- exec-ddl-create-enum
   [ctx parsed]
@@ -11733,6 +11921,10 @@
                                                       tx-state #(exec-ddl-create-sequence ctx parsed))
                               :ddl-alter-sequence    (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-alter-sequence ctx parsed))
+                              :ddl-create-function   (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-function ctx parsed))
+                              :ddl-drop-function     (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop-function ctx parsed))
                               :ddl-create-enum       (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create-enum ctx parsed))
                               :ddl-alter-enum        (execute-ddl-invalidating
