@@ -2661,13 +2661,20 @@
    :base {attr v} :ops [...]}}`. OLD is what is stored, NEW is OLD with
    the statement's assignments applied -- the same reconstruction
    `check-updates-against-row-constraints!` does."
-  [db table-name tx-data]
+  [db table-name tx-data eids]
   (let [ops-by-eid (reduce (fn [acc op]
                              (if (and (vector? op) (keyword? (first op)))
                                (let [[verb eid attr val] op]
                                  (update acc eid (fnil conj []) [verb attr val]))
                                acc))
-                           {} tx-data)
+                           ;; A row the statement MATCHED but did not
+                           ;; change -- `SET i = i` -- emits no operation
+                           ;; at all. PostgreSQL still counts it as
+                           ;; updated and still fires its triggers, so
+                           ;; the rows are driven by the matched eids and
+                           ;; the operations only say what changed.
+                           (into {} (map (fn [e] [e []])) (filter integer? eids))
+                           tx-data)
         cols (fn [m] (into {} (keep (fn [[k v]]
                                       (when (and (keyword? k) (= table-name (namespace k))
                                                  (not= "db-row-exists" (name k)))
@@ -2715,11 +2722,11 @@
    the tx-data is what should actually be written -- a trigger may have
    changed the row or returned NULL to cancel the update for it -- and
    `rows` is what the AFTER triggers will see."
-  [db table-name tx-data changed-columns]
-  (let [by-eid (update-rows-from-ops db table-name tx-data)
+  [db table-name tx-data changed-columns eids]
+  (let [by-eid (update-rows-from-ops db table-name tx-data eids)
         triggers (matching-triggers db table-name :update :before :row changed-columns)]
     (if (or (empty? triggers) (empty? by-eid))
-      [tx-data (mapv (fn [[_ r]] (select-keys r [:old :new])) by-eid)]
+      [tx-data (mapv (fn [[_ r]] (select-keys r [:old :new])) by-eid) 0]
       (let [handler (trigger-handler! table-name)
             outcomes (into {}
                            (map (fn [[eid {:keys [old new base]}]]
@@ -2746,7 +2753,8 @@
                outcomes)
          (into [] (keep (fn [[_ {:keys [row old]}]]
                           (when row {:old old :new row})))
-               outcomes)]))))
+               outcomes)
+         (count (remove (comp :row val) outcomes))]))))
 
 (defn- entity-columns
   "A stored row as `{column value}`, for OLD."
@@ -3446,7 +3454,8 @@
                                                   (keyword? (nth op 2 nil)))
                                          (name (nth op 2))))
                                      tx-data))
-          [tx-data after-rows] (apply-before-row-updates db table tx-data changed-columns)
+          [tx-data after-rows cancelled] (apply-before-row-updates
+                                          db table tx-data changed-columns eids)
           tx-data (tx-wrap tx-data)
           returning (:returning parsed)
           tx-report (when (seq tx-data)
@@ -3466,9 +3475,10 @@
           result)
         (do (fire-after-row-triggers! db table :update after-rows)
             (fire-statement-triggers! db table :update :after)
-            ;; A row a BEFORE trigger cancelled was not updated, so it is
-            ;; not counted -- as PostgreSQL counts what it wrote.
-            (empty-result (str "UPDATE " (count after-rows))))))
+            ;; A row a BEFORE trigger cancelled was not updated, so it
+            ;; is not counted. Every other MATCHED row is, including one
+            ;; whose new value equals its old.
+            (empty-result (str "UPDATE " (- (count eids) cancelled))))))
     (catch Exception e
       (classified-error "UPDATE error: " e))))
 
@@ -8223,8 +8233,9 @@
                                                       (keyword? (nth op 2 nil)))
                                              (name (nth op 2))))
                                          tx-data))
-              [tx-data after-rows] (apply-before-row-updates
-                                    spec-db (:table parsed) tx-data changed-columns)
+              [tx-data after-rows cancelled] (apply-before-row-updates
+                                              spec-db (:table parsed) tx-data
+                                              changed-columns eids)
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-report (dc/with spec-db tx-data)
               _ (unique-constraints/validate-report! spec-report)
@@ -8254,7 +8265,8 @@
                                     :update after-rows)
           (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
                                     :update :after)
-          (or returning-result (empty-result (str "UPDATE " (count after-rows)))))
+          (or returning-result
+              (empty-result (str "UPDATE " (- (count eids) cancelled)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
