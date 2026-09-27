@@ -24,6 +24,34 @@ One notice per missing name, as PostgreSQL emits. The function wording is not a 
 
 `drop_if_exists` goes from 65% to 69% of PostgreSQL's expected output.
 
+### plpgsql
+
+`CREATE FUNCTION … LANGUAGE plpgsql` was a silent no-op. Bodies are parsed and run now.
+
+`pl_gram.y` is the specification for the syntax. What that grammar does — and what `datahike.pg.plpgsql.parse` does — is parse the statement STRUCTURE and hand every embedded expression and query to the SQL layer as source; plpgsql has no expression grammar of its own. **All 258 plpgsql bodies in PostgreSQL's own `src/test/regress` parse.**
+
+The evaluator has two primitives and everything else is control flow: evaluate an expression, and run a statement. Both go through the handler that reached them, so a nested statement shares the transaction, the temporary tables and the session — PostgreSQL's SPI, with the connection it already has. That is why `pl_exec.c` is 9,226 lines and this is not: most of it is memory contexts, plan caching and TupleDesc conversion.
+
+Unlike a `LANGUAGE sql` function, a plpgsql one cannot be inlined — it is imperative, so there is no expression to substitute. It is called once per row, exactly as in PostgreSQL.
+
+Implemented: blocks and nested blocks, `DECLARE` with defaults and types, assignment, `IF`/`ELSIF`/`ELSE`, the `CASE` statement, `LOOP`, `WHILE`, integer `FOR` (with `REVERSE` and `BY`), `FOR … IN <query>`, `FOREACH`, `EXIT`/`CONTINUE` with labels and `WHEN`, `RETURN`, `RETURN NEXT`, `RETURN QUERY`, `PERFORM`, `SELECT … INTO [STRICT]`, `NULL`, and `RAISE` in all four of its forms with `%` formatting, condition names and `USING`.
+
+**A construct the evaluator cannot run is refused at `CREATE FUNCTION`, by name** — `EXECUTE`, exception handlers, cursors and `GET DIAGNOSTICS` — so a gap is a `0A000` against the definition rather than a wrong answer at the call. PostgreSQL validates bodies at definition time too; that is what `check_function_bodies` controls.
+
+`plpgsql` goes from unsupported to **76.8%** of PostgreSQL's expected output, `domain` from 62% to 63.7%.
+
+Five things that had to be got right, each found by running the corpus:
+
+- **A parameter written `$n` is renamed** to `__plpgsql_arg_n` at parse time. It cannot stay `$n`: the translator rewrites *literals* to `$n` placeholders so a plan can be cached across values, so a body's own `$1` is indistinguishable from a `0` the rewriter lifted — `SELECT 0` inside a body came back as the function's first argument.
+- **A nested statement clears the caller's prepared-statement bindings.** `*cached-parsed*` is dynamic and was still in scope, so every statement of a body re-ran the *outer* plan, called the function again, and overflowed the stack.
+- **Variables are coerced to their declared type on assignment.** A statement gives its result back as text, so `t int := 0` held the string `"0"` and `t + 1` was `'0' + 1`.
+- **A loop counter advances before the body runs.** `CONTINUE` leaves the body by throwing, so advancing afterwards meant `CONTINUE WHEN …` never moved the loop on.
+- **`INSERT INTO t` is not `SELECT INTO`.** Lifting the `INTO` clause out of every statement turned it into `INSERT  VALUES (…)`.
+
+### A function's result and arguments are typed
+
+Two fixes that apply to any user function used in an expression: the value coming back from a body is cast to the function's declared return type (`2 * f(1)` was a `ClassCastException`), and an argument that translates to a nested form is materialised into its own variable first (`f(1+1)` said "Nested expression forms are not supported").
+
 ### A SQL function can be a relation
 
 `SELECT * FROM f(args)` now works for a function this database defines, which is what `inline_set_returning_function` (optimizer/util/clauses.c) does in PostgreSQL: the body is pulled into the range table as a subquery. Here it is rewritten into the derived table it means and materialised the way `FROM (SELECT …) alias` already was, so it joins by value like any other relation.
