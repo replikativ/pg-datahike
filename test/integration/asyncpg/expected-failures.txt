@@ -56,7 +56,6 @@ tests/test_codecs.py::TestCodecs::test_interval
 tests/test_codecs.py::TestCodecs::test_multirange_types
 tests/test_codecs.py::TestCodecs::test_numeric
 tests/test_codecs.py::TestCodecs::test_range_types
-tests/test_codecs.py::TestCodecs::test_relacl_array_type
 tests/test_codecs.py::TestCodecs::test_standard_codecs
 tests/test_codecs.py::TestCodecs::test_table_as_composite
 tests/test_codecs.py::TestCodecs::test_timetz_encoding

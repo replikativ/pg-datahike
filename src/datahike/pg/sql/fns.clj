@@ -4251,6 +4251,25 @@
    "lcm"      sql-lcm
    "width_bucket" sql-width-bucket
    "pi"       (fn [] Math/PI)
+   ;; The database's encoding, and the connection's. This server speaks
+   ;; UTF-8 and nothing else, so both are UTF8 and neither depends on
+   ;; the session. PostgreSQL's own `collate.*` and `copyencoding`
+   ;; tests open by asking, and skip themselves when the answer is not
+   ;; UTF8 -- so being unable to answer blocked the whole file.
+   ;; `point(x, y)` -- the constructor. A point VALUE is already its
+   ;; canonical text here, `(x,y)`, so this only has to write it: the
+   ;; literal `'(1,2)'::point` worked while `point(1,2)` said the
+   ;; function does not exist.
+   ;; float8, so a whole number prints without its fraction: PostgreSQL
+   ;; answers `(1,2)` for both `point(1,2)` and `point(1.0,2.0)`.
+   "point" (fn [x y]
+             (letfn [(f [v] (let [d (double v)]
+                              (if (== d (Math/rint d))
+                                (str (long d))
+                                (str d))))]
+               (str "(" (f x) "," (f y) ")")))
+   "getdatabaseencoding"  (fn [] "UTF8")
+   "pg_client_encoding"   (fn [] "UTF8")
    ;; degrees/radians route through PG's checked multiply/divide, so
    ;; they can raise 22003 where Math/toDegrees silently returns Inf.
    "degrees"  #(let [d (double %)] (finite-range (Math/toDegrees d) d))
@@ -4403,6 +4422,9 @@
 
 (def ^:private legacy-sql-fn-arities
   {"pi"       #{0}
+   "point" #{2}
+   "getdatabaseencoding" #{0}
+   "pg_client_encoding"  #{0}
    "abs"      #{1} "sign"    #{1} "sqrt"  #{1} "cbrt"  #{1}
    "exp"      #{1} "ln"      #{1} "log10" #{1}
    "floor"    #{1} "ceil"    #{1} "ceiling" #{1}

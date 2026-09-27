@@ -73,6 +73,12 @@
   :postgres-internal-sanity
   #{"oidjoins" "sanity_check"}
 
+  ;; Their expected output is a property of the SERVER BUILD, not of
+  ;; SQL: `collate.icu.utf8` needs ICU collations compiled in and the
+  ;; others need a particular operating system's locales, which is why
+  ;; PostgreSQL schedules them conditionally too. Answering them
+  ;; correctly means running their own skip test and quitting, against
+  ;; an expected output recorded on a server that did not skip.
   :platform-collation-matrix
   #{"collate.icu.utf8" "collate.linux.utf8" "collate.utf8"
     "collate.windows.win1252"}}}

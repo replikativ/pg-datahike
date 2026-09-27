@@ -91,8 +91,15 @@
 (defn- kind [sql] (:kind (c/classify sql)))
 
 (deftest classify-authorization-ddl
-  (is (= :grant  (kind "GRANT SELECT ON t TO bob")))
-  (is (= :grant  (kind "  grant  select  on t to bob")))
+  ;; GRANT and REVOKE are accepted, not refused. This server has one
+  ;; login identity and enforces no privileges -- `has_table_privilege`
+  ;; and its relatives answer `true` unconditionally -- so refusing the
+  ;; statements while answering "yes, you may" to every privilege
+  ;; question was the inconsistent half.
+  (is (= :privilege-noop (kind "GRANT SELECT ON t TO bob")))
+  (is (= :privilege-noop (kind "  grant  select  on t to bob")))
+  ;; REVOKE stays refused: it claims to take access away, and this
+  ;; server cannot. A loud 0A000 is safe where a silent success is not.
   (is (= :revoke (kind "REVOKE ALL ON t FROM bob")))
   (is (= :create-policy (kind "CREATE POLICY p ON t USING (true)")))
   (is (= :alter-policy  (kind "ALTER POLICY p ON t USING (false)")))

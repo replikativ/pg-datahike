@@ -229,6 +229,10 @@
    "current_setting" types/oid-text
    "set_config"      types/oid-text
    "current_database" types/oid-name
+   ;; `name`, as PostgreSQL declares them -- not text.
+   "point" types/oid-point
+   "getdatabaseencoding" types/oid-name
+   "pg_client_encoding" types/oid-name
    "current_schema"   types/oid-name
    "current_user"  types/oid-name
    "session_user"  types/oid-name

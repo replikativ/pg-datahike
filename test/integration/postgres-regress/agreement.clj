@@ -19,9 +19,11 @@
 
    100% here means every EXPECTED line is present and in order, not
    that the output is byte-identical: extra lines of ours do not lower
-   it. That is deliberate -- the number answers " how much of what
-  PostgreSQL prints do we print ", and a stricter reading is what
-   `pg_regress` itself already gives, namely zero for any difference. It does NOT fail on an improvement: rerun
+   it. That is deliberate -- the number answers how much of what
+   PostgreSQL prints we also print, and a stricter reading is what
+   `pg_regress` itself already gives, namely zero for any difference.
+
+   It does NOT fail on an improvement: rerun
    `measure` and commit the new numbers.
 
    The tolerance exists because a file whose output is mostly cascade
@@ -88,7 +90,10 @@
    client never sees."
   []
   (let [s (slurp scope-file)
-        oos (set (re-seq #"(?<=\")[a-z0-9_]+(?=\")"
+        ;; A test name may contain dots -- `collate.icu.utf8` -- so the
+        ;; character class has to allow them, or the entry silently
+        ;; fails to exclude anything.
+        oos (set (re-seq #"(?<=\")[a-z0-9_.]+(?=\")"
                          (subs s (str/index-of s ":out-of-scope"))))]
     (->> (.listFiles (io/file regress-root "sql"))
          (map #(.getName %))

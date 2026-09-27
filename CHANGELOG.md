@@ -24,6 +24,40 @@ One notice per missing name, as PostgreSQL emits. The function wording is not a 
 
 `drop_if_exists` goes from 65% to 69% of PostgreSQL's expected output.
 
+### `ONLY t` was accepted and ignored
+
+`SELECT … FROM ONLY t` reads t **without** the tables that inherit from it. JSqlParser accepts the word in a SELECT and silently discards it — the Table it hands back is just `t` — and rejects it outright in a DELETE. So the statement was answered as though `ONLY` had not been written, which is a wrong answer rather than a missing feature: `DELETE FROM ONLY parent` deleted the children's rows too.
+
+It is read from the SQL before the parser, stripped so the parser accepts the statement, and honoured in SELECT, UPDATE and DELETE. A child's row carries every ancestor's row marker as well as its own — that is how the parent sees it at all — so excluding the descendants' markers is exactly what `ONLY` means.
+
+`ONLY` is also part of the row-matching plan cache's key now. It is stripped before parsing, so two statements that differ only by it produce the same parse and would otherwise have shared a plan.
+
+### `t*` parses
+
+`FROM parent*` means "and every table that inherits from it", which is already what a bare `parent` means — PostgreSQL has defaulted to including descendants since 7.1 and keeps the marker for compatibility. It is dropped before parsing, and only after a word that introduces a relation, so `a * b` and `count(*)` are untouched.
+
+`select` goes 72.2% → 82.7%, `create_misc` 38.2% → 50.5%, `select_distinct` 71.1% → 74.4%. With the role and `GRANT` work, `rowsecurity` goes 0% → 55.9% and `stats_ext` 0% → 37.3%.
+
+### Roles, the encoding functions, and GRANT
+
+Four things the regression residual named as the first thing blocking a file.
+
+**`getdatabaseencoding()` and `pg_client_encoding()`.** PostgreSQL's `collate.*` and `copyencoding` tests open by asking the encoding and skip themselves when it is not UTF8; being unable to answer failed the very first statement.
+
+**A role is a real object.** `CREATE`/`DROP ROLE | USER | GROUP`, with `IF EXISTS`, several names at once, `42710` for a duplicate and `42704` for a missing one, the notice for a skipped drop, and a row in `pg_roles`. PostgreSQL's command tags are echoed as it echoes them — `CREATE USER` answers `CREATE ROLE`, but `DROP USER` answers `DROP USER`. Role *options* are read and discarded rather than recorded: this server has one login identity and enforces no privileges, so storing `SUPERUSER` or `NOLOGIN` would be a claim nothing honours.
+
+**`GRANT` is accepted; `REVOKE` is not.** Everything is already permitted here — `has_table_privilege` and its relatives answer `true` unconditionally — so granting more permits nothing new and the statement is honestly a no-op. `REVOKE` is different in kind: it claims to take access away, and a caller told it succeeded has been told something false about who can read their data. Refusing is loud and safe. PostgreSQL's own `privileges` test prints 192 `permission denied` lines this server cannot produce, which is the measure of what a silent `REVOKE` would hide. `privileges` goes from 0% to 67% on the strength of `GRANT` alone.
+
+**`point(x, y)`.** A point *literal* already worked; only the constructor was missing. float8, so `point(1.0,2.0)` prints `(1,2)`.
+
+### The four `collate.*` files were never in scope
+
+`scope.edn` has listed them under `:platform-collation-matrix` all along — their expected output is a property of the server build, not of SQL. The gate's scope parser did not allow a **dot** in a test name, so the exclusion silently matched nothing and all four were being measured.
+
+It surfaced as an apparent catastrophe: `collate.icu.utf8` fell from 63.6% to 0.2% precisely *because* `getdatabaseencoding()` started working — the file now runs its own skip test, finds no ICU collations and quits, against an expected output recorded on a server that did not skip. Fixing the parser leaves 176 application-facing files.
+
+The gate also recycles the server every 30 files: the harness bootstraps a database per file and the server keeps them, so a full run had grown it to 7GB and starved the machine.
+
 ### An impossible date is rejected, not rolled
 
 `'1997-13-01'::date` answered the string `1997-13-01` — a date with a thirteenth month — and `'1997-04-31'` quietly became the 30th, `'1997-02-29'` the 28th. Both are now `22008 date/time field value out of range`, as in PostgreSQL, and text that is not a date at all is `22007`.

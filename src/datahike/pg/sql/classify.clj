@@ -621,7 +621,7 @@
 ;; Sequence DDL is classified in full further down (it needs
 ;; read-relation-name, which is defined after this dispatch).
 (declare classify-create-sequence classify-alter-sequence classify-create-function
-         classify-create-trigger)
+         classify-create-trigger classify-role-statement)
 
 (defn- classify-create [toks]
   ;; toks starts after CREATE. Skip qualifiers (OR REPLACE, UNIQUE,
@@ -639,6 +639,8 @@
       (kw=? t1 "extension") {:kind :create-extension :reject-kind :create-extension
                              :tag "CREATE EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "CREATE SCHEMA"}
+      (kw-in? t1 #{"role" "user" "group"})
+      (classify-role-statement :create (rest toks) (str/upper-case (:text t1)))
       (kw=? t1 "database")  {:kind :create-database :tag "CREATE DATABASE"}
       ;; Views are real database objects now; route through JSqlParser and
       ;; the transactional DDL path instead of acknowledging a no-op.
@@ -1075,6 +1077,37 @@
                      :body (:body attrs)}))))))
         reject)))
 
+(defn- classify-role-statement
+  "`CREATE|DROP ROLE|USER|GROUP name [, …] [options]`.
+
+   A role is a real object here -- it is what `pg_roles` lists, what
+   `\\du` shows and what an owner refers to -- but its OPTIONS are not:
+   this server has one superuser and enforces no privileges, so
+   `SUPERUSER`, `NOLOGIN`, `PASSWORD` and the rest are read and
+   discarded rather than pretended to.
+
+   `keyword` is the spelling the statement used, so the command tag
+   echoes it: PostgreSQL answers `CREATE ROLE` to `CREATE USER`, but
+   `DROP USER` to `DROP USER`."
+  [op toks keyword]
+  (let [reject {:kind (if (= op :create) :create-role :drop-role)
+                :reject-kind :role
+                :tag (str (if (= op :create) "CREATE " "DROP ") keyword)}
+        ie? (and (= op :drop) (kw=? (first toks) "if") (kw=? (second toks) "exists"))
+        ts (if ie? (drop 2 toks) toks)]
+    (or (when-let [[names _] (read-relation-list ts)]
+          (when (and (seq names)
+                     ;; `CREATE USER MAPPING FOR …` is a foreign-data
+                     ;; statement, not a role called "mapping".
+                     (not (kw=? (first ts) "mapping")))
+            {:kind (if (= op :create) :create-role-object :drop-role-object)
+             :roles (mapv str/lower-case names)
+             :if-exists? (boolean ie?)
+             ;; PostgreSQL's tag for CREATE USER is CREATE ROLE; for
+             ;; DROP it echoes the word the statement used.
+             :tag (if (= op :create) "CREATE ROLE" (str "DROP " keyword))}))
+        reject)))
+
 (defn- classify-create-trigger
   "CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} event [OR event …]
    ON table [FOR [EACH] {ROW|STATEMENT}] [WHEN (condition)]
@@ -1299,6 +1332,8 @@
       (kw=? t1 "extension") {:kind :drop-extension :reject-kind :create-extension
                              :tag "DROP EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
+      (kw-in? t1 #{"role" "user" "group"})
+      (classify-role-statement :drop (rest toks) (str/upper-case (:text t1)))
       (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
       (kw=? t1 "type")      {:kind :drop-type-enum :system? true :tag "DROP TYPE"}
       (kw=? t1 "domain")    {:kind :drop-domain :system? true :tag "DROP DOMAIN"}
@@ -1754,8 +1789,24 @@
         (let [kw (when (= :ident (:type t1)) (str/lower-case (:text t1)))]
           (case kw
           ;; --- authorization DDL — rejected by default, opt-in silent-accept
-            "grant"   {:kind :grant   :reject-kind :grant   :tag "GRANT"}
-            "revoke"  {:kind :revoke  :reject-kind :revoke  :tag "REVOKE"}
+            ;; This server has one login identity and enforces no
+            ;; privileges: `has_table_privilege` and its relatives
+            ;; already answer `true` unconditionally.
+            ;;
+            ;; GRANT is accepted against that model. Everything is
+            ;; already permitted, so granting more permits nothing new
+            ;; and the statement is honestly a no-op -- and it is
+            ;; incidental setup in the files that were blocked by it.
+            ;;
+            ;; REVOKE is NOT, and the difference is not cosmetic. It
+            ;; claims to take access away, and a caller that believes
+            ;; it has one has been told something false about who can
+            ;; read their data. Refusing is loud and safe; accepting
+            ;; would be silent and not. PostgreSQL's own `privileges`
+            ;; test prints 192 `permission denied` lines that this
+            ;; server cannot produce, which is the measure of the gap.
+            "grant"   {:kind :privilege-noop :tag "GRANT"}
+            "revoke"  {:kind :revoke :reject-kind :revoke :tag "REVOKE"}
 
           ;; --- DDL routed by second keyword
             "create"  (classify-create rest-toks)
