@@ -458,6 +458,30 @@
    reaching for a connection of its own."
   nil)
 
+(def ^:dynamic *only-tables*
+  "The tables this statement named with `ONLY`, lower-cased.
+
+   `FROM ONLY t` reads t WITHOUT the tables that inherit from it.
+   JSqlParser drops the word silently -- the Table it hands back is
+   just `t` -- so the statement was answered as though ONLY had not
+   been written, which is a wrong answer rather than a missing
+   feature. The scan happens before the parser and the translator
+   reads it here."
+  #{})
+
+(defn only-tables-in
+  "The tables `sql` names with ONLY. Token-driven, so the word inside a
+   string or a comment is not the keyword, and a column called `only`
+   is not a modifier."
+  [toks]
+  (into #{}
+        (keep (fn [[a b]]
+                (when (and (= :ident (:type a))
+                           (= "only" (str/lower-case (:text a)))
+                           (contains? #{:ident :quoted} (:type b)))
+                  (str/lower-case (:text b)))))
+        (partition 2 1 (remove #(= :comment (:type %)) toks))))
+
 (def routine-error-key
   "Marks an exception as having escaped a ROUTINE BODY -- a plpgsql
    function's own error, not a translator shortcoming.

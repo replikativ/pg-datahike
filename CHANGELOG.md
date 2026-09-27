@@ -24,6 +24,20 @@ One notice per missing name, as PostgreSQL emits. The function wording is not a 
 
 `drop_if_exists` goes from 65% to 69% of PostgreSQL's expected output.
 
+### `ONLY t` was accepted and ignored
+
+`SELECT … FROM ONLY t` reads t **without** the tables that inherit from it. JSqlParser accepts the word in a SELECT and silently discards it — the Table it hands back is just `t` — and rejects it outright in a DELETE. So the statement was answered as though `ONLY` had not been written, which is a wrong answer rather than a missing feature: `DELETE FROM ONLY parent` deleted the children's rows too.
+
+It is read from the SQL before the parser, stripped so the parser accepts the statement, and honoured in SELECT, UPDATE and DELETE. A child's row carries every ancestor's row marker as well as its own — that is how the parent sees it at all — so excluding the descendants' markers is exactly what `ONLY` means.
+
+`ONLY` is also part of the row-matching plan cache's key now. It is stripped before parsing, so two statements that differ only by it produce the same parse and would otherwise have shared a plan.
+
+### `t*` parses
+
+`FROM parent*` means "and every table that inherits from it", which is already what a bare `parent` means — PostgreSQL has defaulted to including descendants since 7.1 and keeps the marker for compatibility. It is dropped before parsing, and only after a word that introduces a relation, so `a * b` and `count(*)` are untouched.
+
+`select` goes 72.2% → 82.7%, `create_misc` 38.2% → 50.5%, `select_distinct` 71.1% → 74.4%. With the role and `GRANT` work, `rowsecurity` goes 0% → 55.9% and `stats_ext` 0% → 37.3%.
+
 ### Roles, the encoding functions, and GRANT
 
 Four things the regression residual named as the first thing blocking a file.

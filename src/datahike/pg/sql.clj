@@ -2670,12 +2670,23 @@
              (templated-parse sql schema db)
              (let [session? (atom false)
                    mat-params? (atom false)
+                   ;; `FROM ONLY t` excludes the tables that inherit from
+                   ;; t. JSqlParser drops the word, so it is read here,
+                   ;; before the parser, and the translator consults it.
+                   only-tables (params/only-tables-in (cls/tokenize-all sql))
                    parsed (binding [params/*session-dependent?* session?
-                                    params/*materialisation-params?* mat-params?]
+                                    params/*materialisation-params?* mat-params?
+                                    params/*only-tables* only-tables]
                             (parse-sql* sql schema db))
                    ;; A translation that reads a session value belongs to
                    ;; the session it was translated for.
+                   ;; Also carried ON the parsed map, not only in the
+                   ;; dynamic binding: UPDATE and DELETE build their
+                   ;; row-matching query at EXECUTE time, when the
+                   ;; binding is long gone.
                    parsed (cond-> parsed
+                            (and (seq only-tables) (map? parsed))
+                            (assoc :only-tables only-tables)
                             (and @session? (map? parsed))
                             (assoc :session-dependent? true)
                             ;; A derived table or CTE whose body reads a

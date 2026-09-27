@@ -968,6 +968,58 @@
             [pos end (str "'" (str/replace value "'" "''") "'")]))
         toks))
 
+(def ^:private relation-position-words
+  "Words after which a table name may appear, so a `*` following that
+   name is the inheritance marker rather than multiplication."
+  #{"from" "join" "update" "into" "only"})
+
+(defn inheritance-star-rule
+  "`FROM parent*` means \"and every table that inherits from it\", which
+   is already what a bare `parent` means -- PostgreSQL has defaulted to
+   including descendants since 7.1, and the `*` is the old explicit
+   spelling kept for compatibility. JSqlParser has no such syntax, so
+   the marker is dropped.
+
+   Only after a word that introduces a relation, so the `*` in
+   `SELECT a * b FROM t` and `SELECT count(*)` is untouched."
+  [toks]
+  (let [sig (vec (remove #(= :comment (:type %)) toks))]
+    (keep (fn [i]
+            (let [prev (nth sig (dec i) nil)
+                  t (nth sig i nil)
+                  nxt (nth sig (inc i) nil)]
+              (when (and (= :op (:type nxt)) (= "*" (:text nxt))
+                         (contains? #{:ident :quoted} (:type t))
+                         prev (= :ident (:type prev))
+                         (contains? relation-position-words
+                                    (str/lower-case (:text prev))))
+                [(:pos nxt) (:end nxt) ""])))
+          (range 1 (count sig)))))
+
+(defn only-keyword-rule
+  "`FROM|JOIN|UPDATE|DELETE FROM ONLY t` -- drop the word.
+
+   JSqlParser accepts it in a SELECT and silently discards it, and
+   rejects it outright in a DELETE. Either way the translator cannot
+   learn it from the AST, so it is read from the SQL beforehand
+   (`params/only-tables-in`) and removed here, leaving a statement the
+   parser accepts and a set of names the translator honours."
+  [toks]
+  (let [sig (vec (remove #(= :comment (:type %)) toks))]
+    (keep (fn [i]
+            (let [prev (nth sig (dec i) nil)
+                  t (nth sig i nil)
+                  nxt (nth sig (inc i) nil)]
+              (when (and (= :ident (:type t))
+                         (= "only" (str/lower-case (:text t)))
+                         (contains? #{:ident :quoted} (:type nxt))
+                         prev (= :ident (:type prev))
+                         (contains? #{"from" "join" "update"}
+                                    (str/lower-case (:text prev))))
+                ;; Through to the next token's start, so the space goes too.
+                [(:pos t) (:pos nxt) ""])))
+          (range 1 (count sig)))))
+
 (defn order-by-using-rule
   "`ORDER BY x USING <` is PostgreSQL's way of naming the ordering
    OPERATOR rather than a direction, and JSqlParser has no such clause.
@@ -1092,6 +1144,8 @@
    create-index-anonymous-rule
    select-from-rule
    quote-reserved-alias-rule
+   inheritance-star-rule
+   only-keyword-rule
    order-by-using-rule
    select-into-table-rule
    adjacent-string-literal-rule

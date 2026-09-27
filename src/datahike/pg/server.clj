@@ -2939,6 +2939,21 @@
     (catch Exception e
       (classified-error "INSERT error: " e))))
 
+(defn- exclude-inherited-rows!
+  "`ONLY t` in an UPDATE or a DELETE reads and writes t WITHOUT the
+   tables that inherit from it.
+
+   A child's row carries every ancestor's row marker as well as its
+   own, which is how the parent sees it, so excluding the children's
+   markers is exactly ONLY. Without this the word parsed and then did
+   nothing: `DELETE FROM ONLY parent` deleted the child's rows too."
+  [ctx db evar table only-tables]
+  (when (contains? (or only-tables params/*only-tables*)
+                   (str/lower-case (str table)))
+    (doseq [child (sql-ctx/inheritance-descendants db table)]
+      (swap! (:where-clauses ctx) conj
+             (list 'not [evar (pgs/row-marker-attr child) true])))))
+
 (defn- ensure-evar-anchor!
   "The UPDATE/DELETE row-matching query needs at least one data pattern
    binding the table's entity var — a WHERE consisting only of get-else /
@@ -3012,7 +3027,12 @@
         ;; update-row-match-cache / build-update-tx-for-bindings.
         shape-key (when (nil? enriched-db)
                     [(pg-cache/identity-key parsed)
-                     (pg-cache/identity-key schema)])
+                     (pg-cache/identity-key schema)
+                     ;; `ONLY` is stripped from the SQL before the parser
+                     ;; sees it, so two statements that differ only by it
+                     ;; produce the same `parsed` -- and would share this
+                     ;; cached row-matching plan. It belongs in the key.
+                     (:only-tables parsed)])
         cached (when shape-key
                  (.get ^java.util.Map update-row-match-cache shape-key))
         {:keys [q in-args-raw]}
@@ -3040,6 +3060,8 @@
                         (when-let [first-col (second cols)]
                           (#'sql-ctx/col-var! ctx (:attr first-col)))))
                   _ (ensure-evar-anchor! ctx evar table)
+                  _ (exclude-inherited-rows! ctx (or enriched-db db) evar table
+                                             (:only-tables parsed))
                   ;; ?pN param plumbing (mirrors build-update-tx-for-bindings):
                   ;; the WHERE keeps params as vars, so supply the bound values as
                   ;; :in args and run with the plan-stable fold disabled.
@@ -3277,7 +3299,13 @@
    assignment cast into the column. {:eids :tx-data}."
   [ctx db schema parsed]
   (let [{:keys [ns]} parsed
-        {:keys [plan assignments]} (update-set-plan parsed schema db)
+        ;; `update-set-plan` translates at EXECUTE time, after the
+        ;; binding made at parse time has gone, so `ONLY` is restored
+        ;; from the parsed map for it.
+        {:keys [plan assignments]}
+        (binding [params/*only-tables* (or (:only-tables parsed)
+                                           params/*only-tables*)]
+          (update-set-plan parsed schema db))
         bound *cached-bound*
         plan (if bound (resolve-param-refs plan bound) plan)
         ;; A correlated subquery is translated per row and reads `$n`
@@ -3287,6 +3315,22 @@
                                                               (some-> bound rest vec))]
                             (select-rows (assoc ctx :db db) plan))
         rows (mapv #(if (sequential? %) (vec %) [%]) results)
+        ;; `UPDATE ONLY t` updates t without the tables that inherit
+        ;; from it. The row-selection plan is generated SQL that no
+        ;; longer contains the word, so the rows are filtered here
+        ;; instead: a child's row carries its own row marker as well as
+        ;; every ancestor's, and that marker is what identifies it.
+        rows (if-let [only (and (contains? (or (:only-tables parsed) #{})
+                                           (str/lower-case (str (:table parsed))))
+                                (seq (sql-ctx/inheritance-descendants db (:table parsed))))]
+               (let [child-markers (mapv pgs/row-marker-attr only)]
+                 (filterv (fn [row]
+                            (let [eid (first row)]
+                              (or (not (integer? eid))
+                                  (not-any? #(some? (get (d/pull db [%] eid) %))
+                                            child-markers))))
+                          rows))
+               rows)
         ;; UPDATE ... FROM: a target row several source rows match is
         ;; updated once. PostgreSQL leaves the winning pair unspecified.
         rows (if (:from-sql parsed)

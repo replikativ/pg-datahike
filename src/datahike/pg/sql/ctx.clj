@@ -247,6 +247,22 @@
           [:aliased alias-key kw]
           kw)))))
 
+(defn inheritance-descendants
+  "Every table that inherits from `table-name`, directly or through
+   another, so `ONLY` can exclude all of them at once."
+  [db table-name]
+  (when db
+    (loop [frontier #{table-name}, seen #{}]
+      (let [kids (into #{}
+                       (comp (map first) (remove seen))
+                       (d/q '{:find [?child] :in [$ [?parent ...]]
+                              :where [[?e :__inherit__/parent ?parent]
+                                      [?e :__inherit__/child ?child]]}
+                            db (vec frontier)))]
+        (if (empty? kids)
+          seen
+          (recur kids (into seen kids)))))))
+
 (defn inheritance-ancestors
   "Return a table's inheritance chain from its immediate parent to the root.
    A seen set makes malformed/cyclic metadata terminate safely."

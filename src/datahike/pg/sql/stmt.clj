@@ -5538,6 +5538,15 @@
                                (= evar (first c))
                                (keyword? (second c))))
                         @(:where-clauses ctx))]
+              ;; `ONLY t` reads t without the tables that inherit from
+              ;; it. A child's row carries BOTH markers -- its own and
+              ;; every ancestor's -- which is how the parent sees it, so
+              ;; excluding the children's markers is exactly ONLY.
+              (doseq [[a tname] table-aliases
+                      :when (contains? params/*only-tables* (str/lower-case (str tname)))
+                      child (ctx/inheritance-descendants db tname)]
+                (ctx/add-clause!
+                 ctx (list 'not [(ctx/entity-var! ctx a) (pgs/row-marker-attr child) true])))
               (when-not has-plain-anchor?
                 (if (get schema marker)
                   (ctx/add-clause! ctx [evar marker true])
