@@ -56,7 +56,7 @@
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks])
-  (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
+  (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler PgWireServer$Notice
             PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException
             PgWireServer$PasswordAuthenticator PgParamCodec]
            [java.io FileInputStream]
@@ -4297,7 +4297,8 @@
       ;; [nil int4]"), because the guard compares against the schema view,
       ;; which doesn't surface custom :pg/* attrs.
           (and table-name name-conflict? if-not-exists?)
-          [(empty-result (if (:ctas? parsed) "CREATE TABLE AS" "CREATE TABLE")) false]
+          (do (params/notice! "NOTICE" (str "relation \"" table-name "\" already exists, skipping"))
+              [(empty-result (if (:ctas? parsed) "CREATE TABLE AS" "CREATE TABLE")) false])
 
           ;; The current identity lowering uses PostgreSQL's conventional
           ;; table_column_seq name directly.  Until it allocates a numbered
@@ -4482,7 +4483,9 @@
                           db catalog-objects/pg-type-oid
                           (:datahike.pg.object/oid row-type)))))]
     (cond
-      (and (nil? eid) (:if-exists? parsed)) (empty-result "DROP VIEW")
+      (and (nil? eid) (:if-exists? parsed))
+      (do (params/notice! "NOTICE" (str "view \"" (:view-name parsed) "\" does not exist, skipping"))
+          (empty-result "DROP VIEW"))
       (nil? eid) (classified-error
                   ""
                   (ex-info (str "view \"" view-name "\" does not exist")
@@ -8304,10 +8307,10 @@
                   :else (classified-error "CREATE FUNCTION error: " outcome))))))))))
 
 (defn- function-signature
-  "`f(integer, text)` — the way PostgreSQL names a function in an error.
-   Each declared type is resolved to its OID and rendered by its
-   canonical name, so `int` prints as `integer`; a name that resolves to
-   nothing is printed as written."
+  "`f(integer, text)` — the way PostgreSQL names a function in an ERROR.
+   Each declared type is resolved to its OID and rendered by its display
+   name, so `int` prints as `integer`; a name that resolves to nothing is
+   printed as written."
   [db fn-name arg-types]
   (str fn-name "("
        (str/join ", "
@@ -8315,6 +8318,24 @@
                         (or (some-> (oid/sql-type-name->oid t db)
                                     types/oid->pg-name)
                             t))
+                      arg-types))
+       ")"))
+
+(defn- function-signature-qualified
+  "`f(pg_catalog.int4)` — the way PostgreSQL names a function in the
+   IF EXISTS *notice*, which goes through `format_procedure` and so
+   prints schema-qualified pg_type names rather than display names. Its
+   error for the same function says `f(integer)`; the two really do
+   differ."
+  [db fn-name arg-types]
+  (str fn-name "("
+       (str/join ", "
+                 (map (fn [t]
+                        (if-let [oid (oid/sql-type-name->oid t db)]
+                          (if-let [tn (types/oid->pg-type-marker oid)]
+                            (str "pg_catalog." tn)
+                            (or (types/oid->pg-name oid) t))
+                          t))
                       arg-types))
        ")"))
 
@@ -8337,7 +8358,12 @@
     (cond
       (empty? matches)
       (if if-exists?
-        (empty-result "DROP FUNCTION")
+        (do (params/notice!
+             "NOTICE"
+             (str "function "
+                  (if arity (function-signature-qualified db fn-name arg-types) fn-name)
+                  " does not exist, skipping"))
+            (empty-result "DROP FUNCTION"))
         (classified-error ""
                           (ex-info (str "function "
                                         (if arity
@@ -9354,7 +9380,8 @@
                   (empty-result "DROP INDEX"))))
 
           (:if-exists? parsed)
-          (empty-result "DROP INDEX")
+          (do (params/notice! "NOTICE" (str "index \"" (:name parsed) "\" does not exist, skipping"))
+              (empty-result "DROP INDEX"))
 
           :else
           ;; PostgreSQL words this "index \"x\" does not exist"; the
@@ -9990,12 +10017,14 @@
                   (throw (ex-info (str "\"" table "\" is not a table")
                                   {:error :wrong-object-type :sqlstate "42809"}))
 
-                  (and (nil? object)
-                       (not (table-exists? db table))
-                       (not (:if-exists? parsed)))
-                  (throw (ex-info (str "table \"" table "\" does not exist")
-                                  {:error :undefined-table :sqlstate "42P01"
-                                   :table table}))))
+                  (and (nil? object) (not (table-exists? db table)))
+                  (if (:if-exists? parsed)
+                    ;; PostgreSQL says so rather than passing silently,
+                    ;; and its regression files record the notice.
+                    (params/notice! "NOTICE" (str "table \"" table "\" does not exist, skipping"))
+                    (throw (ex-info (str "table \"" table "\" does not exist")
+                                    {:error :undefined-table :sqlstate "42P01"
+                                     :table table})))))
             _ (doseq [table tables
                       child (map first
                                  (d/q '{:find [?child]
@@ -10078,7 +10107,9 @@
                              (:datahike.pg.object/oid object))))]
         (cond
           (and (nil? seq-eid) (nil? object) (:if-exists? parsed))
-          (empty-result "DROP SEQUENCE")
+          (do (params/notice! "NOTICE" (str "sequence \"" (:seq-name parsed)
+                                            "\" does not exist, skipping"))
+              (empty-result "DROP SEQUENCE"))
 
           (and object (not= :sequence (:datahike.pg.object/kind object)))
           (throw (ex-info (str "\"" seq-name "\" is not a sequence")
@@ -11968,17 +11999,41 @@
 ;; Server lifecycle
 ;; ============================================================================
 
+(defn- ->wire-notice
+  ^PgWireServer$Notice [{:keys [severity sqlstate message fields]}]
+  (PgWireServer$Notice. severity (or sqlstate "00000") (str message)
+                        (when (seq fields)
+                          (java.util.HashMap. ^java.util.Map
+                           (into {} (map (fn [[k v]] [(name k) (str v)])) fields)))))
+
+(defn- collecting-notices
+  "Run `f` with a notice collector in scope and hang whatever it recorded
+   on the QueryResult it returns. The wire layer emits one
+   NoticeResponse each, ahead of the statement's own response.
+
+   One seam for every entry point that runs a statement, so a notice
+   raised deep in translation or execution reaches the client without
+   each site knowing how."
+  [f]
+  (let [acc (atom [])
+        result (binding [params/*notices* acc] (f))]
+    (when (and (instance? PgWireServer$QueryResult result) (seq @acc))
+      (set! (.-notices ^PgWireServer$QueryResult result)
+            (java.util.ArrayList. ^java.util.Collection (mapv ->wire-notice @acc))))
+    result))
+
 (defn- scoped-handler
   "`handler`, every call made with Datahike resolving query symbols through
-   `datahike.pg.resolve/symbol-resolver`."
+   `datahike.pg.resolve/symbol-resolver`, and every statement run with a
+   notice collector in scope."
   ^PgWireServer$QueryHandler [^PgWireServer$QueryHandler h]
   (reify PgWireServer$QueryHandler
-    (execute [_ sql] (pg-resolve/with-symbol-resolver (.execute h sql)))
-    (executeInGroup [_ sql] (pg-resolve/with-symbol-resolver (.executeInGroup h sql)))
+    (execute [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.execute h sql))))
+    (executeInGroup [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.executeInGroup h sql))))
     (parse [_ sql oids] (pg-resolve/with-symbol-resolver (.parse h sql oids)))
     (describeParams [_ parsed] (pg-resolve/with-symbol-resolver (.describeParams h parsed)))
     (describeResult [_ parsed] (pg-resolve/with-symbol-resolver (.describeResult h parsed)))
-    (executePrepared [_ parsed params] (pg-resolve/with-symbol-resolver (.executePrepared h parsed params)))
+    (executePrepared [_ parsed params] (collecting-notices #(pg-resolve/with-symbol-resolver (.executePrepared h parsed params))))
     (planCacheToken [_] (pg-resolve/with-symbol-resolver (.planCacheToken h)))
     (markTransactionFailed [_] (pg-resolve/with-symbol-resolver (.markTransactionFailed h)))
     (close [_] (pg-resolve/with-symbol-resolver (.close h)))

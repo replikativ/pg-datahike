@@ -557,6 +557,24 @@ public final class PgWireServer {
     /**
      * Result of a SQL query execution.
      */
+    /** One NoticeResponse: what PostgreSQL emits for NOTICE / WARNING / INFO. */
+    public static final class Notice {
+        public final String severity;   // NOTICE, WARNING, INFO, DEBUG, LOG
+        public final String sqlstate;   // "00000" for a plain notice
+        public final String message;
+        public final java.util.Map<String, String> fields;  // D/H/… as for an error
+
+        public Notice(String severity, String sqlstate, String message,
+                      java.util.Map<String, String> fields) {
+            this.severity = severity;
+            this.sqlstate = sqlstate == null ? "00000" : sqlstate;
+            this.message = message;
+            this.fields = fields;
+        }
+
+        public Notice(String severity, String message) { this(severity, "00000", message, null); }
+    }
+
     public static final class QueryResult {
         public final String[] columnNames;
         public final int[] columnOids;
@@ -641,6 +659,18 @@ public final class PgWireServer {
          * CommandComplete (no rows, no copyInMode, no error).
          */
         public boolean batchable;
+        /**
+         * NoticeResponse messages this statement produced, in order.
+         * PostgreSQL sends a notice as the statement runs, so these go
+         * out BEFORE RowDescription / CommandComplete. Each entry is
+         * {severity, SQLSTATE, message, extras} -- the same shape
+         * ErrorResponse takes, because on the wire a NoticeResponse is
+         * an ErrorResponse with a different type byte.
+         *
+         * A notice is not an error: it does not abort the statement and
+         * does not put the transaction in the failed state.
+         */
+        public java.util.List<Notice> notices;
         /**
          * Opaque per-statement payload appended to the connection's
          * pending-batch buffer when {@link #batchable} is set. The
@@ -1740,6 +1770,12 @@ public final class PgWireServer {
                     txStatus[0] = result.txStatus;
                 }
 
+                // PostgreSQL emits a notice as the statement runs, so it
+                // precedes RowDescription / CommandComplete -- and it
+                // precedes ErrorResponse too, since a statement can warn
+                // and then fail.
+                sendNotices(out, result);
+
                 if (result.error != null) {
                     sendError(out, "ERROR",
                             result.sqlstate != null ? result.sqlstate : "XX000",
@@ -2444,6 +2480,12 @@ public final class PgWireServer {
             txStatus[0] = result.txStatus;
         }
 
+        // Notices go into the CURRENT buffer, not straight to the socket:
+        // a held statement's CommandComplete is drained from it at Sync,
+        // so writing to `out` here would put this statement's notice
+        // ahead of an earlier statement's response.
+        sendNotices(extBatch.curOut, result);
+
         if (result == null) {
             // Shouldn't happen — handler contract returns a QueryResult.
             // Treat as a non-batchable boundary: drain held + cur, then
@@ -2954,8 +2996,30 @@ public final class PgWireServer {
      */
     private void sendError(DataOutputStream out, String severity, String code, String message,
                            java.util.Map<String, String> extras) throws IOException {
+        sendNoticeOrError(out, (byte) 'E', severity, code, message, extras);
+    }
+
+    /**
+     * Send a NoticeResponse. Identical to ErrorResponse on the wire
+     * except for the type byte, and unlike an error it neither aborts
+     * the statement nor marks the transaction failed.
+     */
+    private void sendNotice(DataOutputStream out, Notice n) throws IOException {
+        sendNoticeOrError(out, (byte) 'N', n.severity, n.sqlstate, n.message, n.fields);
+    }
+
+    private void sendNotices(DataOutputStream out, QueryResult r) throws IOException {
+        if (r != null && r.notices != null) {
+            for (Notice n : r.notices) sendNotice(out, n);
+        }
+    }
+
+    private void sendNoticeOrError(DataOutputStream out, byte typeByte,
+                                   String severity, String code, String message,
+                                   java.util.Map<String, String> extras) throws IOException {
         if (WIRE_TRACE) {
-            trace("send ERROR severity=" + severity + " code=" + code
+            trace("send " + (typeByte == (byte) 'N' ? "NOTICE" : "ERROR")
+                  + " severity=" + severity + " code=" + code
                   + " msg=" + message + (extras == null ? "" : " extras=" + extras));
         }
 
@@ -2985,7 +3049,7 @@ public final class PgWireServer {
         for (byte[] b : fieldBytes) bodyLen += 1 + b.length + 1;
         bodyLen += 1;  // trailing zero byte
 
-        out.writeByte('E');
+        out.writeByte(typeByte);
         out.writeInt(4 + bodyLen);
         for (int i = 0; i < fieldCodes.size(); i++) {
             out.writeByte(fieldCodes.get(i));
