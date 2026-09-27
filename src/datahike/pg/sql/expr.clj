@@ -705,9 +705,18 @@
                      (when (> params/*routine-depth* 32)
                        (throw (ex-info "stack depth limit exceeded"
                                        {:sqlstate "54001" :error :stack-depth})))
-                     (let [{:keys [value]} (pl-exec/run-body
-                                            handler ast (concat positional named)
-                                            false type-map)]
+                     (let [{:keys [value]}
+                           (try
+                             (pl-exec/run-body handler ast (concat positional named)
+                                               false type-map)
+                             (catch clojure.lang.ExceptionInfo e
+                               ;; Mark it as the body's own error so the
+                               ;; fast lane reports it rather than
+                               ;; re-running the statement to find out.
+                               (throw (ex-info (ex-message e)
+                                               (assoc (ex-data e)
+                                                      params/routine-error-key true)
+                                               (ex-cause e)))))]
                        (cond
                          ;; `void` is the empty string in PostgreSQL's
                          ;; output, not NULL.
@@ -6162,33 +6171,6 @@
       (and (nil? (.getGroupBy inner)) (.getHaving inner)) (unsupported "HAVING without GROUP BY")
       :else nil)))
 
-(defn- plpgsql-var-key
-  "The key a column reference looks up in the variable scope: its bare
-   name, or `record.field` when it is qualified -- a FOR loop's single
-   target over a multi-column query is a record, and `r.i` is how its
-   fields are read."
-  [^Column col-expr]
-  (let [col (str/lower-case (unquote-ident (.getColumnName col-expr)))]
-    (if-let [t (.getTable col-expr)]
-      (str (str/lower-case (unquote-ident (.getName ^Table t))) "." col)
-      col)))
-
-(defn- plpgsql-var?
-  "Whether this column reference names a plpgsql variable in scope."
-  [^Column col-expr]
-  (boolean
-   (and params/*plpgsql-vars*
-        (contains? params/*plpgsql-vars* (plpgsql-var-key col-expr)))))
-
-(defn- plpgsql-var-value!
-  "The variable's value. Reading one makes the plan specific to it, so
-   the statement is marked session-dependent and stays out of the shared
-   plan cache -- otherwise `x + 1` inside a loop would be cached on the
-   first iteration and answer its value for every later one."
-  [^Column col-expr]
-  (params/session-dependent!)
-  (get params/*plpgsql-vars* (plpgsql-var-key col-expr)))
-
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
    Returns a Datalog-compatible value or variable symbol."
@@ -6320,14 +6302,6 @@
         ;; PostgreSQL's 42703 / 42P01. It used to resolve against the
         ;; whole schema -- `SELECT foo` answered no rows, and `SELECT t.x`
         ;; quietly added t to the query (the long-gone add_missing_from).
-        ;; Nothing in scope to resolve against. Inside a plpgsql body a
-        ;; bare name is a variable of the function -- checked here, so a
-        ;; real column always wins, which is PostgreSQL's default
-        ;; conflict resolution.
-        (and (nil? (:default-table ctx)) (empty? (:table-aliases ctx))
-             (plpgsql-var? col-expr))
-        (plpgsql-var-value! col-expr)
-
         (and (nil? (:default-table ctx)) (empty? (:table-aliases ctx)))
         (let [col (unquote-ident (.getColumnName col-expr))]
           (if tbl
@@ -6343,20 +6317,12 @@
                             {:error :undefined-column :sqlstate "42703" :column col}))))
 
         :else
-        (if-let [resolved (try
-                            (ctx/resolve-column expr
-                                                (:table-aliases ctx)
-                                                (:default-table ctx)
-                                                (:col-overrides ctx)
-                                                (:derived-aliases ctx) (:ci-index ctx))
-                            (catch Exception e
-                              ;; A name that resolves to no column may
-                              ;; still be a plpgsql variable; anything
-                              ;; else re-raises below.
-                              (when-not (plpgsql-var? col-expr) (throw e))
-                              nil))]
-          (column-value! ctx resolved)
-          (plpgsql-var-value! col-expr))))
+        (let [resolved (ctx/resolve-column expr
+                                           (:table-aliases ctx)
+                                           (:default-table ctx)
+                                           (:col-overrides ctx)
+                                           (:derived-aliases ctx) (:ci-index ctx))]
+          (column-value! ctx resolved))))
 
     (instance? AllColumns expr)
     :*

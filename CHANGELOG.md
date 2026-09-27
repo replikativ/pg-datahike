@@ -24,6 +24,31 @@ One notice per missing name, as PostgreSQL emits. The function wording is not a 
 
 `drop_if_exists` goes from 65% to 69% of PostgreSQL's expected output.
 
+### A plpgsql body plans once, not once per call
+
+A statement inside a function body resolved its variables to their VALUES while it was translated, which made the plan specific to those values, so it could not be cached and every execution re-translated. Measured over 200 rows: a body reading one variable cost **11ms a call**, one reading none **0.3ms** — a 35x gap with nothing else different.
+
+A variable now reaches an embedded statement as a **parameter**: its references are rewritten to `$n` and the values are bound per call, which is how PostgreSQL does it. Variables no longer reach the translator at all, so `*plpgsql-vars*`, both of its arms in the expression translator and the `session-dependent!` marking are gone — this is net less code, and it removes the collision class with the literal→`$N` rewrite that caused `SELECT 0` inside a body to answer the function's first argument.
+
+Two caches on top: the parsed plan, per outer statement (handing `executePrepared` a fresh parse costs 1.5ms against 0.55ms for a reused one), and the rewrite itself, which depends only on the variable NAMES and so is shared by every call and every loop iteration.
+
+| | before | after |
+|---|---|---|
+| a one-statement body, 200 calls | 2180 ms | **367 ms** |
+| a 500-iteration loop (1000 nested statements) | — | **525 ms** (0.53 ms each) |
+
+That is 5.9x, and the loop now runs at the measured floor for executing a prepared statement at all.
+
+A plan is only reused while the snapshot it was translated against still describes the database, so the cache is dropped after any statement that is not a `SELECT`.
+
+### An error inside the compiled fast lane no longer runs the statement twice
+
+`fast-select-prepared` returned nil on **any** exception, which sends the statement down the full path — running it again. For a plpgsql body that raises, the rerun repeats the body's side effects on the way to reporting the same error, and in a recursive call it cost exactly **2^depth** body executions: a runaway recursion took 83 seconds to reach depth 15 and never reached the depth limit at all.
+
+An error that escaped a routine body is now rethrown rather than retried. Only that case: the two lanes do word some PostgreSQL errors differently, and the fallback is load-bearing there — six correlated-subquery expectations and the `unsafe use of new value` enum message all depend on the full path's wording, which is how the narrower rule was found.
+
+Runaway recursion now reports `stack depth limit exceeded` in 0.6 seconds.
+
 ### plpgsql
 
 `CREATE FUNCTION … LANGUAGE plpgsql` was a silent no-op. Bodies are parsed and run now.
