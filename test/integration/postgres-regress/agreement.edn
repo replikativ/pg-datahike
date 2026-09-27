@@ -25,10 +25,7 @@
   "char" 79.4
   "circle" 33.0
   "collate" 81.4
-  "collate.icu.utf8" 63.6
-  "collate.linux.utf8" 77.9
   "collate.utf8" 81.3
-  "collate.windows.win1252" 80.3
   "comments" 93.8
   "compression_lz4" 59.8
   "compression_pglz" 66.2

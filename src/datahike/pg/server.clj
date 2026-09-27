@@ -5936,6 +5936,7 @@
     :ddl-create-composite :ddl-create-domain :ddl-drop-domain
     :ddl-create-function :ddl-drop-function
     :ddl-create-trigger :ddl-drop-trigger
+    :ddl-create-role :ddl-drop-role
     ;; Ordinary B-tree CREATE INDEX remains a transaction-compatible
     ;; compatibility declaration. Materialized secondary methods reject a
     ;; buffered/explicit transaction at their narrower execution boundary.
@@ -6768,6 +6769,13 @@
       :schema-noop
       ;; CREATE / DROP / ALTER SCHEMA — classify :tag already
       ;; encodes the full "CREATE SCHEMA" / "DROP SCHEMA" / etc.
+      (empty-result (:tag parsed))
+
+      :privilege-noop
+      ;; GRANT / REVOKE. One login identity, no privilege enforcement:
+      ;; `has_*_privilege` already answers `true` for everything, so
+      ;; accepting these is the same model stated once rather than
+      ;; twice in contradiction.
       (empty-result (:tag parsed))
 
       :owner-noop
@@ -8750,6 +8758,74 @@
                              " is not supported")
                :detail "The body parses; this server cannot run that construct yet."})))
     ast))
+
+(defn- exec-ddl-create-role
+  "CREATE ROLE / USER / GROUP.
+
+   The role becomes a real object -- `pg_roles` lists it, `\\du` shows
+   it, an owner can name it -- but its options do not: this server has
+   one login identity and enforces no privileges, so SUPERUSER,
+   NOLOGIN and the rest are read and discarded rather than recorded as
+   something nothing honours."
+  [ctx parsed]
+  (let [{:keys [conn tx-state session-id]} ctx
+        names (:roles parsed)]
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
+    (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+          existing (set (map first (d/q '{:find [?n]
+                                          :where [[?e :datahike.pg.role/name ?n]]}
+                                        db)))]
+      (if-let [dup (first (filter existing names))]
+        (classified-error "" (ex-info (str "role \"" dup "\" already exists")
+                                      {:error :duplicate-object :sqlstate "42710"}))
+        (let [{:keys [oids tx-data]} (catalog-objects/reserve-user-oids-tx db (count names))
+              create-data
+              (into (vec tx-data)
+                    (concat
+                     [{:db/ident :datahike.pg.role/name
+                       :db/valueType :db.type/string
+                       :db/cardinality :db.cardinality/one
+                       :db/unique :db.unique/identity}
+                      {:db/ident :datahike.pg.role/oid
+                       :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}]
+                     (map (fn [nm oid] {:datahike.pg.role/name nm
+                                        :datahike.pg.role/oid oid})
+                          names oids)))]
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state create-data (:tag parsed))
+            (let [outcome (try (transact-recorded! conn create-data) :committed
+                               (catch Exception e e))]
+              (if (= :committed outcome)
+                (empty-result (:tag parsed))
+                (classified-error "CREATE ROLE error: " outcome)))))))))
+
+(defn- exec-ddl-drop-role [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        names (:roles parsed)
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        found (into {} (d/q '{:find [?n ?e]
+                              :where [[?e :datahike.pg.role/name ?n]]}
+                            db))
+        missing (remove found names)]
+    (cond
+      (and (seq missing) (not (:if-exists? parsed)))
+      (classified-error "" (ex-info (str "role \"" (first missing) "\" does not exist")
+                                    {:error :undefined-object :sqlstate "42704"}))
+
+      :else
+      (do
+        (doseq [m missing]
+          (params/notice! "NOTICE" (str "role \"" m "\" does not exist, skipping")))
+        (let [tx-data (mapv (fn [n] [:db/retractEntity (found n)]) (filter found names))]
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state tx-data (:tag parsed))
+            (let [outcome (try (when (seq tx-data) (transact-recorded! conn tx-data))
+                               :committed
+                               (catch Exception e e))]
+              (if (= :committed outcome)
+                (empty-result (:tag parsed))
+                (classified-error "DROP ROLE error: " outcome)))))))))
 
 (defn- trigger-key [table trigger-name]
   (str table "." trigger-name))
@@ -12574,6 +12650,10 @@
                                                       tx-state #(exec-ddl-create-sequence ctx parsed))
                               :ddl-alter-sequence    (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-alter-sequence ctx parsed))
+                              :ddl-create-role       (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-role ctx parsed))
+                              :ddl-drop-role         (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop-role ctx parsed))
                               :ddl-create-trigger    (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create-trigger ctx parsed))
                               :ddl-drop-trigger      (execute-ddl-invalidating

@@ -24,6 +24,24 @@ One notice per missing name, as PostgreSQL emits. The function wording is not a 
 
 `drop_if_exists` goes from 65% to 69% of PostgreSQL's expected output.
 
+### Roles, the encoding functions, and GRANT
+
+Four things the regression residual named as the first thing blocking a file.
+
+**`getdatabaseencoding()` and `pg_client_encoding()`.** PostgreSQL's `collate.*` and `copyencoding` tests open by asking the encoding and skip themselves when it is not UTF8; being unable to answer failed the very first statement.
+
+**A role is a real object.** `CREATE`/`DROP ROLE | USER | GROUP`, with `IF EXISTS`, several names at once, `42710` for a duplicate and `42704` for a missing one, the notice for a skipped drop, and a row in `pg_roles`. PostgreSQL's command tags are echoed as it echoes them — `CREATE USER` answers `CREATE ROLE`, but `DROP USER` answers `DROP USER`. Role *options* are read and discarded rather than recorded: this server has one login identity and enforces no privileges, so storing `SUPERUSER` or `NOLOGIN` would be a claim nothing honours.
+
+**`GRANT` is accepted; `REVOKE` is not.** Everything is already permitted here — `has_table_privilege` and its relatives answer `true` unconditionally — so granting more permits nothing new and the statement is honestly a no-op. `REVOKE` is different in kind: it claims to take access away, and a caller told it succeeded has been told something false about who can read their data. Refusing is loud and safe. PostgreSQL's own `privileges` test prints 192 `permission denied` lines this server cannot produce, which is the measure of what a silent `REVOKE` would hide. `privileges` goes from 0% to 67% on the strength of `GRANT` alone.
+
+**`point(x, y)`.** A point *literal* already worked; only the constructor was missing. float8, so `point(1.0,2.0)` prints `(1,2)`.
+
+### Three regression files are environment-conditional
+
+`collate.icu.utf8` needs ICU collations compiled into the server and the other two need a specific operating system's locales; PostgreSQL schedules them conditionally for that reason. Answering them correctly means running their own skip test and quitting, which reproduces almost none of an expected output recorded on a server that did not skip — `collate.icu.utf8` went from 63.6% to 0.2% precisely *because* the encoding function started working. They are out of scope now, which leaves 176 application-facing files.
+
+The gate also recycles the server every 30 files: the harness bootstraps a database per file and the server keeps them, so a full run had grown it to 7GB and starved the machine.
+
 ### An impossible date is rejected, not rolled
 
 `'1997-13-01'::date` answered the string `1997-13-01` — a date with a thirteenth month — and `'1997-04-31'` quietly became the 30th, `'1997-02-29'` the 28th. Both are now `22008 date/time field value out of range`, as in PostgreSQL, and text that is not a date at all is `22007`.

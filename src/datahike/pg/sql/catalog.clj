@@ -1233,12 +1233,33 @@
           :pg_namespace/nspowner pg-role-oid
           (pgs/row-marker-attr "pg_namespace") true}]))
     "pg_roles"
-    [{:pg_roles/oid pg-role-oid :pg_roles/rolname pg-role-name
-      :pg_roles/rolsuper true :pg_roles/rolinherit true
-      :pg_roles/rolcreaterole true :pg_roles/rolcreatedb true
-      :pg_roles/rolcanlogin true :pg_roles/rolreplication false
-      :pg_roles/rolbypassrls true :pg_roles/rolconnlimit -1
-      (pgs/row-marker-attr "pg_roles") true}]
+    ;; The handler's own role, plus every role `CREATE ROLE` made. They
+    ;; all read as superusers because this server enforces no
+    ;; privileges -- one login role, everything permitted -- and
+    ;; reporting anything else would be a claim the rest of the server
+    ;; does not honour.
+    (into [{:pg_roles/oid pg-role-oid :pg_roles/rolname pg-role-name
+            :pg_roles/rolsuper true :pg_roles/rolinherit true
+            :pg_roles/rolcreaterole true :pg_roles/rolcreatedb true
+            :pg_roles/rolcanlogin true :pg_roles/rolreplication false
+            :pg_roles/rolbypassrls true :pg_roles/rolconnlimit -1
+            (pgs/row-marker-attr "pg_roles") true}]
+          (map-indexed
+           (fn [i [nm oid]]
+             {:pg_roles/oid (or oid (+ 16384 i))
+              :pg_roles/rolname nm
+              :pg_roles/rolsuper true :pg_roles/rolinherit true
+              :pg_roles/rolcreaterole true :pg_roles/rolcreatedb true
+              :pg_roles/rolcanlogin true :pg_roles/rolreplication false
+              :pg_roles/rolbypassrls true :pg_roles/rolconnlimit -1
+              (pgs/row-marker-attr "pg_roles") true}))
+          ;; `cte-db` is the database this catalog is being materialised
+          ;; against; a bare translator caller may pass none.
+          (when cte-db
+            (sort (d/q '{:find [?n ?o]
+                         :where [[?e :datahike.pg.role/name ?n]
+                                 [?e :datahike.pg.role/oid ?o]]}
+                       cte-db))))
     "pg_database"
     ;; PG always ships with template0, template1, plus each real db.
     ;; Tools (pgjdbc's DatabaseMetaData tests, Odoo's boot, pg_dump) look
@@ -2184,6 +2205,8 @@
     ;; single-quoted string JSqlParser will not carry, so the whole
     ;; statement is token-classified and re-tagged in parse-sql.
     :create-function-sql :drop-function-sql
+    ;; CREATE / DROP ROLE | USER | GROUP -- JSqlParser parses none of them.
+    :create-role-object :drop-role-object :privilege-noop
     ;; CREATE / DROP TRIGGER -- JSqlParser cannot parse either.
     :create-trigger-plpgsql :drop-trigger-plpgsql
     ;; TRUNCATE (whole statement — JSqlParser's Truncate grammar lacks

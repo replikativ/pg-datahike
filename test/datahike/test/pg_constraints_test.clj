@@ -228,8 +228,14 @@
 ;; CT6 — GRANT / REVOKE / RLS rejected with 0A000
 ;; ============================================================================
 
-(deftest reject-grant-revoke
-  (is (err-contains? (run "GRANT SELECT ON t TO bob") "not supported"))
+(deftest grant-is-accepted-and-revoke-is-not
+  ;; Everything is already permitted here -- `has_*_privilege` answers
+  ;; `true` unconditionally -- so GRANT permits nothing new and is
+  ;; honestly a no-op.
+  (is (ok? (run "GRANT SELECT ON t TO bob")))
+  ;; REVOKE is different in kind: it claims to TAKE access away, and a
+  ;; caller that believes it has been told something false about who
+  ;; can read their data. Refusing is loud and safe.
   (is (err-contains? (run "REVOKE ALL ON t FROM bob") "not supported")))
 
 (deftest reject-row-level-security
@@ -288,7 +294,8 @@
   (testing "no opts ⇒ :strict ⇒ everything rejects"
     (let [[h & _ :as bundle] (fresh-handler nil)]
       (try
-        (is (str/includes? (:err (exec h "GRANT SELECT ON t TO bob")) "not supported"))
+        ;; GRANT is accepted under every preset now; CREATE EXTENSION
+        ;; still needs :permissive, which is what :strict means here.
         (is (str/includes? (:err (exec h "CREATE EXTENSION pg_trgm")) "not supported"))
         (finally (close-handler bundle))))))
 
