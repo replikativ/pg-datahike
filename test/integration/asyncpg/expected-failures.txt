@@ -49,7 +49,6 @@ tests/test_codecs.py::TestCodecs::test_custom_codec_override_tuple
 tests/test_codecs.py::TestCodecs::test_custom_codec_text
 tests/test_codecs.py::TestCodecs::test_domains
 tests/test_codecs.py::TestCodecs::test_enum_and_range
-tests/test_codecs.py::TestCodecs::test_enum_function_return
 tests/test_codecs.py::TestCodecs::test_enum_in_array
 tests/test_codecs.py::TestCodecs::test_enum_in_composite
 tests/test_codecs.py::TestCodecs::test_extra_codec_alias
