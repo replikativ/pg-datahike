@@ -2184,6 +2184,8 @@
     ;; single-quoted string JSqlParser will not carry, so the whole
     ;; statement is token-classified and re-tagged in parse-sql.
     :create-function-sql :drop-function-sql
+    ;; CREATE / DROP TRIGGER -- JSqlParser cannot parse either.
+    :create-trigger-plpgsql :drop-trigger-plpgsql
     ;; TRUNCATE (whole statement — JSqlParser's Truncate grammar lacks
     ;; RESTART/CONTINUE IDENTITY) and multi-name DROP TABLE (JSqlParser
     ;; 5.2 parses a single name only). Both re-tagged to non-:system
