@@ -414,6 +414,45 @@
       (< b 0x80) (str (char b))
       :else (format "\\%03o" b))))
 
+(def ^:private ymd-shape
+  "A date written as digits and separators -- the shape PostgreSQL calls
+   out of RANGE rather than bad SYNTAX when its fields do not make a
+   date."
+  #"(?i)^\d{1,6}-\d{1,2}-\d{1,2}(\s+(ad|bc))?$")
+
+(defn- parse-date-strict
+  "`yyyy-M-d`, with the fields checked rather than rolled.
+
+   The default resolver is SMART, which quietly moves 1997-04-31 to the
+   30th and 1997-02-29 to the 28th. PostgreSQL rejects both, and so
+   does STRICT -- which also needs `uuuu` (proleptic year) rather than
+   `yyyy` (year-of-era), so a `BC` date resolves instead of demanding
+   an era field."
+  [^String s]
+  (let [bc? (re-find #"(?i)\s+bc$" s)
+        body (str/trim (str/replace s #"(?i)\s+(ad|bc)$" ""))]
+    (try
+      (let [d (java.time.LocalDate/parse
+               body
+               (-> (java.time.format.DateTimeFormatterBuilder.)
+                   (.appendPattern "uuuu-M-d")
+                   (.toFormatter)
+                   (.withResolverStyle java.time.format.ResolverStyle/STRICT)))]
+        ;; PostgreSQL's 1 BC is the proleptic year 0, 2 BC is -1, and so
+        ;; on -- `2040-04-10 BC` is proleptic -2039.
+        (if bc? (.withYear d (- 1 (.getYear d))) d))
+      (catch Exception _ nil))))
+
+(defn- bad-date!
+  "PostgreSQL tells a date whose FIELDS are impossible (22008) from text
+   that is not a date at all (22007)."
+  [^String s]
+  (if (re-matches ymd-shape s)
+    (throw (ex-info (str "date/time field value out of range: \"" s "\"")
+                    {:error :datetime-field-overflow :sqlstate "22008"}))
+    (throw (ex-info (str "invalid input syntax for type date: \"" s "\"")
+                    {:error :invalid-datetime-format :sqlstate "22007"}))))
+
 (defn cast-scalar
   "Apply a SQL cast of `v` to the target named by `type-str`.
 
@@ -561,17 +600,23 @@
                 (.toLocalDate ^java.time.LocalDateTime v)
                 :else
                 (let [s (str/trim (str v))]
-                  (or (try (java.time.LocalDate/parse
-                            s (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
-                           (catch Exception _ nil))
-                      (try (java.time.LocalDate/parse (first (str/split s #"[ T]")))
-                           (catch Exception _ nil))
-                      (when parse-timestamp
-                        (let [d (parse-timestamp s)]
-                          (when (instance? java.util.Date d)
-                            (-> ^java.util.Date d .toInstant
-                                (.atZone java.time.ZoneOffset/UTC) .toLocalDate))))
-                      v)))
+                  (if (re-matches ymd-shape s)
+                    ;; A bare `y-m-d` is decided HERE and nowhere else.
+                    ;; Falling through to the timestamp parser is what
+                    ;; rolled 1997-04-31 to the 30th and 1997-02-29 to
+                    ;; the 28th: it is lenient, and PostgreSQL is not.
+                    (or (parse-date-strict s) (bad-date! s))
+                    (or (try (java.time.LocalDate/parse (first (str/split s #"[ T]")))
+                             (catch Exception _ nil))
+                        (when parse-timestamp
+                          (let [d (parse-timestamp s)]
+                            (when (instance? java.util.Date d)
+                              (-> ^java.util.Date d .toInstant
+                                  (.atZone java.time.ZoneOffset/UTC) .toLocalDate))))
+                        ;; Passing the text through was a silent wrong
+                        ;; answer: `'1997-13-01'::date` answered the
+                        ;; string `1997-13-01`, a thirteenth month.
+                        (bad-date! s)))))
 
         :time (let [timetz? (contains? #{"timetz" "time with time zone"}
                                        (types/base-type-name-of type-str))

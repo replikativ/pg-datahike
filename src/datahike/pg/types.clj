@@ -1538,21 +1538,31 @@
   ;; java.time's DayOfWeek is Monday=1; PostgreSQL prints the same names.
   ["Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"])
 
-(defn- date-parts [^java.time.LocalDate d]
-  [(format "%02d" (.getMonthValue d))
-   (format "%02d" (.getDayOfMonth d))
-   (format "%04d" (.getYear d))])
+(defn- date-parts
+  "Month, day and year as PostgreSQL prints them. The year is
+   YEAR-OF-ERA: `LocalDate` counts proleptically, where 1 BC is year 0
+   and 2 BC is -1, but PostgreSQL writes `0002-01-01 BC`. The era
+   suffix is returned alongside so every style can append it -- it goes
+   last in all of them."
+  [^java.time.LocalDate d]
+  (let [y (.getYear d)
+        bc? (< y 1)]
+    [(format "%02d" (.getMonthValue d))
+     (format "%02d" (.getDayOfMonth d))
+     (format "%04d" (if bc? (- 1 y) y))
+     (when bc? " BC")]))
 
 (defn date->pg-text
   "A date, in the session's DateStyle. `EncodeDateOnly` in datetime.c."
   ([d] (date->pg-text d *date-style*))
   ([^java.time.LocalDate d [style order]]
-   (let [[m dd y] (date-parts d)]
-     (case style
-       :iso      (str y "-" m "-" dd)
-       :postgres (if (= order :dmy) (str dd "-" m "-" y) (str m "-" dd "-" y))
-       :sql      (if (= order :dmy) (str dd "/" m "/" y) (str m "/" dd "/" y))
-       :german   (str dd "." m "." y)))))
+   (let [[m dd y era] (date-parts d)]
+     (str (case style
+            :iso      (str y "-" m "-" dd)
+            :postgres (if (= order :dmy) (str dd "-" m "-" y) (str m "-" dd "-" y))
+            :sql      (if (= order :dmy) (str dd "/" m "/" y) (str m "/" dd "/" y))
+            :german   (str dd "." m "." y))
+          era))))
 
 (defn timestamp->pg-text
   "A timestamp, in the session's DateStyle. `EncodeDateTime` in

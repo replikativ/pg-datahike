@@ -24,6 +24,26 @@ One notice per missing name, as PostgreSQL emits. The function wording is not a 
 
 `drop_if_exists` goes from 65% to 69% of PostgreSQL's expected output.
 
+### An impossible date is rejected, not rolled
+
+`'1997-13-01'::date` answered the string `1997-13-01` — a date with a thirteenth month — and `'1997-04-31'` quietly became the 30th, `'1997-02-29'` the 28th. Both are now `22008 date/time field value out of range`, as in PostgreSQL, and text that is not a date at all is `22007`.
+
+Two causes, both silent. `DateTimeFormatter` resolves SMART by default, which rolls an out-of-range field into the next month rather than refusing it; the cast now parses with `ResolverStyle/STRICT`. And when nothing could parse the text, the cast returned it unchanged — the passthrough `doc/consolidation-plan.md` lists for Phase 4 — so a date column ended up holding a string that is not a date.
+
+A `BC` date also keeps its era now, in and out: `LocalDate` counts proleptically, where 1 BC is year 0 and 2 BC is −1, while PostgreSQL writes the year of the era with a `BC` suffix.
+
+Found by re-measuring the regression corpus, which is what that measurement is for: `date` had dropped fifteen points.
+
+### A ratchet for the regression baseline
+
+`bb pg-regress-gate` measures every application-facing regression file and fails when one loses ground against `test/integration/postgres-regress/agreement.edn`; `bb pg-regress-measure` rewrites the manifest after a genuine gain.
+
+Agreement is the share of PostgreSQL's expected lines that appear, in order, in ours — `pg_regress` fails a file on any difference, so a pass rate would read zero and say nothing.
+
+The gate has a 3-point tolerance, and that is not slack for regressions: a file whose output is mostly cascade realigns by a point or two whenever anything ahead of its first divergence changes, in either direction. A real regression is several points, or a file dropping off 100%. It also fails when a file stops being measurable at all.
+
+It is deliberately **not** in per-PR CI — all 179 files take about ninety minutes, which would cost more than it catches given that the fuzzer and the unit suite already run there in minutes.
+
 ### Triggers, on the BEFORE ROW INSERT path
 
 `CREATE TRIGGER` was a silent no-op. Triggers are stored, fired and dropped now.

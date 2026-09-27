@@ -49,6 +49,12 @@
                             :task (apply shell "bash test/integration/postgres-regress/run-with-api-fixtures.sh"
                                          *command-line-args*)}
 
+  pg-regress-measure {:doc "Re-measure per-file agreement against PostgreSQL's expected output and rewrite agreement.edn."
+                      :task (shell "bash test/integration/postgres-regress/agreement.sh measure")}
+
+  pg-regress-gate {:doc "Measure per-file agreement and fail if any file lost ground against agreement.edn."
+                   :task (shell "bash test/integration/postgres-regress/agreement.sh gate")}
+
   pg-regress-wave {:doc "List/run a PostgreSQL compatibility wave or its inventory. Usage: bb pg-regress-wave [inventory|WAVE [MODE]]."
                    :task (apply shell "bb test/integration/postgres-regress/campaign.clj"
                                 *command-line-args*)}

@@ -163,3 +163,36 @@
       (is (= "Wed Jan 01 10:00:00 2020" (one c "SELECT ts FROM ev WHERE id = 1")))
       (exec! c "RESET DateStyle"))))
 
+(defn- err-of [^Connection c sql]
+  (try (one c sql) nil
+       (catch java.sql.SQLException e [(.getSQLState e) (.getMessage e)])))
+
+(deftest an-impossible-date-is-rejected-not-rolled
+  ;; `DateTimeFormatter` resolves SMART by default, which quietly moves
+  ;; 1997-04-31 to the 30th and 1997-02-29 to the 28th. PostgreSQL
+  ;; rejects both. Worse, a date whose fields could not be resolved at
+  ;; all fell through the cast's passthrough and came back as its own
+  ;; text -- `'1997-13-01'::date` answered the string `1997-13-01`, a
+  ;; date with a thirteenth month.
+  (with-open [c (jdbc)]
+    (doseq [s ["1997-02-29" "1997-04-31" "1997-13-01" "1997-00-01" "1997-01-32"]]
+      (let [[state msg] (err-of c (str "SELECT '" s "'::date"))]
+        (is (= "22008" state) (str s " => " msg))
+        (is (re-find (re-pattern (str "date/time field value out of range: \"" s "\"")) (str msg)))))
+    (testing "a real date, and a real leap day, still parse"
+      (is (= "1997-02-28" (one c "SELECT '1997-02-28'::date")))
+      (is (= "2000-02-29" (one c "SELECT '2000-02-29'::date")))
+      (is (= "2024-02-29" (one c "SELECT '2024-02-29'::date"))))
+    (testing "text that is not a date at all is 22007, not 22008"
+      (is (= "22007" (first (err-of c "SELECT 'garbage'::date")))))))
+
+(deftest a-bc-date-keeps-its-era
+  ;; LocalDate counts proleptically -- 1 BC is year 0, 2 BC is -1 --
+  ;; while PostgreSQL writes the year of the era and a BC suffix. The
+  ;; era was being dropped on the way in and on the way out.
+  (with-open [c (jdbc)]
+    (is (= "2040-04-10 BC" (one c "SELECT '2040-04-10 BC'::date")))
+    (is (= "0001-01-01 BC" (one c "SELECT '0001-01-01 BC'::date")))
+    (testing "and AD is the default, written without a suffix"
+      (is (= "2040-04-10" (one c "SELECT '2040-04-10 AD'::date")))
+      (is (= "2040-04-10" (one c "SELECT '2040-04-10'::date"))))))
