@@ -2,7 +2,8 @@
 {:lint-as
  {datahike.test.pg-wire-jdbc-test/with-conn clojure.core/let
   datahike.test.pg-constraints-test/with-test-db clojure.core/with-open
-  datahike.test.pg-sql-function-test/with-h clojure.core/with-open}
+  datahike.test.pg-sql-function-test/with-h clojure.core/with-open
+  datahike.test.pg-plpgsql-test/with-h clojure.core/with-open}
 
  :config-in-ns
  {;; Integration-test fixtures intentionally use `defn ^:private` + unused

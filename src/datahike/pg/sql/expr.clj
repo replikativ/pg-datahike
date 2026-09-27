@@ -58,6 +58,8 @@
             [datahike.pg.input :as input]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.plpgsql.parse :as pl-parse]
+            [datahike.pg.plpgsql.exec :as pl-exec]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.rewrite :as rw]
@@ -622,6 +624,114 @@
         (if (:datahike.pg.function/strict? fn-ent)
           (strict-null-guard ctx values result)
           result)))))
+
+(def ^:private plpgsql-ast-cache
+  "Parsed bodies, by source. A body is parsed once per definition
+   rather than once per row."
+  (atom {}))
+
+(defn- plpgsql-ast [^String body]
+  (or (get @plpgsql-ast-cache body)
+      (let [ast (pl-parse/parse-body body)]
+        (swap! plpgsql-ast-cache assoc body ast)
+        ast)))
+
+(defn call-plpgsql-function
+  "A plpgsql function called in an expression.
+
+   plpgsql cannot be inlined: it is imperative, so there is no
+   expression to substitute. It is CALLED, once per row, which is what
+   PostgreSQL does too -- and why a plpgsql function in a WHERE clause
+   is expensive there as well.
+
+   The call is a runtime function clause: the arguments are translated
+   normally, and the closure runs the body against the handler of the
+   statement that reached here, so the body sees the same transaction."
+  [ctx fn-ent arg-exprs]
+  (let [fname (:datahike.pg.function/name fn-ent)
+        body (:datahike.pg.function/body fn-ent)
+        arg-names (read-string (:datahike.pg.function/arg-names fn-ent))
+        arg-types (read-string (:datahike.pg.function/arg-types fn-ent))
+        strict? (:datahike.pg.function/strict? fn-ent)
+        return-type (:type (read-string (:datahike.pg.function/return-type fn-ent)))
+        void? (= "void" return-type)
+        ;; A parameter is typed by its declaration, by name and by $n.
+        type-map (into {} (mapcat (fn [i nm t]
+                                    (cond-> [[(pl-parse/positional-name (inc i)) t]]
+                                      nm (conj [(str/lower-case nm) t])))
+                                  (range) arg-names arg-types))
+        ast (plpgsql-ast body)
+        ;; An argument that translates to a nested form has to become a
+        ;; variable of its own: Datalog takes a variable or a constant
+        ;; as a predicate argument, not another form. `f(1+1)` said
+        ;; "Nested expression forms are not supported" without this.
+        values (mapv (fn [e]
+                       (let [v (translate-expr ctx e)]
+                         (if (seq? v) (ctx/materialize-arg! ctx v) v)))
+                     arg-exprs)
+        handler params/*statement-handler*
+        _ (when-not handler
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message (str "plpgsql function \"" fname
+                                   "\" cannot run in this context")})))
+        call (fn [& args]
+               (if (and strict? (some #(or (nil? %) (fns/sql-null? %)) args))
+                 :__null__
+                 (let [named (map-indexed
+                              (fn [i v]
+                                [(or (nth arg-names i nil)
+                                     (pl-parse/positional-name (inc i)))
+                                 (when-not (fns/sql-null? v) v)])
+                              args)
+                       ;; A parameter is reachable positionally whether
+                       ;; or not it was named, as `$n` is in PostgreSQL;
+                       ;; the parser has renamed those references.
+                       positional (map-indexed
+                                   (fn [i v] [(pl-parse/positional-name (inc i))
+                                              (when-not (fns/sql-null? v) v)])
+                                   args)]
+                   ;; The depth is read HERE, not captured when the
+                   ;; statement was translated: a recursive call
+                   ;; re-enters translation, and a captured 0 meant
+                   ;; every level bound 1 and the guard never fired.
+                   ;;
+                   ;; 32 rather than PostgreSQL's much larger effective
+                   ;; limit: a level here is a whole parse, translation
+                   ;; and query execution, so it costs a few hundred JVM
+                   ;; frames. At 100 the JVM stack went first, and the
+                   ;; connection died instead of reporting 54001.
+                   (binding [params/*routine-depth* (inc params/*routine-depth*)]
+                     (when (> params/*routine-depth* 32)
+                       (throw (ex-info "stack depth limit exceeded"
+                                       {:sqlstate "54001" :error :stack-depth})))
+                     (let [{:keys [value]} (pl-exec/run-body
+                                            handler ast (concat positional named)
+                                            false type-map)]
+                       (cond
+                         ;; `void` is the empty string in PostgreSQL's
+                         ;; output, not NULL.
+                         void? ""
+                         (nil? value) :__null__
+                         ;; A statement gives its result back as TEXT, so
+                         ;; the body's answer arrives as a string. It has
+                         ;; to come back in the function's DECLARED type
+                         ;; or the caller cannot compute with it:
+                         ;; `2 * f(1)` was a ClassCastException.
+                         (string? value)
+                         (try (sql-cast/cast-scalar value return-type {})
+                              (catch Exception _ value))
+                         :else value))))))
+        fn-param (symbol (str "?pg-plpgsql" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)]
+    ;; Its value depends on the database at call time, so the plan is
+    ;; not shared: a body that reads a table must not answer from a plan
+    ;; cached before the table changed.
+    (params/session-dependent!)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj call)
+    (swap! (:where-clauses ctx) conj [(apply list fn-param values) result-var])
+    result-var))
 
 (defn undefined-function!
   "Raise the 42883 PostgreSQL raises for a call it cannot resolve, with
@@ -2532,10 +2642,11 @@
       ;; name, which name+arity resolution cannot do safely.
       (user-sql-function (:db ctx) fname (count arg-exprs)
                          (call-arg-oids ctx arg-exprs))
-      (inline-sql-function ctx
-                           (user-sql-function (:db ctx) fname (count arg-exprs)
-                                              (call-arg-oids ctx arg-exprs))
-                           arg-exprs)
+      (let [ent (user-sql-function (:db ctx) fname (count arg-exprs)
+                                   (call-arg-oids ctx arg-exprs))]
+        (if (= "plpgsql" (:datahike.pg.function/language ent))
+          (call-plpgsql-function ctx ent arg-exprs)
+          (inline-sql-function ctx ent arg-exprs)))
 
       ;; A SQL client names the functions the catalog has; every other
       ;; name is 42883, worded as ParseFuncOrColumn words it.
@@ -6051,6 +6162,33 @@
       (and (nil? (.getGroupBy inner)) (.getHaving inner)) (unsupported "HAVING without GROUP BY")
       :else nil)))
 
+(defn- plpgsql-var-key
+  "The key a column reference looks up in the variable scope: its bare
+   name, or `record.field` when it is qualified -- a FOR loop's single
+   target over a multi-column query is a record, and `r.i` is how its
+   fields are read."
+  [^Column col-expr]
+  (let [col (str/lower-case (unquote-ident (.getColumnName col-expr)))]
+    (if-let [t (.getTable col-expr)]
+      (str (str/lower-case (unquote-ident (.getName ^Table t))) "." col)
+      col)))
+
+(defn- plpgsql-var?
+  "Whether this column reference names a plpgsql variable in scope."
+  [^Column col-expr]
+  (boolean
+   (and params/*plpgsql-vars*
+        (contains? params/*plpgsql-vars* (plpgsql-var-key col-expr)))))
+
+(defn- plpgsql-var-value!
+  "The variable's value. Reading one makes the plan specific to it, so
+   the statement is marked session-dependent and stays out of the shared
+   plan cache -- otherwise `x + 1` inside a loop would be cached on the
+   first iteration and answer its value for every later one."
+  [^Column col-expr]
+  (params/session-dependent!)
+  (get params/*plpgsql-vars* (plpgsql-var-key col-expr)))
+
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
    Returns a Datalog-compatible value or variable symbol."
@@ -6182,6 +6320,14 @@
         ;; PostgreSQL's 42703 / 42P01. It used to resolve against the
         ;; whole schema -- `SELECT foo` answered no rows, and `SELECT t.x`
         ;; quietly added t to the query (the long-gone add_missing_from).
+        ;; Nothing in scope to resolve against. Inside a plpgsql body a
+        ;; bare name is a variable of the function -- checked here, so a
+        ;; real column always wins, which is PostgreSQL's default
+        ;; conflict resolution.
+        (and (nil? (:default-table ctx)) (empty? (:table-aliases ctx))
+             (plpgsql-var? col-expr))
+        (plpgsql-var-value! col-expr)
+
         (and (nil? (:default-table ctx)) (empty? (:table-aliases ctx)))
         (let [col (unquote-ident (.getColumnName col-expr))]
           (if tbl
@@ -6197,12 +6343,20 @@
                             {:error :undefined-column :sqlstate "42703" :column col}))))
 
         :else
-        (let [resolved (ctx/resolve-column expr
-                                           (:table-aliases ctx)
-                                           (:default-table ctx)
-                                           (:col-overrides ctx)
-                                           (:derived-aliases ctx) (:ci-index ctx))]
-          (column-value! ctx resolved))))
+        (if-let [resolved (try
+                            (ctx/resolve-column expr
+                                                (:table-aliases ctx)
+                                                (:default-table ctx)
+                                                (:col-overrides ctx)
+                                                (:derived-aliases ctx) (:ci-index ctx))
+                            (catch Exception e
+                              ;; A name that resolves to no column may
+                              ;; still be a plpgsql variable; anything
+                              ;; else re-raises below.
+                              (when-not (plpgsql-var? col-expr) (throw e))
+                              nil))]
+          (column-value! ctx resolved)
+          (plpgsql-var-value! col-expr))))
 
     (instance? AllColumns expr)
     :*

@@ -449,6 +449,36 @@
                      (seq fields) (assoc :fields fields))))
    nil))
 
+(def ^:dynamic *statement-handler*
+  "The query handler running the current statement, so a plpgsql body
+   can run a nested one against the same transaction, temporary tables
+   and session. This is what SPI is for PostgreSQL.
+
+   nil outside a statement; a plpgsql call then refuses rather than
+   reaching for a connection of its own."
+  nil)
+
+(def ^:dynamic *routine-depth*
+  "How many plpgsql bodies are on the stack. PostgreSQL stops runaway
+   recursion with its stack-depth limit; this is the same guard at a
+   level we can see."
+  0)
+
+(def ^:dynamic *plpgsql-vars*
+  "The plpgsql variables in scope while a statement of a function body is
+   translated, as `{\"name\" value}` (lower-cased names, already-evaluated
+   values).
+
+   plpgsql substitutes its variables into an embedded statement as
+   PARAMETERS, so the same body text plans once and runs with different
+   values. We do it by resolving a bare name to its value during
+   translation, which means the resulting plan is specific to those
+   values -- so any statement that reads one marks itself
+   session-dependent and stays out of the shared plan cache. Without
+   that, `SELECT x + 1` inside a loop would be cached on the first
+   iteration and answer the first iteration's value for every later one."
+  nil)
+
 (def ^:dynamic *sql-fn-args*
   "The arguments of the `LANGUAGE sql` function whose body is being
    translated, as `{\"argname\" value, 1 value, …}` — by name and by

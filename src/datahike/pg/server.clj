@@ -55,7 +55,9 @@
             [datahike.pg.vector :as pg-vector]
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb]
-            [datahike.pg.locks :as locks])
+            [datahike.pg.locks :as locks]
+            [datahike.pg.plpgsql.parse :as pl-parse]
+            [datahike.pg.plpgsql.exec :as pl-exec])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler PgWireServer$Notice
             PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException
             PgWireServer$PasswordAuthenticator PgParamCodec]
@@ -4695,6 +4697,34 @@
    the normal Simple / Extended Query paths."
   nil)
 
+(def ^:private ^:dynamic *nested-statement?*
+  "True while a routine body runs one of its own statements. A `$n` in
+   such a statement is a parameter OF THE ROUTINE, already in scope --
+   not the unbound placeholder that the Simple Query path rejects with
+   42P02."
+  false)
+
+(defn- nested-executor
+  "The `run a statement` primitive a routine body needs: this handler,
+   this transaction, this session -- but with the CALLER's
+   prepared-statement bindings cleared.
+
+   `*cached-parsed*` is the one that matters. `executePrepared` binds it
+   so `execute` reuses the plan instead of re-parsing, and it is
+   dynamic, so it was still in scope when a plpgsql body ran its own
+   statements: every nested statement re-ran the OUTER plan, which
+   called the function again, which ran the statement again. A
+   StackOverflowError, with the body's first statement repeating in the
+   trace."
+  [^PgWireServer$QueryHandler h]
+  (fn [^String sql]
+    (binding [*cached-parsed* nil
+              *cached-bound* nil
+              *snapshot-db* nil
+              *nested-statement?* true
+              params/*bound-params* nil]
+      (.execute h sql))))
+
 (def ^:private ^:dynamic *implicit-tx-allowed*
   "When true (bound by executePrepared for the extended-query path), a
    write executed outside an explicit BEGIN block opens an *implicit*
@@ -8225,6 +8255,9 @@
      {:db/ident :datahike.pg.function/strict?
       :db/valueType :db.type/boolean
       :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.function/language
+      :db/valueType :db.type/string
+      :db/cardinality :db.cardinality/one}
      {:db/ident :datahike.pg.function/body
       :db/valueType :db.type/string
       :db/cardinality :db.cardinality/one}
@@ -8240,6 +8273,7 @@
       :datahike.pg.function/return-type (pr-str returns)
       :datahike.pg.function/setof? (boolean (:setof? returns))
       :datahike.pg.function/strict? (boolean strict?)
+      :datahike.pg.function/language (or (:language parsed) "sql")
       :datahike.pg.function/body body}]))
 
 (defn- existing-function
@@ -8264,6 +8298,31 @@
               db fn-name))
        (mapv #(d/entity db (first %)))))
 
+(defn- validate-plpgsql-body!
+  "Parse a plpgsql body at CREATE time and refuse one the evaluator
+   cannot run, naming the construct.
+
+   PostgreSQL validates a body at definition time too (that is what
+   `check_function_bodies` controls), and refusing here rather than at
+   the call means an unimplemented construct is a clean 0A000 against
+   the CREATE rather than a surprise, or a wrong answer, later."
+  [body]
+  (let [ast (try
+              (pl-parse/parse-body body)
+              (catch clojure.lang.ExceptionInfo e (throw e))
+              (catch Exception e
+                (throw (ex-info (str "could not parse the plpgsql body: " (.getMessage e))
+                                {:error :syntax-error :sqlstate "42601"}))))
+        missing (pl-parse/unsupported-constructs ast)]
+    (when (seq missing)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "plpgsql "
+                             (str/join ", " (map name missing))
+                             " is not supported")
+               :detail "The body parses; this server cannot run that construct yet."})))
+    ast))
+
 (defn- exec-ddl-create-function
   "CREATE [OR REPLACE] FUNCTION … LANGUAGE sql.
 
@@ -8276,6 +8335,8 @@
   [ctx parsed]
   (let [{:keys [conn tx-state session-id]} ctx
         {:keys [fn-name params or-replace?]} parsed]
+    (when (= "plpgsql" (:language parsed))
+      (validate-plpgsql-body! (:body parsed)))
     (acquire-catalog-allocation-lock! conn tx-state session-id)
     (loop [attempt 0]
       (let [current-db (if (:in-tx? @tx-state)
@@ -11242,7 +11303,7 @@
         (when (:in-tx? @tx-state)
           (swap! tx-state assoc :aborted? true)))
 
-      (parse [_ sql param-oids]
+      (parse [this sql param-oids]
         ;; Translate once, return the parsed map as opaque state. The
         ;; wire layer caches it under the Parse stmt name and feeds it
         ;; back via executePrepared. Note: `db` captured at parse time
@@ -11276,7 +11337,14 @@
                     ;; builds the plan. parse-sql includes this binding in
                     ;; its cache key, so plans for different declarations
                     ;; remain isolated.
-                    params/*declared-param-oids* declared-param-oids]
+                    params/*declared-param-oids* declared-param-oids
+                    ;; A plpgsql call is resolved while the statement is
+                    ;; TRANSLATED, and the closure it emits needs a
+                    ;; handler to run the body's statements through.
+                    ;; Translation happens here for every client that
+                    ;; uses the extended protocol, which is every
+                    ;; pgjdbc client by default.
+                    params/*statement-handler* (or params/*statement-handler* (nested-executor this))]
             (let [base-db (apply-temporal (d/db conn) session-state)
                 ;; In an open transaction, parse/validate against the
                 ;; speculative-db so a statement referencing a table
@@ -11514,6 +11582,7 @@
                     ;; path too -- a driver that binds parameters was
                     ;; getting ISO whatever the session had set.
                     types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                    params/*statement-handler* (or params/*statement-handler* (nested-executor this))
                     *max-result-rows* max-result-rows]
             (or
              ;; Tier-1 compiled lane: plain autocommit SELECT with no
@@ -11548,6 +11617,11 @@
                   params/*session-state* session-state
                   types/*date-style* (or (:date-style @session-state) [:iso :mdy])
                   params/*cancel* (current-cancel)
+                  ;; A plpgsql body runs its statements through the
+                  ;; handler that reached it, so it shares this
+                  ;; transaction, these temp tables and this session --
+                  ;; PostgreSQL's SPI, with the connection it already has.
+                  params/*statement-handler* (nested-executor this)
                   *max-result-rows* max-result-rows
                   datahike.query/*disable-planner* false]
           (with-stmt-timeout (:statement-timeout @session-state)
@@ -11581,6 +11655,7 @@
               ;; every prepared statement with a parameter would be
               ;; rejected.
               (if-let [pe (and (nil? *cached-parsed*)
+                               (not *nested-statement?*)
                                (sql/simple-query-param-error sql))]
                 (error-result (:message pe) (:sqlstate pe))
                 (try

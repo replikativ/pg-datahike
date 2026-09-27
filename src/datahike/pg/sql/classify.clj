@@ -1007,8 +1007,9 @@
 
    `toks` starts after the FUNCTION keyword. A function whose body this
    server can run — `LANGUAGE sql`, one statement — is classified in
-   full; everything else keeps the silently-accepted reject it had, so
-   a pg_dump that defines a plpgsql trigger still restores."
+   full -- `LANGUAGE sql` and `LANGUAGE plpgsql`. Everything else keeps
+   the silently-accepted reject it had, so a pg_dump that defines a C
+   function still restores."
   [toks or-replace?]
   (let [reject {:kind :create-function :reject-kind :function :tag "CREATE FUNCTION"}]
     (or (when-let [[nm after-name] (read-relation-name toks)]
@@ -1039,12 +1040,13 @@
                     [nil after-args])]
               (when ret
                 (let [attrs (read-function-attrs after-ret)]
-                  (when (and (= "sql" (:language attrs))
+                  (when (and (contains? #{"sql" "plpgsql"} (:language attrs))
                              (:body attrs)
                              (not (:link-symbol attrs))
                              (every? :type params))
                     {:kind :create-function-sql
                      :fn-name nm
+                     :language (:language attrs)
                      :or-replace? (boolean or-replace?)
                      :params params
                      :returns ret
