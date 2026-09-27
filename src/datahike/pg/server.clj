@@ -4717,13 +4717,42 @@
    StackOverflowError, with the body's first statement repeating in the
    trace."
   [^PgWireServer$QueryHandler h]
-  (fn [^String sql]
-    (binding [*cached-parsed* nil
-              *cached-bound* nil
-              *snapshot-db* nil
-              *nested-statement?* true
-              params/*bound-params* nil]
-      (.execute h sql))))
+  ;; One memo per OUTER statement, since that is how long this executor
+  ;; lives. Re-parsing a body statement costs little (the translation
+  ;; cache holds it) but handing `executePrepared` a FRESH parse each
+  ;; time costs three times as much as handing it the same one:
+  ;; 1.5ms against 0.55ms measured. A loop, or a function called once
+  ;; per row, runs the same few statements over and over.
+  (let [plans (atom {})]
+    (fn [^String sql values oids]
+      (binding [*cached-parsed* nil
+                *cached-bound* nil
+                *snapshot-db* nil
+                *nested-statement?* true
+                params/*bound-params* nil]
+        (if (empty? values)
+          (.execute h sql)
+          ;; With values, the PREPARED path: the routine has rewritten
+          ;; its variable references to `$n`, so the plan is the same
+          ;; whatever they hold. Binding the values during translation
+          ;; instead made every execution re-translate -- a body reading
+          ;; one variable cost 11ms a call against 0.3ms for one reading
+          ;; none.
+          (let [k [sql (vec oids)]
+                parsed (or (get @plans k)
+                           (.parse h sql (int-array (map #(int (or % 0)) oids))))
+                ;; ParamRefs are 1-indexed, so slot 0 is unused -- the
+                ;; same shape the wire layer passes.
+                bound (into-array Object (cons nil values))
+                result (.executePrepared h parsed bound)]
+            ;; A plan carries the db it was translated against, so it is
+            ;; only reusable while that snapshot still describes the
+            ;; database. A SELECT cannot change it; anything else can,
+            ;; so the memo is dropped rather than reasoned about.
+            (if (and (map? parsed) (= :select (:type parsed)))
+              (swap! plans assoc k parsed)
+              (reset! plans {}))
+            result))))))
 
 (def ^:private ^:dynamic *implicit-tx-allowed*
   "When true (bound by executePrepared for the extended-query path), a
@@ -6756,6 +6785,16 @@
                 (when entry
                   (when on-query (on-query (:sql parsed)))
                   ((:exec entry) db bound)))))
+          ;; Returning nil sends the statement down the full path, which
+          ;; RUNS IT AGAIN. That is right for "this lane cannot plan
+          ;; that shape" -- and the two lanes do word some PostgreSQL
+          ;; errors differently, so the fallback is load-bearing there
+          ;; too. It is wrong only for an error the user's own routine
+          ;; raised: the rerun reproduces it, having repeated the body's
+          ;; side effects, and it cost 2^depth body executions in a
+          ;; recursive call (measured exactly).
+          (catch clojure.lang.ExceptionInfo e
+            (if (params/routine-error-key (ex-data e)) (throw e) nil))
           (catch Exception _ nil))))))
 
 (def ^:private select-shape-cache

@@ -458,26 +458,24 @@
    reaching for a connection of its own."
   nil)
 
+(def routine-error-key
+  "Marks an exception as having escaped a ROUTINE BODY -- a plpgsql
+   function's own error, not a translator shortcoming.
+
+   The compiled fast lane returns nil on any exception, which sends the
+   statement down the full path and RUNS IT AGAIN. That is right for
+   \"this lane cannot plan that shape\", and even for a PostgreSQL error
+   the two lanes word differently. It is wrong for an error the user's
+   own code raised: the second run reproduces it, having repeated the
+   body's side effects, and it made a recursive call cost 2^depth body
+   executions."
+  ::from-routine)
+
 (def ^:dynamic *routine-depth*
   "How many plpgsql bodies are on the stack. PostgreSQL stops runaway
    recursion with its stack-depth limit; this is the same guard at a
    level we can see."
   0)
-
-(def ^:dynamic *plpgsql-vars*
-  "The plpgsql variables in scope while a statement of a function body is
-   translated, as `{\"name\" value}` (lower-cased names, already-evaluated
-   values).
-
-   plpgsql substitutes its variables into an embedded statement as
-   PARAMETERS, so the same body text plans once and runs with different
-   values. We do it by resolving a bare name to its value during
-   translation, which means the resulting plan is specific to those
-   values -- so any statement that reads one marks itself
-   session-dependent and stays out of the shared plan cache. Without
-   that, `SELECT x + 1` inside a loop would be cached on the first
-   iteration and answer the first iteration's value for every later one."
-  nil)
 
 (def ^:dynamic *sql-fn-args*
   "The arguments of the `LANGUAGE sql` function whose body is being
