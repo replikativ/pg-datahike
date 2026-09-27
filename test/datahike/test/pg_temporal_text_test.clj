@@ -163,7 +163,6 @@
       (is (= "Wed Jan 01 10:00:00 2020" (one c "SELECT ts FROM ev WHERE id = 1")))
       (exec! c "RESET DateStyle"))))
 
-
 (defn- err-of [^Connection c sql]
   (try (one c sql) nil
        (catch java.sql.SQLException e [(.getSQLState e) (.getMessage e)])))

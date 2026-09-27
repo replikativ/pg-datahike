@@ -19,8 +19,8 @@
 
    100% here means every EXPECTED line is present and in order, not
    that the output is byte-identical: extra lines of ours do not lower
-   it. That is deliberate -- the number answers "how much of what
-   PostgreSQL prints do we print", and a stricter reading is what
+   it. That is deliberate -- the number answers " how much of what
+  PostgreSQL prints do we print ", and a stricter reading is what
    `pg_regress` itself already gives, namely zero for any difference. It does NOT fail on an improvement: rerun
    `measure` and commit the new numbers.
 
