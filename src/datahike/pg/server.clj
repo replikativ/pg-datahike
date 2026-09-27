@@ -767,12 +767,22 @@
    conflict reports `INSERT 0 2`. The upsert tx-fn tallies the real
    number into `:affected-count` as it runs.
 
+   A BEFORE ROW trigger returning NULL suppresses its row, which is the
+   same thing seen from the other end: it was never written, so it is
+   not counted. `:suppressed-count` carries how many.
+
    Falls back to `:count` for every non-upsert INSERT, which has no
    such atom."
   [parsed]
-  (if-let [a (:affected-count parsed)]
-    @a
-    (:count parsed)))
+  (let [base (if-let [a (:affected-count parsed)] @a (:count parsed))]
+    (max 0 (- (long (or base 0)) (long (or (:suppressed-count parsed) 0))))))
+
+(defn- note-suppressed
+  "Record how many candidate rows the BEFORE ROW triggers removed, so
+   the CommandComplete tag counts what was written."
+  [parsed before after]
+  (let [n (- (count (filter map? before)) (count (filter map? after)))]
+    (cond-> parsed (pos? n) (assoc :suppressed-count n))))
 
 (defn- error-result
   "Build an error QueryResult. Optional sqlstate defaults to \"XX000\".
@@ -2460,6 +2470,101 @@
    seen
    specs))
 
+;; The trigger and function registries are read here but defined with
+;; the rest of the routine DDL, further down.
+(declare table-triggers functions-by-name+arity)
+
+(defn- row-entity->columns
+  "A candidate entity map as `{column value}`, dropping the internal
+   keys a trigger has no business seeing."
+  [table-name entity]
+  (into {}
+        (keep (fn [[k v]]
+                (when (and (keyword? k) (= table-name (namespace k))
+                           (not= "db-row-exists" (name k)))
+                  [(name k) v])))
+        entity))
+
+(defn- columns->row-entity
+  "The inverse, merged back over the original so `:db/id`, the row
+   marker and anything else the writer needs survive.
+
+   The values are coerced to their columns' types on the way in: a
+   trigger body computes in plpgsql, where a statement's result arrives
+   as TEXT, so `NEW.n := m` after a `SELECT … INTO m` would otherwise
+   store the string \"10\" in a bigint column."
+  [db table-name entity columns]
+  (reduce (fn [e [c v]]
+            (let [k (keyword table-name c)]
+              (if (nil? v)
+                (dissoc e k)
+                (assoc e k (try (#'stmt/coerce-insert-value v k (dbi/-schema db) db)
+                                (catch Exception _ v))))))
+          entity
+          columns))
+
+(defn- fire-row-triggers
+  "Run the BEFORE ROW triggers of `table-name` over prepared INSERT
+   candidates, in trigger-name order as PostgreSQL does.
+
+   A trigger may rewrite the row -- assigning to `NEW.col` -- or
+   suppress it entirely by returning NULL, which is why this returns
+   new tx-data rather than validating in place. It runs BEFORE the
+   constraint pass, as `ExecBRInsertTriggers` does ahead of
+   `ExecConstraints` (nodeModifyTable.c): a trigger is allowed to fix
+   up a row that would otherwise fail NOT NULL.
+
+   The body's statements run through the handler of the statement that
+   reached here, so they see this transaction."
+  [db table-name tx-data event]
+  (let [triggers (filterv (fn [t] (and (= :row (:level t))
+                                       (= :before (:timing t))
+                                       (some #{event} (:events t))))
+                          (table-triggers db table-name))]
+    (if (empty? triggers)
+      tx-data
+      (let [handler params/*statement-handler*]
+        (when-not handler
+          (throw (errors/pg-error
+                  :feature-not-supported
+                  {:message (str "a trigger on \"" table-name
+                                 "\" cannot run in this context")})))
+        (into []
+              (keep (fn [entry]
+                      (if-not (map? entry)
+                        entry
+                        (loop [[t & more] triggers, entity entry]
+                          (if (nil? t)
+                            entity
+                            (let [fn-ent (first (functions-by-name+arity db (:function t) 0))
+                                  _ (when-not fn-ent
+                                      (throw (errors/pg-error
+                                              :undefined-function
+                                              {:message (str "function " (:function t)
+                                                             "() does not exist")})))
+                                  ast (pl-parse/parse-body
+                                       (:datahike.pg.function/body fn-ent))
+                                  cols (row-entity->columns table-name entity)
+                                  {:keys [row]}
+                                  (pl-exec/run-trigger
+                                   handler ast
+                                   {:new cols
+                                    :tg {"tg_name" (:name t)
+                                         "tg_when" (str/upper-case (name (:timing t)))
+                                         "tg_level" (str/upper-case (name (:level t)))
+                                         "tg_op" (str/upper-case (name event))
+                                         "tg_table_name" table-name
+                                         "tg_nargs" (count (:arguments t))
+                                         "tg_argv" (vec (:arguments t))}
+                                    :types {}})]
+                              ;; nil means the trigger suppressed the row:
+                              ;; no later trigger runs and nothing is
+                              ;; written, as in PostgreSQL.
+                              (if (nil? row)
+                                nil
+                                (recur more (columns->row-entity db table-name entity row))))))))
+                    tx-data))))))
+
 (defn- prepare-insert-candidates
   "Resolve and validate INSERT candidates in PostgreSQL source order.
 
@@ -2569,7 +2674,13 @@
           ;; row operations on the resulting durable basis; this never runs a
           ;; volatile/default expression again.
           db (materialized-insert-base candidate-db (d/db conn) parsed)
-          tx-data (-> (:tx-data prepared)
+          ;; BEFORE ROW triggers see the prepared candidate -- defaults
+          ;; materialised -- and may rewrite or suppress it, so they run
+          ;; ahead of the constraint pass, as ExecBRInsertTriggers does
+          ;; ahead of ExecConstraints.
+          fired (fire-row-triggers db table-name (:tx-data prepared) :insert)
+          parsed (note-suppressed parsed (:tx-data prepared) fired)
+          tx-data (-> fired
                       (apply-column-constraints table-name (:ns parsed) db)
                       (guard-materialized-upsert parsed)
                       tx-wrap)
@@ -5584,6 +5695,7 @@
     :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
     :ddl-create-composite :ddl-create-domain :ddl-drop-domain
     :ddl-create-function :ddl-drop-function
+    :ddl-create-trigger :ddl-drop-trigger
     ;; Ordinary B-tree CREATE INDEX remains a transaction-compatible
     ;; compatibility declaration. Materialized secondary methods reject a
     ;; buffered/explicit transaction at their narrower execution boundary.
@@ -7708,7 +7820,13 @@
                   (reject-explicit-always-identities!
                    (:tx-data parsed) (:table parsed) spec-db))
               table-name (:table parsed)
-              prepared (prepare-insert-candidates parsed spec-db resolver)
+              prepared0 (prepare-insert-candidates parsed spec-db resolver)
+              ;; Same point as the autocommit path: BEFORE ROW triggers
+              ;; see the prepared candidate and may rewrite or suppress
+              ;; it.
+              fired (fire-row-triggers spec-db table-name (:tx-data prepared0) :insert)
+              parsed (note-suppressed parsed (:tx-data prepared0) fired)
+              prepared (assoc prepared0 :tx-data fired)
               ;; A sequence created inside this transaction reserves into the
               ;; live speculative overlay. Preparation must not subsequently
               ;; replace that overlay with the snapshot captured before the
@@ -8323,7 +8441,7 @@
                db (function-key fn-name arg-types))
           (->> (d/entity db))))
 
-(defn- functions-by-name+arity
+(defn functions-by-name+arity
   "Every stored overload of this name with this many arguments. An
    `arity` of nil means every overload of the name."
   [db fn-name arity]
@@ -8361,6 +8479,125 @@
                              " is not supported")
                :detail "The body parses; this server cannot run that construct yet."})))
     ast))
+
+(defn- trigger-key [table trigger-name]
+  (str table "." trigger-name))
+
+(defn- trigger-tx-data
+  "Registry tx-data for a CREATE TRIGGER. A trigger's name is unique per
+   TABLE in PostgreSQL, not per database, so that is the key."
+  [parsed oid]
+  (let [{:keys [trigger-name table timing events update-columns level
+                when-condition function arguments]} parsed]
+    [{:db/ident :datahike.pg.trigger/key
+      :db/valueType :db.type/string
+      :db/cardinality :db.cardinality/one
+      :db/unique :db.unique/identity}
+     {:db/ident :datahike.pg.trigger/name
+      :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.trigger/table
+      :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.trigger/oid
+      :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :datahike.pg.trigger/spec
+      :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:datahike.pg.trigger/key (trigger-key table trigger-name)
+      :datahike.pg.trigger/name trigger-name
+      :datahike.pg.trigger/table table
+      :datahike.pg.trigger/oid oid
+      ;; The whole definition as EDN: nothing queries its parts
+      ;; individually, and one attribute keeps the shape open while the
+      ;; firing path grows.
+      :datahike.pg.trigger/spec (pr-str {:timing timing :events (vec events)
+                                         :update-columns update-columns
+                                         :level level :when when-condition
+                                         :function function
+                                         :arguments (vec arguments)})}]))
+
+(defn table-triggers
+  "Every trigger defined on `table`, as spec maps with their names."
+  [db table]
+  (->> (d/q '{:find [?e] :in [$ ?t]
+              :where [[?e :datahike.pg.trigger/table ?t]]}
+            db table)
+       (mapv (fn [[e]]
+               (let [ent (d/entity db e)]
+                 (assoc (read-string (:datahike.pg.trigger/spec ent))
+                        :name (:datahike.pg.trigger/name ent)))))
+       (sort-by :name)
+       vec))
+
+(defn- exec-ddl-create-trigger
+  "CREATE TRIGGER. The function must already exist and return `trigger`,
+   as PostgreSQL requires."
+  [ctx parsed]
+  (let [{:keys [conn tx-state session-id]} ctx
+        {:keys [trigger-name table function]} parsed]
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
+    (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))]
+      (cond
+        (not (table-exists? db table))
+        (classified-error "" (ex-info (str "relation \"" table "\" does not exist")
+                                      {:error :undefined-table :sqlstate "42P01"}))
+
+        (empty? (d/q '{:find [?e] :in [$ ?n]
+                       :where [[?e :datahike.pg.function/name ?n]]}
+                     db function))
+        (classified-error "" (ex-info (str "function " function "() does not exist")
+                                      {:error :undefined-function :sqlstate "42883"}))
+
+        (some #(= trigger-name (:name %)) (table-triggers db table))
+        (classified-error "" (ex-info (str "trigger \"" trigger-name
+                                           "\" for relation \"" table
+                                           "\" already exists")
+                                      {:error :duplicate-object :sqlstate "42710"}))
+
+        :else
+        (let [{:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
+              create-data (into (vec tx-data) (trigger-tx-data parsed oid))]
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state create-data "CREATE TRIGGER")
+            (let [outcome (try (transact-recorded! conn create-data) :committed
+                               (catch Exception e e))]
+              (if (= :committed outcome)
+                (empty-result "CREATE TRIGGER")
+                (classified-error "CREATE TRIGGER error: " outcome)))))))))
+
+(defn- exec-ddl-drop-trigger [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [trigger-name table if-exists?]} parsed
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        eid (d/q '{:find [?e .] :in [$ ?k]
+                   :where [[?e :datahike.pg.trigger/key ?k]]}
+                 db (trigger-key table trigger-name))]
+    (cond
+      (and (nil? eid) (not (table-exists? db table)))
+      (if if-exists?
+        (do (params/notice! "NOTICE" (str "relation \"" table
+                                          "\" does not exist, skipping"))
+            (empty-result "DROP TRIGGER"))
+        (classified-error "" (ex-info (str "relation \"" table "\" does not exist")
+                                      {:error :undefined-table :sqlstate "42P01"})))
+
+      (nil? eid)
+      (if if-exists?
+        (do (params/notice! "NOTICE" (str "trigger \"" trigger-name "\" for relation \""
+                                          table "\" does not exist, skipping"))
+            (empty-result "DROP TRIGGER"))
+        (classified-error "" (ex-info (str "trigger \"" trigger-name
+                                           "\" for table \"" table
+                                           "\" does not exist")
+                                      {:error :undefined-object :sqlstate "42704"})))
+
+      :else
+      (let [tx-data [[:db/retractEntity eid]]]
+        (if (:in-tx? @tx-state)
+          (execute-ddl-in-tx tx-state tx-data "DROP TRIGGER")
+          (let [outcome (try (transact-recorded! conn tx-data) :committed
+                             (catch Exception e e))]
+            (if (= :committed outcome)
+              (empty-result "DROP TRIGGER")
+              (classified-error "DROP TRIGGER error: " outcome))))))))
 
 (defn- exec-ddl-create-function
   "CREATE [OR REPLACE] FUNCTION … LANGUAGE sql.
@@ -12066,6 +12303,10 @@
                                                       tx-state #(exec-ddl-create-sequence ctx parsed))
                               :ddl-alter-sequence    (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-alter-sequence ctx parsed))
+                              :ddl-create-trigger    (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-trigger ctx parsed))
+                              :ddl-drop-trigger      (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop-trigger ctx parsed))
                               :ddl-create-function   (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create-function ctx parsed))
                               :ddl-drop-function     (execute-ddl-invalidating

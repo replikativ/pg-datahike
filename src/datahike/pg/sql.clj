@@ -1098,6 +1098,12 @@
               :drop-function-sql
               (assoc base :type :ddl-drop-function)
 
+              :create-trigger-plpgsql
+              (assoc base :type :ddl-create-trigger)
+
+              :drop-trigger-plpgsql
+              (assoc base :type :ddl-drop-trigger)
+
               ;; CREATE / ALTER SEQUENCE — fully token-classified; the
               ;; option list arrives on cls-info as :seq-opts. Validation
               ;; (defaults, bounds, 42601/22023) runs in ddl and raises,

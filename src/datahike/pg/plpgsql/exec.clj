@@ -206,15 +206,32 @@
                        :error :plpgsql-statement})))
     result))
 
+(def ^:private bare-name-re #"(?i)^[a-z_][a-z0-9_$]*(\.[a-z_][a-z0-9_$]*)?$")
+
 (defn- eval-expr
   "The value of a plpgsql expression: `SELECT <expr>` and its one cell.
-   nil for SQL NULL."
+   nil for SQL NULL.
+
+   An expression that names a RECORD variable is answered from the
+   scope: NEW and OLD are bound to markers the caller maps back to a
+   row, and no SQL value could carry one, so `RETURN NEW` has to
+   short-circuit.
+
+   Only those. Answering every bare name from the scope looked like a
+   free speed-up and was not: a statement's result comes back as TEXT,
+   so it made `eval-expr` return a Long for `a` and the string \"1\"
+   for `1`, and `CASE a WHEN 1` stopped matching."
   [st ^String expr]
   (when (and expr (not (str/blank? expr)))
-    (let [r (run-sql! st (str "SELECT " expr))
-          rows (.rows r)]
-      (when (pos? (alength rows))
-        (aget ^"[Ljava.lang.String;" (aget rows 0) 0)))))
+    (let [t (str/trim expr)
+          k (str/lower-case t)
+          v (when (re-matches bare-name-re t) (get (all-vars st) k))]
+      (if (keyword? v)
+        v
+        (let [r (run-sql! st (str "SELECT " expr))
+              rows (.rows r)]
+          (when (pos? (alength rows))
+            (aget ^"[Ljava.lang.String;" (aget rows 0) 0)))))))
 
 (defn- truthy?
   "PostgreSQL's boolean: NULL is not true."
@@ -502,6 +519,55 @@
 ;; ============================================================================
 ;; Entry point
 ;; ============================================================================
+
+(defn- record-vars
+  "A record's fields as variables, bare and qualified: `NEW.i` and `i`
+   both reach the column, as they do in a trigger body."
+  [record-name row]
+  (when row
+    (into {}
+          (mapcat (fn [[c v]]
+                    [[(str/lower-case (str record-name "." c)) v]
+                     [(str/lower-case c) v]]))
+          row)))
+
+(defn run-trigger
+  "Run a trigger function's body for one row.
+
+   `row` is `{column value}` for NEW and OLD, `tg` the `TG_*` variables.
+   The answer is what the body RETURNED: for a BEFORE ROW trigger that
+   is the row to write, and nil means suppress it. PostgreSQL ignores
+   the return value of an AFTER trigger, and the caller does too.
+
+   A returned record is recognised by identity -- the body says
+   `RETURN NEW`, and NEW is bound to a marker the evaluator maps back
+   to the row -- so `RETURN NULL` and `RETURN NEW` are distinguishable
+   from a value that merely happens to be nil."
+  [handler ast {:keys [new old tg types]}]
+  (let [vars (merge (record-vars "new" new)
+                    (record-vars "old" old)
+                    (when new {"new" ::new})
+                    (when old {"old" ::old})
+                    tg)
+        st (new-state handler vars)
+        _ (swap! (:types st) into types)
+        returned (try
+                   (exec-block! st ast)
+                   nil
+                   (catch clojure.lang.ExceptionInfo e
+                     (let [sig (signal-of e)]
+                       (if (instance? Returned sig) sig (throw e)))))
+        v (:value returned)]
+    ;; The body may have ASSIGNED to NEW's fields, so the row it means
+    ;; is read back out of the scope rather than taken from the input.
+    (cond
+      (= ::new v) {:row (into {} (map (fn [[c _]]
+                                        [c (get (all-vars st)
+                                                (str/lower-case (str "new." c)))]))
+                              new)}
+      (= ::old v) {:row old}
+      (nil? v) {:row nil}
+      :else {:row new})))
 
 (defn run-body
   "Run a parsed plpgsql body with `args` bound, and return

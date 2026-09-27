@@ -24,6 +24,29 @@ One notice per missing name, as PostgreSQL emits. The function wording is not a 
 
 `drop_if_exists` goes from 65% to 69% of PostgreSQL's expected output.
 
+### Triggers, on the BEFORE ROW INSERT path
+
+`CREATE TRIGGER` was a silent no-op. Triggers are stored, fired and dropped now.
+
+```sql
+CREATE FUNCTION stamp() RETURNS trigger AS $$
+BEGIN NEW.s := 'stamped'; RETURN NEW; END $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE PROCEDURE stamp();
+```
+
+A trigger is not a function call in a query — it is fired by the **write path**, per row. The hook is the per-row sequence in `constraints/row.clj`, and the placement follows PostgreSQL's: `ExecBRInsertTriggers` runs *ahead of* `ExecConstraints` (`nodeModifyTable.c` 935 / 1118), so a BEFORE trigger may fix up a row that would otherwise fail a constraint.
+
+What a BEFORE ROW trigger **returns is the row that gets written**. `RETURN NEW` writes it with whatever the body assigned to its fields, and `RETURN NULL` suppresses it — and a suppressed row is not counted by the CommandComplete tag either, so `INSERT 0 2` for four offered rows of which two were dropped. Several triggers on one table run in name order, as PostgreSQL runs them.
+
+`NEW` and `OLD` are readable bare or qualified (`NEW.i` and `i`), and `TG_NAME`, `TG_WHEN`, `TG_LEVEL`, `TG_OP`, `TG_TABLE_NAME`, `TG_NARGS` and `TG_ARGV` are in scope. A body's own statements run through the handler that reached it, so a trigger can read the database — and the values it assigns are coerced to their columns' types, since plpgsql computes in text.
+
+The DDL errors match PostgreSQL word for word, all five checked against the oracle: `trigger "a" for relation "t" already exists`, `relation "nosuch" does not exist`, `function nofn() does not exist`, `trigger "a" for table "t" does not exist`, and the `… does not exist, skipping` notice for `IF EXISTS`.
+
+**283 of the 371 `CREATE TRIGGER` statements** in PostgreSQL's own regression corpus parse. The 88 that do not are `REFERENCING … TABLE` (transition tables) and `CONSTRAINT TRIGGER`, both deferrable or statement-scoped in ways the firing path does not model; they keep their `0A000`.
+
+Firing is `BEFORE … FOR EACH ROW` on `INSERT`. `AFTER`, `UPDATE`, `DELETE`, statement-level triggers and `WHEN` are stored and parsed but do not fire yet.
+
 ### A plpgsql body plans once, not once per call
 
 A statement inside a function body resolved its variables to their VALUES while it was translated, which made the plan specific to those values, so it could not be cached and every execution re-translated. Measured over 200 rows: a body reading one variable cost **11ms a call**, one reading none **0.3ms** — a 35x gap with nothing else different.

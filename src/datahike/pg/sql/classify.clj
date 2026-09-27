@@ -390,6 +390,19 @@
        (= :ident (:type tok))
        (contains? kws (str/lower-case (:text tok)))))
 
+(def ^:dynamic *source*
+  "The SQL being classified, so a classifier that must keep a fragment
+   VERBATIM -- a trigger's WHEN condition, which is re-parsed later --
+   can slice it rather than rebuild it from tokens. Joining token texts
+   loses the spelling: `NEW.i > 5` came back as `NEW . i > 5`."
+  nil)
+
+(defn- slice-between
+  "The source from the first token's start to the last token's end."
+  [toks]
+  (when (and *source* (seq toks))
+    (subs *source* (:pos (first toks)) (:end (last toks)))))
+
 (defn- ident-text [tok]
   (when tok
     (case (:type tok)
@@ -607,7 +620,8 @@
 
 ;; Sequence DDL is classified in full further down (it needs
 ;; read-relation-name, which is defined after this dispatch).
-(declare classify-create-sequence classify-alter-sequence classify-create-function)
+(declare classify-create-sequence classify-alter-sequence classify-create-function
+         classify-create-trigger)
 
 (defn- classify-create [toks]
   ;; toks starts after CREATE. Skip qualifiers (OR REPLACE, UNIQUE,
@@ -671,7 +685,14 @@
       ;; JSqlParser sees the SQL — so the function body's `$$…$$`
       ;; / TRIGGER body / etc. never reach the parser.
       (kw=? t1 "trigger")
-      {:kind :create-trigger :reject-kind :trigger :tag "CREATE TRIGGER"}
+      (classify-create-trigger (rest toks))
+
+      ;; A CONSTRAINT TRIGGER is deferrable and fires at the end of the
+      ;; statement or the transaction, which the firing path does not
+      ;; model. It keeps the reject rather than being read as an
+      ;; ordinary trigger.
+      (and (kw=? t1 "constraint") (kw=? (second toks) "trigger"))
+      {:kind :create-trigger :reject-kind :trigger :tag "CREATE CONSTRAINT TRIGGER"}
       (kw=? t1 "function")
       (classify-create-function (rest toks) or-replace?)
       (kw=? t1 "procedure")
@@ -1054,6 +1075,113 @@
                      :body (:body attrs)}))))))
         reject)))
 
+(defn- classify-create-trigger
+  "CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} event [OR event …]
+   ON table [FOR [EACH] {ROW|STATEMENT}] [WHEN (condition)]
+   EXECUTE {PROCEDURE|FUNCTION} fn(args).
+
+   `toks` starts after the TRIGGER keyword. JSqlParser cannot parse the
+   statement at all, so it is read here in full. A shape this does not
+   model keeps the silently-accepted reject, so a pg_dump that defines
+   a constraint trigger still restores.
+
+   `UPDATE OF a, b` carries its column list: the trigger only fires when
+   one of those columns is in the UPDATE's target list."
+  [toks]
+  (let [reject {:kind :create-trigger :reject-kind :trigger :tag "CREATE TRIGGER"}]
+    (or
+     (when-let [nm (ident-text (first toks))]
+       (let [i 1
+             [timing i] (cond
+                          (kw=? (nth toks i nil) "before") [:before (inc i)]
+                          (kw=? (nth toks i nil) "after") [:after (inc i)]
+                          (and (kw=? (nth toks i nil) "instead")
+                               (kw=? (nth toks (inc i) nil) "of")) [:instead-of (+ i 2)]
+                          :else [nil i])]
+         (when timing
+           (let [[events cols i]
+                 (loop [i i, evs [], cols nil]
+                   (let [w (some-> (ident-text (nth toks i nil)) str/lower-case)]
+                     (if (contains? #{"insert" "update" "delete" "truncate"} w)
+                       (let [[cs j] (if (and (= "update" w) (kw=? (nth toks (inc i) nil) "of"))
+                                      ;; `,` is punctuation, not an ident, so
+                                      ;; kw=? never matches it.
+                                      (loop [j (+ i 2), cs []]
+                                        (let [c (ident-text (nth toks j nil))]
+                                          (if (and c (= "," (:text (nth toks (inc j) nil))))
+                                            (recur (+ j 2) (conj cs (str/lower-case c)))
+                                            [(cond-> cs c (conj (str/lower-case c)))
+                                             (inc j)])))
+                                      [nil (inc i)])
+                             evs (conj evs (keyword w))
+                             cols (if cs (into (or cols #{}) cs) cols)]
+                         (if (kw=? (nth toks j nil) "or")
+                           (recur (inc j) evs cols)
+                           [evs cols j]))
+                       [evs cols i])))]
+             (when (and (seq events) (kw=? (nth toks i nil) "on"))
+               (when-let [[table after-table] (read-relation-name (drop (inc i) toks))]
+                 (let [toks (vec after-table)
+                       i 0
+                       ;; [FROM referenced] and the deferrability of a
+                       ;; constraint trigger are not modelled.
+                       constraint-bits? (or (kw=? (nth toks i nil) "from")
+                                            (kw=? (nth toks i nil) "deferrable")
+                                            (kw=? (nth toks i nil) "not")
+                                            (kw=? (nth toks i nil) "initially"))
+                       [level i] (if (kw=? (nth toks i nil) "for")
+                                   (let [i (inc i)
+                                         i (if (kw=? (nth toks i nil) "each") (inc i) i)]
+                                     (cond
+                                       (kw=? (nth toks i nil) "row") [:row (inc i)]
+                                       (kw=? (nth toks i nil) "statement") [:statement (inc i)]
+                                       :else [nil i]))
+                                   ;; PostgreSQL's default.
+                                   [:statement i])
+                       ;; REFERENCING OLD/NEW TABLE -- transition tables.
+                       referencing? (kw=? (nth toks i nil) "referencing")
+                       [when-cond i] (if (kw=? (nth toks i nil) "when")
+                                       (if-let [[inner rest-ts] (read-balanced (drop (inc i) toks))]
+                                         [(slice-between inner)
+                                          (- (count toks) (count rest-ts))]
+                                         [nil i])
+                                       [nil i])]
+                   (when (and level (not constraint-bits?) (not referencing?)
+                              (kw=? (nth toks i nil) "execute")
+                              (or (kw=? (nth toks (inc i) nil) "procedure")
+                                  (kw=? (nth toks (inc i) nil) "function")))
+                     (let [fname (ident-text (nth toks (+ i 2) nil))
+                           [args _] (or (read-balanced (drop (+ i 3) toks)) [[] nil])]
+                       (when fname
+                         {:kind :create-trigger-plpgsql
+                          :trigger-name nm
+                          :table table
+                          :timing timing
+                          :events events
+                          :update-columns cols
+                          :level level
+                          :when-condition when-cond
+                          :function fname
+                          :arguments (vec (keep :value args))}))))))))))
+     reject)))
+
+(defn- classify-drop-trigger
+  "DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]."
+  [toks]
+  (let [reject {:kind :drop-trigger :reject-kind :trigger :tag "DROP TRIGGER"}
+        ie? (and (kw=? (first toks) "if") (kw=? (second toks) "exists"))
+        ts (if ie? (drop 2 toks) toks)]
+    (or (when-let [nm (ident-text (first ts))]
+          (when (kw=? (second ts) "on")
+            (when-let [[table rest-ts] (read-relation-name (drop 2 ts))]
+              (let [tail (drop-while #(or (= ";" (:text %))
+                                          (kw=? % "cascade") (kw=? % "restrict"))
+                                     rest-ts)]
+                (when (empty? tail)
+                  {:kind :drop-trigger-plpgsql
+                   :trigger-name nm :table table :if-exists? ie?})))))
+        reject)))
+
 (defn- classify-create-sequence
   "CREATE [TEMP|UNLOGGED] SEQUENCE [IF NOT EXISTS] name [options…].
    `toks` starts just after the SEQUENCE keyword (classify-create has
@@ -1177,7 +1305,7 @@
 
       ;; Symmetric with classify-create — reuse the same :reject-kind
       ;; so a single :silently-accept entry covers both ends.
-      (kw=? t1 "trigger")    {:kind :drop-trigger :reject-kind :trigger :tag "DROP TRIGGER"}
+      (kw=? t1 "trigger")    (classify-drop-trigger (rest toks))
       (kw=? t1 "function")   (classify-drop-function (rest toks))
       (kw=? t1 "procedure")  {:kind :drop-procedure :reject-kind :procedure :tag "DROP PROCEDURE"}
       (kw=? t1 "aggregate")  {:kind :drop-aggregate :reject-kind :aggregate :tag "DROP AGGREGATE"}
@@ -1592,21 +1720,22 @@
   "Classify a SQL string. See namespace docstring for the output
    contract."
   [^String sql]
-  (let [all-toks (tokenize sql)
+  (binding [*source* sql]
+    (let [all-toks (tokenize sql)
         ;; Skip leading `;` (empty statement separators) — some clients
         ;; prefix with a stray semicolon or batch multiple statements.
-        skipped (drop-while #(= ";" (:text %)) all-toks)
+          skipped (drop-while #(= ";" (:text %)) all-toks)
         ;; Kinds that carry a source-text suffix (PREPARE template,
         ;; DECLARE inner SELECT, EXECUTE args-paren-group) need the
         ;; full token stream to locate the end-of-prefix token; all
         ;; others are decided from the first handful. Realize more
         ;; than 12 so the cursor-walkers have enough context.
-        toks (vec (take 64 skipped))
-        t1 (first toks)
-        rest-toks (subvec toks (if (seq toks) 1 0))]
-    (cond
-      (nil? t1)
-      {:kind :empty}
+          toks (vec (take 64 skipped))
+          t1 (first toks)
+          rest-toks (subvec toks (if (seq toks) 1 0))]
+      (cond
+        (nil? t1)
+        {:kind :empty}
 
       ;; psql metacommand at the head of the statement.
       ;; Tokenizer emits `\` as :op (it's not in op-chars but falls
@@ -1614,91 +1743,91 @@
       ;; carries the metacommand name. pg_dump 18+ emits `\restrict`
       ;; / `\unrestrict` markers; older versions emit `\connect`
       ;; before each database in a multi-database dump.
-      (and (= "\\" (:text t1))
-           (= :ident (:type (first rest-toks)))
-           (contains? psql-metacommand-names
-                      (str/lower-case (:text (first rest-toks)))))
-      {:kind :psql-meta
-       :tag (str "\\" (str/lower-case (:text (first rest-toks))))}
+        (and (= "\\" (:text t1))
+             (= :ident (:type (first rest-toks)))
+             (contains? psql-metacommand-names
+                        (str/lower-case (:text (first rest-toks)))))
+        {:kind :psql-meta
+         :tag (str "\\" (str/lower-case (:text (first rest-toks))))}
 
-      :else
-      (let [kw (when (= :ident (:type t1)) (str/lower-case (:text t1)))]
-        (case kw
+        :else
+        (let [kw (when (= :ident (:type t1)) (str/lower-case (:text t1)))]
+          (case kw
           ;; --- authorization DDL — rejected by default, opt-in silent-accept
-          "grant"   {:kind :grant   :reject-kind :grant   :tag "GRANT"}
-          "revoke"  {:kind :revoke  :reject-kind :revoke  :tag "REVOKE"}
+            "grant"   {:kind :grant   :reject-kind :grant   :tag "GRANT"}
+            "revoke"  {:kind :revoke  :reject-kind :revoke  :tag "REVOKE"}
 
           ;; --- DDL routed by second keyword
-          "create"  (classify-create rest-toks)
+            "create"  (classify-create rest-toks)
           ;; classify-drop walks a comma-separated name list of
           ;; unbounded length (DROP TABLE a, b, …) — feed it the full
           ;; lazy token stream, not the 64-token prefix, so a long list
           ;; can't be silently cut short at the realization boundary.
-          "drop"    (classify-drop (rest skipped))
-          "alter"   (classify-alter rest-toks)
+            "drop"    (classify-drop (rest skipped))
+            "alter"   (classify-alter rest-toks)
 
           ;; --- COPY — recognised so parse-sql can dispatch to the
           ;; hand-rolled parser in datahike.pg.sql.copy (JSqlParser
           ;; doesn't handle COPY). Routed as :copy-from-stdin which
           ;; lands in the system-type table.
-          "copy"    {:kind :copy-from-stdin :tag "COPY"}
+            "copy"    {:kind :copy-from-stdin :tag "COPY"}
 
           ;; --- Transaction control
-          "begin"   (cond-> {:kind :begin}
-                      (isolation-level-after rest-toks)
-                      (assoc :isolation (isolation-level-after rest-toks))
-                      (some? (transaction-access-after rest-toks))
-                      (assoc :read-only? (transaction-access-after rest-toks)))
-          "start"   (if (kw=? (first rest-toks) "transaction")
-                      (cond-> {:kind :begin}
+            "begin"   (cond-> {:kind :begin}
                         (isolation-level-after rest-toks)
                         (assoc :isolation (isolation-level-after rest-toks))
                         (some? (transaction-access-after rest-toks))
                         (assoc :read-only? (transaction-access-after rest-toks)))
-                      {:kind :generic-sql})
-          "commit"  {:kind :commit}
+            "start"   (if (kw=? (first rest-toks) "transaction")
+                        (cond-> {:kind :begin}
+                          (isolation-level-after rest-toks)
+                          (assoc :isolation (isolation-level-after rest-toks))
+                          (some? (transaction-access-after rest-toks))
+                          (assoc :read-only? (transaction-access-after rest-toks)))
+                        {:kind :generic-sql})
+            "commit"  {:kind :commit}
           ;; Bare END / END WORK / END TRANSACTION = COMMIT. A trailing
           ;; `;` token must not disqualify it — pgbench -M prepared sends
           ;; "END;" as its own Parse message (jsqlparser can't parse END).
-          "end"     (let [t (first rest-toks)]
-                      (if (or (nil? t)
-                              (= ";" (:text t))
-                              (kw-in? t #{"work" "transaction"}))
-                        {:kind :commit}
-                        {:kind :generic-sql}))
-          "rollback" (classify-rollback rest-toks)
+            "end"     (let [t (first rest-toks)]
+                        (if (or (nil? t)
+                                (= ";" (:text t))
+                                (kw-in? t #{"work" "transaction"}))
+                          {:kind :commit}
+                          {:kind :generic-sql}))
+            "rollback" (classify-rollback rest-toks)
           ;; PostgreSQL's historical ABORT [WORK|TRANSACTION] spelling is
           ;; exactly ROLLBACK.  It still appears in the upstream transaction
           ;; regression file and in older application code.
-          "abort"    {:kind :rollback}
-          "savepoint" {:kind :savepoint :name (ident-text (first rest-toks))}
-          "release"  (let [nm (if (kw=? (first rest-toks) "savepoint")
-                                (ident-text (second rest-toks))
-                                (ident-text (first rest-toks)))]
-                       {:kind :release-savepoint :name nm})
+            "abort"    {:kind :rollback}
+            "savepoint" {:kind :savepoint :name (ident-text (first rest-toks))}
+            "release"  (let [nm (if (kw=? (first rest-toks) "savepoint")
+                                  (ident-text (second rest-toks))
+                                  (ident-text (first rest-toks)))]
+                         {:kind :release-savepoint :name nm})
 
           ;; --- Cursors
-          "declare"    (if (some #(kw=? % "cursor") (take 5 rest-toks))
-                         (classify-declare-cursor sql rest-toks)
-                         {:kind :generic-sql})
-          "fetch"      (classify-fetch-move :fetch-cursor rest-toks)
-          "move"       (classify-fetch-move :move-cursor  rest-toks)
-          "close"      (classify-close rest-toks)
+            "declare"    (if (some #(kw=? % "cursor") (take 5 rest-toks))
+                           (classify-declare-cursor sql rest-toks)
+                           {:kind :generic-sql})
+            "fetch"      (classify-fetch-move :fetch-cursor rest-toks)
+            "move"       (classify-fetch-move :move-cursor  rest-toks)
+            "close"      (classify-close rest-toks)
 
           ;; --- Session / prepared statements
-          "prepare"    (classify-prepare sql rest-toks)
-          "execute"    (classify-execute sql rest-toks)
-          "deallocate" (classify-deallocate rest-toks)
-          "discard" (cond
-                      (kw=? (first rest-toks) "all") {:kind :discard-all}
-                      (kw-in? (first rest-toks)
-                              #{"plans" "sequences" "temp" "temporary" "locks"})
-                      {:kind :discard-scoped
-                       :scope (str/lower-case (:text (first rest-toks)))}
-                      :else {:kind :generic-sql})
-          "set"     (classify-set rest-toks)
-          "reset"   {:kind :reset :var (first (read-dotted-name rest-toks))}
-          "show"    {:kind :show  :var (first (read-dotted-name rest-toks))}
+            "prepare"    (classify-prepare sql rest-toks)
+            "execute"    (classify-execute sql rest-toks)
+            "deallocate" (classify-deallocate rest-toks)
+            "discard" (cond
+                        (kw=? (first rest-toks) "all") {:kind :discard-all}
+                        (kw-in? (first rest-toks)
+                                #{"plans" "sequences" "temp" "temporary" "locks"})
+                        {:kind :discard-scoped
+                         :scope (str/lower-case (:text (first rest-toks)))}
+                        :else {:kind :generic-sql})
+            "set"     (classify-set rest-toks)
+            "reset"   {:kind :reset :var (first (read-dotted-name rest-toks))}
+            "show"    {:kind :show  :var (first (read-dotted-name rest-toks))}
 
           ;; --- LISTEN / UNLISTEN / NOTIFY (async notification channels).
           ;; pg-datahike has no notification delivery, so these are
@@ -1707,36 +1836,36 @@
           ;; all, so they MUST be intercepted here. asyncpg's pool reset
           ;; query (`get_reset_query`) sends `UNLISTEN *` on every
           ;; connection release.
-          "listen"   {:kind :listen-noop   :tag "LISTEN"}
-          "unlisten" {:kind :unlisten-noop :tag "UNLISTEN"}
-          "notify"   {:kind :notify-noop   :tag "NOTIFY"}
+            "listen"   {:kind :listen-noop   :tag "LISTEN"}
+            "unlisten" {:kind :unlisten-noop :tag "UNLISTEN"}
+            "notify"   {:kind :notify-noop   :tag "NOTIFY"}
 
           ;; --- No-op DDL and maintenance
-          "comment" {:kind :comment-on}
-          "lock"    {:kind :lock-table}
-          "vacuum"  {:kind :maintenance-noop :tag "VACUUM"}
-          "reindex" {:kind :maintenance-noop :tag "REINDEX"}
-          "cluster" {:kind :maintenance-noop :tag "CLUSTER"}
-          "analyze" {:kind :maintenance-noop :tag "ANALYZE"}
+            "comment" {:kind :comment-on}
+            "lock"    {:kind :lock-table}
+            "vacuum"  {:kind :maintenance-noop :tag "VACUUM"}
+            "reindex" {:kind :maintenance-noop :tag "REINDEX"}
+            "cluster" {:kind :maintenance-noop :tag "CLUSTER"}
+            "analyze" {:kind :maintenance-noop :tag "ANALYZE"}
 
           ;; --- SELECT may hijack common zero-arg fns + advisory locks
-          "select"  (classify-select rest-toks)
-          "with"    {:kind :generic-sql}  ; CTE: DML follows
-          "table"   {:kind :generic-sql}  ; TABLE t shorthand
-          "values"  {:kind :generic-sql}
+            "select"  (classify-select rest-toks)
+            "with"    {:kind :generic-sql}  ; CTE: DML follows
+            "table"   {:kind :generic-sql}  ; TABLE t shorthand
+            "values"  {:kind :generic-sql}
 
           ;; --- DML
-          "insert"  {:kind :generic-sql}
-          "update"  {:kind :generic-sql}
-          "delete"  {:kind :generic-sql}
-          "merge"   {:kind :generic-sql}
+            "insert"  {:kind :generic-sql}
+            "update"  {:kind :generic-sql}
+            "delete"  {:kind :generic-sql}
+            "merge"   {:kind :generic-sql}
           ;; Full stream for the same reason as "drop" — the table list
           ;; is unbounded.
-          "truncate" (classify-truncate (rest skipped))
+            "truncate" (classify-truncate (rest skipped))
 
           ;; --- EXPLAIN, CALL (function)
-          "explain" {:kind :generic-sql}
-          "call"    {:kind :generic-sql}
+            "explain" {:kind :generic-sql}
+            "call"    {:kind :generic-sql}
 
           ;; default — let JSqlParser try
-          {:kind :generic-sql})))))
+            {:kind :generic-sql}))))))
