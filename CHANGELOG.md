@@ -45,7 +45,18 @@ The DDL errors match PostgreSQL word for word, all five checked against the orac
 
 **283 of the 371 `CREATE TRIGGER` statements** in PostgreSQL's own regression corpus parse. The 88 that do not are `REFERENCING … TABLE` (transition tables) and `CONSTRAINT TRIGGER`, both deferrable or statement-scoped in ways the firing path does not model; they keep their `0A000`.
 
-Firing is `BEFORE … FOR EACH ROW` on `INSERT`. `AFTER`, `UPDATE`, `DELETE`, statement-level triggers and `WHEN` are stored and parsed but do not fire yet.
+All of the firing matrix except `INSTEAD OF`: `BEFORE` and `AFTER`, `FOR EACH ROW` and `FOR EACH STATEMENT`, over `INSERT`, `UPDATE` and `DELETE`.
+
+- A **BEFORE ROW UPDATE** trigger sees `OLD` and `NEW`, may change `NEW`, and cancels the update for that row by returning NULL. `OLD` and `NEW` are reconstructed from the statement's own operations, the way the constraint pass already reconstructs the post-update row.
+- A **BEFORE ROW DELETE** trigger sees `OLD` and vetoes the delete by returning NULL.
+- A **statement-level** trigger sees no row and fires once — including when the statement matched nothing, which is most of what they are for.
+- An **AFTER ROW** trigger's return value is ignored, as in PostgreSQL: `RETURN NULL` there suppresses nothing.
+- **`WHEN (…)`** is evaluated with `NEW` and `OLD` in scope, and a trigger whose condition is false is not fired at all — so a side effect in its body does not happen.
+- **`UPDATE OF a, b`** only fires when one of those columns is in the statement's target list.
+
+Row counts follow what was written: an `UPDATE` whose trigger cancelled the only matching row reports `UPDATE 0`.
+
+Every one of the eighteen behaviours above was checked statement-by-statement against a PostgreSQL 17 oracle.
 
 ### A plpgsql body plans once, not once per call
 

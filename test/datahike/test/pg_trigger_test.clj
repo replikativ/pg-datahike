@@ -180,3 +180,81 @@
     (ok! h "DROP TRIGGER tr ON t")
     (ok! h "INSERT INTO t VALUES (2,'orig')")
     (is (= [["1" "x"] ["2" "orig"]] (rows (ok! h "SELECT i, s FROM t ORDER BY i"))))))
+
+;; ============================================================================
+;; The rest of the matrix
+;; ============================================================================
+
+(deftest statement-level-triggers
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int)")
+    (ok! h "CREATE TABLE log (m text)")
+    (trigfn! h "note" "BEGIN INSERT INTO log VALUES (TG_NAME || ':' || TG_OP || ':' || TG_LEVEL); RETURN NULL; END")
+    (ok! h "CREATE TRIGGER s_ins AFTER INSERT ON t FOR EACH STATEMENT EXECUTE PROCEDURE note()")
+    (testing "once per statement, not once per row"
+      (ok! h "INSERT INTO t VALUES (1),(2),(3)")
+      (is (= [["s_ins:INSERT:STATEMENT"]] (rows (ok! h "SELECT m FROM log")))))
+    (testing "and it fires even when the statement matched no rows"
+      (ok! h "CREATE TRIGGER s_del AFTER DELETE ON t FOR EACH STATEMENT EXECUTE PROCEDURE note()")
+      (ok! h "DELETE FROM t WHERE i = 999")
+      (is (= [["s_del:DELETE:STATEMENT"]]
+             (rows (ok! h "SELECT m FROM log WHERE m LIKE 's_del%'")))))))
+
+(deftest after-row-triggers
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int)")
+    (ok! h "CREATE TABLE log (m text)")
+    ;; OLD is not defined for an INSERT trigger, so the body only reads
+    ;; NEW -- PostgreSQL raises on a reference to the other one too.
+    (trigfn! h "note" "BEGIN INSERT INTO log VALUES (TG_OP || ':' || NEW.i); RETURN NULL; END")
+    (ok! h "CREATE TRIGGER r_ins AFTER INSERT ON t FOR EACH ROW EXECUTE PROCEDURE note()")
+    (ok! h "INSERT INTO t VALUES (1),(2)")
+    ;; Once per row -- and the AFTER trigger's own return value is
+    ;; ignored, so RETURN NULL does not suppress anything.
+    (is (= [["INSERT:1"] ["INSERT:2"]] (rows (ok! h "SELECT m FROM log ORDER BY m"))))
+    (is (= [["1"] ["2"]] (rows (ok! h "SELECT i FROM t ORDER BY i"))))))
+
+(deftest before-update-sees-old-and-new
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int, s text)")
+    (ok! h "INSERT INTO t VALUES (1,'a'),(2,'b')")
+    (trigfn! h "mark" "BEGIN NEW.s := OLD.s || '>' || NEW.s; RETURN NEW; END")
+    (ok! h "CREATE TRIGGER tr BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE mark()")
+    (ok! h "UPDATE t SET s = 'z' WHERE i = 1")
+    (is (= [["1" "a>z"] ["2" "b"]] (rows (ok! h "SELECT i, s FROM t ORDER BY i"))))
+    (testing "and can cancel the update for a row"
+      (trigfn! h "veto" "BEGIN IF NEW.i = 2 THEN RETURN NULL; END IF; RETURN NEW; END")
+      (ok! h "CREATE TRIGGER tr0 BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE veto()")
+      (let [r (ok! h "UPDATE t SET s = 'q' WHERE i = 2")]
+        (is (= "UPDATE 0" (.commandTag r))))
+      (is (= [["2" "b"]] (rows (ok! h "SELECT i, s FROM t WHERE i = 2")))))))
+
+(deftest before-delete-can-veto
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int)")
+    (ok! h "INSERT INTO t VALUES (1),(2),(3)")
+    (trigfn! h "keep2" "BEGIN IF OLD.i = 2 THEN RETURN NULL; END IF; RETURN OLD; END")
+    (ok! h "CREATE TRIGGER tr BEFORE DELETE ON t FOR EACH ROW EXECUTE PROCEDURE keep2()")
+    (let [r (ok! h "DELETE FROM t")]
+      (is (= "DELETE 2" (.commandTag r))))
+    (is (= [["2"]] (rows (ok! h "SELECT i FROM t"))))))
+
+(deftest a-when-condition-gates-the-firing
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int, s text)")
+    (trigfn! h "stamp" "BEGIN NEW.s := 'big'; RETURN NEW; END")
+    (ok! h "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN (NEW.i > 5) EXECUTE PROCEDURE stamp()")
+    (ok! h "INSERT INTO t VALUES (1,'small'),(9,'x')")
+    ;; The body never runs for the row the condition excluded.
+    (is (= [["1" "small"] ["9" "big"]] (rows (ok! h "SELECT i, s FROM t ORDER BY i"))))))
+
+(deftest update-of-columns-only-fires-for-those-columns
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (a int, b int, n int)")
+    (ok! h "INSERT INTO t VALUES (1,1,0)")
+    (trigfn! h "bump" "BEGIN NEW.n := NEW.n + 1; RETURN NEW; END")
+    (ok! h "CREATE TRIGGER tr BEFORE UPDATE OF a ON t FOR EACH ROW EXECUTE PROCEDURE bump()")
+    (ok! h "UPDATE t SET b = 2")
+    (is (= [["0"]] (rows (ok! h "SELECT n FROM t"))) "b is not in the OF list")
+    (ok! h "UPDATE t SET a = 2")
+    (is (= [["1"]] (rows (ok! h "SELECT n FROM t"))) "a is")))

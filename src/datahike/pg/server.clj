@@ -2503,6 +2503,76 @@
           entity
           columns))
 
+(defn- matching-triggers
+  "The triggers of `table-name` for this event, timing and level, in
+   name order -- which is the order PostgreSQL fires them in.
+
+   `UPDATE OF a, b` only fires when one of those columns is in the
+   statement's target list; `changed` is that list, or nil when the
+   event has no column list to compare against."
+  [db table-name event timing level changed]
+  (filterv (fn [t]
+             (and (= level (:level t))
+                  (= timing (:timing t))
+                  (some #{event} (:events t))
+                  (or (nil? (:update-columns t))
+                      (nil? changed)
+                      (some (:update-columns t) changed))))
+           (table-triggers db table-name)))
+
+(defn- trigger-handler!
+  "The handler a trigger body runs its statements through, or a clean
+   refusal when there is none."
+  [table-name]
+  (or params/*statement-handler*
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "a trigger on \"" table-name
+                             "\" cannot run in this context")}))))
+
+(defn- trigger-ast [db t]
+  (let [fn-ent (first (functions-by-name+arity db (:function t) 0))]
+    (when-not fn-ent
+      (throw (errors/pg-error
+              :undefined-function
+              {:message (str "function " (:function t) "() does not exist")})))
+    (pl-parse/parse-body (:datahike.pg.function/body fn-ent))))
+
+(defn- tg-vars [t table-name event]
+  {"tg_name" (:name t)
+   "tg_when" (str/upper-case (name (:timing t)))
+   "tg_level" (str/upper-case (name (:level t)))
+   "tg_op" (str/upper-case (name event))
+   "tg_table_name" table-name
+   "tg_nargs" (count (:arguments t))
+   "tg_argv" (vec (:arguments t))})
+
+(defn- when-condition-holds?
+  "A trigger's `WHEN (…)`, evaluated with NEW and OLD in scope. A
+   trigger whose condition is false is not fired at all -- its body
+   never runs, so a side effect in it does not happen."
+  [handler t table-name new old]
+  (if-not (:when t)
+    true
+    (let [ast (pl-parse/parse-body
+               (str "BEGIN IF " (:when t) " THEN RETURN NEW; END IF; RETURN NULL; END"))]
+      (some? (:row (pl-exec/run-trigger handler ast
+                                        {:new (or new old) :old old
+                                         :tg {} :types {}}))))))
+
+(defn- run-one-trigger
+  "Fire `t` for one row. Returns the row the trigger produced -- which
+   for a BEFORE ROW trigger is what gets written, and nil to suppress
+   it. For AFTER and statement triggers PostgreSQL ignores the return
+   value, and so does the caller."
+  [db handler t table-name event new old]
+  (if-not (when-condition-holds? handler t table-name new old)
+    {:row new}
+    (pl-exec/run-trigger handler (trigger-ast db t)
+                         {:new new :old old
+                          :tg (tg-vars t table-name event)
+                          :types {}})))
+
 (defn- fire-row-triggers
   "Run the BEFORE ROW triggers of `table-name` over prepared INSERT
    candidates, in trigger-name order as PostgreSQL does.
@@ -2517,18 +2587,10 @@
    The body's statements run through the handler of the statement that
    reached here, so they see this transaction."
   [db table-name tx-data event]
-  (let [triggers (filterv (fn [t] (and (= :row (:level t))
-                                       (= :before (:timing t))
-                                       (some #{event} (:events t))))
-                          (table-triggers db table-name))]
+  (let [triggers (matching-triggers db table-name event :before :row nil)]
     (if (empty? triggers)
       tx-data
-      (let [handler params/*statement-handler*]
-        (when-not handler
-          (throw (errors/pg-error
-                  :feature-not-supported
-                  {:message (str "a trigger on \"" table-name
-                                 "\" cannot run in this context")})))
+      (let [handler (trigger-handler! table-name)]
         (into []
               (keep (fn [entry]
                       (if-not (map? entry)
@@ -2536,27 +2598,9 @@
                         (loop [[t & more] triggers, entity entry]
                           (if (nil? t)
                             entity
-                            (let [fn-ent (first (functions-by-name+arity db (:function t) 0))
-                                  _ (when-not fn-ent
-                                      (throw (errors/pg-error
-                                              :undefined-function
-                                              {:message (str "function " (:function t)
-                                                             "() does not exist")})))
-                                  ast (pl-parse/parse-body
-                                       (:datahike.pg.function/body fn-ent))
-                                  cols (row-entity->columns table-name entity)
-                                  {:keys [row]}
-                                  (pl-exec/run-trigger
-                                   handler ast
-                                   {:new cols
-                                    :tg {"tg_name" (:name t)
-                                         "tg_when" (str/upper-case (name (:timing t)))
-                                         "tg_level" (str/upper-case (name (:level t)))
-                                         "tg_op" (str/upper-case (name event))
-                                         "tg_table_name" table-name
-                                         "tg_nargs" (count (:arguments t))
-                                         "tg_argv" (vec (:arguments t))}
-                                    :types {}})]
+                            (let [cols (row-entity->columns table-name entity)
+                                  {:keys [row]} (run-one-trigger db handler t table-name
+                                                                 event cols nil)]
                               ;; nil means the trigger suppressed the row:
                               ;; no later trigger runs and nothing is
                               ;; written, as in PostgreSQL.
@@ -2564,6 +2608,156 @@
                                 nil
                                 (recur more (columns->row-entity db table-name entity row))))))))
                     tx-data))))))
+
+(defn- fire-statement-triggers!
+  "Statement-level triggers. They see no row -- NEW and OLD are not
+   defined for them -- and their return value is ignored. PostgreSQL
+   fires them even when the statement matched no rows, which is most of
+   what they are for."
+  [db table-name event timing]
+  (when-let [triggers (seq (matching-triggers db table-name event timing :statement nil))]
+    (let [handler (trigger-handler! table-name)]
+      (doseq [t triggers]
+        (when (when-condition-holds? handler t table-name nil nil)
+          (pl-exec/run-trigger handler (trigger-ast db t)
+                               {:tg (tg-vars t table-name event) :types {}})))))
+  nil)
+
+(defn- fire-after-row-triggers!
+  "AFTER ROW triggers, over the rows the statement actually wrote.
+   PostgreSQL ignores what they return; only their effects and their
+   errors matter, and an error still aborts the statement."
+  [db table-name event rows]
+  (when (seq rows)
+    (when-let [triggers (seq (matching-triggers db table-name event :after :row nil))]
+      (let [handler (trigger-handler! table-name)]
+        (doseq [{:keys [new old]} rows
+                t triggers]
+          (run-one-trigger db handler t table-name event new old)))))
+  nil)
+
+(defn- keep-row-deletes
+  "The eids whose BEFORE ROW DELETE triggers did not veto them. A
+   trigger returning NULL cancels the delete for that row, which is
+   what `RETURN NULL` means for a BEFORE DELETE trigger; `RETURN OLD`
+   lets it proceed."
+  [db table-name eids old-rows]
+  (let [triggers (matching-triggers db table-name :delete :before :row nil)]
+    (if (empty? triggers)
+      eids
+      (let [handler (trigger-handler! table-name)]
+        (keep (fn [eid]
+                (let [old (get old-rows eid)]
+                  (loop [[t & more] triggers]
+                    (cond
+                      (nil? t) eid
+                      (nil? (:row (run-one-trigger db handler t table-name
+                                                   :delete old old))) nil
+                      :else (recur more)))))
+              eids)))))
+
+(defn- update-rows-from-ops
+  "Group an UPDATE's tx-data by row: `{eid {:old {col v} :new {col v}
+   :base {attr v} :ops [...]}}`. OLD is what is stored, NEW is OLD with
+   the statement's assignments applied -- the same reconstruction
+   `check-updates-against-row-constraints!` does."
+  [db table-name tx-data]
+  (let [ops-by-eid (reduce (fn [acc op]
+                             (if (and (vector? op) (keyword? (first op)))
+                               (let [[verb eid attr val] op]
+                                 (update acc eid (fnil conj []) [verb attr val]))
+                               acc))
+                           {} tx-data)
+        cols (fn [m] (into {} (keep (fn [[k v]]
+                                      (when (and (keyword? k) (= table-name (namespace k))
+                                                 (not= "db-row-exists" (name k)))
+                                        [(name k) v])))
+                           m))]
+    (into {}
+          (keep (fn [[eid ops]]
+                  (when (integer? eid)
+                    (let [base (into {} (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
+                                     (d/datoms db :eavt eid))
+                          post (reduce (fn [m [verb attr val]]
+                                         (case verb
+                                           :db/add (assoc m attr val)
+                                           :db/retract (dissoc m attr)
+                                           m))
+                                       base ops)]
+                      [eid {:old (cols base) :new (cols post) :base base}]))))
+          ops-by-eid)))
+
+(defn- ops-for-row
+  "The tx-data that turns `base` into `row`, as PostgreSQL's UPDATE
+   would: an assignment per changed column, a retract for one the
+   trigger cleared."
+  [db table-name eid base row]
+  (let [want (into {} (keep (fn [[c v]]
+                              (when (some? v)
+                                [(keyword table-name c)
+                                 (try (#'stmt/coerce-insert-value
+                                       v (keyword table-name c) (dbi/-schema db) db)
+                                      (catch Exception _ v))])))
+                   row)
+        table-attr? (fn [a] (and (keyword? a) (= table-name (namespace a))
+                                 (not= "db-row-exists" (name a))))]
+    (into (vec (keep (fn [[a v]]
+                       (when (and (table-attr? a) (not= v (get base a)))
+                         [:db/add eid a v]))
+                     want))
+          (keep (fn [[a v]]
+                  (when (and (table-attr? a) (not (contains? want a)))
+                    [:db/retract eid a v])))
+          base)))
+
+(defn- apply-before-row-updates
+  "Run the BEFORE ROW UPDATE triggers. Returns `[tx-data rows]`, where
+   the tx-data is what should actually be written -- a trigger may have
+   changed the row or returned NULL to cancel the update for it -- and
+   `rows` is what the AFTER triggers will see."
+  [db table-name tx-data changed-columns]
+  (let [by-eid (update-rows-from-ops db table-name tx-data)
+        triggers (matching-triggers db table-name :update :before :row changed-columns)]
+    (if (or (empty? triggers) (empty? by-eid))
+      [tx-data (mapv (fn [[_ r]] (select-keys r [:old :new])) by-eid)]
+      (let [handler (trigger-handler! table-name)
+            outcomes (into {}
+                           (map (fn [[eid {:keys [old new base]}]]
+                                  [eid (loop [[t & more] triggers, row new]
+                                         (if (nil? t)
+                                           {:row row :base base :old old}
+                                           (let [{r :row} (run-one-trigger
+                                                           db handler t table-name
+                                                           :update row old)]
+                                             (if (nil? r)
+                                               {:row nil :base base :old old}
+                                               (recur more r)))))]))
+                           by-eid)
+            touched (set (keys by-eid))
+            ;; Ops for a row a trigger touched are rebuilt; anything not
+            ;; addressed to one of those rows passes through.
+            kept (filterv (fn [op]
+                            (not (and (vector? op) (keyword? (first op))
+                                      (contains? touched (second op)))))
+                          tx-data)]
+        [(into kept
+               (mapcat (fn [[eid {:keys [row base]}]]
+                         (when row (ops-for-row db table-name eid base row))))
+               outcomes)
+         (into [] (keep (fn [[_ {:keys [row old]}]]
+                          (when row {:old old :new row})))
+               outcomes)]))))
+
+(defn- entity-columns
+  "A stored row as `{column value}`, for OLD."
+  [db table-name eid]
+  (when-let [m (d/pull db '[*] eid)]
+    (into {}
+          (keep (fn [[k v]]
+                  (when (and (keyword? k) (= table-name (namespace k))
+                             (not= "db-row-exists" (name k)))
+                    [(name k) v])))
+          m)))
 
 (defn- prepare-insert-candidates
   "Resolve and validate INSERT candidates in PostgreSQL source order.
@@ -2678,6 +2872,7 @@
           ;; materialised -- and may rewrite or suppress it, so they run
           ;; ahead of the constraint pass, as ExecBRInsertTriggers does
           ;; ahead of ExecConstraints.
+          _ (fire-statement-triggers! db table-name :insert :before)
           fired (fire-row-triggers db table-name (:tx-data prepared) :insert)
           parsed (note-suppressed parsed (:tx-data prepared) fired)
           tx-data (-> fired
@@ -2727,7 +2922,12 @@
         (do
           (when speculative?
             (transact-speculative-report! conn db tx-report))
-          (empty-result (str "INSERT 0 " (insert-affected-count parsed))))))
+          (do (fire-after-row-triggers!
+               (d/db conn) table-name :insert
+               (mapv (fn [e] {:new (row-entity->columns table-name e)})
+                     (filter map? tx-data)))
+              (fire-statement-triggers! (d/db conn) table-name :insert :after)
+              (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
 
@@ -2868,12 +3068,29 @@
           cascade-eids (collect-fk-cascade-retractions! db table eids)
           cascade-tx (when (seq cascade-eids)
                        (mapv (fn [e] [:db/retractEntity e]) cascade-eids))
+          ;; BEFORE ROW sees the row as OLD and may veto the delete by
+          ;; returning NULL; the rows it kept are what is retracted and
+          ;; what AFTER ROW then sees.
+          _ (fire-statement-triggers! db table :delete :before)
+          old-rows (into {} (map (fn [e] [e (entity-columns db table e)])) eids)
+          kept (vec (keep-row-deletes db table eids old-rows))
+          suppressed (- (count eids) (count kept))
+          tx-data (if (zero? suppressed)
+                    tx-data
+                    (filterv (fn [op]
+                               (or (not (vector? op))
+                                   (not= :db/retractEntity (first op))
+                                   (some #{(second op)} kept)))
+                             tx-data))
           full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))
           full-tx (tx-wrap full-tx)]
       (when (seq full-tx)
         (transact-recorded! conn full-tx))
+      (fire-after-row-triggers! db table :delete
+                                (mapv (fn [e] {:old (get old-rows e)}) kept))
+      (fire-statement-triggers! db table :delete :after)
       (or returning-result
-          (empty-result (str "DELETE " (count eids)))))
+          (empty-result (str "DELETE " (count kept)))))
     (catch Exception e
       (classified-error "DELETE error: " e))))
 
@@ -3223,6 +3440,13 @@
           _ (check-updates-against-row-constraints!
              db table (or (:ns parsed) table) tx-data)
           _ (enforce-fk-restrict-on-update! db table tx-data)
+          _ (fire-statement-triggers! db table :update :before)
+          changed-columns (set (keep (fn [op]
+                                       (when (and (vector? op) (= :db/add (first op))
+                                                  (keyword? (nth op 2 nil)))
+                                         (name (nth op 2))))
+                                     tx-data))
+          [tx-data after-rows] (apply-before-row-updates db table tx-data changed-columns)
           tx-data (tx-wrap tx-data)
           returning (:returning parsed)
           tx-report (when (seq tx-data)
@@ -3237,8 +3461,14 @@
               result (build-returning-result returning db-after db eids table (:alias parsed)
                                              (:schema db-after) :update)]
           (when (seq tx-data) (transact-speculative-report! conn db tx-report))
+          (fire-after-row-triggers! db table :update after-rows)
+          (fire-statement-triggers! db table :update :after)
           result)
-        (empty-result (str "UPDATE " (count eids)))))
+        (do (fire-after-row-triggers! db table :update after-rows)
+            (fire-statement-triggers! db table :update :after)
+            ;; A row a BEFORE trigger cancelled was not updated, so it is
+            ;; not counted -- as PostgreSQL counts what it wrote.
+            (empty-result (str "UPDATE " (count after-rows))))))
     (catch Exception e
       (classified-error "UPDATE error: " e))))
 
@@ -7824,6 +8054,7 @@
               ;; Same point as the autocommit path: BEFORE ROW triggers
               ;; see the prepared candidate and may rewrite or suppress
               ;; it.
+              _ (fire-statement-triggers! spec-db table-name :insert :before)
               fired (fire-row-triggers spec-db table-name (:tx-data prepared0) :insert)
               parsed (note-suppressed parsed (:tx-data prepared0) fired)
               prepared (assoc prepared0 :tx-data fired)
@@ -7901,7 +8132,13 @@
                                   (assoc :begin-max-tx (:max-tx durable-db)))
                                 (update :eid->tempid merge new-tempids))))
           (or returning-result
-              (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
+              (do (fire-after-row-triggers!
+                   (:speculative-db @tx-state) table-name :insert
+                   (mapv (fn [e] {:new (row-entity->columns table-name e)})
+                         (filter map? (:tx-data prepared))))
+                  (fire-statement-triggers! (:speculative-db @tx-state)
+                                            table-name :insert :after)
+                  (empty-result (str "INSERT 0 " (insert-affected-count parsed))))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
@@ -7980,6 +8217,14 @@
               _ (check-updates-against-row-constraints!
                  spec-db (:table parsed) (or (:ns parsed) (:table parsed)) tx-data)
               _ (enforce-fk-restrict-on-update! spec-db (:table parsed) tx-data)
+              _ (fire-statement-triggers! spec-db (:table parsed) :update :before)
+              changed-columns (set (keep (fn [op]
+                                           (when (and (vector? op) (= :db/add (first op))
+                                                      (keyword? (nth op 2 nil)))
+                                             (name (nth op 2))))
+                                         tx-data))
+              [tx-data after-rows] (apply-before-row-updates
+                                    spec-db (:table parsed) tx-data changed-columns)
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-report (dc/with spec-db tx-data)
               _ (unique-constraints/validate-report! spec-report)
@@ -8005,7 +8250,11 @@
                             (-> ts
                                 (update :tx-buffer into (guard-catalog-tx commit-tx-data))
                                 (assoc :speculative-db db-after))))
-          (or returning-result (empty-result (str "UPDATE " (count eids)))))
+          (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
+                                    :update after-rows)
+          (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
+                                    :update :after)
+          (or returning-result (empty-result (str "UPDATE " (count after-rows)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
@@ -8039,6 +8288,12 @@
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
               _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
+              _ (fire-statement-triggers! spec-db (:table parsed) :delete :before)
+              old-rows (into {} (map (fn [e] [e (entity-columns spec-db (:table parsed) e)]))
+                             eids)
+              ;; A BEFORE ROW DELETE trigger returning NULL cancels the
+              ;; delete for that row.
+              eids (vec (keep-row-deletes spec-db (:table parsed) eids old-rows))
               returning-result (when-let [returning (:returning parsed)]
                                  (build-returning-result returning spec-db spec-db eids
                                                          (:table parsed) (:alias parsed)
@@ -8066,6 +8321,10 @@
                                   (assoc :tx-buffer (into buffer (guard-catalog-tx commit-tx-data))
                                          :speculative-db (:db-after spec-report))
                                   (update :eid->tempid #(apply dissoc % inserted-eids))))))
+          (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed) :delete
+                                    (mapv (fn [e] {:old (get old-rows e)}) eids))
+          (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
+                                    :delete :after)
           (or returning-result (empty-result (str "DELETE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
