@@ -50,9 +50,11 @@ Four things the regression residual named as the first thing blocking a file.
 
 **`point(x, y)`.** A point *literal* already worked; only the constructor was missing. float8, so `point(1.0,2.0)` prints `(1,2)`.
 
-### Three regression files are environment-conditional
+### The four `collate.*` files were never in scope
 
-`collate.icu.utf8` needs ICU collations compiled into the server and the other two need a specific operating system's locales; PostgreSQL schedules them conditionally for that reason. Answering them correctly means running their own skip test and quitting, which reproduces almost none of an expected output recorded on a server that did not skip — `collate.icu.utf8` went from 63.6% to 0.2% precisely *because* the encoding function started working. They are out of scope now, which leaves 176 application-facing files.
+`scope.edn` has listed them under `:platform-collation-matrix` all along — their expected output is a property of the server build, not of SQL. The gate's scope parser did not allow a **dot** in a test name, so the exclusion silently matched nothing and all four were being measured.
+
+It surfaced as an apparent catastrophe: `collate.icu.utf8` fell from 63.6% to 0.2% precisely *because* `getdatabaseencoding()` started working — the file now runs its own skip test, finds no ICU collations and quits, against an expected output recorded on a server that did not skip. Fixing the parser leaves 176 application-facing files.
 
 The gate also recycles the server every 30 files: the harness bootstraps a database per file and the server keeps them, so a full run had grown it to 7GB and starved the machine.
 

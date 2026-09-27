@@ -42,17 +42,7 @@
     "sysviews" "test_setup"}}
 
  :out-of-scope
- {;; Their expected output is a property of the SERVER BUILD, not of
-  ;; SQL: `collate.icu.utf8` needs ICU collations compiled in, and the
-  ;; other two need a specific operating system's locales. PostgreSQL
-  ;; schedules them conditionally for the same reason. Answering them
-  ;; correctly means running their own skip test and quitting, which
-  ;; reproduces almost none of an expected output recorded on a server
-  ;; that did not skip.
-  :environment-conditional
-  #{"collate.icu.utf8" "collate.linux.utf8" "collate.windows.win1252"}
-
-  :physical-access-methods
+ {:physical-access-methods
   #{"brin" "brin_bloom" "brin_multi" "btree_index" "create_am"
     "create_index_spgist" "gin" "gist" "hash_func" "hash_index"
     "index_including" "index_including_gist" "indexing" "spgist"}
@@ -83,6 +73,12 @@
   :postgres-internal-sanity
   #{"oidjoins" "sanity_check"}
 
+  ;; Their expected output is a property of the SERVER BUILD, not of
+  ;; SQL: `collate.icu.utf8` needs ICU collations compiled in and the
+  ;; others need a particular operating system's locales, which is why
+  ;; PostgreSQL schedules them conditionally too. Answering them
+  ;; correctly means running their own skip test and quitting, against
+  ;; an expected output recorded on a server that did not skip.
   :platform-collation-matrix
   #{"collate.icu.utf8" "collate.linux.utf8" "collate.utf8"
     "collate.windows.win1252"}}}
