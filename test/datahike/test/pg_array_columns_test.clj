@@ -405,3 +405,36 @@
               (is (= 1 (long (nth vs 0))))
               (is (nil? (nth vs 1)))
               (is (= 3 (long (nth vs 2)))))))))))
+
+(deftest an-array-column-write-runs-the-array-input-function
+  ;; The INSERT coercion passed any `{`-prefixed string through
+  ;; UNPARSED, so an `int[]` column accepted `{1,abc}`, `{{1,2},{3}}`
+  ;; and `{1,2` and stored them verbatim -- while `'{1,abc}'::int[]`
+  ;; rejected all three. The element type is known at that branch and
+  ;; was simply not used.
+  ;;
+  ;; COPY deferred to the same branch, in a comment stating an
+  ;; invariant that was not true ("the array column path in
+  ;; coerce-insert-value will parse it"), so COPY into an array column
+  ;; was unvalidated as well. One fix closes both.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's, including SQLSTATE
+  ;; 22P02.
+  (with-conn
+    (fn [c]
+      (exec! c "CREATE TABLE tav (a int[])")
+      (testing "malformed array text is refused, not stored"
+        (doseq [bad ["{1,abc}" "{{1,2},{3}}" "{1,2"]]
+          (let [state (try (exec! c (str "INSERT INTO tav VALUES ('" bad "')")) nil
+                           (catch java.sql.SQLException e (.getSQLState e)))]
+            (is (= "22P02" state) (str bad " was accepted")))))
+      (testing "the write and the cast agree, which is the point"
+        (is (= (try (exec! c "INSERT INTO tav VALUES ('{1,abc}')") nil
+                    (catch java.sql.SQLException e (.getSQLState e)))
+               (try (query-rows c "SELECT '{1,abc}'::int[]") nil
+                    (catch java.sql.SQLException e (.getSQLState e))))))
+      (testing "a well-formed array still goes in, canonicalised"
+        (exec! c "INSERT INTO tav VALUES ('{1,2}')")
+        (is (= [["{1,2}"]] (query-rows c "SELECT a FROM tav"))))
+      (testing "and nothing malformed survived"
+        (is (= [["1"]] (query-rows c "SELECT count(*) FROM tav")))))))

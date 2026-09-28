@@ -190,6 +190,35 @@
 ;; Unqualified aliases so the copied body reads naturally — same
 ;; pattern used by ctx / ddl / catalog / expr.
 (def ^:private unquote-ident params/unquote-ident)
+
+(def ^:private ranking-window-fns
+  #{"row_number" "rank" "dense_rank" "ntile" "percent_rank" "cume_dist"
+    "lag" "lead"})
+
+(defn- window-analytic?
+  "True when an AST node is a WINDOW function -- `f(...) OVER (...)` --
+   as opposed to `agg(x) FILTER (WHERE ...)` or an ordered-set
+   aggregate's WITHIN GROUP.
+
+   JSqlParser's AnalyticType says which of the three shapes it is.
+   Inferring it from the PRESENCE of a partition / order / frame
+   instead misses the empty window: `sum(i) OVER ()` has none of them.
+
+   One definition, because two places need the same answer: the
+   projection, which emits the window spec, and ORDER BY, which has to
+   recognise a key whose value only exists after the window pass."
+  [expr]
+  (and (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
+       (let [^net.sf.jsqlparser.expression.AnalyticExpression ae expr
+             analytic-type (str (.getType ae))]
+         (and (not= "WITHIN_GROUP" analytic-type)
+              (or (= "OVER" analytic-type)
+                  (seq (.getPartitionExpressionList ae))
+                  (seq (.getOrderByElements ae))
+                  (.getWindowElement ae)
+                  (contains? ranking-window-fns
+                             (expr/resolution-name (.getName ae))))))))
+
 (def ^:private ->ParamRef params/->ParamRef)
 
 ;; ---------------------------------------------------------------------------
@@ -2539,6 +2568,13 @@
       [new-rows new-aliases new-oids])
     [rows (:find-aliases parsed) nil]))
 
+(def row-bindings
+  "In expr now: the subquery evaluator below it has to apply HAVING with
+   the same bindings the top level and the derived tables use."
+  expr/row-bindings)
+
+(def apply-having expr/apply-having)
+
 (defn materialize-set-op!
   "Run a SELECT (PlainSelect, SetOperationList, or VALUES) and persist its rows
    under `target-name/<col>` in a speculative db. Returns the same
@@ -2628,6 +2664,7 @@
          sub-oids (:select-item-oids sub-parsed)
          q-fn d/q
          run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count
+                                 sql-order-by having
                                  project-set project-order-by project-limit project-offset]
                           :as p}]
                       ;; A body that reads a `$n` is run HERE, at parse
@@ -2660,6 +2697,26 @@
                                             {:feature "derived SELECT ordered by a set-returning function"})))
                                 raw (if (seq project-set)
                                       (apply-project-set raw project-set)
+                                      raw)
+                                ;; And its own HAVING decides which GROUPS
+                                ;; survive. It was applied only at the top
+                                ;; level, so `(SELECT grp FROM a GROUP BY
+                                ;; grp HAVING COUNT(id) > 3)` gave every
+                                ;; group. It has to run BEFORE the sort and
+                                ;; the limit, since it changes which rows
+                                ;; there are to order and count.
+                                raw (apply-having raw having query in-args)
+                                ;; A derived table's OWN `ORDER BY` decides
+                                ;; which rows its `LIMIT` keeps. Datalog
+                                ;; results are unordered, so taking n off
+                                ;; the raw relation returned an arbitrary
+                                ;; row: `(SELECT id FROM a ORDER BY id DESC
+                                ;; LIMIT 1)` answered 8 out of 62, not the
+                                ;; maximum. Sorted by the SAME comparator
+                                ;; the top level uses -- a second one would
+                                ;; be free to disagree about NULLs.
+                                raw (if (seq sql-order-by)
+                                      (sort (fns/null-safe-order-cmp sql-order-by) raw)
                                       raw)
                                 raw (cond->> raw
                                       sql-offset (drop sql-offset)
@@ -3429,71 +3486,12 @@
                    :else x))]
     [(vec (remove binding? clauses)) (inline form)]))
 
-(defn compound-projection-indices
-  "Indices that turn the physical compound-projection shape into its SQL
-   SELECT-list shape. Hidden aggregate inputs are removed and deferred
-   expressions are restored to the positions recorded while lowering."
-  [aliases compound-exprs]
-  (let [visible-indices (into []
-                              (keep-indexed
-                               (fn [i a]
-                                 (when-not (and (string? a)
-                                                (.startsWith ^String a "__compound_"))
-                                   i)))
-                              aliases)
-        positions (mapv :out-pos compound-exprs)
-        n-visible (count visible-indices)
-        reorder? (and (every? some? positions)
-                      (= (count positions) (count (distinct positions)))
-                      (every? #(< -1 % n-visible) positions))]
-    (if reorder?
-      (let [base-count (- n-visible (count compound-exprs))
-            compound-at (into {}
-                              (map-indexed (fn [i pos] [pos (+ base-count i)]))
-                              positions)
-            visible-order
-            (first
-             (reduce (fn [[order next-base] pos]
-                       (if-let [compound-idx (get compound-at pos)]
-                         [(conj order compound-idx) next-base]
-                         [(conj order next-base) (inc next-base)]))
-                     [[] 0]
-                     (range n-visible)))]
-        (mapv #(nth visible-indices %) visible-order))
-      visible-indices)))
+(def compound-projection-indices
+  "In expr now, with apply-compound-projections: the subquery evaluator
+   below this namespace needs the same reconstruction."
+  expr/compound-projection-indices)
 
-(defn apply-compound-projections
-  "Evaluate deferred SELECT projection forms and remove their hidden inputs.
-
-   Shared by the normal SELECT executor and INSERT ... SELECT, which must
-   consume the same visible row shape. Returns [rows aliases]."
-  [results aliases query in-args compound-exprs]
-  (if (seq compound-exprs)
-    (let [row-bindings
-          (fn [row]
-            (let [rv (if (sequential? row) (vec row) [row])]
-              (into (into {} (keep-indexed (fn [i e]
-                                             (when (symbol? e)
-                                               [e (nth rv i nil)])))
-                          (:find query))
-                    (zipmap (rest (:in query)) in-args))))
-          new-results
-          (mapv (fn [row]
-                  (let [rv (if (sequential? row) (vec row) [row])
-                        binds (row-bindings row)]
-                    (reduce (fn [r {:keys [form slots]}]
-                              (let [b (reduce (fn [m [sym idx]]
-                                                (assoc m sym (nth r idx nil)))
-                                              binds slots)
-                                    val (expr/interpret-form form b)]
-                                (conj r (if (= :__null__ val) nil val))))
-                            rv compound-exprs)))
-                results)
-          new-aliases (into (vec aliases) (map :alias compound-exprs))
-          visible-indices (compound-projection-indices new-aliases compound-exprs)]
-      [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
-       (mapv #(nth new-aliases %) visible-indices)])
-    [results aliases]))
+(def apply-compound-projections expr/apply-compound-projections)
 
 (defn- defer-compound-projections
   "Build inert per-row projection markers and remove their hidden inputs.
@@ -4915,8 +4913,7 @@
                       ordered-set-fn? (contains? #{"percentile_cont"
                                                    "percentile_disc"
                                                    "mode"} fname)
-                      ranking-fns #{"row_number" "rank" "dense_rank" "ntile"
-                                    "percent_rank" "cume_dist" "lag" "lead"}
+                      ranking-fns ranking-window-fns
                       ;; JSqlParser's AnalyticType says which of the three
                       ;; shapes this is: OVER (a window function),
                       ;; FILTER_ONLY (`agg(x) FILTER (WHERE …)`), or
@@ -4926,10 +4923,7 @@
                       ;; none of them, so it fell through to the plain
                       ;; aggregate path and raised "column must appear in the
                       ;; GROUP BY clause".
-                      is-window? (and (not within-group?)
-                                      (or (= "OVER" analytic-type)
-                                          (seq partition-list) (seq order-by-list)
-                                          window-elem (contains? ranking-fns fname)))]
+                      is-window? (window-analytic? expr)]
                   (reject-ordered-set-boundary! fname agg-sym inner-expr within-group?)
                   (cond
                     ;; Ordered-set aggregate via WITHIN GROUP — translate
@@ -5018,13 +5012,40 @@
                                                    nulls (condp = (str (.getNullOrdering obe))
                                                            "NULLS_FIRST" :first
                                                            "NULLS_LAST"  :last
-                                                           nil)]
-                                               (when-not (some #{v} @find-elements)
-                                                 (swap! find-elements conj v)
-                                                 (swap! find-aliases conj (str "__win_ord_" (count @find-elements))))
-                                               [(.indexOf ^java.util.List @find-elements v)
-                                                (if asc? :asc :desc)
-                                                nulls]))
+                                                           nil)
+                                               ;; An AGGREGATE as a window's sort
+                                               ;; key -- `RANK() OVER (ORDER BY
+                                               ;; COUNT(id) DESC)` -- translates to
+                                               ;; an aggregate MARKER map, not a var
+                                               ;; or a form. Pushing that into :find
+                                               ;; gave Datahike `Cannot parse :find`
+                                               ;; at the client, the same failure the
+                                               ;; comment below records for COUNT(*).
+                                               ;; The aggregate the query already
+                                               ;; projects IS the key, so reuse its
+                                               ;; column rather than adding one.
+                                                   agg-idx
+                                                   (when (and (map? v) (:aggregate v)
+                                                              (instance? Function
+                                                                         (.getExpression obe)))
+                                                     (match-aggregate-index
+                                                      ^Function (.getExpression obe)
+                                                      @find-elements @find-aliases))
+                                                   _ (when (and (map? v) (nil? agg-idx))
+                                                       (throw (errors/pg-error
+                                                               :feature-not-supported
+                                                               {:feature (str "a window ordered by an"
+                                                                              " aggregate the query does"
+                                                                              " not project")})))]
+                                               (if agg-idx
+                                                 [agg-idx (if asc? :asc :desc) nulls]
+                                                 (do
+                                                   (when-not (some #{v} @find-elements)
+                                                     (swap! find-elements conj v)
+                                                     (swap! find-aliases conj (str "__win_ord_" (count @find-elements))))
+                                                   [(.indexOf ^java.util.List @find-elements v)
+                                                    (if asc? :asc :desc)
+                                                    nulls]))))
                                            order-by-list))
                           ;; The function's own arguments. `.getExpression`
                           ;; is the first, `.getOffset` the second and
@@ -5690,6 +5711,37 @@
                                                          (str (.getExpression selected)))
                                                   i))
                                               (map-indexed vector select-items))
+                                        ;; `ORDER BY rank() OVER w` (the expression
+                                        ;; repeated) and `ORDER BY r` (its output
+                                        ;; alias) name the same window value. The alias
+                                        ;; is deliberately absent from `find-aliases`
+                                        ;; -- the server appends it after computing the
+                                        ;; window -- so nothing here could resolve it
+                                        ;; and it answered `column "r" does not exist`.
+                                        matching-window-out-pos
+                                        (or
+                                         ;; The n-th window in the target list owns the
+                                         ;; n-th spec. Counting them is what makes this
+                                         ;; independent of whether a SELECT-list index
+                                         ;; happens to equal an output position.
+                                         (when matching-select-idx
+                                           (let [win-at? (fn [^SelectItem si]
+                                                           (window-analytic?
+                                                            (.getExpression si)))]
+                                             (when (win-at? (nth select-items
+                                                                 matching-select-idx))
+                                               (let [n (count (filter win-at?
+                                                                      (take matching-select-idx
+                                                                            select-items)))]
+                                                 (:out-pos (nth @window-specs n nil))))))
+                                         (when (and (instance? Column expr)
+                                                    (nil? (.getTable ^Column expr)))
+                                           (let [n (unquote-ident
+                                                    (.getColumnName ^Column expr))]
+                                             (some (fn [sp]
+                                                     (when (= n (:alias sp))
+                                                       (:out-pos sp)))
+                                                   @window-specs))))
                                         ;; Check if ORDER BY references a SELECT alias
                                         v (cond
                                             ;; A bare integer constant is a 1-based
@@ -5720,6 +5772,22 @@
                                                                 {:error :invalid-column-reference
                                                                  :sqlstate "42P10"})))
                                               (nth fe-snap (dec pos)))
+
+                                            ;; A WINDOW function in ORDER BY. Its value
+                                            ;; does not exist yet: the window pass runs
+                                            ;; over the finished rows, above this sort.
+                                            ;; Indexing `fe-snap` by a SELECT-list
+                                            ;; position was wrong twice over -- the two
+                                            ;; lists only line up when nothing in the
+                                            ;; target list is a window function, and
+                                            ;; when they do not it either sorted by an
+                                            ;; unrelated column (`ORDER BY rank() OVER w`
+                                            ;; silently ordering by salary) or ran off
+                                            ;; the end (`IndexOutOfBoundsException`).
+                                            ;; Marked here, applied after the window
+                                            ;; pass instead.
+                                            (some? matching-window-out-pos)
+                                            {:post-window matching-window-out-pos}
 
                                             (instance? Column expr)
                                             (let [col-name (.getColumnName ^Column expr)
@@ -6837,6 +6905,27 @@
                                                   (contains? nullable-vars v)))
                                            order-by-spec)))
         project-out-vars (into #{} (map :out-var) project-set-specs)
+        ;; `ORDER BY` naming a window function: the sort has to wait for
+        ;; the window pass, and once ONE key does, they all must -- a
+        ;; two-key sort cannot be split across two stages and still mean
+        ;; what SQL says. Every key is re-expressed as a position in the
+        ;; finished, interleaved output row.
+        post-window-order-by
+        (when (some (fn [[v]] (and (map? v) (:post-window v))) order-by-spec)
+          (vec (mapcat
+                (fn [[v dir nulls]]
+                  (if (and (map? v) (:post-window v))
+                    [(:post-window v) dir nulls]
+                    (let [idx (.indexOf ^java.util.List find-elems-vec v)]
+                      (when (neg? idx)
+                        (throw (errors/pg-error
+                                :feature-not-supported
+                                {:feature (str "ORDER BY a key that is not in the "
+                                               "select list, alongside a window "
+                                               "function")})))
+                      [(window/base-output-position idx @window-specs) dir nulls])))
+                order-by-spec)))
+        order-by-spec (when-not post-window-order-by order-by-spec)
         [find-elems-vec hidden-count order-by-flat sql-order-by project-order-by]
         (if order-by-spec
           (let [;; seq? covers an aggregate form contributed by ORDER BY that
@@ -7174,6 +7263,7 @@
              :compound-exprs  (when (seq @compound-exprs) @compound-exprs)
              ;; Window function specs for server-side post-processing
              :window-specs    (when (seq @window-specs) @window-specs)
+             :post-window-order-by post-window-order-by
              ;; Correlated scalar subqueries (slice A): each is run per outer
              ;; row by exec-select, which binds the correlation columns
              ;; (whose Datalog result indices are in :corr-col->idx) into
@@ -7773,9 +7863,17 @@
           (cond
             (pg-arr/array? val)
             (pg-arr/to-pg-text val)
+            ;; Array TEXT, which still has to go through the array
+            ;; input function. Passing it through unparsed stored
+            ;; `{1,abc}` in an `int[]`, and `{{1,2},{3}}` and `{1,2`
+            ;; too -- while `'{1,abc}'::int[]` rejected all three. The
+            ;; element type is known right here (`elem-kw`) and was
+            ;; simply not used on this branch; `from-pg-text` raises on
+            ;; malformed input and coerces each element, which is what
+            ;; the cast path has always done.
             (and (string? val)
                  (clojure.string/starts-with? (clojure.string/triml val) "{"))
-            val
+            (pg-arr/to-pg-text (pg-arr/from-pg-text val elem-kw))
             (sequential? val)
             (pg-arr/to-pg-text (pg-arr/array elem-kw (vec val)))
             :else
@@ -7950,6 +8048,33 @@
                (.toInstant (.atStartOfDay ^java.time.LocalDate d
                                           java.time.ZoneOffset/UTC)))
               d))
+          ;; …and the same for `timestamp` / `timestamptz`, which are
+          ;; the branch that USED to catch everything here. The `date`
+          ;; case above was routed through the cast and its sibling was
+          ;; left on the lenient timestamp parser, so the two spellings
+          ;; still disagreed for every other temporal type: `INSERT
+          ;; INTO t(ts) VALUES ('2024-02-30')` stored 2024-02-29 while
+          ;; `'2024-02-30'::timestamp` rejected it, and a named zone in
+          ;; a timestamptz literal was refused on write and applied on
+          ;; cast.
+          (and (= vtype :db.type/instant) (string? val)
+               (contains? #{"timestamp" "timestamptz"} pg-type))
+          (let [t (sql-cast/cast-scalar val pg-type
+                                        {:explicit? true
+                                         :parse-timestamp expr/parse-timestamp-string})]
+            (cond
+              (instance? java.util.Date t) t
+              (instance? java.time.LocalDateTime t)
+              (java.util.Date/from (.toInstant ^java.time.LocalDateTime t
+                                               java.time.ZoneOffset/UTC))
+              (instance? java.time.LocalDate t)
+              (java.util.Date/from (.toInstant (.atStartOfDay ^java.time.LocalDate t
+                                                              java.time.ZoneOffset/UTC)))
+              ;; The cast returns its input when nothing parsed; that is
+              ;; not a timestamp, and storing it would be the passthrough
+              ;; all over again.
+              (string? t) (sql-cast/bad-timestamp! val (= "timestamptz" pg-type))
+              :else t))
           (and (= vtype :db.type/instant) (string? val))
           (expr/parse-timestamp-string val)
           (and (= vtype :db.type/instant) (instance? java.util.Date val)) val

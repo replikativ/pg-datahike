@@ -286,3 +286,214 @@
       (testing "while AT TIME ZONE keeps what was written -- PostgreSQL differs"
         (is (re-find #"time zone \"Nonsense/Zone\" not recognized"
                      (str (second (err-of c "SELECT now() AT TIME ZONE 'Nonsense/Zone'")))))))))
+
+(deftest a-timestamp-write-and-cast-give-the-same-verdict
+  ;; The `date` branch of the INSERT coercion was routed through the
+  ;; cast and its `timestamp`/`timestamptz` SIBLING, directly below it,
+  ;; was left on the lenient parser. So the two spellings still
+  ;; disagreed for every other temporal type.
+  ;;
+  ;; Underneath that, `parse-timestamp-string` built its formatters
+  ;; with `ofPattern`, whose default ResolverStyle/SMART ROLLS an
+  ;; impossible field instead of refusing it -- the same defect
+  ;; `parse-date-strict` exists to fix, never applied here. And when
+  ;; nothing parsed at all, the cast returned its own input: a value
+  ;; that is not a timestamp, indistinguishable from one that is.
+  ;;
+  ;; Expectations, including which SQLSTATE, are a PostgreSQL 17
+  ;; oracle's: impossible FIELDS are 22008, text that is not a
+  ;; timestamp at all is 22007.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tw (ts timestamp, tz timestamptz)")
+    (testing "an impossible date is refused on WRITE, not rolled"
+      (doseq [s ["2024-02-30" "2023-02-29" "2024-04-31"]]
+        (let [[state msg] (err-of c (str "INSERT INTO tw(ts) VALUES ('" s "')"))]
+          (is (= "22008" state) (str s " => " msg)))))
+    (testing "and on CAST, with the same message"
+      (doseq [s ["2024-02-30" "2023-02-29" "2024-04-31"]]
+        (is (= (second (err-of c (str "INSERT INTO tw(ts) VALUES ('" s "')")))
+               (second (err-of c (str "SELECT '" s "'::timestamp"))))
+            s)))
+    (testing "text that is not a timestamp is 22007, and is never stored as itself"
+      (let [[state msg] (err-of c "SELECT 'nonsense'::timestamp")]
+        (is (= "22007" state) msg)
+        (is (re-find #"invalid input syntax for type timestamp" (str msg)))))
+    (testing "a named zone is applied on write, as it is on cast"
+      (exec! c "INSERT INTO tw(tz) VALUES ('1997-02-10 17:32:01 America/New_York')")
+      (is (= "1997-02-10 22:32:01+00"
+             (one c "SELECT tz FROM tw WHERE tz IS NOT NULL"))))
+    (testing "and an ordinary timestamp still goes in"
+      (exec! c "INSERT INTO tw(ts) VALUES ('2024-02-29 10:00:00')")
+      (is (= "2024-02-29 10:00:00"
+             (one c "SELECT ts FROM tw WHERE ts IS NOT NULL"))))))
+
+;; ============================================================================
+;; Reading a temporal value FROM text
+;; ============================================================================
+
+(deftest a-month-name-names-a-month-wherever-it-falls
+  ;; PostgreSQL's datetime input tokenises before it interprets
+  ;; (`datetktbl` in datetime.c), so the month name is recognised in
+  ;; any position and the separator does not matter. Matching that
+  ;; with a list of patterns means missing one of the spellings, and
+  ;; every one of these was `invalid input syntax` here.
+  (with-open [c (jdbc)]
+    (doseq [s ["Jan 15, 2024" "January 15, 2024" "Jan 15 2024" "15-JAN-2024"
+               "15 Jan 2024" "2024-Jan-15" "Jan-15-2024"]]
+      (is (= "2024-01-15 00:00:00" (one c (str "SELECT '" s "'::timestamp::text")))
+          s))
+    (is (= "2024-01-15 10:20:30"
+           (one c "SELECT 'Jan 15, 2024 10:20:30'::timestamp::text")))
+    (is (= "2024-01-15" (one c "SELECT 'Jan 15, 2024'::date::text")))))
+
+(deftest an-impossible-day-spelled-with-a-month-name-is-out-of-range
+  ;; The 22008/22007 split is about the SHAPE of the input, and the
+  ;; shape test only knew digits-and-separators: `Feb 30, 2024` names a
+  ;; real month, so it is a field out of RANGE, exactly as `2024-02-30`
+  ;; is -- while `Foo 30, 2024` is not a date at all.
+  (with-open [c (jdbc)]
+    (is (thrown-with-msg?
+         Exception #"date/time field value out of range: \"Feb 30, 2024\""
+         (one c "SELECT 'Feb 30, 2024'::timestamp")))
+    (is (thrown-with-msg?
+         Exception #"date/time field value out of range: \"Feb 30, 2024\""
+         (one c "SELECT 'Feb 30, 2024'::date")))
+    (is (thrown-with-msg?
+         Exception #"invalid input syntax for type timestamp: \"Foo 30, 2024\""
+         (one c "SELECT 'Foo 30, 2024'::timestamp")))))
+
+(deftest copy-reads-a-timestamp-through-the-same-input-function-as-a-cast
+  ;; COPY kept a THIRD temporal parser, beside cast.clj's and
+  ;; expr.clj's, and it knew fewer spellings than either: `COPY`
+  ;; rejected `20240115` while `'20240115'::timestamp` took it.
+  ;; PostgreSQL has no such seam -- both call `timestamp_in` -- so
+  ;; these assert the two paths agree rather than asserting a format
+  ;; list twice.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE cm (id int, t timestamp)")
+    (let [cm (org.postgresql.copy.CopyManager. (.unwrap c org.postgresql.core.BaseConnection))]
+      (.copyIn cm "COPY cm FROM STDIN"
+               (java.io.ByteArrayInputStream.
+                (.getBytes (str "1\t20240115\n"
+                                "2\tJan 15, 2024 10:20:30\n"
+                                "3\t15-JAN-2024\n")
+                           "UTF-8"))))
+    (is (= "2024-01-15 00:00:00" (one c "SELECT t::text FROM cm WHERE id = 1")))
+    (is (= "2024-01-15 10:20:30" (one c "SELECT t::text FROM cm WHERE id = 2")))
+    (is (= "2024-01-15 00:00:00" (one c "SELECT t::text FROM cm WHERE id = 3")))
+    (testing "and a value neither path accepts raises the type's own error,
+              where COPY used to report a flat 22P02"
+      (is (thrown-with-msg?
+           Exception #"date/time field value out of range"
+           (let [cm (org.postgresql.copy.CopyManager.
+                     (.unwrap c org.postgresql.core.BaseConnection))]
+             (.copyIn cm "COPY cm FROM STDIN"
+                      (java.io.ByteArrayInputStream.
+                       (.getBytes "9\t2024-02-30\n" "UTF-8")))))))))
+
+(deftest the-three-spellings-of-an-offset-are-one-value
+  ;; `pg_dump`'s text format writes a timestamptz with an hour-only
+  ;; offset, and other sources write the four-digit one. PostgreSQL
+  ;; reads `-08`, `-0800` and `-08:00` as the same instant. COPY knew
+  ;; all three only because it carried a private normaliser; folding
+  ;; that into the shared parser is what lets the private copy go, and
+  ;; `-0800` reached the shared parser as an out-of-range date until
+  ;; it did.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tz (id int, t timestamptz)")
+    (let [cm (org.postgresql.copy.CopyManager. (.unwrap c org.postgresql.core.BaseConnection))]
+      (.copyIn cm "COPY tz FROM STDIN"
+               (java.io.ByteArrayInputStream.
+                (.getBytes (str "1\t2022-01-28 17:58:52-08\n"
+                                "2\t2022-01-28 17:58:52-0800\n"
+                                "3\t2022-01-28 17:58:52-08:00\n")
+                           "UTF-8"))))
+    (is (= 1 (count (set (map #(one c (str "SELECT t::text FROM tz WHERE id = " %))
+                              [1 2 3]))))
+        "one instant, however the offset is spelled")))
+
+(deftest a-nested-cast-refuses-what-the-bare-cast-refuses
+  ;; The constant fold for a cast kept its OWN temporal conversion
+  ;; beside `cast-scalar`'s, and so kept its own idea of failure: the
+  ;; timestamp branch called the bare parser, which returns its INPUT
+  ;; when nothing parses, and the date branch answered nil. A cast
+  ;; reaches that fold only when it is NESTED -- a bare
+  ;; `'nonsense'::timestamp` goes down another path and always raised
+  ;; -- so the two disagreed:
+  ;;
+  ;;   'nonsense'::timestamp         ERROR            (right)
+  ;;   'nonsense'::timestamp::text   'nonsense'       (a value that is
+  ;;                                                   not a timestamp,
+  ;;                                                   rendered as one)
+  ;;   'nonsense'::date::text        NULL
+  (with-open [c (jdbc)]
+    (doseq [sql ["SELECT 'nonsense'::timestamp::text"
+                 "SELECT 'nonsense'::date::text"
+                 "SELECT extract(year from 'nonsense'::timestamp)"]]
+      (is (thrown-with-msg? Exception #"invalid input syntax for type"
+                            (one c sql))
+          sql))
+    (testing "an impossible field is still told from bad syntax"
+      (is (thrown-with-msg?
+           Exception #"date/time field value out of range"
+           (one c "SELECT '2024-02-30'::date::text"))))
+    (testing "and everything that did parse still does"
+      (is (= "2024-01-15 00:00:00" (one c "SELECT '2024-01-15'::timestamp::text")))
+      (is (= "2024-01-15" (one c "SELECT '2024-01-15'::date::text")))
+      (is (= "2024-01-15 10:00:00" (one c "SELECT '2024-01-15 10:00'::timestamp::text")))
+      (is (= "2024-01-15 00:00:00" (one c "SELECT 'Jan 15, 2024'::timestamp::text"))))))
+
+(deftest a-column-cast-refuses-what-a-literal-cast-refuses
+  ;; The RUNTIME cast -- a column, not a literal -- kept its own
+  ;; temporal conversion too, beside the `is-time?` branch next to it
+  ;; that already delegated. Same two failure modes, now per row:
+  ;;
+  ;;   s::timestamp  answered the text `nonsense` for the row that did
+  ;;                 not parse, presenting a non-timestamp as one;
+  ;;   s::date       answered nil, and nil FILTERS THE ROW in a datalog
+  ;;                 function binding -- the row silently vanished from
+  ;;                 the result rather than raising.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tt (id int, s text)")
+    (exec! c "INSERT INTO tt VALUES (1,'2024-01-15'),(2,'nonsense')")
+    (is (thrown-with-msg?
+         Exception #"invalid input syntax for type timestamp"
+         (one c "SELECT id, s::timestamp FROM tt ORDER BY id")))
+    (is (thrown-with-msg?
+         Exception #"invalid input syntax for type date"
+         (one c "SELECT id, s::date FROM tt ORDER BY id")))
+    (testing "the rows that do parse are unaffected"
+      (is (= "2024-01-15" (one c "SELECT s::date::text FROM tt WHERE id = 1")))
+      (is (= "2024-01-15 00:00:00"
+             (one c "SELECT s::timestamp::text FROM tt WHERE id = 1"))))))
+
+(deftest the-mdy-slash-spelling-survives-a-strict-resolver
+  ;; `8/10/7777` is PostgreSQL's MDY DateStyle. The pattern for it was
+  ;; the one `ofPattern` site left on year-of-era `y` when the others
+  ;; were moved to proleptic `uuuu`, and STRICT resolves `y` only with
+  ;; an era field -- so it matched nothing and the cast became an
+  ;; error.
+  ;;
+  ;; pgjdbc's own ResultSetTest.testTimestamp is what caught it, three
+  ;; CI runs after the fact, and only in binary mode: the failed cast
+  ;; left TEXT where a timestamp OID was advertised, and the driver
+  ;; answered `Unsupported binary encoding of timestamp`. Asserting it
+  ;; here means the next one fails in seconds rather than in CI.
+  (with-open [c (jdbc)]
+    (is (= "7777-08-10 00:00:00" (one c "SELECT '8/10/7777'::timestamp::text")))
+    (is (= "2017-08-10 00:00:00" (one c "SELECT '8/10/2017'::timestamp::text")))
+    (is (= "2017-08-10" (one c "SELECT '8/10/2017'::date::text")))
+    (testing "through array_fill/unnest, the shape pgjdbc uses"
+      ;; No ::text around it: `unnest(timestamp[])` is not in the
+      ;; signature registry yet, which is a separate gap. Reading the
+      ;; value is what this test is about.
+      (is (some? (one c (str "SELECT unnest(array_fill('8/10/7777'::timestamp, "
+                             "ARRAY[3]))")))))
+    (testing "and an impossible field in THAT spelling is out of range,
+              not bad syntax -- the shape test knew only dashes"
+      (is (thrown-with-msg?
+           Exception #"date/time field value out of range: \"13/10/2017\""
+           (one c "SELECT '13/10/2017'::timestamp")))
+      (is (thrown-with-msg?
+           Exception #"date/time field value out of range: \"2/30/2017\""
+           (one c "SELECT '2/30/2017'::timestamp"))))))

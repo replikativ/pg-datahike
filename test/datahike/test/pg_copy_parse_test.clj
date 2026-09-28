@@ -222,7 +222,11 @@
   ;; with "invalid timestamp" — 380 of them in pagila, which is why a
   ;; real pg_dump restored zero rows. The `--inserts` form goes through
   ;; a different parser, which is how this survived.
-  (let [p #(#'copy/parse-instant %)]
+  ;; It no longer has a parser of its own: it delegates to the same
+  ;; input function a cast uses, so the second argument is the declared
+  ;; PG type. These spellings must survive that delegation -- which is
+  ;; the point of keeping the test pointed at the private fn.
+  (let [p #(#'copy/parse-instant % "timestamptz")]
     (testing "hour-only offset, with and without fractional seconds"
       (is (= (java.util.Date. (- (.getTime #inst "2022-01-29T01:58:52.222Z") 0))
              (p "2022-01-28 17:58:52.222594-08")))
@@ -236,8 +240,12 @@
       (is (= #inst "2024-01-15T10:00:00.000Z" (p "2024-01-15 10:00:00")))
       (is (= #inst "2024-01-15T00:00:00.000Z" (p "2024-01-15"))))
 
-    (testing "genuine rubbish is still rejected"
-      (is (nil? (p "not-a-timestamp"))))))
+    (testing "genuine rubbish is still rejected -- and now with the
+              type's own error rather than a nil the caller had to
+              notice and convert"
+      (is (thrown-with-msg?
+           Exception #"invalid input syntax for type timestamp"
+           (p "not-a-timestamp"))))))
 
 (deftest bytea-hex-is-decoded
   ;; PG's bytea OUTPUT form is `\x` + hex pairs, which is what COPY

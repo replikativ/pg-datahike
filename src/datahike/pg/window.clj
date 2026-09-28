@@ -288,11 +288,27 @@
               (recur (inc i) (max filled e))))))
       nil)))
 
+;; Every window result map is built through a volatile! holding a
+;; transient, and never by calling `assoc!` for its side effect.
+;;
+;; `assoc!` on a transient is only permitted to MUTATE IN PLACE while
+;; the map is small: a transient array-map holds up to 8 entries, and
+;; the 9th `assoc!` returns a NEW hash-map transient. Code that
+;; discarded the return value therefore kept writing into a map that
+;; had stopped being the one it would later persist, so every window
+;; function returned NULL for all rows after the first EIGHT of a
+;; result set -- ROW_NUMBER over 20 rows gave 12 NULLs, and over
+;; BIRD's 750-row `superhero` table, 742.
+;;
+;; Found by BIRD (text-to-SQL) compatibility testing, which runs real
+;; query workloads; every window test here used 8 rows or fewer, which
+;; is exactly the boundary that hides it.
+
 (defn- compute-aggregate-window
   "Window aggregate for every row, over that row's frame."
   [partitions spec]
   (let [{:keys [op frame col-idx arg2-idx arg2-const agg-sym count-star? order-by]} spec
-        result (transient {})]
+        result (volatile! (transient {}))]
     (doseq [partition partitions]
       (let [n (count partition)
             _ (when (and (contains? #{:sum :avg} op)
@@ -334,14 +350,14 @@
         (cond
           whole?
           (let [v (agg-1 [0 n])]
-            (doseq [[orig-idx _] partition] (assoc! result orig-idx v)))
+            (doseq [[orig-idx _] partition] (vswap! result assoc! orig-idx v)))
           running
           (dotimes [i n]
-            (assoc! result (first (nth partition i)) (aget ^objects running i)))
+            (vswap! result assoc! (first (nth partition i)) (aget ^objects running i)))
           :else
           (dotimes [i n]
-            (assoc! result (first (nth partition i)) (agg-1 (nth bounds i)))))))
-    (persistent! result)))
+            (vswap! result assoc! (first (nth partition i)) (agg-1 (nth bounds i)))))))
+    (persistent! @result)))
 
 ;; ============================================================================
 ;; Ranking functions
@@ -352,7 +368,7 @@
    are functions of the peer groups alone. bigint for the three counters,
    float8 for the two fractions -- the types PostgreSQL declares."
   [partitions op]
-  (let [result (transient {})]
+  (let [result (volatile! (transient {}))]
     (doseq [partition partitions]
       (let [n (count partition)
             [peer-lo peer-hi] (peer-bounds partition (:order-by (meta partition)))
@@ -368,7 +384,7 @@
           (let [orig-idx (first (nth partition i))
                 lo (aget ^ints peer-lo i)
                 hi (aget ^ints peer-hi i)]
-            (assoc! result orig-idx
+            (vswap! result assoc! orig-idx
                     (case op
                       :row_number (long (inc i))
                       :rank (long (inc lo))
@@ -377,7 +393,7 @@
                       :percent_rank (if (= n 1) 0.0 (/ (double lo) (double (dec n))))
                       ;; fraction of rows at or before the current PEER group
                       :cume_dist (/ (double hi) (double n))))))))
-    (persistent! result)))
+    (persistent! @result)))
 
 (defn- compute-ntile
   "NTILE(n): PostgreSQL fills the LARGER buckets FIRST -- with 5 rows in 2
@@ -385,7 +401,7 @@
    `(inc (quot (* pos n) size))` produced."
   [partitions spec]
   (let [b (:ntile-n spec)
-        result (transient {})]
+        result (volatile! (transient {}))]
     (when (or (nil? b) (not (pos? (long b))))
       (throw (errors/pg-error :invalid-argument
                               {:message "argument of ntile must be greater than zero"})))
@@ -397,11 +413,11 @@
             big-rows (* extra (inc base))]
         (dotimes [pos size]
           (let [orig-idx (first (nth partition pos))]
-            (assoc! result orig-idx
+            (vswap! result assoc! orig-idx
                     (if (< pos big-rows)
                       (inc (quot pos (inc base)))
                       (+ extra 1 (quot (- pos big-rows) (max 1 base)))))))))
-    (persistent! result)))
+    (persistent! @result)))
 
 ;; ============================================================================
 ;; Navigation functions
@@ -417,7 +433,7 @@
         offset (long (or (:offset-n spec) 1))
         default-val (:default-val spec)
         lead? (= :lead (:op spec))
-        result (transient {})]
+        result (volatile! (transient {}))]
     (doseq [partition partitions]
       (let [size (count partition)]
         (dotimes [pos size]
@@ -427,8 +443,8 @@
                     (let [[_ source-row] (nth partition source-pos)]
                       (nth source-row col-idx nil))
                     default-val)]
-            (assoc! result orig-idx v)))))
-    (persistent! result)))
+            (vswap! result assoc! orig-idx v)))))
+    (persistent! @result)))
 
 (defn- compute-value-fn
   "FIRST_VALUE / LAST_VALUE / NTH_VALUE -- the value at a position within
@@ -438,7 +454,7 @@
   [partitions spec]
   (let [{:keys [op col-idx frame order-by]} spec
         nth-n (long (or (:offset-n spec) 1))
-        result (transient {})]
+        result (volatile! (transient {}))]
     (doseq [partition partitions]
       (let [n (count partition)
             [peer-lo peer-hi] (peer-bounds partition order-by)]
@@ -450,11 +466,28 @@
                       :first_value s
                       :last_value (dec e)
                       :nth_value (+ s (dec nth-n)))]
-            (assoc! result orig-idx
+            (vswap! result assoc! orig-idx
                     (if (and (>= pos s) (< pos e) (>= pos 0) (< pos n))
                       (let [[_ row] (nth partition pos)] (nth row col-idx nil))
                       :__null__))))))
-    (persistent! result)))
+    (persistent! @result)))
+
+(defn base-output-position
+  "The VISIBLE output position of the `base-idx`'th non-window output.
+
+   `window-projection-indices` interleaves window results back into the
+   target list by each spec's `:out-pos`, so a plain column's visible
+   position is not its position among the base outputs whenever a
+   window function is projected before it. A post-window ORDER BY
+   indexes the interleaved row, so it needs this mapping and not the
+   base index."
+  [base-idx window-specs]
+  (let [taken (into #{} (keep :out-pos) window-specs)]
+    (loop [pos 0 seen 0]
+      (cond
+        (contains? taken pos) (recur (inc pos) seen)
+        (= seen base-idx) pos
+        :else (recur (inc pos) (inc seen))))))
 
 (defn window-projection-indices
   "Indices that restore window outputs to their SQL target-list positions.

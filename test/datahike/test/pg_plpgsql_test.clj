@@ -218,3 +218,26 @@
       (let [r (exec h "SELECT forever(1)")]
         (is (some? (.error r)))
         (is (str/includes? (err r) "stack depth"))))))
+
+(deftest a-value-that-will-not-cast-raises-where-it-is-assigned
+  ;; Both boundaries where plpgsql applies a declared type used to
+  ;; `(catch Exception _ v)` and hand the untyped TEXT onward. The cast
+  ;; failure then surfaced far from its cause, as a JVM message
+  ;; ("class java.lang.String cannot be cast to class
+  ;; java.lang.Number") from whatever arithmetic touched the value
+  ;; next. PostgreSQL raises the type's own input error, at the
+  ;; assignment and at the RETURN.
+  (with-h [h (fresh-handler)]
+    (testing "assignment to a declared variable"
+      (defn! h "f" "" "int"
+        "DECLARE x int; BEGIN x := 'abc'; RETURN x + 1; END")
+      (is (= "invalid input syntax for type integer: \"abc\""
+             (err (exec h "SELECT f()")))))
+    (testing "RETURN, where the caller's expression would be the victim"
+      (defn! h "g" "" "int" "BEGIN RETURN 'xyz'; END")
+      (is (= "invalid input syntax for type integer: \"xyz\""
+             (err (exec h "SELECT 2 * g()")))))
+    (testing "and a value that does cast still passes through both"
+      (defn! h "ok2" "" "int"
+        "DECLARE x int; BEGIN x := '41'; RETURN x + 1; END")
+      (is (= "42" (v1 h "SELECT ok2()"))))))

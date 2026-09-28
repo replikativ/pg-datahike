@@ -414,10 +414,72 @@
       (< b 0x80) (str (char b))
       :else (format "\\%03o" b))))
 
+(def month-names
+  ;; PostgreSQL's own table (`datetktbl` in datetime.c) takes the
+  ;; three-letter abbreviation and the full name, case-insensitively.
+  ;; It lives here, not beside the parser that reads it, because
+  ;; classifying a FAILURE needs it too: `Feb 30, 2024` names a real
+  ;; month, so it is a field out of range (22008), where `Foo 30,
+  ;; 2024` is not a date at all (22007).
+  (into {}
+        (mapcat (fn [[i full]] [[(subs full 0 3) i] [full i]]))
+        (map-indexed (fn [i m] [(inc i) m])
+                     ["january" "february" "march" "april" "may" "june" "july"
+                      "august" "september" "october" "november" "december"])))
+
+(defn month-name->number [^String t]
+  (get month-names (str/lower-case t)))
+
+(defn- month-name-date-shape?
+  "A date spelled with a month NAME and otherwise only digits and
+   separators -- the month-name counterpart of `ymd-shape`."
+  [^String s]
+  (let [body (str/trim (str/replace s #"\s+\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$" ""))
+        toks (remove str/blank? (str/split body #"[,\-/ ]+"))]
+    (and (seq toks)
+         (every? #(or (re-matches #"\d{1,6}" %) (month-name->number %)) toks)
+         (some month-name->number toks)
+         (some #(re-matches #"\d{4}" %) toks))))
+
+(defn- date-ish-shape?
+  "Text written as date FIELDS -- digits and separators, or a month
+   name -- whatever the field order.
+
+   Only for telling 22008 (fields out of range) from 22007 (not a date
+   at all). It must never decide which parser runs: `13/10/2017` and
+   `2/30/2017` are out of RANGE in PostgreSQL, and so is `2024-02-30`,
+   but only the dash spelling is read by the strict y-m-d parser."
+  [^String s]
+  (let [t (str/trim s)]
+    (or (re-matches #"(?i)^\d{1,6}[-/]\d{1,2}[-/]\d{1,4}([ T].*|\s+(ad|bc))?$" t)
+        (month-name-date-shape? t))))
+
+(defn bad-timestamp!
+  "The timestamp counterpart of `bad-date!`: PostgreSQL tells a value
+   whose date FIELDS are impossible (22008) from text that is not a
+   timestamp at all (22007), and says so with the target's own name.
+
+   Public because the INSERT coercion needs the same verdict -- writing
+   a timestamp has to refuse exactly what casting one refuses, and by
+   the same rule."
+  [^String s tz?]
+  (if (date-ish-shape? s)
+    (throw (ex-info (str "date/time field value out of range: \"" s "\"")
+                    {:error :datetime-field-overflow :sqlstate "22008"}))
+    (throw (ex-info (str "invalid input syntax for type timestamp"
+                         (when tz? " with time zone") ": \"" s "\"")
+                    {:error :invalid-datetime-format :sqlstate "22007"}))))
+
 (def ^:private ymd-shape
   "A date written as digits and separators -- the shape PostgreSQL calls
    out of RANGE rather than bad SYNTAX when its fields do not make a
    date."
+  ;; Dashes ONLY, and deliberately. This regex has a second job: it
+  ;; ROUTES to the strict `uuuu-M-d` parser below. Widening it to
+  ;; slashes to improve an error code sent `8/10/2017` to a parser that
+  ;; cannot read slashes, turning a date PostgreSQL accepts into an
+  ;; error. Classification uses `date-ish-shape?`, which is separate
+  ;; for exactly that reason.
   #"(?i)^\d{1,6}-\d{1,2}-\d{1,2}(\s+(ad|bc))?$")
 
 (defn- parse-date-strict
@@ -447,7 +509,7 @@
   "PostgreSQL tells a date whose FIELDS are impossible (22008) from text
    that is not a date at all (22007)."
   [^String s]
-  (if (re-matches ymd-shape s)
+  (if (date-ish-shape? s)
     (throw (ex-info (str "date/time field value out of range: \"" s "\"")
                     {:error :datetime-field-overflow :sqlstate "22008"}))
     (throw (ex-info (str "invalid input syntax for type date: \"" s "\"")
@@ -660,7 +722,19 @@
                   (when-not (or (nil? p) (string? p)) p))
                 (try (java.time.LocalDateTime/parse norm)
                      (catch Exception _ nil))
-                (if parse-timestamp (parse-timestamp (str v)) v))))
+                (let [p (when parse-timestamp (parse-timestamp (str v)))]
+                  (when-not (or (nil? p) (string? p)) p))
+                ;; Nothing parsed. Returning `v` here is what made
+                ;; `'2024-02-30'::timestamp` answer with its own TEXT
+                ;; and `'nonsense'::timestamp` likewise -- a value that
+                ;; is not a timestamp, indistinguishable from one that
+                ;; is. PostgreSQL raises, and distinguishes impossible
+                ;; FIELDS (22008) from text that is not a timestamp at
+                ;; all (22007).
+                (bad-timestamp! (str v)
+                                (contains? #{"timestamptz"
+                                             "timestamp with time zone"}
+                                           (types/base-type-name-of type-str))))))
 
         :date (cond
                 (instance? java.time.LocalDate v) v

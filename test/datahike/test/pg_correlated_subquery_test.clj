@@ -935,3 +935,31 @@
       (exec! c "CREATE TABLE nr_z2 (id int, b int)")
       (is (= "42702" (sqlstate c (str "SELECT (SELECT count(*) FROM nr_y WHERE b IS NULL) "
                                       "FROM nr_z, nr_z2")))))))
+
+(deftest subquery-stages-that-are-applied-now
+  ;; The subquery evaluator refused HAVING and compound aggregate
+  ;; expressions rather than ignoring them -- the right call while it
+  ;; could not apply them. It applies both now, with the SAME
+  ;; `apply-having` and `apply-compound-projections` the top level and
+  ;; the derived tables use, so these shapes are answered.
+  ;;
+  ;; The FROM-less HAVING is NOT among them and must stay 0A000:
+  ;; `SELECT count(*) HAVING false` translates to a query whose entity
+  ;; var nothing binds, so running it raises Datahike's `Query for
+  ;; unknown vars` -- broken with or without the HAVING. Removing the
+  ;; guard for every shape turned that explicit refusal into an
+  ;; internal error, which is what this case pins down.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE sg (id int, grp text)")
+    (doseq [[i g] [[1 "a"] [2 "a"] [3 "a"] [4 "b"] [5 "b"] [6 "c"]]]
+      (exec! c (str "INSERT INTO sg VALUES (" i ",'" g "')")))
+    (testing "IN (… GROUP BY … HAVING …)"
+      (is (= "a" (one c (str "SELECT DISTINCT grp FROM sg WHERE grp IN"
+                             " (SELECT grp FROM sg GROUP BY grp HAVING COUNT(id) >= 3)")))))
+    (testing "a scalar subquery whose projection is an expression over an aggregate"
+      (is (= "2" (one c (str "SELECT COUNT(*) FROM sg WHERE id >"
+                             " (SELECT AVG(id) * 1.2 FROM sg)")))))
+    (testing "a FROM-less HAVING is still an explicit capability boundary"
+      (is (= "0A000" (sqlstate c "SELECT 1 IN (SELECT count(*) HAVING false)"))))))

@@ -2264,6 +2264,18 @@ public final class PgWireServer {
         for (int i = 0; i < numFormatCodes; i++) formatCodes[i] = buf.getShort();
 
         short numParams = buf.getShort();
+        // PostgreSQL checks this before decoding anything
+        // (exec_bind_message). Without it a short Bind ran on and the
+        // missing parameter surfaced from wherever the executor indexed
+        // past the end -- `SELECT $1, $2 \bind 'foo'` answered
+        // `IndexOutOfBoundsException`, a JVM class name under XX000,
+        // where PostgreSQL names both counts and the statement.
+        if (numParams != stmt.paramOids.length) {
+            throw new PgProtocolException("08P01",
+                "bind message supplies " + numParams
+                + " parameters, but prepared statement \"" + stmtName
+                + "\" requires " + stmt.paramOids.length);
+        }
         // 1-indexed so ParamRef{idx=N} → bound[N]. Length = numParams + 1,
         // index 0 stays null.
         Object[] bound = new Object[numParams + 1];

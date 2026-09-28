@@ -336,6 +336,21 @@
 (defn nan-num? [x]
   (and (number? x) (Double/isNaN (double x))))
 
+(defn- unbound-param?
+  "A `$N` placeholder that Bind has not filled in yet.
+
+   `datahike.pg.sql.params` requires this namespace, so the record type
+   cannot be imported here; the name is the stable thing to test."
+  [v]
+  (= "datahike.pg.sql.params.ParamRef" (.getName (class v))))
+
+(defn- runtime-type-name
+  "PostgreSQL's name for a value's type, for an error raised where only
+   the VALUE is left: a comparison function sees two bound values and
+   has no expression to read a declared type from."
+  [v]
+  (get types/oid->pg-name (types/infer-oid-from-value v) "unknown"))
+
 (defn order-cmp
   "`compare`, with two corrections.
 
@@ -1263,6 +1278,13 @@
     (and (number? a) (number? b)) (== a b)
     :else (= a b)))
 
+(def ^:private ^:dynamic *cmp-op*
+  "The SQL operator whose implementation is comparing, so the error
+   raised for two incomparable values can name it. `sql-order-cmp` is
+   also the ORDER BY key comparator, which has no operator to name --
+   hence a default rather than a required argument."
+  "<")
+
 (defn- sql-order-cmp [a b]
   (cond
     (and (pg-rec/record? a) (pg-rec/record? b))
@@ -1293,7 +1315,35 @@
         (types/numeric-special? a) (types/numeric-special? b))
     (order-cmp a b)
 
-    :else (compare a b)))
+    ;; `compare` throws a raw ClassCastException for two values of
+    ;; unrelated classes, and the client got the JVM's own sentence --
+    ;; `class java.lang.Long cannot be cast to class java.lang.String`
+    ;; -- under XX000. Whatever put text opposite a number is a defect
+    ;; further up, but leaking a JVM message tells nobody what
+    ;; happened: PostgreSQL names the two types and says it has no
+    ;; such operator.
+    ;;
+    ;; Except against an UNBOUND PARAMETER. A derived table is
+    ;; materialised at TRANSLATE time, before Bind has supplied
+    ;; anything, so `WHERE id <= $1` reaches here as Long vs ParamRef
+    ;; -- and the ClassCastException is load-bearing: it is how that
+    ;; pass learns the relation cannot be computed yet and leaves it
+    ;; empty for the runtime to redo. Answering with a SQL error
+    ;; instead made `SELECT * FROM (SELECT … WHERE id <= ?) x` fail at
+    ;; Parse. Only a comparison of two real VALUES is a type error.
+    :else
+    (try (compare a b)
+         (catch ClassCastException e
+           (when (or (unbound-param? a) (unbound-param? b))
+             (throw e))
+           (throw (errors/pg-error
+                   :undefined-function
+                   {:message (str "operator does not exist: "
+                                  (runtime-type-name a) " " *cmp-op* " "
+                                  (runtime-type-name b))
+                    :hint (str "No operator matches the given name and "
+                               "argument types. You might need to add "
+                               "explicit type casts.")}))))))
 
 (defn- nan-cmp-op
   "PostgreSQL orders NaN ABOVE every non-NaN for float and numeric
@@ -1301,7 +1351,7 @@
    TRUE. IEEE-754 -- and so Clojure's `<` `>` `<=` `>=` -- answers false
    for every comparison involving NaN, which made all four wrong the
    moment a NaN could exist."
-  [pred]
+  [pred op]
   (fn [a b]
     (cond
       ;; NOT null-safe: these are PREDICATES, and `null-safe` yields the
@@ -1311,12 +1361,12 @@
       ;; FALSE (PostgreSQL collapses it at the qual boundary, EEOP_QUAL).
       ;; sql-eq? already answers false the same way, via `=`.
       (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) false
-      :else (pred (sql-order-cmp a b) 0))))
+      :else (binding [*cmp-op* op] (pred (sql-order-cmp a b) 0)))))
 
-(def sql-lt? (nan-cmp-op <))
-(def sql-gt? (nan-cmp-op >))
-(def sql-le? (nan-cmp-op <=))
-(def sql-ge? (nan-cmp-op >=))
+(def sql-lt? (nan-cmp-op < "<"))
+(def sql-gt? (nan-cmp-op > ">"))
+(def sql-le? (nan-cmp-op <= "<="))
+(def sql-ge? (nan-cmp-op >= ">="))
 
 (defn sql-ne?
   "SQL `<>`. The complement of `sql-eq?` on non-NULL operands.
@@ -2377,6 +2427,25 @@
 ;; ---------------------------------------------------------------------------
 ;; SQL string function implementations
 
+(defn pg-str
+  "A value as the TEXT PostgreSQL would render for it.
+
+   `str` is not that for a temporal: `java.util.Date`'s toString is
+   `Mon Sep 28 17:24:49 CEST 2026`, so `SUBSTR(CURRENT_TIMESTAMP, 1, 2)`
+   answered \"Mo\" where PostgreSQL answers \"20\" -- an implicit
+   coercion to text rendering a JVM debug string. An EXPLICIT
+   `::text` already went through the output function and was right,
+   which is how the two disagreed.
+
+   Anything that is already a string, or that has no PG output function
+   of its own, falls back to `str`."
+  ^String [v]
+  (if (string? v)
+    v
+    (or (when-let [oid (try (types/infer-oid-from-value v) (catch Exception _ nil))]
+          (try (types/->pg-text v oid) (catch Exception _ nil)))
+        (str v))))
+
 (defn sql-length
   "SQL LENGTH / CHAR_LENGTH. Bit strings measure in bits, not in the
    record's map entries."
@@ -2506,7 +2575,7 @@
   "Return first n characters of string. A negative n removes |n| trailing
    characters, matching PostgreSQL's text_left."
   [s n]
-  (let [s (str s)
+  (let [s (pg-str s)
         n (long n)
         end (if (neg? n) (+ (count s) n) n)]
     (subs s 0 (max 0 (min end (count s))))))
@@ -2515,12 +2584,18 @@
   "Return last n characters of string. A negative n removes |n| leading
    characters, matching PostgreSQL's text_right."
   [s n]
-  (let [s (str s)
+  (let [s (pg-str s)
         n (long n)
         start (if (neg? n) (- n) (- (count s) n))]
     (subs s (max 0 (min start (count s))))))
 
-(defn- ->s ^String [v] (str v))
+(defn- ->s
+  "The text coercion every lifted string function shares. `pg-str`, not
+   `str`: a `java.util.Date`'s toString is `Mon Sep 28 17:24:49 CEST
+   2026`, so `UPPER(CURRENT_TIMESTAMP)` answered `MON SEP 28 …` and
+   `LEFT(CURRENT_TIMESTAMP, 4)` answered `Mon `. A LocalDate escaped
+   only because its toString happens to be ISO."
+  ^String [v] (pg-str v))
 
 (defn- nullable-str
   "Lift a 1-string-argument function to SQL strictness.
@@ -2952,7 +3027,7 @@
          (if (some? len)
            (pg-bits/substring-bits s start len)
            (pg-bits/substring-bits s start))
-         (let [^String st (str s)
+         (let [^String st (pg-str s)
                n (.length st)
                start (long start)
                _ (when (and len (neg? (long len)))
@@ -2964,6 +3039,44 @@
                lo (max 1 start)
                hi (min (inc n) to)]
            (if (<= hi lo) "" (subs st (dec lo) (dec hi)))))))))
+
+(defn null-safe-order-cmp
+  "Row comparator for the server-side ORDER BY fallback. `sql-order-by`
+   is a flat [col-idx dir nulls col-idx dir nulls …] spec; nil and the
+   :__null__ sentinel both mean SQL NULL.
+
+   `nulls` is :first, :last, or nil for PostgreSQL's default — which is
+   NULLS LAST for ASC and NULLS FIRST for DESC, i.e. NULL sorts as the
+   largest value."
+  [sql-order-by]
+  (fn [a b]
+    (let [av (if (sequential? a) a [a])
+          bv (if (sequential? b) b [b])]
+      (loop [specs (partition 3 sql-order-by)]
+        (if-let [[idx dir nulls] (first specs)]
+          (let [va (nth av idx nil)
+                vb (nth bv idx nil)
+                a-null? (or (nil? va) (= :__null__ va))
+                b-null? (or (nil? vb) (= :__null__ vb))
+                ;; Explicit NULLS FIRST/LAST wins; otherwise the PG default.
+                nulls-first? (if nulls (= nulls :first) (= dir :desc))
+                c (cond
+                    (and a-null? b-null?) 0
+                    a-null? (if nulls-first? -1 1)
+                    b-null? (if nulls-first? 1 -1)
+                    ;; fns/order-cmp, not `compare`: Clojure's compares
+                    ;; NaN EQUAL to everything, so a NaN in the sort key
+                    ;; left the result silently unsorted -- and a
+                    ;; non-transitive comparator can make TimSort raise
+                    ;; outright. PostgreSQL sorts NaN above every
+                    ;; non-NaN.
+                    :else (if (= dir :desc)
+                            (order-cmp vb va)
+                            (order-cmp va vb)))]
+            (if (zero? c)
+              (recur (rest specs))
+              c))
+          0)))))
 
 (defn sql-position
   "1-based position of `substring` in `string`, 0 if not found.
@@ -4246,8 +4359,8 @@
         :__null__))))
 
 (def ^:private legacy-sql-fn->clj-fn
-  {"upper"    str/upper-case
-   "lower"    str/lower-case
+  {"upper"    (fn [v] (str/upper-case (pg-str v)))
+   "lower"    (fn [v] (str/lower-case (pg-str v)))
    ;; NOT bare `count`: a PgBit is a defrecord, so `count` returns its
    ;; number of MAP ENTRIES (2), not its bit width. PG's length() on a
    ;; bit string is the bit count; octet_length is ceil(bits/8).

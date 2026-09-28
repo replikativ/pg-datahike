@@ -727,9 +727,14 @@
                          ;; to come back in the function's DECLARED type
                          ;; or the caller cannot compute with it:
                          ;; `2 * f(1)` was a ClassCastException.
+                         ;; …and the catch that used to be here restored
+                         ;; exactly the ClassCastException named above:
+                         ;; a body whose text does not fit the declared
+                         ;; return type handed untyped TEXT back to the
+                         ;; caller's expression. PostgreSQL raises the
+                         ;; type's own input error instead.
                          (string? value)
-                         (try (sql-cast/cast-scalar value return-type {})
-                              (catch Exception _ value))
+                         (sql-cast/cast-scalar value return-type {})
                          :else value))))))
         fn-param (symbol (str "?pg-plpgsql" (swap! (:var-counter ctx) inc)))
         result-var (ctx/fresh-var! ctx)]
@@ -3420,7 +3425,15 @@
    and the per-row WHERE-position binding below."
   [parse-fn sql subquery? inner-schema query-db]
   (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))]
-    (strict-scalar-subquery parse-fn run-sql inner-schema query-db {})))
+    ;; The ambient namespaces, not `{}`. A CTE is materialised under a
+    ;; SYNTHETIC namespace and reached through this mapping, and
+    ;; PostgreSQL scopes a CTE to its own level and every level inside
+    ;; it (scanNameSpaceForCTE walks outward). Dropping the mapping here
+    ;; cut that chain at the second nesting: one level deep
+    ;; `(SELECT id FROM y)` resolved, two deep it was `relation "y"
+    ;; does not exist`.
+    (strict-scalar-subquery parse-fn run-sql inner-schema query-db
+                            ctx/*relation-namespaces*)))
 
 (defn- translate-value-comparison-operands
   "Translate comparison operands in value position after applying the
@@ -3910,6 +3923,14 @@
         ;; Normalize timestamp formats to ISO-8601
         normalized (-> trimmed
                        (str/replace #"(\d{4}-\d{2}-\d{2})\s+(\d)" "$1T$2")
+                       ;; `-0800` -> `-08:00`. pg_dump writes a
+                       ;; timestamptz with an hour-only offset and some
+                       ;; sources write the four-digit one; PostgreSQL
+                       ;; reads `-08`, `-0800` and `-08:00` as the same
+                       ;; value. This rule has to run BEFORE the
+                       ;; hour-only ones, which would otherwise see the
+                       ;; last two digits as the whole offset.
+                       (str/replace #"(?<=\d)([+-]\d{2})(\d{2})$" "$1:$2")
                        (str/replace #"\+(\d{2})$" "+$1:00")
                        (str/replace #"(?<=\d)-(\d{2})$" "-$1:00"))]
     (or
@@ -3956,7 +3977,9 @@
            (.toInstant (.atStartOfDay
                         (java.time.LocalDate/parse
                          trimmed
-                         (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
+                         (.withResolverStyle
+                          (java.time.format.DateTimeFormatter/ofPattern "uuuu-M-d")
+                          java.time.format.ResolverStyle/STRICT))
                         java.time.ZoneOffset/UTC)))
           (catch Exception _ nil))
      ;; PG 'MDY' default style accepts 'M/d/y' (US-slash), e.g. '8/10/7777'.
@@ -3967,7 +3990,16 @@
              (.toInstant (.atStartOfDay
                           (java.time.LocalDate/parse
                            trimmed
-                           (java.time.format.DateTimeFormatter/ofPattern "M/d/y"))
+                           (.withResolverStyle
+                            ;; `uuuu`, not `y`. STRICT resolves
+                            ;; year-of-era only with an era field, so
+                            ;; this pattern -- the one site left on `y`
+                            ;; when the others were converted -- stopped
+                            ;; matching anything at all, and
+                            ;; `'8/10/7777'::timestamp` went from a
+                            ;; timestamp to an error.
+                            (java.time.format.DateTimeFormatter/ofPattern "M/d/uuuu")
+                            java.time.format.ResolverStyle/STRICT))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
      ;; PG also accepts 'Y/M/d' when the year leads (4 digits): the
@@ -3978,7 +4010,9 @@
              (.toInstant (.atStartOfDay
                           (java.time.LocalDate/parse
                            trimmed
-                           (java.time.format.DateTimeFormatter/ofPattern "yyyy/M/d"))
+                           (.withResolverStyle
+                            (java.time.format.DateTimeFormatter/ofPattern "uuuu/M/d")
+                            java.time.format.ResolverStyle/STRICT))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
      ;; ISO 8601 BASIC format -- the separator-less spelling.
@@ -3998,6 +4032,41 @@
                                        "HHmmss[.SSS][.SS][.S]")))
                      (.atStartOfDay date))]
            (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC)))
+         (catch Exception _ nil)))
+     ;; A month NAME in place of a month number. PostgreSQL's datetime
+     ;; input tokenises first and recognises the month wherever it
+     ;; falls, so `Jan 15, 2024`, `January 15, 2024`, `Jan 15 2024`,
+     ;; `15-JAN-2024`, `15 Jan 2024`, `2024-Jan-15` and `Jan-15-2024`
+     ;; all name the same day. Matching that with a list of patterns
+     ;; means missing one of them, so this tokenises the same way:
+     ;; the alphabetic token is the month, the four-digit token the
+     ;; year, and what is left is the day.
+     (when-let [[_ date-part time-part]
+                (re-matches #"(?i)^([a-z0-9,\-/ ]*?[a-z]{3,9}[a-z0-9,\-/ ]*?)(?:\s+(\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?))?$"
+                            trimmed)]
+       (try
+         (let [toks (remove str/blank? (str/split date-part #"[,\-/ ]+"))
+               month (some (fn [t]
+                             (when (re-matches #"(?i)[a-z]{3,9}" t)
+                               (sql-cast/month-name->number t)))
+                           toks)
+               nums  (filter #(re-matches #"\d{1,4}" %) toks)
+               year  (some #(when (= 4 (count %)) (parse-long %)) nums)
+               day   (some #(when (not= 4 (count %)) (parse-long %)) nums)]
+           (when (and month year day)
+             ;; STRICT: `Feb 30, 2024` is out of range, not the 1st of
+             ;; March. SMART -- the default -- would roll it.
+             (let [ld (java.time.LocalDate/of ^int (int year) ^int (int month)
+                                              ^int (int day))
+                   ldt (if time-part
+                         (.atTime ld (java.time.LocalTime/parse time-part))
+                         (.atStartOfDay ld))]
+               (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC)))))
+         ;; `LocalDate/of` throws DateTimeException for an impossible
+         ;; day, and returning nil here hands the caller its
+         ;; passthrough -- so the month-name spelling of an impossible
+         ;; date must fall to the same `bad-timestamp!` the numeric
+         ;; spelling gets, which is what returning nil arranges.
          (catch Exception _ nil)))
      ;; All parsing failed — return raw string
      s)))
@@ -4258,23 +4327,32 @@
           (sql-cast/cast-scalar inner-raw type-str
                                 {:explicit? true
                                  :parse-timestamp parse-timestamp-string})
-          is-date? (try
-                     (java.time.LocalDate/parse
-                      (str/trim (str inner-raw))
-                      (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
-                     (catch Exception _
-                       (let [d (parse-timestamp-string (str inner-raw))]
-                         (when (instance? java.util.Date d)
-                           (-> ^java.util.Date d .toInstant
-                               (.atZone java.time.ZoneOffset/UTC)
-                               .toLocalDate)))))
+          ;; Delegate, like every other branch of this fold. Keeping a
+          ;; private copy of what `cast-scalar` does meant keeping its
+          ;; own idea of FAILURE too, and this one answered nil -- so a
+          ;; fold of `'nonsense'::date::text` produced NULL where
+          ;; PostgreSQL raises. The bare `'nonsense'::date` was right
+          ;; the whole time; only a cast reaching this fold, which is a
+          ;; NESTED one, took the private path.
+          is-date? (sql-cast/cast-scalar
+                    inner-raw type-str
+                    {:explicit? true
+                     :parse-timestamp parse-timestamp-string})
         ;; ::time — extract the LocalTime so serialization emits only
         ;; "HH:MM:SS[.fff]" and drops any date component the input had.
           is-time? (sql-cast/cast-scalar
                     inner-raw type-str
                     {:explicit? true
                      :parse-timestamp parse-timestamp-string})
-          is-ts?   (parse-timestamp-string (str inner-raw))
+          ;; Not the bare parser: it returns its INPUT when nothing
+          ;; parses, so `'nonsense'::timestamp::text` folded to the
+          ;; text `nonsense` -- a value that is not a timestamp,
+          ;; rendered as though it were one. `cast-scalar` raises with
+          ;; the type's own message.
+          is-ts?   (sql-cast/cast-scalar
+                    inner-raw type-str
+                    {:explicit? true
+                     :parse-timestamp parse-timestamp-string})
           is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200
@@ -4298,33 +4376,20 @@
           (cond
             is-date?
             (let [fn-param (symbol (str "?cast-date" (swap! (:var-counter ctx) inc)))
+                  ;; Delegate, as the `is-time?` branch beside this one
+                  ;; already does. The private copy here knew the
+                  ;; non-string shapes -- a stored instant must not
+                  ;; round-trip through `str` (issue #13) -- but
+                  ;; `cast-scalar` knows them too, and it also knows
+                  ;; what FAILURE means. This answered nil for text
+                  ;; that is not a date, and nil FILTERS THE ROW: a
+                  ;; column cast `s::date` silently dropped every row
+                  ;; whose value did not parse, instead of raising.
                   date-fn (fn [v]
-                            (when v
-                              ;; Temporal instances (now()/current_timestamp
-                              ;; bindings, stored instants) must not round-trip
-                              ;; through `str` — `(str Date)` is RFC-822ish and
-                              ;; unparseable, which dropped the row (issue #13).
-                              (cond
-                                (instance? java.util.Date v)
-                                (-> ^java.util.Date v .toInstant
-                                    (.atZone java.time.ZoneOffset/UTC) .toLocalDate)
-                                (instance? java.time.Instant v)
-                                (-> ^java.time.Instant v
-                                    (.atZone java.time.ZoneOffset/UTC) .toLocalDate)
-                                (instance? java.time.LocalDate v) v
-                                (instance? java.time.LocalDateTime v)
-                                (.toLocalDate ^java.time.LocalDateTime v)
-                                :else
-                                (let [s (str/trim (str v))]
-                                  (or (try (java.time.LocalDate/parse
-                                            s
-                                            (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
-                                           (catch Exception _ nil))
-                                      (when-let [d (parse-timestamp-string s)]
-                                        (when (instance? java.util.Date d)
-                                          (-> ^java.util.Date d .toInstant
-                                              (.atZone java.time.ZoneOffset/UTC)
-                                              .toLocalDate))))))))]
+                            (sql-cast/cast-scalar
+                             v type-str
+                             {:explicit? true
+                              :parse-timestamp parse-timestamp-string}))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj (null-preserving date-fn))
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
@@ -4343,16 +4408,17 @@
             is-ts?
           ;; Timestamp cast: use an in-param function for runtime parsing
             (let [ts-fn-param (symbol (str "?cast-ts" (swap! (:var-counter ctx) inc)))
+                  ;; `cast-scalar`, not the bare parser: the parser
+                  ;; returns its INPUT when nothing parses, so a column
+                  ;; cast `s::timestamp` answered the text `nonsense`
+                  ;; -- a value that is not a timestamp, presented as
+                  ;; one -- where PostgreSQL raises.
                   ts-fn (fn [v]
                           (when v
-                            (cond
-                              (instance? java.util.Date v) v
-                              (instance? java.time.LocalDateTime v) v
-                              (instance? java.time.Instant v)
-                              (java.util.Date/from ^java.time.Instant v)
-                              (instance? java.time.LocalDate v)
-                              (.atStartOfDay ^java.time.LocalDate v)
-                              :else (parse-timestamp-string (str v)))))]
+                            (sql-cast/cast-scalar
+                             v type-str
+                             {:explicit? true
+                              :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj ts-fn-param)
               (swap! (:in-args ctx) conj (null-preserving ts-fn))
               (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
@@ -5124,10 +5190,25 @@
   ;; plausible-looking raw Datalog rows with SQL semantics omitted.
   (when (or (seq (:project-set p))
             (seq (:window-specs p))
-            (seq (:compound-exprs p))
+            ;; `:compound-exprs` was here. They are reconstructed below
+            ;; now -- `(SELECT AVG(id) * 1.2 …)` is an aggregate with an
+            ;; expression over it, which PostgreSQL simply evaluates.
             (seq (:correlated-subqueries p))
             (:distinct-on-n p)
-            (:having p)
+            ;; HAVING is applied below now -- the same `apply-having`
+            ;; the top level and the derived tables use -- so `x IN
+            ;; (SELECT grp FROM a GROUP BY grp HAVING COUNT(id) >= 5)`
+            ;; is answered rather than refused.
+            ;;
+            ;; A TABLE-FREE one still is not: `SELECT count(*) HAVING
+            ;; false` translates to `{:find [(count ?_eid)] :where []}`,
+            ;; whose entity var nothing binds, so running it raises
+            ;; `Query for unknown vars`. That shape is broken with or
+            ;; without the HAVING -- it was simply never reached before
+            ;; -- so the capability boundary stays exactly where it
+            ;; really is, as an explicit 0A000 rather than an internal
+            ;; error.
+            (and (:having p) (empty? (:where (:query p))))
             (:fetch-with-ties? p)
             (:for-update p)
             (seq (:deferred-recursive-ctes p)))
@@ -5136,13 +5217,20 @@
             {:message "this subquery requires SELECT post-processing that is not implemented"}))))
 
 (defn- raw-in-subquery-having?
-  "True when a SELECT AST contains a HAVING clause in any set-op branch.
+  "True when a SELECT AST has a HAVING clause AND NO FROM ITEM, in any
+   set-op branch.
 
-   JSqlParser 5 omits GROUP BY and HAVING from `PlainSelect.toString` when
-   the SELECT has no FROM item.  IN-subquery execution reparses that string,
-   so inspecting only the reparsed plan would silently lose the clause (and
-   can expose a Datahike unknown-var error for aggregate-only SELECTs).  Keep
-   the unsupported-stage boundary on the original AST as well."
+   JSqlParser 5 omits GROUP BY and HAVING from `PlainSelect.toString`
+   when the SELECT has no FROM item. IN-subquery execution reparses that
+   string, so inspecting only the reparsed plan would silently lose the
+   clause -- which is why this reads the original AST.
+
+   Only the FROM-less shape. `SELECT count(*) HAVING false` translates
+   to `{:find [(count ?_eid)] :where []}`, whose entity var nothing
+   binds, so running it raises Datahike's `Query for unknown vars`; it
+   is broken with or without the HAVING. One WITH a FROM is applied
+   normally now, so `x IN (SELECT grp FROM a GROUP BY grp HAVING
+   COUNT(id) >= 5)` is answered rather than refused."
   [select]
   (cond
     (instance? ParenthesedSelect select)
@@ -5153,7 +5241,8 @@
                    (.getSelects ^SetOperationList select)))
 
     (instance? PlainSelect select)
-    (some? (.getHaving ^PlainSelect select))
+    (and (some? (.getHaving ^PlainSelect select))
+         (nil? (.getFromItem ^PlainSelect select)))
 
     :else false))
 
@@ -5177,6 +5266,98 @@
         offset-rows (cond->> ordered tail-offset (drop tail-offset))]
     (vec (cond->> offset-rows tail-limit (take tail-limit)))))
 
+(defn row-bindings
+  "Variable bindings for a projection or predicate FORM evaluated against
+   one result row: every `:find` element that is a plain variable, read
+   off the row by position, plus the query's `:in` parameters.
+
+   That is what lets such a form reference a GROUPING column (`sum(x) +
+   id`, or a plain column in HAVING) and a `$N` placeholder as well as the
+   aggregate slots the caller adds."
+  [query in-args row]
+  (let [rv (if (sequential? row) (vec row) [row])]
+    (into (into {} (keep-indexed (fn [i e] (when (symbol? e) [e (nth rv i nil)])))
+                (:find query))
+          (zipmap (rest (:in query)) in-args))))
+
+(defn apply-having
+  "Filter result rows by HAVING.
+
+   `having` is {:form <predicate form> :slots [[var idx] …]} -- the
+   aggregates hoisted into hidden columns, and a form over them.
+   PostgreSQL keeps a group only when the predicate is TRUE, so UNKNOWN
+   (a NULL operand) drops it, which is what `true?` says here."
+  [results having query in-args]
+  (if-let [{:keys [form slots]} having]
+    (filterv (fn [row]
+               (let [rv (if (sequential? row) (vec row) [row])
+                     binds (reduce (fn [m [sym idx]] (assoc m sym (nth rv idx nil)))
+                                   (row-bindings query in-args row)
+                                   slots)]
+                 (true? (interpret-form form binds))))
+             results)
+    results))
+
+(defn compound-projection-indices
+  "Indices that turn the physical compound-projection shape into its SQL
+   SELECT-list shape. Hidden aggregate inputs are removed and deferred
+   expressions are restored to the positions recorded while lowering."
+  [aliases compound-exprs]
+  (let [visible-indices (into []
+                              (keep-indexed
+                               (fn [i a]
+                                 (when-not (and (string? a)
+                                                (.startsWith ^String a "__compound_"))
+                                   i)))
+                              aliases)
+        positions (mapv :out-pos compound-exprs)
+        n-visible (count visible-indices)
+        reorder? (and (every? some? positions)
+                      (= (count positions) (count (distinct positions)))
+                      (every? #(< -1 % n-visible) positions))]
+    (if reorder?
+      (let [base-count (- n-visible (count compound-exprs))
+            compound-at (into {}
+                              (map-indexed (fn [i pos] [pos (+ base-count i)]))
+                              positions)
+            visible-order
+            (first
+             (reduce (fn [[order next-base] pos]
+                       (if-let [compound-idx (get compound-at pos)]
+                         [(conj order compound-idx) next-base]
+                         [(conj order next-base) (inc next-base)]))
+                     [[] 0]
+                     (range n-visible)))]
+        (mapv #(nth visible-indices %) visible-order))
+      visible-indices)))
+
+(defn apply-compound-projections
+  "Evaluate deferred SELECT projection forms and remove their hidden inputs.
+
+   Shared by the normal SELECT executor and INSERT ... SELECT, which must
+   consume the same visible row shape. Returns [rows aliases]."
+  [results aliases query in-args compound-exprs]
+  (if (seq compound-exprs)
+    ;; The shared `row-bindings`, not a fourth private copy of it.
+    (let [row-bindings #(row-bindings query in-args %)
+          new-results
+          (mapv (fn [row]
+                  (let [rv (if (sequential? row) (vec row) [row])
+                        binds (row-bindings row)]
+                    (reduce (fn [r {:keys [form slots]}]
+                              (let [b (reduce (fn [m [sym idx]]
+                                                (assoc m sym (nth r idx nil)))
+                                              binds slots)
+                                    val (interpret-form form b)]
+                                (conj r (if (= :__null__ val) nil val))))
+                            rv compound-exprs)))
+                results)
+          new-aliases (into (vec aliases) (map :alias compound-exprs))
+          visible-indices (compound-projection-indices new-aliases compound-exprs)]
+      [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
+       (mapv #(nth new-aliases %) visible-indices)])
+    [results aliases]))
+
 (defn- run-subquery-leaf
   [p db]
   (params/check-cancel!)
@@ -5197,8 +5378,21 @@
               (seq in-args) (apply d/q q query-db in-args)
               :else (d/q q query-db))
         raw (or (when (and q (empty? (seq raw))) (empty-aggregate-row q)) raw)
+        ;; BEFORE the order/limit: HAVING decides which groups exist, so
+        ;; it changes what there is to sort and how many to take.
+        raw (apply-having raw (:having p) q in-args)
+        ;; An expression OVER an aggregate rides as a hidden slot plus a
+        ;; form; without reconstructing it the subquery returned the bare
+        ;; aggregate, so it was refused rather than answered wrongly.
+        [raw _] (if (seq (:compound-exprs p))
+                  (apply-compound-projections raw (:find-aliases p) q in-args
+                                              (:compound-exprs p))
+                  [raw nil])
         raw (apply-subquery-order-limit raw p)
-        hidden (long (or (:hidden-count p) 0))]
+        hidden (long (or (:hidden-count p) 0))
+        ;; apply-compound-projections already trimmed to the visible
+        ;; columns, so the hidden-count trim below must not run twice.
+        hidden (if (seq (:compound-exprs p)) 0 hidden)]
     (if (pos? hidden)
       (mapv (fn [row]
               (let [v (if (sequential? row) (vec row) [row])]
@@ -5405,7 +5599,17 @@
                                left-oid
                                output-oid))
                            left-oids output-oids resolution-oids)
-         rows (run-parsed-subquery p db)]
+         ;; The namespaces stay bound for the EXECUTION as well, not
+         ;; just the parse above. A CTE reached from here is
+         ;; materialised under a synthetic namespace, and a subquery
+         ;; nested one level further down runs from a closure invoked
+         ;; HERE -- outside the parse -- so the mapping had already
+         ;; gone and `(SELECT (SELECT id FROM y) FROM x)` answered
+         ;; `relation "y" does not exist` where one level worked.
+         ;; PostgreSQL scopes a CTE to its own level and every level
+         ;; inside it (scanNameSpaceForCTE walks outward).
+         rows (binding [ctx/*relation-namespaces* relation-namespaces]
+                (run-parsed-subquery p db))]
      (if (seq target-oids)
        (mapv #(set-ops/coerce-row % target-oids) rows)
        rows))))
@@ -5467,6 +5671,10 @@
    OIDs. This catches missing inner columns, star-expanded arity and operator
    type errors even when the outer relation contains no rows."
   [ctx left-asts inner corr-refs]
+  ;; A HAVING inside the IN subquery used to be refused here for every
+  ;; shape, because the evaluator below silently ignored it -- refusing
+  ;; was right while that was true. It applies it now, so only the
+  ;; FROM-less shape, which cannot be executed at all, is still refused.
   (when (raw-in-subquery-having? inner)
     (throw (errors/pg-error
             :feature-not-supported
@@ -7884,6 +8092,72 @@
     (some false-sentinel? (rest form))
     :else false))
 
+(defn- predicate-clause?
+  "A Datalog clause that only FILTERS: `[(f a b …)]`, with no output
+   variable to bind."
+  [c]
+  (and (vector? c) (= 1 (count c)) (seq? (first c))))
+
+(defn- disjunct-form
+  "The boolean form a branch of an OR stands for, or nil when the branch
+   is not purely a filter.
+
+   A branch that matches data -- a pattern, a `not-join`, a nested
+   `or-join` -- has to stay a relation. One that only tests already-bound
+   variables is an expression, and can be evaluated as one."
+  [b]
+  (cond
+    (predicate-clause? b) (first b)
+    (and (seq? b) (= 'and (first b)))
+    (let [parts (mapv disjunct-form (rest b))]
+      (when (every? some? parts) (cons 'and parts)))
+    :else nil))
+
+(defn- fused-or-predicate
+  "One predicate clause for an OR whose every branch only tests
+   already-bound variables, in place of an `or-join` over them.
+
+   An `or-join` is a RELATION: each branch is solved on its own and the
+   results are unioned and then joined back. When a branch constrains
+   only some of the shared variables -- which is the normal shape of
+   `WHERE f(a) > x OR g(b) < y`, where each side mentions one of them --
+   the branch does not determine the others, and the join back against
+   the outer rows is quadratic. BIRD 27 (17k x 17k rows) exhausted the
+   heap on exactly that; 2,000 rows already took 130 seconds where
+   PostgreSQL is immediate, and the same query without the OR took one.
+
+   Evaluating the disjunction per row instead is what SQL asks for: the
+   branches bind nothing, so there is no relation to union. Returns nil
+   -- leave the or-join alone -- unless every branch is a pure filter
+   and every variable it reads is already bound HERE, at this point in
+   the clause order."
+  [ctx live-branches]
+  (when-not ctx/*defer-expression-materialization*
+    (when (and (:in-params ctx) (:in-args ctx) (:var-counter ctx))
+      (let [forms (mapv disjunct-form live-branches)]
+        (when (every? some? forms)
+          (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
+                outer-vars  (ctx/collect-vars @(:where-clauses ctx))]
+            ;; Every variable must already be bound: a predicate cannot
+            ;; introduce one, so a branch var the outer clauses have not
+            ;; produced yet would be unresolvable here.
+            (when (and (seq branch-vars)
+                       (every? outer-vars branch-vars))
+              (let [param-vars (vec (sort-by str branch-vars))
+                    fn-param (symbol (str "?or-pred"
+                                          (swap! (:var-counter ctx) inc)))
+                    f (fn [& vals]
+                        (let [bindings (zipmap param-vars vals)]
+                          (boolean
+                           (some (fn [form]
+                                   (let [v (interpret-form form bindings)]
+                                     (and (some? v) (not= :__null__ v)
+                                          (not (false? v)))))
+                                 forms))))]
+                (swap! (:in-params ctx) conj fn-param)
+                (swap! (:in-args ctx) conj f)
+                [(vec (list (apply list fn-param param-vars)))]))))))))
+
 (defn- combine-disjuncts
   "Combine per-branch clause vectors into a single OR clause form.
 
@@ -7934,12 +8208,16 @@
           ;; the post-projection `limit-rel` mismatches across branches.
           ;; Empty intersection → use plain `or`.
           :else
-          (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
-                outer-vars  (ctx/collect-vars @(:where-clauses ctx))
-                shared-vars (vec (sort-by str (set/intersection branch-vars outer-vars)))]
-            [(if (seq shared-vars)
-               (concat ['or-join shared-vars] live-branches)
-               (concat ['or] live-branches))]))))))
+          (or
+           ;; Every branch a pure filter over bound variables -> one
+           ;; predicate, evaluated per row, instead of a relation.
+           (fused-or-predicate ctx live-branches)
+           (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
+                 outer-vars  (ctx/collect-vars @(:where-clauses ctx))
+                 shared-vars (vec (sort-by str (set/intersection branch-vars outer-vars)))]
+             [(if (seq shared-vars)
+                (concat ['or-join shared-vars] live-branches)
+                (concat ['or] live-branches))])))))))
 
 (defn- ground-true?
   "Evaluate a variable-free clause form and say whether it is TRUE.

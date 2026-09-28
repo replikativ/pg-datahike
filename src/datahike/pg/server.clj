@@ -373,37 +373,24 @@
 ;; HAVING post-filter
 ;; ============================================================================
 
-(defn- row-bindings
-  "Variable bindings for a projection or predicate FORM evaluated against
-   one result row: every `:find` element that is a plain variable, read
-   off the row by position, plus the query's `:in` parameters.
+(def ^:private row-bindings
+  "In stmt now: a derived table must apply its own HAVING with the same
+   bindings the top level uses."
+  stmt/row-bindings)
 
-   That is what lets such a form reference a GROUPING column (`sum(x) +
-   id`, or a plain column in HAVING) and a `$N` placeholder as well as the
-   aggregate slots the caller adds."
-  [query in-args row]
-  (let [rv (if (sequential? row) (vec row) [row])]
-    (into (into {} (keep-indexed (fn [i e] (when (symbol? e) [e (nth rv i nil)])))
-                (:find query))
-          (zipmap (rest (:in query)) in-args))))
+(def ^:private apply-having stmt/apply-having)
 
-(defn- apply-having
-  "Filter result rows by HAVING.
+(defn- limit-pushable?
+  "Whether a statement's own LIMIT/OFFSET may be handed to Datalog.
 
-   `having` is {:form <predicate form> :slots [[var idx] …]} -- the
-   aggregates hoisted into hidden columns, and a form over them.
-   PostgreSQL keeps a group only when the predicate is TRUE, so UNKNOWN
-   (a NULL operand) drops it, which is what `true?` says here."
-  [results having query in-args]
-  (if-let [{:keys [form slots]} having]
-    (filterv (fn [row]
-               (let [rv (if (sequential? row) (vec row) [row])
-                     binds (reduce (fn [m [sym idx]] (assoc m sym (nth rv idx nil)))
-                                   (row-bindings query in-args row)
-                                   slots)]
-                 (true? (expr/interpret-form form binds))))
-             results)
-    results))
+   Only when nothing AFTER the scan can still change which rows there
+   are. DISTINCT, HAVING, a set-returning projection, row locking, a
+   window, and a bag-multiplicity `:with` all can, so for those the
+   limit has to be applied to the FINISHED rows instead -- which is
+   also why the safety cap has never been pushed down for them."
+  [datalog {:keys [having has-distinct? project-set for-update window-specs]}]
+  (not (or having has-distinct? project-set for-update
+           (seq window-specs) (seq (:with datalog)))))
 
 ;; ============================================================================
 ;; Result formatting
@@ -2498,8 +2485,16 @@
             (let [k (keyword table-name c)]
               (if (nil? v)
                 (dissoc e k)
-                (assoc e k (try (#'stmt/coerce-insert-value v k (dbi/-schema db) db)
-                                (catch Exception _ v))))))
+                ;; NOT `(catch Exception _ v)`. Every SQLSTATE this
+                ;; coercion exists to raise -- 22P02 bad syntax, 22003
+                ;; out of range, 22001 too long, 22008 an impossible
+                ;; date -- was swallowed, and the UNCOERCED value
+                ;; stored. For a type Datahike carries as a long the
+                ;; schema check caught it afterwards with a different
+                ;; message; for one it carries as a string (jsonb, bit,
+                ;; an array) nothing did, and the row went in. PostgreSQL
+                ;; raises at the assignment.
+                (assoc e k (#'stmt/coerce-insert-value v k (dbi/-schema db) db)))))
           entity
           columns))
 
@@ -2702,9 +2697,10 @@
   (let [want (into {} (keep (fn [[c v]]
                               (when (some? v)
                                 [(keyword table-name c)
-                                 (try (#'stmt/coerce-insert-value
-                                       v (keyword table-name c) (dbi/-schema db) db)
-                                      (catch Exception _ v))])))
+                                 ;; See coerce-trigger-row: the verdict
+                                 ;; is the point of the call.
+                                 (#'stmt/coerce-insert-value
+                                  v (keyword table-name c) (dbi/-schema db) db)])))
                    row)
         table-attr? (fn [a] (and (keyword? a) (= table-name (namespace a))
                                  (not= "db-row-exists" (name a))))]
@@ -7037,43 +7033,10 @@
       :dh-delete-branch  (handle-dh-delete-branch ctx parsed)
       (empty-result "OK"))))
 
-(defn- null-safe-order-cmp
-  "Row comparator for the server-side ORDER BY fallback. `sql-order-by`
-   is a flat [col-idx dir nulls col-idx dir nulls …] spec; nil and the
-   :__null__ sentinel both mean SQL NULL.
-
-   `nulls` is :first, :last, or nil for PostgreSQL's default — which is
-   NULLS LAST for ASC and NULLS FIRST for DESC, i.e. NULL sorts as the
-   largest value."
-  [sql-order-by]
-  (fn [a b]
-    (let [av (if (sequential? a) a [a])
-          bv (if (sequential? b) b [b])]
-      (loop [specs (partition 3 sql-order-by)]
-        (if-let [[idx dir nulls] (first specs)]
-          (let [va (nth av idx nil)
-                vb (nth bv idx nil)
-                a-null? (or (nil? va) (= :__null__ va))
-                b-null? (or (nil? vb) (= :__null__ vb))
-                ;; Explicit NULLS FIRST/LAST wins; otherwise the PG default.
-                nulls-first? (if nulls (= nulls :first) (= dir :desc))
-                c (cond
-                    (and a-null? b-null?) 0
-                    a-null? (if nulls-first? -1 1)
-                    b-null? (if nulls-first? 1 -1)
-                    ;; fns/order-cmp, not `compare`: Clojure's compares
-                    ;; NaN EQUAL to everything, so a NaN in the sort key
-                    ;; left the result silently unsorted -- and a
-                    ;; non-transitive comparator can make TimSort raise
-                    ;; outright. PostgreSQL sorts NaN above every
-                    ;; non-NaN.
-                    :else (if (= dir :desc)
-                            (fns/order-cmp vb va)
-                            (fns/order-cmp va vb)))]
-            (if (zero? c)
-              (recur (rest specs))
-              c))
-          0)))))
+(def ^:private null-safe-order-cmp
+  "Lives in fns now: a derived table has to sort by the SAME comparator
+   the top level uses, and stmt.clj cannot require this namespace."
+  fns/null-safe-order-cmp)
 
 (defn- take-with-ties
   "Take the first `n` sorted rows and every following row equal to the
@@ -7579,6 +7542,7 @@
                 having has-aggregates? has-distinct?
                 in-args hidden-count compound-exprs window-specs
                 sql-order-by sql-limit sql-offset fetch-with-ties?
+                post-window-order-by
                 project-set project-order-by project-limit project-offset
                 enriched-db literal-row literal-rows for-update]} parsed]
     (if (or literal-row literal-rows)
@@ -7636,13 +7600,25 @@
                                        (seq (:with datalog))))
                     cap-limit (when (and safe-cap? *max-result-rows*)
                                 (inc *max-result-rows*))
+                    ;; The user's LIMIT/OFFSET may only be pushed into
+                    ;; Datalog when nothing AFTER the scan can still change
+                    ;; which rows there are. `safe-cap?` already names those
+                    ;; cases for the safety cap -- DISTINCT, HAVING,
+                    ;; set-returning projections, row locking, bag `:with`
+                    ;; -- and the user's own limit was pushed down
+                    ;; regardless. `SELECT DISTINCT t.id … LIMIT 2` asked
+                    ;; Datalog for two JOINED rows, got the same molecule
+                    ;; twice, and deduplicated them to one: fewer rows than
+                    ;; the limit, silently.
+                    pushable? (limit-pushable? datalog parsed)
                     query-limit (cond
-                                  (and limit cap-limit) (min (long limit) cap-limit)
-                                  limit limit
+                                  (and limit pushable? cap-limit)
+                                  (min (long limit) cap-limit)
+                                  (and limit pushable?) limit
                                   :else cap-limit)
                     q-input (cond-> datalog
                               (some? query-limit) (assoc :limit query-limit)
-                              offset (assoc :offset offset)
+                              (and offset pushable?) (assoc :offset offset)
                               :always (assoc :cancel (current-cancel)))]
                 ;; Runtime subquery closures execute inside d/q. Bind the
                 ;; statement's effective query DB, not merely the connection's
@@ -7779,6 +7755,42 @@
             ;; the reference behavior — prefer it in doubt). Also skipped
             ;; when n+o covers half the result or more, where the heap
             ;; bookkeeping has nothing left to win.
+            ;; DISTINCT belongs BEFORE ORDER BY and LIMIT. SQL evaluates
+            ;; window functions, then SELECT/DISTINCT, then ORDER BY, then
+            ;; LIMIT -- and plain DISTINCT ran last of all here, after the
+            ;; limit had already been taken off the duplicated rows:
+            ;; `SELECT DISTINCT t.id FROM atom JOIN mol t … LIMIT 2`
+            ;; returned ONE row, because the two rows the limit kept were
+            ;; the same molecule twice.
+            ;;
+            ;; Only when there are no window functions. With them the
+            ;; later dedup is in the right place already, since a window
+            ;; is evaluated over the rows BEFORE DISTINCT removes any --
+            ;; deduplicating here would change what each window sees.
+            results (if (and has-distinct?
+                             (nil? (:distinct-on-n parsed))
+                             (empty? window-specs))
+                      (distinct (map resolve-result-value results))
+                      results)
+            ;; …and when it could not be pushed down, the limit has to be
+            ;; taken HERE, off the finished rows. It used to be pushed
+            ;; unconditionally, so this had nothing to do; not pushing it
+            ;; without applying it here would drop the limit altogether.
+            ;; …and when it could not be pushed down, the limit has to
+            ;; be taken off the finished rows -- but NOT here when a
+            ;; window is still to be computed. PostgreSQL evaluates a
+            ;; window over the whole result and only then trims, so
+            ;; trimming here made `sum(i) OVER () … LIMIT 2` the sum of
+            ;; the two kept rows (10200 where PostgreSQL says 47100).
+            ;; The comment below already said so, but only the
+            ;; `sql-order-by` branch acted on it, so the plain
+            ;; `LIMIT`-with-a-window path kept trimming early.
+            results (if (or (limit-pushable? query parsed)
+                            (seq window-specs))
+                      results
+                      (cond->> results
+                        offset (drop offset)
+                        limit  (take limit)))
             results (if sql-order-by
                       (let [null-safe-cmp (null-safe-order-cmp sql-order-by)
                             k (when sql-limit
@@ -7902,11 +7914,22 @@
                     final-aliases (mapv #(nth new-aliases %) visible-indices)]
                 [final-results final-aliases])
               [results find-aliases])
-            ;; The OFFSET/LIMIT deferred past the window pass above.
-            results (if (and (seq window-specs) sql-order-by)
-                      (cond->> results
-                        sql-offset (drop sql-offset)
-                        sql-limit  (take sql-limit))
+            ;; `ORDER BY` a window function's output. The value exists
+            ;; only now, so the whole sort waited for it -- the keys are
+            ;; positions in the row just projected.
+            results (if (seq post-window-order-by)
+                      (sort (null-safe-order-cmp post-window-order-by) results)
+                      results)
+            ;; The OFFSET/LIMIT deferred past the window pass above --
+            ;; whichever pair carries it. A sorted query puts it in
+            ;; `sql-limit`, an unsorted one in `limit`, and honouring
+            ;; only the first left the second trimming too early.
+            results (if (seq window-specs)
+                      (let [o (or sql-offset offset)
+                            l (or sql-limit limit)]
+                        (cond->> results
+                          o (drop o)
+                          l (take l)))
                       results)
             ;; Expressions OVER aggregates: `max(a) - min(a)`,
             ;; `round(avg(x), 2)`, `coalesce(sum(x), 0)`. The translator

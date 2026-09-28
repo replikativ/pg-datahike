@@ -18,7 +18,7 @@
      agg(x) FILTER (…) OVER (…)        the filter was ignored
      OVER w  (a WINDOW clause)         no partition, no order, no frame
      SELECT … FROM (SELECT … OVER …)   failed to run at all"
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
   (:import [java.sql Connection DriverManager SQLException]))
@@ -282,3 +282,139 @@
     ;; NULL input, so every cumulative frame remains true.
     (is (= ["t" "t" "t" "t" "t"]
            (col c 2 "SELECT id, bool_and(v > 5) OVER (ORDER BY id) FROM wp ORDER BY id")))))
+
+(deftest every-window-function-past-the-transient-boundary
+  ;; A transient array-map holds EIGHT entries; the ninth `assoc!`
+  ;; returns a new hash-map transient. The window engine called
+  ;; `assoc!` for its side effect and discarded that return, so it kept
+  ;; writing into a map it had stopped owning: every window function
+  ;; produced NULL for every row after the first eight. ROW_NUMBER over
+  ;; 20 rows gave 12 NULLs; over a 750-row table, 742.
+  ;;
+  ;; Every test in this file until now used five rows, and the rest of
+  ;; the suite eight or fewer -- exactly the boundary that hides it.
+  ;; This one crosses it deliberately, and checks EVERY window function
+  ;; rather than one, because they are five separate result maps built
+  ;; the same wrong way.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE w20 (id int)")
+    (doseq [i (range 1 21)]
+      (exec! c (str "INSERT INTO w20 VALUES (" i ")")))
+    (let [q (fn [expr]
+              (col c 1 (str "SELECT count(" expr ") FROM (SELECT id, "
+                            expr " OVER (ORDER BY id) AS w FROM w20) s")))]
+      (testing "no function stops writing at the ninth row"
+        (doseq [[fname expr expected]
+                [["row_number"   "ROW_NUMBER()"    "20"]
+                 ["rank"         "RANK()"          "20"]
+                 ["dense_rank"   "DENSE_RANK()"    "20"]
+                 ["percent_rank" "PERCENT_RANK()"  "20"]
+                 ["cume_dist"    "CUME_DIST()"     "20"]
+                 ["ntile"        "NTILE(4)"        "20"]
+                 ["first_value"  "FIRST_VALUE(id)" "20"]
+                 ["sum"          "SUM(id)"         "20"]]]
+          (is (= [expected]
+                 (col c 1 (str "SELECT count(w) FROM (SELECT ROW_NUMBER()"
+                               " OVER (ORDER BY id) AS rn, " expr
+                               " OVER (ORDER BY id) AS w FROM w20) s")))
+              (str fname " lost rows past the transient boundary")))
+        ;; LAG has no predecessor for the first row, so 19 is correct.
+        (is (= ["19"]
+               (col c 1 (str "SELECT count(w) FROM (SELECT LAG(id)"
+                             " OVER (ORDER BY id) AS w FROM w20) s"))))))
+    (testing "and the values are right, not merely present"
+      (is (= ["20"] (col c 1 (str "SELECT max(rn) FROM (SELECT ROW_NUMBER()"
+                                  " OVER (ORDER BY id) AS rn FROM w20) s"))))
+      (is (= ["210"] (col c 1 (str "SELECT max(s) FROM (SELECT SUM(id)"
+                                   " OVER (ORDER BY id) AS s FROM w20) s")))
+          "the running sum reaches 1+…+20"))))
+
+(deftest a-window-ordered-by-an-aggregate
+  ;; `RANK() OVER (ORDER BY COUNT(id) DESC)` alongside GROUP BY. The
+  ;; sort key translates to an aggregate MARKER map, not a var or a
+  ;; form, and it was pushed straight into `:find` -- so Datahike
+  ;; answered `Cannot parse :find, expected: (find-rel | …)` at the
+  ;; client. The comment at that site already recorded the same failure
+  ;; for COUNT(*); this is the case it did not cover.
+  ;;
+  ;; The aggregate the query ALREADY projects is the sort key, so the
+  ;; window reuses that column rather than adding one.
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE ws (id int, grp text)")
+    (doseq [[i g] [[1 "a"] [2 "a"] [3 "a"] [4 "b"] [5 "b"] [6 "c"]]]
+      (exec! c (str "INSERT INTO ws VALUES (" i ",'" g "')")))
+    (is (= ["1" "2" "3"]
+           (col c 3 (str "SELECT grp, COUNT(id), RANK() OVER (ORDER BY COUNT(id) DESC)"
+                         " FROM ws GROUP BY grp ORDER BY COUNT(id) DESC"))))
+    (is (= ["a" "b" "c"]
+           (col c 1 (str "SELECT grp, COUNT(id), RANK() OVER (ORDER BY COUNT(id) DESC)"
+                         " FROM ws GROUP BY grp ORDER BY COUNT(id) DESC"))))
+    (testing "an aggregate the query does NOT project is refused, not mis-sorted"
+      (is (re-find #"(?i)0A000|not supported|does not project"
+                   (str (try (col c 1 (str "SELECT grp, RANK() OVER (ORDER BY SUM(id) DESC)"
+                                           " FROM ws GROUP BY grp"))
+                             nil
+                             (catch java.sql.SQLException e
+                               (str (.getSQLState e) " " (.getMessage e))))))))))
+
+;; ============================================================================
+;; ORDER BY and LIMIT relative to the window pass
+;; ============================================================================
+
+(deftest order-by-a-window-function-sorts-after-the-window-pass
+  ;; A window value does not exist until the window pass, which runs
+  ;; ABOVE the sort. ORDER BY resolved the key by indexing the :find
+  ;; list with a SELECT-LIST position -- two lists that only line up
+  ;; when no window function is projected. When they did not, it either
+  ;; sorted by an unrelated column or ran off the end:
+  ;;
+  ;;   ORDER BY rank() OVER w   -> IndexOutOfBoundsException, or silently
+  ;;                               ordered by the window's ORDER BY column
+  ;;   ORDER BY r               -> column "r" does not exist, because the
+  ;;                               window alias is deliberately not in
+  ;;                               find-aliases
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE es (depname text, empno int, salary int)")
+    (exec! c (str "INSERT INTO es VALUES "
+                  "('develop',10,5200),('sales',1,5000),('personnel',5,3500),"
+                  "('sales',4,4800),('personnel',2,3900),('develop',7,4200),"
+                  "('develop',9,4500),('sales',3,4800),('develop',8,6000),"
+                  "('develop',11,5200)"))
+    (testing "the window expression repeated in ORDER BY"
+      (is (= ["1" "1" "1" "1" "2" "2" "3" "3" "3" "5"]
+             (col c 4 (str "SELECT depname, empno, salary, rank() OVER w FROM es "
+                           "WINDOW w AS (PARTITION BY depname ORDER BY salary) "
+                           "ORDER BY rank() OVER w")))))
+    (testing "its output ALIAS, which nothing could resolve before"
+      (is (= ["1" "2" "3" "4" "5" "6" "7" "8" "9" "10"]
+             (col c 2 (str "SELECT empno, ROW_NUMBER() OVER (ORDER BY salary) AS r "
+                           "FROM es ORDER BY r")))))
+    (testing "mixed with an ordinary column, where both keys must sort together"
+      (is (= ["1" "2" "3" "3" "5" "1" "2" "1" "1" "3"]
+             (col c 3 (str "SELECT depname, empno, rank() OVER w AS rk FROM es "
+                           "WINDOW w AS (PARTITION BY depname ORDER BY salary) "
+                           "ORDER BY depname, rk")))))))
+
+(deftest limit-waits-for-the-window-even-without-an-order-by
+  ;; PostgreSQL evaluates a window over the WHOLE result and only then
+  ;; trims. The deferral was already written, but only the sorted branch
+  ;; acted on it, so an unsorted `LIMIT` still trimmed first and the
+  ;; window saw the kept rows alone: `sum(salary) OVER ()` answered
+  ;; 10200 -- the two rows' own sum -- where PostgreSQL says 47100.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE es (empno int, salary int)")
+    (exec! c (str "INSERT INTO es VALUES (10,5200),(1,5000),(5,3500),(4,4800),"
+                  "(2,3900),(7,4200),(9,4500),(3,4800),(8,6000),(11,5200)"))
+    (is (= ["47100" "47100"]
+           (col c 2 "SELECT empno, sum(salary) OVER () FROM es LIMIT 2"))
+        "unsorted")
+    (is (= ["47100" "47100"]
+           (col c 2 "SELECT empno, sum(salary) OVER () FROM es ORDER BY empno LIMIT 2"))
+        "sorted -- the branch that was already right")
+    (testing "OFFSET past the window too"
+      (is (= ["9" "10"]
+             (col c 2 (str "SELECT empno, ROW_NUMBER() OVER (ORDER BY salary) AS r "
+                           "FROM es ORDER BY r OFFSET 8")))))))
