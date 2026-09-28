@@ -38,6 +38,9 @@
 
 (defn- err [^PgWireServer$QueryResult r] (some-> (.error r) str))
 
+(defn- notices [^PgWireServer$QueryResult r]
+  (mapv #(.message ^datahike.pg.PgWireServer$Notice %) (or (.notices r) [])))
+
 (defn- ok! [h sql]
   (let [r (exec h sql)]
     (is (nil? (.error r)) (str sql " => " (err r)))
@@ -131,3 +134,68 @@
     (testing "and the ancestors see the new row"
       (is (= [["a1"] ["a2"] ["ee-col1"]]
              (rows (ok! h "SELECT * FROM ctla ORDER BY aa")))))))
+
+(deftest a-table-may-inherit-from-several
+  ;; `INHERITS (b, c, a)`. JSqlParser hands the whole list back as one
+  ;; option string, and reading it as a relation named "b,c,a" left the
+  ;; child with NO inherited columns -- so `INSERT INTO d(aa)` said the
+  ;; column did not exist. It is PostgreSQL's own inherit test's fourth
+  ;; statement.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE a (aa text)")
+    (ok! h "CREATE TABLE b (bb text) INHERITS (a)")
+    (ok! h "CREATE TABLE c (cc text) INHERITS (a)")
+    (let [r (ok! h "CREATE TABLE d (dd text) INHERITS (b,c,a)")]
+      (testing "`aa` arrives three times and is merged once, with a notice each"
+        (is (= ["merging multiple inherited definitions of column \"aa\""
+                "merging multiple inherited definitions of column \"aa\""]
+               (notices r)))))
+    (is (= ["aa" "bb" "cc" "dd"] (cols (ok! h "SELECT * FROM d"))))
+    (ok! h "INSERT INTO a(aa) VALUES ('aaa')")
+    (ok! h "INSERT INTO b(aa) VALUES ('bbb')")
+    (ok! h "INSERT INTO c(aa) VALUES ('ccc')")
+    (ok! h "INSERT INTO d(aa) VALUES ('ddd')")
+    (is (= [["ddd" nil nil nil]] (rows (ok! h "SELECT * FROM d"))))
+    (testing "every ancestor sees the descendant's row"
+      (is (= [["aaa"] ["bbb"] ["ccc"] ["ddd"]]
+             (rows (ok! h "SELECT aa FROM a ORDER BY aa"))))
+      (is (= [["bbb"] ["ddd"]] (rows (ok! h "SELECT aa FROM b ORDER BY aa"))))
+      (is (= [["ccc"] ["ddd"]] (rows (ok! h "SELECT aa FROM c ORDER BY aa")))))
+    (testing "and ONLY still means the table itself"
+      (is (= [["aaa"]] (rows (ok! h "SELECT * FROM ONLY a")))))))
+
+(deftest a-parent-that-does-not-exist-is-named
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE a (aa text)")
+    (let [r (exec h "CREATE TABLE d (dd text) INHERITS (a, nosuch)")]
+      (is (= "relation \"nosuch\" does not exist" (err r)))
+      (is (= "42P01" (.sqlstate r))))))
+
+(deftest copy-into-an-inheriting-table
+  ;; PostgreSQL's own test_setup does exactly this: `person` holds
+  ;; name/age/location, `emp` inherits it and adds salary/manager, and
+  ;; a five-field COPY fills all of them.
+  ;;
+  ;; Two things had to be true and were not. A column list that
+  ;; includes the inherited columns has to resolve each to the
+  ;; attribute the values live under -- `(keyword \"emp\" \"name\")`
+  ;; names nothing, because `name` belongs to person -- and a copied
+  ;; row has to carry every ancestor's marker, the way an inserted one
+  ;; does, or the parent cannot see it.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE person (name text, age int4, location point)")
+    (ok! h "CREATE TABLE emp (salary int4, manager name) INHERITS (person)")
+    (ok! h "COPY person FROM STDIN")
+    (.copyChunk ^PgWireServer$QueryHandler (:handler h)
+                (.getBytes "mike\t40\t(1,2)\n"))
+    (.copyComplete ^PgWireServer$QueryHandler (:handler h))
+    (ok! h "COPY emp FROM STDIN")
+    (.copyChunk ^PgWireServer$QueryHandler (:handler h)
+                (.getBytes "sharon\t25\t(15,12)\t1000\tsam\n"))
+    (.copyComplete ^PgWireServer$QueryHandler (:handler h))
+    (is (= [["sharon" "25" "(15,12)" "1000" "sam"]]
+           (rows (ok! h "SELECT * FROM emp"))))
+    (testing "and person sees both rows, ONLY person only its own"
+      (is (= [["mike"] ["sharon"]]
+             (rows (ok! h "SELECT name FROM person ORDER BY name"))))
+      (is (= [["mike"]] (rows (ok! h "SELECT name FROM ONLY person")))))))
