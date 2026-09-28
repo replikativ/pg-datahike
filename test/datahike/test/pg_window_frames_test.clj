@@ -330,3 +330,32 @@
       (is (= ["210"] (col c 1 (str "SELECT max(s) FROM (SELECT SUM(id)"
                                    " OVER (ORDER BY id) AS s FROM w20) s")))
           "the running sum reaches 1+…+20"))))
+
+(deftest a-window-ordered-by-an-aggregate
+  ;; `RANK() OVER (ORDER BY COUNT(id) DESC)` alongside GROUP BY. The
+  ;; sort key translates to an aggregate MARKER map, not a var or a
+  ;; form, and it was pushed straight into `:find` -- so Datahike
+  ;; answered `Cannot parse :find, expected: (find-rel | …)` at the
+  ;; client. The comment at that site already recorded the same failure
+  ;; for COUNT(*); this is the case it did not cover.
+  ;;
+  ;; The aggregate the query ALREADY projects is the sort key, so the
+  ;; window reuses that column rather than adding one.
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE ws (id int, grp text)")
+    (doseq [[i g] [[1 "a"] [2 "a"] [3 "a"] [4 "b"] [5 "b"] [6 "c"]]]
+      (exec! c (str "INSERT INTO ws VALUES (" i ",'" g "')")))
+    (is (= ["1" "2" "3"]
+           (col c 3 (str "SELECT grp, COUNT(id), RANK() OVER (ORDER BY COUNT(id) DESC)"
+                         " FROM ws GROUP BY grp ORDER BY COUNT(id) DESC"))))
+    (is (= ["a" "b" "c"]
+           (col c 1 (str "SELECT grp, COUNT(id), RANK() OVER (ORDER BY COUNT(id) DESC)"
+                         " FROM ws GROUP BY grp ORDER BY COUNT(id) DESC"))))
+    (testing "an aggregate the query does NOT project is refused, not mis-sorted"
+      (is (re-find #"(?i)0A000|not supported|does not project"
+                   (str (try (col c 1 (str "SELECT grp, RANK() OVER (ORDER BY SUM(id) DESC)"
+                                           " FROM ws GROUP BY grp"))
+                             nil
+                             (catch java.sql.SQLException e
+                               (str (.getSQLState e) " " (.getMessage e))))))))))

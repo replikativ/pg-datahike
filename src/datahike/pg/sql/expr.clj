@@ -5124,10 +5124,25 @@
   ;; plausible-looking raw Datalog rows with SQL semantics omitted.
   (when (or (seq (:project-set p))
             (seq (:window-specs p))
-            (seq (:compound-exprs p))
+            ;; `:compound-exprs` was here. They are reconstructed below
+            ;; now -- `(SELECT AVG(id) * 1.2 …)` is an aggregate with an
+            ;; expression over it, which PostgreSQL simply evaluates.
             (seq (:correlated-subqueries p))
             (:distinct-on-n p)
-            (:having p)
+            ;; HAVING is applied below now -- the same `apply-having`
+            ;; the top level and the derived tables use -- so `x IN
+            ;; (SELECT grp FROM a GROUP BY grp HAVING COUNT(id) >= 5)`
+            ;; is answered rather than refused.
+            ;;
+            ;; A TABLE-FREE one still is not: `SELECT count(*) HAVING
+            ;; false` translates to `{:find [(count ?_eid)] :where []}`,
+            ;; whose entity var nothing binds, so running it raises
+            ;; `Query for unknown vars`. That shape is broken with or
+            ;; without the HAVING -- it was simply never reached before
+            ;; -- so the capability boundary stays exactly where it
+            ;; really is, as an explicit 0A000 rather than an internal
+            ;; error.
+            (and (:having p) (empty? (:where (:query p))))
             (:fetch-with-ties? p)
             (:for-update p)
             (seq (:deferred-recursive-ctes p)))
@@ -5136,13 +5151,20 @@
             {:message "this subquery requires SELECT post-processing that is not implemented"}))))
 
 (defn- raw-in-subquery-having?
-  "True when a SELECT AST contains a HAVING clause in any set-op branch.
+  "True when a SELECT AST has a HAVING clause AND NO FROM ITEM, in any
+   set-op branch.
 
-   JSqlParser 5 omits GROUP BY and HAVING from `PlainSelect.toString` when
-   the SELECT has no FROM item.  IN-subquery execution reparses that string,
-   so inspecting only the reparsed plan would silently lose the clause (and
-   can expose a Datahike unknown-var error for aggregate-only SELECTs).  Keep
-   the unsupported-stage boundary on the original AST as well."
+   JSqlParser 5 omits GROUP BY and HAVING from `PlainSelect.toString`
+   when the SELECT has no FROM item. IN-subquery execution reparses that
+   string, so inspecting only the reparsed plan would silently lose the
+   clause -- which is why this reads the original AST.
+
+   Only the FROM-less shape. `SELECT count(*) HAVING false` translates
+   to `{:find [(count ?_eid)] :where []}`, whose entity var nothing
+   binds, so running it raises Datahike's `Query for unknown vars`; it
+   is broken with or without the HAVING. One WITH a FROM is applied
+   normally now, so `x IN (SELECT grp FROM a GROUP BY grp HAVING
+   COUNT(id) >= 5)` is answered rather than refused."
   [select]
   (cond
     (instance? ParenthesedSelect select)
@@ -5153,7 +5175,8 @@
                    (.getSelects ^SetOperationList select)))
 
     (instance? PlainSelect select)
-    (some? (.getHaving ^PlainSelect select))
+    (and (some? (.getHaving ^PlainSelect select))
+         (nil? (.getFromItem ^PlainSelect select)))
 
     :else false))
 
@@ -5177,6 +5200,98 @@
         offset-rows (cond->> ordered tail-offset (drop tail-offset))]
     (vec (cond->> offset-rows tail-limit (take tail-limit)))))
 
+(defn row-bindings
+  "Variable bindings for a projection or predicate FORM evaluated against
+   one result row: every `:find` element that is a plain variable, read
+   off the row by position, plus the query's `:in` parameters.
+
+   That is what lets such a form reference a GROUPING column (`sum(x) +
+   id`, or a plain column in HAVING) and a `$N` placeholder as well as the
+   aggregate slots the caller adds."
+  [query in-args row]
+  (let [rv (if (sequential? row) (vec row) [row])]
+    (into (into {} (keep-indexed (fn [i e] (when (symbol? e) [e (nth rv i nil)])))
+                (:find query))
+          (zipmap (rest (:in query)) in-args))))
+
+(defn apply-having
+  "Filter result rows by HAVING.
+
+   `having` is {:form <predicate form> :slots [[var idx] …]} -- the
+   aggregates hoisted into hidden columns, and a form over them.
+   PostgreSQL keeps a group only when the predicate is TRUE, so UNKNOWN
+   (a NULL operand) drops it, which is what `true?` says here."
+  [results having query in-args]
+  (if-let [{:keys [form slots]} having]
+    (filterv (fn [row]
+               (let [rv (if (sequential? row) (vec row) [row])
+                     binds (reduce (fn [m [sym idx]] (assoc m sym (nth rv idx nil)))
+                                   (row-bindings query in-args row)
+                                   slots)]
+                 (true? (interpret-form form binds))))
+             results)
+    results))
+
+(defn compound-projection-indices
+  "Indices that turn the physical compound-projection shape into its SQL
+   SELECT-list shape. Hidden aggregate inputs are removed and deferred
+   expressions are restored to the positions recorded while lowering."
+  [aliases compound-exprs]
+  (let [visible-indices (into []
+                              (keep-indexed
+                               (fn [i a]
+                                 (when-not (and (string? a)
+                                                (.startsWith ^String a "__compound_"))
+                                   i)))
+                              aliases)
+        positions (mapv :out-pos compound-exprs)
+        n-visible (count visible-indices)
+        reorder? (and (every? some? positions)
+                      (= (count positions) (count (distinct positions)))
+                      (every? #(< -1 % n-visible) positions))]
+    (if reorder?
+      (let [base-count (- n-visible (count compound-exprs))
+            compound-at (into {}
+                              (map-indexed (fn [i pos] [pos (+ base-count i)]))
+                              positions)
+            visible-order
+            (first
+             (reduce (fn [[order next-base] pos]
+                       (if-let [compound-idx (get compound-at pos)]
+                         [(conj order compound-idx) next-base]
+                         [(conj order next-base) (inc next-base)]))
+                     [[] 0]
+                     (range n-visible)))]
+        (mapv #(nth visible-indices %) visible-order))
+      visible-indices)))
+
+(defn apply-compound-projections
+  "Evaluate deferred SELECT projection forms and remove their hidden inputs.
+
+   Shared by the normal SELECT executor and INSERT ... SELECT, which must
+   consume the same visible row shape. Returns [rows aliases]."
+  [results aliases query in-args compound-exprs]
+  (if (seq compound-exprs)
+    ;; The shared `row-bindings`, not a fourth private copy of it.
+    (let [row-bindings #(row-bindings query in-args %)
+          new-results
+          (mapv (fn [row]
+                  (let [rv (if (sequential? row) (vec row) [row])
+                        binds (row-bindings row)]
+                    (reduce (fn [r {:keys [form slots]}]
+                              (let [b (reduce (fn [m [sym idx]]
+                                                (assoc m sym (nth r idx nil)))
+                                              binds slots)
+                                    val (interpret-form form b)]
+                                (conj r (if (= :__null__ val) nil val))))
+                            rv compound-exprs)))
+                results)
+          new-aliases (into (vec aliases) (map :alias compound-exprs))
+          visible-indices (compound-projection-indices new-aliases compound-exprs)]
+      [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
+       (mapv #(nth new-aliases %) visible-indices)])
+    [results aliases]))
+
 (defn- run-subquery-leaf
   [p db]
   (params/check-cancel!)
@@ -5197,8 +5312,21 @@
               (seq in-args) (apply d/q q query-db in-args)
               :else (d/q q query-db))
         raw (or (when (and q (empty? (seq raw))) (empty-aggregate-row q)) raw)
+        ;; BEFORE the order/limit: HAVING decides which groups exist, so
+        ;; it changes what there is to sort and how many to take.
+        raw (apply-having raw (:having p) q in-args)
+        ;; An expression OVER an aggregate rides as a hidden slot plus a
+        ;; form; without reconstructing it the subquery returned the bare
+        ;; aggregate, so it was refused rather than answered wrongly.
+        [raw _] (if (seq (:compound-exprs p))
+                  (apply-compound-projections raw (:find-aliases p) q in-args
+                                              (:compound-exprs p))
+                  [raw nil])
         raw (apply-subquery-order-limit raw p)
-        hidden (long (or (:hidden-count p) 0))]
+        hidden (long (or (:hidden-count p) 0))
+        ;; apply-compound-projections already trimmed to the visible
+        ;; columns, so the hidden-count trim below must not run twice.
+        hidden (if (seq (:compound-exprs p)) 0 hidden)]
     (if (pos? hidden)
       (mapv (fn [row]
               (let [v (if (sequential? row) (vec row) [row])]
@@ -5467,6 +5595,10 @@
    OIDs. This catches missing inner columns, star-expanded arity and operator
    type errors even when the outer relation contains no rows."
   [ctx left-asts inner corr-refs]
+  ;; A HAVING inside the IN subquery used to be refused here for every
+  ;; shape, because the evaluator below silently ignored it -- refusing
+  ;; was right while that was true. It applies it now, so only the
+  ;; FROM-less shape, which cannot be executed at all, is still refused.
   (when (raw-in-subquery-having? inner)
     (throw (errors/pg-error
             :feature-not-supported

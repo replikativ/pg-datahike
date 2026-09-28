@@ -2377,6 +2377,25 @@
 ;; ---------------------------------------------------------------------------
 ;; SQL string function implementations
 
+(defn pg-str
+  "A value as the TEXT PostgreSQL would render for it.
+
+   `str` is not that for a temporal: `java.util.Date`'s toString is
+   `Mon Sep 28 17:24:49 CEST 2026`, so `SUBSTR(CURRENT_TIMESTAMP, 1, 2)`
+   answered \"Mo\" where PostgreSQL answers \"20\" -- an implicit
+   coercion to text rendering a JVM debug string. An EXPLICIT
+   `::text` already went through the output function and was right,
+   which is how the two disagreed.
+
+   Anything that is already a string, or that has no PG output function
+   of its own, falls back to `str`."
+  ^String [v]
+  (if (string? v)
+    v
+    (or (when-let [oid (try (types/infer-oid-from-value v) (catch Exception _ nil))]
+          (try (types/->pg-text v oid) (catch Exception _ nil)))
+        (str v))))
+
 (defn sql-length
   "SQL LENGTH / CHAR_LENGTH. Bit strings measure in bits, not in the
    record's map entries."
@@ -2506,7 +2525,7 @@
   "Return first n characters of string. A negative n removes |n| trailing
    characters, matching PostgreSQL's text_left."
   [s n]
-  (let [s (str s)
+  (let [s (pg-str s)
         n (long n)
         end (if (neg? n) (+ (count s) n) n)]
     (subs s 0 (max 0 (min end (count s))))))
@@ -2515,12 +2534,18 @@
   "Return last n characters of string. A negative n removes |n| leading
    characters, matching PostgreSQL's text_right."
   [s n]
-  (let [s (str s)
+  (let [s (pg-str s)
         n (long n)
         start (if (neg? n) (- n) (- (count s) n))]
     (subs s (max 0 (min start (count s))))))
 
-(defn- ->s ^String [v] (str v))
+(defn- ->s
+  "The text coercion every lifted string function shares. `pg-str`, not
+   `str`: a `java.util.Date`'s toString is `Mon Sep 28 17:24:49 CEST
+   2026`, so `UPPER(CURRENT_TIMESTAMP)` answered `MON SEP 28 …` and
+   `LEFT(CURRENT_TIMESTAMP, 4)` answered `Mon `. A LocalDate escaped
+   only because its toString happens to be ISO."
+  ^String [v] (pg-str v))
 
 (defn- nullable-str
   "Lift a 1-string-argument function to SQL strictness.
@@ -2952,7 +2977,7 @@
          (if (some? len)
            (pg-bits/substring-bits s start len)
            (pg-bits/substring-bits s start))
-         (let [^String st (str s)
+         (let [^String st (pg-str s)
                n (.length st)
                start (long start)
                _ (when (and len (neg? (long len)))
@@ -4284,8 +4309,8 @@
         :__null__))))
 
 (def ^:private legacy-sql-fn->clj-fn
-  {"upper"    str/upper-case
-   "lower"    str/lower-case
+  {"upper"    (fn [v] (str/upper-case (pg-str v)))
+   "lower"    (fn [v] (str/lower-case (pg-str v)))
    ;; NOT bare `count`: a PgBit is a defrecord, so `count` returns its
    ;; number of MAP ENTRIES (2), not its bit width. PG's length() on a
    ;; bit string is the bit count; octet_length is ceil(bits/8).

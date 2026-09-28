@@ -2539,37 +2539,12 @@
       [new-rows new-aliases new-oids])
     [rows (:find-aliases parsed) nil]))
 
-(defn row-bindings
-  "Variable bindings for a projection or predicate FORM evaluated against
-   one result row: every `:find` element that is a plain variable, read
-   off the row by position, plus the query's `:in` parameters.
+(def row-bindings
+  "In expr now: the subquery evaluator below it has to apply HAVING with
+   the same bindings the top level and the derived tables use."
+  expr/row-bindings)
 
-   That is what lets such a form reference a GROUPING column (`sum(x) +
-   id`, or a plain column in HAVING) and a `$N` placeholder as well as the
-   aggregate slots the caller adds."
-  [query in-args row]
-  (let [rv (if (sequential? row) (vec row) [row])]
-    (into (into {} (keep-indexed (fn [i e] (when (symbol? e) [e (nth rv i nil)])))
-                (:find query))
-          (zipmap (rest (:in query)) in-args))))
-
-(defn apply-having
-  "Filter result rows by HAVING.
-
-   `having` is {:form <predicate form> :slots [[var idx] …]} -- the
-   aggregates hoisted into hidden columns, and a form over them.
-   PostgreSQL keeps a group only when the predicate is TRUE, so UNKNOWN
-   (a NULL operand) drops it, which is what `true?` says here."
-  [results having query in-args]
-  (if-let [{:keys [form slots]} having]
-    (filterv (fn [row]
-               (let [rv (if (sequential? row) (vec row) [row])
-                     binds (reduce (fn [m [sym idx]] (assoc m sym (nth rv idx nil)))
-                                   (row-bindings query in-args row)
-                                   slots)]
-                 (true? (expr/interpret-form form binds))))
-             results)
-    results))
+(def apply-having expr/apply-having)
 
 (defn materialize-set-op!
   "Run a SELECT (PlainSelect, SetOperationList, or VALUES) and persist its rows
@@ -3482,71 +3457,12 @@
                    :else x))]
     [(vec (remove binding? clauses)) (inline form)]))
 
-(defn compound-projection-indices
-  "Indices that turn the physical compound-projection shape into its SQL
-   SELECT-list shape. Hidden aggregate inputs are removed and deferred
-   expressions are restored to the positions recorded while lowering."
-  [aliases compound-exprs]
-  (let [visible-indices (into []
-                              (keep-indexed
-                               (fn [i a]
-                                 (when-not (and (string? a)
-                                                (.startsWith ^String a "__compound_"))
-                                   i)))
-                              aliases)
-        positions (mapv :out-pos compound-exprs)
-        n-visible (count visible-indices)
-        reorder? (and (every? some? positions)
-                      (= (count positions) (count (distinct positions)))
-                      (every? #(< -1 % n-visible) positions))]
-    (if reorder?
-      (let [base-count (- n-visible (count compound-exprs))
-            compound-at (into {}
-                              (map-indexed (fn [i pos] [pos (+ base-count i)]))
-                              positions)
-            visible-order
-            (first
-             (reduce (fn [[order next-base] pos]
-                       (if-let [compound-idx (get compound-at pos)]
-                         [(conj order compound-idx) next-base]
-                         [(conj order next-base) (inc next-base)]))
-                     [[] 0]
-                     (range n-visible)))]
-        (mapv #(nth visible-indices %) visible-order))
-      visible-indices)))
+(def compound-projection-indices
+  "In expr now, with apply-compound-projections: the subquery evaluator
+   below this namespace needs the same reconstruction."
+  expr/compound-projection-indices)
 
-(defn apply-compound-projections
-  "Evaluate deferred SELECT projection forms and remove their hidden inputs.
-
-   Shared by the normal SELECT executor and INSERT ... SELECT, which must
-   consume the same visible row shape. Returns [rows aliases]."
-  [results aliases query in-args compound-exprs]
-  (if (seq compound-exprs)
-    (let [row-bindings
-          (fn [row]
-            (let [rv (if (sequential? row) (vec row) [row])]
-              (into (into {} (keep-indexed (fn [i e]
-                                             (when (symbol? e)
-                                               [e (nth rv i nil)])))
-                          (:find query))
-                    (zipmap (rest (:in query)) in-args))))
-          new-results
-          (mapv (fn [row]
-                  (let [rv (if (sequential? row) (vec row) [row])
-                        binds (row-bindings row)]
-                    (reduce (fn [r {:keys [form slots]}]
-                              (let [b (reduce (fn [m [sym idx]]
-                                                (assoc m sym (nth r idx nil)))
-                                              binds slots)
-                                    val (expr/interpret-form form b)]
-                                (conj r (if (= :__null__ val) nil val))))
-                            rv compound-exprs)))
-                results)
-          new-aliases (into (vec aliases) (map :alias compound-exprs))
-          visible-indices (compound-projection-indices new-aliases compound-exprs)]
-      [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
-       (mapv #(nth new-aliases %) visible-indices)])
-    [results aliases]))
+(def apply-compound-projections expr/apply-compound-projections)
 
 (defn- defer-compound-projections
   "Build inert per-row projection markers and remove their hidden inputs.
@@ -5071,13 +4987,40 @@
                                                    nulls (condp = (str (.getNullOrdering obe))
                                                            "NULLS_FIRST" :first
                                                            "NULLS_LAST"  :last
-                                                           nil)]
-                                               (when-not (some #{v} @find-elements)
-                                                 (swap! find-elements conj v)
-                                                 (swap! find-aliases conj (str "__win_ord_" (count @find-elements))))
-                                               [(.indexOf ^java.util.List @find-elements v)
-                                                (if asc? :asc :desc)
-                                                nulls]))
+                                                           nil)
+                                               ;; An AGGREGATE as a window's sort
+                                               ;; key -- `RANK() OVER (ORDER BY
+                                               ;; COUNT(id) DESC)` -- translates to
+                                               ;; an aggregate MARKER map, not a var
+                                               ;; or a form. Pushing that into :find
+                                               ;; gave Datahike `Cannot parse :find`
+                                               ;; at the client, the same failure the
+                                               ;; comment below records for COUNT(*).
+                                               ;; The aggregate the query already
+                                               ;; projects IS the key, so reuse its
+                                               ;; column rather than adding one.
+                                                   agg-idx
+                                                   (when (and (map? v) (:aggregate v)
+                                                              (instance? Function
+                                                                         (.getExpression obe)))
+                                                     (match-aggregate-index
+                                                      ^Function (.getExpression obe)
+                                                      @find-elements @find-aliases))
+                                                   _ (when (and (map? v) (nil? agg-idx))
+                                                       (throw (errors/pg-error
+                                                               :feature-not-supported
+                                                               {:feature (str "a window ordered by an"
+                                                                              " aggregate the query does"
+                                                                              " not project")})))]
+                                               (if agg-idx
+                                                 [agg-idx (if asc? :asc :desc) nulls]
+                                                 (do
+                                                   (when-not (some #{v} @find-elements)
+                                                     (swap! find-elements conj v)
+                                                     (swap! find-aliases conj (str "__win_ord_" (count @find-elements))))
+                                                   [(.indexOf ^java.util.List @find-elements v)
+                                                    (if asc? :asc :desc)
+                                                    nulls]))))
                                            order-by-list))
                           ;; The function's own arguments. `.getExpression`
                           ;; is the first, `.getOffset` the second and
