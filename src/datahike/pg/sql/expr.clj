@@ -4997,7 +4997,11 @@
         ;; `[:aliased …]` means specifically "the alias differs from the
         ;; table name"; using it unconditionally mis-resolves the plain
         ;; `FROM t` case.
-        attr-ref (fn [c] (if (= alias-name table-name)
+        ;; An inherited column's attribute belongs to the ancestor's
+        ;; namespace, so the bare keyword would bind it against the
+        ;; ancestor's entity var rather than this row's.
+        attr-ref (fn [c] (if (and (= alias-name table-name)
+                                  (= alias-name (namespace (:attr c))))
                            (:attr c)
                            [:aliased alias-name (:attr c)]))
         ;; A row scope's fields are its placeholders, not a scan.

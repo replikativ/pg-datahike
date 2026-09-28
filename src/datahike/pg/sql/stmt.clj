@@ -4878,7 +4878,16 @@
                     ;; Route through the [:aliased …] form so the column
                     ;; binds against the alias's entity var, matching the
                     ;; `t.*` expansion.
-                  (let [v (expr/column-value! ctx (if (= real ali)
+                    ;;
+                    ;; An INHERITED column's attribute lives in the
+                    ;; ANCESTOR's namespace, so a bare keyword would bind
+                    ;; it against the ancestor's entity var -- a second,
+                    ;; unjoined entity, and `SELECT *` on a child with
+                    ;; two rows returned four. The alias form is needed
+                    ;; whenever the attribute is not the relation's own,
+                    ;; not only when the query renamed it.
+                  (let [v (expr/column-value! ctx (if (and (= real ali)
+                                                           (= ali (namespace (:attr col))))
                                                     (:attr col)
                                                     [:aliased ali (:attr col)]))]
                     (swap! find-elements conj v)
