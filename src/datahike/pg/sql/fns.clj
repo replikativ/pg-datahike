@@ -3816,6 +3816,74 @@
                               {:message "pg_lsn out of range"})))
     (types/pg-lsn value)))
 
+(def ^:private pg-lsn-text #"^\s*([0-9A-Fa-f]{1,8})/([0-9A-Fa-f]{1,8})\s*$")
+
+(defn- lsn-value
+  "The unsigned 64-bit value behind a pg_lsn, whatever carrier it
+   arrived in, or nil when the operand is not one.
+
+   A pg_lsn reaches an operator as its `X/Y` TEXT -- the cast tags the
+   OID and keeps the spelling -- so the two halves are recombined here:
+   the high word is the segment and the low word the byte offset within
+   it, which is what `%X/%08X` prints back."
+  ^java.math.BigInteger [x]
+  (cond
+    (types/pg-lsn? x) (:value x)
+    (string? x) (when-let [[_ hi lo] (re-matches pg-lsn-text x)]
+                  (.add (.shiftLeft (java.math.BigInteger. ^String hi 16) 32)
+                        (java.math.BigInteger. ^String lo 16)))
+    :else nil))
+
+(defn- lsn-in-range
+  ^java.math.BigInteger [^java.math.BigInteger v]
+  (if (or (neg? (.signum v)) (pos? (.compareTo v max-pg-lsn)))
+    (throw (errors/pg-error :invalid-parameter-value
+                            {:message "pg_lsn out of range"}))
+    v))
+
+(defn- lsn-offset
+  "The NUMERIC operand of `pg_lsn ± numeric`, as an integer. PostgreSQL
+   names the operator in its NaN message -- `cannot add NaN to pg_lsn`
+   and `cannot subtract NaN from pg_lsn` -- so the verb is passed in."
+  ^java.math.BigInteger [x verb]
+  (when (types/numeric-special? x)
+    (throw (errors/pg-error
+            :invalid-parameter-value
+            {:message (if (= :nan (:kind x))
+                        (case verb
+                          :add "cannot add NaN to pg_lsn"
+                          :sub "cannot subtract NaN from pg_lsn")
+                        "cannot convert infinity to pg_lsn")})))
+  (-> ^java.math.BigDecimal (coerce/coerce-numeric x :bigdec)
+      (.setScale 0 java.math.RoundingMode/HALF_UP)
+      .toBigInteger))
+
+(defn sql-pg-lsn+
+  "`pg_lsn + numeric` -- a WAL address advanced by a byte count. The
+   operator is commutative in PostgreSQL (`numeric + pg_lsn` too), so
+   either operand may be the address."
+  [a b]
+  (if (or (sql-null? a) (sql-null? b))
+    :__null__
+    (let [[lsn off] (if (lsn-value a) [a b] [b a])]
+      (types/pg-lsn
+       (lsn-in-range (.add (lsn-value lsn) (lsn-offset off :add)))))))
+
+(defn sql-pg-lsn-
+  "`pg_lsn - pg_lsn` is the NUMERIC distance between two WAL addresses;
+   `pg_lsn - numeric` is the address moved back. Which one it is
+   depends on the right operand, and only the first is commutative-free
+   -- `numeric - pg_lsn` is not an operator PostgreSQL has."
+  [a b]
+  (if (or (sql-null? a) (sql-null? b))
+    :__null__
+    (let [l (lsn-value a)
+          r (lsn-value b)]
+      (if r
+        (java.math.BigDecimal. (.subtract l r))
+        (types/pg-lsn
+         (lsn-in-range (.subtract l (lsn-offset b :sub))))))))
+
 (def sql-scale
   "scale(numeric) — the declared display scale."
   (null-safe (fn [v] (long (.scale (bigdec v))))))

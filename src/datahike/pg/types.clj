@@ -1265,7 +1265,12 @@
     (let [mask (java.math.BigInteger. "FFFFFFFF" 16)
           hi (.shiftRight value 32)
           lo (.and value mask)]
-      (format "%X/%08X" hi lo))))
+      ;; `%X/%X`, as pg_lsn_out does (utils/adt/pg_lsn.c) -- NOT zero
+      ;; padded. `0/16AE807` and `0/0`, not `0/016AE807` and
+      ;; `0/00000000`. Nothing produced a PgLsn to render until pg_lsn
+      ;; arithmetic did, which is why the padding survived: a literal
+      ;; keeps its own spelling through the cast.
+      (format "%X/%X" hi lo))))
 
 (defn pg-lsn? [x] (instance? PgLsn x))
 (defn pg-lsn [^java.math.BigInteger value] (->PgLsn value))

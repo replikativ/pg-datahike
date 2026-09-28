@@ -4653,6 +4653,21 @@
       (and (= op-sym '/) (money? l) (factor? r)) 'datahike.pg.query-fns/sql-money-div
       :else nil)))
 
+(defn- pg-lsn-arith-op
+  "PostgreSQL's pg_lsn operators. `lsn - lsn` is the NUMERIC distance
+   between two WAL addresses; `lsn ± numeric` moves an address. They
+   reached generic JVM arithmetic, which was handed the `X/Y` text and
+   raised `class java.lang.String cannot be cast to java.lang.Number`
+   at the client."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
+  (let [l (source-oid ctx (.getLeftExpression expr))
+        r (source-oid ctx (.getRightExpression expr))
+        lsn? #(= types/oid-pg-lsn %)]
+    (cond
+      (and (= op-sym '-) (lsn? l)) 'datahike.pg.query-fns/sql-pg-lsn-
+      (and (= op-sym '+) (or (lsn? l) (lsn? r))) 'datahike.pg.query-fns/sql-pg-lsn+
+      :else nil)))
+
 (defn- check-scalar-subquery-arithmetic-types!
   "Do not let a scalar subquery's resolved output type fall back to JVM
    arithmetic. Unlike a quoted literal, `(SELECT '1')` has already crossed
@@ -4734,7 +4749,8 @@
       (let [lv (if (seq? l) (ctx/materialize-arg! ctx l) l)
             rv (if (seq? r) (ctx/materialize-arg! ctx r) r)
             int-op (int-arith-op ctx expr op-sym)
-            emit-op (or (money-arith-op ctx expr op-sym)
+            emit-op (or (pg-lsn-arith-op ctx expr op-sym)
+                        (money-arith-op ctx expr op-sym)
                         (date-arith-op ctx expr op-sym)
                         (first int-op)
                         (float4-arith-op ctx expr op-sym)

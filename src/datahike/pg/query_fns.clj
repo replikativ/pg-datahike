@@ -96,6 +96,8 @@
 (def sql-mod                             fns/sql-mod)
 (def sql-money*                          fns/sql-money*)
 (def sql-money+                          fns/sql-money+)
+(def sql-pg-lsn+                         fns/sql-pg-lsn+)
+(def sql-pg-lsn-                         fns/sql-pg-lsn-)
 (def sql-money-                          fns/sql-money-)
 (def sql-money-div                       fns/sql-money-div)
 (def sql-money-div-money                 fns/sql-money-div-money)
