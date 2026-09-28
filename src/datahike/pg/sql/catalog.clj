@@ -2223,7 +2223,7 @@
     :create-matview :refresh-matview :drop-matview
     ;; CREATE TABLE … (LIKE src) -- JSqlParser's CREATE TABLE grammar has
     ;; no place for a LIKE element, so the statement is expanded first.
-    :create-table-like
+    :create-table-like :create-table-as
     ;; TRUNCATE (whole statement — JSqlParser's Truncate grammar lacks
     ;; RESTART/CONTINUE IDENTITY) and multi-name DROP TABLE (JSqlParser
     ;; 5.2 parses a single name only). Both re-tagged to non-:system

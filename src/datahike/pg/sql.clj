@@ -1104,6 +1104,7 @@
               ;; CREATE TABLE … (LIKE src): the executor needs the
               ;; source text and the spans the LIKE elements occupy.
               :create-table-like (assoc base :type :ddl-create-table-like)
+              :create-table-as   (assoc base :type :ddl-create-table-as)
 
               :create-matview  (assoc base :type :ddl-create-matview)
               :refresh-matview (assoc base :type :ddl-refresh-matview)

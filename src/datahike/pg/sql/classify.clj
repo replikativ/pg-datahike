@@ -1108,6 +1108,45 @@
              :tag (if (= op :create) "CREATE ROLE" (str "DROP " keyword))}))
         reject)))
 
+(defn- read-as-query-tail
+  "`[(col, …)] AS <query> [WITH [NO] DATA]`, read from a token stream
+   positioned just after a relation name. Returns {:columns :query
+   :with-data?} or nil when the shape does not match.
+
+   Shared by CREATE TABLE … AS and CREATE MATERIALIZED VIEW, which is
+   the same grammar: PostgreSQL's gram.y gives both the same
+   `create_as_target` and the same OptWith/WithData tail. The query is
+   sliced from the source rather than re-printed from tokens, because
+   the stream handed to a classifier is a bounded prefix and a query
+   has no length limit.
+
+   `USING`, `TABLESPACE` and a storage `WITH (…)` before the AS describe
+   physical layout; a caller that cannot honour them gets nil."
+  [after-name]
+  (let [[cols after-cols] (if (= "(" (:text (first after-name)))
+                            (let [[inner rest-ts] (read-balanced after-name)]
+                              [(mapv ident-text
+                                     (remove #(= "," (:text %)) inner))
+                               rest-ts])
+                            [nil after-name])
+        pre-as (take-while #(not (kw=? % "as")) after-cols)]
+    (when (and (kw=? (first (drop (count pre-as) after-cols)) "as")
+               (not-any? #(or (kw=? % "using") (kw=? % "tablespace")
+                              (kw=? % "with"))
+                         pre-as))
+      (when-let [q-start (second (drop (count pre-as) after-cols))]
+        (let [tail (str/trim (subs *source* (:pos q-start)))
+              tail (str/replace tail #";\s*$" "")
+              m (re-find #"(?is)\Wwith\s+(no\s+)?data\s*$" tail)
+              query (str/trim (if m
+                                (subs tail 0 (- (count tail)
+                                                (dec (count (first m)))))
+                                tail))]
+          (when (seq query)
+            {:columns cols
+             :query query
+             :with-data? (not (and m (second m)))}))))))
+
 (def ^:private like-include-supported
   "The INCLUDING options a copied column definition can actually carry.
    DEFAULTS is the only one beyond the default set (names, types and
@@ -1189,16 +1228,39 @@
    CREATE TABLE path -- so a copied column is defined by exactly the
    same code as a written-out one."
   [toks]
-  (if-not (re-find #"(?i)\blike\b" *source*)
-    {:kind :generic-sql}
-    (let [elems (create-table-like-elements)]
-      (cond
-        (empty? elems) {:kind :generic-sql}
+  (or
+   ;; `CREATE TABLE t (a, b) AS <query> [WITH [NO] DATA]`. JSqlParser's
+   ;; CREATE TABLE AS grammar has neither the column list nor the
+   ;; WithData tail, so `… WITH DATA` was a parse error and a column
+   ;; list reached the schema transaction as a column with no type --
+   ;; which came back as datahike's "Update not supported for these
+   ;; schema attributes", an internal message for a statement
+   ;; PostgreSQL simply runs. It is the same grammar as CREATE
+   ;; MATERIALIZED VIEW's, so it is read by the same function.
+   (when (re-find #"(?is)\bas\b" *source*)
+     (let [ine? (and (kw=? (first toks) "if") (kw=? (second toks) "not")
+                     (kw=? (nth toks 2 nil) "exists"))
+           ts (if ine? (drop 3 toks) toks)]
+       (when-let [[nm after-name] (read-relation-name ts)]
+         (when-let [t (read-as-query-tail after-name)]
+           ;; A plain `CREATE TABLE t AS <query>` is JSqlParser's
+           ;; already and stays there; only the two things it cannot
+           ;; parse are taken over here.
+           (when (or (seq (:columns t)) (not (:with-data? t))
+                     (re-find #"(?is)\Wwith\s+data\s*;?\s*$" *source*))
+             (assoc t :kind :create-table-as
+                    :table-name nm
+                    :if-not-exists? (boolean ine?)))))))
+   (if-not (re-find #"(?i)\blike\b" *source*)
+     {:kind :generic-sql}
+     (let [elems (create-table-like-elements)]
+       (cond
+         (empty? elems) {:kind :generic-sql}
         ;; An option that cannot be honoured stays with JSqlParser,
         ;; which refuses the statement -- better than a table that
         ;; quietly lacks the constraints it was told to copy.
-        (some #(= :unsupported %) elems) {:kind :generic-sql}
-        :else {:kind :create-table-like :like-elems (vec elems)}))))
+         (some #(= :unsupported %) elems) {:kind :generic-sql}
+         :else {:kind :create-table-like :like-elems (vec elems)})))))
 
 (defn- classify-create-matview
   "`CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(cols)] AS <query>
@@ -1221,29 +1283,10 @@
                   (kw=? (nth toks 2 nil) "exists"))
         ts (if ine? (drop 3 toks) toks)]
     (or (when-let [[nm after-name] (read-relation-name ts)]
-          (let [[cols after-cols] (if (= "(" (:text (first after-name)))
-                                    (let [[inner rest-ts] (read-balanced after-name)]
-                                      [(mapv ident-text
-                                             (remove #(= "," (:text %)) inner))
-                                       rest-ts])
-                                    [nil after-name])
-                pre-as (take-while #(not (kw=? % "as")) after-cols)]
-            (when (and (kw=? (first (drop (count pre-as) after-cols)) "as")
-                       (not-any? #(or (kw=? % "using") (kw=? % "tablespace")
-                                      (kw=? % "with"))
-                                 pre-as))
-              (when-let [q-start (second (drop (count pre-as) after-cols))]
-                (let [tail (str/trim (subs *source* (:pos q-start)))
-                      tail (str/replace tail #";\s*$" "")
-                      m (re-find #"(?is)\Wwith\s+(no\s+)?data\s*$" tail)
-                      query (str/trim (if m (subs tail 0 (- (count tail) (dec (count (first m))))) tail))]
-                  (when (seq query)
-                    {:kind :create-matview
-                     :matview-name nm
-                     :columns cols
-                     :if-not-exists? (boolean ine?)
-                     :with-data? (not (and m (second m)))
-                     :query query}))))))
+          (when-let [t (read-as-query-tail after-name)]
+            (assoc t :kind :create-matview
+                   :matview-name nm
+                   :if-not-exists? (boolean ine?))))
         reject)))
 
 (defn- classify-refresh-matview
