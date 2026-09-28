@@ -286,3 +286,43 @@
       (testing "while AT TIME ZONE keeps what was written -- PostgreSQL differs"
         (is (re-find #"time zone \"Nonsense/Zone\" not recognized"
                      (str (second (err-of c "SELECT now() AT TIME ZONE 'Nonsense/Zone'")))))))))
+
+(deftest a-timestamp-write-and-cast-give-the-same-verdict
+  ;; The `date` branch of the INSERT coercion was routed through the
+  ;; cast and its `timestamp`/`timestamptz` SIBLING, directly below it,
+  ;; was left on the lenient parser. So the two spellings still
+  ;; disagreed for every other temporal type.
+  ;;
+  ;; Underneath that, `parse-timestamp-string` built its formatters
+  ;; with `ofPattern`, whose default ResolverStyle/SMART ROLLS an
+  ;; impossible field instead of refusing it -- the same defect
+  ;; `parse-date-strict` exists to fix, never applied here. And when
+  ;; nothing parsed at all, the cast returned its own input: a value
+  ;; that is not a timestamp, indistinguishable from one that is.
+  ;;
+  ;; Expectations, including which SQLSTATE, are a PostgreSQL 17
+  ;; oracle's: impossible FIELDS are 22008, text that is not a
+  ;; timestamp at all is 22007.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tw (ts timestamp, tz timestamptz)")
+    (testing "an impossible date is refused on WRITE, not rolled"
+      (doseq [s ["2024-02-30" "2023-02-29" "2024-04-31"]]
+        (let [[state msg] (err-of c (str "INSERT INTO tw(ts) VALUES ('" s "')"))]
+          (is (= "22008" state) (str s " => " msg)))))
+    (testing "and on CAST, with the same message"
+      (doseq [s ["2024-02-30" "2023-02-29" "2024-04-31"]]
+        (is (= (second (err-of c (str "INSERT INTO tw(ts) VALUES ('" s "')")))
+               (second (err-of c (str "SELECT '" s "'::timestamp"))))
+            s)))
+    (testing "text that is not a timestamp is 22007, and is never stored as itself"
+      (let [[state msg] (err-of c "SELECT 'nonsense'::timestamp")]
+        (is (= "22007" state) msg)
+        (is (re-find #"invalid input syntax for type timestamp" (str msg)))))
+    (testing "a named zone is applied on write, as it is on cast"
+      (exec! c "INSERT INTO tw(tz) VALUES ('1997-02-10 17:32:01 America/New_York')")
+      (is (= "1997-02-10 22:32:01+00"
+             (one c "SELECT tz FROM tw WHERE tz IS NOT NULL"))))
+    (testing "and an ordinary timestamp still goes in"
+      (exec! c "INSERT INTO tw(ts) VALUES ('2024-02-29 10:00:00')")
+      (is (= "2024-02-29 10:00:00"
+             (one c "SELECT ts FROM tw WHERE ts IS NOT NULL"))))))

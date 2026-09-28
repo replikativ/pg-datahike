@@ -3956,7 +3956,9 @@
            (.toInstant (.atStartOfDay
                         (java.time.LocalDate/parse
                          trimmed
-                         (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
+                         (.withResolverStyle
+                          (java.time.format.DateTimeFormatter/ofPattern "uuuu-M-d")
+                          java.time.format.ResolverStyle/STRICT))
                         java.time.ZoneOffset/UTC)))
           (catch Exception _ nil))
      ;; PG 'MDY' default style accepts 'M/d/y' (US-slash), e.g. '8/10/7777'.
@@ -3967,7 +3969,9 @@
              (.toInstant (.atStartOfDay
                           (java.time.LocalDate/parse
                            trimmed
-                           (java.time.format.DateTimeFormatter/ofPattern "M/d/y"))
+                           (.withResolverStyle
+                            (java.time.format.DateTimeFormatter/ofPattern "M/d/y")
+                            java.time.format.ResolverStyle/STRICT))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
      ;; PG also accepts 'Y/M/d' when the year leads (4 digits): the
@@ -3978,7 +3982,9 @@
              (.toInstant (.atStartOfDay
                           (java.time.LocalDate/parse
                            trimmed
-                           (java.time.format.DateTimeFormatter/ofPattern "yyyy/M/d"))
+                           (.withResolverStyle
+                            (java.time.format.DateTimeFormatter/ofPattern "uuuu/M/d")
+                            java.time.format.ResolverStyle/STRICT))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
      ;; ISO 8601 BASIC format -- the separator-less spelling.
@@ -4261,7 +4267,9 @@
           is-date? (try
                      (java.time.LocalDate/parse
                       (str/trim (str inner-raw))
-                      (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
+                      (.withResolverStyle
+                       (java.time.format.DateTimeFormatter/ofPattern "uuuu-M-d")
+                       java.time.format.ResolverStyle/STRICT))
                      (catch Exception _
                        (let [d (parse-timestamp-string (str inner-raw))]
                          (when (instance? java.util.Date d)
@@ -4318,7 +4326,9 @@
                                 (let [s (str/trim (str v))]
                                   (or (try (java.time.LocalDate/parse
                                             s
-                                            (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
+                                            (.withResolverStyle
+                                             (java.time.format.DateTimeFormatter/ofPattern "uuuu-M-d")
+                                             java.time.format.ResolverStyle/STRICT))
                                            (catch Exception _ nil))
                                       (when-let [d (parse-timestamp-string s)]
                                         (when (instance? java.util.Date d)

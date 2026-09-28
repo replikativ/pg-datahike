@@ -414,6 +414,22 @@
       (< b 0x80) (str (char b))
       :else (format "\\%03o" b))))
 
+(defn bad-timestamp!
+  "The timestamp counterpart of `bad-date!`: PostgreSQL tells a value
+   whose date FIELDS are impossible (22008) from text that is not a
+   timestamp at all (22007), and says so with the target's own name.
+
+   Public because the INSERT coercion needs the same verdict -- writing
+   a timestamp has to refuse exactly what casting one refuses, and by
+   the same rule."
+  [^String s tz?]
+  (if (re-matches #"(?i)^\d{1,6}-\d{1,2}-\d{1,2}([ T].*)?$" (clojure.string/trim s))
+    (throw (ex-info (str "date/time field value out of range: \"" s "\"")
+                    {:error :datetime-field-overflow :sqlstate "22008"}))
+    (throw (ex-info (str "invalid input syntax for type timestamp"
+                         (when tz? " with time zone") ": \"" s "\"")
+                    {:error :invalid-datetime-format :sqlstate "22007"}))))
+
 (def ^:private ymd-shape
   "A date written as digits and separators -- the shape PostgreSQL calls
    out of RANGE rather than bad SYNTAX when its fields do not make a
@@ -660,7 +676,19 @@
                   (when-not (or (nil? p) (string? p)) p))
                 (try (java.time.LocalDateTime/parse norm)
                      (catch Exception _ nil))
-                (if parse-timestamp (parse-timestamp (str v)) v))))
+                (let [p (when parse-timestamp (parse-timestamp (str v)))]
+                  (when-not (or (nil? p) (string? p)) p))
+                ;; Nothing parsed. Returning `v` here is what made
+                ;; `'2024-02-30'::timestamp` answer with its own TEXT
+                ;; and `'nonsense'::timestamp` likewise -- a value that
+                ;; is not a timestamp, indistinguishable from one that
+                ;; is. PostgreSQL raises, and distinguishes impossible
+                ;; FIELDS (22008) from text that is not a timestamp at
+                ;; all (22007).
+                (bad-timestamp! (str v)
+                                (contains? #{"timestamptz"
+                                             "timestamp with time zone"}
+                                           (types/base-type-name-of type-str))))))
 
         :date (cond
                 (instance? java.time.LocalDate v) v

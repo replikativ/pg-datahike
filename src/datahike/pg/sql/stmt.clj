@@ -7946,6 +7946,33 @@
                (.toInstant (.atStartOfDay ^java.time.LocalDate d
                                           java.time.ZoneOffset/UTC)))
               d))
+          ;; …and the same for `timestamp` / `timestamptz`, which are
+          ;; the branch that USED to catch everything here. The `date`
+          ;; case above was routed through the cast and its sibling was
+          ;; left on the lenient timestamp parser, so the two spellings
+          ;; still disagreed for every other temporal type: `INSERT
+          ;; INTO t(ts) VALUES ('2024-02-30')` stored 2024-02-29 while
+          ;; `'2024-02-30'::timestamp` rejected it, and a named zone in
+          ;; a timestamptz literal was refused on write and applied on
+          ;; cast.
+          (and (= vtype :db.type/instant) (string? val)
+               (contains? #{"timestamp" "timestamptz"} pg-type))
+          (let [t (sql-cast/cast-scalar val pg-type
+                                        {:explicit? true
+                                         :parse-timestamp expr/parse-timestamp-string})]
+            (cond
+              (instance? java.util.Date t) t
+              (instance? java.time.LocalDateTime t)
+              (java.util.Date/from (.toInstant ^java.time.LocalDateTime t
+                                               java.time.ZoneOffset/UTC))
+              (instance? java.time.LocalDate t)
+              (java.util.Date/from (.toInstant (.atStartOfDay ^java.time.LocalDate t
+                                                              java.time.ZoneOffset/UTC)))
+              ;; The cast returns its input when nothing parsed; that is
+              ;; not a timestamp, and storing it would be the passthrough
+              ;; all over again.
+              (string? t) (sql-cast/bad-timestamp! val (= "timestamptz" pg-type))
+              :else t))
           (and (= vtype :db.type/instant) (string? val))
           (expr/parse-timestamp-string val)
           (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
