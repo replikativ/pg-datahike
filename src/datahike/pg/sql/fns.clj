@@ -2923,22 +2923,35 @@
   ([s start len]
    (if (or (sql-null? s) (sql-null? start) (and (some? len) (sql-null? len)))
      :__null__
-     (if (pg-bits/pg-bit? s)
-       (if (some? len)
-         (pg-bits/substring-bits s start len)
-         (pg-bits/substring-bits s start))
-       (let [^String st (str s)
-             n (.length st)
-             start (long start)
-             _ (when (and len (neg? (long len)))
-                 (throw (ex-info "negative substring length not allowed"
-                                 {:error :invalid-parameter-value
-                                  :message "negative substring length not allowed"})))
+     ;; `substring(string FROM pattern)` is the SQL-standard REGEX form
+     ;; and shares its spelling with the numeric one -- the second
+     ;; argument decides which. It reached `(long start)` on the pattern
+     ;; and raised a raw ClassCastException at the client, which is both
+     ;; a missing function and an internal error escaping as one.
+     (if (and (string? start) (nil? len))
+       (let [^java.util.regex.Matcher m (.matcher (re-compile start nil) (str s))]
+         (if-not (.find m)
+           :__null__
+           ;; PostgreSQL returns the first parenthesised subexpression
+           ;; when the pattern has one, and the whole match otherwise.
+           (or (when (pos? (.groupCount m)) (.group m 1))
+               (.group m))))
+       (if (pg-bits/pg-bit? s)
+         (if (some? len)
+           (pg-bits/substring-bits s start len)
+           (pg-bits/substring-bits s start))
+         (let [^String st (str s)
+               n (.length st)
+               start (long start)
+               _ (when (and len (neg? (long len)))
+                   (throw (ex-info "negative substring length not allowed"
+                                   {:error :invalid-parameter-value
+                                    :message "negative substring length not allowed"})))
              ;; Half-open window [start, start+len) in 1-based positions.
-             to (if len (+ start (long len)) (inc n))
-             lo (max 1 start)
-             hi (min (inc n) to)]
-         (if (<= hi lo) "" (subs st (dec lo) (dec hi))))))))
+               to (if len (+ start (long len)) (inc n))
+               lo (max 1 start)
+               hi (min (inc n) to)]
+           (if (<= hi lo) "" (subs st (dec lo) (dec hi)))))))))
 
 (defn sql-position
   "1-based position of `substring` in `string`, 0 if not found.
