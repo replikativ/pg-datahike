@@ -196,3 +196,25 @@
     (testing "and AD is the default, written without a suffix"
       (is (= "2040-04-10" (one c "SELECT '2040-04-10 AD'::date")))
       (is (= "2040-04-10" (one c "SELECT '2040-04-10'::date"))))))
+
+(deftest a-date-column-writes-through-the-date-input-function
+  ;; The cast rejected `'1997-02-29'` while the WRITE stored the 28th:
+  ;; `INSERT` fell through to the lenient timestamp parser instead of
+  ;; running PostgreSQL's date input function, so the two spellings of
+  ;; one value disagreed. `time` and `timetz` columns already routed
+  ;; their writes through the cast; a date did not.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE dt (f1 date)")
+    (testing "an impossible date is refused, not rolled into the next month"
+      (doseq [s ["1997-02-29" "1997-04-31" "1997-13-01"]]
+        (let [[state msg] (err-of c (str "INSERT INTO dt VALUES ('" s "')"))]
+          (is (= "22008" state) (str s " => " msg)))))
+    (testing "the write and the cast now give the SAME answer, which is the point"
+      (is (= (second (err-of c "INSERT INTO dt VALUES ('1997-02-29')"))
+             (second (err-of c "SELECT '1997-02-29'::date")))))
+    (testing "a BC date, which the cast accepted and the write refused"
+      (exec! c "INSERT INTO dt VALUES ('2040-04-10 BC')")
+      (is (= "2040-04-10 BC" (one c "SELECT f1 FROM dt"))))
+    (testing "and an ordinary date still goes in"
+      (exec! c "INSERT INTO dt VALUES ('1997-02-28')")
+      (is (= "1997-02-28" (one c "SELECT f1 FROM dt WHERE f1 = '1997-02-28'"))))))

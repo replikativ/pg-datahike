@@ -7934,6 +7934,22 @@
           (types/numeric-value->storage
            (apply-numeric-typmod (coerce/coerce-numeric val :bigdec)
                                  num-prec num-scale))
+        ;; A `date` column's input function is the one `'…'::date`
+        ;; runs, and the write was not using it: the string fell
+        ;; through to the LENIENT timestamp parser below, which rolled
+        ;; `1997-02-29` to the 28th and stored it, and refused
+        ;; `2040-04-10 BC` outright -- while the very same text cast
+        ;; explicitly was rejected, and accepted, correctly. `time` and
+        ;; `timetz` already route through the cast above for exactly
+        ;; this reason; a date has to as well, or the two spellings of
+        ;; one value disagree.
+          (and (= "date" pg-type) (= vtype :db.type/instant) (string? val))
+          (let [d (sql-cast/cast-scalar val "date" {:explicit? true})]
+            (if (instance? java.time.LocalDate d)
+              (java.util.Date/from
+               (.toInstant (.atStartOfDay ^java.time.LocalDate d
+                                          java.time.ZoneOffset/UTC)))
+              d))
           (and (= vtype :db.type/instant) (string? val))
           (expr/parse-timestamp-string val)
           (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
