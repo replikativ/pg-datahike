@@ -18,7 +18,7 @@
      agg(x) FILTER (…) OVER (…)        the filter was ignored
      OVER w  (a WINDOW clause)         no partition, no order, no frame
      SELECT … FROM (SELECT … OVER …)   failed to run at all"
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
   (:import [java.sql Connection DriverManager SQLException]))
@@ -282,3 +282,51 @@
     ;; NULL input, so every cumulative frame remains true.
     (is (= ["t" "t" "t" "t" "t"]
            (col c 2 "SELECT id, bool_and(v > 5) OVER (ORDER BY id) FROM wp ORDER BY id")))))
+
+(deftest every-window-function-past-the-transient-boundary
+  ;; A transient array-map holds EIGHT entries; the ninth `assoc!`
+  ;; returns a new hash-map transient. The window engine called
+  ;; `assoc!` for its side effect and discarded that return, so it kept
+  ;; writing into a map it had stopped owning: every window function
+  ;; produced NULL for every row after the first eight. ROW_NUMBER over
+  ;; 20 rows gave 12 NULLs; over a 750-row table, 742.
+  ;;
+  ;; Every test in this file until now used five rows, and the rest of
+  ;; the suite eight or fewer -- exactly the boundary that hides it.
+  ;; This one crosses it deliberately, and checks EVERY window function
+  ;; rather than one, because they are five separate result maps built
+  ;; the same wrong way.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE w20 (id int)")
+    (doseq [i (range 1 21)]
+      (exec! c (str "INSERT INTO w20 VALUES (" i ")")))
+    (let [q (fn [expr]
+              (col c 1 (str "SELECT count(" expr ") FROM (SELECT id, "
+                            expr " OVER (ORDER BY id) AS w FROM w20) s")))]
+      (testing "no function stops writing at the ninth row"
+        (doseq [[fname expr expected]
+                [["row_number"   "ROW_NUMBER()"    "20"]
+                 ["rank"         "RANK()"          "20"]
+                 ["dense_rank"   "DENSE_RANK()"    "20"]
+                 ["percent_rank" "PERCENT_RANK()"  "20"]
+                 ["cume_dist"    "CUME_DIST()"     "20"]
+                 ["ntile"        "NTILE(4)"        "20"]
+                 ["first_value"  "FIRST_VALUE(id)" "20"]
+                 ["sum"          "SUM(id)"         "20"]]]
+          (is (= [expected]
+                 (col c 1 (str "SELECT count(w) FROM (SELECT ROW_NUMBER()"
+                               " OVER (ORDER BY id) AS rn, " expr
+                               " OVER (ORDER BY id) AS w FROM w20) s")))
+              (str fname " lost rows past the transient boundary")))
+        ;; LAG has no predecessor for the first row, so 19 is correct.
+        (is (= ["19"]
+               (col c 1 (str "SELECT count(w) FROM (SELECT LAG(id)"
+                             " OVER (ORDER BY id) AS w FROM w20) s"))))))
+    (testing "and the values are right, not merely present"
+      (is (= ["20"] (col c 1 (str "SELECT max(rn) FROM (SELECT ROW_NUMBER()"
+                                  " OVER (ORDER BY id) AS rn FROM w20) s"))))
+      (is (= ["210"] (col c 1 (str "SELECT max(s) FROM (SELECT SUM(id)"
+                                   " OVER (ORDER BY id) AS s FROM w20) s")))
+          "the running sum reaches 1+…+20"))))

@@ -7,6 +7,7 @@
    and therefore also enforces foreign keys.  Keeping those phases distinct
    mirrors PostgreSQL's ExecInsert/ExecOnConflictUpdate ordering."
   (:require [datahike.api :as d]
+            [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -119,6 +120,15 @@
                          [name {:kind :domain :attr attr :domain-name domain-name
                                 :check-name (:datahike.pg.domain/check-name domain)
                                 :not-null? (true? (:datahike.pg.domain/not-null domain))
+                                ;; An ARRAY of a domain checks each
+                                ;; element, not the array. Without the
+                                ;; element type here the check bound
+                                ;; `value` to the array's own text and
+                                ;; `value > 0` compared a String to 0 --
+                                ;; a ClassCastException at the client,
+                                ;; for `posint[]`, even when every
+                                ;; element satisfied the domain.
+                                :array-elem (:pg/array-elem column)
                                 :check-expression expression}]))
 
                      enum-name
@@ -277,9 +287,25 @@
                        :domain (:domain-name spec)}))
 
       (and (= :domain (:kind spec)) (:check-ast spec)
-           (false? (eval-check-fn (:check-ast spec)
-                                  {(keyword "" "value") value}
-                                  "" (:schema db) {"value" (:attr spec)})))
+           (let [check1 (fn [v]
+                          (false? (eval-check-fn (:check-ast spec)
+                                                 {(keyword "" "value") v}
+                                                 "" (:schema db)
+                                                 {"value" (:attr spec)})))]
+             (if-let [elem (:array-elem spec)]
+               ;; PostgreSQL applies a domain's constraint to every
+               ;; element of an array over it (execQual's
+               ;; ExecEvalArrayCoerce), and NULL elements are exempt
+               ;; the same way a NULL scalar is.
+               (and (some? value)
+                    (boolean
+                     (some check1
+                           (remove nil?
+                                   (pg-arr/flat-elements
+                                    (if (pg-arr/array? value)
+                                      value
+                                      (pg-arr/from-pg-text (str value) elem)))))))
+               (check1 value))))
       (throw (errors/pg-error :check-violation
                               {:table table-name :column column-name
                                :domain (:domain-name spec)

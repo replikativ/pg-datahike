@@ -2539,6 +2539,38 @@
       [new-rows new-aliases new-oids])
     [rows (:find-aliases parsed) nil]))
 
+(defn row-bindings
+  "Variable bindings for a projection or predicate FORM evaluated against
+   one result row: every `:find` element that is a plain variable, read
+   off the row by position, plus the query's `:in` parameters.
+
+   That is what lets such a form reference a GROUPING column (`sum(x) +
+   id`, or a plain column in HAVING) and a `$N` placeholder as well as the
+   aggregate slots the caller adds."
+  [query in-args row]
+  (let [rv (if (sequential? row) (vec row) [row])]
+    (into (into {} (keep-indexed (fn [i e] (when (symbol? e) [e (nth rv i nil)])))
+                (:find query))
+          (zipmap (rest (:in query)) in-args))))
+
+(defn apply-having
+  "Filter result rows by HAVING.
+
+   `having` is {:form <predicate form> :slots [[var idx] …]} -- the
+   aggregates hoisted into hidden columns, and a form over them.
+   PostgreSQL keeps a group only when the predicate is TRUE, so UNKNOWN
+   (a NULL operand) drops it, which is what `true?` says here."
+  [results having query in-args]
+  (if-let [{:keys [form slots]} having]
+    (filterv (fn [row]
+               (let [rv (if (sequential? row) (vec row) [row])
+                     binds (reduce (fn [m [sym idx]] (assoc m sym (nth rv idx nil)))
+                                   (row-bindings query in-args row)
+                                   slots)]
+                 (true? (expr/interpret-form form binds))))
+             results)
+    results))
+
 (defn materialize-set-op!
   "Run a SELECT (PlainSelect, SetOperationList, or VALUES) and persist its rows
    under `target-name/<col>` in a speculative db. Returns the same
@@ -2628,6 +2660,7 @@
          sub-oids (:select-item-oids sub-parsed)
          q-fn d/q
          run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count
+                                 sql-order-by having
                                  project-set project-order-by project-limit project-offset]
                           :as p}]
                       ;; A body that reads a `$n` is run HERE, at parse
@@ -2660,6 +2693,26 @@
                                             {:feature "derived SELECT ordered by a set-returning function"})))
                                 raw (if (seq project-set)
                                       (apply-project-set raw project-set)
+                                      raw)
+                                ;; And its own HAVING decides which GROUPS
+                                ;; survive. It was applied only at the top
+                                ;; level, so `(SELECT grp FROM a GROUP BY
+                                ;; grp HAVING COUNT(id) > 3)` gave every
+                                ;; group. It has to run BEFORE the sort and
+                                ;; the limit, since it changes which rows
+                                ;; there are to order and count.
+                                raw (apply-having raw having query in-args)
+                                ;; A derived table's OWN `ORDER BY` decides
+                                ;; which rows its `LIMIT` keeps. Datalog
+                                ;; results are unordered, so taking n off
+                                ;; the raw relation returned an arbitrary
+                                ;; row: `(SELECT id FROM a ORDER BY id DESC
+                                ;; LIMIT 1)` answered 8 out of 62, not the
+                                ;; maximum. Sorted by the SAME comparator
+                                ;; the top level uses -- a second one would
+                                ;; be free to disagree about NULLs.
+                                raw (if (seq sql-order-by)
+                                      (sort (fns/null-safe-order-cmp sql-order-by) raw)
                                       raw)
                                 raw (cond->> raw
                                       sql-offset (drop sql-offset)

@@ -621,3 +621,36 @@
       (exec! c "UPDATE ad SET di = i")
       (exec! c "UPDATE ad SET di = 1.5")
       (is (= [[2]] (query-rows c "SELECT di FROM ad"))))))
+
+(deftest an-array-over-a-domain-checks-each-element
+  ;; PostgreSQL applies a domain's constraint to every ELEMENT of an
+  ;; array over it. The check bound `value` to the array's own text
+  ;; instead, so `value > 0` compared a String to 0 and the client got
+  ;; `class java.lang.Long cannot be cast to class java.lang.String` --
+  ;; for `posint[]`, and even when every element satisfied the domain.
+  ;;
+  ;; It is PostgreSQL's own `domain` test, and its expectations are a
+  ;; PostgreSQL 17 oracle's.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN posint AS int CHECK (value > 0)")
+    (exec! c "CREATE TABLE pitable (f1 posint[])")
+    (testing "an array whose elements all satisfy the domain goes in"
+      (exec! c "INSERT INTO pitable VALUES (array[42])")
+      (is (= ["{42}"] (mapv #(str (first %))
+                            (query-rows c "SELECT f1 FROM pitable")))))
+    (testing "one bad element rejects the whole array, named as the domain's"
+      (doseq [sql ["INSERT INTO pitable VALUES (array[-1])"
+                   "INSERT INTO pitable VALUES ('{0}')"
+                   "INSERT INTO pitable VALUES ('{1,-2}')"]]
+        (let [msg (try (exec! c sql) nil
+                       (catch java.sql.SQLException e (.getMessage e)))]
+          (is (re-find #"value for domain posint violates check constraint \"posint_check\""
+                       (str msg))
+              sql)
+          (is (not (re-find #"(?i)cannot be cast|java\.lang" (str msg)))
+              "an internal failure must never reach the client"))))
+    (testing "a NULL element is exempt, as a NULL scalar is"
+      (exec! c "INSERT INTO pitable VALUES ('{1,NULL,3}')")
+      (is (= #{"{42}" "{1,NULL,3}"}
+             (set (mapv #(str (first %))
+                        (query-rows c "SELECT f1 FROM pitable"))))))))

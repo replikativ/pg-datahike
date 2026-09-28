@@ -2965,6 +2965,44 @@
                hi (min (inc n) to)]
            (if (<= hi lo) "" (subs st (dec lo) (dec hi)))))))))
 
+(defn null-safe-order-cmp
+  "Row comparator for the server-side ORDER BY fallback. `sql-order-by`
+   is a flat [col-idx dir nulls col-idx dir nulls …] spec; nil and the
+   :__null__ sentinel both mean SQL NULL.
+
+   `nulls` is :first, :last, or nil for PostgreSQL's default — which is
+   NULLS LAST for ASC and NULLS FIRST for DESC, i.e. NULL sorts as the
+   largest value."
+  [sql-order-by]
+  (fn [a b]
+    (let [av (if (sequential? a) a [a])
+          bv (if (sequential? b) b [b])]
+      (loop [specs (partition 3 sql-order-by)]
+        (if-let [[idx dir nulls] (first specs)]
+          (let [va (nth av idx nil)
+                vb (nth bv idx nil)
+                a-null? (or (nil? va) (= :__null__ va))
+                b-null? (or (nil? vb) (= :__null__ vb))
+                ;; Explicit NULLS FIRST/LAST wins; otherwise the PG default.
+                nulls-first? (if nulls (= nulls :first) (= dir :desc))
+                c (cond
+                    (and a-null? b-null?) 0
+                    a-null? (if nulls-first? -1 1)
+                    b-null? (if nulls-first? 1 -1)
+                    ;; fns/order-cmp, not `compare`: Clojure's compares
+                    ;; NaN EQUAL to everything, so a NaN in the sort key
+                    ;; left the result silently unsorted -- and a
+                    ;; non-transitive comparator can make TimSort raise
+                    ;; outright. PostgreSQL sorts NaN above every
+                    ;; non-NaN.
+                    :else (if (= dir :desc)
+                            (order-cmp vb va)
+                            (order-cmp va vb)))]
+            (if (zero? c)
+              (recur (rest specs))
+              c))
+          0)))))
+
 (defn sql-position
   "1-based position of `substring` in `string`, 0 if not found.
 
