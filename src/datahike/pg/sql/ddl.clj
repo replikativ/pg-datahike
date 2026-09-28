@@ -490,7 +490,13 @@
      :fks      table-fks}))
 
 (defn extract-inherits
-  "Extract parent table name from INHERITS clause in CREATE TABLE options."
+  "The parent table names of a CREATE TABLE's INHERITS clause, in order,
+   or nil when there is none.
+
+   `INHERITS (b, c, a)` names three parents, and JSqlParser hands the
+   whole list back as one option string. Reading it as a single
+   relation named \"b,c,a\" is what made a multiply-inheriting table
+   come out with none of its inherited columns at all."
   [^CreateTable ct]
   (when-let [opts (.getTableOptionsStrings ct)]
     (let [opts-vec (vec opts)
@@ -499,12 +505,15 @@
                         (when (= "inherits" (str/lower-case (str option))) i))
                       opts-vec))]
       (when (and (some? idx) (< (inc idx) (count opts-vec)))
-        ;; Next element is "(parent_table)" — strip parens
         (let [raw (str (nth opts-vec (inc idx)))]
-          (-> raw
-              (str/replace #"^\(" "")
-              (str/replace #"\)$" "")
-              str/trim))))))
+          (->> (-> raw
+                   (str/replace #"^\(" "")
+                   (str/replace #"\)$" "")
+                   (str/split #","))
+               (map #(params/unquote-ident (str/trim %)))
+               (remove str/blank?)
+               vec
+               seq))))))
 
 (defn pg-type-hint
   "The `:pg/type` a column of SQL type `base-type` should record, or nil
@@ -595,28 +604,22 @@
         parent-from-sql (extract-inherits ct)
         db-table-name (get params/*temp-table-map* table-name table-name)
         parent-from-db (when db
-                         (ffirst (d/q
-                                  '{:find [?p]
-                                    :where [[?e :__inherit__/child ?c]
-                                            [?e :__inherit__/parent ?p]]
-                                    :in [$ ?c]}
-                                  db db-table-name)))
-        parent-table (or parent-from-sql parent-from-db)
-        ;; JSqlParser exposes the whole `INHERITS (p1, p2)` list as one
-        ;; option string. pg-datahike's inheritance model remains
-        ;; single-parent, but the regression fixture deliberately creates a
-        ;; multiple-parent table whose own column is still useful. Validate
-        ;; every named parent without treating the comma-joined spelling as
-        ;; one relation.
+                         (seq (mapv first
+                                    (d/q
+                                     '{:find [?p]
+                                       :where [[?e :__inherit__/child ?c]
+                                               [?e :__inherit__/parent ?p]]
+                                       :in [$ ?c]}
+                                     db db-table-name))))
+        parent-tables (or parent-from-sql parent-from-db)
         missing-parent (when (and parent-from-sql db)
                          (some (fn [parent]
-                                 (let [parent (str/trim parent)
-                                       db-parent (get params/*temp-table-map*
+                                 (let [db-parent (get params/*temp-table-map*
                                                       parent parent)]
                                    (when (nil? (pgs/column-info
                                                 (:schema db) db-parent db))
                                      parent)))
-                               (str/split parent-from-sql #",")))
+                               parent-from-sql))
         _ (when missing-parent
             (throw (errors/pg-error :undefined-table {:table missing-parent})))
         vector-columns
@@ -652,7 +655,7 @@
         ;; WHERE id = N lookups.
         skip-col? (fn [cn]
                     (or (= cn "db_id")
-                        (and parent-table (= cn "id"))))
+                        (and (seq parent-tables) (= cn "id"))))
         col-names (vec (keep (fn [^ColumnDefinition col]
                                (let [cn (params/unquote-ident (.getColumnName col))]
                                  (when-not (skip-col? cn) cn)))
@@ -1205,7 +1208,7 @@
                           (when (seq pk-cols) (str table-name "_pkey")))
              :unique-cols (vec single-unique-cols)
              :tx-data (into schema-tx seq-tx)}
-      parent-table (assoc :inherits parent-table))))
+      (seq parent-tables) (assoc :inherits (vec parent-tables)))))
 
 ;; ============================================================================
 ;; Sequence DDL translation

@@ -3534,13 +3534,25 @@
   "Collect all tx-data for a DDL CREATE, including inheritance metadata."
   [parsed]
   (let [base-tx (:tx-data parsed)
-        inherit-tx (when-let [parent (:inherits parsed)]
+        ;; One edge per parent: a table may inherit from several, and the
+        ;; registry has always been edge-shaped, so the only thing that
+        ;; had to change is writing more than one of them.
+        inherit-tx (when-let [parents (seq (:inherits parsed))]
                      (let [child (:table-name parsed)]
-                       [{:db/ident :__inherit__/child :db/valueType :db.type/string
-                         :db/cardinality :db.cardinality/one}
-                        {:db/ident :__inherit__/parent :db/valueType :db.type/string
-                         :db/cardinality :db.cardinality/one}
-                        {:__inherit__/child child :__inherit__/parent parent}]))]
+                       (into [{:db/ident :__inherit__/child
+                               :db/valueType :db.type/string
+                               :db/cardinality :db.cardinality/one}
+                              {:db/ident :__inherit__/parent
+                               :db/valueType :db.type/string
+                               :db/cardinality :db.cardinality/one}
+                              {:db/ident :__inherit__/ordinal
+                               :db/valueType :db.type/long
+                               :db/cardinality :db.cardinality/one}]
+                             (map-indexed (fn [i parent]
+                                            {:__inherit__/child child
+                                             :__inherit__/parent parent
+                                             :__inherit__/ordinal (long i)}))
+                             parents)))]
     (into (vec base-tx) inherit-tx)))
 
 (defn- catalog-column-specs
@@ -4599,14 +4611,36 @@
                            :namespace-oid catalog-objects/public-namespace-oid})
         local-names (vec (:column-order parsed))
         local-name-set (set local-names)
-        parent (when-let [parent-name (:inherits parsed)]
-                 (catalog-objects/object-by-identity
-                  db catalog-objects/pg-class-oid
-                  catalog-objects/public-namespace-oid parent-name))
+        ;; PostgreSQL walks the INHERITS list in order and MERGES columns
+        ;; that repeat: `INHERITS (b, c, a)` where b and c each inherit
+        ;; `aa` from a gives ONE `aa`, at the position of its first
+        ;; appearance, and says so with a notice. Reading the list as a
+        ;; single relation gave the child no inherited columns at all.
+        parents (keep (fn [parent-name]
+                        (let [o (catalog-objects/object-by-identity
+                                 db catalog-objects/pg-class-oid
+                                 catalog-objects/public-namespace-oid
+                                 parent-name)]
+                          (when (= :table (:datahike.pg.object/kind o)) o)))
+                      (:inherits parsed))
         parent-columns
-        (when (= :table (:datahike.pg.object/kind parent))
-          (catalog-objects/columns-by-relation
-           db (:datahike.pg.object/oid parent) true))
+        (->> parents
+             (mapcat (fn [parent]
+                       (catalog-objects/columns-by-relation
+                        db (:datahike.pg.object/oid parent) true)))
+             (reduce (fn [acc column]
+                       (let [nm (:datahike.pg.column/name column)]
+                         (if (contains? (:seen acc) nm)
+                           (do (params/notice!
+                                "NOTICE"
+                                (str "merging multiple inherited definitions"
+                                     " of column \"" nm "\""))
+                               acc)
+                           (-> acc
+                               (update :seen conj nm)
+                               (update :cols conj column)))))
+                     {:seen #{} :cols []})
+             :cols)
         inherited-specs
         (mapv (fn [column]
                 (let [name (:datahike.pg.column/name column)]

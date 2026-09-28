@@ -263,21 +263,42 @@
           seen
           (recur kids (into seen kids)))))))
 
+(defn- direct-parents
+  "A table's immediate parents in the order its INHERITS clause named
+   them. The ordinal is recorded on the edge; edges written before it
+   existed have none and keep their relative order behind a name sort,
+   which is at least stable."
+  [db child]
+  (->> (d/q '{:find [?p ?o]
+              :where [[?e :__inherit__/child ?c]
+                      [?e :__inherit__/parent ?p]
+                      [(get-else $ ?e :__inherit__/ordinal 0) ?o]]
+              :in [$ ?c]}
+            db child)
+       (sort-by (juxt second first))
+       (mapv first)))
+
 (defn inheritance-ancestors
-  "Return a table's inheritance chain from its immediate parent to the root.
-   A seen set makes malformed/cyclic metadata terminate safely."
+  "Every table this one inherits from, nearest first: its parents in
+   declaration order, then theirs, breadth first.
+
+   A table may inherit from SEVERAL -- `INHERITS (b, c, a)` -- so
+   following one chain and stopping saw only the first parent's line,
+   and a row inserted into the child never carried the others' row
+   markers: `SELECT * FROM c` did not find it. A seen set makes
+   malformed or cyclic metadata terminate safely."
   [db table-name]
   (when db
-    (loop [child table-name, seen #{table-name}, ancestors []]
-      (let [parent (ffirst
-                    (d/q '{:find [?p]
-                           :where [[?e :__inherit__/child ?c]
-                                   [?e :__inherit__/parent ?p]]
-                           :in [$ ?c]}
-                         db child))]
-        (if (and parent (not (contains? seen parent)))
-          (recur parent (conj seen parent) (conj ancestors parent))
-          ancestors)))))
+    (loop [queue (vec (direct-parents db table-name))
+           seen #{table-name}
+           ancestors []]
+      (if-let [parent (first queue)]
+        (if (contains? seen parent)
+          (recur (subvec queue 1) seen ancestors)
+          (recur (into (subvec queue 1) (direct-parents db parent))
+                 (conj seen parent)
+                 (conj ancestors parent)))
+        ancestors))))
 
 (defn resolve-inherited-attr
   "For INHERITS support: check if an attribute exists in the table's schema.
