@@ -1399,21 +1399,21 @@
                           (d/q '{:find [?n]
                                  :where [[?e :datahike.pg.matview/name ?n]]}
                                cte-db))]
-      (mapv (fn [t]
-             (let [tbl-oid (or (pgs/table-oid cte-db t)
-                               (Math/abs (.hashCode ^String t)))
-                   row-type (catalog-objects/object-by-identity
-                             cte-db catalog-objects/pg-type-oid
-                             catalog-objects/public-namespace-oid t)]
-               {:pg_class/oid (long tbl-oid)
-                :pg_class/relname t
-                :pg_class/relnamespace 2200
-                :pg_class/relkind (if (contains? matviews t) "m" "r")
-                :pg_class/reltype
-                (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                        (:datahike.pg.object/oid row-type) 0))
-                (pgs/row-marker-attr "pg_class") true}))
-           (pgs/table-names user-schema)))
+       (mapv (fn [t]
+               (let [tbl-oid (or (pgs/table-oid cte-db t)
+                                 (Math/abs (.hashCode ^String t)))
+                     row-type (catalog-objects/object-by-identity
+                               cte-db catalog-objects/pg-type-oid
+                               catalog-objects/public-namespace-oid t)]
+                 {:pg_class/oid (long tbl-oid)
+                  :pg_class/relname t
+                  :pg_class/relnamespace 2200
+                  :pg_class/relkind (if (contains? matviews t) "m" "r")
+                  :pg_class/reltype
+                  (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                          (:datahike.pg.object/oid row-type) 0))
+                  (pgs/row-marker-attr "pg_class") true}))
+             (pgs/table-names user-schema)))
      ;; Composite types get a distinct backing pg_class row (relkind 'c');
      ;; pg_type.typrelid and pg_class.reltype link the two identities.
      (into
