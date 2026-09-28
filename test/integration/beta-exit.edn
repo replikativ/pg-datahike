@@ -212,9 +212,17 @@
               "test/integration/datahike-server/README.md"]
    :exit "The version-pinned Datahike Server Docker/JAR deployment passes restart, persistence, TLS/auth and connection-drop soak tests."}]
 
+ ;; `:plpgsql` was listed here and is NOT a non-goal: the language is
+ ;; implemented -- CREATE FUNCTION … LANGUAGE plpgsql, the statement
+ ;; evaluator, and the triggers built on it -- and its surface is
+ ;; tracked capability by capability in
+ ;; postgres-regress/routine-trigger-capabilities.edn, where
+ ;; `:plpgsql-core` is `:target` and `:plpgsql-advanced` (dynamic
+ ;; EXECUTE, cursors, exception subtransactions, diagnostics) is
+ ;; `:later`. A follow-up is not a non-goal, and this file stating one
+ ;; contradicted the ledger that actually governs the work.
  :non-goals
  [:postgresql-storage-engine-parity
-  :plpgsql
   :replication
   :xa-transactions
   :listen-notify

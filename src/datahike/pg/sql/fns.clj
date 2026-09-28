@@ -2790,29 +2790,11 @@
     (instance? java.time.LocalDateTime v) (.atZone ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
     :else nil))
 
-(defn- resolve-time-zone
-  "A PostgreSQL time-zone spec as a java.time ZoneId. Names and
-   abbreviations resolve through the tz database. A NUMERIC spec -- `+05`,
-   `-03:30`, `UTC+3` -- is POSIX-style, so its sign is INVERTED: `+05` is
-   five hours WEST of UTC (datetime.c DecodePosixTimezone). Unknown names
-   raise 22023, as in PostgreSQL."
-  ^java.time.ZoneId [zone]
-  (let [z (str/trim (str zone))
-        posix (fn [sign h m sec]
-                (let [total (+ (* 3600 (Long/parseLong h))
-                               (* 60 (Long/parseLong (or m "0")))
-                               (Long/parseLong (or sec "0")))]
-                  (java.time.ZoneOffset/ofTotalSeconds
-                   (int (if (= "-" sign) total (- total))))))]
-    (if-let [[_ sign h m sec] (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
-      (posix sign h m sec)
-      (try
-        (java.time.ZoneId/of z java.time.ZoneId/SHORT_IDS)
-        (catch Exception _
-          (try (java.time.ZoneId/of (str/upper-case z) java.time.ZoneId/SHORT_IDS)
-               (catch Exception _
-                 (throw (errors/pg-error :invalid-parameter-value
-                                         {:message (str "time zone \"" z "\" not recognized")})))))))))
+(def ^:private resolve-time-zone
+  "A PostgreSQL time-zone spec as a java.time ZoneId. Lives in types
+   now: the CAST needs the same resolution to read a zone out of a
+   timestamptz literal, and cast.clj cannot require this namespace."
+  types/resolve-time-zone)
 
 (defn- local-date-time
   "A timestamp value as its wall-clock LocalDateTime. Timestamps are held
@@ -2826,7 +2808,30 @@
     (inst? v) (java.time.LocalDateTime/ofInstant
                (if (instance? java.time.Instant v) v (.toInstant ^java.util.Date v))
                java.time.ZoneOffset/UTC)
-    :else nil))
+    ;; An untyped literal -- `'19970210 173201' AT TIME ZONE …` -- is
+    ;; still its own text here, so it has to go through the timestamp
+    ;; input function like any other. Returning nil instead meant the
+    ;; caller dereferenced it and the client got
+    ;; `Cannot invoke "java.time.LocalDateTime.atZone(…)" because the
+    ;; return value of "clojure.lang.IFn.invoke(Object)" is null` --
+    ;; an internal failure where PostgreSQL raises 22007.
+    ;; Parsed ONCE, not by recurring: the cast returns its input
+    ;; unchanged when nothing parses, so recurring on a string that is
+    ;; not a timestamp would never terminate.
+    (string? v)
+    (let [parsed (try (sql-cast/cast-scalar v "timestamp" {:explicit? true})
+                      (catch Exception _ nil))]
+      (if (or (nil? parsed) (string? parsed))
+        (throw (errors/pg-error
+                :invalid-datetime-format
+                {:message (str "invalid input syntax for type timestamp"
+                               " with time zone: \"" v "\"")}))
+        (local-date-time parsed)))
+    :else
+    (throw (errors/pg-error
+            :invalid-datetime-format
+            {:message (str "invalid input syntax for type timestamp with time zone: \""
+                           v "\"")}))))
 
 (defn sql-at-time-zone
   "`value AT TIME ZONE zone` (timestamp.c timestamp_zone / timestamptz_zone,
@@ -2923,22 +2928,42 @@
   ([s start len]
    (if (or (sql-null? s) (sql-null? start) (and (some? len) (sql-null? len)))
      :__null__
-     (if (pg-bits/pg-bit? s)
-       (if (some? len)
-         (pg-bits/substring-bits s start len)
-         (pg-bits/substring-bits s start))
-       (let [^String st (str s)
-             n (.length st)
-             start (long start)
-             _ (when (and len (neg? (long len)))
-                 (throw (ex-info "negative substring length not allowed"
-                                 {:error :invalid-parameter-value
-                                  :message "negative substring length not allowed"})))
+     ;; `substring(string FROM pattern)` is the SQL-standard REGEX form
+     ;; and shares its spelling with the numeric one -- the second
+     ;; argument decides which. It reached `(long start)` on the pattern
+     ;; and raised a raw ClassCastException at the client, which is both
+     ;; a missing function and an internal error escaping as one.
+     (if (and (string? start) (nil? len))
+       (let [^java.util.regex.Matcher m (.matcher (re-compile start nil) (str s))]
+         (if-not (.find m)
+           :__null__
+           ;; PostgreSQL returns the first parenthesised subexpression
+           ;; when the pattern has one, and the whole match otherwise.
+           ;; A pattern that HAS a group whose text did not participate
+           ;; in the match -- `substring('foo' from 'foo(bar)?')` --
+           ;; is NULL, not the whole match: the presence of the
+           ;; parentheses decides what is returned, and whether they
+           ;; matched decides whether there is anything to return.
+           ;; PostgreSQL's own `strings` test covers exactly this.
+           (if (pos? (.groupCount m))
+             (or (.group m 1) :__null__)
+             (.group m))))
+       (if (pg-bits/pg-bit? s)
+         (if (some? len)
+           (pg-bits/substring-bits s start len)
+           (pg-bits/substring-bits s start))
+         (let [^String st (str s)
+               n (.length st)
+               start (long start)
+               _ (when (and len (neg? (long len)))
+                   (throw (ex-info "negative substring length not allowed"
+                                   {:error :invalid-parameter-value
+                                    :message "negative substring length not allowed"})))
              ;; Half-open window [start, start+len) in 1-based positions.
-             to (if len (+ start (long len)) (inc n))
-             lo (max 1 start)
-             hi (min (inc n) to)]
-         (if (<= hi lo) "" (subs st (dec lo) (dec hi))))))))
+               to (if len (+ start (long len)) (inc n))
+               lo (max 1 start)
+               hi (min (inc n) to)]
+           (if (<= hi lo) "" (subs st (dec lo) (dec hi)))))))))
 
 (defn sql-position
   "1-based position of `substring` in `string`, 0 if not found.
@@ -3795,6 +3820,74 @@
       (throw (errors/pg-error :invalid-parameter-value
                               {:message "pg_lsn out of range"})))
     (types/pg-lsn value)))
+
+(def ^:private pg-lsn-text #"^\s*([0-9A-Fa-f]{1,8})/([0-9A-Fa-f]{1,8})\s*$")
+
+(defn- lsn-value
+  "The unsigned 64-bit value behind a pg_lsn, whatever carrier it
+   arrived in, or nil when the operand is not one.
+
+   A pg_lsn reaches an operator as its `X/Y` TEXT -- the cast tags the
+   OID and keeps the spelling -- so the two halves are recombined here:
+   the high word is the segment and the low word the byte offset within
+   it, which is what `%X/%08X` prints back."
+  ^java.math.BigInteger [x]
+  (cond
+    (types/pg-lsn? x) (:value x)
+    (string? x) (when-let [[_ hi lo] (re-matches pg-lsn-text x)]
+                  (.add (.shiftLeft (java.math.BigInteger. ^String hi 16) 32)
+                        (java.math.BigInteger. ^String lo 16)))
+    :else nil))
+
+(defn- lsn-in-range
+  ^java.math.BigInteger [^java.math.BigInteger v]
+  (if (or (neg? (.signum v)) (pos? (.compareTo v max-pg-lsn)))
+    (throw (errors/pg-error :invalid-parameter-value
+                            {:message "pg_lsn out of range"}))
+    v))
+
+(defn- lsn-offset
+  "The NUMERIC operand of `pg_lsn ± numeric`, as an integer. PostgreSQL
+   names the operator in its NaN message -- `cannot add NaN to pg_lsn`
+   and `cannot subtract NaN from pg_lsn` -- so the verb is passed in."
+  ^java.math.BigInteger [x verb]
+  (when (types/numeric-special? x)
+    (throw (errors/pg-error
+            :invalid-parameter-value
+            {:message (if (= :nan (:kind x))
+                        (case verb
+                          :add "cannot add NaN to pg_lsn"
+                          :sub "cannot subtract NaN from pg_lsn")
+                        "cannot convert infinity to pg_lsn")})))
+  (-> ^java.math.BigDecimal (coerce/coerce-numeric x :bigdec)
+      (.setScale 0 java.math.RoundingMode/HALF_UP)
+      .toBigInteger))
+
+(defn sql-pg-lsn+
+  "`pg_lsn + numeric` -- a WAL address advanced by a byte count. The
+   operator is commutative in PostgreSQL (`numeric + pg_lsn` too), so
+   either operand may be the address."
+  [a b]
+  (if (or (sql-null? a) (sql-null? b))
+    :__null__
+    (let [[lsn off] (if (lsn-value a) [a b] [b a])]
+      (types/pg-lsn
+       (lsn-in-range (.add (lsn-value lsn) (lsn-offset off :add)))))))
+
+(defn sql-pg-lsn-
+  "`pg_lsn - pg_lsn` is the NUMERIC distance between two WAL addresses;
+   `pg_lsn - numeric` is the address moved back. Which one it is
+   depends on the right operand, and only the first is commutative-free
+   -- `numeric - pg_lsn` is not an operator PostgreSQL has."
+  [a b]
+  (if (or (sql-null? a) (sql-null? b))
+    :__null__
+    (let [l (lsn-value a)
+          r (lsn-value b)]
+      (if r
+        (java.math.BigDecimal. (.subtract l r))
+        (types/pg-lsn
+         (lsn-in-range (.subtract l (lsn-offset b :sub))))))))
 
 (def sql-scale
   "scale(numeric) — the declared display scale."

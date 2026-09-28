@@ -213,3 +213,30 @@
       ;; nil FILTERS THE ROW.
       (is (= 5 (count (col c 1 "SELECT id, date_trunc('month', d) AS c FROM ft ORDER BY id"))))
       (is (nil? (one c "SELECT date_trunc('month', NULL::date)"))))))
+
+(deftest substring-from-a-pattern-is-the-regex-form
+  ;; `substring(string FROM pattern)` and `substring(string FROM start)`
+  ;; share a spelling; only the second argument's TYPE tells them apart.
+  ;; The pattern reached the numeric path and raised a raw
+  ;; ClassCastException at the client -- a missing function surfacing as
+  ;; an internal error, which the beta-exit rule forbids outright.
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (testing "a parenthesised subexpression wins over the whole match"
+      (is (= "a" (one c "SELECT substring('a' from '((a))+')")))
+      (is (= "foo" (one c (str "SELECT substring('asd TO foo' from "
+                               "' TO (([a-z0-9._]+|\"([^\"]+|\"\")+\")+)')")))))
+    (testing "without one, the whole match"
+      (is (= "mas" (one c "SELECT substring('Thomas' from '...$')"))))
+    (testing "no match is NULL, not the empty string"
+      (is (nil? (one c "SELECT substring('foobar' from 'nomatch')"))))
+    (testing "a group that did not participate is NULL, not the whole match"
+      ;; The parentheses decide WHAT is returned; whether they matched
+      ;; decides whether there is anything to return. PostgreSQL's own
+      ;; `strings` test covers this, and it is the case a plain `or`
+      ;; over the group gets wrong.
+      (is (nil? (one c "SELECT substring('foo' from 'foo(bar)?')")))
+      (is (= "bar" (one c "SELECT substring('foobar' from 'foo(bar)?')"))))
+    (testing "and the numeric form still means what it did"
+      (is (= "hom" (one c "SELECT substring('Thomas' from 2 for 3)")))
+      (is (= "Th" (one c "SELECT substring('Thomas' from 1 for 2)"))))))

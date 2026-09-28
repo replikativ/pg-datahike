@@ -3981,6 +3981,24 @@
                            (java.time.format.DateTimeFormatter/ofPattern "yyyy/M/d"))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
+     ;; ISO 8601 BASIC format -- the separator-less spelling.
+     ;; `19970210 173201`, `19970210T173201`, `19970210`, and the same
+     ;; with a trailing zone name. PostgreSQL reads all of them, and
+     ;; nothing here did: the string fell through to the passthrough
+     ;; below and `'19970210 173201'::timestamp` answered with its own
+     ;; text -- a value that is not a timestamp, in a timestamp column.
+     (when-let [[_ d t] (re-matches #"^(\d{8})(?:[ T](\d{6}(?:\.\d+)?))?$"
+                                    (first (str/split trimmed #"\s+(?=[A-Za-z/_]+$)")))]
+       (try
+         (let [date (java.time.LocalDate/parse
+                     d (java.time.format.DateTimeFormatter/ofPattern "uuuuMMdd"))
+               ldt (if t
+                     (.atTime date (java.time.LocalTime/parse
+                                    t (java.time.format.DateTimeFormatter/ofPattern
+                                       "HHmmss[.SSS][.SS][.S]")))
+                     (.atStartOfDay date))]
+           (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC)))
+         (catch Exception _ nil)))
      ;; All parsing failed — return raw string
      s)))
 
@@ -4653,6 +4671,21 @@
       (and (= op-sym '/) (money? l) (factor? r)) 'datahike.pg.query-fns/sql-money-div
       :else nil)))
 
+(defn- pg-lsn-arith-op
+  "PostgreSQL's pg_lsn operators. `lsn - lsn` is the NUMERIC distance
+   between two WAL addresses; `lsn ± numeric` moves an address. They
+   reached generic JVM arithmetic, which was handed the `X/Y` text and
+   raised `class java.lang.String cannot be cast to java.lang.Number`
+   at the client."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
+  (let [l (source-oid ctx (.getLeftExpression expr))
+        r (source-oid ctx (.getRightExpression expr))
+        lsn? #(= types/oid-pg-lsn %)]
+    (cond
+      (and (= op-sym '-) (lsn? l)) 'datahike.pg.query-fns/sql-pg-lsn-
+      (and (= op-sym '+) (or (lsn? l) (lsn? r))) 'datahike.pg.query-fns/sql-pg-lsn+
+      :else nil)))
+
 (defn- check-scalar-subquery-arithmetic-types!
   "Do not let a scalar subquery's resolved output type fall back to JVM
    arithmetic. Unlike a quoted literal, `(SELECT '1')` has already crossed
@@ -4734,7 +4767,8 @@
       (let [lv (if (seq? l) (ctx/materialize-arg! ctx l) l)
             rv (if (seq? r) (ctx/materialize-arg! ctx r) r)
             int-op (int-arith-op ctx expr op-sym)
-            emit-op (or (money-arith-op ctx expr op-sym)
+            emit-op (or (pg-lsn-arith-op ctx expr op-sym)
+                        (money-arith-op ctx expr op-sym)
                         (date-arith-op ctx expr op-sym)
                         (first int-op)
                         (float4-arith-op ctx expr op-sym)

@@ -98,3 +98,38 @@
       (testing "a plain CREATE TABLE is unchanged"
         (is (= "CREATE TABLE" (.commandTag (exec h "CREATE TABLE c3 (i int)")))))
       (finally (release! h)))))
+
+(deftest ctas-takes-a-column-list-and-a-with-data-tail
+  ;; `create_as_target` in PostgreSQL's grammar allows a column list,
+  ;; and every CTAS may end `WITH DATA` or `WITH NO DATA`. JSqlParser
+  ;; has neither, so `… WITH DATA` was a parse error, and a column list
+  ;; reached the schema transaction as a column with no type and came
+  ;; back as datahike's "Update not supported for these schema
+  ;; attributes" -- an internal message for a statement PostgreSQL just
+  ;; runs. It is the same grammar as CREATE MATERIALIZED VIEW's and is
+  ;; now read by the same function.
+  ;;
+  ;; Expectations, including the command tags, are a PostgreSQL 17
+  ;; oracle's.
+  (let [h (fresh-handler)]
+    (try
+      (testing "WITH DATA is the default, and says so with the row count"
+        (let [r (exec h "CREATE TABLE c1 (a) AS SELECT generate_series(1,3) WITH DATA")]
+          (is (nil? (.error r)))
+          (is (= "SELECT 3" (.commandTag r))))
+        (is (= [["1"] ["2"] ["3"]] (rows (exec h "SELECT * FROM c1 ORDER BY a")))))
+      (testing "the column list renames the query's output"
+        (let [r (exec h "CREATE TABLE c2 (p, q) AS SELECT 1, 2")]
+          (is (nil? (.error r)))
+          (is (= "SELECT 1" (.commandTag r))))
+        (is (= [["1" "2"]] (rows (exec h "SELECT p, q FROM c2")))))
+      (testing "WITH NO DATA creates the table empty, and keeps the DDL tag"
+        (let [r (exec h "CREATE TABLE c3 AS SELECT 1 AS x WITH NO DATA")]
+          (is (nil? (.error r)))
+          (is (= "CREATE TABLE AS" (.commandTag r))))
+        (is (= [["0"]] (rows (exec h "SELECT count(*) FROM c3")))))
+      (testing "a plain CTAS is untouched by any of this"
+        (let [r (exec h "CREATE TABLE c4 AS SELECT 5 AS z")]
+          (is (= "SELECT 1" (.commandTag r))))
+        (is (= [["5"]] (rows (exec h "SELECT * FROM c4")))))
+      (finally (release! h)))))

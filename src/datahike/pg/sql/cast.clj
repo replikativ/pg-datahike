@@ -576,8 +576,70 @@
         (cond
           (instance? java.util.Date v) v
           (instance? java.time.LocalDateTime v) v
+          ;; A NAMED zone inside the literal -- `… America/New_York`,
+          ;; `… PST`. A timestamptz applies it; a plain timestamp
+          ;; ignores it (datetime.c keeps the fields and drops the
+          ;; zone). Neither happened: the zone was parsed away and the
+          ;; wall clock kept, so `'… 17:32:01 America/New_York'` read
+          ;; back as 17:32:01+00 -- five hours out, reported as
+          ;; success -- and the extended spelling did not parse at all
+          ;; and passed its own text through as a timestamptz.
+          (and (string? v)
+               (re-find #"(?i)\s[A-Za-z][A-Za-z_]*(?:/[A-Za-z_+-]+)*\s*$" (str/trim v))
+               (not (re-find #"(?i)\s(AM|PM|BC|AD)\s*$" (str/trim v))))
+          (let [t (str/trim (str v))
+                idx (.lastIndexOf t " ")
+                head (str/trim (subs t 0 idx))
+                zone (str/trim (subs t (inc idx)))
+                tz? (contains? #{"timestamptz" "timestamp with time zone"}
+                               (types/base-type-name-of type-str))
+                inner (cast-scalar head "timestamp"
+                                   {:explicit? true
+                                    :parse-timestamp parse-timestamp})]
+            (if (or (nil? inner) (string? inner))
+              ;; The head is not a timestamp either, so this is not
+              ;; the shape we took it for -- hand the WHOLE value back
+              ;; to the ordinary path so it reports on what was written.
+              v
+              (if-not tz?
+                inner
+                (let [^java.time.LocalDateTime ldt
+                      (cond
+                        (instance? java.time.LocalDateTime inner) inner
+                        (instance? java.util.Date inner)
+                        (java.time.LocalDateTime/ofInstant
+                         (.toInstant ^java.util.Date inner)
+                         java.time.ZoneOffset/UTC)
+                        :else nil)]
+                  (if (nil? ldt)
+                    inner
+                    (java.util.Date/from
+                     (.toInstant
+                      (.atZone ldt
+                               ;; The CAST lowercases the zone in its
+                               ;; message -- the datetime decoder folds
+                               ;; the token -- while AT TIME ZONE keeps
+                               ;; what was written. PostgreSQL really
+                               ;; does differ between the two.
+                               (try (types/resolve-time-zone zone)
+                                    (catch Exception _
+                                      (throw (errors/pg-error
+                                              :invalid-parameter-value
+                                              {:message
+                                               (str "time zone \""
+                                                    (str/lower-case zone)
+                                                    "\" not recognized")}))))))))))))
           :else
           (let [norm (-> (str v) str/trim
+                         ;; ISO 8601 BASIC -- `19970210 173201`,
+                         ;; `19970210T173201`, `19970210`. PostgreSQL
+                         ;; reads the separator-less spelling; rewriting
+                         ;; it to the extended one here means both this
+                         ;; cast and the expression parser get it,
+                         ;; rather than one of them.
+                         (str/replace #"^(\d{4})(\d{2})(\d{2})([ T])(\d{2})(\d{2})(\d{2})"
+                                      "$1-$2-$3T$5:$6:$7")
+                         (str/replace #"^(\d{4})(\d{2})(\d{2})$" "$1-$2-$3")
                          (str/replace #"(\d{4}-\d{2}-\d{2})\s+(\d)" "$1T$2"))
                 ;; LocalDateTime keeps microseconds; parse-timestamp routes
                 ;; through java.util.Date, which is millisecond-only, and
@@ -589,6 +651,15 @@
                       (try (java.time.LocalDateTime/parse norm)
                            (catch Exception _ nil)))]
             (or ldt
+                ;; `norm` was computed and then only consulted on the
+                ;; branch above, so a spelling this normalises but the
+                ;; injected parser does not know -- ISO basic -- fell
+                ;; through to the raw input and a timestamp column got
+                ;; a string that is not a timestamp.
+                (let [p (when parse-timestamp (parse-timestamp (str v)))]
+                  (when-not (or (nil? p) (string? p)) p))
+                (try (java.time.LocalDateTime/parse norm)
+                     (catch Exception _ nil))
                 (if parse-timestamp (parse-timestamp (str v)) v))))
 
         :date (cond

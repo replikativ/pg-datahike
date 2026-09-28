@@ -9160,6 +9160,42 @@
   (classified-error "" (ex-info (str "\"" name "\" is not a materialized view")
                                 {:error :wrong-object-type :sqlstate "42809"})))
 
+(defn- exec-ddl-create-table-as
+  "CREATE TABLE … [(cols)] AS <query> [WITH [NO] DATA].
+
+   The two things JSqlParser cannot parse -- the column list and the
+   WithData tail -- are handled the way the materialized view handles
+   them: the column list becomes a derived table's alias list, which
+   already renames output columns, and WITH NO DATA runs the query for
+   its column types and then empties the table. Everything else is the
+   ordinary CTAS path, so the rows and types are whatever that path
+   produces."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [table-name columns with-data? if-not-exists?]} parsed
+        query (if (seq columns)
+                (str "SELECT * FROM (" (:query parsed) ") AS \"__ctas_src\" ("
+                     (str/join ", " columns) ")")
+                (:query parsed))
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))]
+    (cond
+      (and (table-exists? db table-name) if-not-exists?)
+      (do (params/notice! "NOTICE" (str "relation \"" table-name
+                                        "\" already exists, skipping"))
+          (empty-result "CREATE TABLE AS"))
+      :else
+      (try
+        (let [^PgWireServer$QueryResult built
+              (run-nested! (str "CREATE TABLE " table-name " AS " query))]
+          (if with-data?
+            built
+            (do (run-nested! (str "DELETE FROM " table-name))
+                ;; PostgreSQL tags a populated CTAS with the query's row
+                ;; count and an unpopulated one with the DDL tag.
+                (empty-result "CREATE TABLE AS"))))
+        (catch Exception e
+          (classified-error "" e))))))
+
 (defn- exec-ddl-create-matview
   "CREATE MATERIALIZED VIEW name [(cols)] AS query [WITH [NO] DATA].
 
@@ -13011,6 +13047,8 @@
                                                       tx-state #(exec-ddl-create-role ctx parsed))
                               :ddl-drop-role         (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-drop-role ctx parsed))
+                              :ddl-create-table-as   (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-table-as ctx parsed))
                               :ddl-create-table-like (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create-table-like ctx parsed))
                               :ddl-create-matview    (execute-ddl-invalidating

@@ -196,3 +196,93 @@
     (testing "and AD is the default, written without a suffix"
       (is (= "2040-04-10" (one c "SELECT '2040-04-10 AD'::date")))
       (is (= "2040-04-10" (one c "SELECT '2040-04-10'::date"))))))
+
+(deftest a-date-column-writes-through-the-date-input-function
+  ;; The cast rejected `'1997-02-29'` while the WRITE stored the 28th:
+  ;; `INSERT` fell through to the lenient timestamp parser instead of
+  ;; running PostgreSQL's date input function, so the two spellings of
+  ;; one value disagreed. `time` and `timetz` columns already routed
+  ;; their writes through the cast; a date did not.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE dt (f1 date)")
+    (testing "an impossible date is refused, not rolled into the next month"
+      (doseq [s ["1997-02-29" "1997-04-31" "1997-13-01"]]
+        (let [[state msg] (err-of c (str "INSERT INTO dt VALUES ('" s "')"))]
+          (is (= "22008" state) (str s " => " msg)))))
+    (testing "the write and the cast now give the SAME answer, which is the point"
+      (is (= (second (err-of c "INSERT INTO dt VALUES ('1997-02-29')"))
+             (second (err-of c "SELECT '1997-02-29'::date")))))
+    (testing "a BC date, which the cast accepted and the write refused"
+      (exec! c "INSERT INTO dt VALUES ('2040-04-10 BC')")
+      (is (= "2040-04-10 BC" (one c "SELECT f1 FROM dt"))))
+    (testing "and an ordinary date still goes in"
+      (exec! c "INSERT INTO dt VALUES ('1997-02-28')")
+      (is (= "1997-02-28" (one c "SELECT f1 FROM dt WHERE f1 = '1997-02-28'"))))))
+
+(deftest iso-basic-timestamps-and-at-time-zone-failure
+  ;; PostgreSQL reads ISO 8601's BASIC spelling -- no separators --
+  ;; and nothing here did. `'19970210 173201'::timestamp` answered with
+  ;; its own text: a value that is not a timestamp, in a timestamp
+  ;; column, because the parser returns its input when nothing matches.
+  ;;
+  ;; `AT TIME ZONE` then dereferenced that failure. A string operand
+  ;; produced nil from the wall-clock conversion and the client got
+  ;; `Cannot invoke "java.time.LocalDateTime.atZone(…)" because the
+  ;; return value of "clojure.lang.IFn.invoke(Object)" is null` --
+  ;; fifteen such lines in `timestamptz` alone, all from this one gap.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (testing "the basic spelling parses, in a timestamp and in a date"
+      (is (= "1997-02-10 17:32:01" (one c "SELECT '19970210 173201'::timestamp")))
+      (is (= "1997-02-10" (one c "SELECT '19970210'::date")))
+      (is (= "1997-02-10 17:32:01" (one c "SELECT '19970210T173201'::timestamp"))))
+    (testing "AT TIME ZONE over one of them shifts the wall clock"
+      (is (= "1997-02-10 12:32:01"
+             (one c "SELECT '19970210 173201' AT TIME ZONE 'America/New_York'"))))
+    (testing "and a value that is not a timestamp is 22007, not an internal error"
+      (let [[state msg] (err-of c "SELECT 'garbage' AT TIME ZONE 'America/New_York'")]
+        (is (= "22007" state) msg)
+        (is (re-find #"invalid input syntax for type timestamp with time zone"
+                     (str msg)))
+        (is (not (re-find #"(?i)cannot invoke|java\.lang|clojure\." (str msg)))
+            "an internal failure must never reach the client")))))
+
+(deftest a-named-zone-inside-a-timestamptz-literal
+  ;; `'1997-02-10 17:32:01 America/New_York'::timestamptz` is 22:32:01
+  ;; UTC. The zone was parsed away and the wall clock kept, so it read
+  ;; back as 17:32:01+00 -- five hours out, reported as success -- and
+  ;; the extended spelling did not parse at all and passed its own text
+  ;; through as a timestamptz value.
+  ;;
+  ;; A plain `timestamp` keeps the fields and DROPS the zone, which is
+  ;; the opposite behaviour from the same text, and is PostgreSQL's.
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (testing "the zone is applied, and daylight saving with it"
+      (is (= "1997-02-10 22:32:01+00"
+             (one c "SELECT '1997-02-10 17:32:01 America/New_York'::timestamptz")))
+      (is (= "1997-07-10 21:32:01+00"
+             (one c "SELECT '1997-07-10 17:32:01 America/New_York'::timestamptz"))
+          "July is daylight time, so the same wall clock is an hour earlier in UTC")
+      (is (= "1997-02-11 01:32:01+00"
+             (one c "SELECT '1997-02-10 17:32:01 PST'::timestamptz"))
+          "an abbreviation resolves too")
+      (is (= "1997-02-10 22:32:01+00"
+             (one c "SELECT '19970210 173201 America/New_York'::timestamptz"))
+          "including on the ISO basic spelling"))
+    (testing "a numeric offset still works, and is POSIX-signed"
+      (is (= "1997-02-10 12:32:01+00"
+             (one c "SELECT '1997-02-10 17:32:01+05'::timestamptz"))))
+    (testing "a plain timestamp keeps the fields and drops the zone"
+      (is (= "1997-02-10 17:32:01"
+             (one c "SELECT '1997-02-10 17:32:01 America/New_York'::timestamp")))
+      (is (= "1997-02-10 17:32:01"
+             (one c "SELECT '1997-02-10 17:32:01 PST'::timestamp"))))
+    (testing "an unrecognised zone is an error, lowercased as the cast reports it"
+      (let [[state msg] (err-of c "SELECT '1997-02-10 17:32:01 Nonsense/Zone'::timestamptz")]
+        (is (= "22023" state) msg)
+        (is (re-find #"time zone \"nonsense/zone\" not recognized" (str msg))))
+      (testing "while AT TIME ZONE keeps what was written -- PostgreSQL differs"
+        (is (re-find #"time zone \"Nonsense/Zone\" not recognized"
+                     (str (second (err-of c "SELECT now() AT TIME ZONE 'Nonsense/Zone'")))))))))
