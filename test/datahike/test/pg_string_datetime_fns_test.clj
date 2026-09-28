@@ -230,6 +230,13 @@
       (is (= "mas" (one c "SELECT substring('Thomas' from '...$')"))))
     (testing "no match is NULL, not the empty string"
       (is (nil? (one c "SELECT substring('foobar' from 'nomatch')"))))
+    (testing "a group that did not participate is NULL, not the whole match"
+      ;; The parentheses decide WHAT is returned; whether they matched
+      ;; decides whether there is anything to return. PostgreSQL's own
+      ;; `strings` test covers this, and it is the case a plain `or`
+      ;; over the group gets wrong.
+      (is (nil? (one c "SELECT substring('foo' from 'foo(bar)?')")))
+      (is (= "bar" (one c "SELECT substring('foobar' from 'foo(bar)?')"))))
     (testing "and the numeric form still means what it did"
       (is (= "hom" (one c "SELECT substring('Thomas' from 2 for 3)")))
       (is (= "Th" (one c "SELECT substring('Thomas' from 1 for 2)"))))))

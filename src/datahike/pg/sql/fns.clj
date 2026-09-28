@@ -2934,8 +2934,15 @@
            :__null__
            ;; PostgreSQL returns the first parenthesised subexpression
            ;; when the pattern has one, and the whole match otherwise.
-           (or (when (pos? (.groupCount m)) (.group m 1))
-               (.group m))))
+           ;; A pattern that HAS a group whose text did not participate
+           ;; in the match -- `substring('foo' from 'foo(bar)?')` --
+           ;; is NULL, not the whole match: the presence of the
+           ;; parentheses decides what is returned, and whether they
+           ;; matched decides whether there is anything to return.
+           ;; PostgreSQL's own `strings` test covers exactly this.
+           (if (pos? (.groupCount m))
+             (or (.group m 1) :__null__)
+             (.group m))))
        (if (pg-bits/pg-bit? s)
          (if (some? len)
            (pg-bits/substring-bits s start len)
