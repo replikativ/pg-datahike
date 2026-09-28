@@ -282,13 +282,45 @@ N+1 and is the thing 7.2 and 7.3 must avoid wherever the shape allows.
 | Location | Behaviour | Phase |
 |---|---|---|
 | `jsonb/parse-jsonb` | returns the input string | 0.3 |
-| `parse-timestamp-string` | returns the input string | 1.3 |
+| `parse-timestamp-string` | returns the input string — **every caller now guards it**; the contract itself is what is left | 1.3 |
 | `json_to_record` cells (stmt ~1336) | keeps the raw value on failure | 1.3 |
 | `copy.clj` ref values | keep the raw value on failure | 1.3 |
+| `coerce-unknown` | returns the string on failure (says so in its own docstring) | 1.3 |
 | bytea (stmt ~6983) | falls back to UTF-8 bytes | 3 |
 | `arrays.clj` elements | uuid, numeric and date elements stay strings | 0.1 / 1.3 |
 | interval cast | returns its input | 2 |
 | `cast-scalar` | returns the value unchanged for targets it doesn't know | 4 (resolver: 42704) |
+
+### Closing `parse-timestamp-string`'s callers (2026-09-29)
+
+The parser still returns its input. What changed is that nothing acts on
+that any more:
+
+- `cast-scalar` raises `bad-timestamp!` / `bad-date!` rather than
+  passing the text on;
+- the constant-fold and runtime branches of `translate-cast-expr` for
+  `::date` and `::timestamp` delegate to `cast-scalar` instead of
+  keeping private conversions. They were the observable leaks:
+  `'nonsense'::timestamp::text` answered `nonsense`, and the runtime
+  `s::date` answered nil — which FILTERS THE ROW, so rows vanished
+  rather than raising. A bare `'nonsense'::timestamp` was always right;
+  only NESTED and RUNTIME casts took the private path, and the
+  `is-time?` branch beside them already delegated.
+
+Two traps worth keeping in mind for the rest of 1.3:
+
+- **A predicate with two jobs.** `ymd-shape` both classified errors and
+  ROUTED to the strict `uuuu-M-d` parser. Widening it so `13/10/2017`
+  would report 22008 sent `8/10/2017` to a parser that cannot read
+  slashes. It is `ymd-shape` (routing, dashes only) and
+  `date-ish-shape?` (classification) now.
+- **Binary mode is a separate surface.** `M/d/y` left on year-of-era
+  while its siblings moved to `uuuu` broke `'8/10/7777'::timestamp`
+  under `ResolverStyle/STRICT`. The local suite stayed green for three
+  commits; only pgjdbc-conformance, which forces binary transfer,
+  caught it — the failed cast left TEXT under a timestamp OID and the
+  driver said `Unsupported binary encoding of timestamp`. Our suite now
+  asserts that shape directly.
 
 ## Tracked separately
 

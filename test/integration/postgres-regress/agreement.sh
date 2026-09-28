@@ -9,8 +9,18 @@ set -u
 MODE="${1:-gate}"
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT" || exit 1
-COLLECTED="$(mktemp -d)"
-trap 'rm -rf "$COLLECTED"' EXIT
+# Keeping the outputs is the point of the run: the measurement is one
+# number, and the 174 files behind it are what says WHERE the residual
+# is. A mktemp with a cleanup trap threw them away every time, so the
+# analysis meant running the gate again. Set AGREEMENT_KEEP to a
+# directory to keep them.
+COLLECTED="${AGREEMENT_KEEP:-$(mktemp -d)}"
+mkdir -p "$COLLECTED"
+if [ -z "${AGREEMENT_KEEP:-}" ]; then
+  trap 'rm -rf "$COLLECTED"' EXIT
+else
+  echo "Collecting outputs in $COLLECTED (kept)" >&2
+fi
 
 FILES=$(clojure -M -e '
 (require (quote [clojure.string :as str]) (quote [clojure.java.io :as io]))
