@@ -258,3 +258,37 @@
     (is (= [["0"]] (rows (ok! h "SELECT n FROM t"))) "b is not in the OF list")
     (ok! h "UPDATE t SET a = 2")
     (is (= [["1"]] (rows (ok! h "SELECT n FROM t"))) "a is")))
+
+(deftest a-trigger-row-is-coerced-and-the-verdict-is-kept
+  ;; The writeback coerced each column to its declared type and then
+  ;; discarded the answer: `(catch Exception _ v)` around the call, so
+  ;; every SQLSTATE the coercion exists to raise -- 22P02 bad syntax,
+  ;; 22003 out of range, 22001 too long, 22008 an impossible date --
+  ;; was swallowed and the UNCOERCED value stored.
+  ;;
+  ;; It was only half-visible: for a type Datahike carries as a long,
+  ;; its own schema check caught the value afterwards with a different
+  ;; message, so the bug looked like a wording problem. For one carried
+  ;; as a string it would simply have gone in.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's: it raises at the
+  ;; assignment, with the target type's own error.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (id int, n smallint)")
+    (ok! h (str "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN"
+                " NEW.n := 99999; RETURN NEW; END $$ LANGUAGE plpgsql"))
+    (ok! h "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()")
+    (let [r (exec h "INSERT INTO t VALUES (1, 1)")]
+      (is (= "22003" (.sqlstate r)))
+      (is (re-find #"out of range" (str (err r))))
+      (is (not (re-find #"(?i)invalid input syntax" (str (err r))))
+          "the coercion's own verdict, not one the schema check produced later"))
+    (testing "and nothing was written"
+      (is (= [["0"]] (rows (ok! h "SELECT count(*) FROM t")))))
+    (testing "a value that DOES fit still goes through the trigger"
+      (ok! h (str "CREATE FUNCTION g() RETURNS trigger AS $$ BEGIN"
+                  " NEW.n := 42; RETURN NEW; END $$ LANGUAGE plpgsql"))
+      (ok! h "CREATE TABLE t2 (id int, n smallint)")
+      (ok! h "CREATE TRIGGER tr2 BEFORE INSERT ON t2 FOR EACH ROW EXECUTE FUNCTION g()")
+      (ok! h "INSERT INTO t2 VALUES (1, 1)")
+      (is (= [["1" "42"]] (rows (ok! h "SELECT id, n FROM t2")))))))

@@ -2485,8 +2485,16 @@
             (let [k (keyword table-name c)]
               (if (nil? v)
                 (dissoc e k)
-                (assoc e k (try (#'stmt/coerce-insert-value v k (dbi/-schema db) db)
-                                (catch Exception _ v))))))
+                ;; NOT `(catch Exception _ v)`. Every SQLSTATE this
+                ;; coercion exists to raise -- 22P02 bad syntax, 22003
+                ;; out of range, 22001 too long, 22008 an impossible
+                ;; date -- was swallowed, and the UNCOERCED value
+                ;; stored. For a type Datahike carries as a long the
+                ;; schema check caught it afterwards with a different
+                ;; message; for one it carries as a string (jsonb, bit,
+                ;; an array) nothing did, and the row went in. PostgreSQL
+                ;; raises at the assignment.
+                (assoc e k (#'stmt/coerce-insert-value v k (dbi/-schema db) db)))))
           entity
           columns))
 
@@ -2689,9 +2697,10 @@
   (let [want (into {} (keep (fn [[c v]]
                               (when (some? v)
                                 [(keyword table-name c)
-                                 (try (#'stmt/coerce-insert-value
-                                       v (keyword table-name c) (dbi/-schema db) db)
-                                      (catch Exception _ v))])))
+                                 ;; See coerce-trigger-row: the verdict
+                                 ;; is the point of the call.
+                                 (#'stmt/coerce-insert-value
+                                  v (keyword table-name c) (dbi/-schema db) db)])))
                    row)
         table-attr? (fn [a] (and (keyword? a) (= table-name (namespace a))
                                  (not= "db-row-exists" (name a))))]
