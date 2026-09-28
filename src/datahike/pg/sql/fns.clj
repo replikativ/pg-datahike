@@ -2826,7 +2826,30 @@
     (inst? v) (java.time.LocalDateTime/ofInstant
                (if (instance? java.time.Instant v) v (.toInstant ^java.util.Date v))
                java.time.ZoneOffset/UTC)
-    :else nil))
+    ;; An untyped literal -- `'19970210 173201' AT TIME ZONE …` -- is
+    ;; still its own text here, so it has to go through the timestamp
+    ;; input function like any other. Returning nil instead meant the
+    ;; caller dereferenced it and the client got
+    ;; `Cannot invoke "java.time.LocalDateTime.atZone(…)" because the
+    ;; return value of "clojure.lang.IFn.invoke(Object)" is null` --
+    ;; an internal failure where PostgreSQL raises 22007.
+    ;; Parsed ONCE, not by recurring: the cast returns its input
+    ;; unchanged when nothing parses, so recurring on a string that is
+    ;; not a timestamp would never terminate.
+    (string? v)
+    (let [parsed (try (sql-cast/cast-scalar v "timestamp" {:explicit? true})
+                      (catch Exception _ nil))]
+      (if (or (nil? parsed) (string? parsed))
+        (throw (errors/pg-error
+                :invalid-datetime-format
+                {:message (str "invalid input syntax for type timestamp"
+                               " with time zone: \"" v "\"")}))
+        (local-date-time parsed)))
+    :else
+    (throw (errors/pg-error
+            :invalid-datetime-format
+            {:message (str "invalid input syntax for type timestamp with time zone: \""
+                           v "\"")}))))
 
 (defn sql-at-time-zone
   "`value AT TIME ZONE zone` (timestamp.c timestamp_zone / timestamptz_zone,

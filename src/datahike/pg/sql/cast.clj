@@ -578,6 +578,15 @@
           (instance? java.time.LocalDateTime v) v
           :else
           (let [norm (-> (str v) str/trim
+                         ;; ISO 8601 BASIC -- `19970210 173201`,
+                         ;; `19970210T173201`, `19970210`. PostgreSQL
+                         ;; reads the separator-less spelling; rewriting
+                         ;; it to the extended one here means both this
+                         ;; cast and the expression parser get it,
+                         ;; rather than one of them.
+                         (str/replace #"^(\d{4})(\d{2})(\d{2})([ T])(\d{2})(\d{2})(\d{2})"
+                                      "$1-$2-$3T$5:$6:$7")
+                         (str/replace #"^(\d{4})(\d{2})(\d{2})$" "$1-$2-$3")
                          (str/replace #"(\d{4}-\d{2}-\d{2})\s+(\d)" "$1T$2"))
                 ;; LocalDateTime keeps microseconds; parse-timestamp routes
                 ;; through java.util.Date, which is millisecond-only, and
@@ -589,6 +598,15 @@
                       (try (java.time.LocalDateTime/parse norm)
                            (catch Exception _ nil)))]
             (or ldt
+                ;; `norm` was computed and then only consulted on the
+                ;; branch above, so a spelling this normalises but the
+                ;; injected parser does not know -- ISO basic -- fell
+                ;; through to the raw input and a timestamp column got
+                ;; a string that is not a timestamp.
+                (let [p (when parse-timestamp (parse-timestamp (str v)))]
+                  (when-not (or (nil? p) (string? p)) p))
+                (try (java.time.LocalDateTime/parse norm)
+                     (catch Exception _ nil))
                 (if parse-timestamp (parse-timestamp (str v)) v))))
 
         :date (cond

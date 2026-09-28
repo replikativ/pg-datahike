@@ -3981,6 +3981,24 @@
                            (java.time.format.DateTimeFormatter/ofPattern "yyyy/M/d"))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
+     ;; ISO 8601 BASIC format -- the separator-less spelling.
+     ;; `19970210 173201`, `19970210T173201`, `19970210`, and the same
+     ;; with a trailing zone name. PostgreSQL reads all of them, and
+     ;; nothing here did: the string fell through to the passthrough
+     ;; below and `'19970210 173201'::timestamp` answered with its own
+     ;; text -- a value that is not a timestamp, in a timestamp column.
+     (when-let [[_ d t] (re-matches #"^(\d{8})(?:[ T](\d{6}(?:\.\d+)?))?$"
+                                    (first (str/split trimmed #"\s+(?=[A-Za-z/_]+$)")))]
+       (try
+         (let [date (java.time.LocalDate/parse
+                     d (java.time.format.DateTimeFormatter/ofPattern "uuuuMMdd"))
+               ldt (if t
+                     (.atTime date (java.time.LocalTime/parse
+                                    t (java.time.format.DateTimeFormatter/ofPattern
+                                       "HHmmss[.SSS][.SS][.S]")))
+                     (.atStartOfDay date))]
+           (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC)))
+         (catch Exception _ nil)))
      ;; All parsing failed — return raw string
      s)))
 

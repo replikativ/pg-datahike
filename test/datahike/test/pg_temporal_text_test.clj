@@ -218,3 +218,32 @@
     (testing "and an ordinary date still goes in"
       (exec! c "INSERT INTO dt VALUES ('1997-02-28')")
       (is (= "1997-02-28" (one c "SELECT f1 FROM dt WHERE f1 = '1997-02-28'"))))))
+
+(deftest iso-basic-timestamps-and-at-time-zone-failure
+  ;; PostgreSQL reads ISO 8601's BASIC spelling -- no separators --
+  ;; and nothing here did. `'19970210 173201'::timestamp` answered with
+  ;; its own text: a value that is not a timestamp, in a timestamp
+  ;; column, because the parser returns its input when nothing matches.
+  ;;
+  ;; `AT TIME ZONE` then dereferenced that failure. A string operand
+  ;; produced nil from the wall-clock conversion and the client got
+  ;; `Cannot invoke "java.time.LocalDateTime.atZone(…)" because the
+  ;; return value of "clojure.lang.IFn.invoke(Object)" is null` --
+  ;; fifteen such lines in `timestamptz` alone, all from this one gap.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (testing "the basic spelling parses, in a timestamp and in a date"
+      (is (= "1997-02-10 17:32:01" (one c "SELECT '19970210 173201'::timestamp")))
+      (is (= "1997-02-10" (one c "SELECT '19970210'::date")))
+      (is (= "1997-02-10 17:32:01" (one c "SELECT '19970210T173201'::timestamp"))))
+    (testing "AT TIME ZONE over one of them shifts the wall clock"
+      (is (= "1997-02-10 12:32:01"
+             (one c "SELECT '19970210 173201' AT TIME ZONE 'America/New_York'"))))
+    (testing "and a value that is not a timestamp is 22007, not an internal error"
+      (let [[state msg] (err-of c "SELECT 'garbage' AT TIME ZONE 'America/New_York'")]
+        (is (= "22007" state) msg)
+        (is (re-find #"invalid input syntax for type timestamp with time zone"
+                     (str msg)))
+        (is (not (re-find #"(?i)cannot invoke|java\.lang|clojure\." (str msg)))
+            "an internal failure must never reach the client")))))
