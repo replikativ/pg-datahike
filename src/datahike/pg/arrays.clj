@@ -77,9 +77,15 @@
                 (let [child-shapes (mapv walk vs)]
                   (when (seq (rest child-shapes))
                     (when-not (apply = child-shapes)
-                      (throw (ex-info "ragged array — all sub-arrays must have same shape"
-                                      {:error :array-element-error
-                                       :detail "ragged array — all sub-arrays must have same shape"
+                      ;; PostgreSQL calls this a malformed array LITERAL
+                      ;; (22P02), the same code it gives `{1,abc}` and
+                      ;; `{1,2`; 2202E is its array-SUBSCRIPT error, which
+                      ;; this is not.
+                      (throw (ex-info "malformed array literal"
+                                      {:error :invalid-text-representation
+                                       :sqlstate "22P02"
+                                       :detail (str "Multidimensional arrays must have"
+                                                    " sub-arrays with matching dimensions.")
                                        :input elements}))))
                   (into [(count vs)] (or (first child-shapes) [])))
                 ;; Leaf-level vector / PgArray
@@ -646,9 +652,17 @@
                     child-dims (mapv second children)]
                 (when (seq (rest child-dims))
                   (when-not (apply = child-dims)
-                    (throw (ex-info "ragged array — sub-arrays must have same shape"
-                                    {:error :array-element-error
-                                     :detail "ragged array — sub-arrays must have same shape"
+                    ;; 22P02, as PostgreSQL gives for every malformed
+                    ;; array LITERAL; 2202E is its array-subscript error.
+                    ;; PostgreSQL also quotes the literal in the
+                    ;; message; it is not in scope in this walker, and
+                    ;; the SQLSTATE and DETAIL -- which is what a client
+                    ;; branches on -- already match.
+                    (throw (ex-info "malformed array literal"
+                                    {:error :invalid-text-representation
+                                     :sqlstate "22P02"
+                                     :detail (str "Multidimensional arrays must have"
+                                                  " sub-arrays with matching dimensions.")
                                      :dims child-dims}))))
                 [(mapv first children)
                  (into [(count node)] (or (first child-dims) []))])

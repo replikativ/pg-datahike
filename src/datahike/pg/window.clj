@@ -472,6 +472,23 @@
                       :__null__))))))
     (persistent! @result)))
 
+(defn base-output-position
+  "The VISIBLE output position of the `base-idx`'th non-window output.
+
+   `window-projection-indices` interleaves window results back into the
+   target list by each spec's `:out-pos`, so a plain column's visible
+   position is not its position among the base outputs whenever a
+   window function is projected before it. A post-window ORDER BY
+   indexes the interleaved row, so it needs this mapping and not the
+   base index."
+  [base-idx window-specs]
+  (let [taken (into #{} (keep :out-pos) window-specs)]
+    (loop [pos 0 seen 0]
+      (cond
+        (contains? taken pos) (recur (inc pos) seen)
+        (= seen base-idx) pos
+        :else (recur (inc pos) (inc seen))))))
+
 (defn window-projection-indices
   "Indices that restore window outputs to their SQL target-list positions.
 

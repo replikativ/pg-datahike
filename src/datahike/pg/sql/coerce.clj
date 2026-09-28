@@ -327,6 +327,25 @@
                            (str/starts-with? trimmed "\\x") (subs trimmed 2)
                            (str/starts-with? trimmed "\\\\x") (subs trimmed 3)
                            :else nil)]
+      ;; A value that STARTS with the hex prefix is in hex format, so a
+      ;; bad digit or an odd count is an ERROR, not a reason to fall
+      ;; back. Returning nil let the caller's `(or … (.getBytes s))`
+      ;; store the literal characters: `'\xZZ'::bytea` answered
+      ;; `\x5c785a5a` -- the bytes of `\`, `x`, `Z`, `Z` -- rather
+      ;; than raising, on the write path and the cast path alike.
+      ;; PostgreSQL's messages, and its 22P02.
+      (when without-prefix
+        (when-not (re-matches #"[0-9a-fA-F]*" without-prefix)
+          (throw (ex-info (str "invalid hexadecimal digit: \""
+                               (first (remove #(re-matches #"[0-9a-fA-F]" (str %))
+                                              without-prefix))
+                               "\"")
+                          {:error :invalid-text-representation
+                           :sqlstate "22P02"})))
+        (when-not (even? (count without-prefix))
+          (throw (ex-info "invalid hexadecimal data: odd number of digits"
+                          {:error :invalid-text-representation
+                           :sqlstate "22P02"}))))
       (when (and without-prefix
                  (re-matches #"[0-9a-fA-F]*" without-prefix)
                  (even? (count without-prefix)))

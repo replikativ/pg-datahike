@@ -334,9 +334,17 @@
       (is (= [[1 nil] [nil 4]] (:elements a))))))
 
 (deftest text-parse-rejects-ragged
-  (testing "Ragged literal raises"
-    (is (thrown-with-msg? Exception #"ragged"
-                          (arr/from-pg-text "{{1,2},{3,4,5}}" :int8)))))
+  ;; PostgreSQL's own wording, not ours: `malformed array literal`,
+  ;; with the dimension explanation in DETAIL and SQLSTATE 22P02 -- the
+  ;; same code it gives `{1,abc}` and `{1,2`. This asserted the string
+  ;; "ragged", which was our message and nobody else's, and 2202E is
+  ;; PostgreSQL's array-SUBSCRIPT error rather than a bad literal.
+  (testing "Ragged literal raises, as a malformed literal"
+    (is (thrown-with-msg? Exception #"malformed array literal"
+                          (arr/from-pg-text "{{1,2},{3,4,5}}" :int8)))
+    (is (= "22P02"
+           (:sqlstate (ex-data (try (arr/from-pg-text "{{1,2},{3,4,5}}" :int8)
+                                    (catch Exception e e))))))))
 
 (deftest text-parse-lbound-prefix
   (testing "Non-default lbound is parsed and preserved"

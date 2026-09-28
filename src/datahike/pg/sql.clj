@@ -905,6 +905,58 @@
        withs)
       [db schema [] {}])))
 
+(defn- jsqlparser-syntax-error
+  "PostgreSQL's `syntax error at or near \"x\"`, when that is what a
+   JSqlParser ParseException means.
+
+   The raw exception named the Java class and then dumped its whole
+   `Was expecting one of:` token list into the client's error message:
+
+     ERROR:  SQL parse error: net.sf.jsqlparser.parser.ParseException:
+             Encountered unexpected token: \"of\" \"OF\"
+         at line 1, column 41.
+     Was expecting one of:
+         <EOF>
+         <ST_SEMICOLON>
+         ...
+
+   PostgreSQL says one line, naming the token, and that is also what
+   the regression harness compares against -- the grammar dump counted
+   as several lines of divergence on top of the error itself.
+
+   Only the message changes: an unparseable statement is 42601 either
+   way, and a statement whose grammar this parser DOES know is
+   unaffected."
+  [^Throwable e]
+  (let [root (loop [t e] (if-let [c (.getCause t)] (recur c) t))]
+    (when (instance? net.sf.jsqlparser.parser.ParseException root)
+      (let [msg (or (.getMessage root) "")]
+        (ex-info (if-let [[_ tok] (re-find #"Encountered unexpected token: \"([^\"]*)\"" msg)]
+                   (str "syntax error at or near \"" tok "\"")
+                   "syntax error")
+                 {:error :syntax-error :sqlstate "42601"})))))
+
+(defn- param-number-overflow
+  "PostgreSQL's `parameter number too large`, when that is what a JVM
+   NumberFormatException out of the parser means.
+
+   A `$N` placeholder's index is an int, and the grammar parses it as
+   one, so `SELECT $2147483648` came back as
+   `java.lang.NumberFormatException: For input string: \"2147483648\"`
+   -- the JVM's own sentence, under XX000. PostgreSQL's scanner says so
+   in its own words and points at the token.
+
+   Keyed on the failing input string appearing in THIS statement as a
+   `$`-placeholder, so an overflow from anywhere else is left alone."
+  [^Throwable e ^String sql]
+  (let [root (loop [t e] (if-let [c (.getCause t)] (recur c) t))]
+    (when (instance? NumberFormatException root)
+      (when-let [[_ digits] (re-find #"For input string: \"(\d+)\""
+                                     (or (.getMessage root) ""))]
+        (when (.contains sql (str "$" digits))
+          (ex-info (str "parameter number too large at or near \"$" digits "\"")
+                   {:error :syntax-error :sqlstate "42601"}))))))
+
 (defn- parse-sql*
   "Inner parse-sql implementation — does the actual work. Public
    parse-sql wraps this with the LRU result cache."
@@ -2401,6 +2453,10 @@
          ;; either :sqlstate (legacy / explicit override) or :error
          ;; (structured category). The errors namespace knows how to
          ;; map both to a (sqlstate, message, fields) tuple.
+        (when-let [n (param-number-overflow e sql)]
+          (throw n))
+        (when-let [n (jsqlparser-syntax-error e)]
+          (throw n))
         (let [data (ex-data e)
               [classified-code classified-msg classified-fields]
               (errors/classify-exception e)

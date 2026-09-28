@@ -67,6 +67,7 @@
             [datahike.pg.input :as input]
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector]
+            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.database :as database]))
 
 ;; ----------------------------------------------------------------------------
@@ -449,61 +450,36 @@
   [v]
   (or (= v text-default) (= v csv-default)))
 
-(defn- pg-timestamptz->iso
-  "Normalise PostgreSQL's `timestamp with time zone` OUTPUT form to
-   ISO-8601, or nil when `s` is not in that form.
-
-   COPY text format is what `pg_dump` writes, and it differs from
-   ISO-8601 in exactly two ways:
-
-       2022-01-28 17:58:52.222594-08
-                 ^ space, not T      ^ hour-only offset, not -08:00
-
-   Neither `OffsetDateTime/parse` nor `LocalDateTime/parse` accepts it,
-   so every timestamptz column in a default-format dump was rejected
-   with `invalid timestamp` — 380 of them in pagila, which is why a
-   real pg_dump restored zero rows. The `--inserts` form went through a
-   different parser and was unaffected, which is how this survived."
-  [^String s]
-  (when-let [[_ date time off] (re-matches
-                                #"(\d{4}-\d{2}-\d{2})[ T]([\d:.]+)([+-]\d{2}(?::?\d{2})?)"
-                                s)]
-    (str date "T" time
-         (cond
-           ;; -08 -> -08:00
-           (= 3 (count off)) (str off ":00")
-           ;; -0800 -> -08:00
-           (= 5 (count off)) (str (subs off 0 3) ":" (subs off 3))
-           :else off))))
+(def ^:private rich-parse-timestamp
+  ;; `expr/parse-timestamp-string` is the spelling-tolerant parser --
+  ;; `Jan 15, 2024`, `15-JAN-2024`, a named zone inside the literal.
+  ;; It cannot be required from here (expr.clj sits far above this
+  ;; parser), and `datahike.pg.arrays` resolves across the same edge
+  ;; the same way.
+  (delay (requiring-resolve 'datahike.pg.sql.expr/parse-timestamp-string)))
 
 (defn- parse-instant
-  "Parse an ISO-8601 / PG-timestamp string to a java.util.Date.
-   Tolerant: accepts `2024-01-15`, `2024-01-15 10:00:00`,
-   `2024-01-15T10:00:00Z`, PostgreSQL's `2024-01-15 10:00:00-08`, with
-   or without timezone."
-  ^java.util.Date [^String s]
-  (try
-    (.parse java.time.format.DateTimeFormatter/ISO_INSTANT s
-            java.time.Instant/from)
-    (catch Throwable _
-      (try
-        (java.util.Date/from
-         (.toInstant (java.time.OffsetDateTime/parse
-                      (or (pg-timestamptz->iso s) s))))
-        (catch Throwable _
-          (try
-            (let [ldt (java.time.LocalDateTime/parse
-                       (str/replace s " " "T"))]
-              (java.util.Date/from
-               (.toInstant
-                (.atZone ldt (java.time.ZoneId/of "UTC")))))
-            (catch Throwable _
-              (try
-                (let [ld (java.time.LocalDate/parse s)]
-                  (java.util.Date/from
-                   (.toInstant
-                    (.atStartOfDay ld (java.time.ZoneId/of "UTC")))))
-                (catch Throwable _ nil)))))))))
+  "Parse a COPY field to a `java.util.Date`, through the same input
+   function a cast uses.
+
+   This used to be a third hand-written temporal parser, beside
+   `cast.clj`'s and `expr.clj`'s, and it knew fewer spellings than
+   either: `COPY` rejected `20240115` while `'20240115'::timestamp`
+   accepted it. PostgreSQL has no such seam -- COPY and a cast both
+   call `timestamp_in`, so every spelling one takes the other takes.
+   Delegating is what keeps that true here."
+  ^java.util.Date [^String s pg-type]
+  (let [t (sql-cast/cast-scalar s (or pg-type "timestamp")
+                                {:parse-timestamp @rich-parse-timestamp})]
+    (cond
+      (instance? java.util.Date t) t
+      (instance? java.time.LocalDateTime t)
+      (java.util.Date/from (.toInstant ^java.time.LocalDateTime t
+                                       java.time.ZoneOffset/UTC))
+      (instance? java.time.LocalDate t)
+      (java.util.Date/from (.toInstant (.atStartOfDay ^java.time.LocalDate t
+                                                      java.time.ZoneOffset/UTC)))
+      :else t)))
 
 (defn coerce-field
   "Convert a raw string from a COPY data row into the typed value
@@ -555,11 +531,10 @@
                                                   (subs hex (* 2 i) (+ 2 (* 2 i))) 16))))
                                    ba)
                                  (.getBytes raw java.nio.charset.StandardCharsets/UTF_8))
-            :db.type/instant   (or (parse-instant raw)
-                                   (throw (ex-info (str "invalid timestamp: " raw)
-                                                   {:error :invalid-text-representation
-                                                    :type "timestamp"
-                                                    :value raw})))
+          ;; No `(or ... (throw))` fallback: the input function raises
+          ;; on its own, with the message and the SQLSTATE the type
+          ;; owns (22007/22008), where this threw a flat 22P02.
+            :db.type/instant   (parse-instant raw (get-in schema [attr :pg/type]))
           ;; :db.type/ref — coerce-insert-value handles the lookup-ref
           ;; bridge; we just need to convert the raw string to the
           ;; target attr's value type. Best-effort: try a long first

@@ -336,6 +336,21 @@
 (defn nan-num? [x]
   (and (number? x) (Double/isNaN (double x))))
 
+(defn- unbound-param?
+  "A `$N` placeholder that Bind has not filled in yet.
+
+   `datahike.pg.sql.params` requires this namespace, so the record type
+   cannot be imported here; the name is the stable thing to test."
+  [v]
+  (= "datahike.pg.sql.params.ParamRef" (.getName (class v))))
+
+(defn- runtime-type-name
+  "PostgreSQL's name for a value's type, for an error raised where only
+   the VALUE is left: a comparison function sees two bound values and
+   has no expression to read a declared type from."
+  [v]
+  (get types/oid->pg-name (types/infer-oid-from-value v) "unknown"))
+
 (defn order-cmp
   "`compare`, with two corrections.
 
@@ -1263,6 +1278,13 @@
     (and (number? a) (number? b)) (== a b)
     :else (= a b)))
 
+(def ^:private ^:dynamic *cmp-op*
+  "The SQL operator whose implementation is comparing, so the error
+   raised for two incomparable values can name it. `sql-order-cmp` is
+   also the ORDER BY key comparator, which has no operator to name --
+   hence a default rather than a required argument."
+  "<")
+
 (defn- sql-order-cmp [a b]
   (cond
     (and (pg-rec/record? a) (pg-rec/record? b))
@@ -1293,7 +1315,35 @@
         (types/numeric-special? a) (types/numeric-special? b))
     (order-cmp a b)
 
-    :else (compare a b)))
+    ;; `compare` throws a raw ClassCastException for two values of
+    ;; unrelated classes, and the client got the JVM's own sentence --
+    ;; `class java.lang.Long cannot be cast to class java.lang.String`
+    ;; -- under XX000. Whatever put text opposite a number is a defect
+    ;; further up, but leaking a JVM message tells nobody what
+    ;; happened: PostgreSQL names the two types and says it has no
+    ;; such operator.
+    ;;
+    ;; Except against an UNBOUND PARAMETER. A derived table is
+    ;; materialised at TRANSLATE time, before Bind has supplied
+    ;; anything, so `WHERE id <= $1` reaches here as Long vs ParamRef
+    ;; -- and the ClassCastException is load-bearing: it is how that
+    ;; pass learns the relation cannot be computed yet and leaves it
+    ;; empty for the runtime to redo. Answering with a SQL error
+    ;; instead made `SELECT * FROM (SELECT … WHERE id <= ?) x` fail at
+    ;; Parse. Only a comparison of two real VALUES is a type error.
+    :else
+    (try (compare a b)
+         (catch ClassCastException e
+           (when (or (unbound-param? a) (unbound-param? b))
+             (throw e))
+           (throw (errors/pg-error
+                   :undefined-function
+                   {:message (str "operator does not exist: "
+                                  (runtime-type-name a) " " *cmp-op* " "
+                                  (runtime-type-name b))
+                    :hint (str "No operator matches the given name and "
+                               "argument types. You might need to add "
+                               "explicit type casts.")}))))))
 
 (defn- nan-cmp-op
   "PostgreSQL orders NaN ABOVE every non-NaN for float and numeric
@@ -1301,7 +1351,7 @@
    TRUE. IEEE-754 -- and so Clojure's `<` `>` `<=` `>=` -- answers false
    for every comparison involving NaN, which made all four wrong the
    moment a NaN could exist."
-  [pred]
+  [pred op]
   (fn [a b]
     (cond
       ;; NOT null-safe: these are PREDICATES, and `null-safe` yields the
@@ -1311,12 +1361,12 @@
       ;; FALSE (PostgreSQL collapses it at the qual boundary, EEOP_QUAL).
       ;; sql-eq? already answers false the same way, via `=`.
       (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) false
-      :else (pred (sql-order-cmp a b) 0))))
+      :else (binding [*cmp-op* op] (pred (sql-order-cmp a b) 0)))))
 
-(def sql-lt? (nan-cmp-op <))
-(def sql-gt? (nan-cmp-op >))
-(def sql-le? (nan-cmp-op <=))
-(def sql-ge? (nan-cmp-op >=))
+(def sql-lt? (nan-cmp-op < "<"))
+(def sql-gt? (nan-cmp-op > ">"))
+(def sql-le? (nan-cmp-op <= "<="))
+(def sql-ge? (nan-cmp-op >= ">="))
 
 (defn sql-ne?
   "SQL `<>`. The complement of `sql-eq?` on non-NULL operands.

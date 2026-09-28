@@ -414,6 +414,33 @@
       (< b 0x80) (str (char b))
       :else (format "\\%03o" b))))
 
+(def month-names
+  ;; PostgreSQL's own table (`datetktbl` in datetime.c) takes the
+  ;; three-letter abbreviation and the full name, case-insensitively.
+  ;; It lives here, not beside the parser that reads it, because
+  ;; classifying a FAILURE needs it too: `Feb 30, 2024` names a real
+  ;; month, so it is a field out of range (22008), where `Foo 30,
+  ;; 2024` is not a date at all (22007).
+  (into {}
+        (mapcat (fn [[i full]] [[(subs full 0 3) i] [full i]]))
+        (map-indexed (fn [i m] [(inc i) m])
+                     ["january" "february" "march" "april" "may" "june" "july"
+                      "august" "september" "october" "november" "december"])))
+
+(defn month-name->number [^String t]
+  (get month-names (str/lower-case t)))
+
+(defn- month-name-date-shape?
+  "A date spelled with a month NAME and otherwise only digits and
+   separators -- the month-name counterpart of `ymd-shape`."
+  [^String s]
+  (let [body (str/trim (str/replace s #"\s+\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$" ""))
+        toks (remove str/blank? (str/split body #"[,\-/ ]+"))]
+    (and (seq toks)
+         (every? #(or (re-matches #"\d{1,6}" %) (month-name->number %)) toks)
+         (some month-name->number toks)
+         (some #(re-matches #"\d{4}" %) toks))))
+
 (defn bad-timestamp!
   "The timestamp counterpart of `bad-date!`: PostgreSQL tells a value
    whose date FIELDS are impossible (22008) from text that is not a
@@ -423,7 +450,8 @@
    a timestamp has to refuse exactly what casting one refuses, and by
    the same rule."
   [^String s tz?]
-  (if (re-matches #"(?i)^\d{1,6}-\d{1,2}-\d{1,2}([ T].*)?$" (clojure.string/trim s))
+  (if (or (re-matches #"(?i)^\d{1,6}-\d{1,2}-\d{1,2}([ T].*)?$" (str/trim s))
+          (month-name-date-shape? s))
     (throw (ex-info (str "date/time field value out of range: \"" s "\"")
                     {:error :datetime-field-overflow :sqlstate "22008"}))
     (throw (ex-info (str "invalid input syntax for type timestamp"
@@ -463,7 +491,7 @@
   "PostgreSQL tells a date whose FIELDS are impossible (22008) from text
    that is not a date at all (22007)."
   [^String s]
-  (if (re-matches ymd-shape s)
+  (if (or (re-matches ymd-shape s) (month-name-date-shape? s))
     (throw (ex-info (str "date/time field value out of range: \"" s "\"")
                     {:error :datetime-field-overflow :sqlstate "22008"}))
     (throw (ex-info (str "invalid input syntax for type date: \"" s "\"")

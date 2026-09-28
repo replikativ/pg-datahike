@@ -485,3 +485,29 @@
                         JOIN tree t ON n.parent = t.id
                     )
                     SELECT id, name, depth FROM tree ORDER BY id")))))
+
+(deftest a-cte-is-visible-from-a-doubly-nested-scalar-subquery
+  ;; PostgreSQL scopes a CTE to its own level and to every level inside
+  ;; it -- scanNameSpaceForCTE walks outward until it finds the name.
+  ;;
+  ;; A CTE is materialised here under a SYNTHETIC namespace and reached
+  ;; through a name mapping, and that mapping was bound around the
+  ;; nested PARSE but not around the nested EXECUTION. A subquery one
+  ;; level further down runs from a closure invoked during that
+  ;; execution, by which time the mapping was gone -- so one level of
+  ;; nesting resolved and two answered `relation "y" does not exist`.
+  (with-open [c (jdbc)]
+    (testing "one level, which always worked"
+      (is (= [["5"]] (rows c "WITH y AS (SELECT 5 AS id) SELECT (SELECT id FROM y)"))))
+    (testing "two levels"
+      (is (= [["5"]]
+             (rows c (str "WITH x AS (SELECT 10 AS id), y AS (SELECT 5 AS id) "
+                          "SELECT (SELECT (SELECT id FROM y) FROM x)")))))
+    (testing "and the inner CTE's value taking part in the outer one's expression"
+      (is (= [["15"]]
+             (rows c (str "WITH x AS (SELECT 10 AS id), y AS (SELECT 5 AS id) "
+                          "SELECT (SELECT id + (SELECT id FROM y) FROM x)")))))
+    (testing "two CTEs side by side still resolve independently"
+      (is (= [["10" "5"]]
+             (rows c (str "WITH x AS (SELECT 10 AS id), y AS (SELECT 5 AS id) "
+                          "SELECT (SELECT id FROM x), (SELECT id FROM y)")))))))

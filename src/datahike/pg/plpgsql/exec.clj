@@ -80,7 +80,15 @@
   (let [t (get @(:types st) nm)]
     (if (or (nil? v) (nil? t) (not (string? v)))
       v
-      (try (sql-cast/cast-scalar v t {}) (catch Exception _ v)))))
+      ;; NOT `(catch Exception _ v)`. Swallowing the input function's
+      ;; verdict leaves untyped TEXT in a typed variable, and the
+      ;; failure then surfaces as a JVM ClassCastException wherever the
+      ;; value is finally used -- `x int; x := 'abc'; RETURN x + 1`
+      ;; answered `class java.lang.String cannot be cast to class
+      ;; java.lang.Number`. PostgreSQL raises at the ASSIGNMENT, with
+      ;; the type's own error, which is what the comment above means by
+      ;; assigning through the input function.
+      (sql-cast/cast-scalar v t {}))))
 
 (defn- assign! [st nm v]
   (let [nm (str/lower-case nm)

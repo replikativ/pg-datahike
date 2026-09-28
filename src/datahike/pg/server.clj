@@ -7542,6 +7542,7 @@
                 having has-aggregates? has-distinct?
                 in-args hidden-count compound-exprs window-specs
                 sql-order-by sql-limit sql-offset fetch-with-ties?
+                post-window-order-by
                 project-set project-order-by project-limit project-offset
                 enriched-db literal-row literal-rows for-update]} parsed]
     (if (or literal-row literal-rows)
@@ -7775,7 +7776,17 @@
             ;; taken HERE, off the finished rows. It used to be pushed
             ;; unconditionally, so this had nothing to do; not pushing it
             ;; without applying it here would drop the limit altogether.
-            results (if (limit-pushable? query parsed)
+            ;; …and when it could not be pushed down, the limit has to
+            ;; be taken off the finished rows -- but NOT here when a
+            ;; window is still to be computed. PostgreSQL evaluates a
+            ;; window over the whole result and only then trims, so
+            ;; trimming here made `sum(i) OVER () … LIMIT 2` the sum of
+            ;; the two kept rows (10200 where PostgreSQL says 47100).
+            ;; The comment below already said so, but only the
+            ;; `sql-order-by` branch acted on it, so the plain
+            ;; `LIMIT`-with-a-window path kept trimming early.
+            results (if (or (limit-pushable? query parsed)
+                            (seq window-specs))
                       results
                       (cond->> results
                         offset (drop offset)
@@ -7903,11 +7914,22 @@
                     final-aliases (mapv #(nth new-aliases %) visible-indices)]
                 [final-results final-aliases])
               [results find-aliases])
-            ;; The OFFSET/LIMIT deferred past the window pass above.
-            results (if (and (seq window-specs) sql-order-by)
-                      (cond->> results
-                        sql-offset (drop sql-offset)
-                        sql-limit  (take sql-limit))
+            ;; `ORDER BY` a window function's output. The value exists
+            ;; only now, so the whole sort waited for it -- the keys are
+            ;; positions in the row just projected.
+            results (if (seq post-window-order-by)
+                      (sort (null-safe-order-cmp post-window-order-by) results)
+                      results)
+            ;; The OFFSET/LIMIT deferred past the window pass above --
+            ;; whichever pair carries it. A sorted query puts it in
+            ;; `sql-limit`, an unsorted one in `limit`, and honouring
+            ;; only the first left the second trimming too early.
+            results (if (seq window-specs)
+                      (let [o (or sql-offset offset)
+                            l (or sql-limit limit)]
+                        (cond->> results
+                          o (drop o)
+                          l (take l)))
                       results)
             ;; Expressions OVER aggregates: `max(a) - min(a)`,
             ;; `round(avg(x), 2)`, `coalesce(sum(x), 0)`. The translator

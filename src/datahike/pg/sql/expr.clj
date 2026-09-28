@@ -727,9 +727,14 @@
                          ;; to come back in the function's DECLARED type
                          ;; or the caller cannot compute with it:
                          ;; `2 * f(1)` was a ClassCastException.
+                         ;; …and the catch that used to be here restored
+                         ;; exactly the ClassCastException named above:
+                         ;; a body whose text does not fit the declared
+                         ;; return type handed untyped TEXT back to the
+                         ;; caller's expression. PostgreSQL raises the
+                         ;; type's own input error instead.
                          (string? value)
-                         (try (sql-cast/cast-scalar value return-type {})
-                              (catch Exception _ value))
+                         (sql-cast/cast-scalar value return-type {})
                          :else value))))))
         fn-param (symbol (str "?pg-plpgsql" (swap! (:var-counter ctx) inc)))
         result-var (ctx/fresh-var! ctx)]
@@ -3420,7 +3425,15 @@
    and the per-row WHERE-position binding below."
   [parse-fn sql subquery? inner-schema query-db]
   (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))]
-    (strict-scalar-subquery parse-fn run-sql inner-schema query-db {})))
+    ;; The ambient namespaces, not `{}`. A CTE is materialised under a
+    ;; SYNTHETIC namespace and reached through this mapping, and
+    ;; PostgreSQL scopes a CTE to its own level and every level inside
+    ;; it (scanNameSpaceForCTE walks outward). Dropping the mapping here
+    ;; cut that chain at the second nesting: one level deep
+    ;; `(SELECT id FROM y)` resolved, two deep it was `relation "y"
+    ;; does not exist`.
+    (strict-scalar-subquery parse-fn run-sql inner-schema query-db
+                            ctx/*relation-namespaces*)))
 
 (defn- translate-value-comparison-operands
   "Translate comparison operands in value position after applying the
@@ -3910,6 +3923,14 @@
         ;; Normalize timestamp formats to ISO-8601
         normalized (-> trimmed
                        (str/replace #"(\d{4}-\d{2}-\d{2})\s+(\d)" "$1T$2")
+                       ;; `-0800` -> `-08:00`. pg_dump writes a
+                       ;; timestamptz with an hour-only offset and some
+                       ;; sources write the four-digit one; PostgreSQL
+                       ;; reads `-08`, `-0800` and `-08:00` as the same
+                       ;; value. This rule has to run BEFORE the
+                       ;; hour-only ones, which would otherwise see the
+                       ;; last two digits as the whole offset.
+                       (str/replace #"(?<=\d)([+-]\d{2})(\d{2})$" "$1:$2")
                        (str/replace #"\+(\d{2})$" "+$1:00")
                        (str/replace #"(?<=\d)-(\d{2})$" "-$1:00"))]
     (or
@@ -4004,6 +4025,41 @@
                                        "HHmmss[.SSS][.SS][.S]")))
                      (.atStartOfDay date))]
            (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC)))
+         (catch Exception _ nil)))
+     ;; A month NAME in place of a month number. PostgreSQL's datetime
+     ;; input tokenises first and recognises the month wherever it
+     ;; falls, so `Jan 15, 2024`, `January 15, 2024`, `Jan 15 2024`,
+     ;; `15-JAN-2024`, `15 Jan 2024`, `2024-Jan-15` and `Jan-15-2024`
+     ;; all name the same day. Matching that with a list of patterns
+     ;; means missing one of them, so this tokenises the same way:
+     ;; the alphabetic token is the month, the four-digit token the
+     ;; year, and what is left is the day.
+     (when-let [[_ date-part time-part]
+                (re-matches #"(?i)^([a-z0-9,\-/ ]*?[a-z]{3,9}[a-z0-9,\-/ ]*?)(?:\s+(\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?))?$"
+                            trimmed)]
+       (try
+         (let [toks (remove str/blank? (str/split date-part #"[,\-/ ]+"))
+               month (some (fn [t]
+                             (when (re-matches #"(?i)[a-z]{3,9}" t)
+                               (sql-cast/month-name->number t)))
+                           toks)
+               nums  (filter #(re-matches #"\d{1,4}" %) toks)
+               year  (some #(when (= 4 (count %)) (parse-long %)) nums)
+               day   (some #(when (not= 4 (count %)) (parse-long %)) nums)]
+           (when (and month year day)
+             ;; STRICT: `Feb 30, 2024` is out of range, not the 1st of
+             ;; March. SMART -- the default -- would roll it.
+             (let [ld (java.time.LocalDate/of ^int (int year) ^int (int month)
+                                              ^int (int day))
+                   ldt (if time-part
+                         (.atTime ld (java.time.LocalTime/parse time-part))
+                         (.atStartOfDay ld))]
+               (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC)))))
+         ;; `LocalDate/of` throws DateTimeException for an impossible
+         ;; day, and returning nil here hands the caller its
+         ;; passthrough -- so the month-name spelling of an impossible
+         ;; date must fall to the same `bad-timestamp!` the numeric
+         ;; spelling gets, which is what returning nil arranges.
          (catch Exception _ nil)))
      ;; All parsing failed — return raw string
      s)))
@@ -5543,7 +5599,17 @@
                                left-oid
                                output-oid))
                            left-oids output-oids resolution-oids)
-         rows (run-parsed-subquery p db)]
+         ;; The namespaces stay bound for the EXECUTION as well, not
+         ;; just the parse above. A CTE reached from here is
+         ;; materialised under a synthetic namespace, and a subquery
+         ;; nested one level further down runs from a closure invoked
+         ;; HERE -- outside the parse -- so the mapping had already
+         ;; gone and `(SELECT (SELECT id FROM y) FROM x)` answered
+         ;; `relation "y" does not exist` where one level worked.
+         ;; PostgreSQL scopes a CTE to its own level and every level
+         ;; inside it (scanNameSpaceForCTE walks outward).
+         rows (binding [ctx/*relation-namespaces* relation-namespaces]
+                (run-parsed-subquery p db))]
      (if (seq target-oids)
        (mapv #(set-ops/coerce-row % target-oids) rows)
        rows))))
@@ -8026,6 +8092,72 @@
     (some false-sentinel? (rest form))
     :else false))
 
+(defn- predicate-clause?
+  "A Datalog clause that only FILTERS: `[(f a b …)]`, with no output
+   variable to bind."
+  [c]
+  (and (vector? c) (= 1 (count c)) (seq? (first c))))
+
+(defn- disjunct-form
+  "The boolean form a branch of an OR stands for, or nil when the branch
+   is not purely a filter.
+
+   A branch that matches data -- a pattern, a `not-join`, a nested
+   `or-join` -- has to stay a relation. One that only tests already-bound
+   variables is an expression, and can be evaluated as one."
+  [b]
+  (cond
+    (predicate-clause? b) (first b)
+    (and (seq? b) (= 'and (first b)))
+    (let [parts (mapv disjunct-form (rest b))]
+      (when (every? some? parts) (cons 'and parts)))
+    :else nil))
+
+(defn- fused-or-predicate
+  "One predicate clause for an OR whose every branch only tests
+   already-bound variables, in place of an `or-join` over them.
+
+   An `or-join` is a RELATION: each branch is solved on its own and the
+   results are unioned and then joined back. When a branch constrains
+   only some of the shared variables -- which is the normal shape of
+   `WHERE f(a) > x OR g(b) < y`, where each side mentions one of them --
+   the branch does not determine the others, and the join back against
+   the outer rows is quadratic. BIRD 27 (17k x 17k rows) exhausted the
+   heap on exactly that; 2,000 rows already took 130 seconds where
+   PostgreSQL is immediate, and the same query without the OR took one.
+
+   Evaluating the disjunction per row instead is what SQL asks for: the
+   branches bind nothing, so there is no relation to union. Returns nil
+   -- leave the or-join alone -- unless every branch is a pure filter
+   and every variable it reads is already bound HERE, at this point in
+   the clause order."
+  [ctx live-branches]
+  (when-not ctx/*defer-expression-materialization*
+    (when (and (:in-params ctx) (:in-args ctx) (:var-counter ctx))
+      (let [forms (mapv disjunct-form live-branches)]
+        (when (every? some? forms)
+          (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
+                outer-vars  (ctx/collect-vars @(:where-clauses ctx))]
+            ;; Every variable must already be bound: a predicate cannot
+            ;; introduce one, so a branch var the outer clauses have not
+            ;; produced yet would be unresolvable here.
+            (when (and (seq branch-vars)
+                       (every? outer-vars branch-vars))
+              (let [param-vars (vec (sort-by str branch-vars))
+                    fn-param (symbol (str "?or-pred"
+                                          (swap! (:var-counter ctx) inc)))
+                    f (fn [& vals]
+                        (let [bindings (zipmap param-vars vals)]
+                          (boolean
+                           (some (fn [form]
+                                   (let [v (interpret-form form bindings)]
+                                     (and (some? v) (not= :__null__ v)
+                                          (not (false? v)))))
+                                 forms))))]
+                (swap! (:in-params ctx) conj fn-param)
+                (swap! (:in-args ctx) conj f)
+                [(vec (list (apply list fn-param param-vars)))]))))))))
+
 (defn- combine-disjuncts
   "Combine per-branch clause vectors into a single OR clause form.
 
@@ -8076,12 +8208,16 @@
           ;; the post-projection `limit-rel` mismatches across branches.
           ;; Empty intersection → use plain `or`.
           :else
-          (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
-                outer-vars  (ctx/collect-vars @(:where-clauses ctx))
-                shared-vars (vec (sort-by str (set/intersection branch-vars outer-vars)))]
-            [(if (seq shared-vars)
-               (concat ['or-join shared-vars] live-branches)
-               (concat ['or] live-branches))]))))))
+          (or
+           ;; Every branch a pure filter over bound variables -> one
+           ;; predicate, evaluated per row, instead of a relation.
+           (fused-or-predicate ctx live-branches)
+           (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
+                 outer-vars  (ctx/collect-vars @(:where-clauses ctx))
+                 shared-vars (vec (sort-by str (set/intersection branch-vars outer-vars)))]
+             [(if (seq shared-vars)
+                (concat ['or-join shared-vars] live-branches)
+                (concat ['or] live-branches))])))))))
 
 (defn- ground-true?
   "Evaluate a variable-free clause form and say whether it is TRUE.

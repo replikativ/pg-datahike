@@ -596,3 +596,41 @@
                  (if (.next rs)
                    (recur (conj values (.getInt rs 1)))
                    values))))))))
+
+;; ---------------------------------------------------------------------------
+;; Protocol errors that used to arrive as JVM class names
+;; ---------------------------------------------------------------------------
+
+(deftest a-short-bind-is-refused-before-anything-is-decoded
+  ;; PostgreSQL checks the count in exec_bind_message, before it decodes
+  ;; a single parameter. Without that check the missing parameter
+  ;; surfaced from wherever the executor indexed past the end of the
+  ;; bound array -- `SELECT $1, $2` bound with one value answered
+  ;; `IndexOutOfBoundsException` under XX000.
+  (let [conn (java.sql.DriverManager/getConnection *jdbc-url*)]
+    (try
+      ;; pgjdbc sends Parse/Bind/Execute, so a deliberately short bind
+      ;; has to be built by hand -- setString on only the first of two.
+      (with-open [ps (.prepareStatement conn "SELECT ?, ?")]
+        (.setString ps 1 "foo")
+        (let [e (try (.executeQuery ps) nil
+                     (catch java.sql.SQLException ex ex))]
+          (is (some? e) "a short bind must be refused")
+          (is (not (re-find #"IndexOutOfBounds" (str (.getMessage e))))
+              (str "a JVM class name reached the client: " (.getMessage e)))))
+      (finally (.close conn)))))
+
+(deftest a-parameter-number-too-large-is-a-syntax-error
+  ;; A `$N` index is an int and the grammar parses it as one, so
+  ;; `SELECT $2147483648` came back as `java.lang.NumberFormatException:
+  ;; For input string: "2147483648"` -- the JVM's sentence under XX000.
+  ;; PostgreSQL's scanner says so in its own words.
+  (let [^PgWireServer$QueryResult r
+        (.execute *handler* "PREPARE pbig AS SELECT $2147483648")]
+    (is (= "parameter number too large at or near \"$2147483648\""
+           (str (.error r))))
+    (is (= "42601" (.-sqlstate r))))
+  (testing "an ordinary placeholder is untouched"
+    (let [^PgWireServer$QueryResult r
+          (.execute *handler* "PREPARE psmall AS SELECT $1")]
+      (is (nil? (.error r))))))

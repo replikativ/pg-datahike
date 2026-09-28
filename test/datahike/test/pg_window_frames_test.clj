@@ -359,3 +359,62 @@
                              nil
                              (catch java.sql.SQLException e
                                (str (.getSQLState e) " " (.getMessage e))))))))))
+
+;; ============================================================================
+;; ORDER BY and LIMIT relative to the window pass
+;; ============================================================================
+
+(deftest order-by-a-window-function-sorts-after-the-window-pass
+  ;; A window value does not exist until the window pass, which runs
+  ;; ABOVE the sort. ORDER BY resolved the key by indexing the :find
+  ;; list with a SELECT-LIST position -- two lists that only line up
+  ;; when no window function is projected. When they did not, it either
+  ;; sorted by an unrelated column or ran off the end:
+  ;;
+  ;;   ORDER BY rank() OVER w   -> IndexOutOfBoundsException, or silently
+  ;;                               ordered by the window's ORDER BY column
+  ;;   ORDER BY r               -> column "r" does not exist, because the
+  ;;                               window alias is deliberately not in
+  ;;                               find-aliases
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE es (depname text, empno int, salary int)")
+    (exec! c (str "INSERT INTO es VALUES "
+                  "('develop',10,5200),('sales',1,5000),('personnel',5,3500),"
+                  "('sales',4,4800),('personnel',2,3900),('develop',7,4200),"
+                  "('develop',9,4500),('sales',3,4800),('develop',8,6000),"
+                  "('develop',11,5200)"))
+    (testing "the window expression repeated in ORDER BY"
+      (is (= ["1" "1" "1" "1" "2" "2" "3" "3" "3" "5"]
+             (col c 4 (str "SELECT depname, empno, salary, rank() OVER w FROM es "
+                           "WINDOW w AS (PARTITION BY depname ORDER BY salary) "
+                           "ORDER BY rank() OVER w")))))
+    (testing "its output ALIAS, which nothing could resolve before"
+      (is (= ["1" "2" "3" "4" "5" "6" "7" "8" "9" "10"]
+             (col c 2 (str "SELECT empno, ROW_NUMBER() OVER (ORDER BY salary) AS r "
+                           "FROM es ORDER BY r")))))
+    (testing "mixed with an ordinary column, where both keys must sort together"
+      (is (= ["1" "2" "3" "3" "5" "1" "2" "1" "1" "3"]
+             (col c 3 (str "SELECT depname, empno, rank() OVER w AS rk FROM es "
+                           "WINDOW w AS (PARTITION BY depname ORDER BY salary) "
+                           "ORDER BY depname, rk")))))))
+
+(deftest limit-waits-for-the-window-even-without-an-order-by
+  ;; PostgreSQL evaluates a window over the WHOLE result and only then
+  ;; trims. The deferral was already written, but only the sorted branch
+  ;; acted on it, so an unsorted `LIMIT` still trimmed first and the
+  ;; window saw the kept rows alone: `sum(salary) OVER ()` answered
+  ;; 10200 -- the two rows' own sum -- where PostgreSQL says 47100.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE es (empno int, salary int)")
+    (exec! c (str "INSERT INTO es VALUES (10,5200),(1,5000),(5,3500),(4,4800),"
+                  "(2,3900),(7,4200),(9,4500),(3,4800),(8,6000),(11,5200)"))
+    (is (= ["47100" "47100"]
+           (col c 2 "SELECT empno, sum(salary) OVER () FROM es LIMIT 2"))
+        "unsorted")
+    (is (= ["47100" "47100"]
+           (col c 2 "SELECT empno, sum(salary) OVER () FROM es ORDER BY empno LIMIT 2"))
+        "sorted -- the branch that was already right")
+    (testing "OFFSET past the window too"
+      (is (= ["9" "10"]
+             (col c 2 (str "SELECT empno, ROW_NUMBER() OVER (ORDER BY salary) AS r "
+                           "FROM es ORDER BY r OFFSET 8")))))))
