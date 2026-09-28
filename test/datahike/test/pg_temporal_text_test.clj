@@ -411,3 +411,89 @@
     (is (= 1 (count (set (map #(one c (str "SELECT t::text FROM tz WHERE id = " %))
                               [1 2 3]))))
         "one instant, however the offset is spelled")))
+
+(deftest a-nested-cast-refuses-what-the-bare-cast-refuses
+  ;; The constant fold for a cast kept its OWN temporal conversion
+  ;; beside `cast-scalar`'s, and so kept its own idea of failure: the
+  ;; timestamp branch called the bare parser, which returns its INPUT
+  ;; when nothing parses, and the date branch answered nil. A cast
+  ;; reaches that fold only when it is NESTED -- a bare
+  ;; `'nonsense'::timestamp` goes down another path and always raised
+  ;; -- so the two disagreed:
+  ;;
+  ;;   'nonsense'::timestamp         ERROR            (right)
+  ;;   'nonsense'::timestamp::text   'nonsense'       (a value that is
+  ;;                                                   not a timestamp,
+  ;;                                                   rendered as one)
+  ;;   'nonsense'::date::text        NULL
+  (with-open [c (jdbc)]
+    (doseq [sql ["SELECT 'nonsense'::timestamp::text"
+                 "SELECT 'nonsense'::date::text"
+                 "SELECT extract(year from 'nonsense'::timestamp)"]]
+      (is (thrown-with-msg? Exception #"invalid input syntax for type"
+                            (one c sql))
+          sql))
+    (testing "an impossible field is still told from bad syntax"
+      (is (thrown-with-msg?
+           Exception #"date/time field value out of range"
+           (one c "SELECT '2024-02-30'::date::text"))))
+    (testing "and everything that did parse still does"
+      (is (= "2024-01-15 00:00:00" (one c "SELECT '2024-01-15'::timestamp::text")))
+      (is (= "2024-01-15" (one c "SELECT '2024-01-15'::date::text")))
+      (is (= "2024-01-15 10:00:00" (one c "SELECT '2024-01-15 10:00'::timestamp::text")))
+      (is (= "2024-01-15 00:00:00" (one c "SELECT 'Jan 15, 2024'::timestamp::text"))))))
+
+(deftest a-column-cast-refuses-what-a-literal-cast-refuses
+  ;; The RUNTIME cast -- a column, not a literal -- kept its own
+  ;; temporal conversion too, beside the `is-time?` branch next to it
+  ;; that already delegated. Same two failure modes, now per row:
+  ;;
+  ;;   s::timestamp  answered the text `nonsense` for the row that did
+  ;;                 not parse, presenting a non-timestamp as one;
+  ;;   s::date       answered nil, and nil FILTERS THE ROW in a datalog
+  ;;                 function binding -- the row silently vanished from
+  ;;                 the result rather than raising.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tt (id int, s text)")
+    (exec! c "INSERT INTO tt VALUES (1,'2024-01-15'),(2,'nonsense')")
+    (is (thrown-with-msg?
+         Exception #"invalid input syntax for type timestamp"
+         (one c "SELECT id, s::timestamp FROM tt ORDER BY id")))
+    (is (thrown-with-msg?
+         Exception #"invalid input syntax for type date"
+         (one c "SELECT id, s::date FROM tt ORDER BY id")))
+    (testing "the rows that do parse are unaffected"
+      (is (= "2024-01-15" (one c "SELECT s::date::text FROM tt WHERE id = 1")))
+      (is (= "2024-01-15 00:00:00"
+             (one c "SELECT s::timestamp::text FROM tt WHERE id = 1"))))))
+
+(deftest the-mdy-slash-spelling-survives-a-strict-resolver
+  ;; `8/10/7777` is PostgreSQL's MDY DateStyle. The pattern for it was
+  ;; the one `ofPattern` site left on year-of-era `y` when the others
+  ;; were moved to proleptic `uuuu`, and STRICT resolves `y` only with
+  ;; an era field -- so it matched nothing and the cast became an
+  ;; error.
+  ;;
+  ;; pgjdbc's own ResultSetTest.testTimestamp is what caught it, three
+  ;; CI runs after the fact, and only in binary mode: the failed cast
+  ;; left TEXT where a timestamp OID was advertised, and the driver
+  ;; answered `Unsupported binary encoding of timestamp`. Asserting it
+  ;; here means the next one fails in seconds rather than in CI.
+  (with-open [c (jdbc)]
+    (is (= "7777-08-10 00:00:00" (one c "SELECT '8/10/7777'::timestamp::text")))
+    (is (= "2017-08-10 00:00:00" (one c "SELECT '8/10/2017'::timestamp::text")))
+    (is (= "2017-08-10" (one c "SELECT '8/10/2017'::date::text")))
+    (testing "through array_fill/unnest, the shape pgjdbc uses"
+      ;; No ::text around it: `unnest(timestamp[])` is not in the
+      ;; signature registry yet, which is a separate gap. Reading the
+      ;; value is what this test is about.
+      (is (some? (one c (str "SELECT unnest(array_fill('8/10/7777'::timestamp, "
+                             "ARRAY[3]))")))))
+    (testing "and an impossible field in THAT spelling is out of range,
+              not bad syntax -- the shape test knew only dashes"
+      (is (thrown-with-msg?
+           Exception #"date/time field value out of range: \"13/10/2017\""
+           (one c "SELECT '13/10/2017'::timestamp")))
+      (is (thrown-with-msg?
+           Exception #"date/time field value out of range: \"2/30/2017\""
+           (one c "SELECT '2/30/2017'::timestamp"))))))

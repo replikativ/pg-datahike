@@ -441,6 +441,19 @@
          (some month-name->number toks)
          (some #(re-matches #"\d{4}" %) toks))))
 
+(defn- date-ish-shape?
+  "Text written as date FIELDS -- digits and separators, or a month
+   name -- whatever the field order.
+
+   Only for telling 22008 (fields out of range) from 22007 (not a date
+   at all). It must never decide which parser runs: `13/10/2017` and
+   `2/30/2017` are out of RANGE in PostgreSQL, and so is `2024-02-30`,
+   but only the dash spelling is read by the strict y-m-d parser."
+  [^String s]
+  (let [t (str/trim s)]
+    (or (re-matches #"(?i)^\d{1,6}[-/]\d{1,2}[-/]\d{1,4}([ T].*|\s+(ad|bc))?$" t)
+        (month-name-date-shape? t))))
+
 (defn bad-timestamp!
   "The timestamp counterpart of `bad-date!`: PostgreSQL tells a value
    whose date FIELDS are impossible (22008) from text that is not a
@@ -450,8 +463,7 @@
    a timestamp has to refuse exactly what casting one refuses, and by
    the same rule."
   [^String s tz?]
-  (if (or (re-matches #"(?i)^\d{1,6}-\d{1,2}-\d{1,2}([ T].*)?$" (str/trim s))
-          (month-name-date-shape? s))
+  (if (date-ish-shape? s)
     (throw (ex-info (str "date/time field value out of range: \"" s "\"")
                     {:error :datetime-field-overflow :sqlstate "22008"}))
     (throw (ex-info (str "invalid input syntax for type timestamp"
@@ -462,6 +474,12 @@
   "A date written as digits and separators -- the shape PostgreSQL calls
    out of RANGE rather than bad SYNTAX when its fields do not make a
    date."
+  ;; Dashes ONLY, and deliberately. This regex has a second job: it
+  ;; ROUTES to the strict `uuuu-M-d` parser below. Widening it to
+  ;; slashes to improve an error code sent `8/10/2017` to a parser that
+  ;; cannot read slashes, turning a date PostgreSQL accepts into an
+  ;; error. Classification uses `date-ish-shape?`, which is separate
+  ;; for exactly that reason.
   #"(?i)^\d{1,6}-\d{1,2}-\d{1,2}(\s+(ad|bc))?$")
 
 (defn- parse-date-strict
@@ -491,7 +509,7 @@
   "PostgreSQL tells a date whose FIELDS are impossible (22008) from text
    that is not a date at all (22007)."
   [^String s]
-  (if (or (re-matches ymd-shape s) (month-name-date-shape? s))
+  (if (date-ish-shape? s)
     (throw (ex-info (str "date/time field value out of range: \"" s "\"")
                     {:error :datetime-field-overflow :sqlstate "22008"}))
     (throw (ex-info (str "invalid input syntax for type date: \"" s "\"")

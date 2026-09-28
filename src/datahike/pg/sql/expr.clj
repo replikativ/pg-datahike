@@ -3991,7 +3991,14 @@
                           (java.time.LocalDate/parse
                            trimmed
                            (.withResolverStyle
-                            (java.time.format.DateTimeFormatter/ofPattern "M/d/y")
+                            ;; `uuuu`, not `y`. STRICT resolves
+                            ;; year-of-era only with an era field, so
+                            ;; this pattern -- the one site left on `y`
+                            ;; when the others were converted -- stopped
+                            ;; matching anything at all, and
+                            ;; `'8/10/7777'::timestamp` went from a
+                            ;; timestamp to an error.
+                            (java.time.format.DateTimeFormatter/ofPattern "M/d/uuuu")
                             java.time.format.ResolverStyle/STRICT))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
@@ -4320,25 +4327,32 @@
           (sql-cast/cast-scalar inner-raw type-str
                                 {:explicit? true
                                  :parse-timestamp parse-timestamp-string})
-          is-date? (try
-                     (java.time.LocalDate/parse
-                      (str/trim (str inner-raw))
-                      (.withResolverStyle
-                       (java.time.format.DateTimeFormatter/ofPattern "uuuu-M-d")
-                       java.time.format.ResolverStyle/STRICT))
-                     (catch Exception _
-                       (let [d (parse-timestamp-string (str inner-raw))]
-                         (when (instance? java.util.Date d)
-                           (-> ^java.util.Date d .toInstant
-                               (.atZone java.time.ZoneOffset/UTC)
-                               .toLocalDate)))))
+          ;; Delegate, like every other branch of this fold. Keeping a
+          ;; private copy of what `cast-scalar` does meant keeping its
+          ;; own idea of FAILURE too, and this one answered nil -- so a
+          ;; fold of `'nonsense'::date::text` produced NULL where
+          ;; PostgreSQL raises. The bare `'nonsense'::date` was right
+          ;; the whole time; only a cast reaching this fold, which is a
+          ;; NESTED one, took the private path.
+          is-date? (sql-cast/cast-scalar
+                    inner-raw type-str
+                    {:explicit? true
+                     :parse-timestamp parse-timestamp-string})
         ;; ::time — extract the LocalTime so serialization emits only
         ;; "HH:MM:SS[.fff]" and drops any date component the input had.
           is-time? (sql-cast/cast-scalar
                     inner-raw type-str
                     {:explicit? true
                      :parse-timestamp parse-timestamp-string})
-          is-ts?   (parse-timestamp-string (str inner-raw))
+          ;; Not the bare parser: it returns its INPUT when nothing
+          ;; parses, so `'nonsense'::timestamp::text` folded to the
+          ;; text `nonsense` -- a value that is not a timestamp,
+          ;; rendered as though it were one. `cast-scalar` raises with
+          ;; the type's own message.
+          is-ts?   (sql-cast/cast-scalar
+                    inner-raw type-str
+                    {:explicit? true
+                     :parse-timestamp parse-timestamp-string})
           is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200
@@ -4362,35 +4376,20 @@
           (cond
             is-date?
             (let [fn-param (symbol (str "?cast-date" (swap! (:var-counter ctx) inc)))
+                  ;; Delegate, as the `is-time?` branch beside this one
+                  ;; already does. The private copy here knew the
+                  ;; non-string shapes -- a stored instant must not
+                  ;; round-trip through `str` (issue #13) -- but
+                  ;; `cast-scalar` knows them too, and it also knows
+                  ;; what FAILURE means. This answered nil for text
+                  ;; that is not a date, and nil FILTERS THE ROW: a
+                  ;; column cast `s::date` silently dropped every row
+                  ;; whose value did not parse, instead of raising.
                   date-fn (fn [v]
-                            (when v
-                              ;; Temporal instances (now()/current_timestamp
-                              ;; bindings, stored instants) must not round-trip
-                              ;; through `str` — `(str Date)` is RFC-822ish and
-                              ;; unparseable, which dropped the row (issue #13).
-                              (cond
-                                (instance? java.util.Date v)
-                                (-> ^java.util.Date v .toInstant
-                                    (.atZone java.time.ZoneOffset/UTC) .toLocalDate)
-                                (instance? java.time.Instant v)
-                                (-> ^java.time.Instant v
-                                    (.atZone java.time.ZoneOffset/UTC) .toLocalDate)
-                                (instance? java.time.LocalDate v) v
-                                (instance? java.time.LocalDateTime v)
-                                (.toLocalDate ^java.time.LocalDateTime v)
-                                :else
-                                (let [s (str/trim (str v))]
-                                  (or (try (java.time.LocalDate/parse
-                                            s
-                                            (.withResolverStyle
-                                             (java.time.format.DateTimeFormatter/ofPattern "uuuu-M-d")
-                                             java.time.format.ResolverStyle/STRICT))
-                                           (catch Exception _ nil))
-                                      (when-let [d (parse-timestamp-string s)]
-                                        (when (instance? java.util.Date d)
-                                          (-> ^java.util.Date d .toInstant
-                                              (.atZone java.time.ZoneOffset/UTC)
-                                              .toLocalDate))))))))]
+                            (sql-cast/cast-scalar
+                             v type-str
+                             {:explicit? true
+                              :parse-timestamp parse-timestamp-string}))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj (null-preserving date-fn))
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
@@ -4409,16 +4408,17 @@
             is-ts?
           ;; Timestamp cast: use an in-param function for runtime parsing
             (let [ts-fn-param (symbol (str "?cast-ts" (swap! (:var-counter ctx) inc)))
+                  ;; `cast-scalar`, not the bare parser: the parser
+                  ;; returns its INPUT when nothing parses, so a column
+                  ;; cast `s::timestamp` answered the text `nonsense`
+                  ;; -- a value that is not a timestamp, presented as
+                  ;; one -- where PostgreSQL raises.
                   ts-fn (fn [v]
                           (when v
-                            (cond
-                              (instance? java.util.Date v) v
-                              (instance? java.time.LocalDateTime v) v
-                              (instance? java.time.Instant v)
-                              (java.util.Date/from ^java.time.Instant v)
-                              (instance? java.time.LocalDate v)
-                              (.atStartOfDay ^java.time.LocalDate v)
-                              :else (parse-timestamp-string (str v)))))]
+                            (sql-cast/cast-scalar
+                             v type-str
+                             {:explicit? true
+                              :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj ts-fn-param)
               (swap! (:in-args ctx) conj (null-preserving ts-fn))
               (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
