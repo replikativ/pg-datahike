@@ -1098,6 +1098,17 @@
               :drop-function-sql
               (assoc base :type :ddl-drop-function)
 
+              ;; Materialized views: the classifier carries the view's
+              ;; name and the SOURCE of its query, which the executor
+              ;; runs through CREATE TABLE AS / INSERT … SELECT.
+              ;; CREATE TABLE … (LIKE src): the executor needs the
+              ;; source text and the spans the LIKE elements occupy.
+              :create-table-like (assoc base :type :ddl-create-table-like)
+
+              :create-matview  (assoc base :type :ddl-create-matview)
+              :refresh-matview (assoc base :type :ddl-refresh-matview)
+              :drop-matview    (assoc base :type :ddl-drop-matview)
+
               :create-trigger-plpgsql
               (assoc base :type :ddl-create-trigger)
 

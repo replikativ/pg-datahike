@@ -1390,7 +1390,16 @@
            ["pg_table_size" "v" 1 20 "26"]])
     "pg_class"
     (into
-     (mapv (fn [t]
+     ;; A materialized view's rows live in an ordinary table, so it is
+     ;; in table-names like any other -- but it is relkind 'm', which
+     ;; is how psql's \\dm and every tool that distinguishes the two
+     ;; tell them apart.
+     (let [matviews (into #{}
+                          (map first)
+                          (d/q '{:find [?n]
+                                 :where [[?e :datahike.pg.matview/name ?n]]}
+                               cte-db))]
+      (mapv (fn [t]
              (let [tbl-oid (or (pgs/table-oid cte-db t)
                                (Math/abs (.hashCode ^String t)))
                    row-type (catalog-objects/object-by-identity
@@ -1399,12 +1408,12 @@
                {:pg_class/oid (long tbl-oid)
                 :pg_class/relname t
                 :pg_class/relnamespace 2200
-                :pg_class/relkind "r"
+                :pg_class/relkind (if (contains? matviews t) "m" "r")
                 :pg_class/reltype
                 (long (if (= :row-type (:datahike.pg.object/kind row-type))
                         (:datahike.pg.object/oid row-type) 0))
                 (pgs/row-marker-attr "pg_class") true}))
-           (pgs/table-names user-schema))
+           (pgs/table-names user-schema)))
      ;; Composite types get a distinct backing pg_class row (relkind 'c');
      ;; pg_type.typrelid and pg_class.reltype link the two identities.
      (into
@@ -2209,6 +2218,12 @@
     :create-role-object :drop-role-object :privilege-noop
     ;; CREATE / DROP TRIGGER -- JSqlParser cannot parse either.
     :create-trigger-plpgsql :drop-trigger-plpgsql
+    ;; CREATE / REFRESH / DROP MATERIALIZED VIEW -- likewise unparsed by
+    ;; JSqlParser; the classifier slices the view's query from the source.
+    :create-matview :refresh-matview :drop-matview
+    ;; CREATE TABLE … (LIKE src) -- JSqlParser's CREATE TABLE grammar has
+    ;; no place for a LIKE element, so the statement is expanded first.
+    :create-table-like
     ;; TRUNCATE (whole statement — JSqlParser's Truncate grammar lacks
     ;; RESTART/CONTINUE IDENTITY) and multi-name DROP TABLE (JSqlParser
     ;; 5.2 parses a single name only). Both re-tagged to non-:system

@@ -621,7 +621,8 @@
 ;; Sequence DDL is classified in full further down (it needs
 ;; read-relation-name, which is defined after this dispatch).
 (declare classify-create-sequence classify-alter-sequence classify-create-function
-         classify-create-trigger classify-role-statement)
+         classify-create-trigger classify-role-statement classify-create-matview
+         classify-refresh-matview classify-drop-matview classify-create-table)
 
 (defn- classify-create [toks]
   ;; toks starts after CREATE. Skip qualifiers (OR REPLACE, UNIQUE,
@@ -649,7 +650,7 @@
       ;; Ordinary indexes remain compatibility no-ops; extension-backed types
       ;; such as vector must reject until their index semantics are real.
       (kw=? t1 "index")     {:kind :generic-sql}
-      (kw=? t1 "table")     {:kind :generic-sql}
+      (kw=? t1 "table")     (classify-create-table (rest toks))
       (kw=? t1 "sequence")  (classify-create-sequence (rest toks))
 
       ;; CREATE TYPE — only AS ENUM is supported as a first-class
@@ -702,8 +703,7 @@
       (kw=? t1 "aggregate")
       {:kind :create-aggregate :reject-kind :aggregate :tag "CREATE AGGREGATE"}
       (and (kw=? t1 "materialized") (kw=? (second toks) "view"))
-      {:kind :create-materialized-view :reject-kind :materialized-view
-       :tag "CREATE MATERIALIZED VIEW"}
+      (classify-create-matview (drop 2 toks))
       (kw=? t1 "rule")
       {:kind :create-rule :reject-kind :rule :tag "CREATE RULE"}
       (kw=? t1 "operator")
@@ -1108,6 +1108,179 @@
              :tag (if (= op :create) "CREATE ROLE" (str "DROP " keyword))}))
         reject)))
 
+(def ^:private like-include-supported
+  "The INCLUDING options a copied column definition can actually carry.
+   DEFAULTS is the only one beyond the default set (names, types and
+   NOT NULL); the others -- CONSTRAINTS, INDEXES, IDENTITY, GENERATED,
+   STORAGE, COMMENTS, STATISTICS, COMPRESSION, ALL -- name things that
+   would have to be modelled separately, and copying none of them while
+   saying the statement succeeded is the failure mode worth avoiding."
+  #{"defaults"})
+
+(defn- read-like-element
+  "One `LIKE source [INCLUDING|EXCLUDING option …]` from a CREATE TABLE
+   body. Returns {:source-table … :defaults? …} or nil when the element
+   is an ordinary column or constraint, and :unsupported when it asks
+   for an option that cannot be honoured."
+  [elem]
+  (when (kw=? (first elem) "like")
+    (if-let [[nm rest-ts] (read-relation-name (rest elem))]
+      (loop [ts rest-ts, defaults? false]
+        (cond
+          (empty? ts) {:source-table nm :defaults? defaults?}
+          (and (kw=? (first ts) "including")
+               (contains? like-include-supported
+                          (some-> (second ts) :text str/lower-case)))
+          (recur (drop 2 ts) true)
+          ;; EXCLUDING restates a default; it removes nothing that was
+          ;; going to be copied anyway.
+          (and (kw=? (first ts) "excluding") (ident-tok? (second ts)))
+          (recur (drop 2 ts) defaults?)
+          :else :unsupported))
+      :unsupported)))
+
+(defn- create-table-like-elements
+  "The `LIKE …` elements of a CREATE TABLE body, each with the source
+   span it occupies, or nil when there are none.
+
+   The whole statement is re-tokenized here rather than read from the
+   bounded prefix the dispatch works on: a LIKE element can sit after
+   any number of ordinary columns, and a body has no length limit. The
+   cost is paid only by a CREATE TABLE whose text contains the word
+   `like` at all."
+  []
+  (let [toks (vec (remove #(= :comment (:type %)) (tokenize-all *source*)))
+        open (loop [i 0]
+               (cond
+                 (>= i (count toks)) nil
+                 ;; `CREATE TABLE t AS SELECT (…)` -- the paren belongs
+                 ;; to the query, not to a column list.
+                 (kw=? (nth toks i) "as") nil
+                 (= "(" (:text (nth toks i))) i
+                 :else (recur (inc i))))]
+    (when open
+      (loop [i (inc open), depth 1, elem [], out []]
+        (if (>= i (count toks))
+          (seq (keep identity out))
+          (let [t (nth toks i)
+                txt (:text t)]
+            (cond
+              (and (= 1 depth) (or (= ")" txt) (= "," txt)))
+              (let [parsed (when (seq elem) (read-like-element elem))
+                    out (cond-> out
+                          parsed (conj (if (= :unsupported parsed)
+                                         :unsupported
+                                         (assoc parsed
+                                                :start (:pos (first elem))
+                                                :end (:end (last elem))))))]
+                (if (= ")" txt)
+                  (seq (keep identity out))
+                  (recur (inc i) depth [] out)))
+
+              (= "(" txt) (recur (inc i) (inc depth) (conj elem t) out)
+              (= ")" txt) (recur (inc i) (dec depth) (conj elem t) out)
+              :else       (recur (inc i) depth (conj elem t) out))))))))
+
+(defn- classify-create-table
+  "CREATE TABLE is JSqlParser's, with one exception: a `LIKE source`
+   element, which JSqlParser's grammar has no place for. Those are
+   classified here so the executor can replace each one with the source
+   table's column definitions and hand the result back to the ordinary
+   CREATE TABLE path -- so a copied column is defined by exactly the
+   same code as a written-out one."
+  [toks]
+  (if-not (re-find #"(?i)\blike\b" *source*)
+    {:kind :generic-sql}
+    (let [elems (create-table-like-elements)]
+      (cond
+        (empty? elems) {:kind :generic-sql}
+        ;; An option that cannot be honoured stays with JSqlParser,
+        ;; which refuses the statement -- better than a table that
+        ;; quietly lacks the constraints it was told to copy.
+        (some #(= :unsupported %) elems) {:kind :generic-sql}
+        :else {:kind :create-table-like :like-elems (vec elems)}))))
+
+(defn- classify-create-matview
+  "`CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(cols)] AS <query>
+   [WITH [NO] DATA]`.
+
+   A materialized view is a table whose contents are a query's result
+   at the moment the query was last run, so what the statement has to
+   carry is the query's SOURCE: the executor runs it to fill the view,
+   and REFRESH runs it again. `USING <method>` and `TABLESPACE` before
+   the AS describe physical storage and keep the reject -- there is
+   nothing here to store them against.
+
+   The query is sliced from the source rather than re-printed from
+   tokens, because the token stream handed to this classifier is only
+   a bounded prefix and a view body has no length limit."
+  [toks]
+  (let [reject {:kind :create-materialized-view :reject-kind :materialized-view
+                :tag "CREATE MATERIALIZED VIEW"}
+        ine? (and (kw=? (first toks) "if") (kw=? (second toks) "not")
+                  (kw=? (nth toks 2 nil) "exists"))
+        ts (if ine? (drop 3 toks) toks)]
+    (or (when-let [[nm after-name] (read-relation-name ts)]
+          (let [[cols after-cols] (if (= "(" (:text (first after-name)))
+                                    (let [[inner rest-ts] (read-balanced after-name)]
+                                      [(mapv ident-text
+                                             (remove #(= "," (:text %)) inner))
+                                       rest-ts])
+                                    [nil after-name])
+                pre-as (take-while #(not (kw=? % "as")) after-cols)]
+            (when (and (kw=? (first (drop (count pre-as) after-cols)) "as")
+                       (not-any? #(or (kw=? % "using") (kw=? % "tablespace")
+                                      (kw=? % "with"))
+                                 pre-as))
+              (when-let [q-start (second (drop (count pre-as) after-cols))]
+                (let [tail (str/trim (subs *source* (:pos q-start)))
+                      tail (str/replace tail #";\s*$" "")
+                      m (re-find #"(?is)\Wwith\s+(no\s+)?data\s*$" tail)
+                      query (str/trim (if m (subs tail 0 (- (count tail) (dec (count (first m))))) tail))]
+                  (when (seq query)
+                    {:kind :create-matview
+                     :matview-name nm
+                     :columns cols
+                     :if-not-exists? (boolean ine?)
+                     :with-data? (not (and m (second m)))
+                     :query query}))))))
+        reject)))
+
+(defn- classify-refresh-matview
+  "`REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`.
+
+   CONCURRENTLY is about locking -- it lets readers see the old
+   contents while the new ones are built -- and this server refreshes
+   inside one transaction either way, so the word is accepted and has
+   no separate behaviour to model."
+  [toks]
+  (let [reject {:kind :refresh-materialized-view :reject-kind :materialized-view
+                :tag "REFRESH MATERIALIZED VIEW"}]
+    (or (when (and (kw=? (first toks) "materialized") (kw=? (second toks) "view"))
+          (let [ts (drop 2 toks)
+                ts (if (kw=? (first ts) "concurrently") (rest ts) ts)]
+            (when-let [[nm rest-ts] (read-relation-name ts)]
+              (let [all (vec rest-ts)
+                    with-data? (not (and (kw=? (first all) "with")
+                                         (kw=? (second all) "no")))]
+                {:kind :refresh-matview :matview-name nm :with-data? with-data?}))))
+        reject)))
+
+(defn- classify-drop-matview
+  "`DROP MATERIALIZED VIEW [IF EXISTS] name [, …] [CASCADE|RESTRICT]`."
+  [toks]
+  (let [reject {:kind :drop-materialized-view :reject-kind :materialized-view
+                :tag "DROP MATERIALIZED VIEW"}
+        ie? (and (kw=? (first toks) "if") (kw=? (second toks) "exists"))
+        ts (if ie? (drop 2 toks) toks)]
+    (or (when-let [[names rest-ts] (read-relation-list ts)]
+          (let [tail (drop-while #(or (= ";" (:text %))
+                                      (kw=? % "cascade") (kw=? % "restrict"))
+                                 rest-ts)]
+            (when (empty? tail)
+              {:kind :drop-matview :matviews names :if-exists? (boolean ie?)})))
+        reject)))
+
 (defn- classify-create-trigger
   "CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} event [OR event …]
    ON table [FOR [EACH] {ROW|STATEMENT}] [WHEN (condition)]
@@ -1345,8 +1518,7 @@
       (kw=? t1 "procedure")  {:kind :drop-procedure :reject-kind :procedure :tag "DROP PROCEDURE"}
       (kw=? t1 "aggregate")  {:kind :drop-aggregate :reject-kind :aggregate :tag "DROP AGGREGATE"}
       (and (kw=? t1 "materialized") (kw=? (second toks) "view"))
-      {:kind :drop-materialized-view :reject-kind :materialized-view
-       :tag "DROP MATERIALIZED VIEW"}
+      (classify-drop-matview (drop 2 toks))
       (kw=? t1 "rule")       {:kind :drop-rule :reject-kind :rule :tag "DROP RULE"}
       (kw=? t1 "operator")   {:kind :drop-operator :reject-kind :operator :tag "DROP OPERATOR"}
       (kw=? t1 "cast")       {:kind :drop-cast :reject-kind :cast :tag "DROP CAST"}
@@ -1810,6 +1982,7 @@
 
           ;; --- DDL routed by second keyword
             "create"  (classify-create rest-toks)
+            "refresh" (classify-refresh-matview rest-toks)
           ;; classify-drop walks a comma-separated name list of
           ;; unbounded length (DROP TABLE a, b, …) — feed it the full
           ;; lazy token stream, not the 64-token prefix, so a long list

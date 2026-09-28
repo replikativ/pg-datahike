@@ -740,6 +740,16 @@
    "bit" "bit" "varbit" "varbit" "bit varying" "varbit"
    "uuid" "uuid" "date" "date" "time" "time"
    "timestamp" "timestamp" "timestamptz" "timestamptz"
+   ;; The SQL-standard spellings. Without them a column declared
+   ;; `timestamp with time zone` resolved to no known name and fell
+   ;; through to text -- so its OID said 25, `\\d` printed `text`, and
+   ;; the declared type was gone. The short spellings alone were
+   ;; enough to hide it: `timestamptz` worked in the same table.
+   "timestamp without time zone" "timestamp"
+   "timestamp with time zone" "timestamptz"
+   "time without time zone" "time"
+   "time with time zone" "timetz" "timetz" "timetz"
+   "interval" "interval" "money" "money"
    "json" "json" "jsonb" "jsonb" "bytea" "bytea" "oid" "oid"})
 
 (defn field-type->oid

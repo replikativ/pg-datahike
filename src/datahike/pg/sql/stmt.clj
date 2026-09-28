@@ -3108,6 +3108,23 @@
    which are skipped during WITH-fold."
   #{})
 
+(defn- reject-unpopulated-matview!
+  "A materialized view created WITH NO DATA holds no rows and cannot be
+   read: PostgreSQL refuses the scan (55000) rather than answering with
+   an empty result, so \"never refreshed\" can never be mistaken for
+   \"refreshed and empty\"."
+  [db name]
+  (when (and db name)
+    (when (false? (d/q '{:find [?p .] :in [$ ?n]
+                         :where [[?e :datahike.pg.matview/name ?n]
+                                 [?e :datahike.pg.matview/populated? ?p]]}
+                       db name))
+      (throw (ex-info (str "materialized view \"" name
+                           "\" has not been populated")
+                      {:error :object-not-in-prerequisite-state
+                       :sqlstate "55000"
+                       :hint "Use the REFRESH MATERIALIZED VIEW command."})))))
+
 (defn- relation-known?
   "True when `tname` names something a query can scan: a user table / CTE
    / derived table whose columns live in `schema` (any attribute in that
@@ -3759,6 +3776,7 @@
                             {:error :undefined-table
                              :sqlstate "42P01"
                              :table name})))
+        _ (when (instance? Table from-item) (reject-unpopulated-matview! db name))
 
         ;; Build table aliases: {alias → real-table-name}
         ;; For self-joins, the alias is the key; for regular usage, table name is the key too.
