@@ -1180,19 +1180,31 @@
         (or (get types/oid->pg-name (:oid col)) (pg-type-name (:valuetype col)))
         "YES" nil]))))
 
+(defn registered-columns
+  "The persisted catalog columns of `table-name` in attnum order, or nil
+   when the table has none.
+
+   An INHERITS child's list holds its ANCESTORS' columns as well as its
+   own -- that is how a child gets PostgreSQL's column order, inherited
+   first -- and each entry's `:datahike.pg.column/storage-ident` names
+   the attribute the values actually live under, which for an inherited
+   column belongs to the ancestor's namespace."
+  [db table-name]
+  (when db
+    (when-let [relation (catalog-objects/object-by-identity
+                         db catalog-objects/pg-class-oid
+                         catalog-objects/public-namespace-oid table-name)]
+      (seq (catalog-objects/columns-by-relation
+            db (:datahike.pg.object/oid relation) true)))))
+
 (defn column-order-from-db
   "Return columns in durable PostgreSQL attnum order. Databases without
    persisted attnums fall back to schema entity order (the historical CREATE
    TABLE ordering convention)."
   [db table-name]
   (if db
-    (let [registered
-          (when-let [relation (catalog-objects/object-by-identity
-                               db catalog-objects/pg-class-oid
-                               catalog-objects/public-namespace-oid table-name)]
-            (mapv :datahike.pg.column/name
-                  (catalog-objects/columns-by-relation
-                   db (:datahike.pg.object/oid relation) true)))]
+    (let [registered (mapv :datahike.pg.column/name
+                           (registered-columns db table-name))]
       (if (seq registered)
         registered
         (let [results (d/q '{:find [?e ?ident]
@@ -1231,10 +1243,31 @@
              ;; collapsing the table to db_id only — which would cause
              ;; COUNT(*) under as-of to emit a `:find` containing the
              ;; entity var with no `:where` binding it.
-             ordered (if-let [col-order (when db (seq (column-order-from-db db table-name)))]
+             ;; An inherited column is not among the child's own
+             ;; attributes -- its values live under the ancestor's
+             ;; namespace -- so matching the catalog's order against the
+             ;; child's own columns alone DROPPED it. `SELECT *` on a
+             ;; child then answered without the columns it inherited,
+             ;; while `SELECT aa` on the same table returned them and
+             ;; `\\d` listed them: a silently short row. The catalog
+             ;; entry names the storage attribute, so an entry the child
+             ;; does not own is resolved through that instead.
+             by-ident (delay (into {}
+                                   (for [[_ t] tables, c (:columns t)]
+                                     [(:attr c) c])))
+             ordered (if-let [regs (when db (registered-columns db table-name))]
                        (let [col-map (into {} (map (juxt :name identity)) columns)]
-                         (vec (keep col-map col-order)))
-                       columns)]
+                         (vec (keep (fn [reg]
+                                      (let [nm (:datahike.pg.column/name reg)]
+                                        (or (get col-map nm)
+                                            (some-> (get @by-ident
+                                                         (:datahike.pg.column/storage-ident reg))
+                                                    (assoc :name nm)))))
+                                    regs)))
+                       (if-let [col-order (when db (seq (column-order-from-db db table-name)))]
+                         (let [col-map (into {} (map (juxt :name identity)) columns)]
+                           (vec (keep col-map col-order)))
+                         columns))]
          (into [{:name "db_id" :attr :db/id :oid types/oid-int8
                  :valuetype :db.type/long :cardinality :db.cardinality/one
                  :ref? false :indexed? true}]

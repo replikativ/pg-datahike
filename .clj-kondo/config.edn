@@ -8,7 +8,8 @@
   datahike.test.pg-roles-test/with-h clojure.core/with-open
   datahike.test.pg-inheritance-only-test/with-h clojure.core/with-open
   datahike.test.pg-matview-test/with-h clojure.core/with-open
-  datahike.test.pg-create-table-like-test/with-h clojure.core/with-open}
+  datahike.test.pg-create-table-like-test/with-h clojure.core/with-open
+  datahike.test.pg-inheritance-star-test/with-h clojure.core/with-open}
 
  :config-in-ns
  {;; Integration-test fixtures intentionally use `defn ^:private` + unused

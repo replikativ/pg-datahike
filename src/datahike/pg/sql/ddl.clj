@@ -657,6 +657,18 @@
                                (let [cn (params/unquote-ident (.getColumnName col))]
                                  (when-not (skip-col? cn) cn)))
                              columns))
+        ;; PostgreSQL rejects a repeated column name outright. Without
+        ;; this the duplicate reached the schema transaction and came
+        ;; back as datahike's own unique-constraint message, naming an
+        ;; internal attribute and a datom -- an error the caller cannot
+        ;; act on, for a mistake in their own statement. It matters
+        ;; more now that `LIKE` can introduce the duplicate.
+        _ (when-let [dup (->> col-names frequencies
+                              (keep (fn [[n c]] (when (> c 1) n)))
+                              first)]
+            (throw (ex-info (str "column \"" dup "\" specified more than once")
+                            {:error :duplicate-column :sqlstate "42701"
+                             :column dup})))
         column-types
         (into {}
               (keep (fn [^ColumnDefinition col]
