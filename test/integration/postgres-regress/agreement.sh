@@ -63,13 +63,25 @@ done
 rm -f "$STAMP"
 echo >&2
 
+# Say it BEFORE measuring, and again after, but measure either way: the
+# run costs an hour and a half, and throwing that away over one file
+# that timed out helps nobody. What must not happen is measuring the
+# missing file from an earlier run's leftovers, and it no longer can --
+# it is simply absent from the collected outputs.
 if [ -n "$MISSING" ]; then
   echo "NO OUTPUT from:$MISSING" >&2
-  echo "These files produced no result this run, so they cannot be" >&2
-  echo "measured. Check the newest .internal/pg-regress/*/bootstrap.log." >&2
-  exit 1
+  echo "Those files produced no result this run. They are NOT measured" >&2
+  echo "below. Check the newest .internal/pg-regress/*/bootstrap.log." >&2
 fi
 
 clojure -M -e "
 (load-file \"test/integration/postgres-regress/agreement.clj\")
 (agreement/-main \"$MODE\" \"$COLLECTED\")"
+STATUS=$?
+
+if [ -n "$MISSING" ]; then
+  echo >&2
+  echo "REMINDER -- no output this run from:$MISSING" >&2
+  exit 1
+fi
+exit "$STATUS"
