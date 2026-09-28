@@ -170,3 +170,32 @@
     (let [r (exec h "CREATE TABLE d (dd text) INHERITS (a, nosuch)")]
       (is (= "relation \"nosuch\" does not exist" (err r)))
       (is (= "42P01" (.sqlstate r))))))
+
+(deftest copy-into-an-inheriting-table
+  ;; PostgreSQL's own test_setup does exactly this: `person` holds
+  ;; name/age/location, `emp` inherits it and adds salary/manager, and
+  ;; a five-field COPY fills all of them.
+  ;;
+  ;; Two things had to be true and were not. A column list that
+  ;; includes the inherited columns has to resolve each to the
+  ;; attribute the values live under -- `(keyword \"emp\" \"name\")`
+  ;; names nothing, because `name` belongs to person -- and a copied
+  ;; row has to carry every ancestor's marker, the way an inserted one
+  ;; does, or the parent cannot see it.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE person (name text, age int4, location point)")
+    (ok! h "CREATE TABLE emp (salary int4, manager name) INHERITS (person)")
+    (ok! h "COPY person FROM STDIN")
+    (.copyChunk ^PgWireServer$QueryHandler (:handler h)
+                (.getBytes "mike\t40\t(1,2)\n"))
+    (.copyComplete ^PgWireServer$QueryHandler (:handler h))
+    (ok! h "COPY emp FROM STDIN")
+    (.copyChunk ^PgWireServer$QueryHandler (:handler h)
+                (.getBytes "sharon\t25\t(15,12)\t1000\tsam\n"))
+    (.copyComplete ^PgWireServer$QueryHandler (:handler h))
+    (is (= [["sharon" "25" "(15,12)" "1000" "sam"]]
+           (rows (ok! h "SELECT * FROM emp"))))
+    (testing "and person sees both rows, ONLY person only its own"
+      (is (= [["mike"] ["sharon"]]
+             (rows (ok! h "SELECT name FROM person ORDER BY name"))))
+      (is (= [["mike"]] (rows (ok! h "SELECT name FROM ONLY person")))))))

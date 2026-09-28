@@ -55,33 +55,32 @@ for table_and_file in \
     --command="\\copy ${table} FROM STDIN" < "${data_file}"
 done
 
-# test_setup's inheritance DDL is accepted only as a declared-column subset.
-# Preserve the useful scalar fixtures without pretending inherited columns are
-# implemented: load each child table's own columns from the corresponding
-# upstream rows. road cannot be created until PostgreSQL path is supported.
-"${psql}" -X -v ON_ERROR_STOP=1 \
-  --host="${target_host}" \
-  --port="${target_port}" \
-  --username="${target_user}" \
-  --dbname="${target_db}" \
-  --command="\\copy person FROM STDIN" < "${person_file}"
+# The inheritance fixtures, loaded the way test_setup loads them: whole
+# rows, inherited columns included. These used to be awk-ed down to each
+# child's OWN columns, because a child's inherited columns were invisible
+# and a full row would have been rejected -- so the fixture agreed with
+# the bug rather than with PostgreSQL, and `person` never saw the rows
+# its descendants held. road still cannot be created (PostgreSQL `path`).
+for table_and_file in \
+  "person|${person_file}" \
+  "emp|${emp_file}" \
+  "student|${student_file}" \
+  "stud_emp|${stud_emp_file}"; do
+  table="${table_and_file%%|*}"
+  data_file="${table_and_file#*|}"
+  "${psql}" -X -v ON_ERROR_STOP=1 \
+    --host="${target_host}" \
+    --port="${target_port}" \
+    --username="${target_user}" \
+    --dbname="${target_db}" \
+    --command="\\copy ${table} FROM STDIN" < "${data_file}"
+done
 
-awk -F '\t' 'BEGIN {OFS=FS} {print $4, $5}' "${emp_file}" \
-  | "${psql}" -X -v ON_ERROR_STOP=1 \
-    --host="${target_host}" --port="${target_port}" --username="${target_user}" \
-    --dbname="${target_db}" --command="\\copy emp FROM STDIN"
-
-awk -F '\t' '{print $4}' "${student_file}" \
-  | "${psql}" -X -v ON_ERROR_STOP=1 \
-    --host="${target_host}" --port="${target_port}" --username="${target_user}" \
-    --dbname="${target_db}" --command="\\copy student FROM STDIN"
-
-awk -F '\t' '{print $7}' "${stud_emp_file}" \
-  | "${psql}" -X -v ON_ERROR_STOP=1 \
-    --host="${target_host}" --port="${target_port}" --username="${target_user}" \
-    --dbname="${target_db}" --command="\\copy stud_emp FROM STDIN"
-
-expected_counts="1000|1000|10000|10000|50|3|2|3"
+# person/emp/student/stud_emp count 58|6|5|3, not 50|3|2|3: a query on a
+# table includes its descendants' rows, so person holds its own 50 plus
+# the 6 its children loaded, and emp and student each hold stud_emp's 3.
+# These are real PostgreSQL 17's counts for the same four files.
+expected_counts="1000|1000|10000|10000|58|6|5|3"
 actual_counts="$("${psql}" -X -v ON_ERROR_STOP=1 --tuples-only --no-align \
   --field-separator='|' \
   --host="${target_host}" --port="${target_port}" --username="${target_user}" \

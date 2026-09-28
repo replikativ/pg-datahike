@@ -11337,6 +11337,19 @@
                                    (= ns (namespace ident))))
                             (keys current-schema))
         available-columns (columns-from-schema current-schema ns db-now)
+        ;; An INHERITED column's values live under the ANCESTOR's
+        ;; attribute, so `(keyword ns column)` names nothing: `COPY emp`
+        ;; (which inherits name/age/location from person) failed on its
+        ;; first field. The column list already knows the attribute --
+        ;; carry it rather than rebuilding the name.
+        column-attrs (into {}
+                           (map (juxt :name :attr))
+                           (pgs/column-info current-schema ns db-now))
+        ;; A row belongs to every ancestor as well as to the table it was
+        ;; copied into -- that is how the parent sees it. INSERT has
+        ;; always set those markers; COPY set only its own.
+        ancestor-markers (mapv pgs/row-marker-attr
+                               (sql-ctx/inheritance-ancestors db-now ns))
         col-names (or columns available-columns)
         unknown-columns (seq (remove (set available-columns) col-names))]
     (when-not table-exists?
@@ -11380,9 +11393,11 @@
                  :decode-step-fn  step-fn
                  :decode-finalize-fn finalize-fn
                  :columns         col-names
+                 :column-attrs    column-attrs
                  :ns              ns
                  :table           table
                  :row-marker      (pgs/row-marker-attr table)
+                 :ancestor-markers ancestor-markers
                  :tempid-prefix   (str "copy-" (java.util.UUID/randomUUID) "-row-")
                  :catalog-basis   (catalog-basis/capture db-now)
                ;; A transaction may have its own speculative DDL, so retain a
@@ -11478,7 +11493,9 @@
         copy-db (:speculative-db @copy-state)
         schema (stmt/enrich-schema-with-pg-array-meta
                 (or (:schema copy-db) schema) copy-db)
-        {:keys [columns ns row-marker batch-size tempid-prefix]} @copy-state]
+        {:keys [columns column-attrs ns row-marker ancestor-markers
+                batch-size tempid-prefix]} @copy-state
+        attr-of (fn [column] (or (get column-attrs column) (keyword ns column)))]
     (doseq [row rows]
       (when-not (:error @copy-state)
         (try
@@ -11501,7 +11518,7 @@
                 ;; earlier coercion error or sequence reservation in the row.
                 _ (doseq [[column raw] (map vector columns row)
                           :when (copy/default-sentinel? raw)
-                          :let [attr (keyword ns column)]
+                          :let [attr (attr-of column)]
                           :when (nil? (get column-defaults attr))]
                     (throw (ex-info
                             "unexpected default marker in COPY data"
@@ -11541,7 +11558,7 @@
                 (reduce
                  (fn [candidate [column raw]]
                    (params/check-cancel!)
-                   (let [attr (keyword ns column)]
+                   (let [attr (attr-of column)]
                      (cond
                        (copy/null-sentinel? raw)
                        (assoc candidate attr nil)
@@ -11567,8 +11584,10 @@
                        (assoc candidate attr
                               (copy/coerce-field
                                raw attr schema)))))
-                 (cond-> {:db/id (str tempid-prefix next-idx)}
-                   row-marker (assoc row-marker true))
+                 (reduce (fn [e m] (if (get schema m) (assoc e m true) e))
+                         (cond-> {:db/id (str tempid-prefix next-idx)}
+                           row-marker (assoc row-marker true))
+                         ancestor-markers)
                  (map vector columns row))
                 candidate (materialize-insert-candidate
                            entity constraint-plan db-now resolve-value)
