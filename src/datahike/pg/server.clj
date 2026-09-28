@@ -4862,6 +4862,15 @@
         row-type (catalog-objects/object-by-identity
                   db catalog-objects/pg-type-oid
                   catalog-objects/public-namespace-oid view-name)
+        ;; A materialized view backs onto an ordinary table, so nothing
+        ;; above would notice it -- but DROP VIEW is not how it goes.
+        _ (when (seq (d/q '{:find [?e] :in [$ ?n]
+                            :where [[?e :datahike.pg.matview/name ?n]]}
+                          db view-name))
+            (throw (ex-info (str "\"" view-name "\" is not a view")
+                            {:error :wrong-object-type :sqlstate "42809"
+                             :hint (str "Use DROP MATERIALIZED VIEW to "
+                                        "remove a materialized view.")})))
         _ (when (and relation
                      (not= :view (:datahike.pg.object/kind relation)))
             (throw (ex-info (str "\"" view-name "\" is not a view")
@@ -8990,6 +8999,251 @@
               (empty-result "DROP TRIGGER")
               (classified-error "DROP TRIGGER error: " outcome))))))))
 
+(defn- run-nested!
+  "Run `sql` on this connection's own handler -- same transaction, same
+   session -- and raise its error as ours.
+
+   This is how a statement that is DEFINED in terms of other statements
+   is executed: a materialized view is a table filled by a query, and
+   reusing CREATE TABLE AS and INSERT … SELECT is what keeps its
+   contents identical to the same query written out by hand."
+  ^PgWireServer$QueryResult [^String sql]
+  (let [h params/*statement-handler*]
+    (when-not h
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "materialized views cannot run in this context"})))
+    (let [^PgWireServer$QueryResult r (h sql nil nil)]
+      (when (.error r)
+        (throw (ex-info (.error r)
+                        {:sqlstate (or (.sqlstate r) "XX000")
+                         :error :nested-statement})))
+      r)))
+
+(defn- like-column-definitions
+  "The column definitions of `src`, spelled as a CREATE TABLE body.
+
+   They are read through the CATALOG -- pg_attribute, format_type,
+   pg_attrdef -- rather than from the schema directly, because that is
+   the surface whose type spellings are already tested, and a second
+   derivation would be free to disagree with what `\\d` reports.
+
+   PostgreSQL copies names, types and NOT NULL; DEFAULT only with
+   INCLUDING DEFAULTS."
+  [src defaults?]
+  (let [^PgWireServer$QueryResult r
+        (run-nested!
+         (str "SELECT a.attname, format_type(a.atttypid, a.atttypmod),"
+              " a.attnotnull, d.adbin"
+              " FROM pg_attribute a"
+              " JOIN pg_class c ON c.oid = a.attrelid"
+              " LEFT JOIN pg_attrdef d"
+              "   ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
+              " WHERE c.relname = '" (str/replace src "'" "''") "'"
+              "   AND a.attnum > 0 AND NOT a.attisdropped"
+              " ORDER BY a.attnum"))
+        rows (.rows r)]
+    (when (zero? (alength rows))
+      (throw (ex-info (str "relation \"" src "\" does not exist")
+                      {:error :undefined-table :sqlstate "42P01"})))
+    (str/join ", "
+              (for [^"[Ljava.lang.String;" row rows
+                    :let [[nm typ notnull dflt] (vec row)]]
+                (str "\"" nm "\" " typ
+                     (when (= "t" notnull) " NOT NULL")
+                     (when (and defaults? dflt) (str " DEFAULT " dflt)))))))
+
+(defn- exec-ddl-create-table-like
+  "CREATE TABLE … (LIKE source …): substitute each LIKE element with the
+   source table's column definitions and run the statement that results.
+
+   The substitution is textual and the result goes through the ordinary
+   CREATE TABLE path, so a copied column is created by the same code as
+   a written-out one -- there is no second definition of what a column
+   is that could drift."
+  [ctx parsed]
+  (let [sql (:sql parsed)]
+    (try
+      (let [expanded (reduce (fn [s {:keys [start end source-table defaults?]}]
+                               (str (subs s 0 start)
+                                    (like-column-definitions source-table defaults?)
+                                    (subs s end)))
+                             sql
+                             (sort-by :start > (:like-elems parsed)))]
+        (run-nested! expanded))
+      (catch Exception e
+        (classified-error "" e)))))
+
+(defn- matview-tx-data
+  "Registry tx-data for a materialized view. The view's ROWS live in an
+   ordinary table of the same name -- that is what a materialized view
+   is -- so all that is stored here is the query that produced them,
+   which REFRESH runs again, and whether it has been run at all."
+  [name query populated?]
+  [{:db/ident :datahike.pg.matview/name
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :datahike.pg.matview/query
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.matview/populated?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one}
+   {:datahike.pg.matview/name name
+    :datahike.pg.matview/query query
+    :datahike.pg.matview/populated? (boolean populated?)}])
+
+(def ^:private ^:dynamic *dropping-matview*
+  "True while DROP MATERIALIZED VIEW runs its own DROP TABLE. Without
+   it that nested statement would trip the guard that stops a plain
+   DROP TABLE from removing a materialized view."
+  false)
+
+(defn- matview-entity
+  "The registry entity for `name`, or nil if it is not a materialized
+   view (including when no relation of that name exists at all)."
+  [db name]
+  (some->> (d/q '{:find [?e .] :in [$ ?n]
+                  :where [[?e :datahike.pg.matview/name ?n]]}
+                db name)
+           (d/entity db)))
+
+(defn- commit-ddl
+  "Finish a DDL statement: inside a transaction block it accumulates,
+   outside one it commits now. Both report `tag`."
+  [ctx tx-data tag]
+  (let [{:keys [conn tx-state]} ctx]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data tag)
+      (let [outcome (try (transact-recorded! conn tx-data) :committed
+                         (catch Exception e e))]
+        (if (= :committed outcome)
+          (empty-result tag)
+          (classified-error (str tag " error: ") outcome))))))
+
+(defn- not-a-matview-error [name]
+  (classified-error "" (ex-info (str "\"" name "\" is not a materialized view")
+                                {:error :wrong-object-type :sqlstate "42809"})))
+
+(defn- exec-ddl-create-matview
+  "CREATE MATERIALIZED VIEW name [(cols)] AS query [WITH [NO] DATA].
+
+   The view is built by running CREATE TABLE AS on the stored query, so
+   its column names, types and contents are exactly those of the query
+   -- there is no second code path that could disagree with a plain
+   CTAS. WITH NO DATA still runs the query, to learn the column types
+   PostgreSQL also records for an unpopulated view, and then empties
+   it."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [matview-name columns with-data? if-not-exists?]} parsed
+        ;; An explicit column list renames the query's output columns.
+        ;; A derived table's alias list does exactly that and is
+        ;; already translated, so the rename lives in the query that
+        ;; gets stored -- and REFRESH then reproduces the same names
+        ;; without a second rule to keep in step.
+        query (if (seq columns)
+                (str "SELECT * FROM (" (:query parsed) ") AS \"__matview_src\" ("
+                     (str/join ", " columns) ")")
+                (:query parsed))
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))]
+    (cond
+      (table-exists? db matview-name)
+      (if if-not-exists?
+        (do (params/notice! "NOTICE" (str "relation \"" matview-name
+                                          "\" already exists, skipping"))
+            (empty-result "CREATE MATERIALIZED VIEW"))
+        (classified-error "" (ex-info (str "relation \"" matview-name
+                                           "\" already exists")
+                                      {:error :duplicate-table :sqlstate "42P07"})))
+
+      :else
+      (try
+        (let [^PgWireServer$QueryResult built
+              (run-nested! (str "CREATE TABLE " matview-name " AS " query))]
+          (when-not with-data?
+            (run-nested! (str "DELETE FROM " matview-name)))
+          (commit-ddl ctx (matview-tx-data matview-name query with-data?)
+                      ;; PostgreSQL tags a POPULATED materialized view
+                      ;; with the query's row count, exactly as it tags
+                      ;; CREATE TABLE AS -- `SELECT 3`, not `CREATE
+                      ;; MATERIALIZED VIEW`. WITH NO DATA ran no query
+                      ;; to count, so it keeps the DDL tag.
+                      (if with-data?
+                        (or (.commandTag built) "CREATE MATERIALIZED VIEW")
+                        "CREATE MATERIALIZED VIEW")))
+        (catch Exception e
+          (classified-error "" e))))))
+
+(defn- exec-ddl-refresh-matview
+  "REFRESH MATERIALIZED VIEW: run the stored query again and replace the
+   contents. The old rows go and the new ones arrive inside the same
+   transaction as the REFRESH, which is what CONCURRENTLY buys in
+   PostgreSQL by other means."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [matview-name with-data?]} parsed
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        ent (matview-entity db matview-name)]
+    (cond
+      (and (nil? ent) (not (table-exists? db matview-name)))
+      (classified-error "" (ex-info (str "relation \"" matview-name
+                                         "\" does not exist")
+                                    {:error :undefined-table :sqlstate "42P01"}))
+      (nil? ent) (not-a-matview-error matview-name)
+
+      :else
+      (try
+        (run-nested! (str "DELETE FROM " matview-name))
+        (when with-data?
+          (run-nested! (str "INSERT INTO " matview-name " "
+                            (:datahike.pg.matview/query ent))))
+        (commit-ddl ctx
+                    [{:datahike.pg.matview/name matview-name
+                      :datahike.pg.matview/populated? (boolean with-data?)}]
+                    "REFRESH MATERIALIZED VIEW")
+        (catch Exception e
+          (classified-error "" e))))))
+
+(defn- exec-ddl-drop-matview
+  "DROP MATERIALIZED VIEW a, b, …  Dropping the backing table and the
+   registry entry is one statement's worth of work, so a list that
+   fails partway leaves nothing behind only inside a transaction
+   block -- the same as PostgreSQL, which runs the whole list in one."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [matviews if-exists?]} parsed]
+    (try
+      (let [retractions
+            (reduce
+             (fn [acc name]
+               (let [db (if (:in-tx? @tx-state)
+                          (:speculative-db @tx-state)
+                          (d/db conn))
+                     ent (matview-entity db name)]
+                 (cond
+                   ent (do (binding [*dropping-matview* true]
+                             (run-nested! (str "DROP TABLE " name)))
+                           (conj acc [:db/retractEntity (:db/id ent)]))
+                   (table-exists? db name)
+                   (throw (ex-info (str "\"" name "\" is not a materialized view")
+                                   {:error :wrong-object-type :sqlstate "42809"}))
+                   if-exists?
+                   (do (params/notice! "NOTICE"
+                                       (str "materialized view \"" name
+                                            "\" does not exist, skipping"))
+                       acc)
+                   :else
+                   (throw (ex-info (str "relation \"" name "\" does not exist")
+                                   {:error :undefined-table :sqlstate "42P01"})))))
+             [] matviews)]
+        (if (seq retractions)
+          (commit-ddl ctx retractions "DROP MATERIALIZED VIEW")
+          (empty-result "DROP MATERIALIZED VIEW")))
+      (catch Exception e
+        (classified-error "" e)))))
+
 (defn- exec-ddl-create-function
   "CREATE [OR REPLACE] FUNCTION … LANGUAGE sql.
 
@@ -10741,6 +10995,12 @@
                                     db catalog-objects/pg-class-oid
                                     catalog-objects/public-namespace-oid table)]]
                 (cond
+                  (and (not *dropping-matview*) (matview-entity db table))
+                  (throw (ex-info (str "\"" table "\" is not a table")
+                                  {:error :wrong-object-type :sqlstate "42809"
+                                   :hint (str "Use DROP MATERIALIZED VIEW to "
+                                              "remove a materialized view.")}))
+
                   (and object (not= :table (:datahike.pg.object/kind object)))
                   (throw (ex-info (str "\"" table "\" is not a table")
                                   {:error :wrong-object-type :sqlstate "42809"}))
@@ -12698,6 +12958,14 @@
                                                       tx-state #(exec-ddl-create-role ctx parsed))
                               :ddl-drop-role         (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-drop-role ctx parsed))
+                              :ddl-create-table-like (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-table-like ctx parsed))
+                              :ddl-create-matview    (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-matview ctx parsed))
+                              :ddl-refresh-matview   (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-refresh-matview ctx parsed))
+                              :ddl-drop-matview      (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop-matview ctx parsed))
                               :ddl-create-trigger    (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create-trigger ctx parsed))
                               :ddl-drop-trigger      (execute-ddl-invalidating
