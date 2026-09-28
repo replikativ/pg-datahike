@@ -247,3 +247,42 @@
                      (str msg)))
         (is (not (re-find #"(?i)cannot invoke|java\.lang|clojure\." (str msg)))
             "an internal failure must never reach the client")))))
+
+(deftest a-named-zone-inside-a-timestamptz-literal
+  ;; `'1997-02-10 17:32:01 America/New_York'::timestamptz` is 22:32:01
+  ;; UTC. The zone was parsed away and the wall clock kept, so it read
+  ;; back as 17:32:01+00 -- five hours out, reported as success -- and
+  ;; the extended spelling did not parse at all and passed its own text
+  ;; through as a timestamptz value.
+  ;;
+  ;; A plain `timestamp` keeps the fields and DROPS the zone, which is
+  ;; the opposite behaviour from the same text, and is PostgreSQL's.
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (testing "the zone is applied, and daylight saving with it"
+      (is (= "1997-02-10 22:32:01+00"
+             (one c "SELECT '1997-02-10 17:32:01 America/New_York'::timestamptz")))
+      (is (= "1997-07-10 21:32:01+00"
+             (one c "SELECT '1997-07-10 17:32:01 America/New_York'::timestamptz"))
+          "July is daylight time, so the same wall clock is an hour earlier in UTC")
+      (is (= "1997-02-11 01:32:01+00"
+             (one c "SELECT '1997-02-10 17:32:01 PST'::timestamptz"))
+          "an abbreviation resolves too")
+      (is (= "1997-02-10 22:32:01+00"
+             (one c "SELECT '19970210 173201 America/New_York'::timestamptz"))
+          "including on the ISO basic spelling"))
+    (testing "a numeric offset still works, and is POSIX-signed"
+      (is (= "1997-02-10 12:32:01+00"
+             (one c "SELECT '1997-02-10 17:32:01+05'::timestamptz"))))
+    (testing "a plain timestamp keeps the fields and drops the zone"
+      (is (= "1997-02-10 17:32:01"
+             (one c "SELECT '1997-02-10 17:32:01 America/New_York'::timestamp")))
+      (is (= "1997-02-10 17:32:01"
+             (one c "SELECT '1997-02-10 17:32:01 PST'::timestamp"))))
+    (testing "an unrecognised zone is an error, lowercased as the cast reports it"
+      (let [[state msg] (err-of c "SELECT '1997-02-10 17:32:01 Nonsense/Zone'::timestamptz")]
+        (is (= "22023" state) msg)
+        (is (re-find #"time zone \"nonsense/zone\" not recognized" (str msg))))
+      (testing "while AT TIME ZONE keeps what was written -- PostgreSQL differs"
+        (is (re-find #"time zone \"Nonsense/Zone\" not recognized"
+                     (str (second (err-of c "SELECT now() AT TIME ZONE 'Nonsense/Zone'")))))))))

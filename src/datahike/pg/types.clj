@@ -1259,6 +1259,32 @@
       (when (clojure.string/ends-with? base "[]")
         (or (:elem (parse-array-type-name sql-type-name)) :text)))))
 
+(defn resolve-time-zone
+  "A PostgreSQL time-zone spec as a java.time ZoneId. Names and
+   abbreviations resolve through the tz database. A NUMERIC spec -- `+05`,
+   `-03:30`, `UTC+3` -- is POSIX-style, so its sign is INVERTED: `+05` is
+   five hours WEST of UTC (datetime.c DecodePosixTimezone). Unknown names
+   raise 22023, as in PostgreSQL."
+  ^java.time.ZoneId [zone]
+  (let [z (clojure.string/trim (str zone))
+        posix (fn [sign h m sec]
+                (let [total (+ (* 3600 (Long/parseLong h))
+                               (* 60 (Long/parseLong (or m "0")))
+                               (Long/parseLong (or sec "0")))]
+                  (java.time.ZoneOffset/ofTotalSeconds
+                   (int (if (= "-" sign) total (- total))))))]
+    (if-let [[_ sign h m sec] (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
+      (posix sign h m sec)
+      (try
+        (java.time.ZoneId/of z java.time.ZoneId/SHORT_IDS)
+        (catch Exception _
+          (try (java.time.ZoneId/of (clojure.string/upper-case z) java.time.ZoneId/SHORT_IDS)
+               (catch Exception _
+                 (throw (ex-info (str "time zone \"" z "\" not recognized")
+                                 {:error :invalid-parameter-value
+                                  :sqlstate "22023"
+                                  :message (str "time zone \"" z "\" not recognized")})))))))))
+
 (defrecord PgLsn [^java.math.BigInteger value]
   Object
   (toString [_]

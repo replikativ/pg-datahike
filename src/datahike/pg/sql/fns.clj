@@ -2790,29 +2790,11 @@
     (instance? java.time.LocalDateTime v) (.atZone ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
     :else nil))
 
-(defn- resolve-time-zone
-  "A PostgreSQL time-zone spec as a java.time ZoneId. Names and
-   abbreviations resolve through the tz database. A NUMERIC spec -- `+05`,
-   `-03:30`, `UTC+3` -- is POSIX-style, so its sign is INVERTED: `+05` is
-   five hours WEST of UTC (datetime.c DecodePosixTimezone). Unknown names
-   raise 22023, as in PostgreSQL."
-  ^java.time.ZoneId [zone]
-  (let [z (str/trim (str zone))
-        posix (fn [sign h m sec]
-                (let [total (+ (* 3600 (Long/parseLong h))
-                               (* 60 (Long/parseLong (or m "0")))
-                               (Long/parseLong (or sec "0")))]
-                  (java.time.ZoneOffset/ofTotalSeconds
-                   (int (if (= "-" sign) total (- total))))))]
-    (if-let [[_ sign h m sec] (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
-      (posix sign h m sec)
-      (try
-        (java.time.ZoneId/of z java.time.ZoneId/SHORT_IDS)
-        (catch Exception _
-          (try (java.time.ZoneId/of (str/upper-case z) java.time.ZoneId/SHORT_IDS)
-               (catch Exception _
-                 (throw (errors/pg-error :invalid-parameter-value
-                                         {:message (str "time zone \"" z "\" not recognized")})))))))))
+(def ^:private resolve-time-zone
+  "A PostgreSQL time-zone spec as a java.time ZoneId. Lives in types
+   now: the CAST needs the same resolution to read a zone out of a
+   timestamptz literal, and cast.clj cannot require this namespace."
+  types/resolve-time-zone)
 
 (defn- local-date-time
   "A timestamp value as its wall-clock LocalDateTime. Timestamps are held
