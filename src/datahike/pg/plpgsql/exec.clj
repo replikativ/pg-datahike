@@ -49,19 +49,25 @@
 ;; State
 ;; ============================================================================
 
-(defn- new-state [handler vars]
-  {:handler handler
-   ;; A stack of scopes, innermost first. A block pushes one; assignment
-   ;; writes to the innermost scope that already holds the name.
-   :scopes (atom (list (atom (into {} vars))))
-   ;; The DECLARE type of each variable, by name. A statement gives its
-   ;; result back as TEXT, and a plpgsql variable is typed, so an
-   ;; assignment coerces: without it `t int := 0` held the string "0"
-   ;; and `t + 1` was `'0' + 1`.
-   :types (atom {})
-   ;; Rows accumulated by RETURN NEXT / RETURN QUERY in a set-returning
-   ;; function.
-   :out (atom [])})
+(defn- new-state
+  ([handler vars] (new-state handler vars nil))
+  ([handler vars transitions]
+   {:handler handler
+    ;; `{name {:cols [c …] :sql "(VALUES …)"}}` -- a trigger's transition
+    ;; relations, spliced into any body statement that names one. See
+    ;; `with-transition-ctes`.
+    :transitions transitions
+    ;; A stack of scopes, innermost first. A block pushes one; assignment
+    ;; writes to the innermost scope that already holds the name.
+    :scopes (atom (list (atom (into {} vars))))
+    ;; The DECLARE type of each variable, by name. A statement gives its
+    ;; result back as TEXT, and a plpgsql variable is typed, so an
+    ;; assignment coerces: without it `t int := 0` held the string "0"
+    ;; and `t + 1` was `'0' + 1`.
+    :types (atom {})
+    ;; Rows accumulated by RETURN NEXT / RETURN QUERY in a set-returning
+    ;; function.
+    :out (atom [])}))
 
 (defn- all-vars
   "Every variable in scope, innermost shadowing outermost."
@@ -195,6 +201,58 @@
        (mapv #(get vars %) names)
        (mapv #(or (some-> (get @(:types st) %) (oid/sql-type-name->oid nil)) 0) names)])))
 
+(defn- names-referenced
+  "Which of `names` the statement mentions as a bare identifier. Token
+   driven, so a name inside a string literal, a comment or a quoted
+   identifier is not a reference."
+  [^String sql names]
+  (into #{}
+        (comp (remove #(= :comment (:type %)))
+              (filter #(contains? #{:ident} (:type %)))
+              (map #(str/lower-case (:text %)))
+              (filter names))
+        (cls/tokenize-all sql)))
+
+(defn- with-transition-ctes
+  "Prefix `sql` with a CTE for each transition relation it names.
+
+   A transition relation is the statement's before or after image, which
+   PostgreSQL holds as a tuplestore in the query environment. There is no
+   such thing here -- the translator resolves a FROM name against the
+   schema -- so the rows are carried as a `VALUES` CTE, which every
+   statement form the body can write already accepts, including a
+   data-modifying one.
+
+   Materialising them as TEMP TABLES was the obvious alternative and is
+   not safe: creating and dropping a relation inside the statement's own
+   write path left a row lock in the registry that the NEXT statement
+   timed out on, from a table with no triggers at all.
+
+   Only when the statement names one. Prefixing every statement in the
+   body would cost a CTE per statement for the many that never read the
+   relation."
+  [st ^String sql]
+  (let [ts (:transitions st)]
+    (if-not (seq ts)
+      sql
+      (let [used (names-referenced sql (set (keys ts)))]
+        (if (empty? used)
+          sql
+          (let [ctes (str/join ", "
+                               (for [n (sort used)
+                                     :let [{:keys [cols sql]} (get ts n)]]
+                                 (str n " (" (str/join ", " cols) ") AS (" sql ")")))
+                trimmed (str/triml sql)
+                lower (str/lower-case trimmed)]
+            (cond
+              ;; The body's own WITH list: ours joins it rather than
+              ;; wrapping it, and RECURSIVE stays where it is.
+              (str/starts-with? lower "with recursive ")
+              (str "WITH RECURSIVE " ctes ", " (subs trimmed (count "WITH RECURSIVE ")))
+              (str/starts-with? lower "with ")
+              (str "WITH " ctes ", " (subs trimmed (count "WITH ")))
+              :else (str "WITH " ctes " " trimmed))))))))
+
 (defn- run-sql!
   "Run one statement of the body. Returns the QueryResult; raises the
    statement's own error.
@@ -206,6 +264,7 @@
    otherwise make every nested statement re-run the outer plan."
   ^PgWireServer$QueryResult [st ^String sql]
   (let [run (:handler st)
+        sql (with-transition-ctes st sql)
         [sql' values oids] (parameterise st sql)
         result (run sql' values oids)]
     (when (.error result)
@@ -551,13 +610,13 @@
    `RETURN NEW`, and NEW is bound to a marker the evaluator maps back
    to the row -- so `RETURN NULL` and `RETURN NEW` are distinguishable
    from a value that merely happens to be nil."
-  [handler ast {:keys [new old tg types]}]
+  [handler ast {:keys [new old tg types transitions]}]
   (let [vars (merge (record-vars "new" new)
                     (record-vars "old" old)
                     (when new {"new" ::new})
                     (when old {"old" ::old})
                     tg)
-        st (new-state handler vars)
+        st (new-state handler vars transitions)
         _ (swap! (:types st) into types)
         returned (try
                    (exec-block! st ast)
