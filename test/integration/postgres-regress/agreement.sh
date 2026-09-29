@@ -61,7 +61,36 @@ for f in $FILES; do
   n=$((n+1))
   printf "\r[%3d] %-28s" "$n" "$f" >&2
   touch "$STAMP"
-  timeout 300 bb pg-regress-with-fixtures "$f" >/dev/null 2>&1
+  # `geometry` reads `box_tbl`, which `box` creates -- real PostgreSQL
+  # runs the schedule against one database, so it is there. Running the
+  # prerequisite first in the same disposable database is all that
+  # takes; the fixture runner already accepts several targets.
+  #
+  # It does not move the number and is not meant to. It stops the
+  # residual reporting a harness artifact where a real gap hides:
+  # `geometry` blocked on `relation "box_tbl" does not exist` and now
+  # blocks on the SAME LINE with `function center(text) does not
+  # exist`, which is the thing worth fixing.
+  #
+  # ONE file, out of 174. I measured before writing this, and then
+  # again after, because the first count was wrong:
+  #
+  #   24 files have a missing relation as their first blocker;
+  #   13 are unimplemented CATALOGS (pg_operator, pg_statistic,
+  #      pg_ts_parser, information_schema.views, …);
+  #    9 are the file's own object, whose CREATE failed earlier;
+  #    1 is `with` wanting `q1`, which is a CTE, not a table;
+  #    1 is this.
+  #
+  # `select_views` looked like a second case -- it wants `street` from
+  # `create_view` -- but pairing them changes nothing: `CREATE VIEW
+  # street` fails on `?#`, an operator we do not parse. Its relation is
+  # missing because of us, not because of isolation.
+  case "$f" in
+    geometry) targets="box $f" ;;
+    *)        targets="$f" ;;
+  esac
+  timeout 300 bb pg-regress-with-fixtures $targets >/dev/null 2>&1
   R=$(find .internal/pg-regress/*/tests/results/"$f".out -newer "$STAMP" \
         2>/dev/null | head -1)
   if [ -n "$R" ]; then
