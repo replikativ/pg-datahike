@@ -162,8 +162,18 @@
 (defn compile-constraint-metadata
   "Compile a previously read metadata snapshot. Does not reread its database
    or evaluate defaults/predicates. Check ordering follows the input snapshot."
-  [{:keys [checks fks domain-enum] :as metadata}]
+  [{:keys [checks fks domain-enum columns] :as metadata}]
   (assoc metadata
+         ;; An expression DEFAULT is parsed HERE, with the checks, and not
+         ;; per row: the plan is compiled once per statement, so a
+         ;; thousand-row INSERT parses `now() + interval '1 day'` once.
+         :columns
+         (mapv (fn [{:keys [default] :as column}]
+                 (if (= :expr (first default))
+                   (assoc column :default-ast
+                          (parse-constraint-expression (second default)))
+                   column))
+               columns)
          :checks (when checks
                    (mapv (fn [{:keys [constraint expression]}]
                            {:constraint constraint :ast (parse-constraint-expression expression)})
@@ -211,6 +221,11 @@
   [kind value]
   (case kind
     (:literal :bit :bit-coerced) value
+    ;; Handled by the caller, which has the evaluator; see
+    ;; `prepare-candidate`. Never silently nil.
+    :expr (throw (ex-info "expression default needs the SQL evaluator"
+                          {:error :unevaluated-expression-default
+                           :expression value}))
     :fn (let [^java.util.Date statement-time
               (or params/*statement-time* (java.util.Date.))
               instant (.toInstant statement-time)
@@ -241,6 +256,16 @@
              (throw (ex-info "sequence default was not reserved before row validation"
                              {:error :unresolved-sequence-default
                               :sequence arg :column name}))
+             ;; Same rule as :nextval, for the same reason: an expression
+             ;; default needs the SELECT evaluator, which this namespace
+             ;; deliberately does not reach. `materialize-column-default`
+             ;; resolves it before validation runs. Reaching here means a
+             ;; write path skipped that step -- say so instead of
+             ;; defaulting to nil and writing a NULL.
+             (= :expr kind)
+             (throw (ex-info "expression default was not evaluated before row validation"
+                             {:error :unevaluated-expression-default
+                              :expression value :column name}))
              default (eval-default kind value)
              :else nil)
            coerced (when (some? resolved) (coerce-fn resolved attr))]

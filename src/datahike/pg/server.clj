@@ -2342,15 +2342,24 @@
                     {:error :internal-error :sqlstate "XX000"}))))
 
 (defn- materialize-column-default
-  [default resolve-value]
-  (let [[kind value arg] default
-        raw (cond
-              (= :nextval kind) {:fn :nextval :seq-name arg
-                                 :generated-default? true}
-              default (row-constraints/eval-default kind value)
-              :else nil)
-        resolved (when default (resolve-value raw))]
-    resolved))
+  "The value an omitted column takes. `eval-expr`, when given, evaluates
+   an expression DEFAULT's parsed AST; that is the only kind needing it."
+  ([default resolve-value] (materialize-column-default default resolve-value nil nil))
+  ([default resolve-value default-ast eval-expr]
+   (let [[kind value arg] default]
+     (cond
+       (nil? default) nil
+       (= :expr kind)
+       (if (and default-ast eval-expr)
+         (eval-expr default-ast)
+         (throw (ex-info "expression default reached a path without an evaluator"
+                         {:error :unevaluated-expression-default
+                          :expression value})))
+       :else
+       (let [raw (if (= :nextval kind)
+                   {:fn :nextval :seq-name arg :generated-default? true}
+                   (row-constraints/eval-default kind value))]
+         (resolve-value raw))))))
 
 (defn- materialize-insert-candidate
   "Evaluate one candidate's target columns in physical column order.
@@ -2360,13 +2369,15 @@
    final constraint/rebase pass sees values rather than expressions."
   [candidate constraint-plan db resolve-value]
   (let [schema (dbi/-schema db)
+        eval-expr #(row-eval/default-value % schema db)
         attrs
         (reduce
-         (fn [attrs {:keys [attr default]}]
+         (fn [attrs {:keys [attr default default-ast]}]
            (let [present? (contains? attrs attr)
                  resolved (if present?
                             (resolve-value (get attrs attr))
-                            (materialize-column-default default resolve-value))
+                            (materialize-column-default default resolve-value
+                                                        default-ast eval-expr))
                  coerced (when (some? resolved)
                            (#'stmt/coerce-insert-value resolved attr schema db))]
              (cond-> attrs
@@ -3217,8 +3228,18 @@
                                (nil? (.getTable ^Column value-expr))
                                (= "default" (str/lower-case (.getColumnName ^Column value-expr))))
                         (let [[kind value arg] (:default (get column-constraints column))]
-                          (if (= :nextval kind)
+                          (cond
+                            (= :nextval kind)
                             (assoc a :sql (str "nextval('" (str/replace (or arg value) "'" "''") "')"))
+                            ;; An expression default is already SQL, and
+                            ;; this path is building SQL: hand it over as
+                            ;; the assignment's own expression, the same
+                            ;; way `nextval` is. It is then translated and
+                            ;; evaluated per row like any other SET
+                            ;; expression.
+                            (= :expr kind)
+                            (assoc a :sql value)
+                            :else
                             (assoc a :sql "NULL" :default-fill [kind value])))
                         (assoc a :sql (str value-expr))))
                     assignments)
@@ -11603,6 +11624,11 @@
                 (into {}
                       (map (juxt :attr :default))
                       (:columns constraint-plan))
+                column-default-asts
+                (into {}
+                      (keep (fn [{:keys [attr default-ast]}]
+                              (when default-ast [attr default-ast])))
+                      (:columns constraint-plan))
                 ;; PostgreSQL's format parser identifies every raw DEFAULT
                 ;; marker before it invokes any column input function. Thus a
                 ;; marker targeting a column without a default wins over an
@@ -11657,7 +11683,9 @@
                        (copy/default-sentinel? raw)
                        (if-let [default (get column-defaults attr)]
                          (let [resolved (materialize-column-default
-                                         default resolve-value)
+                                         default resolve-value
+                                         (get column-default-asts attr)
+                                         #(row-eval/default-value % schema db-now))
                                coerced (when (some? resolved)
                                          (#'stmt/coerce-insert-value
                                           resolved attr schema db-now))]
