@@ -549,3 +549,27 @@
              Exception #"date/time field value out of range"
              (one c "SELECT '8/10/2017'::date"))
             "day 2017 under YMD")))))
+(deftest the-float-sum-guc-is-a-session-setting
+  ;; Compensated summation is opt-in, and the GUC has to behave like one:
+  ;; SHOW reports it, SET changes it, RESET clears it, and a value that
+  ;; is neither is refused rather than silently ignored.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE fs (v float8)")
+    (exec! c "INSERT INTO fs VALUES (1e16),(1.0),(1.0),(1.0),(1.0),(-1e16)")
+    (is (= "naive" (one c "SHOW pg_datahike.float_sum"))
+        "off by default -- differential-fuzz compares against a real
+         PostgreSQL, which sums naively")
+    (exec! c "SET pg_datahike.float_sum = 'compensated'")
+    (is (= "compensated" (one c "SHOW pg_datahike.float_sum")))
+    (is (= "4" (one c "SELECT sum(v) FROM fs"))
+        "the true total, whatever order the plan produced")
+    (exec! c "RESET pg_datahike.float_sum")
+    (is (= "naive" (one c "SHOW pg_datahike.float_sum")))
+    (testing "an unknown value is refused"
+      (is (thrown-with-msg?
+           Exception #"pg_datahike.float_sum must be 'naive' or 'compensated'"
+           (exec! c "SET pg_datahike.float_sum = 'wrong'"))))
+    (testing "RESET ALL clears it too"
+      (exec! c "SET pg_datahike.float_sum = 'compensated'")
+      (exec! c "RESET ALL")
+      (is (= "naive" (one c "SHOW pg_datahike.float_sum"))))))
