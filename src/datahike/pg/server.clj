@@ -2865,6 +2865,28 @@
                     [:db/retract eid a v])))
           base)))
 
+(defn- coerce-row-columns
+  "A trigger's returned `{column value}` read back in the columns' own
+   types.
+
+   plpgsql computes over what a statement produced, which is TEXT, so a
+   body that assigns `NEW.f1 := NEW.f1 * 10` hands back a string. The
+   INSERT path round-trips the row through `columns->row-entity` between
+   triggers and coerces there; the UPDATE path passed the raw map to the
+   next trigger, which then did arithmetic on a string --
+   `class java.lang.String cannot be cast to class java.lang.Number`,
+   with no SQLSTATE, on the SECOND of two BEFORE UPDATE triggers.
+   `triggers.sql` does exactly this."
+  [db table-name row]
+  (let [schema (dbi/-schema db)]
+    (reduce-kv (fn [m c v]
+                 (let [attr (keyword table-name c)]
+                   (assoc m c (if (or (nil? v) (not (contains? schema attr)))
+                                v
+                                (#'stmt/coerce-insert-value v attr schema db)))))
+               {}
+               row)))
+
 (defn- apply-before-row-updates
   "Run the BEFORE ROW UPDATE triggers. Returns `[tx-data rows]`, where
    the tx-data is what should actually be written -- a trigger may have
@@ -2886,7 +2908,8 @@
                                                            :update row old)]
                                              (if (nil? r)
                                                {:row nil :base base :old old}
-                                               (recur more r)))))]))
+                                               (recur more (coerce-row-columns
+                                                            db table-name r))))))]))
                            by-eid)
             touched (set (keys by-eid))
             ;; Ops for a row a trigger touched are rebuilt; anything not

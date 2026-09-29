@@ -157,6 +157,27 @@
       (is (str/includes? (str (err (exec h "INSERT INTO u (i) VALUES (1)")))
                          "not-null")))))
 
+(deftest triggers-chain-in-the-columns-own-types
+  ;; plpgsql computes over what a statement produced, which is TEXT, so
+  ;; `NEW.f1 := NEW.f1 * 10` hands back a string. The INSERT path
+  ;; round-trips the row through `columns->row-entity` between triggers
+  ;; and coerces there; the UPDATE path passed the raw map on, so the
+  ;; SECOND trigger did arithmetic on a string and the statement died
+  ;; with a bare `class java.lang.String cannot be cast to class
+  ;; java.lang.Number` -- no SQLSTATE. `triggers.sql` opens with exactly
+  ;; this pair.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (f1 int, f2 text)")
+    (trigfn! h "times10" "BEGIN NEW.f1 := NEW.f1 * 10; RETURN NEW; END")
+    (ok! h "CREATE TRIGGER alpha BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE times10()")
+    (ok! h "CREATE TRIGGER zed BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE times10()")
+    (ok! h "INSERT INTO t VALUES (1, 'foo')")
+    (is (= [["100" "foo"]] (rows (ok! h "SELECT f1, f2 FROM t")))
+        "both triggers ran on INSERT")
+    (ok! h "UPDATE t SET f2 = f2 || 'bar'")
+    (is (= [["10000" "foobar"]] (rows (ok! h "SELECT f1, f2 FROM t")))
+        "and both on UPDATE, each seeing an int rather than the other's text")))
+
 (deftest returning-null-suppresses-the-row
   (with-h [h (fresh-handler)]
     (ok! h "CREATE TABLE t (i int)")
