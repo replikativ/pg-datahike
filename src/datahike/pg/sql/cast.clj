@@ -541,6 +541,37 @@
         ;; on -- `2040-04-10 BC` is proleptic -2039.
         (if bc? (.withYear d (- 1 (.getYear d))) d)))))
 
+(def ^:private trailing-zone-re
+  "A numeric zone at the end of a datetime literal.
+
+   Two spellings, and the distinction is load-bearing. Attached to a
+   TIME (`12:00:00+05`) it needs no space; standing alone
+   (`2000-09-07 -07`) it must have one, because `2000-01-01` ends in
+   `-01` and an end-anchored pattern with no such guard eats the day and
+   leaves `2000-01` -- which then parses as nothing at all."
+  #"(?i)^(?:(.*\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*|(.*\d)\s+)([+-]\d{2}(?::?\d{2})?|Z)$")
+
+(defn split-trailing-zone
+  "`[head zone-offset]` for a datetime literal that carries a numeric
+   zone, else `[s nil]`.
+
+   Splitting it out is the whole point: `timestamp without time zone`
+   keeps the fields and DROPS the zone (datetime.c decodes tzp and then
+   ignores it), while `timestamptz` converts by it. Reading the literal
+   once and letting the target decide is what keeps the two answers from
+   being parsed by different code."
+  [^String s]
+  (let [t (str/trim (str s))]
+    (if-let [[_ after-time after-date z] (re-matches trailing-zone-re t)]
+      [(str/trim (or after-time after-date))
+       (if (contains? #{"Z" "z"} z)
+         java.time.ZoneOffset/UTC
+         (let [[_ sign hh mm] (re-matches #"([+-])(\d{2}):?(\d{2})?" z)]
+           (java.time.ZoneOffset/ofHoursMinutes
+            (* (if (= "-" sign) -1 1) (parse-long hh))
+            (* (if (= "-" sign) -1 1) (parse-long (or mm "0"))))))]
+      [t nil])))
+
 (defn- bad-date!
   "PostgreSQL tells a date whose FIELDS are impossible (22008) from text
    that is not a date at all (22007)."
@@ -728,7 +759,30 @@
                                                     (str/lower-case zone)
                                                     "\" not recognized")}))))))))))))
           :else
-          (let [norm (-> (str v) str/trim
+          (let [tz? (contains? #{"timestamptz" "timestamp with time zone"}
+                               (types/base-type-name-of type-str))
+                ;; A NUMERIC offset, the sibling of the named-zone
+                ;; branch above: `timestamp without time zone` keeps the
+                ;; fields it was given and DROPS the zone (datetime.c
+                ;; decodes tzp and then ignores it for DTK_DATE without
+                ;; a zone), while timestamptz converts by it. Only the
+                ;; named spelling was handled, so
+                ;; `'2000-01-01 12:00:00+05'::timestamp` answered
+                ;; 07:00:00 -- five hours out, and reported as success.
+                ;; The zone is read ONCE and applied by the target, so
+                ;; the two types cannot be decided by different code.
+                [head zone] (split-trailing-zone (str v))
+                ;; The head carries no zone, so parsing it as an instant
+                ;; at UTC yields exactly its wall clock. That reuses the
+                ;; whole accumulated spelling table rather than growing
+                ;; a second one beside it.
+                head-local (let [p (when parse-timestamp (parse-timestamp head))]
+                             (when (instance? java.util.Date p)
+                               (java.time.LocalDateTime/ofInstant
+                                (.toInstant ^java.util.Date p)
+                                java.time.ZoneOffset/UTC)))
+                v (if zone head v)
+                norm (-> (str v) str/trim
                          ;; ISO 8601 BASIC -- `19970210 173201`,
                          ;; `19970210T173201`, `19970210`. PostgreSQL
                          ;; reads the separator-less spelling; rewriting
@@ -748,18 +802,35 @@
                 ldt (when prefer-local-datetime?
                       (try (java.time.LocalDateTime/parse norm)
                            (catch Exception _ nil)))]
-            (or ldt
+            (or
+                ;; A literal WITH a zone is finished here: timestamptz
+                ;; converts by it, timestamp drops it. Only these two
+                ;; answers are possible and both are decided from the
+                ;; one reading above -- `'… 12:00:00 +05'` (space) and
+                ;; `'… 12:00+02'` (no seconds) used to reach neither
+                ;; branch and raise, and `'2000-09-07 -07'::timestamptz`
+                ;; answered midnight UTC instead of 07:00.
+             (when (and zone head-local)
+               (if tz?
+                 (java.util.Date/from (.toInstant ^java.time.LocalDateTime head-local
+                                                  ^java.time.ZoneOffset zone))
+                 (if prefer-local-datetime?
+                   head-local
+                   (java.util.Date/from
+                    (.toInstant ^java.time.LocalDateTime head-local
+                                java.time.ZoneOffset/UTC)))))
+             ldt
                 ;; `norm` was computed and then only consulted on the
                 ;; branch above, so a spelling this normalises but the
                 ;; injected parser does not know -- ISO basic -- fell
                 ;; through to the raw input and a timestamp column got
                 ;; a string that is not a timestamp.
-                (let [p (when parse-timestamp (parse-timestamp (str v)))]
-                  (when-not (or (nil? p) (string? p)) p))
-                (try (java.time.LocalDateTime/parse norm)
-                     (catch Exception _ nil))
-                (let [p (when parse-timestamp (parse-timestamp (str v)))]
-                  (when-not (or (nil? p) (string? p)) p))
+             (let [p (when parse-timestamp (parse-timestamp (str v)))]
+               (when-not (or (nil? p) (string? p)) p))
+             (try (java.time.LocalDateTime/parse norm)
+                  (catch Exception _ nil))
+             (let [p (when parse-timestamp (parse-timestamp (str v)))]
+               (when-not (or (nil? p) (string? p)) p))
                 ;; Nothing parsed. Returning `v` here is what made
                 ;; `'2024-02-30'::timestamp` answer with its own TEXT
                 ;; and `'nonsense'::timestamp` likewise -- a value that
@@ -767,10 +838,7 @@
                 ;; is. PostgreSQL raises, and distinguishes impossible
                 ;; FIELDS (22008) from text that is not a timestamp at
                 ;; all (22007).
-                (bad-timestamp! (str v)
-                                (contains? #{"timestamptz"
-                                             "timestamp with time zone"}
-                                           (types/base-type-name-of type-str))))))
+             (bad-timestamp! (str v) tz?))))
 
         :date (cond
                 (instance? java.time.LocalDate v) v

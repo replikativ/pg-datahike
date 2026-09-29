@@ -573,3 +573,61 @@
       (exec! c "SET pg_datahike.float_sum = 'compensated'")
       (exec! c "RESET ALL")
       (is (= "naive" (one c "SHOW pg_datahike.float_sum"))))))
+;; ---------------------------------------------------------------------------
+;; The zone in a datetime literal
+;;
+;; `timestamp without time zone` keeps the fields it was given and DROPS
+;; the zone -- datetime.c decodes tzp and then ignores it -- while
+;; `timestamptz` converts by it. Only the NAMED spelling was handled
+;; here; a numeric offset fell through to a parser that converts
+;; whatever the target, so `'2000-01-01 12:00:00+05'::timestamp`
+;; answered 07:00:00. Five hours out, reported as success.
+;;
+;; The zone is read once now (`split-trailing-zone`) and applied by the
+;; target, which is also what fixed three timestamptz spellings that
+;; used to raise or answer midnight.
+;;
+;; Every expectation below is a PostgreSQL 17 oracle's.
+;; ---------------------------------------------------------------------------
+
+(deftest a-zone-in-the-literal-is-the-targets-to-apply
+  (with-open [c (jdbc)]
+    (testing "timestamp drops it, whatever the spelling"
+      (doseq [lit ["2000-01-01 12:00:00+05"
+                   "2000-01-01 12:00:00-05"
+                   "2000-01-01 12:00:00+0530"
+                   "2000-01-01 12:00:00 +05"
+                   "2000-01-01 12:00:00Z"
+                   "2000-01-01T12:00:00+05:00"
+                   "2000-01-01 12:00:00 PST"
+                   "2000-01-01 12:00:00 America/New_York"]]
+        (is (= "2000-01-01 12:00:00" (one c (str "SELECT '" lit "'::timestamp::text")))
+            lit))
+      (is (= "2000-01-01 12:00:00.5"
+             (one c "SELECT '2000-01-01 12:00:00.5+03'::timestamp::text"))
+          "a fractional second before the offset is still a time field"))
+    (testing "timestamptz converts by it"
+      (is (= "2000-01-01 07:00:00+00"
+             (one c "SELECT '2000-01-01 12:00:00+05'::timestamptz::text")))
+      (is (= "2000-01-01 06:30:00+00"
+             (one c "SELECT '2000-01-01 12:00:00+05:30'::timestamptz::text")))
+      (testing "including the spellings that used to raise"
+        ;; A space before the offset, and an offset after HH:MM with no
+        ;; seconds, reached neither branch and were reported as invalid
+        ;; input for a literal PostgreSQL reads.
+        (is (= "2000-01-01 07:00:00+00"
+               (one c "SELECT '2000-01-01 12:00:00 +05'::timestamptz::text")))
+        (is (= "2000-01-01 10:00:00+00"
+               (one c "SELECT '2000-01-01 12:00+02'::timestamptz::text"))))
+      (testing "and a date-only literal whose offset was being dropped"
+        ;; `2000-09-07 -07` is midnight at -07, which is 07:00 UTC. It
+        ;; answered midnight UTC.
+        (is (= "2000-09-07 07:00:00+00"
+               (one c "SELECT '2000-09-07 -07'::timestamptz::text")))))
+    (testing "a bare date is not a zone"
+      ;; `2000-01-01` ends in `-01`. An end-anchored zone pattern with no
+      ;; guard eats the day, leaves `2000-01`, and the literal then
+      ;; parses as nothing at all.
+      (is (= "2000-01-01 00:00:00" (one c "SELECT '2000-01-01'::timestamp::text")))
+      (is (= "2000-09-07 00:00:00" (one c "SELECT '2000-09-07 -07'::timestamp::text"))
+          "the offset is dropped, not subtracted"))))
