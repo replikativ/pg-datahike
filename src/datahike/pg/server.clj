@@ -2451,34 +2451,48 @@
                    (row-constraints/eval-default kind value))]
          (resolve-value raw))))))
 
+(declare before-row-insert-triggers?)
+
 (defn- materialize-insert-candidate
   "Evaluate one candidate's target columns in physical column order.
 
    The translated map is only storage; map iteration is never an execution
    order. Omitted non-sequence defaults are materialized here as well, so the
-   final constraint/rebase pass sees values rather than expressions."
-  [candidate constraint-plan db resolve-value]
-  (let [schema (dbi/-schema db)
-        eval-expr #(row-eval/default-value % schema db)
-        attrs
-        (reduce
-         (fn [attrs {:keys [attr default default-ast]}]
-           (let [present? (contains? attrs attr)
-                 resolved (if present?
-                            (resolve-value (get attrs attr))
-                            (materialize-column-default default resolve-value
-                                                        default-ast eval-expr))
-                 coerced (when (some? resolved)
-                           (#'stmt/coerce-insert-value resolved attr schema db))]
-             (cond-> attrs
-               (or present? default) (assoc attr coerced))))
-         candidate
-         (:columns constraint-plan))]
-    (row-constraints/validate-pre-arbiter!
-     db (:table constraint-plan) attrs constraint-plan
-     (row-eval/check-fn db)
-     nil)
-    attrs))
+   final constraint/rebase pass sees values rather than expressions.
+
+   `validate?` false leaves the constraint check to the post-trigger pass.
+   PostgreSQL runs `ExecBRInsertTriggers` AHEAD of `ExecConstraints`
+   (nodeModifyTable.c), precisely so a BEFORE ROW trigger may fix up a
+   row that would otherwise fail -- the `IF NEW.b IS NULL THEN NEW.b :=
+   … END IF` shape. Validating here fired 23502 before the trigger ran
+   at all, so that trigger never got to fix anything. `apply-column-
+   constraints` performs the same checks after the triggers, so nothing
+   goes unchecked."
+  ([candidate constraint-plan db resolve-value]
+   (materialize-insert-candidate candidate constraint-plan db resolve-value true))
+  ([candidate constraint-plan db resolve-value validate?]
+   (let [schema (dbi/-schema db)
+         eval-expr #(row-eval/default-value % schema db)
+         attrs
+         (reduce
+          (fn [attrs {:keys [attr default default-ast]}]
+            (let [present? (contains? attrs attr)
+                  resolved (if present?
+                             (resolve-value (get attrs attr))
+                             (materialize-column-default default resolve-value
+                                                         default-ast eval-expr))
+                  coerced (when (some? resolved)
+                            (#'stmt/coerce-insert-value resolved attr schema db))]
+              (cond-> attrs
+                (or present? default) (assoc attr coerced))))
+          candidate
+          (:columns constraint-plan))]
+     (when validate?
+       (row-constraints/validate-pre-arbiter!
+        db (:table constraint-plan) attrs constraint-plan
+        (row-eval/check-fn db)
+        nil))
+     attrs)))
 
 (defn- materialize-insert-source-projection
   "Resolve INSERT ... SELECT output expressions in SELECT-list order.
@@ -2569,14 +2583,31 @@
 
 (defn- row-entity->columns
   "A candidate entity map as `{column value}`, dropping the internal
-   keys a trigger has no business seeing."
-  [table-name entity]
-  (into {}
-        (keep (fn [[k v]]
-                (when (and (keyword? k) (= table-name (namespace k))
-                           (not= "db-row-exists" (name k)))
-                  [(name k) v])))
-        entity))
+   keys a trigger has no business seeing.
+
+   EVERY column of the table, not only the ones the entity carries:
+   PostgreSQL's NEW is the whole tuple, so `NEW.b := 'x'` works for a
+   column the INSERT did not mention. Built from the entity's own keys,
+   `NEW.b` was not a variable at all and the body died with
+   `new.b is not a known variable` -- which failed the statement, so
+   a BEFORE ROW trigger could veto a row but not rewrite one, the case
+   the trigger machinery mostly exists for.
+
+   nil for a column the candidate lacks is right rather than lossy:
+   defaults are materialised before this runs (see `fire-row-triggers`),
+   so a column still absent here is one the row has no value for, and
+   `columns->row-entity` drops a nil on the way back rather than writing
+   an explicit NULL over it."
+  [db table-name entity]
+  (let [present (into {}
+                      (keep (fn [[k v]]
+                              (when (and (keyword? k) (= table-name (namespace k))
+                                         (not= "db-row-exists" (name k)))
+                                [(name k) v])))
+                      entity)]
+    (reduce (fn [m {:keys [name]}] (if (contains? m name) m (assoc m name nil)))
+            present
+            (row-eval/table-columns db (dbi/-schema db) table-name))))
 
 (defn- columns->row-entity
   "The inverse, merged back over the original so `:db/id`, the row
@@ -2674,6 +2705,13 @@
                           :tg (tg-vars t table-name event)
                           :types {}})))
 
+(defn- before-row-insert-triggers?
+  "Whether `table-name` has any BEFORE ROW trigger for `event`. The
+   candidate pass asks so it can leave constraint checking to the
+   post-trigger pass; see `materialize-insert-candidate`."
+  [db table-name event]
+  (boolean (seq (matching-triggers db table-name event :before :row nil))))
+
 (defn- fire-row-triggers
   "Run the BEFORE ROW triggers of `table-name` over prepared INSERT
    candidates, in trigger-name order as PostgreSQL does.
@@ -2699,7 +2737,7 @@
                         (loop [[t & more] triggers, entity entry]
                           (if (nil? t)
                             entity
-                            (let [cols (row-entity->columns table-name entity)
+                            (let [cols (row-entity->columns db table-name entity)
                                   {:keys [row]} (run-one-trigger db handler t table-name
                                                                  event cols nil)]
                               ;; nil means the trigger suppressed the row:
@@ -2727,14 +2765,22 @@
 (defn- fire-after-row-triggers!
   "AFTER ROW triggers, over the rows the statement actually wrote.
    PostgreSQL ignores what they return; only their effects and their
-   errors matter, and an error still aborts the statement."
+   errors matter, and an error still aborts the statement.
+
+   `rows` may be a thunk, so a caller that would have to BUILD the row
+   maps does not pay for them on a table with no AFTER trigger -- which
+   is every table, nearly always. Reading a row's full column list is a
+   catalog query now (`row-entity->columns`), and doing it per INSERT
+   showed up as one."
   [db table-name event rows]
-  (when (seq rows)
-    (when-let [triggers (seq (matching-triggers db table-name event :after :row nil))]
-      (let [handler (trigger-handler! table-name)]
-        (doseq [{:keys [new old]} rows
-                t triggers]
-          (run-one-trigger db handler t table-name event new old)))))
+  (when-let [triggers (and (or (fn? rows) (seq rows))
+                           (seq (matching-triggers db table-name event
+                                                   :after :row nil)))]
+    (let [rows (if (fn? rows) (rows) rows)
+          handler (trigger-handler! table-name)]
+      (doseq [{:keys [new old]} rows
+              t triggers]
+        (run-one-trigger db handler t table-name event new old))))
   nil)
 
 (defn- keep-row-deletes
@@ -2895,7 +2941,9 @@
                           (materialize-insert-source-projection
                            (:insert-source-order parsed) base-db resolve-value))
               candidate (materialize-insert-candidate
-                         candidate constraint-plan base-db resolve-value)
+                         candidate constraint-plan base-db resolve-value
+                         (not (before-row-insert-triggers?
+                               base-db (:table constraint-plan) :insert)))
               ;; ON CONFLICT arbitration has statement-wide state: two source
               ;; rows may not update the same target, and an earlier update can
               ;; change the key seen by a later row. Carry that reducer state
@@ -3034,8 +3082,8 @@
             (transact-speculative-report! conn db tx-report))
           (do (fire-after-row-triggers!
                (d/db conn) table-name :insert
-               (mapv (fn [e] {:new (row-entity->columns table-name e)})
-                     (filter map? tx-data)))
+               (fn [] (mapv (fn [e] {:new (row-entity->columns db table-name e)})
+                            (filter map? tx-data))))
               (fire-statement-triggers! (d/db conn) table-name :insert :after)
               (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))))
     (catch Exception e
@@ -8405,8 +8453,10 @@
           (or returning-result
               (do (fire-after-row-triggers!
                    (:speculative-db @tx-state) table-name :insert
-                   (mapv (fn [e] {:new (row-entity->columns table-name e)})
-                         (filter map? (:tx-data prepared))))
+                   (fn [] (let [after-db (:speculative-db @tx-state)]
+                            (mapv (fn [e] {:new (row-entity->columns
+                                                 after-db table-name e)})
+                                  (filter map? (:tx-data prepared))))))
                   (fire-statement-triggers! (:speculative-db @tx-state)
                                             table-name :insert :after)
                   (empty-result (str "INSERT 0 " (insert-affected-count parsed))))))

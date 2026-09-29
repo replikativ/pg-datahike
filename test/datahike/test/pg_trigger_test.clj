@@ -116,6 +116,47 @@
     (ok! h "INSERT INTO t VALUES (1,'orig'),(2,'orig')")
     (is (= [["1" "stamped"] ["2" "stamped"]] (rows (ok! h "SELECT i, s FROM t ORDER BY i"))))))
 
+(deftest a-trigger-may-assign-to-a-column-the-insert-omitted
+  ;; NEW is the whole tuple in PostgreSQL. It was built from the
+  ;; candidate entity's own keys here, so a column the INSERT did not
+  ;; mention was not a variable at all and the body died with
+  ;; `new.s is not a known variable` -- failing the statement. The test
+  ;; above did not catch it because its INSERT supplies every column.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int, s text)")
+    (trigfn! h "stamp" "BEGIN NEW.s := 'stamped'; RETURN NEW; END")
+    (ok! h "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE PROCEDURE stamp()")
+    (ok! h "INSERT INTO t (i) VALUES (1)")
+    (is (= [["1" "stamped"]] (rows (ok! h "SELECT i, s FROM t"))))
+    (testing "and may set one back to NULL"
+      (trigfn! h "blank" "BEGIN NEW.s := NULL; RETURN NEW; END")
+      (ok! h "CREATE TABLE u (i int, s text)")
+      (ok! h "CREATE TRIGGER ur BEFORE INSERT ON u FOR EACH ROW EXECUTE PROCEDURE blank()")
+      (ok! h "INSERT INTO u VALUES (1, 'given')")
+      (is (= [["1" nil]] (rows (ok! h "SELECT i, s FROM u")))))))
+
+(deftest a-before-trigger-runs-ahead-of-the-constraints
+  ;; `ExecBRInsertTriggers` before `ExecConstraints` (nodeModifyTable.c),
+  ;; which is what lets a trigger fix up a row that would otherwise
+  ;; fail. NOT NULL was being checked while the candidate was built --
+  ;; before any trigger ran -- so the fixup shape never got the chance.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int, s text NOT NULL, n int DEFAULT 9, d text)")
+    (trigfn! h "fixup"
+             (str "BEGIN IF NEW.s IS NULL THEN NEW.s := 'filled'; END IF;"
+                  " NEW.d := 'n-was-' || NEW.n::text; RETURN NEW; END"))
+    (ok! h "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE PROCEDURE fixup()")
+    (ok! h "INSERT INTO t (i) VALUES (1)")
+    (is (= [["1" "filled" "9" "n-was-9"]]
+           (rows (ok! h "SELECT i, s, n, d FROM t")))
+        "the trigger also sees the DEFAULT already materialised")
+    (testing "the constraint still bites when the trigger does not fix it"
+      (ok! h "CREATE TABLE u (i int, s text NOT NULL)")
+      (trigfn! h "passthru" "BEGIN RETURN NEW; END")
+      (ok! h "CREATE TRIGGER ur BEFORE INSERT ON u FOR EACH ROW EXECUTE PROCEDURE passthru()")
+      (is (str/includes? (str (err (exec h "INSERT INTO u (i) VALUES (1)")))
+                         "not-null")))))
+
 (deftest returning-null-suppresses-the-row
   (with-h [h (fresh-handler)]
     (ok! h "CREATE TABLE t (i int)")
