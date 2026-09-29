@@ -230,7 +230,10 @@
     "primary" "key" "foreign" "references" "unique" "check"
     "default" "create" "alter" "drop" "as" "on"})
 
-(defn- quote-ident [^String s]
+(defn quote-ident
+  "A SQL identifier, quoted. Public because the trigger path materialises
+   transition tables through SQL text and must quote names the same way."
+  [^String s]
   ;; Always quote: simpler + always correct. PG's lower-case folding
   ;; for unquoted idents would otherwise mangle the case for clients
   ;; that round-trip through pg_dump.
@@ -474,8 +477,13 @@
     (keyword? v) (subs (str v) 1)
     :else (str v)))
 
-(defn- format-value-for-insert
-  "Render a Clojure value as a SQL literal for an INSERT clause."
+(defn format-value-for-insert
+  "Render a Clojure value as a SQL literal for an INSERT clause.
+
+   Public because the trigger path builds the INSERT that fills a
+   transition table. Rendering values a second time there would be a
+   second set of quoting rules to get wrong; this one is covered by the
+   dump round-trip suite."
   [v col]
   (cond
     (nil? v) "NULL"

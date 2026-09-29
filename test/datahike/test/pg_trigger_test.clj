@@ -188,6 +188,104 @@
       (is (= "INSERT 0 2" (.commandTag r))))
     (is (= [["2"] ["4"]] (rows (ok! h "SELECT i FROM t ORDER BY i"))))))
 
+(deftest transition-tables
+  ;; `REFERENCING { OLD | NEW } TABLE AS name` -- the statement's before
+  ;; and after images, as relations the body can query. PostgreSQL keeps
+  ;; them as tuplestores in the query environment; there is no analogue
+  ;; here, so they are materialised as temp tables for the duration of
+  ;; the body, created from the source table's own shape.
+  ;;
+  ;; The clause was PARSED but always rejected -- and it was read after
+  ;; `FOR EACH`, where PostgreSQL's grammar puts it before, so it never
+  ;; matched anything anyway. 55 of `triggers.sql`'s CREATE TRIGGER
+  ;; statements use it.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (a int, b text)")
+    (trigfn! h "report"
+             (str "DECLARE n int; s text; BEGIN"
+                  " SELECT count(*), string_agg(b, ',' ORDER BY a) INTO n, s"
+                  " FROM nt; INSERT INTO log VALUES (n, s); RETURN NULL; END"))
+    (ok! h "CREATE TABLE log (n int, s text)")
+    (ok! h (str "CREATE TRIGGER tr AFTER INSERT ON t REFERENCING NEW TABLE AS nt"
+                " FOR EACH STATEMENT EXECUTE FUNCTION report()"))
+    (ok! h "INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z')")
+    (is (= [["3" "x,y,z"]] (rows (ok! h "SELECT n, s FROM log")))
+        "the whole statement's rows, in one relation")
+    (testing "an empty statement still fires, with an empty relation"
+      (ok! h "DELETE FROM log")
+      (ok! h "INSERT INTO t SELECT 9, 'q' WHERE false")
+      (is (= [["0" nil]] (rows (ok! h "SELECT n, s FROM log")))))
+    ;; Last: a failing statement aborts the handler's transaction, so
+    ;; nothing may follow it here.
+    (testing "the relation does not outlive the body"
+      (is (some? (err (exec h "SELECT * FROM nt")))))))
+
+(deftest transition-tables-on-update-and-delete
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (a int, b text)")
+    (ok! h "CREATE TABLE log (o text, n text)")
+    (trigfn! h "both"
+             (str "DECLARE o text; n text; BEGIN"
+                  " SELECT string_agg(b, ',' ORDER BY a) INTO o FROM ot;"
+                  " SELECT string_agg(b, ',' ORDER BY a) INTO n FROM nt;"
+                  " INSERT INTO log VALUES (o, n); RETURN NULL; END"))
+    (trigfn! h "gone"
+             (str "DECLARE o text; BEGIN"
+                  " SELECT string_agg(b, ',' ORDER BY a) INTO o FROM ot;"
+                  " INSERT INTO log VALUES (o, NULL); RETURN NULL; END"))
+    (ok! h (str "CREATE TRIGGER tu AFTER UPDATE ON t"
+                " REFERENCING OLD TABLE AS ot NEW TABLE AS nt"
+                " FOR EACH STATEMENT EXECUTE FUNCTION both()"))
+    (ok! h (str "CREATE TRIGGER td AFTER DELETE ON t REFERENCING OLD TABLE AS ot"
+                " FOR EACH STATEMENT EXECUTE FUNCTION gone()"))
+    (ok! h "INSERT INTO t VALUES (1,'x'),(2,'y')")
+    (ok! h "UPDATE t SET b = b || '!'")
+    (is (= [["x,y" "x!,y!"]] (rows (ok! h "SELECT o, n FROM log"))))
+    (ok! h "DELETE FROM log")
+    (ok! h "DELETE FROM t WHERE a = 2")
+    (is (= [["y!" nil]] (rows (ok! h "SELECT o, n FROM log"))))))
+
+(deftest transition-table-rules-match-postgresql
+  ;; trigger.c's own checks, with its own wording.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (a int, b text)")
+    (trigfn! h "noop" "BEGIN RETURN NULL; END")
+    (let [bad (fn [sql] (str (err (exec h sql))))]
+      (is (str/includes?
+           (bad (str "CREATE TRIGGER x BEFORE INSERT ON t REFERENCING NEW TABLE AS nt"
+                     " FOR EACH STATEMENT EXECUTE FUNCTION noop()"))
+           "transition table name can only be specified for an AFTER trigger"))
+      (is (str/includes?
+           (bad (str "CREATE TRIGGER x AFTER INSERT OR UPDATE ON t REFERENCING NEW TABLE AS nt"
+                     " FOR EACH STATEMENT EXECUTE FUNCTION noop()"))
+           "more than one event"))
+      (is (str/includes?
+           (bad (str "CREATE TRIGGER x AFTER UPDATE OF b ON t REFERENCING NEW TABLE AS nt"
+                     " FOR EACH STATEMENT EXECUTE FUNCTION noop()"))
+           "column lists"))
+      (is (str/includes?
+           (bad (str "CREATE TRIGGER x AFTER DELETE ON t REFERENCING NEW TABLE AS nt"
+                     " FOR EACH STATEMENT EXECUTE FUNCTION noop()"))
+           "NEW TABLE can only be specified for an INSERT or UPDATE trigger"))
+      (is (str/includes?
+           (bad (str "CREATE TRIGGER x AFTER INSERT ON t REFERENCING OLD TABLE AS ot"
+                     " FOR EACH STATEMENT EXECUTE FUNCTION noop()"))
+           "OLD TABLE can only be specified for a DELETE or UPDATE trigger")))))
+
+(deftest dropping-a-table-drops-its-triggers
+  ;; A trigger is a dependent of its table. Left in the registry, the
+  ;; name was still taken -- a later CREATE TABLE of the same name could
+  ;; not define a trigger of the same name -- and the orphan matched the
+  ;; new table on every write. Regression files drop and recreate tables
+  ;; constantly.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (a int)")
+    (trigfn! h "noop" "BEGIN RETURN NULL; END")
+    (ok! h "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH STATEMENT EXECUTE FUNCTION noop()")
+    (ok! h "DROP TABLE t")
+    (ok! h "CREATE TABLE t (a int)")
+    (ok! h "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH STATEMENT EXECUTE FUNCTION noop()")))
+
 (deftest several-triggers-run-in-name-order
   (with-h [h (fresh-handler)]
     (ok! h "CREATE TABLE t (i int, s text)")

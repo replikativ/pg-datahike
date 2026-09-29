@@ -1324,6 +1324,24 @@
               {:kind :drop-matview :matviews names :if-exists? (boolean ie?)})))
         reject)))
 
+(defn- read-transition-tables
+  "`REFERENCING { OLD | NEW } TABLE [AS] name [ … ]` -- the transition
+   relations an AFTER trigger sees. Returns `[{:old n :new n} idx]`,
+   the index one past the clause.
+
+   PostgreSQL allows the two in either order and repeats `TABLE` for
+   each, so this loops rather than reading a fixed shape."
+  [toks i]
+  (loop [i i, acc {}]
+    (let [w (some-> (ident-text (nth toks i nil)) str/lower-case)]
+      (if-not (and (contains? #{"old" "new"} w)
+                   (kw=? (nth toks (inc i) nil) "table"))
+        [(not-empty acc) i]
+        (let [j (if (kw=? (nth toks (+ i 2) nil) "as") (+ i 3) (+ i 2))]
+          (if-let [nm (ident-text (nth toks j nil))]
+            (recur (inc j) (assoc acc (keyword w) nm))
+            [(not-empty acc) i]))))))
+
 (defn- classify-create-trigger
   "CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} event [OR event …]
    ON table [FOR [EACH] {ROW|STATEMENT}] [WHEN (condition)]
@@ -1378,6 +1396,14 @@
                                             (kw=? (nth toks i nil) "deferrable")
                                             (kw=? (nth toks i nil) "not")
                                             (kw=? (nth toks i nil) "initially"))
+                       ;; REFERENCING OLD/NEW TABLE -- transition tables.
+                       ;; PostgreSQL's grammar puts this BEFORE `FOR
+                       ;; EACH`, so it is read first; reading it after
+                       ;; never matched, which is why the clause only
+                       ;; ever served as a reject flag.
+                       [transitions i] (if (kw=? (nth toks i nil) "referencing")
+                                         (read-transition-tables toks (inc i))
+                                         [nil i])
                        [level i] (if (kw=? (nth toks i nil) "for")
                                    (let [i (inc i)
                                          i (if (kw=? (nth toks i nil) "each") (inc i) i)]
@@ -1387,15 +1413,13 @@
                                        :else [nil i]))
                                    ;; PostgreSQL's default.
                                    [:statement i])
-                       ;; REFERENCING OLD/NEW TABLE -- transition tables.
-                       referencing? (kw=? (nth toks i nil) "referencing")
                        [when-cond i] (if (kw=? (nth toks i nil) "when")
                                        (if-let [[inner rest-ts] (read-balanced (drop (inc i) toks))]
                                          [(slice-between inner)
                                           (- (count toks) (count rest-ts))]
                                          [nil i])
                                        [nil i])]
-                   (when (and level (not constraint-bits?) (not referencing?)
+                   (when (and level (not constraint-bits?)
                               (kw=? (nth toks i nil) "execute")
                               (or (kw=? (nth toks (inc i) nil) "procedure")
                                   (kw=? (nth toks (inc i) nil) "function")))
@@ -1411,6 +1435,7 @@
                           :level level
                           :when-condition when-cond
                           :function fname
+                          :transition-tables transitions
                           :arguments (vec (keep :value args))}))))))))))
      reject)))
 
