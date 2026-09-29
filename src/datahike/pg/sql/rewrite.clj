@@ -286,6 +286,34 @@
                                   acc')]
                       (recur end-idx acc''))))))))))))
 
+(def unnamed-check-sentinel
+  "Injected by `alter-add-check-rule`; recognised as \"no name given\"."
+  "CONSTRAINT __pg_unnamed_check__")
+
+(defn alter-add-check-rule
+  "Name an `ALTER TABLE ... ADD CHECK (...)`.
+
+   JSqlParser's ALTER grammar accepts `ADD CONSTRAINT <name> CHECK (...)`
+   but not the unnamed `ADD CHECK (...)` that PostgreSQL also allows and
+   that the regression suite writes. Injecting `CONSTRAINT
+   __pg_unnamed_check__` makes it parse; the executor treats that
+   sentinel as no name and generates PostgreSQL's own (`t_check`,
+   `t_check1`, ...), which is what an unnamed CHECK gets anyway."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (dec n))
+        acc
+        (let [t (nth toks i)]
+          (if (and (= "add" (kw-text t))
+                   (= "check" (kw-text (nth toks (inc i) nil)))
+                   (punct? (nth toks (+ i 2) nil) "("))
+            (recur (+ i 2)
+                   (conj acc [(:pos (nth toks (inc i)))
+                              (:pos (nth toks (inc i)))
+                              (str unnamed-check-sentinel " ")]))
+            (recur (inc i) acc)))))))
+
 (defn- fk-column-count
   "How many columns the table-level `FOREIGN KEY (...)` ending at the `)`
    before `ref-idx` names. Walks back to the matching `(` and counts the
@@ -1252,6 +1280,7 @@
    rules here are disjoint."
   [inline-references-rule
    table-level-fk-match-rule
+   alter-add-check-rule
    create-index-anonymous-rule
    select-from-rule
    quote-reserved-alias-rule

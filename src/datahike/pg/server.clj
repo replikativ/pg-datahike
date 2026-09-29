@@ -1964,6 +1964,96 @@
                        db table-name)))]
     (if (= ::nil v) [] v)))
 
+(defn- table-row-attrs
+  "Every existing row of `table`, as its storage-attribute map. The
+   row-existence marker is the anchor -- a row with all columns NULL has
+   no other datom."
+  [db table]
+  (let [marker (pgs/row-marker-attr table)]
+    (when (contains? (dbi/-schema db) marker)
+      (->> (d/q {:find '[?e] :where [['?e marker true]]} db)
+           (mapv (fn [[eid]] (into {} (remove (comp #{:db/id} key))
+                                   (d/pull db '[*] eid))))))))
+
+(defn- validate-added-check!
+  "PostgreSQL validates a CHECK against the rows already in the table and
+   refuses the ALTER if any fails (23514) -- the constraint would
+   otherwise be true of new rows and false of old ones."
+  [db table cname ast]
+  (let [plan (row-constraints/constraint-plan db table)
+        eval-check (row-eval/check-fn db)
+        schema (:schema db)]
+    (doseq [attrs (table-row-attrs db table)
+            :let [logical (row-constraints/logical-row table attrs (:columns plan))]
+            :when (false? (eval-check ast logical table schema))]
+      (throw (ex-info (str "check constraint \"" cname "\" of relation \""
+                           table "\" is violated by some row")
+                      {:error :check-violation :sqlstate "23514"
+                       :table table :constraint cname})))))
+
+(defn- validate-added-fk!
+  "The same pass for a foreign key: every existing row with a
+   fully-specified key must already have its parent (23503). A key with
+   any NULL is satisfied vacuously, as MATCH SIMPLE says."
+  [db table cname cols parent-table parent-cols]
+  (let [parent-attrs (mapv #(keyword parent-table %) parent-cols)]
+    (doseq [attrs (table-row-attrs db table)
+            :let [child-vals (mapv #(get attrs (keyword table %)) cols)]
+            :when (every? some? child-vals)
+            :when (nil? (ffirst (d/q {:find '[?p]
+                                      :where (mapv (fn [attr v] ['?p attr v])
+                                                   parent-attrs child-vals)}
+                                     db)))]
+      (throw (ex-info "foreign key violation"
+                      {:error :foreign-key-violation
+                       :table table :constraint cname
+                       :detail (str "Key (" (str/join ", " cols) ")=("
+                                    (str/join ", " (map str child-vals))
+                                    ") is not present in table \""
+                                    parent-table "\".")})))))
+
+(defn- added-constraint-tx
+  "The constraint entity an `ALTER TABLE ... ADD` writes -- the same shape
+   CREATE TABLE writes, so the two spellings cannot drift apart -- after
+   validating the rows already in the table."
+  [db table taken {:keys [op name expr cols parent-table parent-cols
+                          on-delete on-update]}]
+  (case op
+    :add-check
+    (let [cname (or name (ddl/generated-constraint-name taken table nil "check"))
+          ast (row-constraints/parse-constraint-expression expr)]
+      (validate-added-check! db table cname ast)
+      [{:pg/constraint-key (ddl/constraint-key table cname)
+        :pg/check-conname cname
+        :pg/check-table table
+        :pg/check-expr expr}])
+
+    :add-foreign-key
+    (let [cname (or name (ddl/generated-constraint-name
+                          taken table (str/join "_" cols) "fkey"))
+          parent-cols (if (seq parent-cols)
+                        parent-cols
+                        (ddl/primary-key-cols db parent-table))
+          ->action {"cascade" :cascade "set null" :set-null
+                    "set default" :set-default "restrict" :restrict
+                    "no action" :no-action}]
+      (when (empty? parent-cols)
+        (throw (ex-info (str "there is no primary key for referenced table \""
+                             parent-table "\"")
+                        {:error :invalid-foreign-key :sqlstate "42830"
+                         :table table :constraint cname})))
+      (validate-added-fk! db table cname cols parent-table parent-cols)
+      [(cond-> {:pg/constraint-key (ddl/constraint-key table cname)
+                :pg/fk-conname cname
+                :pg/fk-child-table table
+                :pg/fk-child-cols (jb/serialize-jsonb cols)
+                :pg/fk-parent-table parent-table
+                :pg/fk-parent-cols (jb/serialize-jsonb parent-cols)}
+         on-delete (assoc :pg/fk-on-delete (->action on-delete :no-action))
+         on-update (assoc :pg/fk-on-update (->action on-update :no-action)))])
+
+    nil))
+
 (defn- enforce-fk-on-insert!
   "For each FK where this table is the child, verify every row in
    `entity-maps` references an existing parent-row. Raises 23503 on
@@ -10925,6 +11015,27 @@
                                                        {:db/ident attr :db/index true})))
                                                  nil))
                                              operations))
+            ;; CHECK and FOREIGN KEY added by ALTER. The whole operation
+            ;; used to end at `{:op :add-constraint}`, which nothing
+            ;; consumed -- the statement answered ALTER TABLE and added
+            ;; nothing, so a CHECK that should have refused a row let it
+            ;; through and an FK never looked for its parent.
+            added-constraint-data
+            (let [existing (row-constraints/constraint-metadata db table)
+                  ;; Both kinds. Seeding from checks alone let a second
+                  ;; unnamed FK generate the name the first already had,
+                  ;; and the two entities shared a :pg/constraint-key --
+                  ;; the second silently replaced the first.
+                  taken (atom (into #{} (map :constraint)
+                                    (concat (:checks existing) (:fks existing))))]
+              (vec (mapcat (fn [{:keys [op] :as operation}]
+                             (when (contains? #{:add-check :add-foreign-key} op)
+                               (let [tx (added-constraint-tx db table @taken operation)]
+                                 (swap! taken into (keep (some-fn :pg/check-conname
+                                                                  :pg/fk-conname))
+                                        tx)
+                                 tx)))
+                           operations)))
             attnum-data
             (when first-attnum
               (catalog-objects/create-columns-tx
@@ -10953,7 +11064,8 @@
                         nil))
                     operations)
             tx-data (into schema-and-constraint-data
-                          (concat attnum-data inherited-column-data
+                          (concat added-constraint-data attnum-data
+                                  inherited-column-data
                                   hint-data lifecycle-data))
             tx-data (if (and relation-oid (seq tx-data))
                       (into tx-data

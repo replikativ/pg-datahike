@@ -2435,8 +2435,20 @@
                                               {:op :add-unique
                                                :columns (mapv unquote-ident
                                                               (or uk-cols (.getColumnsNames idx)))}
-                                              ;; FK, CHECK, etc. — no-op
-                                              :else {:op :add-constraint}))
+                                              ;; CHECK and FOREIGN KEY ride
+                                              ;; along in getIndex as the same
+                                              ;; CheckConstraint /
+                                              ;; ForeignKeyIndex nodes CREATE
+                                              ;; TABLE gets, so `ddl/alter-added-
+                                              ;; constraint` reads them the one
+                                              ;; way. They used to fall through
+                                              ;; to `{:op :add-constraint}`,
+                                              ;; which nothing consumed: the
+                                              ;; statement answered ALTER TABLE
+                                              ;; and added no constraint.
+                                              :else
+                                              (or (ddl/alter-added-constraint exp)
+                                                  {:op :add-constraint})))
                                 ;; DROP COLUMN
                                           (and (= op "DROP") (.hasColumn exp))
                                           {:op :drop-column
