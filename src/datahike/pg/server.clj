@@ -54,6 +54,7 @@
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector]
             [datahike.pg.window :as window]
+            [datahike.pg.dump :as dump]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks]
             [datahike.pg.plpgsql.parse :as pl-parse]
@@ -2748,19 +2749,82 @@
                                 (recur more (columns->row-entity db table-name entity row))))))))
                     tx-data))))))
 
+(defn- transition-relation-sql
+  "A transition relation as SQL a CTE can hold: `VALUES (…), (…)` with
+   every value cast to its column's type, or a typed empty relation.
+
+   Values are rendered by the dump's literal writer rather than pasted
+   in: it is the one place in the tree that already knows how to quote
+   every type we store, and it is covered by the dump round-trip suite.
+   The casts matter -- a bare VALUES list types its columns from the
+   literals, so `'x'` would arrive as unknown and an all-NULL column as
+   text."
+  [db table-name rows]
+  (let [cols (row-eval/table-columns db (dbi/-schema db) table-name)
+        schema (dbi/-schema db)
+        ;; The declared SQL type when the column carries one (`:pg/type`
+        ;; records it where Datahike's valueType is a reduction -- date
+        ;; and timestamp are both :db.type/instant), else the valueType's
+        ;; own name.
+        type-of (fn [{:keys [name]}]
+                  (let [attr (keyword table-name name)
+                        ent (d/entity db attr)]
+                    (or (:pg/type ent)
+                        (types/pg-name-for-dh-type
+                         (get-in schema [attr :db/valueType])))))]
+    {:cols (mapv :name cols)
+     :sql
+     (if (empty? rows)
+       ;; VALUES cannot be empty, and an empty relation still has types.
+       (str "SELECT "
+            (str/join ", " (for [c cols]
+                             (str "NULL::" (type-of c) " AS "
+                                  (dump/quote-ident (:name c)))))
+            " WHERE false")
+       (str "VALUES "
+            (str/join ", "
+                      (for [row rows]
+                        (str "("
+                             (str/join ", "
+                                       (for [{:keys [name] :as c} cols]
+                                         (str (dump/format-value-for-insert
+                                               (get row name)
+                                               {:spec (get schema (keyword table-name name))})
+                                              "::" (type-of c))))
+                             ")")))))}))
+
+(defn- trigger-transitions
+  "`{name {:cols … :sql …}}` for a trigger's declared OLD/NEW TABLE, or
+   nil when it declares none."
+  [db table-name t rows]
+  (when-let [tts (:transition-tables t)]
+    (into {}
+          (map (fn [[which tname]]
+                 [(str/lower-case tname)
+                  (transition-relation-sql
+                   db table-name
+                   (vec (keep (if (= :old which) :old :new) rows)))]))
+          tts)))
+
 (defn- fire-statement-triggers!
   "Statement-level triggers. They see no row -- NEW and OLD are not
    defined for them -- and their return value is ignored. PostgreSQL
    fires them even when the statement matched no rows, which is most of
    what they are for."
-  [db table-name event timing]
-  (when-let [triggers (seq (matching-triggers db table-name event timing :statement nil))]
-    (let [handler (trigger-handler! table-name)]
-      (doseq [t triggers]
-        (when (when-condition-holds? handler t table-name nil nil)
-          (pl-exec/run-trigger handler (trigger-ast db t)
-                               {:tg (tg-vars t table-name event) :types {}})))))
-  nil)
+  ([db table-name event timing]
+   (fire-statement-triggers! db table-name event timing nil))
+  ([db table-name event timing rows]
+   (when-let [triggers (seq (matching-triggers db table-name event timing :statement nil))]
+     (let [handler (trigger-handler! table-name)
+           rows (delay (if (fn? rows) (rows) rows))]
+       (doseq [t triggers]
+         (when (when-condition-holds? handler t table-name nil nil)
+           (pl-exec/run-trigger handler (trigger-ast db t)
+                                {:tg (tg-vars t table-name event) :types {}
+                                 :transitions (trigger-transitions
+                                               db table-name t
+                                               (when (:transition-tables t) @rows))})))))
+   nil))
 
 (defn- fire-after-row-triggers!
   "AFTER ROW triggers, over the rows the statement actually wrote.
@@ -3103,12 +3167,13 @@
         (do
           (when speculative?
             (transact-speculative-report! conn db tx-report))
-          (do (fire-after-row-triggers!
-               (d/db conn) table-name :insert
-               (fn [] (mapv (fn [e] {:new (row-entity->columns db table-name e)})
-                            (filter map? tx-data))))
-              (fire-statement-triggers! (d/db conn) table-name :insert :after)
-              (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))))
+          (let [after-rows (fn [] (mapv (fn [e] {:new (row-entity->columns
+                                                       db table-name e)})
+                                        (filter map? tx-data)))]
+            (fire-after-row-triggers! (d/db conn) table-name :insert after-rows)
+            (fire-statement-triggers! (d/db conn) table-name :insert :after
+                                      after-rows)
+            (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
 
@@ -3289,9 +3354,9 @@
           full-tx (tx-wrap full-tx)]
       (when (seq full-tx)
         (transact-recorded! conn full-tx))
-      (fire-after-row-triggers! db table :delete
-                                (mapv (fn [e] {:old (get old-rows e)}) kept))
-      (fire-statement-triggers! db table :delete :after)
+      (let [deleted-rows (mapv (fn [e] {:old (get old-rows e)}) kept)]
+        (fire-after-row-triggers! db table :delete deleted-rows)
+        (fire-statement-triggers! db table :delete :after deleted-rows))
       (or returning-result
           (empty-result (str "DELETE " (count kept)))))
     (catch Exception e
@@ -3698,10 +3763,10 @@
                                              (:schema db-after) :update)]
           (when (seq tx-data) (transact-speculative-report! conn db tx-report))
           (fire-after-row-triggers! db table :update after-rows)
-          (fire-statement-triggers! db table :update :after)
+          (fire-statement-triggers! db table :update :after after-rows)
           result)
         (do (fire-after-row-triggers! db table :update after-rows)
-            (fire-statement-triggers! db table :update :after)
+            (fire-statement-triggers! db table :update :after after-rows)
             ;; A row a BEFORE trigger cancelled was not updated, so it
             ;; is not counted. Every other MATCHED row is, including one
             ;; whose new value equals its old.
@@ -8474,15 +8539,15 @@
                                   (assoc :begin-max-tx (:max-tx durable-db)))
                                 (update :eid->tempid merge new-tempids))))
           (or returning-result
-              (do (fire-after-row-triggers!
-                   (:speculative-db @tx-state) table-name :insert
-                   (fn [] (let [after-db (:speculative-db @tx-state)]
-                            (mapv (fn [e] {:new (row-entity->columns
-                                                 after-db table-name e)})
-                                  (filter map? (:tx-data prepared))))))
-                  (fire-statement-triggers! (:speculative-db @tx-state)
-                                            table-name :insert :after)
-                  (empty-result (str "INSERT 0 " (insert-affected-count parsed))))))
+              (let [after-rows (fn [] (let [after-db (:speculative-db @tx-state)]
+                                        (mapv (fn [e] {:new (row-entity->columns
+                                                             after-db table-name e)})
+                                              (filter map? (:tx-data prepared)))))]
+                (fire-after-row-triggers! (:speculative-db @tx-state)
+                                          table-name :insert after-rows)
+                (fire-statement-triggers! (:speculative-db @tx-state)
+                                          table-name :insert :after after-rows)
+                (empty-result (str "INSERT 0 " (insert-affected-count parsed))))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
@@ -8598,7 +8663,7 @@
           (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
                                     :update after-rows)
           (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
-                                    :update :after)
+                                    :update :after after-rows)
           (or returning-result
               (empty-result (str "UPDATE " (- (count eids) cancelled)))))
         (catch Exception e
@@ -8667,10 +8732,11 @@
                                   (assoc :tx-buffer (into buffer (guard-catalog-tx commit-tx-data))
                                          :speculative-db (:db-after spec-report))
                                   (update :eid->tempid #(apply dissoc % inserted-eids))))))
-          (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed) :delete
-                                    (mapv (fn [e] {:old (get old-rows e)}) eids))
-          (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
-                                    :delete :after)
+          (let [deleted-rows (mapv (fn [e] {:old (get old-rows e)}) eids)]
+            (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
+                                      :delete deleted-rows)
+            (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
+                                      :delete :after deleted-rows))
           (or returning-result (empty-result (str "DELETE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
@@ -9161,7 +9227,7 @@
    TABLE in PostgreSQL, not per database, so that is the key."
   [parsed oid]
   (let [{:keys [trigger-name table timing events update-columns level
-                when-condition function arguments]} parsed]
+                when-condition function arguments transition-tables]} parsed]
     [{:db/ident :datahike.pg.trigger/key
       :db/valueType :db.type/string
       :db/cardinality :db.cardinality/one
@@ -9185,6 +9251,7 @@
                                          :update-columns update-columns
                                          :level level :when when-condition
                                          :function function
+                                         :transition-tables transition-tables
                                          :arguments (vec arguments)})}]))
 
 (defn table-triggers
@@ -9224,6 +9291,39 @@
                                            "\" for relation \"" table
                                            "\" already exists")
                                       {:error :duplicate-object :sqlstate "42710"}))
+
+        ;; PostgreSQL's own rules for a transition relation
+        ;; (CreateTrigger, trigger.c): it is the AFTER image of the
+        ;; statement, so BEFORE and INSTEAD OF have nothing to show,
+        ;; and an event has only the side it changes.
+        (and (:transition-tables parsed) (not= :after (:timing parsed)))
+        (classified-error "" (ex-info "transition table name can only be specified for an AFTER trigger"
+                                      {:error :invalid-object-definition :sqlstate "42P17"}))
+
+        (and (:transition-tables parsed) (some #{:truncate} (:events parsed)))
+        (classified-error "" (ex-info "transition tables cannot be specified for triggers with more than one event"
+                                      {:error :feature-not-supported :sqlstate "0A000"}))
+
+        ;; One event only: PostgreSQL shows inserted tuples to INSERT
+        ;; triggers and updated ones to UPDATE triggers, and has not
+        ;; decided what `INSERT OR UPDATE` should see.
+        (and (:transition-tables parsed) (> (count (:events parsed)) 1))
+        (classified-error "" (ex-info "transition tables cannot be specified for triggers with more than one event"
+                                      {:error :feature-not-supported :sqlstate "0A000"}))
+
+        (and (:transition-tables parsed) (seq (:update-columns parsed)))
+        (classified-error "" (ex-info "transition tables cannot be specified for triggers with column lists"
+                                      {:error :feature-not-supported :sqlstate "0A000"}))
+
+        (and (get-in parsed [:transition-tables :new])
+             (some #{:delete} (:events parsed)))
+        (classified-error "" (ex-info "NEW TABLE can only be specified for an INSERT or UPDATE trigger"
+                                      {:error :invalid-object-definition :sqlstate "42P17"}))
+
+        (and (get-in parsed [:transition-tables :old])
+             (some #{:insert} (:events parsed)))
+        (classified-error "" (ex-info "OLD TABLE can only be specified for a DELETE or UPDATE trigger"
+                                      {:error :invalid-object-definition :sqlstate "42P17"}))
 
         :else
         (let [{:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
