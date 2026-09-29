@@ -99,9 +99,26 @@
     (is (= ["t"] (run c "SELECT b FROM df")))
     (is (= ["7"] (run c "SELECT i FROM df")))
     (is (= ["2020-01-02"] (run c "SELECT d FROM df")))
-    (testing "AT TIME ZONE folds into now() only for UTC"
+    (testing "AT TIME ZONE in a DEFAULT is evaluated, not folded"
+      ;; `now() AT TIME ZONE '<zone>'` used to be recognised only for
+      ;; UTC, where it IS `now`, and refused as 0A000 for any other zone
+      ;; -- folding it would have stored a time shifted by the offset.
+      ;; A DEFAULT is now an expression the translator evaluates per
+      ;; write, so the zone is applied instead of guessed at.
       (is (= 0 (run c "CREATE TABLE dz (id int PRIMARY KEY, a timestamp DEFAULT (now() AT TIME ZONE 'UTC'))")))
-      (is (= "0A000" (second (run c "CREATE TABLE dz2 (id int PRIMARY KEY, a timestamp DEFAULT (now() AT TIME ZONE 'America/New_York'))")))))))
+      (is (= 0 (run c (str "CREATE TABLE dz2 (id int PRIMARY KEY,"
+                           " a timestamp DEFAULT (now() AT TIME ZONE 'America/New_York'),"
+                           " b timestamp DEFAULT (now() AT TIME ZONE 'UTC'))"))))
+      (run c "INSERT INTO dz2 (id) VALUES (1)")
+      ;; The zone is really applied: the two differ by New York's offset
+      ;; from UTC, and the column agrees with the same expression run as
+      ;; a query rather than as a default.
+      (is (= ["04:00:00"] (run c "SELECT (b - a)::text FROM dz2"))
+          "a folded default would make the two columns equal")
+      (is (= ["true"]
+             (run c (str "SELECT ((((now() AT TIME ZONE 'America/New_York')"
+                         " - a) < interval '1 minute'))::text FROM dz2")))
+          "the stored default is the same wall clock the expression gives now"))))
 
 (deftest on-conflict-checks-and-where-use-sql-semantics
   (with-open [c (jdbc)]

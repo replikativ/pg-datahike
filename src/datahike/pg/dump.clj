@@ -256,7 +256,13 @@
                                  :else (str v)))
                     :bit (str "B'" (:pg/default-value ent) "'")
                     :bit-coerced (str "'" (:pg/default-value ent) "'")
-                    :now "now()"
+                    ;; `:fn`, not `:now`: the kind ddl.clj stores for a
+                    ;; zero-arg default is `:fn` with the name in
+                    ;; :pg/default-value. `:now` matched nothing, so
+                    ;; every `DEFAULT now()` was dropped from the dump.
+                    :fn (let [v (:pg/default-value ent)]
+                          (if (= "now" v) "now()" v))
+                    :expr (:pg/default-value ent)
                     :nextval (str "nextval('" (:pg/default-arg ent) "')")
                     nil))]
     (str (quote-ident name)

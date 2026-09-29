@@ -282,6 +282,21 @@
                               (recur (inc i) depth sb))))]
                   (str/trim matched))))))))))
 
+(defn parse-default-expression
+  "Parse a DEFAULT expression's text, or nil if JSqlParser cannot read it.
+
+   Only a parse check. Whether the expression can be EVALUATED -- that
+   its functions exist and that it references no column -- is settled by
+   the evaluator at write time, where the same scope rules a CHECK
+   constraint gets apply. PostgreSQL rejects a column reference at CREATE
+   TABLE (\"cannot use column reference in DEFAULT expression\"); we
+   reject it at the first write instead. Loudly, either way."
+  [raw]
+  (when-not (str/blank? raw)
+    (try
+      (CCJSqlParserUtil/parseExpression raw)
+      (catch Exception _ nil))))
+
 (defn column-default-spec
   "If the column spec list carries `DEFAULT <expr>`, return a map
    describing the default so translate-create-table can attach it to
@@ -401,8 +416,27 @@
             (re-matches #"(?i)\(?\s*nextval\s*\(\s*'(?:[^'.]+\.)?([^']+)'\s*(?:::\s*regclass)?\s*\)\s*\)?" base)
             (let [m (re-matches #"(?i)\(?\s*nextval\s*\(\s*'(?:[^'.]+\.)?([^']+)'\s*(?:::\s*regclass)?\s*\)\s*\)?" base)]
               {:kind :nextval :value (second m)})
+            ;; Anything else is kept as its own text and evaluated per
+            ;; write, through the same expression evaluator a CHECK
+            ;; constraint uses. Deferred rather than folded here because
+            ;; the schema entity is written once and the expression may
+            ;; be volatile -- `gen_random_uuid()` folded at CREATE TABLE
+            ;; would give every row the same uuid.
             :else
-            {:kind :unsupported :raw raw}))))))
+            ;; Anything else is kept as its own text and evaluated per
+            ;; write, through the same expression evaluator a CHECK
+            ;; constraint uses. Deferred rather than folded here because
+            ;; the schema entity is written once and the expression may
+            ;; be volatile -- `gen_random_uuid()` folded at CREATE TABLE
+            ;; would give every row the same uuid.
+            ;;
+            ;; The PARSED form is what is stored, not the token join:
+            ;; the specs arrive tokenized, so `raw` reads `100 +1` and
+            ;; `upper ('ab')`, and that text is what `pg_get_expr` shows
+            ;; and what pg_dump writes back out.
+            (if-let [expr (parse-default-expression peeled)]
+              {:kind :expr :value (str expr)}
+              {:kind :unsupported :raw raw})))))))
 
 (defn extract-ddl-constraints
   "Collect PRIMARY KEY and UNIQUE constraints from a CreateTable into a

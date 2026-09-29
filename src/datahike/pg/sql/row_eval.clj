@@ -252,6 +252,22 @@
    (let [v (first (:values (row-values [ast] row ns schema db opts)))]
      (when (some? v) (boolean v)))))
 
+(defn default-value
+  "The value of a column DEFAULT expression, with NO row in scope.
+
+   PostgreSQL evaluates a default the same way it evaluates any other
+   expression, but against an empty tuple: a default may call a function
+   and may read a sequence, and it may not read a column. Passing no
+   table is what enforces the last one -- `scopes` yields an empty scope,
+   so a column reference fails to resolve and raises 42703 rather than
+   reading as NULL and writing a wrong value.
+
+   Evaluated per write, never folded into the schema entity: the
+   expression may be volatile, and `gen_random_uuid()` folded once at
+   CREATE TABLE would give every row the same uuid."
+  [ast schema db]
+  (first (:values (row-values [ast] {} nil schema db))))
+
 (defn check-fn
   "The CHECK evaluator constraint validation takes: (fn [ast row ns schema
    & [column-types]]) over `db`."
