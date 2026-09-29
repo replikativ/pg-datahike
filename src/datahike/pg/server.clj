@@ -7914,23 +7914,6 @@
                     final-aliases (mapv #(nth new-aliases %) visible-indices)]
                 [final-results final-aliases])
               [results find-aliases])
-            ;; `ORDER BY` a window function's output. The value exists
-            ;; only now, so the whole sort waited for it -- the keys are
-            ;; positions in the row just projected.
-            results (if (seq post-window-order-by)
-                      (sort (null-safe-order-cmp post-window-order-by) results)
-                      results)
-            ;; The OFFSET/LIMIT deferred past the window pass above --
-            ;; whichever pair carries it. A sorted query puts it in
-            ;; `sql-limit`, an unsorted one in `limit`, and honouring
-            ;; only the first left the second trimming too early.
-            results (if (seq window-specs)
-                      (let [o (or sql-offset offset)
-                            l (or sql-limit limit)]
-                        (cond->> results
-                          o (drop o)
-                          l (take l)))
-                      results)
             ;; Expressions OVER aggregates: `max(a) - min(a)`,
             ;; `round(avg(x), 2)`, `coalesce(sum(x), 0)`. The translator
             ;; hoisted each aggregate into a hidden `__compound_` column and
@@ -7950,6 +7933,30 @@
               (stmt/apply-compound-projections results find-aliases query
                                                in-args compound-exprs)
               [results find-aliases])
+            ;; `ORDER BY` an output that only exists now -- a window
+            ;; function, or an expression over aggregates. The whole sort
+            ;; waits for it, because a two-key sort cannot be split across
+            ;; two stages and still mean what SQL says, and the keys are
+            ;; positions in the finished row.
+            ;;
+            ;; BELOW the compound step, not above it: `SUM(x)/12 AS m …
+            ;; ORDER BY m` is spliced in by that step, and sorting before
+            ;; it could only sort by the hidden aggregate column. A window
+            ;; key is already computed by here either way.
+            results (if (seq post-window-order-by)
+                      (sort (null-safe-order-cmp post-window-order-by) results)
+                      results)
+            ;; The OFFSET/LIMIT deferred past those stages -- whichever
+            ;; pair carries it. A sorted query puts it in `sql-limit`, an
+            ;; unsorted one in `limit`, and honouring only the first left
+            ;; the second trimming too early.
+            results (if (or (seq window-specs) (seq post-window-order-by))
+                      (let [o (or sql-offset offset)
+                            l (or sql-limit limit)]
+                        (cond->> results
+                          o (drop o)
+                          l (take l)))
+                      results)
             ;; Correlated scalar subqueries (slice A — doc/correlated-lateral-
             ;; plan.md): run each inner SELECT per outer row with the
             ;; correlation columns bound into *from-bindings*, splice the

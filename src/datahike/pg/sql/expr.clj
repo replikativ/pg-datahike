@@ -3969,52 +3969,22 @@
            (.toInstant (.atStartOfDay (java.time.LocalDate/parse trimmed)
                                       java.time.ZoneOffset/UTC)))
           (catch Exception _ nil))
-     ;; PG-lenient date: accepts single-digit month/day (e.g. '2010-11-3').
-     ;; PG's date input is forgiving about leading zeros; LocalDate.parse
-     ;; above requires strict yyyy-MM-dd, so fall through to a pattern
-     ;; formatter that accepts 1- or 2-digit month/day fields.
-     (try (java.util.Date/from
-           (.toInstant (.atStartOfDay
-                        (java.time.LocalDate/parse
-                         trimmed
-                         (.withResolverStyle
-                          (java.time.format.DateTimeFormatter/ofPattern "uuuu-M-d")
-                          java.time.format.ResolverStyle/STRICT))
-                        java.time.ZoneOffset/UTC)))
-          (catch Exception _ nil))
-     ;; PG 'MDY' default style accepts 'M/d/y' (US-slash), e.g. '8/10/7777'.
-     ;; Only consider it if the trimmed input looks like a slash date;
-     ;; don't try on every string.
-     (when (re-matches #"\d{1,2}/\d{1,2}/\d{1,4}" trimmed)
-       (try (java.util.Date/from
-             (.toInstant (.atStartOfDay
-                          (java.time.LocalDate/parse
-                           trimmed
-                           (.withResolverStyle
-                            ;; `uuuu`, not `y`. STRICT resolves
-                            ;; year-of-era only with an era field, so
-                            ;; this pattern -- the one site left on `y`
-                            ;; when the others were converted -- stopped
-                            ;; matching anything at all, and
-                            ;; `'8/10/7777'::timestamp` went from a
-                            ;; timestamp to an error.
-                            (java.time.format.DateTimeFormatter/ofPattern "M/d/uuuu")
-                            java.time.format.ResolverStyle/STRICT))
-                          java.time.ZoneOffset/UTC)))
-            (catch Exception _ nil)))
-     ;; PG also accepts 'Y/M/d' when the year leads (4 digits): the
-     ;; canonical Chinook fixture uses '2002/8/14'-style dates. Real
-     ;; PG parses these via DateStyle=ISO,MDY so we mirror that.
-     (when (re-matches #"\d{4}/\d{1,2}/\d{1,2}" trimmed)
-       (try (java.util.Date/from
-             (.toInstant (.atStartOfDay
-                          (java.time.LocalDate/parse
-                           trimmed
-                           (.withResolverStyle
-                            (java.time.format.DateTimeFormatter/ofPattern "uuuu/M/d")
-                            java.time.format.ResolverStyle/STRICT))
-                          java.time.ZoneOffset/UTC)))
-            (catch Exception _ nil)))
+     ;; A numeric date, in the session's DateStyle ORDER, with an
+     ;; optional time. ONE decoder, shared with the `::date` path:
+     ;; there used to be three patterns here -- `uuuu-M-d`, `M/d/uuuu`
+     ;; and `uuuu/M/d` -- each with the field order baked in, so
+     ;; `SET datestyle TO dmy` changed the `::date` answer and not the
+     ;; `::timestamp` one. Separators carry no meaning: PostgreSQL
+     ;; reads `8/10/2017` and `10-08-2017` the same way, by order.
+     (when-let [[_ f1 f2 f3 t]
+                (re-matches #"(\d{1,6})[-/](\d{1,6})[-/](\d{1,6})(?:[ T](\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?))?"
+                            trimmed)]
+       (when-let [ld (sql-cast/decode-numeric-date
+                      f1 f2 f3 (second types/*date-style*))]
+         (let [ldt (if t
+                     (.atTime ld (java.time.LocalTime/parse t))
+                     (.atStartOfDay ld))]
+           (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC)))))
      ;; ISO 8601 BASIC format -- the separator-less spelling.
      ;; `19970210 173201`, `19970210T173201`, `19970210`, and the same
      ;; with a trailing zone name. PostgreSQL reads all of them, and
