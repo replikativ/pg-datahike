@@ -57,6 +57,56 @@
 ;; Non-matching rows produce the :__null__ sentinel; these filter it out.
 ;; The sql-aggregate->datalog map names them as `datahike.pg.query-fns/filter-*`.
 
+(def ^:dynamic *compensated-float-sum?*
+  "Whether `SUM`/`AVG` over float8 accumulate with compensation.
+
+   OFF by default: PostgreSQL sums float8 naively, and
+   `differential-fuzz` compares our rows against a real PostgreSQL
+   17.7, so a compensated sum would disagree with it in the last digit
+   and fail our own release gate.
+
+   What the default does NOT buy is agreement. float8 addition is not
+   associative, PostgreSQL adds in ITS scan order and we add in ours,
+   so the two already differ on an input that is sensitive to order:
+
+     1e16, 1, 1, 1, 1, -1e16   PostgreSQL 0, here 4 (true sum 4)
+
+   Naive matches PostgreSQL's ALGORITHM, never its ORDER. Compensation
+   does not make us agree with PostgreSQL either -- it makes our own
+   answer the same whatever the plan does, which is what a benchmark
+   graded on exact equality needs: BIRD marks a correct query wrong
+   when we answer 2086.0499999999997 and SQLite answers 2086.05.
+
+   `SET pg_datahike.float_sum = 'compensated'` turns it on per session."
+  false)
+
+(defn- neumaier-sum
+  "Kahan-Babuska-Neumaier summation: the running compensation covers the
+   case the plain Kahan form loses, where the next term is LARGER in
+   magnitude than the accumulator.
+
+   Returns the same double for any permutation of `vs`, which is the
+   whole point -- our join order is not PostgreSQL's."
+  ^double [vs]
+  (loop [vs (seq vs) sum 0.0 c 0.0]
+    (if-not vs
+      (+ sum c)
+      (let [v (double (first vs))
+            t (+ sum v)
+            c (+ c (if (>= (Math/abs sum) (Math/abs v))
+                     ;; the low-order bits of v are what get lost
+                     (+ (- sum t) v)
+                     ;; ...and here it is sum's that do
+                     (+ (- v t) sum)))]
+        (recur (next vs) t c)))))
+
+(defn- sum-doubles
+  "Total of `vs` as a double, compensated or not per the session."
+  [vs]
+  (if *compensated-float-sum?*
+    (neumaier-sum vs)
+    (reduce + 0 vs)))
+
 (defn filter-sum
   "SUM that ignores :__null__ sentinel values. Returns :__null__ if all filtered.
    Uses Clojure's auto-promoting `+` so int8 inputs that overflow
@@ -65,7 +115,12 @@
    is NUMERIC; this one stays for SUM(int4) / SUM(float*)."
   [coll]
   (let [vs (remove #(= :__null__ %) coll)]
-    (if (empty? vs) :__null__ (reduce + 0 vs))))
+    (cond
+      (empty? vs) :__null__
+      ;; Only float8 compensates. An integer sum is exact already, and
+      ;; running it through a double would LOSE precision past 2^53.
+      (and *compensated-float-sum?* (some double? vs)) (sum-doubles vs)
+      :else (reduce + 0 vs))))
 
 (defn filter-sum-float4
   "SUM over a `real` column, accumulated AT float4 precision.
@@ -137,7 +192,9 @@
    preserves precision via BigDecimal."
   [coll]
   (let [vs (remove #(= :__null__ %) coll)]
-    (if (empty? vs) :__null__ (/ (double (reduce + 0 vs)) (count vs)))))
+    (if (empty? vs)
+      :__null__
+      (/ (double (sum-doubles vs)) (count vs)))))
 
 (def ^:private ^:const numeric-min-sig-digits
   "Mirrors PG's `NUMERIC_MIN_SIG_DIGITS` (16). AVG / division aim for

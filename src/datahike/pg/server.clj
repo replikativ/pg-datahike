@@ -1581,6 +1581,11 @@
       (show-setting "statement_timeout"
                     (str (or (:statement-timeout @session-state) 0)))
 
+      (= setting-name "pg_datahike.float_sum")
+      (show-setting "pg_datahike.float_sum"
+                    (if (= :compensated (:float-sum @session-state))
+                      "compensated" "naive"))
+
       (= setting-name "hnsw.ef_search")
       (show-setting "hnsw.ef_search"
                     (str (or (:hnsw-ef-search @session-state) 40)))
@@ -6176,7 +6181,8 @@
   "Session-state keys that behave as resettable GUCs. RESET ALL clears
    these but preserves connection-identity keys (e.g. :db-name)."
   [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search :date-style
-   :valid-at :valid-from :valid-to :statement-timeout :isolation :read-only?])
+   :valid-at :valid-from :valid-to :statement-timeout :isolation :read-only?
+   :float-sum])
 
 (defn- handle-reset
   "RESET ALL / RESET <var>. The datahike.* temporal vars and
@@ -6199,7 +6205,10 @@
       (swap! session-state dissoc :date-style)
 
       (= "hnsw.ef_search" setting)
-      (swap! session-state dissoc :hnsw-ef-search)))
+      (swap! session-state dissoc :hnsw-ef-search)
+
+      (= "pg_datahike.float_sum" setting)
+      (swap! session-state dissoc :float-sum)))
   (empty-result "RESET"))
 
 ;; --- Advisory-lock handlers -------------------------------------------------
@@ -6805,6 +6814,22 @@
               (swap! session-state assoc :date-style
                      (types/parse-date-style
                       raw (or (:date-style @session-state) [:iso :mdy])))))
+          ;; Compensated float summation, OFF by default. See
+          ;; `fns/*compensated-float-sum?*` for why the default cannot
+          ;; change: PostgreSQL sums float8 naively and our own
+          ;; differential gate compares against it.
+          (when (= "pg_datahike.float_sum" setting)
+            (let [v (some-> (or (:value parsed)
+                                (first (:values parsed)))
+                            str/lower-case
+                            (str/replace #"^'|'$" ""))]
+              (case v
+                "naive"       (swap! session-state dissoc :float-sum)
+                "compensated" (swap! session-state assoc :float-sum :compensated)
+                (throw (errors/pg-error
+                        :invalid-parameter-value
+                        {:message (str "pg_datahike.float_sum must be "
+                                       "'naive' or 'compensated'")})))))
           (when (= "hnsw.ef_search" setting)
             (let [value (try
                           (parse-long (or (:value parsed) ""))
@@ -12375,6 +12400,8 @@
                     ;; The date/timestamp OUTPUT format is this session's
                     ;; setting, and the renderer runs on this thread.
                     types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                    fns/*compensated-float-sum?*
+                    (= :compensated (:float-sum @session-state))
                     ;; Parameter types declared by the Parse message affect
                     ;; expression resolution and lowering, not merely the
                     ;; later ParameterDescription. For example, PostgreSQL
@@ -12628,6 +12655,8 @@
                     ;; path too -- a driver that binds parameters was
                     ;; getting ISO whatever the session had set.
                     types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                    fns/*compensated-float-sum?*
+                    (= :compensated (:float-sum @session-state))
                     params/*statement-handler* (or params/*statement-handler* (nested-executor this))
                     *max-result-rows* max-result-rows]
             (or
@@ -12662,6 +12691,8 @@
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
                   types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                  fns/*compensated-float-sum?*
+                  (= :compensated (:float-sum @session-state))
                   params/*cancel* (current-cancel)
                   ;; A plpgsql body runs its statements through the
                   ;; handler that reached it, so it shares this

@@ -246,3 +246,47 @@
     ;; `Keyword cannot be cast to String`. array_agg shared the bug.
     (is (= "a,b" (fns/filter-string-agg-ordered
                   [[:__null__ nil ","] ["a" "a" ","] ["b" "b" ","]])))))
+
+;; ---------------------------------------------------------------------------
+;; Compensated float summation (opt-in)
+;; ---------------------------------------------------------------------------
+
+(deftest compensated-float-sum-is-order-independent
+  ;; float8 addition is not associative, and our join order is not
+  ;; PostgreSQL's, so the same query can answer 2086.0499999999997 where
+  ;; another engine answers 2086.05. A benchmark graded on exact
+  ;; equality then marks a correct query wrong.
+  ;;
+  ;; Compensation does not make us AGREE with PostgreSQL -- nothing
+  ;; short of matching its scan order would. It makes our own answer the
+  ;; same whatever the plan does.
+  (let [vs [1.0E16 1.0 1.0 1.0 1.0 -1.0E16]]
+    (testing "naive summation loses the small terms in one order"
+      (is (= 0.0 (reduce + 0 [1.0E16 1.0 1.0 1.0 1.0 -1.0E16])))
+      (is (= 4.0 (reduce + 0 [1.0 1.0 1.0 1.0 1.0E16 -1.0E16])))
+      (is (not= (reduce + 0 vs)
+                (reduce + 0 [1.0 1.0 1.0 1.0 1.0E16 -1.0E16]))
+          "same multiset, two orders, two answers -- the whole problem.
+           (Note the REVERSE of vs also gives 0.0: it is not reversal
+           that matters but whether the small terms are added while the
+           accumulator is still small.)"))
+    (testing "compensated gives the true sum, whatever the order"
+      (binding [fns/*compensated-float-sum?* true]
+        (doseq [perm [vs (reverse vs) (shuffle vs) (shuffle vs)]]
+          (is (= 4.0 (fns/filter-sum (vec perm))) (pr-str perm)))))
+    (testing "and it is OFF unless the session asks"
+      (is (= 0.0 (fns/filter-sum vs))
+          "the default must stay naive: differential-fuzz compares
+           against a real PostgreSQL, which sums naively")))
+  (testing "an INTEGER sum is untouched -- a double would lose precision past 2^53"
+    (binding [fns/*compensated-float-sum?* true]
+      (let [big (inc (long 9007199254740992))]
+        (is (= (+ big big) (fns/filter-sum [big big]))))))
+  (testing "NULL sentinels are still filtered, and all-NULL is still NULL"
+    (binding [fns/*compensated-float-sum?* true]
+      (is (= 3.0 (fns/filter-sum [1.0 :__null__ 2.0])))
+      (is (= :__null__ (fns/filter-sum [:__null__])))))
+  (testing "AVG uses the same accumulation"
+    (binding [fns/*compensated-float-sum?* true]
+      ;; eight values, true total 4
+      (is (= 0.5 (fns/filter-avg [1.0E16 1.0 1.0 1.0 1.0 -1.0E16 0.0 0.0]))))))
