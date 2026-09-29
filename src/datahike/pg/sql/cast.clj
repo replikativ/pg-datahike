@@ -474,36 +474,72 @@
   "A date written as digits and separators -- the shape PostgreSQL calls
    out of RANGE rather than bad SYNTAX when its fields do not make a
    date."
-  ;; Dashes ONLY, and deliberately. This regex has a second job: it
-  ;; ROUTES to the strict `uuuu-M-d` parser below. Widening it to
-  ;; slashes to improve an error code sent `8/10/2017` to a parser that
-  ;; cannot read slashes, turning a date PostgreSQL accepts into an
-  ;; error. Classification uses `date-ish-shape?`, which is separate
-  ;; for exactly that reason.
-  #"(?i)^\d{1,6}-\d{1,2}-\d{1,2}(\s+(ad|bc))?$")
+  ;; Routes to `parse-date-strict`, which now reads either separator by
+  ;; DateStyle order -- so slashes belong here. They did NOT while that
+  ;; parser was `uuuu-M-d`: widening this regex then sent `8/10/2017`
+  ;; to a parser that could not read slashes and turned a date
+  ;; PostgreSQL accepts into an error. Classification stays separate
+  ;; (`date-ish-shape?`), because the two jobs diverge: `Feb 30, 2024`
+  ;; is a date SHAPE that this parser must not be handed.
+  #"(?i)^\d{1,6}[-/]\d{1,6}[-/]\d{1,6}(\s+(ad|bc))?$")
+
+(defn- two-digit-year
+  "PostgreSQL maps a two-digit year 70-99 to the 1900s and 00-69 to the
+   2000s (`AdjustYearToCurrentCentury`, datetime.c)."
+  [^long y]
+  (cond (>= y 100) y (>= y 70) (+ 1900 y) :else (+ 2000 y)))
+
+(defn decode-numeric-date
+  "Three numeric date fields to a LocalDate, per `DateStyle`'s field
+   ORDER -- the half of DateStyle that says whether `8/10/2017` is
+   August 10th or the 8th of October.
+
+   PostgreSQL's rules (DecodeDateTime):
+
+     - a leading field of FOUR or more digits is the year, whatever the
+       order, so `2017-08-10` reads the same under MDY, DMY and YMD;
+     - otherwise the order assigns the fields, and a two-digit year is
+       mapped to a century;
+     - the fields are then CHECKED, not rolled: `13/10/2017` is a month
+       13 under MDY and an error, while under DMY it is the 13th of
+       October.
+
+   Returns nil when the fields do not make a date; the caller decides
+   whether that is 22008 or 22007. Separators do not matter here --
+   `8/10/2017` and `10-08-2017` differ only in punctuation, and
+   PostgreSQL reads both by order."
+  [^String f1 ^String f2 ^String f3 order]
+  (let [n1 (parse-long f1) n2 (parse-long f2) n3 (parse-long f3)]
+    (when (and n1 n2 n3)
+      (let [[y m d] (cond
+                      ;; A four-digit leading field is unambiguous and
+                      ;; wins over the order, which is why `2017-08-10`
+                      ;; is the same date under every DateStyle.
+                      (>= (count f1) 4) [n1 n2 n3]
+                      (= order :ymd)    [(two-digit-year n1) n2 n3]
+                      (= order :dmy)    [(if (>= (count f3) 4) n3 (two-digit-year n3)) n2 n1]
+                      :else             [(if (>= (count f3) 4) n3 (two-digit-year n3)) n1 n2])]
+        (try (java.time.LocalDate/of (int y) (int m) (int d))
+             (catch Exception _ nil))))))
 
 (defn- parse-date-strict
-  "`yyyy-M-d`, with the fields checked rather than rolled.
+  "A numeric date, with the fields checked rather than rolled and the
+   session's `DateStyle` order applied.
 
-   The default resolver is SMART, which quietly moves 1997-04-31 to the
-   30th and 1997-02-29 to the 28th. PostgreSQL rejects both, and so
-   does STRICT -- which also needs `uuuu` (proleptic year) rather than
-   `yyyy` (year-of-era), so a `BC` date resolves instead of demanding
-   an era field."
+   It used to be `uuuu-M-d` and nothing else, so the ORDER half of
+   DateStyle was ignored on input: `SET datestyle TO ymd` then
+   `date '1/8/1999'` answered 1999-01-08 where PostgreSQL reads day
+   1999 and raises. The rolling resolver was the other half of the
+   problem -- SMART quietly moves 1997-04-31 to the 30th, and
+   PostgreSQL rejects it."
   [^String s]
   (let [bc? (re-find #"(?i)\s+bc$" s)
         body (str/trim (str/replace s #"(?i)\s+(ad|bc)$" ""))]
-    (try
-      (let [d (java.time.LocalDate/parse
-               body
-               (-> (java.time.format.DateTimeFormatterBuilder.)
-                   (.appendPattern "uuuu-M-d")
-                   (.toFormatter)
-                   (.withResolverStyle java.time.format.ResolverStyle/STRICT)))]
+    (when-let [[_ f1 f2 f3] (re-matches #"(\d{1,6})[-/](\d{1,6})[-/](\d{1,6})" body)]
+      (when-let [d (decode-numeric-date f1 f2 f3 (second types/*date-style*))]
         ;; PostgreSQL's 1 BC is the proleptic year 0, 2 BC is -1, and so
         ;; on -- `2040-04-10 BC` is proleptic -2039.
-        (if bc? (.withYear d (- 1 (.getYear d))) d))
-      (catch Exception _ nil))))
+        (if bc? (.withYear d (- 1 (.getYear d))) d)))))
 
 (defn- bad-date!
   "PostgreSQL tells a date whose FIELDS are impossible (22008) from text

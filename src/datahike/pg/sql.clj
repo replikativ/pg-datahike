@@ -310,14 +310,23 @@
 (defn translation-context
   "What a translation depends on besides its SQL, schema and catalog: the
    declared parameter types, the session's temp tables, whether the SQL is
-   nested in a statement (see params/*nested-parse?*), search_path and the
-   database. The cache is server-wide and its keys compare by value, so two
-   databases built by the same DDL have equal schemas and an equal catalog
-   basis; without the name they would share a plan."
+   nested in a statement (see params/*nested-parse?*), search_path,
+   DateStyle and the database. The cache is server-wide and its keys
+   compare by value, so two databases built by the same DDL have equal
+   schemas and an equal catalog basis; without the name they would share
+   a plan.
+
+   DateStyle belongs here because it is read at TRANSLATE time: a
+   literal date is decoded and folded while translating, so
+   `'8/10/2017'::date` is a different value under MDY and under DMY.
+   Without it in the key the first execution's answer was served to the
+   second, and `SET datestyle TO dmy` appeared to do nothing under any
+   driver using the extended protocol -- psql's simple queries happened
+   to miss the cache and looked correct."
   []
   [params/*declared-param-oids* params/*temp-table-map* params/*nested-parse?*
    (when params/*session-state*
-     (select-keys @params/*session-state* [:search-path :db-name]))])
+     (select-keys @params/*session-state* [:search-path :db-name :date-style]))])
 
 (defn- translation-cache-key [sql schema db]
   ;; Keep exact values, not their hashes: native catalog transactions do not
