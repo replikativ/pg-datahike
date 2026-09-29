@@ -1009,15 +1009,24 @@
                     "max"            'max
                     "count_distinct" 'count-distinct
                     agg-sym)]
-    (or (some (fn [[i a]] (when (= a fname) i))
-              (map-indexed vector find-aliases))
-        (some (fn [[i elem]]
-                (when (and (seq? elem)
-                           (let [op (first elem)]
-                             (or (= op agg-sym)
-                                 (= op base-name))))
-                  i))
-              (map-indexed vector find-elems)))))
+    (letfn [(this-aggregate? [elem]
+              (and (seq? elem)
+                   (let [op (first elem)]
+                     (or (= op agg-sym) (= op base-name)))))]
+      (or
+       ;; An output column NAMED for this aggregate -- but only when that
+       ;; column really is this aggregate. PostgreSQL names
+       ;; `(SELECT COUNT(x) FROM …)` `count`, so a scalar subquery in the
+       ;; SELECT list put a column called `count` next to a find element
+       ;; that is just its value. Matching on the name alone then bound
+       ;; `ORDER BY COUNT(x)` to the SUBQUERY's constant, and a grouped
+       ;; query sorted every row by the same number.
+       (some (fn [[i a]]
+               (when (and (= a fname) (this-aggregate? (nth find-elems i nil)))
+                 i))
+             (map-indexed vector find-aliases))
+       (some (fn [[i elem]] (when (this-aggregate? elem) i))
+             (map-indexed vector find-elems))))))
 
 ;; ============================================================================
 ;; Derived-table materialization — shared by FROM (...) AS t and
@@ -5734,6 +5743,19 @@
                                                                       (take matching-select-idx
                                                                             select-items)))]
                                                  (:out-pos (nth @window-specs n nil))))))
+                                         ;; …or the output ALIAS of anything
+                                         ;; computed after the query: a window
+                                         ;; function, or an expression over
+                                         ;; aggregates. Both record `:alias` and
+                                         ;; `:out-pos`, and neither is in
+                                         ;; `find-aliases` -- the server appends
+                                         ;; them -- so nothing else here could
+                                         ;; resolve the name. PostgreSQL matches
+                                         ;; an ORDER BY name against the OUTPUT
+                                         ;; columns first, which is what makes
+                                         ;; `SUM(x)/12 AS m … ORDER BY m`
+                                         ;; ordinary SQL rather than
+                                         ;; `column "m" does not exist`.
                                          (when (and (instance? Column expr)
                                                     (nil? (.getTable ^Column expr)))
                                            (let [n (unquote-ident
@@ -5741,7 +5763,8 @@
                                              (some (fn [sp]
                                                      (when (= n (:alias sp))
                                                        (:out-pos sp)))
-                                                   @window-specs))))
+                                                   (concat @window-specs
+                                                           @compound-exprs)))))
                                         ;; Check if ORDER BY references a SELECT alias
                                         v (cond
                                             ;; A bare integer constant is a 1-based
@@ -5878,6 +5901,23 @@
                                                   ;; branch adds the entity var to :find
                                                   ;; and breaks the grouping.
                                                   (reset! has-aggregates? true)
+                                                  ;; …and the BAG has to survive, exactly
+                                                  ;; as it does when the projection emits
+                                                  ;; the aggregate. Datalog `:find` is a
+                                                  ;; SET: without the entity id in `:with`
+                                                  ;; the rows collapse to one per distinct
+                                                  ;; group key BEFORE the aggregate runs,
+                                                  ;; so every count came out 1 and
+                                                  ;; `GROUP BY c ORDER BY COUNT(c) DESC`
+                                                  ;; sorted five equal ones arbitrarily.
+                                                  ;; Only the ORDER-BY-contributed
+                                                  ;; aggregate was missing this; the
+                                                  ;; projected one has always had it,
+                                                  ;; which is why projecting the count
+                                                  ;; made the same query correct.
+                                                  (when default-table
+                                                    (swap! (:with-vars ctx) conj
+                                                           (ctx/entity-var! ctx default-table)))
                                                   elem)))
                                             v)
                                         ;; Still a marker: an aggregate shape
@@ -7057,11 +7097,23 @@
           (let [^OrderByElement obe (first order-by)
                 order-expr (.getExpression obe)]
             (when (instance? Column order-expr)
-              (let [resolved (ctx/resolve-column
-                              order-expr table-aliases default-table
-                              (:col-overrides ctx) (:derived-aliases ctx)
-                              (:ci-index ctx))
-                    attr (ctx/attr-of ctx resolved)
+              (let [;; A PROBE, so it must not decide the statement's fate.
+                    ;; `resolve-column` raises 42703 for a name that is not
+                    ;; an input column -- and an ORDER BY name is resolved
+                    ;; against the OUTPUT columns first, so `SELECT x AS c
+                    ;; … ORDER BY c LIMIT 2` is an ordinary alias sort that
+                    ;; died here with `column "c" does not exist`. Without
+                    ;; the LIMIT the probe never ran and the same query
+                    ;; worked, which is what made it look like a LIMIT bug.
+                    ;; A name this cannot resolve simply means "not
+                    ;; eligible"; if it really is unknown, the ordinary
+                    ;; path raises with the full context.
+                    resolved (try (ctx/resolve-column
+                                   order-expr table-aliases default-table
+                                   (:col-overrides ctx) (:derived-aliases ctx)
+                                   (:ci-index ctx))
+                                  (catch Exception _ nil))
+                    attr (when resolved (ctx/attr-of ctx resolved))
                     attr-schema (get schema attr)
                     alias (cond
                             (and (vector? resolved)

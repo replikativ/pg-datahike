@@ -497,3 +497,55 @@
       (is (thrown-with-msg?
            Exception #"date/time field value out of range: \"2/30/2017\""
            (one c "SELECT '2/30/2017'::timestamp"))))))
+
+(deftest datestyle-decides-what-a-numeric-date-means
+  ;; DateStyle has two halves and only the OUTPUT half was honoured, so
+  ;; `SET datestyle TO dmy` changed how a date printed and not how one
+  ;; was read. `8/10/2017` was always August 10th.
+  ;;
+  ;; PostgreSQL's rules (DecodeDateTime): a leading field of FOUR or
+  ;; more digits is the year whatever the order, so `2017-08-10` reads
+  ;; the same everywhere; otherwise the order assigns the fields, a
+  ;; two-digit year gets a century, and the fields are CHECKED rather
+  ;; than rolled. Separators carry no meaning -- `8/10/2017` and
+  ;; `10-08-2017` differ only in punctuation.
+  ;;
+  ;; Every expectation here is a PostgreSQL 17 oracle's, taken as a
+  ;; matrix over the three orders.
+  (with-open [c (jdbc)]
+    (let [d (fn [style s] (exec! c (str "SET datestyle TO '" style "'"))
+              (one c (str "SELECT '" s "'::date::text")))
+          ts (fn [style s] (exec! c (str "SET datestyle TO '" style "'"))
+               (one c (str "SELECT '" s "'::timestamp::text")))]
+      (testing "MDY, the default"
+        (is (= "2017-08-10" (d "ISO, MDY" "8/10/2017")))
+        (is (= "1999-01-08" (d "ISO, MDY" "1/8/1999")))
+        (is (= "2017-10-08" (d "ISO, MDY" "10-08-2017")))
+        (is (= "2017-08-10" (d "ISO, MDY" "2017-08-10"))))
+      (testing "DMY swaps the first two fields"
+        (is (= "2017-10-08" (d "ISO, DMY" "8/10/2017")))
+        (is (= "1999-08-01" (d "ISO, DMY" "1/8/1999")))
+        (is (= "2017-08-10" (d "ISO, DMY" "10-08-2017")))
+        (is (= "2017-10-13" (d "ISO, DMY" "13/10/2017"))
+            "a 13 that cannot be a month is the day here"))
+      (testing "a four-digit leading field wins over the order"
+        (doseq [style ["ISO, MDY" "ISO, DMY" "ISO, YMD"]]
+          (is (= "2017-08-10" (d style "2017-08-10")) style)))
+      (testing "YMD reads the year first, and gives a two-digit one a century"
+        (is (= "1999-01-02" (d "ISO, YMD" "99-01-02"))))
+      (testing "the timestamp parser follows the same order"
+        (is (= "2017-10-08 00:00:00" (ts "ISO, DMY" "8/10/2017")))
+        (is (= "2017-08-10 00:00:00" (ts "ISO, DMY" "10-08-2017")))
+        (is (= "2017-08-10 00:00:00" (ts "ISO, MDY" "8/10/2017")))
+        (is (= "2017-08-10 10:20:30" (ts "ISO, MDY" "2017-08-10 10:20:30"))))
+      (testing "and impossible fields are out of range, not bad syntax"
+        (exec! c "SET datestyle TO 'ISO, MDY'")
+        (doseq [s ["13/10/2017" "2/30/2017" "2024-02-30"]]
+          (is (thrown-with-msg?
+               Exception #"date/time field value out of range"
+               (one c (str "SELECT '" s "'::date"))) s))
+        (exec! c "SET datestyle TO 'ISO, YMD'")
+        (is (thrown-with-msg?
+             Exception #"date/time field value out of range"
+             (one c "SELECT '8/10/2017'::date"))
+            "day 2017 under YMD")))))
