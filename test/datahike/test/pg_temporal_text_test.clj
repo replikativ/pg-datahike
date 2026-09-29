@@ -631,3 +631,71 @@
       (is (= "2000-01-01 00:00:00" (one c "SELECT '2000-01-01'::timestamp::text")))
       (is (= "2000-09-07 00:00:00" (one c "SELECT '2000-09-07 -07'::timestamp::text"))
           "the offset is dropped, not subtracted"))))
+
+;; ---------------------------------------------------------------------------
+;; What datetime.c reads that we did not
+;;
+;; Two of these were the leak class -- input PostgreSQL REFUSES that we
+;; accepted and answered. The rest were loud gaps.
+;;
+;; Expectations are a PostgreSQL 17 oracle's.
+;; ---------------------------------------------------------------------------
+
+(deftest a-date-validates-the-time-it-discards
+  (with-open [c (jdbc)]
+    ;; `date_in` reads the whole literal and then keeps the date. Taking
+    ;; the first token and ignoring the rest accepted an hour that does
+    ;; not exist and answered the date anyway.
+    (is (= "2001-02-03" (one c "SELECT ('2001-02-03 04:05:06'::date)::text")))
+    (is (= "2001-02-03" (one c "SELECT ('2001-02-03T04:05:06'::date)::text")))
+    (is (= "22008" (first (err-of c "SELECT '2001-02-03 25:00:00'::date"))))
+    (is (= "22008" (first (err-of c "SELECT '2001-02-03 04:99:00'::date"))))
+    (is (= "22007" (first (err-of c "SELECT '2001-02-03 nonsense'::date"))))))
+
+(deftest a-time-takes-a-leading-date-only-with-a-space
+  (with-open [c (jdbc)]
+    ;; `time_in` drops a leading date in the space-separated spelling
+    ;; and refuses the T one. Accepting `[ T]` answered a time for a
+    ;; literal PostgreSQL rejects.
+    (is (= "04:05:06" (one c "SELECT ('2001-02-03 04:05:06'::time)::text")))
+    (is (= "04:05:06+00" (one c "SELECT ('2001-02-03 04:05:06'::timetz)::text")))
+    (is (= "22007" (first (err-of c "SELECT '2001-02-03T04:05:06'::time"))))
+    (is (= "22007" (first (err-of c "SELECT '2001-02-03'::time"))))))
+
+(deftest reserved-datetime-inputs
+  (with-open [c (jdbc)]
+    (testing "epoch and allballs"
+      (is (= "1970-01-01 00:00:00" (one c "SELECT ('epoch'::timestamp)::text")))
+      (is (= "1970-01-01 00:00:00+00" (one c "SELECT ('epoch'::timestamptz)::text")))
+      (is (= "1970-01-01" (one c "SELECT ('epoch'::date)::text")))
+      (is (= "00:00:00" (one c "SELECT ('allballs'::time)::text")))
+      (is (= "00:00:00+00" (one c "SELECT ('allballs'::timetz)::text")))
+      (is (= "00:00:00" (one c "SELECT ('ALLBALLS'::time)::text"))
+          "datetime.c folds the token"))
+    (testing "the volatile ones are still refused, deliberately"
+      ;; `now` / `today` / `tomorrow` / `yesterday` take the statement's
+      ;; time, and a cast is constant-folded into a cached plan, so
+      ;; answering one here would freeze it. They need the deferred
+      ;; treatment `now()` gets.
+      (is (= "22007" (first (err-of c "SELECT 'now'::timestamp"))))
+      (is (= "22007" (first (err-of c "SELECT 'today'::date")))))))
+
+(deftest the-bc-era-on-a-timestamp
+  (with-open [c (jdbc)]
+    ;; `parse-date-strict` read the era for `date` and nothing read it
+    ;; for `timestamp`, so a literal PostgreSQL accepts raised.
+    (is (= "2001-02-03 04:05:06 BC"
+           (one c "SELECT ('2001-02-03 04:05:06 BC'::timestamp)::text")))
+    (is (= "2001-02-03 00:00:00+00 BC"
+           (one c "SELECT ('2001-02-03 BC'::timestamptz)::text"))
+        "the offset goes before the era, as EncodeDateTime writes it")
+    (is (= "2001-02-03 BC" (one c "SELECT ('2001-02-03 BC'::date)::text")))
+    (is (= "2001-02-03 00:00:00" (one c "SELECT ('2001-02-03 AD'::timestamp)::text")))
+    (testing "and the era is last in every DateStyle"
+      (doseq [[style expected] [["Postgres, MDY" "Thu Feb 03 04:05:06 2001 BC"]
+                                ["SQL, MDY"      "02/03/2001 04:05:06 BC"]
+                                ["German, DMY"   "03.02.2001 04:05:06 BC"]]]
+        (exec! c (str "SET datestyle TO '" style "'"))
+        (is (= expected (one c "SELECT ('2001-02-03 04:05:06 BC'::timestamp)::text"))
+            style))
+      (exec! c "SET datestyle TO 'ISO, MDY'"))))
