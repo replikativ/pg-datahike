@@ -202,6 +202,33 @@
     (ok! h "CREATE TABLE t (i int)")
     (ok! h "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH STATEMENT EXECUTE PROCEDURE noop()")))
 
+(deftest pg-catalog-reports-the-triggers
+  ;; `pg_trigger` was a real relation with PostgreSQL 17's columns and no
+  ;; rows -- every query against it came back empty, including the ones
+  ;; the regression suite uses to check a trigger was created at all.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int)")
+    (ok! h "CREATE TABLE plain (i int)")
+    (trigfn! h "noop" "BEGIN RETURN NULL; END")
+    (ok! h (str "CREATE TRIGGER b_row BEFORE INSERT OR UPDATE ON t"
+                " FOR EACH ROW EXECUTE PROCEDURE noop()"))
+    (ok! h (str "CREATE TRIGGER a_stmt AFTER DELETE ON t"
+                " FOR EACH STATEMENT EXECUTE PROCEDURE noop()"))
+    ;; tgtype is PostgreSQL's bitmask (trigger.h): ROW 1, BEFORE 2,
+    ;; INSERT 4, DELETE 8, UPDATE 16. AFTER is the absence of BEFORE.
+    (is (= [["a_stmt" "8"] ["b_row" "23"]]
+           (rows (ok! h (str "SELECT tgname, tgtype::text FROM pg_trigger"
+                             " ORDER BY tgname")))))
+    (testing "and joins pg_class on tgrelid"
+      (is (= [["2"]]
+             (rows (ok! h (str "SELECT count(*)::text FROM pg_trigger tg"
+                               " JOIN pg_class c ON c.oid = tg.tgrelid"
+                               " WHERE c.relname = 't'"))))))
+    (testing "pg_tables.hastriggers is no longer hard-coded false"
+      (is (= [["plain" "false"] ["t" "true"]]
+             (rows (ok! h (str "SELECT tablename, hastriggers::text FROM pg_tables"
+                               " WHERE tablename IN ('t','plain') ORDER BY tablename"))))))))
+
 (deftest several-triggers-run-in-name-order
   (with-h [h (fresh-handler)]
     (ok! h "CREATE TABLE t (i int, s text)")
