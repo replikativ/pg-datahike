@@ -45,7 +45,7 @@
   "SQL type names that imply auto-increment (like IDENTITY)."
   #{"serial" "serial2" "serial4" "serial8" "bigserial" "smallserial"})
 
-(defn- primary-key-cols
+(defn primary-key-cols
   "Return the declared primary-key columns of `table-name` in key order.
 
    PostgreSQL permits `REFERENCES parent` without an explicit column list;
@@ -197,6 +197,13 @@
   (some #(let [n (make-object-name name1 name2 (str label %))]
            (when-not (contains? taken n) n))
         (cons "" (iterate inc 1))))
+
+(defn generated-constraint-name
+  "PostgreSQL's name for a constraint the statement did not name:
+   `t_col_check`, `t_col_fkey`, numbered if taken. Exposed for ALTER
+   TABLE ADD, which names its constraints the same way CREATE TABLE does."
+  [taken table-name col label]
+  (choose-constraint-name (set taken) table-name col label))
 
 (defn- reject-duplicate-constraint-names!
   "42710 for two explicitly named constraints of one table sharing a name,
@@ -437,6 +444,63 @@
             (if-let [expr (parse-default-expression peeled)]
               {:kind :expr :value (str expr)}
               {:kind :unsupported :raw raw})))))))
+
+(defn- foreign-key-index->spec
+  "The FK shape `extract-ddl-constraints` produces, from a
+   `ForeignKeyIndex` -- the node CREATE TABLE and ALTER TABLE both carry."
+  [^ForeignKeyIndex fk]
+  (let [parsed-ref-cols (mapv (comp params/unquote-ident str)
+                              (or (.getReferencedColumnNames fk) []))]
+    {:name (some-> (.getName fk) params/unquote-ident)
+     :cols (mapv (comp params/unquote-ident str) (.getColumnsNames fk))
+     :parent-table (some-> (.getTable fk) .getName params/unquote-ident)
+     ;; The sentinel `inline-references-rule` injects when the SQL named
+     ;; no referenced columns; DDL lowering fills in the parent's PK.
+     :parent-cols (if (= ["__pg_default_pk__"] parsed-ref-cols) [] parsed-ref-cols)
+     :on-delete (some-> (.getOnDeleteReferenceOption fk) str/lower-case)
+     :on-update (some-> (.getOnUpdateReferenceOption fk) str/lower-case)}))
+
+(defn alter-added-constraint
+  "The constraint an `ALTER TABLE ... ADD ...` expression adds, as
+   {:op :add-check ...} or {:op :add-foreign-key ...}, or nil when it is
+   neither.
+
+   PRIMARY KEY and UNIQUE are read by the caller, which maps them onto
+   Datahike's own uniqueness; these two are stored as their own
+   constraint entities, the same ones CREATE TABLE writes, so the
+   spellings cannot diverge."
+  [^net.sf.jsqlparser.statement.alter.AlterExpression exp]
+  (let [idx (.getIndex exp)]
+    (cond
+      (instance? CheckConstraint idx)
+      {:op :add-check
+       :name (let [n (some-> (.getName ^CheckConstraint idx) params/unquote-ident)]
+               ;; The sentinel `alter-add-check-rule` injects so
+               ;; JSqlParser accepts an unnamed `ADD CHECK (...)`.
+               (when-not (= "__pg_unnamed_check__" n) n))
+       :expr (str (.getExpression ^CheckConstraint idx))}
+
+      (instance? ForeignKeyIndex idx)
+      (assoc (foreign-key-index->spec idx) :op :add-foreign-key)
+
+      ;; `ADD FOREIGN KEY (a) REFERENCES p (b)` with no CONSTRAINT name
+      ;; arrives in these flat accessors instead of an Index node.
+      (seq (.getFkColumns exp))
+      (let [action (fn [^net.sf.jsqlparser.statement.ReferentialAction$Type t]
+                     ;; Not `str` on the ReferentialAction, which renders
+                     ;; as " ON DELETE CASCADE" -- the action alone.
+                     (some-> (.getReferentialAction exp t)
+                             .getAction str str/lower-case
+                             (str/replace "_" " ")))]
+        {:op :add-foreign-key
+         :name nil
+         :cols (mapv params/unquote-ident (.getFkColumns exp))
+         :parent-table (some-> (.getFkSourceTable exp) params/unquote-ident)
+         :parent-cols (mapv params/unquote-ident (or (.getFkSourceColumns exp) []))
+         :on-delete (action net.sf.jsqlparser.statement.ReferentialAction$Type/DELETE)
+         :on-update (action net.sf.jsqlparser.statement.ReferentialAction$Type/UPDATE)})
+
+      :else nil)))
 
 (defn extract-ddl-constraints
   "Collect PRIMARY KEY and UNIQUE constraints from a CreateTable into a

@@ -153,7 +153,7 @@
     {:table table-name :columns columns
      :checks (vec checks) :fks (vec fks) :domain-enum domain-enum}))
 
-(defn- parse-constraint-expression [expression]
+(defn parse-constraint-expression [expression]
   (try
     (CCJSqlParserUtil/parseCondExpression expression)
     (catch Exception _

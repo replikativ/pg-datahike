@@ -109,6 +109,24 @@
 ;; Rules
 ;; ============================================================================
 
+(defn- skip-match-type
+  "Index past an optional `MATCH FULL | MATCH PARTIAL | MATCH SIMPLE`,
+   which PostgreSQL's grammar puts between the referenced-column list and
+   the `ON DELETE` / `ON UPDATE` clauses. Returns idx unchanged when the
+   next token is not `match`.
+
+   Only for an INLINE reference, where it carries no information: the
+   three MATCH types differ only when SOME of the referencing columns are
+   NULL and others are not, and an inline reference is one column. A
+   table-level `FOREIGN KEY (a, b) ... MATCH FULL` is a different
+   question, and not this rule's -- JSqlParser parses that form itself."
+  [toks ^long idx]
+  (if (and (= "match" (kw-text (nth toks idx nil)))
+           (contains? #{"full" "partial" "simple"}
+                      (kw-text (nth toks (inc idx) nil))))
+    (+ idx 2)
+    idx))
+
 (defn- match-on-action
   "Given toks and an index pointing at what might be `ON DELETE/UPDATE
    action`, return {:end-idx … :verb … :action …} if matched, nil
@@ -210,8 +228,14 @@
                                                        #(or (ident-tok? %)
                                                             (punct? % ".")))
                       after-cols-idx (match-paren-group toks after-name-idx)
-                      on-match (match-on-action toks after-cols-idx)
-                      end-idx (or (:end-idx on-match) after-cols-idx)
+                      ;; `MATCH FULL` sits here, before the ON clauses.
+                      ;; It used to be left behind while the REFERENCES
+                      ;; around it was lifted away, so the column
+                      ;; definition became `a int   MATCH FULL,` and the
+                      ;; whole CREATE TABLE failed to parse.
+                      after-match-idx (skip-match-type toks after-cols-idx)
+                      on-match (match-on-action toks after-match-idx)
+                      end-idx (or (:end-idx on-match) after-match-idx)
                       end-pos (:end (nth toks (dec end-idx)))
                       act (:action on-match)
                       verb (:verb on-match)]
@@ -237,6 +261,8 @@
                           ;; the action clause start (after-cols-idx).
                           ;; after-name-idx points one past the table name
                           ;; (at `(` of the col list), so we need (inc i).
+                          ;; The MATCH clause is deliberately NOT carried
+                          ;; into the lifted FK: see `skip-match-type`.
                           ref-target (str (token-range-text toks (inc i) after-cols-idx)
                                           ;; JSqlParser requires an explicit
                                           ;; referenced-column list although
@@ -259,6 +285,107 @@
                                   (conj acc' [close-paren-pos close-paren-pos inject])
                                   acc')]
                       (recur end-idx acc''))))))))))))
+
+(def unnamed-check-sentinel
+  "Injected by `alter-add-check-rule`; recognised as \"no name given\"."
+  "CONSTRAINT __pg_unnamed_check__")
+
+(defn alter-add-check-rule
+  "Name an `ALTER TABLE ... ADD CHECK (...)`.
+
+   JSqlParser's ALTER grammar accepts `ADD CONSTRAINT <name> CHECK (...)`
+   but not the unnamed `ADD CHECK (...)` that PostgreSQL also allows and
+   that the regression suite writes. Injecting `CONSTRAINT
+   __pg_unnamed_check__` makes it parse; the executor treats that
+   sentinel as no name and generates PostgreSQL's own (`t_check`,
+   `t_check1`, ...), which is what an unnamed CHECK gets anyway."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (dec n))
+        acc
+        (let [t (nth toks i)]
+          (if (and (= "add" (kw-text t))
+                   (= "check" (kw-text (nth toks (inc i) nil)))
+                   (punct? (nth toks (+ i 2) nil) "("))
+            (recur (+ i 2)
+                   (conj acc [(:pos (nth toks (inc i)))
+                              (:pos (nth toks (inc i)))
+                              (str unnamed-check-sentinel " ")]))
+            (recur (inc i) acc)))))))
+
+(defn- fk-column-count
+  "How many columns the table-level `FOREIGN KEY (...)` ending at the `)`
+   before `ref-idx` names. Walks back to the matching `(` and counts the
+   top-level commas."
+  [toks ^long ref-idx]
+  (let [close-idx (loop [k (dec ref-idx)]
+                    (cond (neg? k) nil
+                          (punct? (nth toks k) ")") k
+                          :else (recur (dec k))))]
+    (when close-idx
+      (loop [k (dec close-idx), depth 0, commas 0]
+        (cond
+          (neg? k) (inc commas)
+          (punct? (nth toks k) ")") (recur (dec k) (inc depth) commas)
+          (punct? (nth toks k) "(") (if (zero? depth)
+                                      (inc commas)
+                                      (recur (dec k) (dec depth) commas))
+          (and (zero? depth) (punct? (nth toks k) ","))
+          (recur (dec k) depth (inc commas))
+          :else (recur (dec k) depth commas))))))
+
+(defn table-level-fk-match-rule
+  "Strip `MATCH FULL | MATCH PARTIAL | MATCH SIMPLE` from a TABLE-LEVEL
+   foreign key -- `FOREIGN KEY (...) REFERENCES t (...) MATCH FULL`, in
+   CREATE TABLE and in ALTER TABLE ADD CONSTRAINT alike. JSqlParser's
+   grammar has no production for it in either position.
+
+   Stripping is exact for a ONE-COLUMN key: the three MATCH types differ
+   only when some referencing columns are NULL and others are not, which
+   one column cannot do. For a multi-column key MATCH FULL and MATCH
+   PARTIAL are real, different constraints -- MATCH FULL forbids mixing
+   NULL and non-NULL across the key -- and accepting the syntax while
+   enforcing MATCH SIMPLE would be a silently wrong answer. Those raise.
+
+   (The inline spelling, `col int REFERENCES t (c) MATCH FULL`, is
+   handled by `inline-references-rule`, which lifts the whole reference
+   to a table-level FK; it is one column by construction.)"
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i n)
+        acc
+        (let [t (nth toks i)]
+          (if (not= "references" (kw-text t))
+            (recur (inc i) acc)
+            (let [prev (non-comment-before toks i)]
+              (if-not (punct? prev ")")
+                (recur (inc i) acc)
+                (let [after-name-idx (skip-non-comment toks (inc i)
+                                                       #(or (ident-tok? %)
+                                                            (punct? % ".")))
+                      after-cols-idx (match-paren-group toks after-name-idx)
+                      mt (kw-text (nth toks (inc after-cols-idx) nil))]
+                  (if-not (and (= "match" (kw-text (nth toks after-cols-idx nil)))
+                               (contains? #{"full" "partial" "simple"} mt))
+                    (recur (inc i) acc)
+                    (let [ncols (or (fk-column-count toks i) 1)]
+                      (when (and (> ncols 1) (not= "simple" mt))
+                        (throw (ex-info "unsupported foreign-key match type"
+                                        {:error :feature-not-supported
+                                         :feature (str "MATCH " (str/upper-case mt)
+                                                       " on a " ncols "-column FOREIGN KEY")
+                                         :detail (str "MATCH " (str/upper-case mt)
+                                                      " constrains how NULLs may be"
+                                                      " mixed across the key columns;"
+                                                      " only MATCH SIMPLE is"
+                                                      " implemented for a"
+                                                      " multi-column key")})))
+                      (recur (+ after-cols-idx 2)
+                             (conj acc [(:pos (nth toks after-cols-idx))
+                                        (:end (nth toks (inc after-cols-idx)))
+                                        " "])))))))))))))
 
 (defonce ^:private anon-index-counter (atom 0))
 
@@ -1152,6 +1279,8 @@
    Order matters only for rules that target the same source span; all
    rules here are disjoint."
   [inline-references-rule
+   table-level-fk-match-rule
+   alter-add-check-rule
    create-index-anonymous-rule
    select-from-rule
    quote-reserved-alias-rule

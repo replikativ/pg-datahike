@@ -132,3 +132,107 @@
         (is (str/includes? create "DEFAULT 100 + 1"))
         (is (str/includes? create "DEFAULT upper('ab')"))
         (is (str/includes? create "DEFAULT now()"))))))
+
+;; ---------------------------------------------------------------------------
+;; ALTER TABLE ADD CONSTRAINT
+;;
+;; `sql.clj` mapped every ADD that was not PRIMARY KEY or UNIQUE onto
+;; `{:op :add-constraint}`, and nothing consumed it. The statement replied
+;; ALTER TABLE and added no constraint: a CHECK that should have refused a
+;; row let it through, and a FOREIGN KEY never looked for its parent.
+;; ---------------------------------------------------------------------------
+
+(deftest alter-add-check-constrains
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE t (a int, b int)")
+    (exec! c "INSERT INTO t VALUES (1, 1)")
+    (exec! c "ALTER TABLE t ADD CONSTRAINT tc CHECK (a > 0)")
+    (let [e (is (thrown? SQLException (exec! c "INSERT INTO t VALUES (-5, 1)")))]
+      (is (= "23514" (.getSQLState ^SQLException e))))
+    (is (= [[1]] (rows c "SELECT count(*) FROM t")))
+    (testing "the unnamed spelling, and PostgreSQL's generated names"
+      ;; `ADD CHECK (...)` without CONSTRAINT is a JSqlParser parse error;
+      ;; `alter-add-check-rule` names it so the parser accepts it, and the
+      ;; executor then generates the name PostgreSQL would.
+      (exec! c "ALTER TABLE t ADD CHECK (b > 0)")
+      (exec! c "ALTER TABLE t ADD CHECK (b < 100)")
+      (is (= [["t_check"] ["t_check1"] ["tc"]]
+             (rows c (str "SELECT conname FROM pg_constraint"
+                          " WHERE conrelid = 't'::regclass AND contype = 'c'"
+                          " ORDER BY conname"))))
+      (is (thrown? SQLException (exec! c "INSERT INTO t VALUES (1, 500)"))))))
+
+(deftest alter-add-foreign-key-constrains
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE p (b int PRIMARY KEY)")
+    (exec! c "CREATE TABLE ch (a int)")
+    (exec! c "INSERT INTO p VALUES (1)")
+    (exec! c "ALTER TABLE ch ADD CONSTRAINT chfk FOREIGN KEY (a) REFERENCES p(b)")
+    (exec! c "INSERT INTO ch VALUES (1)")
+    (let [e (is (thrown? SQLException (exec! c "INSERT INTO ch VALUES (9)")))]
+      (is (= "23503" (.getSQLState ^SQLException e))))
+    (testing "a NULL key is satisfied vacuously, as MATCH SIMPLE says"
+      (exec! c "INSERT INTO ch VALUES (NULL)")
+      (is (= [[2]] (rows c "SELECT count(*) FROM ch"))))
+    (testing "two unnamed keys get distinct generated names"
+      ;; The generated-name set was seeded from CHECK constraints only, so
+      ;; a second unnamed FK produced the name the first already had and
+      ;; the two entities collided on :pg/constraint-key -- the second
+      ;; silently replaced the first.
+      (exec! c "CREATE TABLE ch2 (a int)")
+      (exec! c "ALTER TABLE ch2 ADD FOREIGN KEY (a) REFERENCES p")
+      (exec! c "ALTER TABLE ch2 ADD FOREIGN KEY (a) REFERENCES p(b) MATCH FULL")
+      (is (= [["ch2_a_fkey"] ["ch2_a_fkey1"]]
+             (rows c (str "SELECT conname FROM pg_constraint"
+                          " WHERE conrelid = 'ch2'::regclass AND contype = 'f'"
+                          " ORDER BY conname")))))))
+
+(deftest alter-add-constraint-validates-the-rows-already-there
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (testing "CHECK"
+      (exec! c "CREATE TABLE t (a int)")
+      (exec! c "INSERT INTO t VALUES (-5), (3)")
+      (let [e (is (thrown? SQLException
+                           (exec! c "ALTER TABLE t ADD CONSTRAINT tc CHECK (a > 0)")))]
+        (is (= "23514" (.getSQLState ^SQLException e))))
+      ;; Refused means not added: the violating row is still insertable.
+      (exec! c "INSERT INTO t VALUES (-6)")
+      (is (= [[3]] (rows c "SELECT count(*) FROM t"))))
+    (testing "FOREIGN KEY"
+      (exec! c "CREATE TABLE p (b int PRIMARY KEY)")
+      (exec! c "CREATE TABLE ch (a int)")
+      (exec! c "INSERT INTO p VALUES (1)")
+      (exec! c "INSERT INTO ch VALUES (1), (99)")
+      (let [e (is (thrown? SQLException
+                           (exec! c (str "ALTER TABLE ch ADD CONSTRAINT f"
+                                         " FOREIGN KEY (a) REFERENCES p(b)"))))]
+        (is (= "23503" (.getSQLState ^SQLException e)))))))
+
+(deftest fk-match-type
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE p (a int PRIMARY KEY)")
+    (testing "inline, where the rule used to strand the MATCH clause"
+      ;; `inline-references-rule` lifted the REFERENCES to a table-level FK
+      ;; and left `MATCH FULL` behind in the column definition.
+      (exec! c "CREATE TABLE ch (a int REFERENCES p(a) MATCH FULL)")
+      (exec! c "INSERT INTO p VALUES (1)")
+      (exec! c "INSERT INTO ch VALUES (1)")
+      (is (thrown? SQLException (exec! c "INSERT INTO ch VALUES (2)"))
+          "the lifted FK must still be enforced"))
+    (testing "table-level, which JSqlParser cannot parse at all"
+      (exec! c "CREATE TABLE ch2 (a int, FOREIGN KEY (a) REFERENCES p(a) MATCH FULL)")
+      (is (thrown? SQLException (exec! c "INSERT INTO ch2 VALUES (7)"))))
+    (testing "a multi-column MATCH FULL is refused, not quietly downgraded"
+      ;; MATCH FULL and MATCH SIMPLE differ only when some key columns are
+      ;; NULL and others are not -- impossible for one column, real for
+      ;; two. Accepting the syntax and enforcing MATCH SIMPLE underneath
+      ;; would be a silently wrong answer.
+      (exec! c "CREATE TABLE q (x int, y int, PRIMARY KEY (x, y))")
+      (let [e (is (thrown? SQLException
+                           (exec! c (str "CREATE TABLE ch3 (a int, b int,"
+                                         " FOREIGN KEY (a, b) REFERENCES q(x, y)"
+                                         " MATCH FULL)"))))]
+        (is (= "0A000" (.getSQLState ^SQLException e))))
+      (testing "MATCH SIMPLE on the same key is the default, so it is fine"
+        (exec! c (str "CREATE TABLE ch4 (a int, b int,"
+                      " FOREIGN KEY (a, b) REFERENCES q(x, y) MATCH SIMPLE)"))))))
