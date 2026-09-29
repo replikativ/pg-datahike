@@ -12691,8 +12691,8 @@
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
                   types/*date-style* (or (:date-style @session-state) [:iso :mdy])
-                    fns/*compensated-float-sum?*
-                    (= :compensated (:float-sum @session-state))
+                  fns/*compensated-float-sum?*
+                  (= :compensated (:float-sum @session-state))
                   params/*cancel* (current-cancel)
                   ;; A plpgsql body runs its statements through the
                   ;; handler that reached it, so it shares this
