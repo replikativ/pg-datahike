@@ -188,6 +188,20 @@
       (is (= "INSERT 0 2" (.commandTag r))))
     (is (= [["2"] ["4"]] (rows (ok! h "SELECT i FROM t ORDER BY i"))))))
 
+(deftest dropping-a-table-drops-its-triggers
+  ;; A trigger is a dependent of its table, as PostgreSQL makes it. Left
+  ;; in the registry, the name was still taken -- a later CREATE TABLE of
+  ;; the same name could not define a trigger of the same name -- and the
+  ;; orphan matched the new table on every write. Regression files drop
+  ;; and recreate tables constantly.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int)")
+    (trigfn! h "noop" "BEGIN RETURN NULL; END")
+    (ok! h "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH STATEMENT EXECUTE PROCEDURE noop()")
+    (ok! h "DROP TABLE t")
+    (ok! h "CREATE TABLE t (i int)")
+    (ok! h "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH STATEMENT EXECUTE PROCEDURE noop()")))
+
 (deftest several-triggers-run-in-name-order
   (with-h [h (fresh-handler)]
     (ok! h "CREATE TABLE t (i int, s text)")

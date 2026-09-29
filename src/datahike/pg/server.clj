@@ -11221,7 +11221,16 @@
               [(when (get db-schema :pg/check-table)
                  (d/q '{:find [?e] :in [$ ?t] :where [[?e :pg/check-table ?t]]} db table))
                (when (get db-schema :pg/fk-child-table)
-                 (d/q '{:find [?e] :in [$ ?t] :where [[?e :pg/fk-child-table ?t]]} db table))])
+                 (d/q '{:find [?e] :in [$ ?t] :where [[?e :pg/fk-child-table ?t]]} db table))
+               ;; A trigger is a dependent of its table, as PostgreSQL
+               ;; makes it. Left behind, the registry still held it: a
+               ;; later CREATE TABLE of the same name could not define a
+               ;; trigger of the same name ("already exists"), and the
+               ;; orphan matched the new table on every write. Regression
+               ;; files drop and recreate tables constantly.
+               (when (get db-schema :datahike.pg.trigger/table)
+                 (d/q '{:find [?e] :in [$ ?t]
+                        :where [[?e :datahike.pg.trigger/table ?t]]} db table))])
         ;; Physical PostgreSQL indexes are schema dependents of their table.
         ;; Retract declarations in the SAME root transaction so no committed
         ;; database value can retain an index whose covered attributes have
