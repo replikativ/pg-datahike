@@ -157,6 +157,27 @@
       (is (str/includes? (str (err (exec h "INSERT INTO u (i) VALUES (1)")))
                          "not-null")))))
 
+(deftest triggers-chain-in-the-columns-own-types
+  ;; plpgsql computes over what a statement produced, which is TEXT, so
+  ;; `NEW.f1 := NEW.f1 * 10` hands back a string. The INSERT path
+  ;; round-trips the row through `columns->row-entity` between triggers
+  ;; and coerces there; the UPDATE path passed the raw map on, so the
+  ;; SECOND trigger did arithmetic on a string and the statement died
+  ;; with a bare `class java.lang.String cannot be cast to class
+  ;; java.lang.Number` -- no SQLSTATE. `triggers.sql` opens with exactly
+  ;; this pair.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (f1 int, f2 text)")
+    (trigfn! h "times10" "BEGIN NEW.f1 := NEW.f1 * 10; RETURN NEW; END")
+    (ok! h "CREATE TRIGGER alpha BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE times10()")
+    (ok! h "CREATE TRIGGER zed BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE times10()")
+    (ok! h "INSERT INTO t VALUES (1, 'foo')")
+    (is (= [["100" "foo"]] (rows (ok! h "SELECT f1, f2 FROM t")))
+        "both triggers ran on INSERT")
+    (ok! h "UPDATE t SET f2 = f2 || 'bar'")
+    (is (= [["10000" "foobar"]] (rows (ok! h "SELECT f1, f2 FROM t")))
+        "and both on UPDATE, each seeing an int rather than the other's text")))
+
 (deftest returning-null-suppresses-the-row
   (with-h [h (fresh-handler)]
     (ok! h "CREATE TABLE t (i int)")
@@ -166,6 +187,47 @@
       ;; PostgreSQL counts what was written, not what was offered.
       (is (= "INSERT 0 2" (.commandTag r))))
     (is (= [["2"] ["4"]] (rows (ok! h "SELECT i FROM t ORDER BY i"))))))
+
+(deftest dropping-a-table-drops-its-triggers
+  ;; A trigger is a dependent of its table, as PostgreSQL makes it. Left
+  ;; in the registry, the name was still taken -- a later CREATE TABLE of
+  ;; the same name could not define a trigger of the same name -- and the
+  ;; orphan matched the new table on every write. Regression files drop
+  ;; and recreate tables constantly.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int)")
+    (trigfn! h "noop" "BEGIN RETURN NULL; END")
+    (ok! h "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH STATEMENT EXECUTE PROCEDURE noop()")
+    (ok! h "DROP TABLE t")
+    (ok! h "CREATE TABLE t (i int)")
+    (ok! h "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH STATEMENT EXECUTE PROCEDURE noop()")))
+
+(deftest pg-catalog-reports-the-triggers
+  ;; `pg_trigger` was a real relation with PostgreSQL 17's columns and no
+  ;; rows -- every query against it came back empty, including the ones
+  ;; the regression suite uses to check a trigger was created at all.
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE t (i int)")
+    (ok! h "CREATE TABLE plain (i int)")
+    (trigfn! h "noop" "BEGIN RETURN NULL; END")
+    (ok! h (str "CREATE TRIGGER b_row BEFORE INSERT OR UPDATE ON t"
+                " FOR EACH ROW EXECUTE PROCEDURE noop()"))
+    (ok! h (str "CREATE TRIGGER a_stmt AFTER DELETE ON t"
+                " FOR EACH STATEMENT EXECUTE PROCEDURE noop()"))
+    ;; tgtype is PostgreSQL's bitmask (trigger.h): ROW 1, BEFORE 2,
+    ;; INSERT 4, DELETE 8, UPDATE 16. AFTER is the absence of BEFORE.
+    (is (= [["a_stmt" "8"] ["b_row" "23"]]
+           (rows (ok! h (str "SELECT tgname, tgtype::text FROM pg_trigger"
+                             " ORDER BY tgname")))))
+    (testing "and joins pg_class on tgrelid"
+      (is (= [["2"]]
+             (rows (ok! h (str "SELECT count(*)::text FROM pg_trigger tg"
+                               " JOIN pg_class c ON c.oid = tg.tgrelid"
+                               " WHERE c.relname = 't'"))))))
+    (testing "pg_tables.hastriggers is no longer hard-coded false"
+      (is (= [["plain" "false"] ["t" "true"]]
+             (rows (ok! h (str "SELECT tablename, hastriggers::text FROM pg_tables"
+                               " WHERE tablename IN ('t','plain') ORDER BY tablename"))))))))
 
 (deftest several-triggers-run-in-name-order
   (with-h [h (fresh-handler)]

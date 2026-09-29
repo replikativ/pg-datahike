@@ -842,6 +842,29 @@
                db))
     []))
 
+(def ^:private trigger-type-bits
+  "`pg_trigger.tgtype`, from PostgreSQL's trigger.h. AFTER is the absence
+   of both BEFORE and INSTEAD."
+  {:row 1, :before 2, :insert 4, :delete 8, :update 16, :truncate 32,
+   :instead-of 64})
+
+(defn- trigger-entities
+  "Every registered trigger, with its spec decoded. Read from the datoms
+   rather than through `server/table-triggers`: the catalog layer is
+   below the server's."
+  [db]
+  (if-not (and db (get (dbi/-schema db) :datahike.pg.trigger/spec))
+    []
+    (mapv (fn [[name table oid spec]]
+            (let [m (try (edn/read-string spec) (catch Exception _ {}))]
+              (assoc m :name name :table table :oid oid)))
+          (d/q '{:find [?name ?table ?oid ?spec]
+                 :where [[?e :datahike.pg.trigger/name ?name]
+                         [?e :datahike.pg.trigger/table ?table]
+                         [?e :datahike.pg.trigger/oid ?oid]
+                         [?e :datahike.pg.trigger/spec ?spec]]}
+               db))))
+
 (defn- explicit-index-descriptors [db]
   (if-not db
     []
@@ -1488,17 +1511,45 @@
                  (pgs/row-marker-attr "pg_class") true})
               (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db)))))))
     "pg_tables"
-    (mapv (fn [t]
-            {:pg_tables/schemaname "public"
-             :pg_tables/tablename t
-             :pg_tables/tableowner "datahike"
-             :pg_tables/tablespace "pg_default"
-             :pg_tables/hasindexes true
-             :pg_tables/hasrules false
-             :pg_tables/hastriggers false
-             :pg_tables/rowsecurity false
-             (pgs/row-marker-attr "pg_tables") true})
-          (pgs/table-names user-schema))
+    ;; `hastriggers` was hard-coded false, which is what a client reads
+    ;; to decide whether to look in pg_trigger at all.
+    (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
+      (mapv (fn [t]
+              {:pg_tables/schemaname "public"
+               :pg_tables/tablename t
+               :pg_tables/tableowner "datahike"
+               :pg_tables/tablespace "pg_default"
+               :pg_tables/hasindexes true
+               :pg_tables/hasrules false
+               :pg_tables/hastriggers (contains? triggered t)
+               :pg_tables/rowsecurity false
+               (pgs/row-marker-attr "pg_tables") true})
+            (pgs/table-names user-schema)))
+    "pg_trigger"
+    ;; Populated from the trigger registry. The relation existed with
+    ;; PostgreSQL 17's columns but no rows, so `\d t` listed no triggers
+    ;; and every `pg_trigger` query in the regression suite came back
+    ;; empty -- including the ones that check a trigger was created.
+    (mapv (fn [{:keys [name table oid timing level events arguments] :as t}]
+            {:pg_trigger/oid oid
+             :pg_trigger/tgrelid (or (pgs/table-oid cte-db table) 0)
+             :pg_trigger/tgparentid 0
+             :pg_trigger/tgname name
+             :pg_trigger/tgfoid 0
+             :pg_trigger/tgtype (long (reduce + 0 (keep trigger-type-bits
+                                                        (cons level
+                                                              (cons timing events)))))
+             :pg_trigger/tgenabled "O"
+             :pg_trigger/tgisinternal false
+             :pg_trigger/tgconstrrelid 0
+             :pg_trigger/tgconstrindid 0
+             :pg_trigger/tgconstraint 0
+             :pg_trigger/tgdeferrable false
+             :pg_trigger/tginitdeferred false
+             :pg_trigger/tgnargs (long (count arguments))
+             :pg_trigger/tgqual (or (:when t) "")
+             (pgs/row-marker-attr "pg_trigger") true})
+          (trigger-entities cte-db))
     "pg_views"
     (mapv (fn [{view-name :name definition :definition}]
             {:pg_views/schemaname "public"
@@ -1828,7 +1879,6 @@
           [[100 "default" "d" -1 nil] [811 "pg_c_utf8" "b" 6 nil]
            [950 "C" "c" -1 "C"] [951 "POSIX" "c" -1 "POSIX"]
            [962 "ucs_basic" "b" 6 nil] [963 "unicode" "i" -1 nil]])
-    "pg_trigger" []
     "pg_rewrite" []
     ;; The advisory locks this server actually holds. PostgreSQL reports
     ;; a one-argument key as (classid 0, objid, objsubid 1) and a

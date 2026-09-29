@@ -2865,6 +2865,28 @@
                     [:db/retract eid a v])))
           base)))
 
+(defn- coerce-row-columns
+  "A trigger's returned `{column value}` read back in the columns' own
+   types.
+
+   plpgsql computes over what a statement produced, which is TEXT, so a
+   body that assigns `NEW.f1 := NEW.f1 * 10` hands back a string. The
+   INSERT path round-trips the row through `columns->row-entity` between
+   triggers and coerces there; the UPDATE path passed the raw map to the
+   next trigger, which then did arithmetic on a string --
+   `class java.lang.String cannot be cast to class java.lang.Number`,
+   with no SQLSTATE, on the SECOND of two BEFORE UPDATE triggers.
+   `triggers.sql` does exactly this."
+  [db table-name row]
+  (let [schema (dbi/-schema db)]
+    (reduce-kv (fn [m c v]
+                 (let [attr (keyword table-name c)]
+                   (assoc m c (if (or (nil? v) (not (contains? schema attr)))
+                                v
+                                (#'stmt/coerce-insert-value v attr schema db)))))
+               {}
+               row)))
+
 (defn- apply-before-row-updates
   "Run the BEFORE ROW UPDATE triggers. Returns `[tx-data rows]`, where
    the tx-data is what should actually be written -- a trigger may have
@@ -2886,7 +2908,8 @@
                                                            :update row old)]
                                              (if (nil? r)
                                                {:row nil :base base :old old}
-                                               (recur more r)))))]))
+                                               (recur more (coerce-row-columns
+                                                            db table-name r))))))]))
                            by-eid)
             touched (set (keys by-eid))
             ;; Ops for a row a trigger touched are rebuilt; anything not
@@ -11198,7 +11221,16 @@
               [(when (get db-schema :pg/check-table)
                  (d/q '{:find [?e] :in [$ ?t] :where [[?e :pg/check-table ?t]]} db table))
                (when (get db-schema :pg/fk-child-table)
-                 (d/q '{:find [?e] :in [$ ?t] :where [[?e :pg/fk-child-table ?t]]} db table))])
+                 (d/q '{:find [?e] :in [$ ?t] :where [[?e :pg/fk-child-table ?t]]} db table))
+               ;; A trigger is a dependent of its table, as PostgreSQL
+               ;; makes it. Left behind, the registry still held it: a
+               ;; later CREATE TABLE of the same name could not define a
+               ;; trigger of the same name ("already exists"), and the
+               ;; orphan matched the new table on every write. Regression
+               ;; files drop and recreate tables constantly.
+               (when (get db-schema :datahike.pg.trigger/table)
+                 (d/q '{:find [?e] :in [$ ?t]
+                        :where [[?e :datahike.pg.trigger/table ?t]]} db table))])
         ;; Physical PostgreSQL indexes are schema dependents of their table.
         ;; Retract declarations in the SAME root transaction so no committed
         ;; database value can retain an index whose covered attributes have
