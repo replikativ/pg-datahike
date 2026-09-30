@@ -2,8 +2,6 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/../../.." && pwd)"
-postgres_source="${POSTGRES_SOURCE:-${repo_root}/../postgres}"
 pg_major="${PG_REGRESS_MAJOR:-17}"
 pg_bindir="${PG_REGRESS_BINDIR:-/usr/lib/postgresql/${pg_major}/bin}"
 target_host="${PG_REGRESS_HOST:-127.0.0.1}"
@@ -12,69 +10,20 @@ target_user="${PG_REGRESS_USER:-datahike}"
 target_db="${PG_REGRESS_DB:-datahike}"
 
 psql="${pg_bindir}/psql"
-onek_file="${postgres_source}/src/test/regress/data/onek.data"
-tenk_file="${postgres_source}/src/test/regress/data/tenk.data"
-person_file="${postgres_source}/src/test/regress/data/person.data"
-emp_file="${postgres_source}/src/test/regress/data/emp.data"
-student_file="${postgres_source}/src/test/regress/data/student.data"
-stud_emp_file="${postgres_source}/src/test/regress/data/stud_emp.data"
-
 if [[ ! -x "${psql}" ]]; then
   echo "psql not executable under PG_REGRESS_BINDIR: ${pg_bindir}" >&2
   exit 2
 fi
 
-for required in "${onek_file}" "${tenk_file}" "${person_file}" \
-  "${emp_file}" "${student_file}" "${stud_emp_file}"; do
-  if [[ ! -e "${required}" ]]; then
-    echo "required PostgreSQL regression fixture not found: ${required}" >&2
-    exit 2
-  fi
-done
-
-echo "Bootstrapping API regression fixtures into ${target_host}:${target_port}/${target_db}"
-"${psql}" -X -v ON_ERROR_STOP=1 \
-  --host="${target_host}" \
-  --port="${target_port}" \
-  --username="${target_user}" \
-  --dbname="${target_db}" \
-  --file="${script_dir}/bootstrap-api.sql"
-
-for table_and_file in \
-  "onek|${onek_file}" \
-  "onek2|${onek_file}" \
-  "tenk1|${tenk_file}" \
-  "tenk2|${tenk_file}"; do
-  table="${table_and_file%%|*}"
-  data_file="${table_and_file#*|}"
-  "${psql}" -X -v ON_ERROR_STOP=1 \
-    --host="${target_host}" \
-    --port="${target_port}" \
-    --username="${target_user}" \
-    --dbname="${target_db}" \
-    --command="\\copy ${table} FROM STDIN" < "${data_file}"
-done
-
-# The inheritance fixtures, loaded the way test_setup loads them: whole
-# rows, inherited columns included. These used to be awk-ed down to each
-# child's OWN columns, because a child's inherited columns were invisible
-# and a full row would have been rejected -- so the fixture agreed with
-# the bug rather than with PostgreSQL, and `person` never saw the rows
-# its descendants held. road still cannot be created (PostgreSQL `path`).
-for table_and_file in \
-  "person|${person_file}" \
-  "emp|${emp_file}" \
-  "student|${student_file}" \
-  "stud_emp|${stud_emp_file}"; do
-  table="${table_and_file%%|*}"
-  data_file="${table_and_file#*|}"
-  "${psql}" -X -v ON_ERROR_STOP=1 \
-    --host="${target_host}" \
-    --port="${target_port}" \
-    --username="${target_user}" \
-    --dbname="${target_db}" \
-    --command="\\copy ${table} FROM STDIN" < "${data_file}"
-done
+# Nothing is loaded here any more. `test_setup` loads all eight fixtures
+# itself, from its own server-side `COPY ... FROM 'file'`, and builds
+# onek2/tenk2 with CTAS -- so this script's whole job is now to say so,
+# and to fail loudly if that stops being true.
+#
+# It did load them, and when server-side COPY started working the rows
+# went in TWICE: 2000 where PostgreSQL has 1000. The count check below
+# is what caught it, which is the argument for keeping it.
+echo "Verifying test_setup fixtures in ${target_host}:${target_port}/${target_db}"
 
 # person/emp/student/stud_emp count 58|6|5|3, not 50|3|2|3: a query on a
 # table includes its descendants' rows, so person holds its own 50 plus

@@ -2,9 +2,13 @@
 set -euo pipefail
 
 # Run relation-dependent PostgreSQL regression tests in one disposable
-# database. PostgreSQL's test_setup uses server-side COPY, so run its DDL,
-# replace the file-loading portion with client-side \copy, and only then run
-# the requested tests.
+# database: run test_setup, verify the fixtures it loaded, and only then
+# run the requested tests.
+#
+# test_setup used to need help -- its COPY reads files on the server, and
+# that was not supported, so the data went in over a client-side \copy
+# instead. It loads its own fixtures now; bootstrap-api.sh only checks
+# that it did.
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
@@ -62,10 +66,19 @@ echo "Creating disposable fixture database ${isolated_db} (admin: ${admin_db})"
   --command="CREATE DATABASE \"${isolated_db}\"" >/dev/null
 database_created=1
 
-# test_setup is expected to differ because pg-datahike deliberately rejects
-# its server-side COPY FROM paths. Never let a caller's strict flags turn that
-# classified setup difference into a failed target run.
+# test_setup is still expected to differ -- CREATE TYPE, CREATE FUNCTION
+# and CREATE OPERATOR remain unimplemented, and `road` wants the `path`
+# column type. Never let a caller's strict flags turn that classified
+# setup difference into a failed target run.
+#
+# The setup phase also gets a longer per-statement limit than the
+# default 10s. test_setup's `COPY tenk1` is 10,000 rows and takes ~12.5s
+# here -- the fixture load never met that limit before because it
+# happened out of band, in a script pg_regress was not driving. The 10s
+# default is there to stop a hung statement wedging a test run; a bulk
+# load that is merely slow is not what it is for.
 env -u PG_REGRESS_STRICT -u PG_REGRESS_API_STRICT \
+  PG_REGRESS_STATEMENT_TIMEOUT=120s \
   PG_REGRESS_DB="${isolated_db}" \
   PG_REGRESS_ISOLATE=0 \
   PG_REGRESS_OUTPUT="${output_dir}/setup" \

@@ -1,5 +1,5 @@
 (ns datahike.test.pg-copy-parse-test
-  "Unit coverage for `datahike.pg.sql.copy/parse-copy-from-stdin` —
+  "Unit coverage for `datahike.pg.sql.copy/parse-copy` —
    the token-driven parser for `COPY ... FROM STDIN`. Validates both
    the modern paren `WITH (key = value, ...)` and the legacy
    keyword `WITH KW1 KW2 ...` forms, plus default-resolution from
@@ -8,7 +8,7 @@
             [datahike.pg.sql.copy :as copy]))
 
 (defn- parse [sql]
-  (copy/parse-copy-from-stdin (copy/tokenize sql)))
+  (copy/parse-copy (copy/tokenize sql)))
 
 (defn- opts [sql] (:options (parse sql)))
 
@@ -172,17 +172,44 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown COPY option: nonsense"
                         (parse "COPY t FROM stdin WITH (NONSENSE 'x')"))))
 
-(deftest missing-from-rejected
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expected from"
-                        (parse "COPY t TO stdin"))))
+(deftest missing-direction-rejected
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expected FROM or TO"
+                        (parse "COPY t stdin"))))
 
-(deftest copy-from-file-rejected
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only COPY FROM STDIN"
-                        (parse "COPY t FROM '/tmp/data.csv'"))))
+(deftest direction-and-target-must-agree
+  ;; The direction is read first, so a mismatched target is reported
+  ;; against the direction actually written -- `TO stdin` is a bad
+  ;; target for TO, not a missing FROM.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expected stdin/stdout"
+                        (parse "COPY t TO stdin")))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expected stdin/stdout"
+                        (parse "COPY t FROM stdout"))))
 
-(deftest copy-from-program-rejected
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only COPY FROM STDIN"
-                        (parse "COPY t FROM PROGRAM 'cat /tmp/data.csv'"))))
+;; The parse is structural: it reports WHICH target was written and
+;; leaves refusing an unsupported one to the server, so that
+;; `COPY ... FROM PROGRAM` reports the feature rather than a syntax
+;; error.
+
+(deftest copy-from-file-parsed
+  (let [p (parse "COPY t FROM '/tmp/data.csv'")]
+    (is (= :from (:direction p)))
+    (is (= {:file "/tmp/data.csv"} (:target p)))))
+
+(deftest copy-to-file-parsed
+  (let [p (parse "COPY t TO '/tmp/data.csv' WITH (FORMAT csv)")]
+    (is (= :to (:direction p)))
+    (is (= {:file "/tmp/data.csv"} (:target p)))
+    (is (= :csv (:format (:options p))))))
+
+(deftest copy-to-stdout-parsed
+  (let [p (parse "COPY t TO STDOUT")]
+    (is (= :to (:direction p)))
+    (is (= :stdout (:target p)))))
+
+(deftest copy-from-program-parsed
+  (let [p (parse "COPY t FROM PROGRAM 'cat /tmp/data.csv'")]
+    (is (= :from (:direction p)))
+    (is (= {:program "cat /tmp/data.csv"} (:target p)))))
 
 (deftest copy-query-rejected
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"COPY \( query"
@@ -258,3 +285,15 @@
     (is (= [] (vec (coerce "\\x"))))
     (testing "a non-hex value falls back to its UTF-8 bytes rather than throwing"
       (is (= (vec (.getBytes "plain" "UTF-8")) (vec (coerce "plain")))))))
+
+(deftest escape-string-literals-are-strings
+  ;; `E'...'` is one lexical token in PostgreSQL, and COPY options are
+  ;; written that way in the wild -- `DELIMITER E'\t'`, `ESCAPE E'\\'`.
+  ;; The `E` used to lex as an identifier, so an ordinary statement was
+  ;; reported as a syntax error.
+  (is (= "\t" (:delimiter (:options (parse "COPY t FROM stdin WITH (DELIMITER E'\\t')")))))
+  (is (= "\\" (:escape (:options (parse "COPY t FROM stdin WITH (FORMAT csv, ESCAPE E'\\\\')")))))
+  ;; A doubled quote is still a quote inside an escape string, and an
+  ;; unrecognised backslash escape is the character itself.
+  (is (= "'" (:null-marker (:options (parse "COPY t FROM stdin WITH (NULL E'''')")))))
+  (is (= "q" (:null-marker (:options (parse "COPY t FROM stdin WITH (NULL E'\\q')"))))))

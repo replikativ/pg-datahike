@@ -1050,7 +1050,10 @@
               :copy-from-stdin
               (try
                 (let [toks (copy/tokenize sql)
-                      parsed (copy/parse-copy-from-stdin toks)]
+                      ;; The raw SQL goes with the tokens: a
+                      ;; `COPY ( query ) TO` has to hand its query text
+                      ;; to the real parser verbatim.
+                      parsed (copy/parse-copy toks sql)]
                   (merge base parsed))
                 (catch clojure.lang.ExceptionInfo e
                   (let [data (ex-data e)

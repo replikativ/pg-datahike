@@ -621,3 +621,151 @@
     (is (thrown-with-msg? java.sql.SQLException #"BINARY"
                           (with-open [stmt (.createStatement c)]
                             (.execute stmt "COPY users FROM stdin WITH BINARY"))))))
+
+;; ============================================================================
+;; Server-side files
+;; ============================================================================
+;;
+;; `COPY ... FROM 'file'` shares everything after the bytes with STDIN,
+;; so what is worth testing here is the part that differs: where the
+;; bytes come from, and what a path the server cannot read reports.
+;; PostgreSQL reports the latter through `errcode_for_file_access`, so
+;; the SQLSTATE names the file problem rather than COPY.
+
+(defn- temp-data-file
+  ^java.io.File [^String suffix ^String body]
+  (doto (java.io.File/createTempFile "pgdh-copy" suffix)
+    (.deleteOnExit)
+    (->> (#(java.nio.file.Files/write (.toPath ^java.io.File %)
+                                      (.getBytes body "UTF-8")
+                                      (into-array java.nio.file.OpenOption []))))))
+
+(defn- exec! [^Connection c ^String sql]
+  (with-open [st (.createStatement c)]
+    (.executeUpdate st sql)))
+
+(deftest copy-from-server-side-file
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [f (temp-data-file ".txt" "1\tada\ta@x\tt\n2\tgrace\tg@x\tf\n")]
+      (is (= 2 (exec! c (str "COPY users FROM '" (.getAbsolutePath f) "'"))))
+      (is (= [[1 "ada" "a@x" true] [2 "grace" "g@x" false]]
+             (query-rows c "SELECT id,name,email,active FROM users ORDER BY id"))))))
+
+(deftest copy-from-server-side-csv-file
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [f (temp-data-file ".csv" "id,name,email,active\n3,\"van, damme\",v@x,t\n")]
+      (is (= 1 (exec! c (str "COPY users FROM '" (.getAbsolutePath f)
+                             "' WITH (FORMAT csv, HEADER true)"))))
+      (is (= [[3 "van, damme" "v@x" true]]
+             (query-rows c "SELECT id,name,email,active FROM users"))))))
+
+(deftest copy-from-file-reports-the-file-problem-not-copy
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [missing (str (System/getProperty "java.io.tmpdir")
+                       "/pgdh-copy-does-not-exist-" (java.util.UUID/randomUUID))]
+      ;; 58P01 undefined_file, as `errcode_for_file_access` maps ENOENT.
+      (is (= "58P01" (try (exec! c (str "COPY users FROM '" missing "'"))
+                          nil
+                          (catch java.sql.SQLException e (.getSQLState e)))))
+      ;; PostgreSQL opens before it stats, so a directory is its own
+      ;; error: 42809 wrong_object_type.
+      (is (= "42809" (try (exec! c (str "COPY users FROM '"
+                                        (System/getProperty "java.io.tmpdir") "'"))
+                          nil
+                          (catch java.sql.SQLException e (.getSQLState e))))))))
+
+(deftest copy-from-file-leaves-no-half-open-copy-behind
+  ;; The path is checked BEFORE the COPY-IN session is installed. When it
+  ;; was checked after, a bad path left `:copy-state` set and the next
+  ;; statement on the connection was swallowed as COPY data.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (thrown? java.sql.SQLException
+                 (exec! c "COPY users FROM '/nonexistent/pgdh/copy.txt'")))
+    (is (= 1 (copy-in-text c "COPY users FROM STDIN" "5\tzoe\tz@x\tt\n")))
+    (is (= [[5 "zoe"]] (query-rows c "SELECT id,name FROM users")))))
+
+(deftest program-reports-the-feature-it-lacks
+  ;; The parse is structural, so an unsupported target says which target
+  ;; it is rather than failing as a syntax error -- and says it for
+  ;; either direction.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [[sql expect] [["COPY users FROM PROGRAM 'cat /etc/hostname'"
+                           #"COPY \.\.\. FROM PROGRAM is not supported"]
+                          ["COPY users TO PROGRAM 'cat'"
+                           #"COPY \.\.\. TO PROGRAM is not supported"]]]
+      (is (re-find expect
+                   (try (exec! c sql) ""
+                        (catch java.sql.SQLException e (.getMessage e))))
+          sql))))
+
+;; ============================================================================
+;; COPY ... TO
+;; ============================================================================
+;;
+;; COPY TO is not a sub-protocol the way COPY FROM STDIN is -- the
+;; server does all the talking -- so what these cover is that the wire
+;; exchange is well-formed and that the bytes are the ones PostgreSQL
+;; writes. The field-level encoding has its own unit coverage in
+;; `pg-copy-out-format-test`, checked against a real PostgreSQL 17.
+
+(defn- copy-out-text
+  "Drive a `COPY ... TO STDOUT` and return what the server sent."
+  [^Connection c ^String sql]
+  (let [buf (java.io.ByteArrayOutputStream.)]
+    (.copyOut (CopyManager. (.unwrap c PGConnection)) sql buf)
+    (.toString buf "UTF-8")))
+
+(deftest copy-to-stdout-round-trips-through-the-wire
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (= 2 (copy-in-text c "COPY users FROM STDIN"
+                           "1\tada\ta@x\tt\n2\tgrace\t\\N\tf\n")))
+    (is (= "1\tada\ta@x\tt\n2\tgrace\t\\N\tf\n"
+           (copy-out-text c "COPY users TO STDOUT")))
+    (is (= "1,ada,a@x,t\n2,grace,,f\n"
+           (copy-out-text c "COPY users TO STDOUT WITH (FORMAT csv)")))
+    (is (= "id,name\n1,ada\n2,grace\n"
+           (copy-out-text c (str "COPY users (id,name) TO STDOUT "
+                                 "WITH (FORMAT csv, HEADER true)"))))))
+
+(deftest copy-query-to-stdout
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (= 2 (copy-in-text c "COPY users FROM STDIN"
+                           "1\tada\ta@x\tt\n2\tgrace\tg@x\tf\n")))
+    ;; The query text reaches the real parser verbatim -- including the
+    ;; parentheses inside it, which is why the split is made on
+    ;; characters rather than on this namespace's tokens.
+    (is (= "2\n1\n"
+           (copy-out-text c (str "COPY (SELECT id FROM users "
+                                 "WHERE (id + 0) > 0 ORDER BY id DESC) "
+                                 "TO STDOUT"))))))
+
+(deftest copy-to-file-and-back
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (= 2 (copy-in-text c "COPY users FROM STDIN"
+                           "1\tada\ta@x\tt\n2\tgrace\tg@x\tf\n")))
+    (let [out (java.io.File/createTempFile "pgdh-copy-out" ".csv")]
+      (.deleteOnExit out)
+      (is (= 2 (exec! c (str "COPY users TO '" (.getAbsolutePath out)
+                             "' WITH (FORMAT csv)"))))
+      (exec! c "DELETE FROM users")
+      (is (= 2 (exec! c (str "COPY users FROM '" (.getAbsolutePath out)
+                             "' WITH (FORMAT csv)"))))
+      (is (= [[1 "ada" "a@x" true] [2 "grace" "g@x" false]]
+             (query-rows c "SELECT id,name,email,active FROM users ORDER BY id"))))))
+
+(deftest copy-to-file-refuses-a-relative-path
+  ;; PostgreSQL resolves a relative path for COPY FROM and lets the open
+  ;; fail, but rejects one outright for COPY TO: writing somewhere
+  ;; surprising is worse than failing to read from one.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (= "42602" (try (exec! c "COPY users TO 'somewhere.csv'") nil
+                        (catch java.sql.SQLException e (.getSQLState e)))))))
+
+(deftest copy-to-is-a-read-not-a-write
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (= 1 (copy-in-text c "COPY users FROM STDIN" "1\tada\ta@x\tt\n")))
+    (exec! c "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+    (try
+      (is (= "1\tada\ta@x\tt\n" (copy-out-text c "COPY users TO STDOUT")))
+      (finally
+        (exec! c "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")))))

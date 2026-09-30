@@ -1,8 +1,8 @@
 (ns datahike.pg.sql.copy
-  "Token-driven hand-parser for `COPY ... FROM STDIN` (and `COPY ...
-   TO STDOUT`, deferred). JSqlParser 5.x doesn't recognise COPY at
-   all — UnsupportedStatement — so the wire-protocol layer needs
-   structured access before it can drive the COPY-IN sub-protocol.
+  "Token-driven hand-parser for `COPY`. JSqlParser 5.x doesn't
+   recognise COPY at all — UnsupportedStatement — so the wire-protocol
+   layer needs structured access before it can drive the COPY-IN
+   sub-protocol.
 
    Also exposes `row->entity-map`: shared helper used by the COPY-IN
    exec handler (server.clj) to turn a vector of decoded
@@ -22,7 +22,8 @@
    PG syntax (from `../postgres/doc/src/sgml/ref/copy.sgml`):
 
      COPY [schema.]table [ ( col [, ...] ) ]
-         FROM { 'file' | PROGRAM 'cmd' | STDIN }
+         { FROM { 'file' | PROGRAM 'cmd' | STDIN }
+         | TO   { 'file' | PROGRAM 'cmd' | STDOUT } }
          [ [ WITH ] ( option [, ...] ) ]
 
    Options accepted:
@@ -41,8 +42,10 @@
      DEFAULT         'X'                — defaults-marker (PG 16+)
      OIDS            [ BOOL ]           — legacy, removed in PG 12; rejected
 
-   Output shape (for COPY FROM STDIN):
+   Output shape:
      {:type :copy-from-stdin
+      :direction :from | :to
+      :target :stdin | :stdout | {:file path} | {:program cmd}
       :ns string                ;; lowercase table namespace
       :table string             ;; original-case table name
       :columns [string ...]     ;; lowercase, or nil if no col-list given
@@ -607,58 +610,127 @@
 ;; Top-level parser
 ;; ----------------------------------------------------------------------------
 
-(defn parse-copy-from-stdin
-  "Parse a tokenised `COPY ... FROM STDIN` statement.
+(defn split-copy-query
+  "For `COPY ( query ) TO ...`, return `[query-text rest-sql]` by
+   scanning the raw SQL for the parenthesis that closes the one after
+   COPY.
+
+   Tokens cannot answer this. The query has to reach the real parser
+   verbatim, and re-assembling it from this namespace's tokens would
+   hand it back whatever the tokenizer normalised -- so the split is
+   made on the characters, skipping over quoted strings and quoted
+   identifiers so a parenthesis inside one does not count.
+
+   Returns nil when the SQL does not have that shape."
+  [^String sql]
+  (let [n (.length sql)
+        open (loop [i 0]
+               (cond (>= i n) nil
+                     (= \( (.charAt sql i)) i
+                     :else (recur (inc i))))]
+    (when open
+      (loop [i (inc open) depth 1 in-str nil]
+        (if (>= i n)
+          nil
+          (let [c (.charAt sql i)]
+            (cond
+              ;; Inside a literal or quoted identifier: only its own
+              ;; closing mark matters, and a doubled one is an escape.
+              in-str
+              (if (= c in-str)
+                (if (and (< (inc i) n) (= in-str (.charAt sql (inc i))))
+                  (recur (+ i 2) depth in-str)
+                  (recur (inc i) depth nil))
+                (recur (inc i) depth in-str))
+
+              (or (= c \') (= c \")) (recur (inc i) depth c)
+              (= c \()               (recur (inc i) (inc depth) nil)
+              (= c \))               (if (= 1 depth)
+                                       [(subs sql (inc open) i)
+                                        (subs sql (inc i))]
+                                       (recur (inc i) (dec depth) nil))
+              :else                  (recur (inc i) depth nil))))))))
+
+(defn- consume-direction
+  "Read FROM or TO off the front of `toks`, without consuming it: the
+   target parser needs it to say which targets are legal."
+  [toks]
+  (cond
+    (ident-eq? (first toks) "from") :from
+    (ident-eq? (first toks) "to")   :to
+    :else
+    (throw (ex-info (str "expected FROM or TO in COPY, got: "
+                         (pr-str (first toks)))
+                    {:error :syntax-error :got (first toks)}))))
+
+(defn- consume-options-tail
+  "Parse everything after the target: an optional WITH, then either the
+   modern parenthesised list or the legacy keyword run, or nothing."
+  [toks]
+  (let [toks (if (ident-eq? (first toks) "with") (rest toks) toks)]
+    (cond
+      (or (empty? toks) (= :semicolon (ffirst toks))) []
+      (= :lparen (ffirst toks)) (first (consume-paren-option-list toks))
+      :else                     (first (consume-legacy-option-list toks)))))
+
+(defn parse-copy
+  "Parse a tokenised `COPY` statement in either direction.
 
    Returns:
      {:db-name nil       ;; for parity with database.clj parse shape
+      :direction :from | :to
+      :target :stdin | :stdout | {:file path} | {:program cmd}
       :ns lowercase-string-or-nil
       :table original-case-string
       :columns [lowercase-string ...] | nil
       :options normalised-options-map}
 
+   The parse is structural: which direction/target combinations the
+   server can actually execute is decided there, not here, so that an
+   unsupported one reports what it is rather than a syntax error.
+
    Throws ex-info with `:error :syntax-error` on malformed input,
    or `:feature-not-supported` for COPY BINARY / OIDS."
-  [toks]
-  (let [[c1 c2 & rest1] toks]
-    (when-not (ident-eq? c1 "copy")
-      (throw (ex-info "not a COPY statement"
-                      {:error :syntax-error :got [c1 c2]})))
-    ;; Reject COPY (query) TO stdout shape early — only FROM stdin in tier 2.
-    (when (= :lparen (first c2))
-      (throw (ex-info "COPY ( query ) TO/FROM not supported in this version"
-                      {:error :feature-not-supported
-                       :feature "COPY ( query ) ..."})))
-    (when-not (ident-token? c2)
-      (throw (ex-info "expected table name after COPY"
-                      {:error :syntax-error :got c2})))
-    (let [[table-info t-after-name] (consume-table-name (cons c2 rest1))
-          [columns t-after-cols] (consume-column-list t-after-name)
-          [target t-after-target] (consume-from-target t-after-cols :from)
-          _ (when-not (= :stdin target)
-              (throw (ex-info (str "only COPY FROM STDIN is supported; got: "
-                                   (pr-str target))
-                              {:error :feature-not-supported
-                               :feature "COPY FROM file/PROGRAM"})))
-          ;; Optional WITH (or no WITH at all)
-          t-after-with (if (ident-eq? (first t-after-target) "with")
-                         (rest t-after-target)
-                         t-after-target)
-          ;; Modern paren form vs legacy keyword form
-          [opts-vec _t-rest]
-          (cond
-            ;; No options at all
-            (or (empty? t-after-with)
-                (= :semicolon (ffirst t-after-with)))
-            [[] t-after-with]
-
-            (= :lparen (ffirst t-after-with))
-            (consume-paren-option-list t-after-with)
-
-            :else
-            (consume-legacy-option-list t-after-with))]
-      {:db-name nil
-       :ns (:ns table-info)
-       :table (:table table-info)
-       :columns columns
-       :options (options->map opts-vec)})))
+  ([toks] (parse-copy toks nil))
+  ([toks sql]
+   (let [[c1 c2 & rest1] toks]
+     (when-not (ident-eq? c1 "copy")
+       (throw (ex-info "not a COPY statement"
+                       {:error :syntax-error :got [c1 c2]})))
+     (if (= :lparen (first c2))
+       ;; `COPY ( query ) TO ...` has no table to name. The query text
+       ;; is recovered from the raw SQL, because it has to reach the
+       ;; real parser verbatim; the rest of the statement is
+       ;; re-tokenised from what follows the closing parenthesis.
+       (let [[query rest-sql] (when sql (split-copy-query sql))]
+         (when-not query
+           (throw (ex-info "COPY ( query ) TO/FROM not supported in this version"
+                           {:error :feature-not-supported
+                            :feature "COPY ( query ) ..."})))
+         (let [rtoks (tokenize rest-sql)
+               direction (consume-direction rtoks)
+               [target after-target] (consume-from-target rtoks direction)]
+           {:db-name nil
+            :direction direction
+            :target target
+            :query (str/trim query)
+            :ns nil
+            :table nil
+            :columns nil
+            :options (options->map (consume-options-tail after-target))}))
+       (do
+         (when-not (ident-token? c2)
+           (throw (ex-info "expected table name after COPY"
+                           {:error :syntax-error :got c2})))
+         (let [[table-info t-after-name] (consume-table-name (cons c2 rest1))
+               [columns t-after-cols] (consume-column-list t-after-name)
+               direction (consume-direction t-after-cols)
+               [target t-after-target] (consume-from-target t-after-cols direction)]
+           {:db-name nil
+            :direction direction
+            :target target
+            :query nil
+            :ns (:ns table-info)
+            :table (:table table-info)
+            :columns columns
+            :options (options->map (consume-options-tail t-after-target))}))))))
