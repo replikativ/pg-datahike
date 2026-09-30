@@ -89,6 +89,44 @@
           (= \= (.charAt sql i)) (recur (unchecked-inc i) (conj toks [:eq "="]))
           (= \; (.charAt sql i)) (recur (unchecked-inc i) (conj toks [:semicolon ";"]))
 
+          ;; E'string' — PostgreSQL's escape-string literal, where a
+          ;; backslash introduces a C-style escape. COPY's own options
+          ;; are written this way in the wild (`DELIMITER E'\t'`,
+          ;; `ESCAPE E'\\'`), and without this the `E` lexed as an
+          ;; identifier and the option parser reported a syntax error
+          ;; against a perfectly ordinary statement.
+          (and (or (= \E (.charAt sql i)) (= \e (.charAt sql i)))
+               (< (inc i) n)
+               (= \' (.charAt sql (inc i))))
+          (let [sb (StringBuilder.)
+                end (loop [j (+ i 2)]
+                      (cond
+                        (>= j n) j
+
+                        (= \' (.charAt sql j))
+                        ;; '' is still a quote, as in an ordinary literal.
+                        (if (and (< (unchecked-inc j) n)
+                                 (= \' (.charAt sql (unchecked-inc j))))
+                          (do (.append sb \') (recur (+ j 2)))
+                          j)
+
+                        (and (= \\ (.charAt sql j)) (< (unchecked-inc j) n))
+                        (let [c (.charAt sql (unchecked-inc j))]
+                          (case c
+                            \b (do (.append sb \backspace) (recur (+ j 2)))
+                            \f (do (.append sb \formfeed) (recur (+ j 2)))
+                            \n (do (.append sb \newline) (recur (+ j 2)))
+                            \r (do (.append sb \return) (recur (+ j 2)))
+                            \t (do (.append sb \tab) (recur (+ j 2)))
+                            ;; Anything else after a backslash is itself:
+                            ;; that is what makes E'\\' one backslash and
+                            ;; E'\'' one quote.
+                            (do (.append sb c) (recur (+ j 2)))))
+
+                        :else (do (.append sb (.charAt sql j))
+                                  (recur (unchecked-inc j)))))]
+            (recur (unchecked-inc end) (conj toks [:string (.toString sb)])))
+
           ;; 'string'  — ANSI-style: '' inside is an escaped quote
           (= \' (.charAt sql i))
           (let [sb (StringBuilder.)

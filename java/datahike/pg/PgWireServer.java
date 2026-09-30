@@ -647,6 +647,21 @@ public final class PgWireServer {
         public int copyColumnCount;
 
         /**
+         * COPY-OUT sub-protocol signal. When true, the wire layer
+         * emits CopyOutResponse, one CopyData per line, CopyDone and
+         * then the CommandComplete — and, unlike COPY-IN, does NOT
+         * suspend the protocol: COPY TO is a complete statement by the
+         * time it reaches the wire, so what follows is ordinary.
+         *
+         * Each entry of {@link #copyOutLines} is one already-encoded
+         * row WITHOUT its terminating newline; the wire layer appends
+         * it. The encoding is the Clojure layer's business — it is the
+         * only side that knows the format options.
+         */
+        public boolean copyOutMode;
+        public String[] copyOutLines;
+
+        /**
          * Deferred-CC batching marker. When {@code true}, the wire
          * layer holds back this result's CommandComplete and parks
          * {@link #batchTxData} in the connection's pending-batch
@@ -758,6 +773,19 @@ public final class PgWireServer {
          * columns (all text format) and transition to COPY-IN state
          * before reading the next message.
          */
+        /**
+         * Flag this result as COPY-OUT with the given already-encoded
+         * lines. {@code columnCount} goes into CopyOutResponse so a
+         * client can pre-size its per-column format array; we always
+         * declare text.
+         */
+        public QueryResult withCopyOutMode(String[] lines, int columnCount) {
+            this.copyOutMode = true;
+            this.copyOutLines = lines;
+            this.copyColumnCount = columnCount;
+            return this;
+        }
+
         public QueryResult withCopyInMode(int columnCount) {
             this.copyInMode = true;
             this.copyColumnCount = columnCount;
@@ -1809,6 +1837,21 @@ public final class PgWireServer {
                     out.flush();
                     copyState[0] = 1;
                     return;
+                } else if (result.copyOutMode) {
+                    // COPY ... TO STDOUT. Drain the held batch first so
+                    // the rows this COPY reads include them, then emit
+                    // the whole exchange and carry on: no sub-protocol
+                    // to enter, because the server does all the talking.
+                    QueryResult flushErr = flushBatch(out, handler, batch);
+                    if (flushErr != null) {
+                        sendError(out, "ERROR",
+                                flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                                flushErr.error, flushErr.errorFields);
+                        if (txStatus[0] == 'T') txStatus[0] = 'E';
+                        errored = true;
+                        break;
+                    }
+                    sendCopyOut(out, result);
                 } else if (result.columnNames.length == 0) {
                     // Non-batchable single command (DDL, SET, BEGIN,
                     // …). Drain the held batch first so its rows are
@@ -2551,6 +2594,21 @@ public final class PgWireServer {
             out.flush();
             copyState[0] = 1;
             return;
+        } else if (result.copyOutMode) {
+            // Extended-Query COPY-OUT. Same ordering obligation as the
+            // simple path: held INSERTs are committed and written
+            // first, then this statement's own pre-Execute responses,
+            // then the COPY exchange.
+            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+            if (flushErr != null) {
+                throw new PgProtocolException(
+                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                    flushErr.error, flushErr.errorFields);
+            }
+            extBatch.cur.writeTo(out);
+            extBatch.resetCur();
+            sendCopyOut(out, result);
+            return;
         } else if (result.columnNames.length == 0) {
             // Non-batchable command (DDL, BEGIN, COMMIT, …). Commit
             // any held INSERTs first, write their bytes to wire, then
@@ -2963,6 +3021,61 @@ public final class PgWireServer {
         for (int i = 0; i < numColumns; i++) {
             out.writeShort((short) 0);          // per-column format: 0 = text
         }
+    }
+
+    /**
+     * Emit CopyOutResponse ('H') with the given column count. Same
+     * shape as CopyInResponse, different type byte:
+     *
+     *   Byte1('H') | Int32(length) | Int8(format) | Int16(numColumns) |
+     *     Int16[numColumns](perColumnFormatCodes)
+     *
+     * Spec: protocol.sgml (CopyOutResponse).
+     */
+    private void sendCopyOutResponse(DataOutputStream out, int numColumns) throws IOException {
+        int payloadLen = 4 + 1 + 2 + (2 * numColumns);
+        out.writeByte('H');
+        out.writeInt(payloadLen);
+        out.writeByte(0);                       // overall format: 0 = text
+        out.writeShort((short) numColumns);
+        for (int i = 0; i < numColumns; i++) {
+            out.writeShort((short) 0);          // per-column format: 0 = text
+        }
+    }
+
+    /**
+     * Write one COPY-OUT row: CopyOutResponse's stream is a sequence of
+     * CopyData ('d') messages. PostgreSQL sends one per row for
+     * text/CSV, which is what psql's `\copy` and pg_dump both expect.
+     */
+    private void sendCopyData(DataOutputStream out, byte[] payload) throws IOException {
+        out.writeByte('d');
+        out.writeInt(4 + payload.length);
+        out.write(payload);
+    }
+
+    private void sendCopyDone(DataOutputStream out) throws IOException {
+        out.writeByte('c');
+        out.writeInt(4);
+    }
+
+    /**
+     * The whole COPY-OUT exchange for one finished result: the
+     * response header, the rows, the terminator and the
+     * CommandComplete. The caller carries on as after any other
+     * statement — COPY TO does not put the connection in a sub-protocol
+     * the way COPY FROM STDIN does, because the server is the one
+     * doing the talking.
+     */
+    private void sendCopyOut(DataOutputStream out, QueryResult result) throws IOException {
+        sendCopyOutResponse(out, result.copyColumnCount);
+        if (result.copyOutLines != null) {
+            for (String line : result.copyOutLines) {
+                sendCopyData(out, (line + "\n").getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        sendCopyDone(out);
+        sendCommandComplete(out, result.commandTag);
     }
 
     /**

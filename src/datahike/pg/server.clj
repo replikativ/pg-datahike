@@ -43,6 +43,7 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.copy :as copy]
+            [datahike.pg.sql.copy.out :as copy-out]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
@@ -6279,10 +6280,14 @@
 
 (defn- reject-read-only-write!
   [tx-state session-state parsed]
-  (let [write-type (if (= :copy-from-stdin (:kind parsed))
-                     ;; COPY owns its transaction/sub-protocol and therefore
-                     ;; is a :system parse, deliberately absent from
-                     ;; write-parse-types.
+  (let [write-type (if (and (= :copy-from-stdin (:kind parsed))
+                            ;; COPY owns its transaction/sub-protocol and
+                            ;; therefore is a :system parse, deliberately
+                            ;; absent from write-parse-types. Only the FROM
+                            ;; direction writes -- COPY TO is a read, and
+                            ;; PostgreSQL allows it in a read-only
+                            ;; transaction.
+                            (not= :to (:direction parsed)))
                      :copy-from-stdin
                      (:type parsed))]
     (when (and (or (contains? write-parse-types write-type)
@@ -7033,7 +7038,8 @@
 ;; for `:copy-from-stdin`, but exec-copy-from-stdin (which depends on
 ;; helpers like columns-from-schema, copy-flush-batch!) is defined further
 ;; below to keep related code contiguous.
-(declare exec-copy-from-stdin admit-unique-index-enforcement!)
+(declare exec-copy-from-stdin exec-copy-from-file exec-copy-to
+         admit-unique-index-enforcement!)
 
 (defn- exec-system
   "Dispatch on (:system-type parsed). System-types are recognised by
@@ -7158,14 +7164,30 @@
         (single-row-result "set_config" PgWireServer/OID_TEXT (or value "")))
 
       :copy-from-stdin
-      ;; SQL `COPY t [(cols)] FROM STDIN [WITH (...)];`. Returns a
-      ;; QueryResult flagged copyInMode — the wire layer emits
-      ;; CopyInResponse and transitions to COPY-IN sub-protocol;
-      ;; subsequent CopyData/CopyDone/CopyFail messages route to
-      ;; the QueryHandler reify's copyChunk/copyComplete/copyAbort
-      ;; methods, which mutate the :copy-state atom.
+      ;; SQL `COPY t [(cols)] FROM {STDIN | 'file'} [WITH (...)];`.
+      ;;
+      ;; STDIN returns a QueryResult flagged copyInMode — the wire layer
+      ;; emits CopyInResponse and transitions to the COPY-IN
+      ;; sub-protocol; subsequent CopyData/CopyDone/CopyFail messages
+      ;; route to the QueryHandler reify's
+      ;; copyChunk/copyComplete/copyAbort methods, which mutate the
+      ;; :copy-state atom.
+      ;;
+      ;; A server-side file needs none of that: it runs the whole COPY
+      ;; here and returns the finished `COPY n`.
       (try
-        (exec-copy-from-stdin ctx parsed)
+        (let [{:keys [direction target]} parsed]
+          (cond
+            (:program target)
+            (throw (ex-info (str "COPY " (str/upper-case (name direction))
+                                 " PROGRAM is not supported by datahike pgwire")
+                            {:error :feature-not-supported
+                             :feature (str "COPY ... " (str/upper-case (name direction))
+                                           " PROGRAM")}))
+
+            (= :to direction) (exec-copy-to ctx parsed)
+            (:file target)    (exec-copy-from-file ctx parsed)
+            :else             (exec-copy-from-stdin ctx parsed)))
         (catch clojure.lang.ExceptionInfo e
           (classified-error "COPY failed: " e))
         (catch Throwable e
@@ -11710,12 +11732,13 @@
             sort
             vec))))
 
-(defn- exec-copy-from-stdin
-  "Initialise a COPY-IN session and return a QueryResult signalling
-   `copyInMode`. The wire layer reads that and emits CopyInResponse,
-   then routes subsequent CopyData/CopyDone/CopyFail messages to
-   the QueryHandler reify's copyChunk/copyComplete/copyAbort
-   methods (which read the session out of `:copy-state`)."
+(defn- start-copy-in!
+  "Validate a COPY destination and install the COPY-IN session on
+   `:copy-state`. Returns the resolved column names.
+
+   Where the data then comes from is the caller's business: the wire
+   layer streams it as CopyData frames, and `COPY ... FROM 'file'`
+   reads it off disk. Both then drive `copy-feed-chunk!`/`copy-finish!`."
   [ctx parsed]
   (let [{:keys [schema copy-state conn tx-state]} ctx
         {:keys [ns table columns options]} parsed
@@ -11835,10 +11858,19 @@
                                          (* 1000000 (long timeout-ms)))))
                  :utf8-tail       (byte-array 0)
                  :error           nil}))
-      ;; Return QueryResult signalling COPY-IN with the column count.
-      (let [r (PgWireServer$QueryResult/empty "COPY 0")]
-        (.withCopyInMode r (count col-names))
-        r))))
+      col-names)))
+
+(defn- exec-copy-from-stdin
+  "Initialise a COPY-IN session and return a QueryResult signalling
+   `copyInMode`. The wire layer reads that and emits CopyInResponse,
+   then routes subsequent CopyData/CopyDone/CopyFail messages to
+   the QueryHandler reify's copyChunk/copyComplete/copyAbort
+   methods (which read the session out of `:copy-state`)."
+  [ctx parsed]
+  (let [col-names (start-copy-in! ctx parsed)
+        r (PgWireServer$QueryResult/empty "COPY 0")]
+    (.withCopyInMode r (count col-names))
+    r))
 
 (defn- copy-flush-batch!
   "Validate one bounded COPY executor batch against a private snapshot.
@@ -12101,6 +12133,253 @@
                                  tempids)))))
       (when (seq tx-data)
         (transact-recorded! conn commit-tx-data)))))
+
+(defn- copy-feed-chunk!
+  "Decode one COPY-IN byte chunk and run its rows through the pipeline.
+
+   Shared by the wire layer's CopyData callback and server-side
+   `COPY ... FROM 'file'`: those differ only in where the bytes come
+   from, and the difference stopped there once this stopped being
+   inlined in the QueryHandler reify.
+
+   Errors are latched on `:copy-state` rather than thrown, because the
+   COPY-IN sub-protocol must stay in COPY mode until CopyDone."
+  [{:keys [copy-state] :as ctx} ^bytes chunk-bytes]
+  (when-let [s @copy-state]
+    (when-not (:error s)
+      (try
+        (with-copy-execution-context
+          s
+          (fn []
+            (check-copy-interrupt! s)
+            (let [[chunk tail encoding-error]
+                  (decode-copy-utf8 (:utf8-tail s) chunk-bytes false)]
+              (swap! copy-state assoc :utf8-tail tail)
+              (copy-process-chars! ctx chunk)
+              (when (and encoding-error
+                         (nil? (:error @copy-state))
+                         (not (get-in @copy-state [:decoder :eod?])))
+                (swap! copy-state assoc :error encoding-error)))))
+        (catch Throwable e
+          (swap! copy-state assoc :error e :pending-rows []))))))
+
+(defn- copy-finish!
+  "Flush the decoder's tail, publish the accumulated rows, and return the
+   `COPY n` QueryResult (or a classified error). Ends the session either
+   way — `:copy-state` is nil afterwards."
+  [{:keys [copy-state tx-state] :as ctx}]
+  (let [s @copy-state]
+    (if (nil? s)
+      (PgWireServer$QueryResult/empty "COPY 0")
+      (with-copy-execution-context
+        s
+        (fn []
+          (when-not (:error @copy-state)
+            (try
+              (check-copy-interrupt! s)
+              (let [[tail-text tail encoding-error]
+                    (decode-copy-utf8 (:utf8-tail s) (byte-array 0) true)]
+                (swap! copy-state assoc :utf8-tail tail)
+                (copy-process-chars! ctx tail-text)
+                (when (and encoding-error
+                           (nil? (:error @copy-state))
+                           (not (get-in @copy-state [:decoder :eod?])))
+                  (swap! copy-state assoc :error encoding-error)))
+              (catch Throwable e
+                (swap! copy-state assoc :error e))))
+          (let [current @copy-state
+                finalize-fn (:decode-finalize-fn current)
+                final-result (when-not (:error current)
+                               (try
+                                 (finalize-fn (:decoder current))
+                                 (catch Throwable e
+                                   (swap! copy-state assoc :error e)
+                                   nil)))
+                [final-rows _eod?] final-result]
+            (when (and (nil? (:error @copy-state)) (seq final-rows))
+              (copy-process-rows! ctx final-rows))
+            (try
+              (copy-flush-batch! ctx)
+              (when-let [e (:error @copy-state)]
+                (throw e))
+              (publish-copy! ctx)
+              (let [processed (:rows-processed @copy-state)]
+                (reset! copy-state nil)
+                (PgWireServer$QueryResult/empty (str "COPY " processed)))
+              (catch Throwable e
+                (let [processed (:rows-processed @copy-state)]
+                  (when (:in-tx? @tx-state)
+                    (swap! tx-state assoc :aborted? true))
+                  (reset! copy-state nil)
+                  (classified-error
+                   (str "COPY failed after processing " processed " rows: ")
+                   e))))))))))
+
+(defn- copy-file-error
+  "Shape an unopenable COPY file the way `copyfrom.c` does.
+
+   PostgreSQL reports it through `errcode_for_file_access`, so the
+   SQLSTATE names the reason rather than COPY: ENOENT is 58P01
+   (undefined_file), EACCES is 42501 (insufficient_privilege), and
+   anything else is 58030 (io_error). It opens the file before it stats
+   it, so a directory -- which opens fine on Linux -- is a separate
+   42809 with no hint.
+
+   The hint is attached for exactly the two errnos PG attaches it to:
+   it exists to point a confused client at psql's `\\copy`, which is
+   only the answer when the server could not see the file at all."
+  [^String path]
+  (let [file (java.io.File. path)]
+    (cond
+      (.isDirectory file)
+      (ex-info (str "\"" path "\" is a directory")
+               {:sqlstate "42809" :error :wrong-object-type})
+
+      (or (not (.exists file)) (not (.canRead file)))
+      (let [missing? (not (.exists file))]
+        (ex-info (str "could not open file \"" path "\" for reading: "
+                      (if missing?
+                        "No such file or directory"
+                        "Permission denied"))
+                 {:sqlstate (if missing? "58P01" "42501")
+                  :error :io-error
+                  :hint (str "COPY FROM instructs the PostgreSQL server "
+                             "process to read a file. You may want a "
+                             "client-side facility such as psql's \\copy.")}))
+
+      :else
+      (ex-info (str "could not read file \"" path "\"")
+               {:sqlstate "58030" :error :io-error}))))
+
+(defn- exec-copy-from-file
+  "Execute server-side `COPY t [(cols)] FROM 'file' [WITH (...)]`.
+
+   The file is read by the server process, not the client -- which is
+   why PostgreSQL restricts this form to superusers and the
+   `pg_read_server_files` role, and why STDIN exists as the
+   unprivileged spelling. We do not model that separation.
+
+   A relative path is not rejected: PostgreSQL resolves one against its
+   data directory and lets the open fail, so the error a client sees is
+   `could not open file` either way. (`relative path not allowed` is a
+   COPY *TO* rule.) Ours resolves against the server's working
+   directory, which is the same promise -- somewhere the server, not
+   the client, can see.
+
+   Everything after the bytes is the STDIN path: the same decoder, the
+   same constraint and default handling, the same `COPY n` tag."
+  [{:keys [copy-state] :as ctx} parsed]
+  (let [^String path (get-in parsed [:target :file])
+        file (java.io.File. path)]
+    ;; Fail before installing the COPY session, so a bad path leaves no
+    ;; half-open COPY behind on the connection.
+    (when-not (and (.exists file) (.canRead file) (not (.isDirectory file)))
+      (throw (copy-file-error path)))
+    (start-copy-in! ctx parsed)
+    (try
+      (with-open [in (java.io.FileInputStream. file)]
+        (let [buf (byte-array 65536)]
+          (loop []
+            (let [n (.read in buf)]
+              (when (pos? n)
+                (copy-feed-chunk! ctx (java.util.Arrays/copyOf buf n))
+                ;; A failed row latches on :copy-state; stop reading the
+                ;; file rather than decode megabytes we will discard.
+                (when (nil? (:error @copy-state))
+                  (recur)))))))
+      (catch java.io.IOException e
+        (reset! copy-state nil)
+        (throw (copy-file-error path))))
+    (copy-finish! ctx)))
+
+(defn- copy-to-lines
+  "Run the SELECT a COPY TO reads from and encode its rows.
+
+   The rows come back from the ordinary statement path already
+   rendered as text -- the same strings a DataRow would carry -- so
+   COPY TO agrees with SELECT by construction rather than by having a
+   second renderer that has to be kept in step with the first.
+
+   Returns [column-names lines row-count]. The header, when asked for,
+   is encoded like any other row except that FORCE_QUOTE does not
+   apply to it, which is what `copyto.c` does."
+  [ctx parsed]
+  (let [{:keys [options columns table query]} parsed
+        ;; `physicalize-temp-parse` has already rewritten a temp table's
+        ;; name to its physical namespace, and `visible-session-schema`
+        ;; deliberately HIDES those -- that is what stops one session
+        ;; reaching another's temp table by spelling the storage name.
+        ;; A SELECT built from the physical name therefore cannot see
+        ;; the table this COPY is reading. Map it back.
+        table (get (clojure.set/map-invert @(:temp-tables ctx)) table table)
+        sql (or query
+                (str "SELECT "
+                     (if (seq columns) (str/join ", " columns) "*")
+                     " FROM " table))
+        ;; Through `*statement-handler*`, not the handler directly: the
+        ;; caller's `*cached-parsed*` is still in scope here, so a bare
+        ;; `.execute` re-runs the OUTER plan -- this COPY -- and
+        ;; recurses until the stack ends. Exactly the failure
+        ;; `nested-executor` was written for, one caller later.
+        ^PgWireServer$QueryResult r
+        (if-let [run params/*statement-handler*]
+          (run sql [] [])
+          (.execute ^PgWireServer$QueryHandler (:handler ctx) sql))]
+    (when (.error r)
+      (throw (ex-info (.error r)
+                      {:sqlstate (or (.sqlstate r) "XX000")
+                       :error :copy-to-query})))
+    (let [col-names (vec (.columnNames r))
+          rows (.rows r)
+          lines (mapv (fn [row] (copy-out/row-line (vec row) col-names options))
+                      rows)]
+      [col-names
+       (if (= :true (:header options))
+         (into [(copy-out/row-line col-names col-names
+                                   (assoc options :force-quote nil))]
+               lines)
+         lines)
+       (alength rows)])))
+
+(defn- exec-copy-to
+  "Execute `COPY {t [(cols)] | ( query )} TO {STDOUT | 'file'} [WITH (...)]`.
+
+   STDOUT hands the encoded lines to the wire layer, which emits the
+   COPY-OUT exchange; a file is written here. Unlike COPY FROM,
+   PostgreSQL does reject a relative path for COPY TO outright rather
+   than resolving it -- writing somewhere surprising is worse than
+   failing to read from one."
+  [ctx parsed]
+  (let [{:keys [target options]} parsed]
+    (when (= :binary (:format options))
+      (throw (ex-info "COPY BINARY is not supported by datahike pgwire"
+                      {:error :feature-not-supported :feature "COPY BINARY"})))
+    (let [[col-names lines n] (copy-to-lines ctx parsed)]
+      (if (= :stdout target)
+        (doto (PgWireServer$QueryResult/empty (str "COPY " n))
+          (.withCopyOutMode (into-array String lines) (count col-names)))
+        (let [^String path (:file target)
+              file (java.io.File. path)]
+          (when-not (.isAbsolute file)
+            (throw (ex-info "relative path not allowed for COPY to file"
+                            {:sqlstate "42602" :error :invalid-name})))
+          (try
+            (with-open [w (java.io.BufferedWriter.
+                           (java.io.OutputStreamWriter.
+                            (java.io.FileOutputStream. file)
+                            java.nio.charset.StandardCharsets/UTF_8))]
+              (doseq [^String line lines]
+                (.write w line)
+                (.write w "\n")))
+            (catch java.io.IOException e
+              (throw (ex-info (str "could not open file \"" path "\" for writing: "
+                                   (.getMessage e))
+                              {:sqlstate "58030" :error :io-error
+                               :hint (str "COPY TO instructs the PostgreSQL "
+                                          "server process to write a file. You "
+                                          "may want a client-side facility such "
+                                          "as psql's \\copy.")}))))
+          (PgWireServer$QueryResult/empty (str "COPY " n)))))))
 
 (defn- copy-decoder-awaits-cr-lookahead? [decoder]
   (let [^StringBuilder buf (:line-buf decoder)
@@ -12513,81 +12792,21 @@
       ;; execute() call — we're a separate Java callback).
 
       (copyChunk [_ chunk-bytes]
-        (when-let [s @copy-state]
-          (when-not (:error s)
-            (try
-              (with-copy-execution-context
-                s
-                (fn []
-                  (check-copy-interrupt! s)
-                  (let [[chunk tail encoding-error]
-                        (decode-copy-utf8 (:utf8-tail s) chunk-bytes false)
-                        ctx-fresh {:conn conn
-                                   :schema (:schema (d/db conn))
-                                   :copy-state copy-state
-                                   :tx-state tx-state}]
-                    (swap! copy-state assoc :utf8-tail tail)
-                    (copy-process-chars! ctx-fresh chunk)
-                    (when (and encoding-error
-                               (nil? (:error @copy-state))
-                               (not (get-in @copy-state [:decoder :eod?])))
-                      (swap! copy-state assoc :error encoding-error)))))
-              (catch Throwable e
-                ;; Stay in COPY-IN protocol mode and report the typed error at
-                ;; CopyDone.  Throwing here made the Java loop emit XX000 while
-                ;; accidentally leaving its COPY state active.
-                (swap! copy-state assoc :error e :pending-rows []))))))
+        ;; Errors are latched on :copy-state, not thrown: staying in
+        ;; COPY-IN protocol mode and reporting the typed error at
+        ;; CopyDone. Throwing here made the Java loop emit XX000 while
+        ;; accidentally leaving its COPY state active.
+        (copy-feed-chunk! {:conn conn
+                           :schema (:schema (d/db conn))
+                           :copy-state copy-state
+                           :tx-state tx-state}
+                          chunk-bytes))
 
       (copyComplete [_]
-        (let [s @copy-state]
-          (if (nil? s)
-            (PgWireServer$QueryResult/empty "COPY 0")
-            (with-copy-execution-context
-              s
-              (fn []
-                (let [ctx-fresh {:conn conn
-                                 :schema (:schema (d/db conn))
-                                 :copy-state copy-state
-                                 :tx-state tx-state}]
-                  (when-not (:error @copy-state)
-                    (try
-                      (check-copy-interrupt! s)
-                      (let [[tail-text tail encoding-error]
-                            (decode-copy-utf8 (:utf8-tail s) (byte-array 0) true)]
-                        (swap! copy-state assoc :utf8-tail tail)
-                        (copy-process-chars! ctx-fresh tail-text)
-                        (when (and encoding-error
-                                   (nil? (:error @copy-state))
-                                   (not (get-in @copy-state [:decoder :eod?])))
-                          (swap! copy-state assoc :error encoding-error)))
-                      (catch Throwable e
-                        (swap! copy-state assoc :error e))))
-                  (let [current @copy-state
-                        finalize-fn (:decode-finalize-fn current)
-                        final-result (when-not (:error current)
-                                       (try
-                                         (finalize-fn (:decoder current))
-                                         (catch Throwable e
-                                           (swap! copy-state assoc :error e)
-                                           nil)))
-                        [final-rows _eod?] final-result]
-                    (when (and (nil? (:error @copy-state)) (seq final-rows))
-                      (copy-process-rows! ctx-fresh final-rows))
-                    (try
-                      (copy-flush-batch! ctx-fresh)
-                      (when-let [e (:error @copy-state)]
-                        (throw e))
-                      (publish-copy! ctx-fresh)
-                      (let [processed (:rows-processed @copy-state)]
-                        (reset! copy-state nil)
-                        (PgWireServer$QueryResult/empty (str "COPY " processed)))
-                      (catch Throwable e
-                        (let [processed (:rows-processed @copy-state)]
-                          (when (:in-tx? @tx-state)
-                            (swap! tx-state assoc :aborted? true))
-                          (reset! copy-state nil)
-                          (classified-error
-                           (str "COPY failed after processing " processed " rows: ") e)))))))))))
+        (copy-finish! {:conn conn
+                       :schema (:schema (d/db conn))
+                       :copy-state copy-state
+                       :tx-state tx-state}))
 
       (copyAbort [_ _reason]
         (when (:in-tx? @tx-state)
