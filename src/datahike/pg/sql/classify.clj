@@ -1012,6 +1012,22 @@
                    (first strs) (assoc :body (first strs))
                    (second strs) (assoc :link-symbol (second strs)))))
 
+        ;; `RETURN expr` — the SQL-standard body, with no LANGUAGE and
+        ;; no AS. PostgreSQL 14+ reads it as LANGUAGE SQL, and it is how
+        ;; `test_setup` defines `fipshash`, which twelve other
+        ;; regression files then call. The expression is taken from the
+        ;; SOURCE, not the tokens: it has to reach the real parser
+        ;; verbatim, and `classify` only realizes the first 64 tokens.
+        (kw=? t "return")
+        (let [nxt (second ts)
+              body (when (and nxt *source*)
+                     (-> (subs *source* (:pos nxt))
+                         str/trim
+                         (str/replace #";\s*$" "")))]
+          (if (str/blank? body)
+            acc
+            (assoc acc :body (str "SELECT " body) :language "sql")))
+
         (kw=? t "strict")
         (recur (rest ts) (assoc acc :strict? true))
 

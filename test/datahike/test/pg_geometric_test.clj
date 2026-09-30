@@ -124,3 +124,41 @@
     (testing "and a bad one does not get written at all"
       (is (= "22P02" (state-of c "INSERT INTO g VALUES (2, 'garbage', NULL, NULL)")))
       (is (= "1" (one c "SELECT count(*)::text FROM g"))))))
+
+;; ============================================================================
+;; Coordinates are float8, and nothing less
+;; ============================================================================
+
+(deftest coordinates_are_float8_in_and_out
+  ;; `pair_decode` is `float8in` and `pair_encode` is `float8out`. This
+  ;; had a private renderer instead, and being private is what made it
+  ;; wrong: an integral double went through `(long d)`, so `1e+300`
+  ;; printed as 9223372036854775807, and there was no scientific
+  ;; notation at all. `point_tbl` -- which `test_setup` builds and seven
+  ;; other regression files read -- has both `(1e+300,Inf)` and
+  ;; `(1e-300,-1e-300)`, so the file lost every statement after it.
+  (with-open [c (jdbc)]
+    (testing "the fixed-vs-scientific threshold is float8out's"
+      (is (= "(1e+300,1)" (one c "select '(1e+300,1)'::point")))
+      (is (= "(1e+15,100000000000000)" (one c "select '(1e15,1e14)'::point")))
+      (is (= "(1e-300,1e-05)" (one c "select '(1e-300,0.00001)'::point")))
+      (is (= "(1.2345678901234567e+19,-0)"
+             (one c "select '(12345678901234567890,-0.0)'::point"))))
+    (testing "the non-finite spellings float8in accepts"
+      ;; `Inf` is the one Java's parseDouble does NOT know, and it is
+      ;; how PostgreSQL's own fixture writes it.
+      (is (= "(1e+300,Infinity)" (one c "select '(1e+300,Inf)'::point")))
+      (is (= "(-Infinity,NaN)" (one c "select '(-inf,nan)'::point")))
+      (is (= "(Infinity,-Infinity)" (one c "select '(infinity,-infinity)'::point"))))
+    (testing "strtod reads hex, and float8in is strtod"
+      (is (= "(16,2)" (one c "select '(0x10,2)'::point"))))
+    (testing "what float8in refuses"
+      ;; Java's parseDouble takes a `d`/`f` suffix; PostgreSQL does not.
+      (is (= "22P02" (state-of c "select '(1d,2)'::point")))
+      (is (= "22P02" (state-of c "select '(1f,2)'::point")))
+      (is (= "22P02" (state-of c "select '(1e,2)'::point"))))
+    (testing "it is float8out everywhere a coordinate is printed"
+      (is (= "(1e+300,2),(0,0)" (one c "select '((0,0),(1e300,2))'::box")))
+      (is (= "[(1e+300,Infinity),(0,0)]"
+             (one c "select '[(1e+300,Inf),(0,0)]'::lseg")))
+      (is (= "<(1e+16,2),300000>" (one c "select '<(1e16,2),3e5>'::circle"))))))
