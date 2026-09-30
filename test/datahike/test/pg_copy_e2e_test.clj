@@ -264,6 +264,12 @@
       (let [e (try (.endCopy copy) nil
                    (catch java.sql.SQLException e e))]
         (is (= "57014" (.getSQLState ^java.sql.SQLException e)))))
+    ;; Clear it before the verification query. The 20ms timeout is
+    ;; session-scoped and this SELECT runs on the same connection, so
+    ;; on a loaded machine the check itself was cancelled -- the test
+    ;; failed by its own setup rather than by anything COPY did.
+    (with-open [st (.createStatement c)]
+      (.execute st "SET statement_timeout = 0"))
     (is (= [[0]] (query-rows c "SELECT count(*) FROM users")))))
 
 (deftest copy-late-row-failure-rolls-back-the-whole-statement

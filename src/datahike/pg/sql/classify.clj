@@ -2064,6 +2064,30 @@
             "grant"   {:kind :privilege-noop :tag "GRANT"}
             "revoke"  {:kind :revoke :reject-kind :revoke :tag "REVOKE"}
 
+          ;; --- An anonymous code block. `DO [LANGUAGE l] 'code'` and
+          ;; `DO 'code' [LANGUAGE l]` are both legal, and the default
+          ;; language is plpgsql. The body is an ordinary string
+          ;; literal, which in practice is always dollar-quoted -- and
+          ;; the tokeniser has already decoded it, so the `$$` never
+          ;; reaches JSqlParser (which has no DO at all).
+            "do"      (let [ts rest-toks
+                            lang (when (kw=? (first ts) "language")
+                                   (some-> (or (ident-text (second ts))
+                                               (string-value (second ts)))
+                                           str/lower-case))
+                            ts (if lang (drop 2 ts) ts)
+                            body (string-value (first ts))
+                            after (rest ts)
+                            lang (or lang
+                                     (when (kw=? (first after) "language")
+                                       (some-> (or (ident-text (second after))
+                                                   (string-value (second after)))
+                                               str/lower-case))
+                                     "plpgsql")]
+                        (if body
+                          {:kind :do-block :language lang :body body :tag "DO"}
+                          {:kind :do-block :reject-kind :do :tag "DO"}))
+
           ;; --- DDL routed by second keyword
             "create"  (classify-create rest-toks)
             "refresh" (classify-refresh-matview rest-toks)

@@ -7163,6 +7163,39 @@
           (set-search-path! session-state [value]))
         (single-row-result "set_config" PgWireServer/OID_TEXT (or value "")))
 
+      :do-block
+      ;; `DO [LANGUAGE l] $$ … $$` -- an anonymous code block. It is a
+      ;; plpgsql body with no parameters and no result, so it runs
+      ;; through the routine executor that CREATE FUNCTION already
+      ;; uses; the only new part is that nothing is stored and nothing
+      ;; comes back. PostgreSQL's tag is bare `DO`.
+      (try
+        (let [{:keys [language body]} parsed]
+          (cond
+            (nil? body)
+            (throw (ex-info "syntax error at or near \"DO\""
+                            {:error :syntax-error :sqlstate "42601"}))
+
+            (not= "plpgsql" language)
+            (throw (ex-info (str "language \"" language "\" does not exist")
+                            {:error :undefined-object :sqlstate "42704"}))
+
+            :else
+            (let [handler params/*statement-handler*]
+              (when-not handler
+                (throw (ex-info "DO is not available here"
+                                {:error :feature-not-supported})))
+              (binding [params/*routine-depth* (inc params/*routine-depth*)]
+                (when (> params/*routine-depth* 32)
+                  (throw (ex-info "stack depth limit exceeded"
+                                  {:sqlstate "54001" :error :stack-depth})))
+                (pl-exec/run-body handler (pl-parse/parse-body body) [] false {}))
+              (PgWireServer$QueryResult/empty "DO"))))
+        (catch clojure.lang.ExceptionInfo e
+          (classified-error "" e))
+        (catch Throwable e
+          (classified-error "DO failed: " e)))
+
       :copy-from-stdin
       ;; SQL `COPY t [(cols)] FROM {STDIN | 'file'} [WITH (...)];`.
       ;;

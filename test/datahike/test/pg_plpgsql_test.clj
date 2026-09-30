@@ -241,3 +241,60 @@
       (defn! h "ok2" "" "int"
         "DECLARE x int; BEGIN x := '41'; RETURN x + 1; END")
       (is (= "42" (v1 h "SELECT ok2()"))))))
+
+;; ============================================================================
+;; DO — an anonymous block
+;; ============================================================================
+;;
+;; `DO $$ … $$` appears in 27 of the 174 regression files, 70 blocks in
+;; all, and was a syntax error: JSqlParser has no DO, so nothing in the
+;; statement reached a parser that could read it. The body is the same
+;; thing a plpgsql function body is, so the executor was already here.
+
+(deftest do-runs-an-anonymous-block
+  (let [h (fresh-handler)]
+    (try
+      (ok! h "CREATE TABLE dot (a int)")
+      (ok! h "DO $$ BEGIN FOR i IN 1..3 LOOP INSERT INTO dot VALUES (i); END LOOP; END $$")
+      (is (= [["3"]] (rows (ok! h "SELECT count(*) FROM dot"))))
+      (testing "it sees the same transaction and tables as its caller"
+        (ok! h (str "DO $$ DECLARE n int := 0; BEGIN "
+                    "SELECT count(*) INTO n FROM dot; "
+                    "INSERT INTO dot VALUES (n * 10); END $$"))
+        (is (= [["30"]] (rows (ok! h "SELECT max(a) FROM dot")))))
+      (finally (release! h)))))
+
+(deftest do-takes-language-on-either-side
+  ;; `DO [LANGUAGE l] code` and `DO code [LANGUAGE l]` are both legal,
+  ;; and plpgsql is the default.
+  (let [h (fresh-handler)]
+    (try
+      (ok! h "CREATE TABLE dol (a int)")
+      (ok! h "DO LANGUAGE plpgsql $$ BEGIN INSERT INTO dol VALUES (1); END $$")
+      (ok! h "DO $$ BEGIN INSERT INTO dol VALUES (2); END $$ LANGUAGE plpgsql")
+      (ok! h "DO $$ BEGIN INSERT INTO dol VALUES (3); END $$")
+      (is (= [["3"]] (rows (ok! h "SELECT count(*) FROM dol"))))
+      (finally (release! h)))))
+
+(deftest do-reports-its-own-errors
+  (let [h (fresh-handler)]
+    (try
+      (is (re-find #"boom" (err (exec h "DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$"))))
+      (testing "a language we do not have is the object that does not exist,
+                not a syntax error"
+        (is (re-find #"language \"nope\" does not exist"
+                     (err (exec h "DO LANGUAGE nope $$ BEGIN END $$")))))
+      (testing "a failed block leaves nothing behind"
+        ;; In an EXPLICIT transaction, because that is what this harness
+        ;; can speak for. A statement's implicit transaction is
+        ;; committed and rolled back by the wire layer at Sync, and
+        ;; there is no wire layer here -- so an in-process handler would
+        ;; report the row surviving and say nothing true about the
+        ;; server. (Over psql it is 0 rows, matching PostgreSQL.)
+        (ok! h "CREATE TABLE doe (a int)")
+        (ok! h "BEGIN")
+        (is (some? (err (exec h (str "DO $$ BEGIN INSERT INTO doe VALUES (1); "
+                                     "RAISE EXCEPTION 'stop'; END $$")))))
+        (ok! h "ROLLBACK")
+        (is (= [["0"]] (rows (ok! h "SELECT count(*) FROM doe")))))
+      (finally (release! h)))))

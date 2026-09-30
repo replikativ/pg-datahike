@@ -2511,6 +2511,9 @@
     ;; single-quoted string JSqlParser will not carry, so the whole
     ;; statement is token-classified and re-tagged in parse-sql.
     :create-function-sql :drop-function-sql
+    ;; DO — an anonymous plpgsql block. JSqlParser has no DO at all, and
+    ;; the body is the same dollar-quoted string a function body is.
+    :do-block
     ;; CREATE / DROP ROLE | USER | GROUP -- JSqlParser parses none of them.
     :create-role-object :drop-role-object :privilege-noop
     ;; CREATE / DROP TRIGGER -- JSqlParser cannot parse either.
