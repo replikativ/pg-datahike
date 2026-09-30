@@ -1586,14 +1586,15 @@
 (defn date->pg-text
   "A date, in the session's DateStyle. `EncodeDateOnly` in datetime.c."
   ([d] (date->pg-text d *date-style*))
-  ([^java.time.LocalDate d [style order]]
+  ([d ds] (date->pg-text d ds true))
+  ([^java.time.LocalDate d [style order] era?]
    (let [[m dd y era] (date-parts d)]
      (str (case style
             :iso      (str y "-" m "-" dd)
             :postgres (if (= order :dmy) (str dd "-" m "-" y) (str m "-" dd "-" y))
             :sql      (if (= order :dmy) (str dd "/" m "/" y) (str m "/" dd "/" y))
             :german   (str dd "." m "." y))
-          era))))
+          (when era? era)))))
 
 (defn timestamp->pg-text
   "A timestamp, in the session's DateStyle. `EncodeDateTime` in
@@ -1601,15 +1602,26 @@
    `Thu Sep 01 12:00:00 2016` -- and the others keep the date and time
    in the style's own order, separated by a space."
   ([ldt] (timestamp->pg-text ldt *date-style*))
-  ([^java.time.LocalDateTime ldt [style order :as ds]]
+  ;; `zone-text` is appended BEFORE the era, as EncodeDateTime does:
+  ;; `2001-02-03 00:00:00+00 BC`. Appending it around the whole string
+  ;; put it after, which no style writes.
+  ([ldt ds] (timestamp->pg-text ldt ds nil))
+  ([^java.time.LocalDateTime ldt [style order :as ds] zone-text]
    (let [d (.toLocalDate ldt)
-         t (time-text (.toLocalTime ldt))]
-     (case style
-       :postgres (str (nth day-abbrevs (dec (.getValue (.getDayOfWeek d)))) " "
-                      (nth month-abbrevs (dec (.getMonthValue d))) " "
-                      (format "%02d" (.getDayOfMonth d)) " "
-                      t " " (format "%04d" (.getYear d)))
-       (str (date->pg-text d ds) " " t)))))
+         t (time-text (.toLocalTime ldt))
+         ;; The era goes after the TIME in a timestamp, not after the
+         ;; date: PostgreSQL writes `2001-02-03 04:05:06 BC`. Letting
+         ;; `date->pg-text` append it put it in the middle.
+         [_ _ y era] (date-parts d)]
+     (str
+      (case style
+        :postgres (str (nth day-abbrevs (dec (.getValue (.getDayOfWeek d)))) " "
+                       (nth month-abbrevs (dec (.getMonthValue d))) " "
+                       (format "%02d" (.getDayOfMonth d)) " "
+                       t " " y)
+        (str (date->pg-text d ds false) " " t))
+      zone-text
+      era))))
 
 (defn money-text
   "cash_out in the C locale: `-$1,234,567.89`."
@@ -1645,8 +1657,8 @@
      (instance? java.time.LocalDateTime v) (timestamp->pg-text v)
      (instance? java.time.OffsetDateTime v)
      (let [^java.time.OffsetDateTime t v]
-       (str (timestamp->pg-text (.toLocalDateTime (.withOffsetSameInstant t java.time.ZoneOffset/UTC)))
-            "+00"))
+       (timestamp->pg-text (.toLocalDateTime (.withOffsetSameInstant t java.time.ZoneOffset/UTC))
+                           *date-style* "+00"))
 
      (inst? v)
      (let [^java.time.Instant inst (if (instance? java.time.Instant v)
@@ -1655,7 +1667,7 @@
            ldt (java.time.LocalDateTime/ofInstant inst java.time.ZoneOffset/UTC)]
        (cond
          (= src-oid oid-date)        (date->pg-text (.toLocalDate ldt))
-         (= src-oid oid-timestamptz) (str (timestamp->pg-text ldt) "+00")
+         (= src-oid oid-timestamptz) (timestamp->pg-text ldt *date-style* "+00")
          :else                       (timestamp->pg-text ldt)))
 
      :else nil)))
