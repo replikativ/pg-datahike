@@ -616,6 +616,64 @@
             (* (if (= "-" sign) -1 1) (parse-long (or mm "0"))))))]
       [t nil])))
 
+(defn- peel-named-zone
+  "`[head zone-name]` when the text ends in a zone NAME (`PST`,
+   `America/New_York`), else `[s nil]`. The AM/PM and era words end a
+   datetime too and are not zones."
+  [^String s]
+  (let [t (str/trim s)]
+    (if (and (re-find #"(?i)\s[A-Za-z][A-Za-z_]*(?:/[A-Za-z_+-]+)*$" t)
+             (not (re-find #"(?i)\s(AM|PM|BC|AD)$" t)))
+      (let [i (.lastIndexOf t " ")]
+        [(str/trim (subs t 0 i)) (str/trim (subs t (inc i)))])
+      [t nil])))
+
+(defn- validate-date-tail!
+  "`date_in` reads the WHOLE literal and then keeps the date, so an
+   impossible time or an unknown zone after the date is an error even
+   though neither survives into the value. Taking the first token and
+   ignoring the rest answered `2001-02-03` for
+   `'2001-02-03 25:00:00'::date`, where PostgreSQL raises 22008.
+
+   PostgreSQL accepts a trailing zone here -- numeric, `Z`, or a name it
+   recognises -- which is how pgjdbc spells a date parameter
+   (`1970-01-01 +00`). An unrecognised word is 22007.
+
+   Returns nil; raises with the whole literal and the right SQLSTATE."
+  [^String whole parse-time]
+  ;; Peeled from the WHOLE literal, not from the tail: a zone standing
+  ;; alone (`1970-01-01 +00`, which is how pgjdbc spells a date
+  ;; parameter) is recognised by what precedes it, and the tail on its
+  ;; own has no such context.
+  (let [[without-zone numeric-zone] (split-trailing-zone whole)
+        [head zone-name] (if numeric-zone
+                           [without-zone nil]
+                           (peel-named-zone without-zone))
+        after-date (second (str/split head #"[ T]" 2))]
+    (when zone-name
+      (try (types/resolve-time-zone zone-name)
+           (catch Exception _
+             (throw (ex-info (str "invalid input syntax for type date: \"" whole "\"")
+                             {:error :invalid-datetime-format :type "date"
+                              :value whole})))))
+    (when-let [t (some-> after-date str/trim not-empty)]
+      (try
+        (parse-time t false)
+        (catch clojure.lang.ExceptionInfo e
+          ;; `pg-error` records the category under :error, not :sqlstate,
+          ;; and the WIRE layer re-formats the message from ex-data -- so
+          ;; `:type` has to move too, not just the text.
+          (let [overflow? (= :datetime-field-overflow (:error (ex-data e)))]
+            (throw (ex-info
+                    (if overflow?
+                      (str "date/time field value out of range: \"" whole "\"")
+                      (str "invalid input syntax for type date: \"" whole "\""))
+                    (assoc (ex-data e)
+                           :type "date" :value whole
+                           :error (if overflow?
+                                    :datetime-field-overflow
+                                    :invalid-datetime-format))))))))))
+
 (defn- to-bc-era
   "Reflect a parsed datetime into the BC era: PostgreSQL's 1 BC is the
    proleptic year 0, 2 BC is -1, and so on."
@@ -933,43 +991,7 @@
                     (or (parse-date-strict s) (bad-date! s))
                     (or (try (let [[d & more] (str/split s #"[ T]" 2)
                                    ld (java.time.LocalDate/parse d)]
-                               ;; The remainder is a TIME and has to be
-                               ;; valid even though the date throws it
-                               ;; away. Taking the first token and
-                               ;; ignoring the rest answered
-                               ;; `2001-02-03` for
-                               ;; `'2001-02-03 25:00:00'::date`, where
-                               ;; PostgreSQL raises 22008 -- an hour
-                               ;; that does not exist, accepted and
-                               ;; silently dropped.
-                               (when-let [tail (some-> (first more) str/trim not-empty)]
-                                 (try
-                                   (parse-time-input tail false)
-                                   (catch clojure.lang.ExceptionInfo e
-                                     ;; Same SQLSTATE, reported against
-                                     ;; the date and the whole literal,
-                                     ;; as date_in does.
-                                     ;; `pg-error` records the category
-                                     ;; under :error, not :sqlstate.
-                                     (let [overflow? (= :datetime-field-overflow
-                                                        (:error (ex-data e)))]
-                                       (throw (ex-info
-                                               (if overflow?
-                                                 (str "date/time field value out of range: \"" s "\"")
-                                                 (str "invalid input syntax for type date: \"" s "\""))
-                                               ;; `:type` too, not only
-                                               ;; the message: the wire
-                                               ;; layer re-formats from
-                                               ;; ex-data, so a message
-                                               ;; fixed here alone still
-                                               ;; reached the client
-                                               ;; saying "type time".
-                                               (assoc (ex-data e)
-                                                      :type "date"
-                                                      :value s
-                                                      :error (if overflow?
-                                                               :datetime-field-overflow
-                                                               :invalid-datetime-format))))))))
+                               (validate-date-tail! s parse-time-input)
                                ld)
                              (catch clojure.lang.ExceptionInfo e (throw e))
                              (catch Exception _ nil))

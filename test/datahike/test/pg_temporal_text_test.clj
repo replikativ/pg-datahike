@@ -650,7 +650,20 @@
     (is (= "2001-02-03" (one c "SELECT ('2001-02-03T04:05:06'::date)::text")))
     (is (= "22008" (first (err-of c "SELECT '2001-02-03 25:00:00'::date"))))
     (is (= "22008" (first (err-of c "SELECT '2001-02-03 04:99:00'::date"))))
-    (is (= "22007" (first (err-of c "SELECT '2001-02-03 nonsense'::date"))))))
+    (is (= "22007" (first (err-of c "SELECT '2001-02-03 nonsense'::date"))))
+    (testing "a trailing ZONE is accepted, as date_in accepts it"
+      ;; `1970-01-01 +00` is how pgjdbc spells a date parameter, and the
+      ;; first version of this validation rejected it -- caught by
+      ;; pgjdbc-conformance, which is the only suite that drives the
+      ;; driver's own parameter spellings.
+      (doseq [lit ["1970-01-01 +00" "1970-01-01 -07" "1970-01-01 +05:30"
+                   "1970-01-01 Z" "1970-01-01 PST" "1970-01-01 America/New_York"]]
+        (is (= "1970-01-01" (one c (str "SELECT ('" lit "'::date)::text"))) lit))
+      (is (= "2001-02-03" (one c "SELECT ('2001-02-03 04:05:06 +02'::date)::text")))
+      (testing "but a word that is not a zone is not"
+        (is (= "22007" (first (err-of c "SELECT '1970-01-01 nosuchzone'::date")))))
+      (testing "and an impossible time is still caught behind one"
+        (is (= "22008" (first (err-of c "SELECT '1970-01-01 25:00:00 +02'::date"))))))))
 
 (deftest a-time-takes-a-leading-date-only-with-a-space
   (with-open [c (jdbc)]
