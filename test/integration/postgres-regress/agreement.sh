@@ -51,6 +51,7 @@ restart_server() {
 # Each run is required to leave a result newer than this stamp.
 STAMP="$COLLECTED/.stamp"
 MISSING=""
+TIMEDOUT=""
 
 # The recycle below is the only thing that ever started a server, so a
 # run begun without one measured NOTHING until the first recycle -- 30
@@ -99,10 +100,19 @@ for f in $FILES; do
     geometry) targets="box $f" ;;
     *)        targets="$f" ;;
   esac
-  timeout 300 bb pg-regress-with-fixtures $targets >/dev/null 2>&1
+  # A file killed by this limit still leaves a PARTIAL .out, newer than
+  # the stamp, so collecting it would measure how fast this machine is.
+  # `alter_table`'s last write was exactly 300s after its run started,
+  # and its 8.8 points of "regression" were the cut moving, not us.
+  # `timeout` exits 124 when it fires; that file is NOT measured.
+  timeout "${AGREEMENT_FILE_TIMEOUT:-900}" bb pg-regress-with-fixtures $targets >/dev/null 2>&1
+  RC=$?
   R=$(find .internal/pg-regress/*/tests/results/"$f".out -newer "$STAMP" \
         2>/dev/null | head -1)
-  if [ -n "$R" ]; then
+  if [ "$RC" -eq 124 ]; then
+    TIMEDOUT="$TIMEDOUT $f"
+    MISSING="$MISSING $f"
+  elif [ -n "$R" ]; then
     cp "$R" "$COLLECTED/"
   else
     MISSING="$MISSING $f"
@@ -116,6 +126,12 @@ echo >&2
 # that timed out helps nobody. What must not happen is measuring the
 # missing file from an earlier run's leftovers, and it no longer can --
 # it is simply absent from the collected outputs.
+if [ -n "$TIMEDOUT" ]; then
+  echo "TIMED OUT (${AGREEMENT_FILE_TIMEOUT:-900}s):$TIMEDOUT" >&2
+  echo "A killed run leaves a partial .out; measuring it would report" >&2
+  echo "this machine's speed as agreement. Raise AGREEMENT_FILE_TIMEOUT." >&2
+fi
+
 if [ -n "$MISSING" ]; then
   echo "NO OUTPUT from:$MISSING" >&2
   echo "Those files produced no result this run. They are NOT measured" >&2
