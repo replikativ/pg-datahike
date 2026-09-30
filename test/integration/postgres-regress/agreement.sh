@@ -52,6 +52,15 @@ restart_server() {
 STAMP="$COLLECTED/.stamp"
 MISSING=""
 
+# The recycle below is the only thing that ever started a server, so a
+# run begun without one measured NOTHING until the first recycle -- 30
+# files, silently, reported only as "NO OUTPUT from:" at the very end.
+# Start one up front if the port is dead.
+if ! (exec 3<>/dev/tcp/127.0.0.1/15432) 2>/dev/null; then
+  echo "no server on 15432; starting one" >&2
+  restart_server || { echo "server did not come back" >&2; exit 1; }
+fi
+
 n=0
 for f in $FILES; do
   if [ $((n % RECYCLE)) -eq 0 ] && [ "$n" -gt 0 ]; then
