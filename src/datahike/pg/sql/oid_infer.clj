@@ -82,6 +82,12 @@
    "to_char"       types/oid-text
    "to_number"     types/oid-numeric
    "md5"           types/oid-text
+   "encode"        types/oid-text
+   "decode"        types/oid-bytea
+   "sha224"        types/oid-bytea
+   "sha256"        types/oid-bytea
+   "sha384"        types/oid-bytea
+   "sha512"        types/oid-bytea
    "quote_ident"   types/oid-text
    "quote_literal" types/oid-text
    "format"        types/oid-text

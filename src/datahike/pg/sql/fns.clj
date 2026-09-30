@@ -2721,6 +2721,136 @@
                    (.getBytes (->s s) java.nio.charset.StandardCharsets/UTF_8))]
     (apply str (map #(format "%02x" %) d))))
 
+(defn- ->bytes
+  "The bytea coercion. A bytea value is a `byte[]`; text reaching a
+   bytea argument is its UTF-8 bytes, which is what an unknown literal
+   like `encode('abc', 'hex')` means."
+  ^bytes [v]
+  (cond
+    (nil? v) nil
+    (bytes? v) v
+    :else (.getBytes (->s v) java.nio.charset.StandardCharsets/UTF_8)))
+
+(def ^:private base64-line-length
+  "PostgreSQL's base64 encoder breaks the output with a newline every 76
+   characters (`pg_base64_encode`, encode.c). Nothing else does this, and
+   omitting it makes every long value disagree."
+  76)
+
+(defn- esc-encode
+  "`esc_encode` (encode.c). Only a NUL and a high-bit byte become octal;
+   a backslash doubles; EVERY other byte is written as itself --
+   including the ASCII control characters and DEL, which is not what
+   the name suggests."
+  ^String [^bytes b]
+  (let [sb (StringBuilder.)]
+    (dotimes [i (alength b)]
+      (let [v (bit-and (aget b i) 0xff)]
+        (cond
+          (or (zero? v) (>= v 0x80)) (.append sb (format "\\%03o" v))
+          (= v 0x5c)                 (.append sb "\\\\")
+          :else                      (.append sb (char v)))))
+    (.toString sb)))
+
+(defn- esc-decode
+  "`esc_decode` (encode.c): `\\` is one backslash, `\nnn` is that octal
+   byte, and anything else is itself."
+  ^bytes [^String s]
+  (let [out (java.io.ByteArrayOutputStream.)
+        n (.length s)]
+    (loop [i 0]
+      (when (< i n)
+        (let [c (.charAt s i)]
+          (cond
+            (and (= c \\) (< (inc i) n) (= (.charAt s (inc i)) \\))
+            (do (.write out 0x5c) (recur (+ i 2)))
+
+            (and (= c \\) (< (+ i 3) n))
+            (let [oct (subs s (inc i) (+ i 4))]
+              (if (re-matches #"[0-7]{3}" oct)
+                (do (.write out (int (Integer/parseInt oct 8))) (recur (+ i 4)))
+                (throw (errors/pg-error
+                        :invalid-text-representation
+                        {:type "bytea" :value s}))))
+
+            (= c \\)
+            (throw (errors/pg-error :invalid-text-representation
+                                    {:type "bytea" :value s}))
+
+            :else (do (.write out (int c)) (recur (inc i)))))))
+    (.toByteArray out)))
+
+(defn sql-encode
+  "`encode(bytea, text)`. PostgreSQL knows three formats and rejects any
+   other by name."
+  [v fmt]
+  (when-not (nil? v)
+    (let [^bytes b (->bytes v)
+          f (str/lower-case (->s fmt))]
+      (case f
+        "hex"    (apply str (map #(format "%02x" (bit-and % 0xff)) b))
+        "base64" (let [enc (.encodeToString (java.util.Base64/getEncoder) b)]
+                   (->> (partition-all base64-line-length enc)
+                        (map #(apply str %))
+                        (str/join "\n")))
+        "escape" (esc-encode b)
+        (throw (errors/pg-error :invalid-parameter-value
+                                {:message (str "unrecognized encoding: \"" f "\"")}))))))
+
+(defn sql-decode
+  "`decode(text, text)`, the inverse of `encode`."
+  [v fmt]
+  (when-not (nil? v)
+    (let [^String s (->s v)
+          f (str/lower-case (->s fmt))]
+      (case f
+        ;; The two hex errors are `get_hex` and its caller in encode.c,
+        ;; and both are 22023 -- NOT the 22P02 a bad bytea literal
+        ;; gets. `decode` names the digit it choked on, which is the
+        ;; difference between a usable message and a shrug.
+        "hex" (let [t (str/replace s #"\s" "")]
+                (when (odd? (count t))
+                  (throw (errors/pg-error
+                          :invalid-parameter-value
+                          {:message "invalid hexadecimal data: odd number of digits"})))
+                (let [out (byte-array (quot (count t) 2))]
+                  (dotimes [i (alength out)]
+                    (let [pair (subs t (* 2 i) (+ 2 (* 2 i)))]
+                      (doseq [c pair]
+                        (when-not (re-matches #"[0-9a-fA-F]" (str c))
+                          (throw (errors/pg-error
+                                  :invalid-parameter-value
+                                  {:message (str "invalid hexadecimal digit: \"" c "\"")}))))
+                      (aset-byte out i (unchecked-byte (Integer/parseInt pair 16)))))
+                  out))
+        ;; The encoder's line breaks have to be tolerated by the decoder
+        ;; that reads its output, which is what the MIME decoder does --
+        ;; but it also SKIPS anything else it does not recognise, where
+        ;; PostgreSQL names the symbol and stops.
+        "base64" (do (when-let [bad (first (remove #(or (Character/isLetterOrDigit ^char %)
+                                                        (contains? #{\+ \/ \= \newline \return} %))
+                                                   s))]
+                       (throw (errors/pg-error
+                               :invalid-parameter-value
+                               {:message (str "invalid symbol \"" bad
+                                              "\" found while decoding base64 sequence")})))
+                     (.decode (java.util.Base64/getMimeDecoder) s))
+        "escape" (esc-decode s)
+        (throw (errors/pg-error :invalid-parameter-value
+                                {:message (str "unrecognized encoding: \"" f "\"")}))))))
+
+(defn- sha-digest
+  "The SHA-2 family (`sha224`/`sha256`/`sha384`/`sha512`), bytea to
+   bytea."
+  [^String alg v]
+  (when-not (nil? v)
+    (.digest (java.security.MessageDigest/getInstance alg) (->bytes v))))
+
+(defn sql-sha224 [v] (sha-digest "SHA-224" v))
+(defn sql-sha256 [v] (sha-digest "SHA-256" v))
+(defn sql-sha384 [v] (sha-digest "SHA-384" v))
+(defn sql-sha512 [v] (sha-digest "SHA-512" v))
+
 (defn sql-starts-with [s prefix] (.startsWith (->s s) (->s prefix)))
 
 (defn sql-split-part
@@ -4594,6 +4724,12 @@
    "chr"          sql-chr
    "btrim"        sql-btrim
    "md5"          sql-md5
+   "encode"       sql-encode
+   "decode"       sql-decode
+   "sha224"       sql-sha224
+   "sha256"       sql-sha256
+   "sha384"       sql-sha384
+   "sha512"       sql-sha512
    "starts_with"  sql-starts-with
    "split_part"   sql-split-part
    "translate"    sql-translate
@@ -4723,6 +4859,8 @@
    "length"   #{1} "char_length" #{1} "octet_length" #{1} "bit_length" #{1}
    "left"     #{2} "right" #{2} "position" #{2} "strpos" #{2}
    "ascii"    #{1} "chr" #{1} "md5" #{1} "to_hex" #{1} "isfinite" #{1}
+   "encode"   #{2} "decode" #{2}
+   "sha224"   #{1} "sha256" #{1} "sha384" #{1} "sha512" #{1}
    "btrim"    #{1 2} "starts_with" #{2} "split_part" #{3} "translate" #{3}
    "ltrim"    #{1 2} "rtrim" #{1 2} "trim" #{1 2}
    "date_part" #{2}

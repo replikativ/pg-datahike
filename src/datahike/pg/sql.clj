@@ -2680,7 +2680,16 @@
              ;; commands: `PREPARE p AS SELECT $1` is a placeholder in a
              ;; TEMPLATE, bound later by EXECUTE, and is legal in Simple
              ;; Query exactly as it is in PG.
-             (not (contains? #{:prepare :execute-prepared :deallocate}
+             ;;
+             ;; A function body is the same thing. `CREATE FUNCTION
+             ;; f(int) RETURNS int RETURN $1 + 1` binds its $1 per call,
+             ;; and the SQL-standard `RETURN expr` form leaves it BARE in
+             ;; the statement text -- unlike `AS $$ ... $$`, where the
+             ;; tokeniser sees a dollar-quoted string and no parameter at
+             ;; all. So the two spellings of one function disagreed, and
+             ;; the standard one was a 42P02.
+             (not (contains? #{:prepare :execute-prepared :deallocate
+                               :create-function :create-function-sql}
                              (:kind (cls/classify sql)))))
     (when-let [p (first (filter #(= :param (:type %)) (cls/tokenize-all sql)))]
       {:type :error

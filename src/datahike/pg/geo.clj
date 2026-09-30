@@ -15,26 +15,64 @@
    The operators (`&&`, `<->`, `~=`, `@>`) are a separate matter; this
    is input, output and identity only."
   (:require [clojure.string :as str]
-            [datahike.pg.errors :as errors]))
+            [datahike.pg.errors :as errors]
+            [datahike.pg.types :as types]))
 
 (defn- bad! [type-name ^String input]
   (throw (errors/pg-error :invalid-text-representation
                           {:type type-name :value input})))
 
 (defn- num-text
-  "A coordinate as PostgreSQL prints it: shortest form, no trailing
-   `.0`, and an exponent expanded (`1e2` is `100`)."
+  "A coordinate as PostgreSQL prints it.
+
+   This is `float8out` and nothing else, because that is what
+   `pair_encode` calls (geo_ops.c). It used to be a second, private
+   rendering -- and being second is what made it wrong: an integral
+   double went through `(long d)`, so `1e+300` printed as
+   9223372036854775807, and it had no scientific notation at all."
   [^double d]
-  (cond
-    (Double/isNaN d) "NaN"
-    (Double/isInfinite d) (if (pos? d) "Infinity" "-Infinity")
-    (== d (Math/rint d)) (let [l (long d)] (str l))
-    :else (let [s (str d)]
-            ;; `str` on a double gives shortest-round-trip already,
-            ;; except that it may use scientific notation.
-            (if (or (str/includes? s "E") (str/includes? s "e"))
-              (.toPlainString (java.math.BigDecimal. d))
-              s))))
+  (types/float->pg-text d false))
+
+(def ^:private special-coords
+  "The non-finite spellings `float8in` accepts, lower-cased. Java's
+   `parseDouble` knows `Infinity` and `NaN` but not `Inf`, which is how
+   PostgreSQL's own regression fixtures write it -- `point_tbl` has
+   `(1e+300,Inf)`."
+  {"inf" Double/POSITIVE_INFINITY
+   "+inf" Double/POSITIVE_INFINITY
+   "-inf" Double/NEGATIVE_INFINITY
+   "infinity" Double/POSITIVE_INFINITY
+   "+infinity" Double/POSITIVE_INFINITY
+   "-infinity" Double/NEGATIVE_INFINITY
+   "nan" Double/NaN
+   "+nan" Double/NaN
+   "-nan" Double/NaN})
+
+(def ^:private coord-re
+  "What `float8in` accepts as a finite decimal number. Narrower than
+   `Double/parseDouble`, which also takes a `d` or `f` suffix --
+   `'(1d,2)'::point` is an error in PostgreSQL."
+  #"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+(def ^:private hex-coord-re
+  "`float8in` is `strtod`, and strtod reads hex: `'(0x10,2)'::point` is
+   `(16,2)`. Java reads a hex FLOAT (`0x1p4`) but not a bare hex
+   integer, so one gets the exponent strtod would have defaulted to."
+  #"[+-]?0[xX][0-9a-fA-F]*\.?[0-9a-fA-F]*(?:[pP][+-]?\d+)?")
+
+(defn- parse-coord
+  "One coordinate, or nil when the text is not a float PostgreSQL would
+   accept."
+  [^String t]
+  (if-let [special (get special-coords (str/lower-case t))]
+    special
+    (let [t (cond
+              (re-matches coord-re t) t
+              (re-matches hex-coord-re t)
+              (if (re-find #"[pP]" t) t (str t "p0"))
+              :else nil)]
+      (when t
+        (try (Double/parseDouble t) (catch Exception _ nil))))))
 
 (defn- numbers
   "Every number in `s`, in order, or nil when `s` holds anything that is
@@ -45,7 +83,7 @@
         toks (remove str/blank? (str/split (str/trim cleaned) #"\s+"))]
     (when (seq toks)
       (reduce (fn [acc t]
-                (if-let [d (try (Double/parseDouble t) (catch Exception _ nil))]
+                (if-let [d (parse-coord t)]
                   (conj acc (double d))
                   (reduced nil)))
               []
