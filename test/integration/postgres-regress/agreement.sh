@@ -57,7 +57,9 @@ TIMEDOUT=""
 # run begun without one measured NOTHING until the first recycle -- 30
 # files, silently, reported only as "NO OUTPUT from:" at the very end.
 # Start one up front if the port is dead.
-if ! (exec 3<>/dev/tcp/127.0.0.1/15432) 2>/dev/null; then
+server_up() { (exec 3<>/dev/tcp/127.0.0.1/15432) 2>/dev/null; }
+
+if ! server_up; then
   echo "no server on 15432; starting one" >&2
   restart_server || { echo "server did not come back" >&2; exit 1; }
 fi
@@ -107,6 +109,24 @@ for f in $FILES; do
   # `timeout` exits 124 when it fires; that file is NOT measured.
   timeout "${AGREEMENT_FILE_TIMEOUT:-900}" bb pg-regress-with-fixtures $targets >/dev/null 2>&1
   RC=$?
+  # A server that DIES mid-file is worse than one that times out: the
+  # file leaves a partial .out that is collected and measured, and
+  # every file after it finds no server at all until the next recycle.
+  # It cost a whole run: `foreign_key` was measured at 6.1% against a
+  # 66.7% baseline and the four files after it produced nothing, and
+  # none of that was a regression. Notice it, restart, and try once
+  # more -- the retry is what makes the number mean something.
+  if ! server_up; then
+    printf "\r[%3d] %-28s server died; restarting\n" "$n" "$f" >&2
+    restart_server || { echo "server did not come back" >&2; exit 1; }
+    touch "$STAMP"
+    timeout "${AGREEMENT_FILE_TIMEOUT:-900}" bb pg-regress-with-fixtures $targets >/dev/null 2>&1
+    RC=$?
+    if ! server_up; then
+      echo "server died again during $f; not measuring it" >&2
+      RC=124
+    fi
+  fi
   R=$(find .internal/pg-regress/*/tests/results/"$f".out -newer "$STAMP" \
         2>/dev/null | head -1)
   if [ "$RC" -eq 124 ]; then
