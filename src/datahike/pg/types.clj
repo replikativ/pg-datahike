@@ -703,6 +703,20 @@
         (re-find #"(?i)(?:^|\.)\s*\"?vector\"?\s*(?:\(|\[|$)"
                  (str/trim (str sql-type-name))))))
 
+(defn unquote-type-name
+  "A type name with its identifier quotes removed -- EXCEPT `\"char\"`.
+
+   Quotes are how `path` survives JSqlParser, which reserves the word,
+   so every type lookup has to see through them. They are also the only
+   thing distinguishing PostgreSQL's one-byte `\"char\"` (OID 18) from
+   the unquoted `char`, which is bpchar. Stripping them blindly made
+   `'hello'::\"char\"` answer `hello` instead of `h`."
+  [^String s]
+  (let [t (str s)]
+    (if (= "\"char\"" t)
+      t
+      (clojure.string/replace t #"^\"(.*)\"$" "$1"))))
+
 (defn normalize-sql-type-name
   "Normalize the built-in compatibility spelling of pgvector's type.
    JSqlParser preserves schema qualification and identifier quotes in
@@ -719,9 +733,9 @@
           s
           ;; Quotes come off here so every downstream lookup sees the
           ;; bare name: `path` is rewritten to `"path"` before parsing,
-          ;; because JSqlParser reserves the word.
-          (clojure.string/lower-case
-           (clojure.string/replace s #"^\"(.*)\"$" "$1")))))))
+          ;; because JSqlParser reserves the word. `"char"` keeps
+          ;; them -- see `unquote-type-name`.
+          (clojure.string/lower-case (unquote-type-name s)))))))
 
 ;; ============================================================================
 ;; Catalog data: pg_type rows for virtual table materialization
@@ -1151,7 +1165,7 @@
   (-> (str type-str)
       (str/replace #"\s*\([^)]*\)" "")
       str/trim
-      (str/replace #"^\"(.*)\"$" "$1")
+      unquote-type-name
       str/lower-case))
 
 (defn parse-char-length

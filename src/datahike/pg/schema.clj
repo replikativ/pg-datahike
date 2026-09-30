@@ -43,7 +43,7 @@
         ;; cast to it arrived here as `"path"` and resolved to nothing.
         raw (-> (str normalized) str/trim str/lower-case
                 (str/replace #"\s*\([^)]*\)" "")
-                (str/replace #"^\"(.*)\"$" "$1"))
+                types/unquote-type-name)
         raw (if (str/ends-with? raw "[]")
               (subs raw 0 (- (count raw) 2))
               raw)
