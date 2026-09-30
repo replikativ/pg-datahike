@@ -530,6 +530,51 @@ public final class PgParamCodec {
         return v.toString();
     }
 
+    /**
+     * PostgreSQL's infinite timestamps, as this server stores them: the
+     * extreme {@code java.util.Date}. Datahike has only an instant type,
+     * so a date infinity and a timestamp infinity are the same value and
+     * differ only in how they are encoded.
+     */
+    private static final long POS_INFINITY_MILLIS = Long.MAX_VALUE;
+    private static final long NEG_INFINITY_MILLIS = Long.MIN_VALUE;
+
+    /**
+     * Which infinity a value is, or 0 for none.
+     *
+     * A DataRow reaches {@code encodeBinary} already TEXT-RENDERED, so the
+     * value arrives as the word rather than as the sentinel Date -- which
+     * is why an {@code instanceof Date} test here matched nothing and the
+     * overflowed micros went out on the wire as the year 292278994.
+     */
+    private static int infinitySign(Object value) {
+        if (value instanceof java.util.Date d) {
+            if (d.getTime() == POS_INFINITY_MILLIS) return 1;
+            if (d.getTime() == NEG_INFINITY_MILLIS) return -1;
+            return 0;
+        }
+        if (value != null) {
+            String s = value.toString().trim();
+            if (s.equalsIgnoreCase("infinity") || s.equalsIgnoreCase("+infinity")) return 1;
+            if (s.equalsIgnoreCase("-infinity")) return -1;
+        }
+        return 0;
+    }
+
+    private static Long infiniteTimestampMicros(Object value) {
+        int sign = infinitySign(value);
+        if (sign > 0) return Long.MAX_VALUE;
+        if (sign < 0) return Long.MIN_VALUE;
+        return null;
+    }
+
+    private static Integer infiniteDateDays(Object value) {
+        int sign = infinitySign(value);
+        if (sign > 0) return Integer.MAX_VALUE;
+        if (sign < 0) return Integer.MIN_VALUE;
+        return null;
+    }
+
     /** Days between the Unix epoch (1970-01-01) and the PG epoch (2000-01-01). */
     private static final long PG_EPOCH_DAYS = 10957L;
     /** Microseconds between the Unix epoch and the PG epoch. */
@@ -926,6 +971,14 @@ public final class PgParamCodec {
                 }
 
                 case PgWireServer.OID_DATE -> {
+                    // infinity is INT32_MAX days and -infinity INT32_MIN,
+                    // not a date to convert: the sentinel is the extreme
+                    // java.util.Date, and computing days from it overflows.
+                    Integer infDays = infiniteDateDays(value);
+                    if (infDays != null) {
+                        yield ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+                                        .putInt(infDays).array();
+                    }
                     LocalDate d = (value instanceof LocalDate ld) ? ld
                                  : (value instanceof java.util.Date jd)
                                      ? jd.toInstant().atZone(ZoneOffset.UTC).toLocalDate()
@@ -936,6 +989,14 @@ public final class PgParamCodec {
 
                 case PgWireServer.OID_TIMESTAMP,
                      PgWireServer.OID_TIMESTAMPTZ -> {
+                    // infinity is INT64_MAX microseconds and -infinity
+                    // INT64_MIN. `getEpochSecond() * 1_000_000` overflows
+                    // for the sentinel and would send a nonsense instant.
+                    Long infMicros = infiniteTimestampMicros(value);
+                    if (infMicros != null) {
+                        yield ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
+                                        .putLong(infMicros).array();
+                    }
                     // value->string produces "2024-01-15 10:30:00" (no 'T', no 'Z').
                     Instant inst;
                     if (value instanceof Instant i) {

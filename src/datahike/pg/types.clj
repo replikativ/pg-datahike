@@ -1569,6 +1569,30 @@
   ;; java.time's DayOfWeek is Monday=1; PostgreSQL prints the same names.
   ["Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"])
 
+(def ^:const pos-infinity-millis
+  "`timestamp 'infinity'`. PostgreSQL holds it as INT64_MAX microseconds
+   and a date as INT32_MAX days; Datahike has only :db.type/instant, so
+   both are the extreme java.util.Date. Being the extreme is what makes
+   comparison and ordering work without a special case: infinity really
+   is greater than every finite timestamp we can store."
+  Long/MAX_VALUE)
+
+(def ^:const neg-infinity-millis
+  "`timestamp '-infinity'`."
+  Long/MIN_VALUE)
+
+(def pos-infinity (java.util.Date. pos-infinity-millis))
+(def neg-infinity (java.util.Date. neg-infinity-millis))
+
+(defn infinite-datetime
+  "`:pos`, `:neg`, or nil -- the infinity a temporal value is, if any."
+  [v]
+  (when (instance? java.util.Date v)
+    (condp = (.getTime ^java.util.Date v)
+      pos-infinity-millis :pos
+      neg-infinity-millis :neg
+      nil)))
+
 (defn- date-parts
   "Month, day and year as PostgreSQL prints them. The year is
    YEAR-OF-ERA: `LocalDate` counts proleptically, where 1 BC is year 0
@@ -1649,6 +1673,11 @@
   ([v] (temporal->pg-text v nil))
   ([v src-oid]
    (cond
+     ;; Before anything that formats fields: the sentinel has none that
+     ;; mean anything, and PostgreSQL prints the word for every temporal
+     ;; type that can hold it.
+     (= :pos (infinite-datetime v)) "infinity"
+     (= :neg (infinite-datetime v)) "-infinity"
      (instance? java.time.LocalDate v)     (date->pg-text v)
      (instance? java.time.LocalTime v)     (time-text v)
      (instance? java.time.OffsetTime v)

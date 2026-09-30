@@ -712,3 +712,45 @@
         (is (= expected (one c "SELECT ('2001-02-03 04:05:06 BC'::timestamp)::text"))
             style))
       (exec! c "SET datestyle TO 'ISO, MDY'"))))
+
+(deftest infinity
+  ;; PostgreSQL holds an infinite timestamp as INT64_MAX microseconds and
+  ;; an infinite date as INT32_MAX days. Datahike has only
+  ;; :db.type/instant, so both are the extreme java.util.Date -- and
+  ;; being the EXTREME is what makes comparison and ordering work without
+  ;; a special case anywhere.
+  ;;
+  ;; 201 occurrences in PostgreSQL's own regression suite, which is why
+  ;; this was the largest single item left in 1.3.
+  (with-open [c (jdbc)]
+    (testing "input, in every spelling PostgreSQL takes"
+      (is (= "infinity" (one c "SELECT ('infinity'::timestamp)::text")))
+      (is (= "infinity" (one c "SELECT ('INFINITY'::timestamp)::text")))
+      (is (= "infinity" (one c "SELECT ('+infinity'::date)::text")))
+      (is (= "-infinity" (one c "SELECT ('-infinity'::timestamptz)::text")))
+      (testing "and not the ones it does not"
+        ;; `inf` is a float spelling, not a datetime one, and `time` has
+        ;; no room for an infinity at all.
+        (is (= "22007" (first (err-of c "SELECT 'inf'::timestamp"))))
+        (is (= "22007" (first (err-of c "SELECT 'infinity'::time"))))))
+    (testing "it orders and compares as the extreme it is"
+      (is (= "true" (one c "SELECT ('infinity'::timestamp > '9999-12-31'::timestamp)::text")))
+      (is (= "true" (one c "SELECT ('-infinity'::timestamp < '0001-01-01'::timestamp)::text")))
+      (is (= "true" (one c "SELECT ('infinity'::timestamp = 'infinity'::timestamp)::text"))))
+    (testing "isfinite"
+      (is (= "false" (one c "SELECT isfinite('infinity'::timestamp)::text")))
+      (is (= "false" (one c "SELECT isfinite('-infinity'::date)::text")))
+      (is (= "true" (one c "SELECT isfinite('2001-01-01'::date)::text"))))
+    (testing "it survives storage, and sorts and aggregates there"
+      (exec! c "CREATE TABLE inf (id int, d date, t timestamp)")
+      (exec! c "INSERT INTO inf VALUES (1,'infinity','infinity')")
+      (exec! c "INSERT INTO inf VALUES (2,'-infinity','-infinity')")
+      (exec! c "INSERT INTO inf VALUES (3,'2001-02-03','2001-02-03 04:05:06')")
+      (is (= "infinity" (one c "SELECT d::text FROM inf WHERE id = 1")))
+      (is (= "-infinity" (one c "SELECT t::text FROM inf WHERE id = 2")))
+      (is (= "1" (one c "SELECT id::text FROM inf WHERE t > '2001-01-01'")))
+      (is (= "2" (one c "SELECT id::text FROM inf WHERE t < '2001-01-01'")))
+      (is (= "infinity" (one c "SELECT max(t)::text FROM inf")))
+      (is (= "-infinity" (one c "SELECT min(t)::text FROM inf")))
+      (is (= "2,3,1" (one c (str "SELECT string_agg(id::text, ',' ORDER BY t)"
+                                 " FROM inf")))))))

@@ -89,6 +89,7 @@
    ;; that gets 3802 for row_to_json picks the jsonb codec and reads the
    ;; wrong punctuation back.
    "pg_is_in_recovery" types/oid-bool
+   "isfinite"       types/oid-bool
    "to_json"       types/oid-json
    "row_to_json"   types/oid-json
    "json_agg"      types/oid-json

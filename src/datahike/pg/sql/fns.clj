@@ -2670,6 +2670,13 @@
   [s]
   (let [^String t (->s s)] (if (zero? (.length t)) 0 (long (.codePointAt t 0)))))
 
+(defn sql-isfinite
+  "`isfinite(date|timestamp|timestamptz)` -- false only for the two
+   infinities. PostgreSQL has no isfinite for time, which cannot hold
+   one."
+  [v]
+  (nil? (types/infinite-datetime v)))
+
 (defn sql-chr
   "Character with the given code point. PostgreSQL rejects 0 outright
    (chr(0) is not a valid text character)."
@@ -4577,6 +4584,7 @@
    "position"     sql-position
    "strpos"       sql-position
    "ascii"        sql-ascii
+   "isfinite"     sql-isfinite
    "date_part"    sql-extract
    "regexp_replace" sql-regexp-replace
    "regexp_like"    sql-regexp-like
@@ -4714,7 +4722,7 @@
    "upper"    #{1} "lower" #{1} "initcap" #{1} "reverse" #{1}
    "length"   #{1} "char_length" #{1} "octet_length" #{1} "bit_length" #{1}
    "left"     #{2} "right" #{2} "position" #{2} "strpos" #{2}
-   "ascii"    #{1} "chr" #{1} "md5" #{1} "to_hex" #{1}
+   "ascii"    #{1} "chr" #{1} "md5" #{1} "to_hex" #{1} "isfinite" #{1}
    "btrim"    #{1 2} "starts_with" #{2} "split_part" #{3} "translate" #{3}
    "ltrim"    #{1 2} "rtrim" #{1 2} "trim" #{1 2}
    "date_part" #{2}
