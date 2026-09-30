@@ -27,6 +27,7 @@
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks]
+            [datahike.pg.pg-catalog :as pg-cat]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
@@ -58,6 +59,9 @@
    tables are added via register-catalog-table! and don't appear here."
   #{"pg_type" "pg_class" "pg_tables" "pg_views" "pg_matviews" "pg_attribute"
     "pg_namespace" "pg_database" "pg_proc" "pg_roles" "pg_settings"
+    "pg_authid" "pg_auth_members" "pg_am" "pg_language" "pg_tablespace"
+    "pg_operator" "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
+    "pg_shdepend"
     "pg_indexes"
     ;; pg_sequences — the user-facing view over every sequence's
     ;; parameters and current position (issue #26). Distinct from
@@ -348,6 +352,133 @@
      {:db/ident :pg_roles/rolbypassrls :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_roles/rolconnlimit :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_roles") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    ;; Catalogs that were absent entirely, so a query naming one failed
+    ;; with 42P01 and took the rest of the file with it. Ordered by how
+    ;; often PostgreSQL's own suite names them: pg_authid 84, pg_operator
+    ;; 77, pg_am 57.
+    "pg_authid"
+    ;; The same single role pg_roles reports, plus the columns only
+    ;; pg_authid carries. `rolpassword` is NULL: there is no password to
+    ;; report and inventing one would be worse than saying nothing.
+    [{:db/ident :pg_authid/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_authid/rolname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_authid/rolsuper :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_authid/rolinherit :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_authid/rolcreaterole :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_authid/rolcreatedb :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_authid/rolcanlogin :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_authid/rolreplication :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_authid/rolbypassrls :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_authid/rolconnlimit :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_authid/rolpassword :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_authid") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_auth_members"
+    ;; One role, so no memberships. The relation still has to EXIST: a
+    ;; join against it answers no rows, where an absent one fails the
+    ;; statement.
+    [{:db/ident :pg_auth_members/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_auth_members/roleid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_auth_members/member :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_auth_members/grantor :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_auth_members/admin_option :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_auth_members") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_am"
+    [{:db/ident :pg_am/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_am/amname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_am/amhandler :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_am/amtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident (pgs/row-marker-attr "pg_am") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_language"
+    [{:db/ident :pg_language/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_language/lanname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_language/lanowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_language/lanispl :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_language/lanpltrusted :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_language/lanplcallfoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_language/laninline :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_language/lanvalidator :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident (pgs/row-marker-attr "pg_language") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_tablespace"
+    [{:db/ident :pg_tablespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_tablespace/spcname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_tablespace/spcowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident (pgs/row-marker-attr "pg_tablespace") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_operator"
+    ;; From the generated catalog (pg_operator.dat), the same source the
+    ;; operator-resolution tables read, so the two cannot disagree.
+    [{:db/ident :pg_operator/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_operator/oprname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_operator/oprnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_operator/oprowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_operator/oprkind :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_operator/oprcanmerge :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_operator/oprcanhash :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_operator/oprleft :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_operator/oprright :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_operator/oprresult :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_operator/oprcode :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident (pgs/row-marker-attr "pg_operator") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_cast"
+    [{:db/ident :pg_cast/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_cast/castsource :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_cast/casttarget :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_cast/castfunc :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_cast/castcontext :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_cast/castmethod :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident (pgs/row-marker-attr "pg_cast") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_sequence"
+    ;; The catalog twin of the pg_sequences view, from the one
+    ;; `sequence-entities` source so the two cannot disagree.
+    [{:db/ident :pg_sequence/seqrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_sequence/seqtypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_sequence/seqstart :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequence/seqincrement :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequence/seqmax :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequence/seqmin :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequence/seqcache :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequence/seqcycle :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_sequence") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    ;; Relations that exist and are empty, which is the honest answer
+    ;; rather than an absent relation that fails the statement: no range
+    ;; types, no planner statistics, no shared dependencies (one role,
+    ;; one database).
+    "pg_range"
+    [{:db/ident :pg_range/rngtypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_range/rngsubtype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_range/rngmultitypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_range/rngcollation :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_range/rngsubopc :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_range/rngcanonical :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_range/rngsubdiff :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident (pgs/row-marker-attr "pg_range") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_statistic"
+    [{:db/ident :pg_statistic/starelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_statistic/staattnum :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_statistic/stainherit :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_statistic/stanullfrac :db/valueType :db.type/float :db/cardinality :db.cardinality/one :pg/type "float4"}
+     {:db/ident :pg_statistic/stawidth :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_statistic/stadistinct :db/valueType :db.type/float :db/cardinality :db.cardinality/one :pg/type "float4"}
+     {:db/ident (pgs/row-marker-attr "pg_statistic") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_shdepend"
+    [{:db/ident :pg_shdepend/dbid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_shdepend/classid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_shdepend/objid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_shdepend/objsubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_shdepend/refclassid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_shdepend/refobjid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_shdepend/deptype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident (pgs/row-marker-attr "pg_shdepend") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
     "pg_database"
     [{:db/ident :pg_database/datname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_database/datdba :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -847,6 +978,27 @@
    of both BEFORE and INSTEAD."
   {:row 1, :before 2, :insert 4, :delete 8, :update 16, :truncate 32,
    :instead-of 64})
+
+(def ^:private predefined-roles
+  "PostgreSQL's built-in roles (pg_authid.dat). Fixed rows of the
+   catalog, not something a server creates."
+  [[3373 "pg_monitor"] [3374 "pg_read_all_settings"] [3375 "pg_read_all_stats"]
+   [3377 "pg_stat_scan_tables"] [4200 "pg_signal_backend"] [4544 "pg_checkpoint"]
+   [4550 "pg_use_reserved_connections"] [4569 "pg_read_server_files"]
+   [4570 "pg_write_server_files"] [4571 "pg_execute_server_program"]
+   [6171 "pg_database_owner"] [6181 "pg_read_all_data"] [6182 "pg_write_all_data"]
+   [6304 "pg_create_subscription"] [6337 "pg_maintain"]])
+
+(def ^:private cast-func-oid
+  "The OID of a cast's implementing function, from its signature text.
+   The generated rows spell it `int4(bool)`; pg_cast.castfunc is an OID.
+   0 when the function is not one we carry, which is also what a
+   binary-coercible cast reports."
+  (memoize
+   (fn [func]
+     (or (when-let [nm (some-> func (str/split #"\(") first str/trim not-empty)]
+           (:oid (first (get pg-cat/procs-by-name nm))))
+         0))))
 
 (defn- trigger-entities
   "Every registered trigger, with its spec decoded. Read from the datoms
@@ -1550,6 +1702,101 @@
              :pg_trigger/tgqual (or (:when t) "")
              (pgs/row-marker-attr "pg_trigger") true})
           (trigger-entities cte-db))
+    "pg_authid"
+    ;; The login role, plus PostgreSQL's predefined roles. Those are
+    ;; fixed rows of the catalog rather than anything a server creates,
+    ;; and a query that lists roles or joins one by name expects them.
+    (into [{:pg_authid/oid pg-role-oid :pg_authid/rolname pg-role-name
+            :pg_authid/rolsuper true :pg_authid/rolinherit true
+            :pg_authid/rolcreaterole true :pg_authid/rolcreatedb true
+            :pg_authid/rolcanlogin true :pg_authid/rolreplication false
+            :pg_authid/rolbypassrls true :pg_authid/rolconnlimit -1
+            (pgs/row-marker-attr "pg_authid") true}]
+          (map (fn [[oid nm]]
+                 {:pg_authid/oid oid :pg_authid/rolname nm
+                  :pg_authid/rolsuper false :pg_authid/rolinherit true
+                  :pg_authid/rolcreaterole false :pg_authid/rolcreatedb false
+                  :pg_authid/rolcanlogin false :pg_authid/rolreplication false
+                  :pg_authid/rolbypassrls false :pg_authid/rolconnlimit -1
+                  (pgs/row-marker-attr "pg_authid") true}))
+          predefined-roles)
+
+    "pg_auth_members" []
+    "pg_range" []
+    "pg_statistic" []
+    "pg_shdepend" []
+
+    "pg_sequence"
+    (mapv (fn [s]
+            {:pg_sequence/seqrelid (or (pgs/table-oid cte-db (:__seq__/name s)) 0)
+             :pg_sequence/seqtypid (or (types/pg-name->oid (:__seq__/type s))
+                                       types/oid-int8)
+             :pg_sequence/seqstart (:__seq__/start s)
+             :pg_sequence/seqincrement (:__seq__/increment s)
+             :pg_sequence/seqmax (:__seq__/maxvalue s)
+             :pg_sequence/seqmin (:__seq__/minvalue s)
+             :pg_sequence/seqcache (:__seq__/cache s)
+             :pg_sequence/seqcycle (boolean (:__seq__/cycle s))
+             (pgs/row-marker-attr "pg_sequence") true})
+          (sequence-entities cte-db))
+
+    "pg_am"
+    ;; pg_am.dat. `heap` is the one table method; the index methods are
+    ;; listed because a query asking which exist should get PostgreSQL's
+    ;; answer, not an empty one -- whether we can BUILD each index is a
+    ;; different question and pg_index answers it.
+    (mapv (fn [[oid nm handler kind]]
+            {:pg_am/oid oid :pg_am/amname nm :pg_am/amhandler handler
+             :pg_am/amtype kind (pgs/row-marker-attr "pg_am") true})
+          [[2 "heap" 3 "t"] [403 "btree" 330 "i"] [405 "hash" 331 "i"]
+           [783 "gist" 332 "i"] [2742 "gin" 335 "i"] [3580 "brin" 3952 "i"]
+           [4000 "spgist" 4001 "i"]])
+
+    "pg_language"
+    (mapv (fn [[oid nm ispl trusted]]
+            {:pg_language/oid oid :pg_language/lanname nm
+             :pg_language/lanowner pg-role-oid
+             :pg_language/lanispl ispl :pg_language/lanpltrusted trusted
+             :pg_language/lanplcallfoid 0 :pg_language/laninline 0
+             :pg_language/lanvalidator 0
+             (pgs/row-marker-attr "pg_language") true})
+          [[12 "internal" false false] [13 "c" false false]
+           [14 "sql" false true] [13671 "plpgsql" true true]])
+
+    "pg_tablespace"
+    (mapv (fn [[oid nm]]
+            {:pg_tablespace/oid oid :pg_tablespace/spcname nm
+             :pg_tablespace/spcowner pg-role-oid
+             (pgs/row-marker-attr "pg_tablespace") true})
+          [[1663 "pg_default"] [1664 "pg_global"]])
+
+    "pg_operator"
+    (mapv (fn [{:keys [oid oprname kind left right result code]}]
+            {:pg_operator/oid oid :pg_operator/oprname oprname
+             :pg_operator/oprnamespace 11 :pg_operator/oprowner pg-role-oid
+             :pg_operator/oprkind kind
+             :pg_operator/oprcanmerge false :pg_operator/oprcanhash false
+             :pg_operator/oprleft (or left 0) :pg_operator/oprright (or right 0)
+             :pg_operator/oprresult (or result 0)
+             :pg_operator/oprcode (str code)
+             (pgs/row-marker-attr "pg_operator") true})
+          pg-cat/operators)
+
+    "pg_cast"
+    (vec (map-indexed
+          (fn [i {:keys [source target context method func]}]
+            {:pg_cast/oid (+ 10000 i)
+             :pg_cast/castsource source :pg_cast/casttarget target
+             ;; The generated rows carry the function's SIGNATURE TEXT
+             ;; (`int4(bool)`), and pg_cast.castfunc is an OID. Resolving
+             ;; it here keeps the two catalogs consistent; a cast whose
+             ;; function we do not carry reports 0, as a binary-coercible
+             ;; cast does.
+             :pg_cast/castfunc (cast-func-oid func)
+             :pg_cast/castcontext (str context) :pg_cast/castmethod (str method)
+             (pgs/row-marker-attr "pg_cast") true})
+          pg-cat/casts))
+
     "pg_views"
     (mapv (fn [{view-name :name definition :definition}]
             {:pg_views/schemaname "public"

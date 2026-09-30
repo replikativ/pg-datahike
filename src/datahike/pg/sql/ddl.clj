@@ -631,13 +631,22 @@
    `array?` suppresses the scalar hints: an `int[]` column has base-type
    \"int\" too and its array `:pg/type` (\"_int4\") is set elsewhere."
   [^String base-type array?]
-  (let [bt (some-> base-type str/lower-case str/trim)]
+  ;; `base-type-name-of` rather than a bare lower-case: a type name can
+  ;; arrive quoted (`path` is rewritten to its quoted spelling because
+  ;; JSqlParser reserves the word), and an unquoted comparison missed it.
+  (let [bt (some-> base-type types/base-type-name-of not-empty)]
     (cond
       (nil? bt) nil
 
       array? nil
 
       (#{"jsonb" "json" "money" "interval" "tsvector" "tsquery" "vector"} bt) bt
+
+      ;; The geometric family is carried as canonical text like jsonb, so
+      ;; the hint is the only thing that lets the catalog report the
+      ;; column's own type. Without it `format_type` answered `text` for
+      ;; every one of them but `point`.
+      (#{"point" "lseg" "path" "box" "polygon" "line" "circle"} bt) bt
 
       (#{"date" "time" "timetz" "timestamp" "timestamptz"
          "timestamp without time zone" "timestamp with time zone"

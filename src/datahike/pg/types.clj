@@ -34,6 +34,18 @@
 (def oid-tid        27)
 (def oid-json      114)
 (def oid-point     600)
+;; The rest of the geometric family. Their pg_type rows were already
+;; generated from pg_type.dat; nothing mapped the NAMES to them, so a
+;; `box` column reported `text` through format_type and every catalog
+;; join that asks for a column's type got the wrong answer. Values are
+;; held as their canonical text, as point's already were -- the
+;; operators (`&&`, `<->`, `~=`) are a separate matter.
+(def oid-lseg      601)
+(def oid-path      602)
+(def oid-box       603)
+(def oid-polygon   604)
+(def oid-line      628)
+(def oid-circle    718)
 (def oid-money     790)
 (def oid-float4    700)
 (def oid-float8    701)
@@ -418,6 +430,12 @@
     "json"        oid-json
     "jsonb"       oid-jsonb
     "point"       oid-point
+    "lseg"        oid-lseg
+    "path"        oid-path
+    "box"         oid-box
+    "polygon"     oid-polygon
+    "line"        oid-line
+    "circle"      oid-circle
     "tsvector"    oid-tsvector
     "tsquery"     oid-tsquery
     "vector"      oid-vector
@@ -538,6 +556,12 @@
    oid-json       "json"
    oid-jsonb      "jsonb"
    oid-point      "point"
+   oid-lseg       "lseg"
+   oid-path       "path"
+   oid-box        "box"
+   oid-polygon    "polygon"
+   oid-line       "line"
+   oid-circle     "circle"
    oid-tsvector   "tsvector"
    oid-tsquery    "tsquery"
    oid-pg-lsn     "pg_lsn"
@@ -679,6 +703,20 @@
         (re-find #"(?i)(?:^|\.)\s*\"?vector\"?\s*(?:\(|\[|$)"
                  (str/trim (str sql-type-name))))))
 
+(defn unquote-type-name
+  "A type name with its identifier quotes removed -- EXCEPT `\"char\"`.
+
+   Quotes are how `path` survives JSqlParser, which reserves the word,
+   so every type lookup has to see through them. They are also the only
+   thing distinguishing PostgreSQL's one-byte `\"char\"` (OID 18) from
+   the unquoted `char`, which is bpchar. Stripping them blindly made
+   `'hello'::\"char\"` answer `hello` instead of `h`."
+  [^String s]
+  (let [t (str s)]
+    (if (= "\"char\"" t)
+      t
+      (clojure.string/replace t #"^\"(.*)\"$" "$1"))))
+
 (defn normalize-sql-type-name
   "Normalize the built-in compatibility spelling of pgvector's type.
    JSqlParser preserves schema qualification and identifier quotes in
@@ -693,7 +731,11 @@
         (clojure.string/replace-first s valid-prefix "vector")
         (if (vector-type-spelling? s)
           s
-          (clojure.string/lower-case s))))))
+          ;; Quotes come off here so every downstream lookup sees the
+          ;; bare name: `path` is rewritten to `"path"` before parsing,
+          ;; because JSqlParser reserves the word. `"char"` keeps
+          ;; them -- see `unquote-type-name`.
+          (clojure.string/lower-case (unquote-type-name s)))))))
 
 ;; ============================================================================
 ;; Catalog data: pg_type rows for virtual table materialization
@@ -710,7 +752,9 @@
                  oid-bpchar oid-name oid-date oid-time oid-timetz oid-timestamp
                  oid-timestamptz oid-interval oid-numeric oid-uuid oid-bit
                  oid-varbit oid-jsonb oid-tsvector oid-tsquery oid-pg-lsn
-                 oid-regclass oid-regtype oid-regnamespace oid-vector]
+                 oid-regclass oid-regtype oid-regnamespace oid-vector
+                 oid-point oid-lseg oid-path oid-box oid-polygon oid-line
+                 oid-circle]
                 (vals element-oid->array-oid))))
 
 ;; ============================================================================
@@ -736,6 +780,7 @@
     oid-money oid-oid oid-text oid-varchar oid-bpchar oid-name oid-char
     oid-date oid-time oid-timetz oid-timestamp oid-timestamptz oid-interval
     oid-bit oid-varbit oid-uuid oid-bytea oid-json oid-jsonb oid-point
+    oid-lseg oid-path oid-box oid-polygon oid-line oid-circle
     oid-tid oid-pg-lsn oid-tsvector oid-tsquery oid-vector})
 
 (def oid->category
@@ -1109,9 +1154,19 @@
     (- (bit-xor x 1024) 1024)))
 
 (defn base-type-name-of
-  "The SQL type name with its `(…)` modifier stripped, lower-cased."
+  "The SQL type name with its `(…)` modifier stripped, unquoted and
+   lower-cased.
+
+   Unquoted because a type name can reach here quoted: `path` is a
+   reserved word in JSqlParser's grammar, so it is rewritten to the
+   quoted spelling before parsing, and every lookup keyed on this
+   otherwise missed it -- a `path` column reported `text`."
   [type-str]
-  (-> (str type-str) (str/replace #"\s*\([^)]*\)" "") str/trim str/lower-case))
+  (-> (str type-str)
+      (str/replace #"\s*\([^)]*\)" "")
+      str/trim
+      unquote-type-name
+      str/lower-case))
 
 (defn parse-char-length
   "The `n` of `varchar(n)` / `char(n)`, or nil for an unmodified text
@@ -1222,6 +1277,8 @@
         ;; cast was a no-op that only set the wire OID, so a malformed
         ;; literal was accepted and a well-formed one was not
         ;; canonicalised.
+        (#{"point" "lseg" "box" "path" "polygon" "line" "circle"} base)
+        :geometric
         (= base "json")                       :json
         (= base "jsonb")                      :jsonb
         (= base "tsvector")                   :tsvector

@@ -38,8 +38,12 @@
         invalid-vector-spelling?
         (and (types/vector-type-spelling? type-name)
              (not= :vector (types/cast-category normalized)))
+        ;; Unquoted: `path` is a reserved word in JSqlParser's grammar
+        ;; and is rewritten to its quoted spelling before parsing, so a
+        ;; cast to it arrived here as `"path"` and resolved to nothing.
         raw (-> (str normalized) str/trim str/lower-case
-                (str/replace #"\s*\([^)]*\)" ""))
+                (str/replace #"\s*\([^)]*\)" "")
+                types/unquote-type-name)
         raw (if (str/ends-with? raw "[]")
               (subs raw 0 (- (count raw) 2))
               raw)
@@ -802,7 +806,15 @@
          canonical (get sql-type->pg-name normalized normalized)]
      (or (when-not array? (get planned-user-types canonical))
          (:datahike.pg.object/oid (user-type-object db pg-type))
-         (when pg-type (field-type->oid pg-type))
+         ;; The CANONICAL name for a scalar, not the declared one. A
+         ;; type name can arrive quoted -- `path` is a reserved word in
+         ;; JSqlParser's grammar and is rewritten to `"path"` before
+         ;; parsing -- and `field-type->oid` answers TEXT for a name it
+         ;; does not know rather than nil, so a fallback after it never
+         ;; runs. The column was recorded as text (25) while every other
+         ;; geometric type resolved.
+         (when pg-type
+           (field-type->oid (if (and canonical (not array?)) canonical pg-type)))
          types/oid-text))))
 
 (defn composite-types
