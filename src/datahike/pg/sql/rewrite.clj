@@ -758,6 +758,43 @@
 ;; reserved word in column position. Quote it so the AST builds.
 ;; ============================================================================
 
+(defn path-type-name-rule
+  "Quote `path` where it names a TYPE. JSqlParser reserves the word, so
+   `CREATE TABLE t (v path)`, `x::path` and `CAST(x AS path)` are all
+   parse errors, while the quoted spelling parses identically in every
+   one of them. The other six geometric types have no such problem.
+
+   Only in a type position: after `::`, after `AS` inside a CAST, or
+   following an identifier inside a column definition. `path` is an
+   ordinary column name too -- `SELECT path FROM t` must stay as it is,
+   and PostgreSQL folds an unquoted name to lower case anyway, so the
+   replacement is the lower-cased quoted form."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i n)
+        acc
+        (let [t (nth toks i)]
+          (if-not (= "path" (kw-text t))
+            (recur (inc i) acc)
+            (let [prev (non-comment-before toks i)
+                  prev-kw (kw-text prev)
+                  nxt (nth toks (inc i) nil)
+                  type-position?
+                  (or (= "::" (:text prev))
+                      (= "as" prev-kw)
+                      ;; `col path` / `col path[]` in a column list: an
+                      ;; identifier before it and a comma, `)` or `[`
+                      ;; after.
+                      (and (ident-tok? prev)
+                           (or (nil? nxt)
+                               (punct? nxt ",")
+                               (punct? nxt ")")
+                               (punct? nxt "["))))]
+              (if type-position?
+                (recur (inc i) (conj acc [(:pos t) (:end t) "\"path\""]))
+                (recur (inc i) acc)))))))))
+
 (defn reserved-column-name-rule
   "Match `<INDEX|KEY> varchar` and quote the first ident: `\"INDEX\" varchar`."
   [toks]
@@ -1278,7 +1315,8 @@
 
    Order matters only for rules that target the same source span; all
    rules here are disjoint."
-  [inline-references-rule
+  [path-type-name-rule
+   inline-references-rule
    table-level-fk-match-rule
    alter-add-check-rule
    create-index-anonymous-rule

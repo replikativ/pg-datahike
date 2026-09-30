@@ -50,6 +50,7 @@
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.errors :as errors]
             [datahike.pg.records :as pg-rec]
+            [datahike.pg.geo :as geo]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks]
             [datahike.pg.schema :as pgs]
@@ -4173,6 +4174,27 @@
           (swap! (:in-args ctx) conj #(params/cast-domain-value (:db ctx) domain-spec %))
           (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
           result-var))
+
+      ;; A geometric cast, folded or at runtime. `cast-category` had no
+      ;; branch for these either, so the value passed through UNCHANGED
+      ;; and `'garbage'::point` answered `garbage` -- text that is not a
+      ;; point, in a point column, reported as success. It also meant no
+      ;; canonical form, so `'(1,2),(3,4)'::box` and
+      ;; `'(3,4),(1,2)'::box` were different text for the same box.
+      (= :geometric cast-cat)
+      (let [tname (types/base-type-name-of type-str)]
+        (if (string? inner-raw)
+          (geo/geometric-in tname inner-raw)
+          (let [param (symbol (str "?geo-cast" (swap! (:var-counter ctx) inc)))
+                result (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)]
+            (swap! (:in-params ctx) conj param)
+            (swap! (:in-args ctx) conj
+                   (fn [v]
+                     (if (or (nil? v) (= :__null__ v))
+                       :__null__
+                       (geo/geometric-in tname v))))
+            (swap! (:where-clauses ctx) conj [(list param inner-raw) result])
+            result)))
 
       json-cast
       (if (string? inner-raw)

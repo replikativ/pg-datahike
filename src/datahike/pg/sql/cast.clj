@@ -30,6 +30,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
+            [datahike.pg.geo :as geo]
             [datahike.pg.input :as input]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.tsearch :as tsearch]
@@ -821,6 +822,12 @@
                  (string? v) (or (coerce/parse-bytea-hex v)
                                  (.getBytes ^String v "UTF-8"))
                  :else v)
+
+        ;; A geometric value is held as its canonical text. Without
+        ;; this the cast fell through to the default and handed back
+        ;; whatever was written: `'garbage'::point` answered `garbage`.
+        :geometric
+        (geo/geometric-in (types/base-type-name-of type-str) v)
 
         :timestamp
         (cond

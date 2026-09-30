@@ -52,6 +52,7 @@
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.constraints.unique :as unique-constraints]
             [datahike.pg.window :as window]
+            [datahike.pg.geo :as geo]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.schema :as pgs]
@@ -7870,6 +7871,13 @@
         ;; behaving like PG `json`). Canonicalize every jsonb write here — string
         ;; literal or Clojure map/vector alike — keyed on the :pg/type tag.
           jsonb? (jb/serialize-jsonb val)
+
+          ;; A geometric column is :db.type/string too, so the same
+          ;; reasoning as jsonb applies twice over: without this an
+          ;; INSERT stored whatever text was written -- `'garbage'` into
+          ;; a point column succeeded -- and two spellings of one box
+          ;; were different values.
+          (geo/geometric-type? pg-type) (geo/geometric-in pg-type val)
 
           (= "tsvector" pg-type) (tsearch/canonical-tsvector val)
 
