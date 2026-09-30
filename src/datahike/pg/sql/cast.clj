@@ -366,6 +366,11 @@
               :timestamp epoch-instant
               ::none)
     "allballs" (if (= :time kind) (java.time.LocalTime/of 0 0 0) ::none)
+    ;; `infinity` is a timestamp and a date, never a time -- `time_in`
+    ;; has no room for it and PostgreSQL raises. `inf` is not a
+    ;; spelling PostgreSQL accepts either.
+    ("infinity" "+infinity") (if (= :time kind) ::none types/pos-infinity)
+    "-infinity" (if (= :time kind) ::none types/neg-infinity)
     ::none))
 
 (defn- parse-time-fields
@@ -822,10 +827,14 @@
           (instance? java.util.Date v) v
           (instance? java.time.LocalDateTime v) v
           (and (string? v) (not= ::none (special-datetime v :timestamp)))
-          (let [^java.time.LocalDateTime ldt (special-datetime v :timestamp)]
-            (if prefer-local-datetime?
-              ldt
-              (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC))))
+          (let [sp (special-datetime v :timestamp)]
+            (if (instance? java.time.LocalDateTime sp)
+              (if prefer-local-datetime?
+                sp
+                (java.util.Date/from (.toInstant ^java.time.LocalDateTime sp
+                                                 java.time.ZoneOffset/UTC)))
+              ;; An infinity is already the stored value.
+              sp))
           ;; A NAMED zone inside the literal -- `… America/New_York`,
           ;; `… PST`. A timestamptz applies it; a plain timestamp
           ;; ignores it (datetime.c keeps the fields and drops the
