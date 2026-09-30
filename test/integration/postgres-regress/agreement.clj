@@ -75,7 +75,26 @@
           (recur (inc i) cur))))))
 
 (defn agreement
-  "[percentage matched total] for one file, or nil when it was not run."
+  "[percentage matched total] for one file, or nil when it was not run.
+
+   THE METRIC IS GAMEABLE, and knowing how is the point of reading it.
+   It divides by the size of PostgreSQL's expected output and counts
+   only what appears in order, so EMITTING MORE LINES CAN ONLY RAISE
+   IT. A statement we answer with a wrong-but-plausible block of rows
+   scores above one we refuse outright, and a parser that echoes junk
+   before failing scores above one that fails cleanly.
+
+   That is not hypothetical. Ten files appeared to LOSE ground in the
+   2026-09-29 comparison; eight of them reproduced their old score
+   exactly once the removed JSqlParser grammar dump was simulated --
+   the earlier number had been inflated by lines that were never an
+   answer to anything.
+
+   So: a rise is evidence of nothing on its own, and a fall is a
+   question rather than a regression. What the number is good for is
+   WHICH FILE to open next, and the first divergence inside it. The
+   gate exists to make a large drop visible, not to make the mean a
+   goal."
   [test-name results-dir]
   (let [exp (io/file regress-root "expected" (str test-name ".out"))
         act (io/file results-dir (str test-name ".out"))]
@@ -152,6 +171,12 @@
                    " ;; The tolerance is not slack for regressions: a file that is\n"
                    " ;; mostly cascade realigns by a point or two whenever anything\n"
                    " ;; ahead of its first divergence changes, in either direction.\n"
+                   " ;;\n"
+                   " ;; And the number is GAMEABLE: it counts expected lines we\n"
+                   " ;; reproduce, so emitting MORE output can only raise it. A\n"
+                   " ;; wrong-but-plausible block of rows scores above a clean\n"
+                   " ;; refusal. Read a file's score to decide what to open next,\n"
+                   " ;; never as a goal. See `agreement`.\n"
                    " :tolerance " (or (:tolerance manifest) 3.0) "\n"
                    " :files\n {\n"
                    (str/join "\n" (for [[n p] (sort measured)]
