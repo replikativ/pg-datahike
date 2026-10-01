@@ -124,4 +124,13 @@
     (let [s (v "SELECT json_agg(w) FROM wo w")]
       (is (re-find #"\}, \n \{" s) s)
       (is (re-find #"\{\"id\":\d+,\"zz\":" s) s))
-    (is (= "[1, 6]" (v "SELECT json_agg(id ORDER BY id) FROM wo")))))
+    (is (= "[1, 6]" (v "SELECT json_agg(id ORDER BY id) FROM wo")))
+    (testing "and the ORDER BY is applied, not merely agreed with: the
+              json family had no ordered form at all, so this returned
+              the scan order and passed only while that order was
+              already sorted"
+      (run "INSERT INTO wo VALUES (2,0,0,0,0)")
+      (is (= "[1, 2, 6]" (v "SELECT json_agg(id ORDER BY id) FROM wo")))
+      (is (= "[6, 2, 1]" (v "SELECT json_agg(id ORDER BY id DESC) FROM wo")))
+      (is (= "[1, 2, 6]" (v "SELECT jsonb_agg(id ORDER BY id) FROM wo")))
+      (is (= "[6, 2, 1]" (v "SELECT jsonb_agg(id ORDER BY id DESC) FROM wo"))))))

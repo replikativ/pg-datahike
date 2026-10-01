@@ -4735,7 +4735,20 @@
                             ;; the in-aggregate ORDER BY (composite field order in
                             ;; asyncpg's introspection depends on this). Direction
                             ;; is taken uniformly from the keys (all-DESC → desc).
-                      (let [order-els (when (= fname "array_agg")
+                            ;; The json family needs this as much as
+                            ;; array_agg does: `json_agg(x ORDER BY x)`
+                            ;; silently ignored its ORDER BY and returned
+                            ;; the scan order.
+                      (let [ordered-aggs {"array_agg"
+                                          ['datahike.pg.query-fns/filter-array-agg-ordered
+                                           'datahike.pg.query-fns/filter-array-agg-ordered-desc]
+                                          "json_agg"
+                                          ['datahike.pg.query-fns/filter-json-agg-ordered
+                                           'datahike.pg.query-fns/filter-json-agg-ordered-desc]
+                                          "jsonb_agg"
+                                          ['datahike.pg.query-fns/filter-jsonb-agg-ordered
+                                           'datahike.pg.query-fns/filter-jsonb-agg-ordered-desc]}
+                            order-els (when (contains? ordered-aggs fname)
                                         (seq (.getOrderByElements f)))]
                         (if order-els
                           (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
@@ -4749,9 +4762,8 @@
                                 all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
                                                     (not (.isAsc o)))
                                                   order-els)
-                                ord-sym (if all-desc?
-                                          'datahike.pg.query-fns/filter-array-agg-ordered-desc
-                                          'datahike.pg.query-fns/filter-array-agg-ordered)]
+                                ord-sym (let [[asc desc] (get ordered-aggs fname)]
+                                          (if all-desc? desc asc))]
                             (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
                             (swap! find-elements conj (list ord-sym pair-var)))
                           (swap! find-elements conj (list agg-sym v))))
