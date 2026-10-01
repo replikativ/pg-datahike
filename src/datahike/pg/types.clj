@@ -46,6 +46,17 @@
 (def oid-polygon   604)
 (def oid-line      628)
 (def oid-circle    718)
+;; The network-address family's MAC half. Their pg_type rows were
+;; already generated; nothing mapped the NAMES, so neither type could be
+;; spelled at all -- `'08:00:2b:01:02:03'::macaddr` was `type "macaddr"
+;; does not exist`, and so was a column of one.
+;;
+;; Held as canonical text, like the geometric family. For these it costs
+;; nothing: the canonical form is fixed-width lower-case hex, so
+;; lexicographic text order IS `macaddr_cmp`'s byte order, and equality
+;; is byte equality.
+(def oid-macaddr8  774)
+(def oid-macaddr   829)
 (def oid-money     790)
 (def oid-float4    700)
 (def oid-float8    701)
@@ -436,6 +447,8 @@
     "polygon"     oid-polygon
     "line"        oid-line
     "circle"      oid-circle
+    "macaddr"     oid-macaddr
+    "macaddr8"    oid-macaddr8
     "tsvector"    oid-tsvector
     "tsquery"     oid-tsquery
     "vector"      oid-vector
@@ -559,6 +572,8 @@
    oid-lseg       "lseg"
    oid-path       "path"
    oid-box        "box"
+   oid-macaddr    "macaddr"
+   oid-macaddr8   "macaddr8"
    oid-polygon    "polygon"
    oid-line       "line"
    oid-circle     "circle"
@@ -754,7 +769,7 @@
                  oid-varbit oid-jsonb oid-tsvector oid-tsquery oid-pg-lsn
                  oid-regclass oid-regtype oid-regnamespace oid-vector
                  oid-point oid-lseg oid-path oid-box oid-polygon oid-line
-                 oid-circle]
+                 oid-circle oid-macaddr oid-macaddr8]
                 (vals element-oid->array-oid))))
 
 ;; ============================================================================
@@ -781,6 +796,7 @@
     oid-date oid-time oid-timetz oid-timestamp oid-timestamptz oid-interval
     oid-bit oid-varbit oid-uuid oid-bytea oid-json oid-jsonb oid-point
     oid-lseg oid-path oid-box oid-polygon oid-line oid-circle
+    oid-macaddr oid-macaddr8
     oid-tid oid-pg-lsn oid-tsvector oid-tsquery oid-vector})
 
 (def oid->category
@@ -1279,6 +1295,7 @@
         ;; canonicalised.
         (#{"point" "lseg" "box" "path" "polygon" "line" "circle"} base)
         :geometric
+        (#{"macaddr" "macaddr8"} base)        :mac
         (= base "json")                       :json
         (= base "jsonb")                      :jsonb
         (= base "tsvector")                   :tsvector

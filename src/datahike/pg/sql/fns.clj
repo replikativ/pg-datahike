@@ -39,6 +39,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
+            [datahike.pg.mac :as mac]
             [datahike.pg.input :as input]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.numeric-format :as numfmt]
@@ -2374,10 +2375,24 @@
      ;; PostgreSQL does not expose a negative display scale here.
      (if (neg? scale) (.setScale rounded 0) rounded))))
 
+(def ^:private canonical-mac-re
+  "A MAC address in the only form one can be STORED in: canonical
+   colon-separated lower-case hex, six groups or eight. Used to tell a
+   `trunc(macaddr)` from a numeric `trunc` by value, because a numeric
+   string can never contain a colon -- a looser test would catch a
+   12-digit decimal, which is also valid hex."
+  #"(?i)^([0-9a-f]{2}:){5}[0-9a-f]{2}$|^([0-9a-f]{2}:){7}[0-9a-f]{2}$")
+
 (defn- sql-trunc
-  "SQL TRUNC — round toward zero. TRUNC(x, n) truncates to n decimals."
+  "SQL TRUNC — round toward zero. TRUNC(x, n) truncates to n decimals.
+
+   `trunc(macaddr)` and `trunc(macaddr8)` are a different function
+   sharing the name: they zero everything after the 24-bit OUI.
+   PostgreSQL tells them apart by type and we have only the value, so
+   the discriminator is the canonical form."
   ([x]
    (cond
+     (and (string? x) (re-matches canonical-mac-re x)) (mac/mac-trunc x)
      (integer? x) x
      (decimal? x) (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/DOWN)
      :else (-> (bigdec x) (.setScale 0 java.math.RoundingMode/DOWN) (.longValueExact))))
@@ -2551,17 +2566,29 @@
 ;; rather than saturating. Clojure's bit-shift-* on longs already do both.
 ;; ---------------------------------------------------------------------------
 
+(defn- mac-operand?
+  "A MAC address reaching an operator is always in canonical form, and a
+   number never contains a colon -- so the colon is what tells
+   `macaddr & macaddr` from `int & int`. PostgreSQL tells them apart by
+   type; we have only the value."
+  [v]
+  (and (string? v) (re-matches canonical-mac-re v)))
+
 (defn- bit-dispatch
-  "Apply `bitf` for bit-string operands, `intf` for integers."
-  [bitf intf a b]
+  "Apply `bitf` for bit-string operands, `macf` for MAC addresses,
+   `intf` for integers."
+  [bitf macf intf a b]
   (cond
     (or (sql-null? a) (sql-null? b)) :__null__
     (and (pg-bits/pg-bit? a) (pg-bits/pg-bit? b)) (bitf a b)
+    (and (mac-operand? a) (mac-operand? b)) (macf a b)
     :else (intf (long a) (long b))))
 
-(defn sql-bit-and [a b] (bit-dispatch pg-bits/and-bits bit-and a b))
-(defn sql-bit-or  [a b] (bit-dispatch pg-bits/or-bits  bit-or  a b))
-(defn sql-bit-xor [a b] (bit-dispatch pg-bits/xor-bits bit-xor a b))
+(defn sql-bit-and [a b] (bit-dispatch pg-bits/and-bits mac/mac-and bit-and a b))
+(defn sql-bit-or  [a b] (bit-dispatch pg-bits/or-bits  mac/mac-or  bit-or  a b))
+;; There is no `#` for MAC addresses in PostgreSQL, so XOR keeps the
+;; integer behaviour for a value that merely looks like one.
+(defn sql-bit-xor [a b] (bit-dispatch pg-bits/xor-bits bit-xor bit-xor a b))
 
 (defn sql-bit-not
   "`~` — bitwise NOT."
@@ -2569,6 +2596,7 @@
   (cond
     (sql-null? a) :__null__
     (pg-bits/pg-bit? a) (pg-bits/not-bits a)
+    (mac-operand? a) (mac/mac-not a)
     :else (bit-not (long a))))
 
 (defn sql-bit-shift-left
@@ -4730,6 +4758,7 @@
    "sha256"       sql-sha256
    "sha384"       sql-sha384
    "sha512"       sql-sha512
+   "macaddr8_set7bit" mac/mac8-set7bit
    "starts_with"  sql-starts-with
    "split_part"   sql-split-part
    "translate"    sql-translate
@@ -4861,6 +4890,7 @@
    "ascii"    #{1} "chr" #{1} "md5" #{1} "to_hex" #{1} "isfinite" #{1}
    "encode"   #{2} "decode" #{2}
    "sha224"   #{1} "sha256" #{1} "sha384" #{1} "sha512" #{1}
+   "macaddr8_set7bit" #{1}
    "btrim"    #{1 2} "starts_with" #{2} "split_part" #{3} "translate" #{3}
    "ltrim"    #{1 2} "rtrim" #{1 2} "trim" #{1 2}
    "date_part" #{2}

@@ -88,6 +88,7 @@
    "sha256"        types/oid-bytea
    "sha384"        types/oid-bytea
    "sha512"        types/oid-bytea
+   "macaddr8_set7bit" types/oid-macaddr8
    "quote_ident"   types/oid-text
    "quote_literal" types/oid-text
    "format"        types/oid-text

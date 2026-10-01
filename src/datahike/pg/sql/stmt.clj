@@ -53,6 +53,7 @@
             [datahike.pg.constraints.unique :as unique-constraints]
             [datahike.pg.window :as window]
             [datahike.pg.geo :as geo]
+            [datahike.pg.mac :as mac]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.schema :as pgs]
@@ -7878,6 +7879,12 @@
           ;; a point column succeeded -- and two spellings of one box
           ;; were different values.
           (geo/geometric-type? pg-type) (geo/geometric-in pg-type val)
+
+          ;; The second road to a MAC column, and the one the cast path
+          ;; does not cover: without this an INSERT stored whatever was
+          ;; written, so `'garbage'` in a macaddr column succeeded and
+          ;; two spellings of one address were two values.
+          (mac/mac-type? pg-type) (mac/mac-in pg-type val)
 
           (= "tsvector" pg-type) (tsearch/canonical-tsvector val)
 
