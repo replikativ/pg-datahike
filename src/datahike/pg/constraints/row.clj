@@ -51,6 +51,12 @@
                             kind (:pg/default-kind entity)]
                         {:name name :attr attr
                          :not-null? (true? (:pg/not-null entity))
+                         ;; GENERATED ALWAYS AS (expr) STORED. Carried
+                         ;; alongside the default and not as one: a
+                         ;; default fills an omitted column, and this
+                         ;; replaces whatever was written.
+                         :generated (:pg/generated entity)
+                         :generated-expr (:pg/generated-expr entity)
                          :default (when kind
                                     [kind (:pg/default-value entity)
                                      (:pg/default-arg entity)])}))))
@@ -168,11 +174,17 @@
          ;; per row: the plan is compiled once per statement, so a
          ;; thousand-row INSERT parses `now() + interval '1 day'` once.
          :columns
-         (mapv (fn [{:keys [default] :as column}]
-                 (if (= :expr (first default))
-                   (assoc column :default-ast
-                          (parse-constraint-expression (second default)))
-                   column))
+         (mapv (fn [{:keys [default generated-expr] :as column}]
+                 (cond-> column
+                   ;; A generated column's expression is parsed here too,
+                   ;; and for the same reason: once per statement rather
+                   ;; than once per row.
+                   generated-expr
+                   (assoc :generated-ast
+                          (parse-constraint-expression generated-expr))
+                   (= :expr (first default))
+                   (assoc :default-ast
+                          (parse-constraint-expression (second default)))))
                columns)
          :checks (when checks
                    (mapv (fn [{:keys [constraint expression]}]

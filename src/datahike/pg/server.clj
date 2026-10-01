@@ -2455,6 +2455,29 @@
 
 (declare before-row-insert-triggers?)
 
+(defn- generated-column-values
+  "Fill every `GENERATED ALWAYS AS (expr) STORED` column of `attrs` by
+   evaluating its expression over the row, replacing whatever is there.
+
+   The row is in scope, unlike a DEFAULT's: `row-values` is the same
+   evaluator a CHECK constraint gets, so a generated expression may name
+   the table's other columns and sees exactly what a CHECK would."
+  [attrs constraint-plan schema db]
+  (let [gens (filter :generated (:columns constraint-plan))]
+    (if (empty? gens)
+      attrs
+      (let [table (:table constraint-plan)]
+        (reduce (fn [acc {:keys [attr generated-ast]}]
+                  (if-not generated-ast
+                    acc
+                    (let [v (first (:values (row-eval/row-values
+                                             [generated-ast] acc table schema db)))]
+                      (assoc acc attr
+                             (when (some? v)
+                               (#'stmt/coerce-insert-value v attr schema db))))))
+                attrs
+                gens)))))
+
 (defn- materialize-insert-candidate
   "Evaluate one candidate's target columns in physical column order.
 
@@ -2477,18 +2500,42 @@
          eval-expr #(row-eval/default-value % schema db)
          attrs
          (reduce
-          (fn [attrs {:keys [attr default default-ast]}]
-            (let [present? (contains? attrs attr)
-                  resolved (if present?
-                             (resolve-value (get attrs attr))
-                             (materialize-column-default default resolve-value
-                                                         default-ast eval-expr))
-                  coerced (when (some? resolved)
-                            (#'stmt/coerce-insert-value resolved attr schema db))]
-              (cond-> attrs
-                (or present? default) (assoc attr coerced))))
+          (fn [attrs {:keys [attr default default-ast generated] col-name :name}]
+            ;; A generated column is filled below, from the finished row.
+            ;; Skipping it here is what stops a DEFAULT or a supplied
+            ;; value standing in for the expression.
+            (if generated
+              ;; A value was written for it. PostgreSQL refuses that --
+              ;; 428C9, and the DETAIL names the reason -- rather than
+              ;; silently overwriting, because a caller who wrote a
+              ;; value believes it will be stored. DEFAULT is the one
+              ;; accepted spelling, and DEFAULT arrives here as an
+              ;; OMITTED column, so its absence is what permits it.
+              (if (contains? attrs attr)
+                (throw (ex-info (str "cannot insert a non-DEFAULT value into column \""
+                                     col-name "\"")
+                                {:sqlstate "428C9"
+                                 :error :generated-always
+                                 :detail (str "Column \"" col-name
+                                              "\" is a generated column.")}))
+                attrs)
+              (let [present? (contains? attrs attr)
+                    resolved (if present?
+                               (resolve-value (get attrs attr))
+                               (materialize-column-default default resolve-value
+                                                           default-ast eval-expr))
+                    coerced (when (some? resolved)
+                              (#'stmt/coerce-insert-value resolved attr schema db))]
+                (cond-> attrs
+                  (or present? default) (assoc attr coerced)))))
           candidate
-          (:columns constraint-plan))]
+          (:columns constraint-plan))
+         ;; GENERATED ALWAYS AS (expr) STORED, evaluated LAST and over the
+         ;; row the other columns just produced -- the expression may name
+         ;; any of them, which is the whole point and the thing a DEFAULT
+         ;; may not do. PostgreSQL also forbids one generated column from
+         ;; reading another, so one pass is enough.
+         attrs (generated-column-values attrs constraint-plan schema db)]
      (when validate?
        (row-constraints/validate-pre-arbiter!
         db (:table constraint-plan) attrs constraint-plan
@@ -3589,19 +3636,78 @@
                                    [(conj seen (first row)) (conj out row)]))
                                [#{} []] rows))
                rows)
+        ;; GENERATED ALWAYS AS (expr) STORED. Two obligations, and the
+        ;; UPDATE path is the only place with both the row as it was and
+        ;; the values replacing it.
+        gen-plan (row-constraint-plan db (:table parsed))
+        gen-cols (filterv :generated (:columns gen-plan))
+        gen-names (into #{} (map :name) gen-cols)
+        ;; Assigning to one is refused -- 428C9, the same code INSERT
+        ;; uses -- EXCEPT `SET c = DEFAULT`, which PostgreSQL accepts and
+        ;; which arrives here as a :default-fill.
+        _ (when (seq gen-names)
+            (doseq [{:keys [column default-fill]} assignments]
+              (when (and (contains? gen-names column) (not default-fill))
+                (throw (ex-info (str "column \"" column "\" can only be updated to DEFAULT")
+                                {:sqlstate "428C9"
+                                 :error :generated-always
+                                 :detail (str "Column \"" column
+                                              "\" is a generated column.")})))))
         tx-data (into []
                       (mapcat
                        (fn [[eid & values]]
                          (let [entity-map (into {} (map (fn [^datahike.datom.Datom d]
                                                           [(.-a d) (.-v d)]))
-                                                (d/datoms db :eavt eid))]
-                           (keep (fn [[{:keys [column default-fill]} v]]
-                                   (assignment-op eid entity-map (keyword ns column)
-                                                  (if default-fill
-                                                    (apply row-constraints/eval-default default-fill)
-                                                    (when-not (= :__null__ v) v))
-                                                  schema db))
-                                 (map vector assignments values)))))
+                                                (d/datoms db :eavt eid))
+                               assigned
+                               (keep (fn [[{:keys [column default-fill]} v]]
+                                       (assignment-op eid entity-map (keyword ns column)
+                                                      (if default-fill
+                                                        (apply row-constraints/eval-default default-fill)
+                                                        (when-not (= :__null__ v) v))
+                                                      schema db))
+                                     (map vector assignments values))]
+                           (if (empty? gen-cols)
+                             assigned
+                             ;; Recompute over the row AS IT WILL BE: the
+                             ;; expression names other columns, so an
+                             ;; UPDATE of one of them changes it even
+                             ;; though the statement never mentioned it.
+                             ;; Omitting this left the old value in place,
+                             ;; which is a stale answer rather than a
+                             ;; missing feature.
+                             (let [after (reduce (fn [m op]
+                                                   (cond
+                                                     (not (vector? op)) m
+                                                     (= :db/add (first op))
+                                                     (assoc m (nth op 2) (nth op 3))
+                                                     ;; `SET col = NULL` RETRACTS, and
+                                                     ;; ignoring that left the OLD value
+                                                     ;; in scope: the expression then
+                                                     ;; recomputed from it, so
+                                                     ;; `SET a = NULL` kept b at its
+                                                     ;; previous number instead of
+                                                     ;; going NULL with it.
+                                                     (= :db/retract (first op))
+                                                     (dissoc m (nth op 2))
+                                                     :else m))
+                                                 entity-map assigned)
+                                   row-after (into {} (keep (fn [[a v]]
+                                                              (when (keyword? a) [a v])))
+                                                   after)]
+                               (into (vec assigned)
+                                     (keep (fn [{:keys [attr generated-ast]}]
+                                             (when generated-ast
+                                               (let [v (first (:values
+                                                               (row-eval/row-values
+                                                                [generated-ast] row-after
+                                                                (:table parsed) schema db)))]
+                                                 (assignment-op eid entity-map attr
+                                                                (when (some? v)
+                                                                  (#'stmt/coerce-insert-value
+                                                                   v attr schema db))
+                                                                schema db))))
+                                           gen-cols)))))))
                       rows)]
     {:eids (mapv first rows) :tx-data tx-data}))
 
@@ -4257,6 +4363,14 @@
               [:pg/default-kind kw1]
               [:pg/default-value str1]
               [:pg/default-arg str1]
+              ;; GENERATED ALWAYS AS (expr) STORED. Deliberately NOT
+              ;; reusing :pg/default-*: a default fills a column that was
+              ;; omitted, and this replaces whatever was written, so the
+              ;; write paths have to tell them apart. `s` matches
+              ;; pg_attribute.attgenerated, which is the value a client
+              ;; reads.
+              [:pg/generated str1]
+              [:pg/generated-expr str1]
               ;; Constraint identity: table + name (ddl/constraint-key).
               ;; PostgreSQL names are unique per table, so CHECK and FK
               ;; entities are keyed by both; :pg/check-conname and
@@ -11891,6 +12005,20 @@
       ;; as XX000 instead of PostgreSQL's undefined-column error.
       (throw (errors/pg-error :undefined-column
                               {:column (first unknown-columns)})))
+    ;; A generated column cannot be COPYed into -- its value is the
+    ;; expression's, and COPY has no DEFAULT spelling to stand aside
+    ;; with. PostgreSQL's own code for this is 42P10, not the 428C9 that
+    ;; INSERT and UPDATE raise, and it is checked here for the same
+    ;; reason as the unknown column: before the connection enters COPY
+    ;; mode, or psql consumes the following SQL as row data.
+    (when-let [gen (let [plan (row-constraint-plan db-now table)
+                         gens (into #{} (comp (filter :generated) (map :name))
+                                    (:columns plan))]
+                     (first (filter gens col-names)))]
+      (throw (ex-info (str "column \"" gen "\" is a generated column")
+                      {:sqlstate "42P10"
+                       :error :invalid-column-reference
+                       :detail "Generated columns cannot be used in COPY."})))
     (when (empty? col-names)
       (throw (ex-info (str "no columns found for COPY into \"" table "\"")
                       {:error :undefined-table :table table})))

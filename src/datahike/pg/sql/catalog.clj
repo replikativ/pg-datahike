@@ -343,6 +343,9 @@
      ;; PG identity-column kind: '' = not identity, 'a' = always,
      ;; 'd' = by default. We never emit identity columns.
      {:db/ident :pg_attribute/attidentity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; `s` for a STORED generated column, empty otherwise -- the value a
+     ;; client reads to tell a computed column from a writable one.
+     {:db/ident :pg_attribute/attgenerated :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      ;; PostgreSQL type storage strategy: p=plain, m=main, x=extended.
      ;; psql's \d+ renders this as Plain/Main/Extended.
      {:db/ident :pg_attribute/attstorage :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -1417,6 +1420,7 @@
                  :pg_attribute/attnotnull false
                  :pg_attribute/atthasdef false
                  :pg_attribute/attidentity ""
+                 :pg_attribute/attgenerated ""
                  :pg_attribute/attstorage (attribute-storage (:oid f))
                  :pg_attribute/atttypmod
                  (long (or (:datahike.pg.column/typmod column) -1))
@@ -1476,6 +1480,7 @@
            :pg_attribute/attnotnull (boolean (or pk? (:not-null? col)))
            :pg_attribute/atthasdef (contains? default-idents (:attr col))
            :pg_attribute/attidentity identity-code
+           :pg_attribute/attgenerated (or (:generated col) "")
            :pg_attribute/attstorage (attribute-storage (:oid col))
            :pg_attribute/atttypmod typmod
            :pg_attribute/attisdropped false

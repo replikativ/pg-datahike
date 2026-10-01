@@ -103,6 +103,34 @@
          (some #(= "generated" (str/lower-case (str %))) specs)
          (not (identity-column? col)))))
 
+(defn generated-column-spec
+  "For `GENERATED ALWAYS AS (expr) STORED`, the expression's text and its
+   storage mode; nil for any other column.
+
+   The specs arrive tokenized -- GENERATED, ALWAYS, AS, `(a * 2)`,
+   STORED -- so the expression is the token after AS --
+   already parenthesised by JSqlParser, and already normalised, which is
+   the form `pg_get_expr` should show.
+
+   `VIRTUAL` is PostgreSQL 18's and is REFUSED rather than quietly
+   treated as STORED: the two differ in when the expression runs and
+   what a later ALTER may do to it, and silently picking one would make
+   a column that disagrees with the statement that created it."
+  [^ColumnDefinition col]
+  (let [specs (mapv str (or (.getColumnSpecs col) []))
+        lower (mapv str/lower-case specs)
+        as-idx (first (keep-indexed (fn [i w] (when (= "as" w) i)) lower))]
+    (when (and (some #{"generated"} lower)
+               (not (identity-column? col))
+               as-idx
+               (< (inc as-idx) (count specs)))
+      {:expr (nth specs (inc as-idx))
+       :mode (cond (some #{"stored"} lower)  :stored
+                   (some #{"virtual"} lower) :virtual
+                   ;; PostgreSQL requires one of the two words; without
+                   ;; it this is not a generated column it would accept.
+                   :else nil)})))
+
 (defn identity-generation
   "Return PostgreSQL's generation mode for an identity column."
   [^ColumnDefinition col]
@@ -699,14 +727,18 @@
                     :feature-not-supported
                     {:feature (str "ON COMMIT " (str/upper-case on-commit-action))})))
         columns (.getColumnDefinitions ct)
-        _ (when-let [col (some #(when (stored-generated-column? %) %) columns)]
-            ;; Treat stored generated columns as an explicit boundary. Silently
-            ;; creating an ordinary writable column here also lets a later
-            ;; COPY name it, at which point psql enters COPY mode and consumes
-            ;; following SQL as row data.
+        ;; A VIRTUAL generated column (PostgreSQL 18) keeps the explicit
+        ;; boundary the STORED ones used to have. Silently creating an
+        ;; ordinary writable column also lets a later COPY name it, at
+        ;; which point psql enters COPY mode and consumes following SQL
+        ;; as row data -- which is why this is loud.
+        _ (when-let [col (some (fn [c]
+                                 (let [g (generated-column-spec c)]
+                                   (when (and g (not= :stored (:mode g))) c)))
+                               columns)]
             (throw (errors/pg-error
                     :feature-not-supported
-                    {:message (str "stored generated column \""
+                    {:message (str "virtual generated column \""
                                    (params/unquote-ident (.getColumnName ^ColumnDefinition col))
                                    "\" is not supported")})))
         ;; Detect INHERITS (parent_table) — either from this CREATE TABLE
@@ -1066,6 +1098,18 @@
                        (= dh-type :db.type/float-array) (assoc :pg/type "vector")
                        char-pg-type (assoc :pg/type char-pg-type)
                        not-null-here? (assoc :pg/not-null true)
+                       ;; A STORED generated column: `attgenerated = 's'`
+                       ;; plus the expression. It is NOT a default --
+                       ;; a default fills an omitted column and this
+                       ;; replaces whatever was written -- so it gets
+                       ;; its own attributes rather than reusing
+                       ;; :pg/default-*, which INSERT consults only when
+                       ;; the column was left out.
+                       (generated-column-spec col)
+                       (as-> m
+                             (assoc m :pg/generated "s"
+                                    :pg/generated-expr
+                                    (:expr (generated-column-spec col))))
                        (and default-spec
                             (not= :unsupported (:kind default-spec)))
                        (as-> m
