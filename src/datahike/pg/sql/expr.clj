@@ -51,6 +51,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.geo :as geo]
+            [datahike.pg.mac :as mac]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks]
             [datahike.pg.schema :as pgs]
@@ -4181,6 +4182,25 @@
       ;; point, in a point column, reported as success. It also meant no
       ;; canonical form, so `'(1,2),(3,4)'::box` and
       ;; `'(3,4),(1,2)'::box` were different text for the same box.
+      (= :mac cast-cat)
+      (let [tname (types/base-type-name-of type-str)]
+        (if (string? inner-raw)
+          (if (and (= "macaddr" tname)
+                   (mac/macaddr8-bytes inner-raw)
+                   (not (mac/macaddr-bytes inner-raw)))
+            (mac/mac8->mac inner-raw)
+            (mac/mac-in tname inner-raw))
+          (let [param (symbol (str "?mac-cast" (swap! (:var-counter ctx) inc)))
+                result (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)]
+            (swap! (:in-params ctx) conj param)
+            (swap! (:in-args ctx) conj
+                   (fn [v]
+                     (if (or (nil? v) (= :__null__ v))
+                       :__null__
+                       (mac/mac-in tname v))))
+            (swap! (:where-clauses ctx) conj [(list param inner-raw) result])
+            result)))
+
       (= :geometric cast-cat)
       (let [tname (types/base-type-name-of type-str)]
         (if (string? inner-raw)

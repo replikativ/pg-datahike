@@ -31,6 +31,7 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.geo :as geo]
+            [datahike.pg.mac :as mac]
             [datahike.pg.input :as input]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.tsearch :as tsearch]
@@ -828,6 +829,20 @@
         ;; whatever was written: `'garbage'::point` answered `garbage`.
         :geometric
         (geo/geometric-in (types/base-type-name-of type-str) v)
+
+        ;; A MAC address is held as its canonical text, so the cast is
+        ;; the input function. macaddr8 <-> macaddr is a real conversion
+        ;; rather than a re-parse: widening inserts ff:fe and narrowing
+        ;; is only defined when they are there.
+        :mac
+        (let [tname (types/base-type-name-of type-str)
+              from (when (string? v) v)]
+          (cond
+            (nil? v) nil
+            (and (= "macaddr" tname) (mac/macaddr8-bytes from)
+                 (not (mac/macaddr-bytes from)))
+            (mac/mac8->mac from)
+            :else (mac/mac-in tname v)))
 
         :timestamp
         (cond

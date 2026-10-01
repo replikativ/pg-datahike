@@ -648,6 +648,11 @@
       ;; every one of them but `point`.
       (#{"point" "lseg" "path" "box" "polygon" "line" "circle"} bt) bt
 
+      ;; Same reasoning for the MAC family: the hint is the only thing
+      ;; that lets format_type and pg_attribute.atttypid report
+      ;; `macaddr` rather than the storage type.
+      (#{"macaddr" "macaddr8"} bt) bt
+
       (#{"date" "time" "timetz" "timestamp" "timestamptz"
          "timestamp without time zone" "timestamp with time zone"
          "time without time zone" "time with time zone"} bt)
