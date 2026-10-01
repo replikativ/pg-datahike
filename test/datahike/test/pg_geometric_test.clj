@@ -225,3 +225,66 @@
     (testing "circle_in rejects a negative radius and must accept NaN"
       (is (= "22P02" (state-of c "SELECT '<(0,0),-1>'::circle")))
       (is (= "<(0,0),NaN>" (one c "SELECT '<(0,0),NaN>'::circle"))))))
+
+(deftest the-comparison-surface-is-pg_operator-s
+  ;; There is no btree opclass for ANY geometric type in PostgreSQL --
+  ;; `select count(*) from pg_opclass where opcintype::regtype::text in
+  ;; (...) and opcmethod = 403` is 0 -- so "canonical text, therefore
+  ;; text order is the type's order" was false for all seven. The
+  ;; operators that exist compare AREA, LENGTH or POINT COUNT, and
+  ;; several spellings have no operator at all.
+  (with-open [c (jdbc)]
+    (testing "box and circle compare by AREA, not by text"
+      (is (= "t" (one c "SELECT '(0,0),(1,4)'::box = '(0,0),(2,2)'::box")))
+      (is (= "f" (one c "SELECT '(0,0),(10,1)'::box < '(0,0),(2,2)'::box")))
+      (is (= "t" (one c "SELECT '<(0,0),2>'::circle = '<(99,99),2>'::circle")))
+      (is (= "t" (one c "SELECT '<(0,0),3>'::circle < '<(0,0),10>'::circle"))))
+    (testing "path by POINT COUNT, lseg by LENGTH, line after scaling"
+      (is (= "t" (one c "SELECT '[(0,0),(1,1)]'::path = '[(9,9),(8,8)]'::path")))
+      (is (= "t" (one c "SELECT '[(0,0),(1,1),(2,2)]'::path > '[(9,9),(8,8)]'::path")))
+      (is (= "t" (one c "SELECT '[(0,0),(3,4)]'::lseg < '[(0,0),(0,6)]'::lseg")))
+      (is (= "t" (one c "SELECT '{1,2,3}'::line = '{2,4,6}'::line"))))
+    (testing "and the spellings PostgreSQL does not have are 42883 --
+              point has no =, box has no <>, line has no <>, polygon has
+              none of the six"
+      (is (= "42883" (state-of c "SELECT '(1,2)'::point = '(1,2)'::point")))
+      (is (= "42883" (state-of c "SELECT '(1,2)'::point < '(1,3)'::point")))
+      (is (= "42883" (state-of c "SELECT '(0,0),(1,4)'::box <> '(0,0),(2,2)'::box")))
+      (is (= "42883" (state-of c "SELECT '{1,2,3}'::line <> '{2,4,6}'::line")))
+      (is (= "42883" (state-of c (str "SELECT '((0,0),(1,1),(2,0))'::polygon "
+                                      "= '((0,0),(1,1),(2,0))'::polygon"))))
+      (testing "point does have <>"
+        (is (= "t" (one c "SELECT '(1,2)'::point <> '(1,3)'::point")))))))
+
+(deftest sorting-grouping-and-dedup-have-no-operator-either
+  ;; With no btree opclass there is nothing to sort or group by. These
+  ;; silently succeeded on the canonical text, in an order that is not
+  ;; PostgreSQL's for any of the seven.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE zg (id int, p point, b box)")
+    (exec! c (str "INSERT INTO zg VALUES (1,'(1,2)','(0,0),(10,1)'), "
+                  "(2,'(1,2)','(0,0),(2,2)')"))
+    (is (= "42883" (state-of c "SELECT b FROM zg ORDER BY b")))
+    (is (= "42883" (state-of c "SELECT id FROM zg ORDER BY p")))
+    (is (= "42883" (state-of c "SELECT DISTINCT p FROM zg")))
+    (is (= "42883" (state-of c "SELECT p, count(*) FROM zg GROUP BY p")))
+    (is (= (str "ERROR: could not identify an ordering operator for type box"
+                "\n  Hint: Use an explicit ordering operator or modify the query.")
+           (message-of c "SELECT b FROM zg ORDER BY b")))
+    (is (= "ERROR: could not identify an equality operator for type point"
+           (message-of c "SELECT DISTINCT p FROM zg")))
+    (testing "but a comparison that DOES exist still filters"
+      (is (= "1" (one c "SELECT id FROM zg WHERE b = '(0,0),(10,1)'::box"))))))
+
+(deftest length-is-geometric-for-lseg-and-path
+  ;; `length` answered with the CHARACTER COUNT of the canonical text --
+  ;; 13 for `[(0,0),(3,4)]`, where PostgreSQL says 5. A plausible number
+  ;; and no error. The value cannot say which it is, because a geometric
+  ;; value IS text; only the static type can.
+  (with-open [c (jdbc)]
+    (is (= "5" (one c "SELECT length('[(0,0),(3,4)]'::lseg)")))
+    (testing "a closed path includes the segment back to the first point"
+      (is (= "12" (one c "SELECT length('((0,0),(3,4),(3,0))'::path)")))
+      (is (= "9" (one c "SELECT length('[(0,0),(3,4),(3,0)]'::path)"))))
+    (testing "and length() on text is untouched"
+      (is (= "3" (one c "SELECT length('abc')"))))))

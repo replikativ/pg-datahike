@@ -267,3 +267,133 @@
   (if-let [f (get by-type type-name)]
     (f (str v) type-name)
     (str v)))
+
+;; ---------------------------------------------------------------------------
+;; Comparison
+;;
+;; There is no btree opclass for ANY geometric type in PostgreSQL --
+;; `select count(*) from pg_opclass where opcintype::regtype::text in
+;; (…) and opcmethod=403` is 0 -- so "canonical text, therefore text
+;; order is the type's order" was false for all seven. The operators
+;; that do exist compare AREA (box, circle), LENGTH (lseg) or POINT
+;; COUNT (path), none of which is lexicographic in any reading, and
+;; several spellings have no operator at all: `point = point` and
+;; `box <> box` are 42883 in PostgreSQL and were `t`/`f` here.
+
+(def ^:private epsilon 1.0E-06)
+
+(defn- fpeq [^double a ^double b] (or (== a b) (<= (Math/abs (- a b)) epsilon)))
+(defn- fplt [^double a ^double b] (< (+ a epsilon) b))
+(defn- fple [^double a ^double b] (<= a (+ b epsilon)))
+(defn- fpgt [^double a ^double b] (> a (+ b epsilon)))
+(defn- fpge [^double a ^double b] (>= (+ a epsilon) b))
+
+(defn- coords
+  "Every number in a value we ourselves canonicalised, in order. Safe
+   because the text came out of the input functions above."
+  [^String s]
+  (loop [i 0, acc []]
+    (if-let [[v e] (input/float8-prefix s i)]
+      (recur (long e) (conj acc (double v)))
+      (if (>= i (.length s))
+        acc
+        (recur (inc i) acc)))))
+
+(defn- box-area ^double [s]
+  (let [[hx hy lx ly] (coords s)] (* (- hx lx) (- hy ly))))
+
+(defn- circle-area ^double [s]
+  (let [[_ _ r] (coords s)] (* r r Math/PI)))
+
+(defn- lseg-length ^double [s]
+  (let [[x1 y1 x2 y2] (coords s)] (Math/hypot (- x1 x2) (- y1 y2))))
+
+(defn- path-npts ^long [s] (quot (count (coords s)) 2))
+
+(defn- points-eq? [[x1 y1] [x2 y2]] (and (fpeq x1 x2) (fpeq y1 y2)))
+
+(defn- lseg-eq? [a b]
+  (let [[ax1 ay1 ax2 ay2] (coords a)
+        [bx1 by1 bx2 by2] (coords b)]
+    (and (points-eq? [ax1 ay1] [bx1 by1])
+         (points-eq? [ax2 ay2] [bx2 by2]))))
+
+(defn- line-eq?
+  "`line_eq`: equal after scaling by the ratio of the A (or B)
+   coefficients, so `{1,2,3}` and `{2,4,6}` are one line."
+  [a b]
+  (let [[a1 b1 c1] (coords a)
+        [a2 b2 c2] (coords b)
+        ratio (cond (not (zero? a2)) (/ a1 a2)
+                    (not (zero? b2)) (/ b1 b2)
+                    :else nil)]
+    (if ratio
+      (and (fpeq a1 (* ratio a2)) (fpeq b1 (* ratio b2)) (fpeq c1 (* ratio c2)))
+      (and (fpeq a1 a2) (fpeq b1 b2) (fpeq c1 c2)))))
+
+(def comparison-operators
+  "Which of `= <> < > <= >=` PostgreSQL actually has for each type, read
+   off pg_operator. `~=` (`same as`) is left out: it does not parse here
+   yet. Note the gaps -- box and path have no `<>`, point has no `=`,
+   and polygon has none of the six."
+  {"point"   #{'not=}
+   "lseg"    #{'= 'not= '< '> '<= '>=}
+   "path"    #{'= '< '> '<= '>=}
+   "box"     #{'= '< '> '<= '>=}
+   "polygon" #{}
+   "line"    #{'=}
+   "circle"  #{'= 'not= '< '> '<= '>=}})
+
+(defn comparison-exists?
+  "Does PostgreSQL have `op` for two operands of `type-name`?"
+  [type-name op]
+  (contains? (get comparison-operators type-name #{}) op))
+
+(defn compare-values
+  "`a op b` for two canonical values of `type-name`. Only called for the
+   combinations `comparison-exists?` admits."
+  [type-name op a b]
+  (case type-name
+    ("box" "circle")
+    (let [area (if (= "box" type-name) box-area circle-area)
+          x (double (area a)), y (double (area b))]
+      (case op
+        = (fpeq x y), not= (not (fpeq x y))
+        < (fplt x y), > (fpgt x y), <= (fple x y), >= (fpge x y)))
+
+    "path"
+    (let [x (path-npts a), y (path-npts b)]
+      (case op
+        = (= x y), not= (not= x y)
+        < (< x y), > (> x y), <= (<= x y), >= (>= x y)))
+
+    "lseg"
+    (case op
+      ;; lseg_eq/lseg_ne are the ENDPOINTS; the orderings are the LENGTH.
+      = (lseg-eq? a b)
+      not= (not (lseg-eq? a b))
+      (let [x (lseg-length a), y (lseg-length b)]
+        (case op
+          < (fplt x y), > (fpgt x y), <= (fple x y), >= (fpge x y))))
+
+    "line" (case op = (line-eq? a b))
+
+    "point" (case op not= (not (points-eq? (vec (take 2 (coords a)))
+                                           (vec (take 2 (coords b))))))))
+
+(defn geometric-length
+  "`lseg_length` / `path_length`: the sum of the segment lengths, which
+   `length()` answered with the CHARACTER COUNT of the canonical text --
+   13 for `[(0,0),(3,4)]`, where PostgreSQL says 5. A plausible number
+   with no error, which is the worst shape a wrong answer takes."
+  ^double [type-name ^String s]
+  (let [cs (coords s)
+        pts (partition 2 cs)]
+    (case type-name
+      "lseg" (lseg-length s)
+      "path" (let [closed? (str/starts-with? (str/trim s) "(")
+                   segs (if closed? (concat pts [(first pts)]) pts)]
+               (reduce + 0.0 (map (fn [[[x1 y1] [x2 y2]]]
+                                    (Math/hypot (- x1 x2) (- y1 y2)))
+                                  (partition 2 1 segs))))
+      0.0)))
