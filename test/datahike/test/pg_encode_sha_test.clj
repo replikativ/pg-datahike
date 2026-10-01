@@ -129,3 +129,65 @@
                   "return substr(encode(sha256($1::bytea), 'hex'), 1, 32)"))
     (is (= "ba7816bf8f01cfea414140de5dae2223" (one c "select fipshash('abc'::bytea)")))
     (is (= "ba7816bf8f01cfea414140de5dae2223" (one c "select fipshash('abc'::text)")))))
+
+(deftest bytea-cast-is-not-a-no-op
+  ;; `::bytea` had no branch in the expression-level cast, so it
+  ;; returned the TEXT unchanged and every bytea function then worked on
+  ;; the characters of the literal. The write path DID reach
+  ;; `cast-scalar`, so a bytea through a column was right and the same
+  ;; value written as a literal was not -- two paths, one tested.
+  (with-open [c (jdbc)]
+    (is (= "3" (one c "SELECT length('\\x616263'::bytea)")))
+    (is (= "3" (one c "SELECT octet_length('\\x616263'::bytea)")))
+    (is (= "616263" (one c "SELECT encode('\\x616263'::bytea, 'hex')")))
+    (is (= "\\x616263" (one c "SELECT '\\x616263'::bytea")))
+    (testing "the digests agree with a 17 oracle, which is the whole
+              point of fipshash -- it was returning a plausible wrong
+              hash of the eight literal characters"
+      (is (= "900150983cd24fb0d6963f7d28e17f72"
+             (one c "SELECT md5('\\x616263'::bytea)")))
+      (is (= "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+             (one c "SELECT encode(sha256('\\x616263'::bytea), 'hex')")))
+      (testing "and md5(text) is unchanged -- PostgreSQL hashes the UTF-8
+                bytes either way, so one coercion serves both"
+        (is (= "900150983cd24fb0d6963f7d28e17f72" (one c "SELECT md5('abc')")))))
+    (testing "md5 of a bytea COLUMN hashed the byte array's Java
+              toString, so the digest changed on every run"
+      (exec! c "CREATE TABLE bt (b bytea)")
+      (exec! c "INSERT INTO bt VALUES ('\\x616263')")
+      (is (= "900150983cd24fb0d6963f7d28e17f72" (one c "SELECT md5(b) FROM bt"))))))
+
+(deftest byteain-escape-format
+  ;; The traditional escaped style was not implemented: a string that
+  ;; did not begin `\x` had its UTF-8 bytes taken verbatim, so the
+  ;; escapes were stored as themselves and a lone backslash -- which
+  ;; PostgreSQL rejects -- was accepted.
+  (with-open [c (jdbc)]
+    (is (= "\\x61" (one c "SELECT '\\141'::bytea")))
+    (is (= "\\x4142" (one c "SELECT '\\101\\102'::bytea")))
+    (is (= "\\x5c" (one c "SELECT '\\\\'::bytea")))
+    (is (= "\\x610062" (one c "SELECT 'a\\000b'::bytea")))
+    (is (= "\\x616263" (one c "SELECT 'abc'::bytea")))
+    (testing "a lone backslash, followed by neither another nor three
+              valid octal digits, is 22P02"
+      (is (= "22P02" (state-of c "SELECT '\\1'::bytea")))
+      (is (= "22P02" (state-of c "SELECT 'ab\\'::bytea")))
+      (testing "\\400 is out of byteain's [0-3][0-7][0-7] range"
+        (is (= "22P02" (state-of c "SELECT '\\400'::bytea")))))))
+
+(deftest byteain-hex-format
+  (with-open [c (jdbc)]
+    (is (= "0" (one c "SELECT length('\\x'::bytea)")))
+    (testing "whitespace is skipped BETWEEN pairs"
+      (is (= "\\x6162" (one c "SELECT '\\x61 62'::bytea"))))
+    (testing "but not inside one -- hex_decode_safe skips at the top of a
+              loop that consumes two digits"
+      (is (= "22023" (state-of c "SELECT '\\x6 162'::bytea"))))
+    (testing "both hex errors are 22023, not the 22P02 the escaped style
+              raises; a bad digit is quoted and an odd count is named"
+      (is (= "22023" (state-of c "SELECT '\\xZZ'::bytea")))
+      (is (= "22023" (state-of c "SELECT '\\x616'::bytea")))
+      (is (= "ERROR: invalid hexadecimal digit: \"Z\""
+             (message-of c "SELECT '\\xZZ'::bytea")))
+      (is (= "ERROR: invalid hexadecimal data: odd number of digits"
+             (message-of c "SELECT '\\x616'::bytea"))))))

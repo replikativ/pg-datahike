@@ -4201,6 +4201,30 @@
             (swap! (:where-clauses ctx) conj [(list param inner-raw) result])
             result)))
 
+      ;; `::bytea`. There was no branch for it, so the cast fell
+      ;; through and returned the TEXT unchanged -- `::bytea` was a
+      ;; complete no-op in an expression:
+      ;;   length('\x616263'::bytea)  ->  8, not 3
+      ;;   encode('\x616263'::bytea, 'hex')  ->  5c78363136323633
+      ;; The characters of the literal, hashed and encoded as if they
+      ;; were the value. `cast-scalar`'s `:bytes` arm was already
+      ;; correct; nothing reached it from here, and the column write
+      ;; path did reach it, so one spelling of a bytea worked and the
+      ;; other silently did not.
+      (= :bytes cast-cat)
+      (if (or (string? inner-raw) (bytes? inner-raw))
+        (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
+        (let [param (symbol (str "?bytea-cast" (swap! (:var-counter ctx) inc)))
+              result (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)]
+          (swap! (:in-params ctx) conj param)
+          (swap! (:in-args ctx) conj
+                 (fn [v]
+                   (if (or (nil? v) (= :__null__ v))
+                     :__null__
+                     (sql-cast/cast-scalar v type-str {:explicit? true}))))
+          (swap! (:where-clauses ctx) conj [(list param inner-raw) result])
+          result))
+
       (= :geometric cast-cat)
       (let [tname (types/base-type-name-of type-str)]
         (if (string? inner-raw)

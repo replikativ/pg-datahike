@@ -2767,11 +2767,19 @@
   (nullable-str (fn ([s] (str/trimr (->s s)))
                   ([s chars] (trim-set (->s s) (->s chars) false true)))))
 
+(declare ->bytes)
+
 (defn sql-md5
-  "MD5 as a lowercase hex string, as PostgreSQL's md5() returns."
+  "MD5 as a lowercase hex string, as PostgreSQL's md5() returns.
+
+   `md5(bytea)` is a real overload, and this stringified its argument
+   first -- so a byte[] was hashed as `[B@1f2a3b`, a different digest on
+   every run. `->bytes` is the same coercion the other digests use, and
+   it agrees with `md5(text)` for text: PostgreSQL hashes the UTF-8
+   bytes either way."
   [s]
   (let [d (.digest (java.security.MessageDigest/getInstance "MD5")
-                   (.getBytes (->s s) java.nio.charset.StandardCharsets/UTF_8))]
+                   (->bytes s))]
     (apply str (map #(format "%02x" %) d))))
 
 (defn- ->bytes

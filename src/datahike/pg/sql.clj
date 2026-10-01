@@ -1886,13 +1886,26 @@
                                                                (let [v (expr/translate-expr fake-ctx expr)]
                                                                  (if (or (nil? v) (= :__null__ v)) :__null__ v))
                                                                :__null__)
-                                                   ;; ARRAY[…] / ARRAY[[…],[…]] — format
-                                                   ;; to PG's canonical text form {…}/{{…}}.
-                                                   ;; We don't implement full array types yet,
-                                                   ;; but pgjdbc tests that SELECT an array
-                                                   ;; literal assert on the text form (e.g.
-                                                   ;; testgetBadBoolean expects the error to
-                                                   ;; contain "{{1,0},{0,1}}").
+                                                   ;; ARRAY[…] / ARRAY[[…],[…]].
+                                                   ;; `translate-expr` builds a real PgArray,
+                                                   ;; which knows its element type -- so the
+                                                   ;; elements canonicalise and the delimiter
+                                                   ;; is the element type's typdelim. The
+                                                   ;; formatter below is a SECOND renderer
+                                                   ;; that did neither: it quoted every
+                                                   ;; StringValue and always joined with a
+                                                   ;; comma, so `ARRAY['(1,2),(3,4)'::box]`
+                                                   ;; came out as
+                                                   ;; `{"(1,2),(3,4)"}` here and as
+                                                   ;; `{(3,4),(1,2)}` over a simple query --
+                                                   ;; one protocol tested, two served. It is
+                                                   ;; kept only for the no-db case, where
+                                                   ;; pgjdbc's testgetBadBoolean still wants
+                                                   ;; `{{1,0},{0,1}}` in the message.
+                                                             (and (instance? ArrayConstructor expr) cte-db)
+                                                             (let [v (expr/translate-expr fake-ctx expr)]
+                                                               (if (or (nil? v) (= :__null__ v)) :__null__ v))
+
                                                              (instance? ArrayConstructor expr)
                                                              (let [fmt (fn fmt [e]
                                                                          (cond
