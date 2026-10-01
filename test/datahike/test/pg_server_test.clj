@@ -563,13 +563,23 @@
       (is (= "42P16" (sqlstate r)))
       (is (re-find #"temporary tables" (err r))))))
 
-(deftest stored-generated-columns-fail-before-creating-a-writable-column
+(deftest virtual-generated-columns-fail-before-creating-a-writable-column
+  ;; STORED is supported now (see pg-generated-column-test); VIRTUAL, which
+  ;; is PostgreSQL 18's, keeps the refusal. The reason for refusing rather
+  ;; than quietly making an ordinary column is unchanged: a writable column
+  ;; here also lets a later COPY name it, at which point psql enters COPY
+  ;; mode and consumes the following SQL as row data.
   (let [r (.execute *handler*
-                    "CREATE TABLE generated_probe (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)")]
+                    "CREATE TABLE generated_probe (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)")]
     (is (= "0A000" (sqlstate r)))
-    (is (re-find #"stored generated column.*b" (err r)))
+    (is (re-find #"virtual generated column.*b" (err r)))
     (is (= "42P01" (sqlstate (.execute *handler*
-                                       "SELECT * FROM generated_probe"))))))
+                                       "SELECT * FROM generated_probe")))))
+  (testing "and the STORED form creates a column that computes itself"
+    (is (nil? (err (.execute *handler*
+                             "CREATE TABLE generated_ok (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)"))))
+    (is (nil? (err (.execute *handler* "INSERT INTO generated_ok (a) VALUES (5)"))))
+    (is (= [["5" "10"]] (rows (.execute *handler* "SELECT a, b FROM generated_ok"))))))
 
 (deftest identity-by-default-is-not-parsed-as-a-column-default
   (is (nil? (err (.execute *handler*

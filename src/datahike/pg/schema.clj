@@ -600,6 +600,16 @@
                           :where [[?e :db/ident ?ident]
                                   [?e :pg/not-null true]]}
                         db)
+        ;; `GENERATED ALWAYS AS (…) STORED`, recorded and just as
+        ;; invisible as the two above. Needed in three places at once:
+        ;; the write paths (which must compute the value and refuse a
+        ;; supplied one), pg_attribute.attgenerated, and
+        ;; information_schema.columns.is_generated.
+        generateds (q-fn '{:find [?ident ?expr]
+                           :where [[?e :db/ident ?ident]
+                                   [?e :pg/generated "s"]
+                                   [?e :pg/generated-expr ?expr]]}
+                         db)
         ;; Column ORDER, by schema-entity id — which is CREATE TABLE
         ;; order. Collected here rather than per-call because everything
         ;; attnum-shaped needs it and they were disagreeing:
@@ -623,13 +633,16 @@
                                  (update acc (namespace ident) (fnil conj []) (name ident))
                                  acc))
                              {} ordered-idents)]
-    (assoc (reduce (fn [acc [ident]]
-                     (update acc ident assoc :not-null? true))
-                   (reduce (fn [acc [ident pt]]
-                             (update acc ident assoc :pg-type pt))
-                           ident-hints
-                           pg-types)
-                   not-nulls)
+    (assoc (reduce (fn [acc [ident expr]]
+                     (update acc ident assoc :generated "s" :generated-expr expr))
+                   (reduce (fn [acc [ident]]
+                             (update acc ident assoc :not-null? true))
+                           (reduce (fn [acc [ident pt]]
+                                     (update acc ident assoc :pg-type pt))
+                                   ident-hints
+                                   pg-types)
+                           not-nulls)
+                   generateds)
            ::column-order column-order
            ::catalog-db db)))
 
@@ -932,6 +945,11 @@
                                         ;; `(:schema db)` surfaces only the
                                         ;; :db/* keys.
                                         :not-null?   (boolean (:not-null? h))
+                                        ;; `GENERATED ALWAYS AS (…) STORED`,
+                                        ;; carried the same way and for the
+                                        ;; same reason.
+                                        :generated   (:generated h)
+                                        :generated-expr (:generated-expr h)
                                         :ref?        (= vtype :db.type/ref)
                                         :references  (:references h)
                                         :internal-index? (:internal-index? h)

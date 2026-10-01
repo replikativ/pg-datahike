@@ -273,7 +273,15 @@
     (exec! c "INSERT INTO ub VALUES (1,100),(2,200)")
     (testing "a target matched by several source rows is updated once"
       (is (= 2 (update-count c "UPDATE uf t SET x = t.x + a.v FROM ua a WHERE a.id = t.id")))
-      (is (= [["1" "15"] ["2" "26"] ["3" "30"]] (rows c "SELECT id, x FROM uf ORDER BY id"))))
+      ;; ONCE is the promise; WHICH of the two matching pairs wins is
+      ;; explicitly unspecified in PostgreSQL, so asserting 15 pinned
+      ;; our scan order rather than the behaviour. It duly broke when an
+      ;; unrelated change shifted entity ids and the other pair won --
+      ;; and 17 is just as correct. What must hold is that exactly one
+      ;; of them was applied, not that both were.
+      (is (contains? #{"15" "17"} (second (first (rows c "SELECT id, x FROM uf WHERE id = 1")))))
+      (is (= [["2" "26"] ["3" "30"]]
+             (rows c "SELECT id, x FROM uf WHERE id <> 1 ORDER BY id"))))
     (testing "SET is evaluated for every pair, including the discarded ones"
       (exec! c "INSERT INTO ua VALUES (2,0,'d')")
       (is (= "22012" (sqlstate c "UPDATE uf t SET x = 100 / a.v FROM ua a WHERE a.id = t.id")))
