@@ -53,6 +53,9 @@
 (defn- state-of [^Connection c sql]
   (try (one c sql) nil (catch SQLException e (.getSQLState e))))
 
+(defn- message-of [^Connection c sql]
+  (try (one c sql) nil (catch SQLException e (.getMessage e))))
+
 (deftest every-spelling-canonicalises
   (with-open [c (jdbc)]
     (testing "point takes parens or not, and prints the shortest number"
@@ -162,3 +165,126 @@
       (is (= "[(1e+300,Infinity),(0,0)]"
              (one c "select '[(1e+300,Inf),(0,0)]'::lseg")))
       (is (= "<(1e+16,2),300000>" (one c "select '<(1e16,2),3e5>'::circle"))))))
+
+(deftest the-scanner-requires-what-postgresql-requires
+  ;; The parsing was `replace every delimiter with a space, split on
+  ;; whitespace, check the delimiter shape separately`, which cannot see
+  ;; WHERE a character sits. `pair_decode` requires the comma between a
+  ;; point's two coordinates, and `path_decode` requires the brackets to
+  ;; balance.
+  (with-open [c (jdbc)]
+    (is (= "22P02" (state-of c "SELECT '(1 2)'::point")))
+    (is (= "22P02" (state-of c "SELECT '[(1,2)(3,4)]'::path")))
+    (is (= "22P02" (state-of c "SELECT '((1,2)'::polygon")))
+    (is (= "22P02" (state-of c "SELECT '(1,2)'::lseg")))
+    (testing "but the legal spacings stay legal -- float8in_internal
+              skips trailing whitespace before reporting where it
+              stopped, so the structural comma is found after the spaces"
+      (is (= "(1,2)" (one c "SELECT '( 1 , 2 )'::point")))
+      (is (= "(1,2)" (one c "SELECT '  (1,2)  '::point")))
+      (is (= "(1,2)" (one c "SELECT '1,2'::point"))))))
+
+(deftest line-through-two-points-uses-line-construct
+  ;; Not `divide through by the leading non-zero coefficient` -- that
+  ;; stored a different value from PostgreSQL for every slope but +/-1,
+  ;; and `[(1,2),(3,4)]` (slope 1) is why a sweep missed it.
+  (with-open [c (jdbc)]
+    (is (= "{2,-1,-1}" (one c "SELECT '(1,1),(3,5)'::line")))
+    (is (= "{2,-1,-1}" (one c "SELECT '(3,5),(1,1)'::line")))
+    (testing "vertical is x = C and horizontal is y = C"
+      (is (= "{-1,0,0}" (one c "SELECT '(0,0),(0,5)'::line")))
+      (is (= "{0,-1,0}" (one c "SELECT '(0,0),(5,0)'::line"))))
+    (testing "line_in's two specific messages, which were generic"
+      (is (= "ERROR: invalid line specification: A and B cannot both be zero"
+             (message-of c "SELECT '{0,0,1}'::line")))
+      (is (= "ERROR: invalid line specification: must be two distinct points"
+             (message-of c "SELECT '(1,2),(1,2)'::line"))))))
+
+(deftest box-reorders-with-float8-lt-not-with-max
+  ;; `float8_lt` is `!isnan(a) && (isnan(b) || a < b)` -- NaN is LARGER
+  ;; than everything, and each coordinate is reordered independently.
+  ;; max/min propagate NaN into both corners instead.
+  (with-open [c (jdbc)]
+    (is (= "(NaN,1),(1,0)" (one c "SELECT '(NaN,0),(1,1)'::box")))
+    (is (= "(NaN,1),(1,0)" (one c "SELECT '(1,1),(NaN,0)'::box")))
+    (testing "the documented four-number form, which was refused"
+      (is (= "(3,4),(1,2)" (one c "SELECT '(1,2,3,4)'::box"))))))
+
+(deftest coordinates_are_range_checked_everywhere
+  ;; `Double/parseDouble` saturates; strtod reports ERANGE. And the
+  ;; character class gating path and polygon excluded the letters of
+  ;; Inf, NaN and 0x, so the non-finite and hex work reached five of the
+  ;; seven types.
+  (with-open [c (jdbc)]
+    (is (= "22003" (state-of c "SELECT '(1e400,2)'::point")))
+    (is (= "22003" (state-of c "SELECT '(1e-400,2)'::point")))
+    (is (= "[(1,Infinity)]" (one c "SELECT '[(1,Inf)]'::path")))
+    (is (= "[(1,2),(16,4)]" (one c "SELECT '[(1,2),(0x10,4)]'::path")))
+    (is (= "((1,NaN),(2,3))" (one c "SELECT '((1,NaN),(2,3))'::polygon")))
+    (is (= "((1,2),(16,4))" (one c "SELECT '((1,2),(0x10,4))'::polygon")))
+    (testing "circle_in rejects a negative radius and must accept NaN"
+      (is (= "22P02" (state-of c "SELECT '<(0,0),-1>'::circle")))
+      (is (= "<(0,0),NaN>" (one c "SELECT '<(0,0),NaN>'::circle"))))))
+
+(deftest the-comparison-surface-is-pg_operator-s
+  ;; There is no btree opclass for ANY geometric type in PostgreSQL --
+  ;; `select count(*) from pg_opclass where opcintype::regtype::text in
+  ;; (...) and opcmethod = 403` is 0 -- so "canonical text, therefore
+  ;; text order is the type's order" was false for all seven. The
+  ;; operators that exist compare AREA, LENGTH or POINT COUNT, and
+  ;; several spellings have no operator at all.
+  (with-open [c (jdbc)]
+    (testing "box and circle compare by AREA, not by text"
+      (is (= "t" (one c "SELECT '(0,0),(1,4)'::box = '(0,0),(2,2)'::box")))
+      (is (= "f" (one c "SELECT '(0,0),(10,1)'::box < '(0,0),(2,2)'::box")))
+      (is (= "t" (one c "SELECT '<(0,0),2>'::circle = '<(99,99),2>'::circle")))
+      (is (= "t" (one c "SELECT '<(0,0),3>'::circle < '<(0,0),10>'::circle"))))
+    (testing "path by POINT COUNT, lseg by LENGTH, line after scaling"
+      (is (= "t" (one c "SELECT '[(0,0),(1,1)]'::path = '[(9,9),(8,8)]'::path")))
+      (is (= "t" (one c "SELECT '[(0,0),(1,1),(2,2)]'::path > '[(9,9),(8,8)]'::path")))
+      (is (= "t" (one c "SELECT '[(0,0),(3,4)]'::lseg < '[(0,0),(0,6)]'::lseg")))
+      (is (= "t" (one c "SELECT '{1,2,3}'::line = '{2,4,6}'::line"))))
+    (testing "and the spellings PostgreSQL does not have are 42883 --
+              point has no =, box has no <>, line has no <>, polygon has
+              none of the six"
+      (is (= "42883" (state-of c "SELECT '(1,2)'::point = '(1,2)'::point")))
+      (is (= "42883" (state-of c "SELECT '(1,2)'::point < '(1,3)'::point")))
+      (is (= "42883" (state-of c "SELECT '(0,0),(1,4)'::box <> '(0,0),(2,2)'::box")))
+      (is (= "42883" (state-of c "SELECT '{1,2,3}'::line <> '{2,4,6}'::line")))
+      (is (= "42883" (state-of c (str "SELECT '((0,0),(1,1),(2,0))'::polygon "
+                                      "= '((0,0),(1,1),(2,0))'::polygon"))))
+      (testing "point does have <>"
+        (is (= "t" (one c "SELECT '(1,2)'::point <> '(1,3)'::point")))))))
+
+(deftest sorting-grouping-and-dedup-have-no-operator-either
+  ;; With no btree opclass there is nothing to sort or group by. These
+  ;; silently succeeded on the canonical text, in an order that is not
+  ;; PostgreSQL's for any of the seven.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE zg (id int, p point, b box)")
+    (exec! c (str "INSERT INTO zg VALUES (1,'(1,2)','(0,0),(10,1)'), "
+                  "(2,'(1,2)','(0,0),(2,2)')"))
+    (is (= "42883" (state-of c "SELECT b FROM zg ORDER BY b")))
+    (is (= "42883" (state-of c "SELECT id FROM zg ORDER BY p")))
+    (is (= "42883" (state-of c "SELECT DISTINCT p FROM zg")))
+    (is (= "42883" (state-of c "SELECT p, count(*) FROM zg GROUP BY p")))
+    (is (= (str "ERROR: could not identify an ordering operator for type box"
+                "\n  Hint: Use an explicit ordering operator or modify the query.")
+           (message-of c "SELECT b FROM zg ORDER BY b")))
+    (is (= "ERROR: could not identify an equality operator for type point"
+           (message-of c "SELECT DISTINCT p FROM zg")))
+    (testing "but a comparison that DOES exist still filters"
+      (is (= "1" (one c "SELECT id FROM zg WHERE b = '(0,0),(10,1)'::box"))))))
+
+(deftest length-is-geometric-for-lseg-and-path
+  ;; `length` answered with the CHARACTER COUNT of the canonical text --
+  ;; 13 for `[(0,0),(3,4)]`, where PostgreSQL says 5. A plausible number
+  ;; and no error. The value cannot say which it is, because a geometric
+  ;; value IS text; only the static type can.
+  (with-open [c (jdbc)]
+    (is (= "5" (one c "SELECT length('[(0,0),(3,4)]'::lseg)")))
+    (testing "a closed path includes the segment back to the first point"
+      (is (= "12" (one c "SELECT length('((0,0),(3,4),(3,0))'::path)")))
+      (is (= "9" (one c "SELECT length('[(0,0),(3,4),(3,0)]'::path)"))))
+    (testing "and length() on text is untouched"
+      (is (= "3" (one c "SELECT length('abc')"))))))

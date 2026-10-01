@@ -4431,6 +4431,12 @@
         ;; input column's OID is INT8 / NUMERIC. Mirrors the fuller
         ;; oid-env constructed below for select-item OID inference;
         ;; both pull from the same fields.
+        geo-oid->name (fn [oid]
+                        (get {types/oid-point "point" types/oid-lseg "lseg"
+                              types/oid-path "path" types/oid-box "box"
+                              types/oid-polygon "polygon" types/oid-line "line"
+                              types/oid-circle "circle"}
+                             oid))
         agg-oid-env {:db db :schema schema
                      :table-aliases table-aliases
                      :default-table default-table
@@ -5684,6 +5690,35 @@
                   (list (or precision-variant agg-sym) v))))))
 
         ;; ORDER BY — resolve aliases to find-elements before creating patterns
+        ;; The geometric types have no btree opclass in PostgreSQL, so
+        ;; there is nothing to sort, group or dedupe them by: ORDER BY
+        ;; is "could not identify an ordering operator" and
+        ;; DISTINCT/GROUP BY "could not identify an equality operator".
+        ;; Held as canonical text, they sorted by that text instead --
+        ;; silently, and in an order that is not PostgreSQL's for any of
+        ;; the seven.
+        reject-geometric-sort!
+        (fn [expr what]
+          (when-let [t (geo-oid->name (try (oid/expr-oid expr agg-oid-env)
+                                           (catch Throwable _ nil)))]
+            (throw (errors/pg-error
+                    :undefined-function
+                    {:message (str "could not identify an "
+                                   (if (= :order what) "ordering" "equality")
+                                   " operator for type " t)
+                     :hint (if (= :order what)
+                             "Use an explicit ordering operator or modify the query."
+                             nil)}))))
+        _ (doseq [^OrderByElement obe (or (.getOrderByElements select) [])]
+            (reject-geometric-sort! (.getExpression obe) :order))
+        _ (when (.getDistinct select)
+            (doseq [^SelectItem si select-items]
+              (reject-geometric-sort! (.getExpression si) :equality)))
+        _ (doseq [g (or (some-> (.getGroupBy select)
+                                .getGroupByExpressionList
+                                .getExpressions)
+                        [])]
+            (reject-geometric-sort! g :equality))
         order-by (.getOrderByElements select)
         order-by-spec (when (seq order-by)
                         (let [fe-snap @find-elements

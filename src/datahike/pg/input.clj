@@ -18,8 +18,6 @@
   (:refer-clojure :exclude [parse-uuid])
   (:require [clojure.string :as str]
             [datahike.pg.errors :as errors]
-            [datahike.pg.geo :as geo]
-            [datahike.pg.mac :as mac]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types])
   (:import [datahike.pg PgParamCodec PgWireServer$PgProtocolException]))
@@ -189,6 +187,87 @@
                               {:message (str "\"" t "\" is out of range for type double precision")}))
       :else v)))
 
+(defn- digits-end
+  "Index after a run of decimal digits starting at `i` (possibly none)."
+  ^long [^String s ^long i ^long n]
+  (loop [i i]
+    (if (and (< i n) (Character/isDigit (.charAt s i))) (recur (inc i)) i)))
+
+(defn- hex-digits-end
+  ^long [^String s ^long i ^long n]
+  (loop [i i]
+    (if (and (< i n)
+             (let [c (.charAt s i)]
+               (or (Character/isDigit c)
+                   (and (>= (int c) 97) (<= (int c) 102))
+                   (and (>= (int c) 65) (<= (int c) 70)))))
+      (recur (inc i))
+      i)))
+
+(defn- word-at?
+  "Case-insensitive literal match of `w` at `i`."
+  [^String s ^long i ^long n ^String w]
+  (and (<= (+ i (.length w)) n)
+       (.regionMatches s true (int i) w (int 0) (int (.length w)))))
+
+(defn- float8-extent
+  "The index after the float token starting at `i`, or nil when none
+   does. The three shapes `strtod` accepts, scanned by hand: a regex
+   matcher here costs more than the parse, and these run per COORDINATE
+   -- an 8-vertex polygon reads sixteen."
+  [^String s ^long i ^long n]
+  (let [i (if (and (< i n) (let [c (.charAt s i)] (or (= \+ c) (= \- c)))) (inc i) i)]
+    (cond
+      ;; hex: 0x, hex digits and/or .hex digits, optional binary exponent
+      (and (< (inc i) n) (= \0 (.charAt s i))
+           (let [c (.charAt s (inc i))] (or (= \x c) (= \X c))))
+      (let [j (hex-digits-end s (+ i 2) n)
+            j (if (and (< j n) (= \. (.charAt s j))) (hex-digits-end s (inc j) n) j)]
+        (when (> j (+ i 2))
+          (if (and (< j n) (let [c (.charAt s j)] (or (= \p c) (= \P c))))
+            (let [k (if (and (< (inc j) n)
+                             (let [c (.charAt s (inc j))] (or (= \+ c) (= \- c))))
+                      (+ j 2) (inc j))
+                  e (digits-end s k n)]
+              (if (> e k) e j))
+            j)))
+
+      (word-at? s i n "infinity") (+ i 8)
+      (word-at? s i n "inf")      (+ i 3)
+      (word-at? s i n "nan")      (+ i 3)
+
+      :else
+      (let [j (digits-end s i n)
+            j (if (and (< j n) (= \. (.charAt s j))) (digits-end s (inc j) n) j)]
+        (when (> j i)
+          (if (and (< j n) (let [c (.charAt s j)] (or (= \e c) (= \E c))))
+            (let [k (if (and (< (inc j) n)
+                             (let [c (.charAt s (inc j))] (or (= \+ c) (= \- c))))
+                      (+ j 2) (inc j))
+                  e (digits-end s k n)]
+              (if (> e k) e j))
+            j))))))
+
+(defn float8-prefix
+  "`float8in_internal` with a non-NULL endptr: read one float starting at
+   `from` (after any leading whitespace) and return `[value end-index]`,
+   or nil when no float starts there. `end-index` is past any TRAILING
+   whitespace, which is what makes `'( 1 , 2 )'::point` legal -- the
+   structural comma is found after the spaces.
+
+   Out of range still raises 22003: strtod reports ERANGE wherever the
+   number sits, so `'(1e400,2)'::point` is an error and not
+   `(Infinity,2)`."
+  [^String s ^long from]
+  (let [n (.length s)
+        i (loop [i from]
+            (if (and (< i n) (Character/isWhitespace (.charAt s i))) (recur (inc i)) i))]
+    (when-let [e (float8-extent s i n)]
+      (let [e (long e)]
+        [(parse-float8 (.substring s i e))
+         (loop [k e]
+           (if (and (< k n) (Character/isWhitespace (.charAt s k))) (recur (inc k)) k))]))))
+
 (defn parse-float4
   "float4in: parsed as a double (strtod), then range-checked for real."
   [^String s]
@@ -220,6 +299,15 @@
 
 ;; ---------------------------------------------------------------------------
 
+(def ^:private geometric-in
+  "Resolved late: `datahike.pg.geo` reads its coordinates with
+   `float8-prefix` below, so it depends on this namespace and cannot be
+   required from it."
+  (delay @(requiring-resolve 'datahike.pg.geo/geometric-in)))
+
+(def ^:private mac-in
+  (delay @(requiring-resolve 'datahike.pg.mac/mac-in)))
+
 (def ^:private parsers
   {types/oid-bool parse-bool
    types/oid-int2 parse-int2
@@ -239,15 +327,15 @@
    ;; it kept the raw token, so `'{08002B010203}'::macaddr[]` held
    ;; un-canonical text that no longer equalled the same address
    ;; written any other way.
-   types/oid-point    #(geo/geometric-in "point" %)
-   types/oid-lseg     #(geo/geometric-in "lseg" %)
-   types/oid-path     #(geo/geometric-in "path" %)
-   types/oid-box      #(geo/geometric-in "box" %)
-   types/oid-polygon  #(geo/geometric-in "polygon" %)
-   types/oid-line     #(geo/geometric-in "line" %)
-   types/oid-circle   #(geo/geometric-in "circle" %)
-   types/oid-macaddr  #(mac/mac-in "macaddr" %)
-   types/oid-macaddr8 #(mac/mac-in "macaddr8" %)})
+   types/oid-point    #(@geometric-in "point" %)
+   types/oid-lseg     #(@geometric-in "lseg" %)
+   types/oid-path     #(@geometric-in "path" %)
+   types/oid-box      #(@geometric-in "box" %)
+   types/oid-polygon  #(@geometric-in "polygon" %)
+   types/oid-line     #(@geometric-in "line" %)
+   types/oid-circle   #(@geometric-in "circle" %)
+   types/oid-macaddr  #(@mac-in "macaddr" %)
+   types/oid-macaddr8 #(@mac-in "macaddr8" %)})
 
 (defn parser
   "The input function for `oid`, or nil when that type's input is not

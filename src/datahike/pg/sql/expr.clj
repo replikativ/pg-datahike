@@ -958,6 +958,13 @@
   [ctx expr]
   (try (oid-infer/expr-oid expr (oid-env ctx)) (catch Throwable _ nil)))
 
+(def ^:private geo-oid->type-name
+  {types/oid-point "point" types/oid-lseg "lseg" types/oid-path "path"
+   types/oid-box "box" types/oid-polygon "polygon" types/oid-line "line"
+   types/oid-circle "circle"})
+
+(defn- geo-type-of-oid [oid] (get geo-oid->type-name oid))
+
 (defn- row-operand? [expr]
   (or (instance? RowConstructor expr)
       (and (instance? ParenthesedExpressionList expr)
@@ -2366,6 +2373,26 @@
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
+      ;; A function whose meaning depends on the ARGUMENT TYPE, not on
+      ;; the value. `length` is the case this exists for: on an lseg or
+      ;; a path it is the geometric length, and the generic `length`
+      ;; answered with the character count of the canonical text -- 13
+      ;; for `[(0,0),(3,4)]`, where PostgreSQL says 5. A plausible
+      ;; number and no error. The value cannot tell us: a geometric
+      ;; value is canonical TEXT, so only the static type can.
+      (and (= 1 (count args))
+           (contains? #{"length"} fname)
+           (#{"lseg" "path"} (or (geo-type-of-oid (first (call-arg-oids ctx arg-exprs))) "")))
+      (let [tname (geo-type-of-oid (first (call-arg-oids ctx arg-exprs)))
+            fn-param (symbol (str "?fn-geo-" fname "-"
+                                  (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj
+               (fns/null-safe (fn [v] (geo/geometric-length tname (str v)))))
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
       ;; Known mapped functions. Emit via an in-param wrapping `null-safe`
       ;; so SQL NULL propagates (UPPER(NULL)=NULL etc.) instead of throwing
       ;; when a raw Clojure fn receives the `:__null__` keyword sentinel.
@@ -3501,6 +3528,43 @@
                    :else '<=)
           [kind arr-expr] (quantified-rhs (.getRightExpression e))]
       (quantified-result-var ctx op (.getLeftExpression e) arr-expr kind))
+
+    ;; Geometric comparison. The operators PostgreSQL HAS compare area
+    ;; (box, circle), length (lseg) or point count (path) -- never the
+    ;; text. `check-comparison-types!` has already refused the spellings
+    ;; it does not have.
+    (and (or (instance? EqualsTo expr)
+             (instance? NotEqualsTo expr)
+             (instance? GreaterThan expr)
+             (instance? GreaterThanEquals expr)
+             (instance? MinorThan expr)
+             (instance? MinorThanEquals expr))
+         (let [^net.sf.jsqlparser.expression.BinaryExpression e expr]
+           (or (geo-type-of-oid (source-oid ctx (.getLeftExpression e)))
+               (geo-type-of-oid (source-oid ctx (.getRightExpression e))))))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
+          op (cond
+               (instance? EqualsTo e) '=
+               (instance? NotEqualsTo e) 'not=
+               (instance? GreaterThan e) '>
+               (instance? GreaterThanEquals e) '>=
+               (instance? MinorThan e) '<
+               :else '<=)
+          _ (check-comparison-types! ctx op
+                                     (.getLeftExpression e)
+                                     (.getRightExpression e))
+          tname (or (geo-type-of-oid (source-oid ctx (.getLeftExpression e)))
+                    (geo-type-of-oid (source-oid ctx (.getRightExpression e))))
+          [l r] (translate-value-comparison-operands
+                 ctx (.getLeftExpression e) (.getRightExpression e))
+          p (symbol (str "?geo-cmp-" (swap! (:var-counter ctx) inc)))]
+      (swap! (:in-params ctx) conj p)
+      (swap! (:in-args ctx) conj
+             (fn [a b]
+               (if (or (nil? a) (nil? b) (= :__null__ a) (= :__null__ b))
+                 :__null__
+                 (geo/compare-values tname op (str a) (str b)))))
+      (list p l r))
 
     (and (or (instance? EqualsTo expr)
              (instance? NotEqualsTo expr)
@@ -7898,7 +7962,25 @@
    whole risk is a false positive."
   [ctx op left right]
   (let [a (operand-type-oid ctx left)
-        b (operand-type-oid ctx right)]
+        b (operand-type-oid ctx right)
+        ga (geo-type-of-oid a)
+        gb (geo-type-of-oid b)]
+    ;; The geometric types have NO btree opclass in PostgreSQL, so the
+    ;; comparison surface is not "all six operators" -- it is a short,
+    ;; per-type list read off pg_operator. `point = point` and
+    ;; `box <> box` do not exist and were answered here by comparing the
+    ;; canonical TEXT, which is also the wrong order for the ones that
+    ;; do exist.
+    (when (or ga gb)
+      (when-not (and ga gb (= ga gb) (geo/comparison-exists? ga op))
+        (throw (errors/pg-error
+                :undefined-function
+                {:detail (str "operator does not exist: "
+                              (get types/oid->pg-name a "?") " "
+                              (get op-sym->sql op (str op)) " "
+                              (get types/oid->pg-name b "?"))
+                 :hint (str "No operator matches the given name and argument "
+                            "types. You might need to add explicit type casts.")}))))
     (when-not (types/comparison-compatible? op a b)
       (throw (errors/pg-error
               :undefined-function
