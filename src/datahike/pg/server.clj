@@ -6134,8 +6134,16 @@
 
       (= direction "all")
       (let [count-sql (str "SELECT count(*) FROM (" (:sql rec) ") _subq")
+            ;; Through `*statement-handler*`, not the handler directly.
+            ;; The caller's `*cached-parsed*` is still in scope, so a
+            ;; bare `.execute` re-runs the OUTER plan -- this MOVE --
+            ;; which runs this branch again, until the stack ends and
+            ;; the connection dies. The fourth caller to make this
+            ;; mistake; `nested-executor` exists for it.
             result (binding [*snapshot-db* (:snap rec)]
-                     (.execute ^PgWireServer$QueryHandler handler count-sql))]
+                     (if-let [run params/*statement-handler*]
+                       (run count-sql [] [])
+                       (.execute ^PgWireServer$QueryHandler handler count-sql)))]
         (if (.error ^PgWireServer$QueryResult result)
           result
           (let [rows (.rows ^PgWireServer$QueryResult result)
@@ -13306,6 +13314,30 @@
                (get @sql-prepared (:name parsed)))
           (.describeResult ^PgWireServer$QueryHandler this
                            (:parsed (get @sql-prepared (:name parsed))))
+
+          ;; `FETCH` produces the DECLAREd cursor's columns, and the
+          ;; cursor already knows them -- `handle-fetch-cursor` builds
+          ;; its QueryResult from `(:columns rec)`/`(:oids rec)`. This
+          ;; reported NoData, so Execute then streamed DataRows the
+          ;; client had no field structure for, and EVERY cursor read
+          ;; over the extended protocol failed:
+          ;;
+          ;;   fetch 2 from cur
+          ;;   -> IllegalStateException: Received resultset tuples,
+          ;;      but no field structure for them
+          ;;
+          ;; while the same statement over a simple query worked, which
+          ;; is why the suites never saw it. The identical bug, with the
+          ;; identical message, is the one fixed for EXECUTE above.
+          (and (= :system (:type parsed))
+               (= :fetch-cursor (:system-type parsed))
+               (get @cursors (:name parsed)))
+          (let [rec (get @cursors (:name parsed))]
+            (PgWireServer$QueryResult.
+             (into-array String (:columns rec))
+             (int-array (map types/oid->wire-int (:oids rec)))
+             (into-array (Class/forName "[Ljava.lang.String;") (make-array String 0 0))
+             nil))
 
           ;; INSERT/UPDATE/DELETE … RETURNING produces rows, so its
           ;; prepared form must Describe the RETURNING column shape —
