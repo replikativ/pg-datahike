@@ -316,48 +316,101 @@
 ;; literal through this table when the column resolves to a Datahike
 ;; valueType we recognise.
 
+(defn- hex-decode
+  ^bytes [^String hex]
+  (let [n   (.length hex)
+        out (java.io.ByteArrayOutputStream.)
+        hex-val (fn [c]
+                  (let [ch (long (int ^Character c))]
+                    (cond
+                      (and (>= ch 48) (<= ch 57))  (- ch 48)
+                      (and (>= ch 97) (<= ch 102)) (- ch 87)
+                      (and (>= ch 65) (<= ch 70))  (- ch 55))))
+        skip? (fn [c] (or (= \space c) (= \newline c) (= \tab c) (= \return c)))
+        bad!  (fn [c] (throw (ex-info (str "invalid hexadecimal digit: \"" c "\"")
+                                      {:error :invalid-parameter-value
+                                       :sqlstate "22023"})))]
+    (loop [i 0, pending nil]
+      (if (>= i n)
+        (if pending
+          (throw (ex-info "invalid hexadecimal data: odd number of digits"
+                          {:error :invalid-parameter-value
+                           :sqlstate "22023"}))
+          (.toByteArray out))
+        (let [c (.charAt hex i)]
+          (cond
+            ;; Whitespace is skipped only BETWEEN pairs. `hex_decode_safe`
+            ;; skips at the top of a loop that consumes two digits, so
+            ;; `'\x6 162'` is an error, not `\x6162`.
+            (and (skip? c) (nil? pending)) (recur (inc i) pending)
+            :else
+            (let [v (or (hex-val c) (bad! c))]
+              (if pending
+                (do (.write out (unchecked-int
+                                 (bit-or (bit-shift-left (long pending) 4) (long v))))
+                    (recur (inc i) nil))
+                (recur (inc i) v)))))))))
+
+(defn bytea-in
+  "`byteain` (varlena.c). Two formats, chosen by the first two
+   characters:
+
+   - `\\x` followed by hex digits, whitespace permitted between them.
+   - otherwise the traditional escaped style: `\\\\` is one backslash,
+     `\\nnn` with n in [0-3][0-7][0-7] is that octal byte, EVERY other
+     character is itself, and a lone backslash followed by neither is
+     22P02.
+
+   The escaped style was not implemented -- a string that was not hex
+   had its UTF-8 bytes taken verbatim, so `'\\\\141'::bytea` kept six
+   bytes where PostgreSQL stores four, and a lone backslash was accepted
+   where PostgreSQL rejects it. `byteain` works on BYTES, not
+   characters, so a multi-byte character contributes all of its bytes;
+   this scans the UTF-8 encoding for the same reason."
+  ^bytes [^String s]
+  (if (and (>= (.length s) 2) (= \\ (.charAt s 0)) (= \x (.charAt s 1)))
+    (hex-decode (subs s 2))
+    (let [^bytes in (.getBytes s java.nio.charset.StandardCharsets/UTF_8)
+          n   (alength in)
+          out (java.io.ByteArrayOutputStream.)
+          bs  (byte 0x5c)
+          oct? (fn [^long b ^long lo ^long hi] (and (>= b lo) (<= b hi)))]
+      (loop [i 0]
+        (if (>= i n)
+          (.toByteArray out)
+          (let [b (long (aget in i))]
+            (cond
+              (not= b 0x5c)
+              (do (.write out (unchecked-int b)) (recur (inc i)))
+
+              (and (< (+ i 3) n)
+                   (oct? (long (aget in (+ i 1))) 0x30 0x33)
+                   (oct? (long (aget in (+ i 2))) 0x30 0x37)
+                   (oct? (long (aget in (+ i 3))) 0x30 0x37))
+              (do (.write out (unchecked-int
+                               (+ (bit-shift-left (- (long (aget in (+ i 1))) 0x30) 6)
+                                  (bit-shift-left (- (long (aget in (+ i 2))) 0x30) 3)
+                                  (- (long (aget in (+ i 3))) 0x30))))
+                  (recur (+ i 4)))
+
+              (and (< (inc i) n) (= 0x5c (long (aget in (inc i)))))
+              (do (.write out (unchecked-int bs)) (recur (+ i 2)))
+
+              :else
+              ;; one backslash, followed by neither another nor valid octal
+              (throw (ex-info "invalid input syntax for type bytea"
+                              {:error :invalid-text-representation
+                               :sqlstate "22P02"})))))))))
+
 (defn parse-bytea-hex
-  "Decode a PostgreSQL bytea hex-format literal (`\\xDEADBEEF`) to a byte array.
-   Accepts both `\\x...` and `\\\\x...` prefixes (JDBC/psycopg2 escape variants).
-   Returns nil for values that don't look like hex bytea literals."
+  "The bytea input function, under the name its callers already use.
+   Returns nil for a nil or non-string input so the `(or … )` shapes
+   around the call sites still read, but a STRING is now always read by
+   `bytea-in` -- it never falls back to the literal's own bytes, which
+   is what let `'\\xZZ'::bytea` answer `\\x5c785a5a` instead of raising."
   [s]
   (when (string? s)
-    (let [trimmed (str/trim s)
-          without-prefix (cond
-                           (str/starts-with? trimmed "\\x") (subs trimmed 2)
-                           (str/starts-with? trimmed "\\\\x") (subs trimmed 3)
-                           :else nil)]
-      ;; A value that STARTS with the hex prefix is in hex format, so a
-      ;; bad digit or an odd count is an ERROR, not a reason to fall
-      ;; back. Returning nil let the caller's `(or … (.getBytes s))`
-      ;; store the literal characters: `'\xZZ'::bytea` answered
-      ;; `\x5c785a5a` -- the bytes of `\`, `x`, `Z`, `Z` -- rather
-      ;; than raising, on the write path and the cast path alike.
-      ;; PostgreSQL's messages, and its 22P02.
-      (when without-prefix
-        (when-not (re-matches #"[0-9a-fA-F]*" without-prefix)
-          (throw (ex-info (str "invalid hexadecimal digit: \""
-                               (first (remove #(re-matches #"[0-9a-fA-F]" (str %))
-                                              without-prefix))
-                               "\"")
-                          {:error :invalid-text-representation
-                           :sqlstate "22P02"})))
-        (when-not (even? (count without-prefix))
-          (throw (ex-info "invalid hexadecimal data: odd number of digits"
-                          {:error :invalid-text-representation
-                           :sqlstate "22P02"}))))
-      (when (and without-prefix
-                 (re-matches #"[0-9a-fA-F]*" without-prefix)
-                 (even? (count without-prefix)))
-        (let [n (/ (count without-prefix) 2)
-              bs (byte-array n)]
-          (dotimes [i n]
-            (aset-byte bs i
-                       (unchecked-byte
-                        (Integer/parseInt
-                         (subs without-prefix (* 2 i) (+ 2 (* 2 i)))
-                         16))))
-          bs)))))
+    (bytea-in s)))
 
 ;; The input functions of the types with an unambiguous text form -- bool,
 ;; the integers, oid, float4/8, numeric, uuid -- live in datahike.pg.input.
