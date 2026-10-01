@@ -18,6 +18,8 @@
   (:refer-clojure :exclude [parse-uuid])
   (:require [clojure.string :as str]
             [datahike.pg.errors :as errors]
+            [datahike.pg.geo :as geo]
+            [datahike.pg.mac :as mac]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types])
   (:import [datahike.pg PgParamCodec PgWireServer$PgProtocolException]))
@@ -229,7 +231,23 @@
    ;; numeric_in: coerce-numeric already matches it, NaN/Infinity,
    ;; underscores and 0x/0o/0b integers included.
    types/oid-numeric #(coerce/coerce-numeric % :bigdec)
-   types/oid-uuid parse-uuid})
+   types/oid-uuid parse-uuid
+   ;; The geometric and MAC families delegate to their own input
+   ;; functions. Registering them here is what makes an ARRAY element
+   ;; read by the element typinput, as array_in does: `coerce-token`
+   ;; looks the element OID up through this table, and without an entry
+   ;; it kept the raw token, so `'{08002B010203}'::macaddr[]` held
+   ;; un-canonical text that no longer equalled the same address
+   ;; written any other way.
+   types/oid-point    #(geo/geometric-in "point" %)
+   types/oid-lseg     #(geo/geometric-in "lseg" %)
+   types/oid-path     #(geo/geometric-in "path" %)
+   types/oid-box      #(geo/geometric-in "box" %)
+   types/oid-polygon  #(geo/geometric-in "polygon" %)
+   types/oid-line     #(geo/geometric-in "line" %)
+   types/oid-circle   #(geo/geometric-in "circle" %)
+   types/oid-macaddr  #(mac/mac-in "macaddr" %)
+   types/oid-macaddr8 #(mac/mac-in "macaddr8" %)})
 
 (defn parser
   "The input function for `oid`, or nil when that type's input is not
