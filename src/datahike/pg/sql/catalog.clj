@@ -41,6 +41,16 @@
 
 ;; Alias so the extracted body (which still calls bare `unquote-ident`)
 ;; resolves without rewriting each call site.
+(defn- oid-list->regtype-array
+  "An array of type OIDs as `regtype[]` text: the NAMES, because that is
+   what regtype prints. An OID with no name we know is printed as the
+   number, which is also what PostgreSQL does for a type it cannot
+   name."
+  [oids]
+  (str "{" (str/join "," (map (fn [o]
+                                (or (get types/oid->pg-name o) (str o)))
+                              oids)) "}"))
+
 (def ^:private unquote-ident params/unquote-ident)
 
 (def ^:const pg-role-oid
@@ -62,6 +72,22 @@
     "pg_authid" "pg_auth_members" "pg_am" "pg_language" "pg_tablespace"
     "pg_operator" "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
     "pg_shdepend"
+    ;; Session views. These are the only catalogs here that are NOT
+    ;; derived from the database: a PREPAREd statement and a DECLAREd
+    ;; cursor belong to one connection and die with it, so their rows
+    ;; come from the session through params/*session-prepared* and
+    ;; params/*session-cursors*.
+    "pg_prepared_statements" "pg_cursors"
+    ;; Views over facilities this server does not have. They are EMPTY,
+    ;; and empty is the honest answer rather than a convenient one:
+    ;; there is no WAL, no 2PC, no postgresql.conf / pg_hba.conf, and no
+    ;; extension mechanism, so there is nothing for any of them to
+    ;; report. They exist because a client that introspects them should
+    ;; be told "none" rather than handed a 42P01 that stops the session.
+    "pg_prepared_xacts" "pg_available_extensions"
+    "pg_available_extension_versions" "pg_file_settings"
+    "pg_hba_file_rules" "pg_ident_file_mappings"
+    "pg_stat_wal" "pg_stat_slru" "pg_stat_wal_receiver"
     "pg_indexes"
     ;; pg_sequences — the user-facing view over every sequence's
     ;; parameters and current position (issue #26). Distinct from
@@ -383,6 +409,118 @@
      {:db/ident :pg_auth_members/grantor :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_auth_members/admin_option :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_auth_members") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_prepared_statements"
+    [{:db/ident :pg_prepared_statements/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_prepared_statements/statement :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_prepared_statements/prepare_time :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :pg/type "timestamptz"}
+     {:db/ident :pg_prepared_statements/parameter_types :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regtype[]"}
+     {:db/ident :pg_prepared_statements/result_types :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regtype[]"}
+     {:db/ident :pg_prepared_statements/from_sql :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_prepared_statements/generic_plans :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_prepared_statements/custom_plans :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident (pgs/row-marker-attr "pg_prepared_statements") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_cursors"
+    [{:db/ident :pg_cursors/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_cursors/statement :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_cursors/is_holdable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_cursors/is_binary :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_cursors/is_scrollable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_cursors/creation_time :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :pg/type "timestamptz"}
+     {:db/ident (pgs/row-marker-attr "pg_cursors") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_prepared_xacts"
+    [{:db/ident :pg_prepared_xacts/transaction :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "xid"}
+     {:db/ident :pg_prepared_xacts/gid :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_prepared_xacts/prepared :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :pg/type "timestamptz"}
+     {:db/ident :pg_prepared_xacts/owner :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_prepared_xacts/database :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident (pgs/row-marker-attr "pg_prepared_xacts") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_available_extensions"
+    [{:db/ident :pg_available_extensions/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_available_extensions/default_version :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_available_extensions/installed_version :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_available_extensions/comment :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_available_extensions") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_available_extension_versions"
+    [{:db/ident :pg_available_extension_versions/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_available_extension_versions/version :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_available_extension_versions/installed :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_available_extension_versions/superuser :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_available_extension_versions/trusted :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_available_extension_versions/relocatable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_available_extension_versions/schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_available_extension_versions/requires :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name[]"}
+     {:db/ident :pg_available_extension_versions/comment :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_available_extension_versions") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_file_settings"
+    [{:db/ident :pg_file_settings/sourcefile :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_file_settings/sourceline :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_file_settings/seqno :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_file_settings/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_file_settings/setting :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_file_settings/applied :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_file_settings/error :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_file_settings") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_hba_file_rules"
+    [{:db/ident :pg_hba_file_rules/rule_number :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_hba_file_rules/file_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_hba_file_rules/line_number :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_hba_file_rules/type :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_hba_file_rules/database :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text[]"}
+     {:db/ident :pg_hba_file_rules/user_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text[]"}
+     {:db/ident :pg_hba_file_rules/address :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_hba_file_rules/netmask :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_hba_file_rules/auth_method :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_hba_file_rules/options :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text[]"}
+     {:db/ident :pg_hba_file_rules/error :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_hba_file_rules") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_ident_file_mappings"
+    [{:db/ident :pg_ident_file_mappings/map_number :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_ident_file_mappings/file_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_ident_file_mappings/line_number :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_ident_file_mappings/map_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_ident_file_mappings/sys_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_ident_file_mappings/pg_username :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_ident_file_mappings/error :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_ident_file_mappings") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_stat_wal"
+    [{:db/ident :pg_stat_wal/wal_records :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_wal/wal_fpi :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_wal/wal_bytes :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "numeric"}
+     {:db/ident :pg_stat_wal/wal_buffers_full :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_wal/stats_reset :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :pg/type "timestamptz"}
+     {:db/ident (pgs/row-marker-attr "pg_stat_wal") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_stat_slru"
+    [{:db/ident :pg_stat_slru/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_slru/blks_zeroed :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_slru/blks_hit :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_slru/blks_read :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_slru/blks_written :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_slru/blks_exists :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_slru/flushes :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_slru/truncates :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int8"}
+     {:db/ident :pg_stat_slru/stats_reset :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :pg/type "timestamptz"}
+     {:db/ident (pgs/row-marker-attr "pg_stat_slru") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_stat_wal_receiver"
+    [{:db/ident :pg_stat_wal_receiver/pid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_stat_wal_receiver/status :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_wal_receiver/receive_start_lsn :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_lsn"}
+     {:db/ident :pg_stat_wal_receiver/receive_start_tli :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_stat_wal_receiver/written_lsn :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_lsn"}
+     {:db/ident :pg_stat_wal_receiver/flushed_lsn :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_lsn"}
+     {:db/ident :pg_stat_wal_receiver/received_tli :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_stat_wal_receiver/conninfo :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_stat_wal_receiver") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_am"
     [{:db/ident :pg_am/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
@@ -1739,6 +1877,71 @@
              :pg_sequence/seqcycle (boolean (:__seq__/cycle s))
              (pgs/row-marker-attr "pg_sequence") true})
           (sequence-entities cte-db))
+
+    ;; --- Session views -------------------------------------------------
+    ;; Not derived from the database: these two report what THIS
+    ;; connection has prepared and declared.
+
+    "pg_prepared_statements"
+    (let [prepared (some-> params/*session-prepared* deref)]
+      (mapv (fn [[nm rec]]
+              {:pg_prepared_statements/name nm
+               :pg_prepared_statements/statement (or (:source-sql rec) (:sql rec))
+               :pg_prepared_statements/prepare_time (:prepare-time rec)
+               ;; regtype renders a type's NAME, so the array carries
+               ;; names. The OIDs are the ones Describe would report --
+               ;; the same answer the client already got, not a second
+               ;; opinion formed here.
+               :pg_prepared_statements/parameter_types
+               (oid-list->regtype-array (:param-oids rec))
+               :pg_prepared_statements/result_types
+               (oid-list->regtype-array (:result-oids rec))
+               ;; Every prepared statement here came from SQL PREPARE;
+               ;; the extended-protocol ones live in the wire layer's
+               ;; own cache and PostgreSQL does not list those as
+               ;; from_sql either.
+               :pg_prepared_statements/from_sql true
+               ;; There is one plan per statement and no generic/custom
+               ;; choice to make, so the counters PostgreSQL uses to
+               ;; explain that choice are zero.
+               :pg_prepared_statements/generic_plans 0
+               :pg_prepared_statements/custom_plans 0
+               (pgs/row-marker-attr "pg_prepared_statements") true})
+            (sort-by key prepared)))
+
+    "pg_cursors"
+    (let [cursors (some-> params/*session-cursors* deref)]
+      (mapv (fn [[nm rec]]
+              {:pg_cursors/name nm
+               :pg_cursors/statement (or (:source-sql rec) (:sql rec) "")
+               ;; These say what the cursor can do, not what was
+               ;; written: a FETCH here only scans forward and only in
+               ;; text, so SCROLL and BINARY report false however they
+               ;; were declared. (`cursor can only scan forward` is the
+               ;; error two regression files stop on.)
+               :pg_cursors/is_holdable (boolean (:holdable? rec))
+               :pg_cursors/is_binary (boolean (:binary? rec))
+               :pg_cursors/is_scrollable (boolean (:scrollable? rec))
+               ;; A cursor declared before this was recorded has no
+               ;; creation time, and a nil is not a value Datahike will
+               ;; store -- leave the column out rather than invent one.
+               :pg_cursors/creation_time (or (:created-at rec) (java.util.Date. 0))
+               (pgs/row-marker-attr "pg_cursors") true})
+            (sort-by key cursors)))
+
+    ;; --- Views over facilities this server does not have ---------------
+    ;; Empty, and empty is the truth: no 2PC, no extension mechanism, no
+    ;; configuration files, no WAL. A view that invented rows to look
+    ;; more like PostgreSQL would be worse than the 42P01 it replaces.
+    "pg_prepared_xacts" []
+    "pg_available_extensions" []
+    "pg_available_extension_versions" []
+    "pg_file_settings" []
+    "pg_hba_file_rules" []
+    "pg_ident_file_mappings" []
+    "pg_stat_wal" []
+    "pg_stat_slru" []
+    "pg_stat_wal_receiver" []
 
     "pg_am"
     ;; pg_am.dat. `heap` is the one table method; the index methods are

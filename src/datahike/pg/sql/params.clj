@@ -253,6 +253,30 @@
    for callers that use the SQL translator without a server session."
   nil)
 
+(def ^:dynamic *session-prepared*
+  "The current connection's PREPAREd statements atom (name -> record),
+   for `pg_prepared_statements`.
+
+   Catalog rows are materialized from the database, and a prepared
+   statement is not in the database -- it lives for one connection and
+   dies with it. So the view needs the session the way
+   `*session-state*` does, and for the same reason. Nil outside a
+   server session, which the view reads as no statements."
+  nil)
+
+(def ^:dynamic *query-string*
+  "The query string the client submitted, PostgreSQL's
+   `debug_query_string`. For a Simple Query that is the WHOLE message,
+   semicolons and sibling statements included -- which is what
+   `pg_prepared_statements.statement` reports, and it differs from the
+   one statement being executed. Nil outside a server session."
+  nil)
+
+(def ^:dynamic *session-cursors*
+  "The current connection's DECLAREd cursors atom, for `pg_cursors`.
+   Session-scoped for the same reason as [[*session-prepared*]]."
+  nil)
+
 (def ^:dynamic *parse-db*
   "Bound by parse-sql to the live db snapshot so downstream helpers
    (e.g. pg-type-of-attr) can consult Datahike for attribute metadata

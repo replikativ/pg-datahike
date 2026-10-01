@@ -226,6 +226,17 @@ public final class PgWireServer {
         default Object planCacheToken() { return null; }
 
         /** Mark the handler's explicit transaction aborted after a wire-level error. */
+        /**
+         * The query string now being executed, as the client submitted
+         * it. PostgreSQL calls this {@code debug_query_string}, and
+         * {@code pg_prepared_statements.statement} reports it verbatim
+         * -- so for a Simple Query it is the WHOLE message, semicolons
+         * and sibling statements included, not the one statement being
+         * run. The wire layer is the only place that still has it:
+         * {@link #execute} is handed the statements one at a time.
+         */
+        default void setQueryString(String sql) { /* default: no-op */ }
+
         default void markTransactionFailed() { /* default: no-op */ }
 
         /**
@@ -1705,6 +1716,11 @@ public final class PgWireServer {
     private void handleQuery(byte[] body, DataOutputStream out, char[] txStatus, QueryHandler handler, int[] copyState, BatchBuffer batch) throws IOException {
         String sql = new String(body, 0, body.length - 1, StandardCharsets.UTF_8).trim();
 
+        // Before the split: a statement that reports its own source
+        // (PREPARE, for pg_prepared_statements) needs the string the
+        // client sent, which no longer exists after this line.
+        handler.setQueryString(sql);
+
         String[] statements = splitStatements(sql);
 
         // A query string that yields NO statements at all — "", ";",
@@ -2522,6 +2538,10 @@ public final class PgWireServer {
 
         QueryResult result = portal.activeResult;
         if (result == null) {
+            // Extended protocol: the statement IS the whole query
+            // string, and leaving a previous Simple Query's string in
+            // place would misreport it.
+            handler.setQueryString(portal.stmt.sql);
             result = handler.executePrepared(portal.parsed, portal.boundParams);
             // Clear any interrupt bit left by the safety-net cancel path.
             Thread.interrupted();

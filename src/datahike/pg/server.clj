@@ -5755,23 +5755,71 @@
   [^PgWireServer$QueryHandler handler template]
   (loop []
     (let [before (.planCacheToken handler)
-          parsed (.parse handler template (int-array 0))
+          ;; The template's `$1` is a placeholder in a TEMPLATE, bound
+          ;; later by EXECUTE -- not a wire parameter of the PREPARE
+          ;; itself. In the extended protocol the PREPARE arrives with
+          ;; its own (empty) bind list, and that binding was still in
+          ;; scope here, so `$1` resolved against it and
+          ;; `PREPARE q(int) AS SELECT $1` died with an
+          ;; IndexOutOfBoundsException. The caller's bindings have no
+          ;; business in a nested parse -- the same rule
+          ;; `nested-executor` exists for.
+          ;; The template's `$1` is a placeholder in a TEMPLATE, bound
+          ;; later by EXECUTE -- not a wire parameter of the PREPARE
+          ;; itself. In the extended protocol the PREPARE arrives with
+          ;; its own (empty) bind list, and that binding was still in
+          ;; scope here, so `$1` resolved against it and
+          ;; `PREPARE q(int) AS SELECT $1` died with an
+          ;; IndexOutOfBoundsException. The caller's bindings have no
+          ;; business in a nested parse -- the rule `nested-executor`
+          ;; exists for.
+          parsed (binding [params/*bound-params* nil]
+                   (.parse handler template (int-array 0)))
           description (.describeResult handler parsed)
           after (.planCacheToken handler)]
       (if (= before after)
         {:parsed parsed
          :result-signature (result-description-signature description)
+         ;; For pg_prepared_statements. The wire layer already asks the
+         ;; handler both of these for Describe, so the view reports what
+         ;; a client would be told rather than a second opinion.
+         ;; For pg_prepared_statements. Both come from what the wire
+         ;; layer would tell the client at Describe, so the view cannot
+         ;; disagree with what the client was told.
+         ;;
+         ;; `some->`, because a statement with no result columns -- an
+         ;; INSERT, which is what a PREPAREd statement usually is --
+         ;; describes as nil, and reading a field off it threw inside
+         ;; PREPARE. The statement was then never stored and EXECUTE
+         ;; answered nil, far from the cause.
+         :param-oids (vec (some-> (.describeParams handler parsed)))
+         :result-oids (vec (some-> description (.-columnOids)))
          :plan-token after}
         (recur)))))
 
 (defn- handle-prepare
   "PREPARE name [(types)] AS sql — classify extracts :name and :template."
-  [{:keys [sql-prepared handler]} parsed]
+  [{:keys [sql-prepared handler sql]} parsed]
   (let [pname (:name parsed)
         tmpl  (:template parsed)]
     (if (and pname tmpl)
       (do (swap! sql-prepared assoc pname
-                 (assoc (plan-sql-prepared handler tmpl) :sql tmpl))
+                 (assoc (plan-sql-prepared handler tmpl)
+                        :sql tmpl
+                        ;; pg_prepared_statements.statement is the
+                        ;; whole query string the client SUBMITTED --
+                        ;; PostgreSQL's debug_query_string, semicolon
+                        ;; and sibling statements included -- not the
+                        ;; template that EXECUTE runs, and not this one
+                        ;; statement either.
+                        ;; pg_prepared_statements.statement is the
+                        ;; whole query string the client SUBMITTED --
+                        ;; PostgreSQL's debug_query_string, semicolon
+                        ;; and sibling statements included -- not the
+                        ;; template that EXECUTE runs, and not this one
+                        ;; statement either.
+                        :source-sql (or params/*query-string* sql)
+                        :prepare-time (java.util.Date.)))
           (empty-result "PREPARE"))
       (error-result "PREPARE: syntax error" "42601"))))
 
@@ -5862,6 +5910,18 @@
           probe
           (do (swap! cursors assoc cname
                      {:sql     cquery
+                      ;; For pg_cursors, which reports the SUBMITTED
+                      ;; query string and when the cursor was declared,
+                      ;; not the SELECT that FETCH rewrites.
+                      :source-sql (or params/*query-string* cquery)
+                      :created-at (java.util.Date.)
+                      ;; What pg_cursors reports is what this cursor
+                      ;; can actually do, not what was asked for: a
+                      ;; FETCH here only scans forward and only in
+                      ;; text, whatever SCROLL or BINARY was written.
+                      :scrollable? false
+                      :binary?     false
+                      :holdable?   (boolean (:with-hold? parsed))
                       :bound   bound
                       :param-oids (vec param-oids)
                       :columns (vec (.columnNames ^PgWireServer$QueryResult probe))
@@ -12768,6 +12828,9 @@
         ;;    :rows-processed long
         ;;    :pending-rows  vec of partial-batch rows
         ;;    :batch-size    long}
+        ;; The client's whole query string, set by the wire layer per
+        ;; message (see setQueryString).
+        query-string (atom nil)
         copy-state (atom nil)
         ;; Logical-to-physical names for this session's temp tables. Physical
         ;; namespaces include session-id, so concurrent sessions can create
@@ -12840,6 +12903,13 @@
                        :schema (:schema (d/db conn))
                        :copy-state copy-state
                        :tx-state tx-state}))
+
+      (setQueryString [_ sql]
+        ;; The wire layer hands over the string the client sent, which
+        ;; `.execute` never sees whole: a Simple Query arrives here
+        ;; already split into statements. PREPARE records it so
+        ;; pg_prepared_statements can report what PostgreSQL does.
+        (reset! query-string sql))
 
       (copyAbort [_ _reason]
         (when (:in-tx? @tx-state)
@@ -12971,6 +13041,9 @@
                                                       (java.util.IdentityHashMap.))
                     catalog/*registered-databases* registered-databases
                     params/*session-state* session-state
+                    params/*session-prepared* sql-prepared
+                    params/*session-cursors* cursors
+                    params/*query-string* @query-string
                     ;; The date/timestamp OUTPUT format is this session's
                     ;; setting, and the renderer runs on this thread.
                     types/*date-style* (or (:date-style @session-state) [:iso :mdy])
@@ -13264,6 +13337,11 @@
                   params/*statement-time* (java.util.Date.)
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
+                  ;; pg_prepared_statements and pg_cursors are views over
+                  ;; this connection's own session, not over the database.
+                  params/*session-prepared* sql-prepared
+                  params/*session-cursors* cursors
+                  params/*query-string* @query-string
                   types/*date-style* (or (:date-style @session-state) [:iso :mdy])
                   fns/*compensated-float-sum?*
                   (= :compensated (:float-sum @session-state))
@@ -13779,6 +13857,7 @@
     (describeResult [_ parsed] (pg-resolve/with-symbol-resolver (.describeResult h parsed)))
     (executePrepared [_ parsed params] (collecting-notices #(pg-resolve/with-symbol-resolver (.executePrepared h parsed params))))
     (planCacheToken [_] (pg-resolve/with-symbol-resolver (.planCacheToken h)))
+    (setQueryString [_ sql] (.setQueryString h sql))
     (markTransactionFailed [_] (pg-resolve/with-symbol-resolver (.markTransactionFailed h)))
     (close [_] (pg-resolve/with-symbol-resolver (.close h)))
     (copyChunk [_ chunk] (pg-resolve/with-symbol-resolver (.copyChunk h chunk)))
