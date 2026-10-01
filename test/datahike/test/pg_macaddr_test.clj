@@ -158,3 +158,50 @@
     (testing "there is no min/max aggregate for macaddr -- PostgreSQL has
               none either, and says so in the same words"
       (is (= "42883" (state-of c "SELECT min(a) FROM mo"))))))
+
+(deftest arrays-of-the-new-types-still-work
+  ;; A REGRESSION these commits introduced, found by review. Giving
+  ;; these types a `pg-type-hint` did not make their arrays work and did
+  ;; not leave them alone: `sql-name->elem-kw` had no entry, so
+  ;; `array-spec` came out nil, the column took the SCALAR hint, and
+  ;; INSERT ran `macaddr_in` over the whole `{...}` literal. Before the
+  ;; types existed the same column behaved as `text[]` and ACCEPTED
+  ;; values, so this turned working DDL into a hard error -- and an
+  ;; ARRAY value reached the input function as its Java toString,
+  ;; putting `datahike.pg.arrays.PgArray@f30a7cfd` in a user-facing
+  ;; message.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE ar (id int, m macaddr[], b box[], p point[])")
+    (exec! c (str "INSERT INTO ar VALUES "
+                  "(1, '{08002B010203,0800.2b01.0204}', '{\"(1,2),(3,4)\"}', "
+                  "'{\"(1,2)\"}')"))
+    (testing "elements are read by the ELEMENT type's input function, as
+              array_in does -- so they canonicalise and garbage is refused"
+      (is (= "{08:00:2b:01:02:03,08:00:2b:01:02:04}" (one c "SELECT m FROM ar")))
+      (is (= "{(3,4),(1,2)}" (one c "SELECT b FROM ar")))
+      (is (= "22P02" (state-of c "SELECT '{garbage}'::macaddr[]"))))
+    (testing "the column reports its own array type, not text[]"
+      (is (= "macaddr[]" (one c (str "SELECT format_type(atttypid, atttypmod) "
+                                     "FROM pg_attribute WHERE attrelid = 'ar'::regclass "
+                                     "AND attname = 'm'"))))
+      (is (= "box[]" (one c (str "SELECT format_type(atttypid, atttypmod) "
+                                 "FROM pg_attribute WHERE attrelid = 'ar'::regclass "
+                                 "AND attname = 'b'")))))))
+
+(deftest box-arrays-are-delimited-by-semicolons
+  ;; `box` is the only type in all of PostgreSQL whose pg_type.typdelim
+  ;; is not a comma, and it has to be: a box PRINTS as `(3,4),(1,2)`,
+  ;; which already contains two commas. With a comma delimiter
+  ;; PostgreSQL's own `box[]` output read back as four elements here,
+  ;; and ours could not be read by PostgreSQL at all.
+  (with-open [c (jdbc)]
+    (is (= "{(3,4),(1,2)}" (one c "SELECT '{(3,4),(1,2)}'::box[]")))
+    (is (= "1" (one c "SELECT array_length('{(3,4),(1,2)}'::box[], 1)")))
+    (is (= "2" (one c "SELECT array_length('{(3,4),(1,2);(9,9),(8,8)}'::box[], 1)")))
+    (is (= "(9,9),(8,8)" (one c "SELECT ('{(3,4),(1,2);(9,9),(8,8)}'::box[])[2]")))
+    (testing "our own output is what we read back, and what PostgreSQL emits"
+      (is (= "{(3,4),(1,2);(7,8),(5,6)}"
+             (one c "SELECT ARRAY['(1,2),(3,4)'::box, '(5,6),(7,8)'::box]"))))
+    (testing "the comma types are untouched"
+      (is (= "{a,\"b,c\"}" (one c "SELECT '{a,\"b,c\"}'::text[]")))
+      (is (= "{{1,2},{3,4}}" (one c "SELECT '{{1,2},{3,4}}'::int[]"))))))

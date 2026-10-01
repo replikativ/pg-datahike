@@ -141,7 +141,17 @@
         [oid-bool oid-bytea oid-name oid-int2 oid-int4 oid-text oid-int8
          oid-float4 oid-float8 oid-oid oid-varchar oid-bpchar oid-date
          oid-time oid-timetz oid-timestamp oid-timestamptz oid-numeric
-         oid-uuid oid-json oid-money oid-jsonb oid-tsvector oid-tsquery]))
+         oid-uuid oid-json oid-money oid-jsonb oid-tsvector oid-tsquery
+         ;; The geometric and MAC families. Their `_T` rows were already
+         ;; in the generated catalog; nothing mapped the ELEMENT to them,
+         ;; and the consequence was not a missing array type but a BROKEN
+         ;; one: with no entry here `sql-name->elem-kw` had no keyword, so
+         ;; `array-spec` came out nil, the column took the SCALAR
+         ;; `:pg/type` hint, and INSERT ran the scalar input function over
+         ;; the whole `{...}` literal. Before these types existed the same
+         ;; column behaved as `text[]` and worked.
+         oid-point oid-lseg oid-path oid-box oid-polygon oid-line
+         oid-circle oid-macaddr oid-macaddr8]))
 
 (def array-oid->element-oid
   "Inverse of element-oid->array-oid: T[] OID → T OID."
@@ -170,7 +180,16 @@
    :uuid        oid-uuid
    :json        oid-json
    :money       oid-money
-   :jsonb       oid-jsonb})
+   :jsonb       oid-jsonb
+   :point       oid-point
+   :lseg        oid-lseg
+   :path        oid-path
+   :box         oid-box
+   :polygon     oid-polygon
+   :line        oid-line
+   :circle      oid-circle
+   :macaddr     oid-macaddr
+   :macaddr8    oid-macaddr8})
 
 (def oid->elem-kw
   "Inverse of elem-kw->oid."
@@ -357,7 +376,21 @@
    "json"              :json
    "jsonb"             :jsonb
    "bytea"             :bytea
-   "oid"               :oid})
+   "oid"               :oid
+   ;; The geometric and MAC families. Omitting them did not make
+   ;; `box[]` behave as `text[]` -- it made the column take the SCALAR
+   ;; `box` hint and run `box_in` over the whole `{...}` literal, so a
+   ;; valid array literal was rejected and an ARRAY value reached the
+   ;; input function as its Java toString. See element-oid->array-oid.
+   "point"             :point
+   "lseg"              :lseg
+   "path"              :path
+   "box"               :box
+   "polygon"           :polygon
+   "line"              :line
+   "circle"            :circle
+   "macaddr"           :macaddr
+   "macaddr8"          :macaddr8})
 
 (defn parse-array-type-name
   "Parse a SQL type string for arrays. Returns

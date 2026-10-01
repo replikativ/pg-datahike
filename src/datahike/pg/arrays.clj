@@ -389,15 +389,32 @@
 ;; Text codec
 ;; ---------------------------------------------------------------------------
 
+(def ^:private elem-delim
+  "Element-type keyword -> pg_type.typdelim. `box` is the only type in
+   all of PostgreSQL whose delimiter is not a comma, and it has to be:
+   a box prints as `(3,4),(1,2)`, which contains two commas, so with a
+   comma delimiter `{(3,4),(1,2)}` would read as FOUR elements -- which
+   is exactly what it did here, so neither could PostgreSQL's own
+   `box[]` output be read back nor ours be read by PostgreSQL."
+  {:box \;})
+
+(defn- delim-for
+  "The delimiter character for an array of `elem-type` (default `,`)."
+  [elem-type]
+  (get elem-delim elem-type \,))
+
 (def ^:private text-specials
-  "Chars that force double-quoting on output per PG array_out."
-  #{\, \" \\ \{ \} \space \tab \newline \return})
+  "Chars that force double-quoting on output per PG array_out, other
+   than the element delimiter -- which is type-dependent, so
+   `needs-quote?` takes it separately."
+  #{\" \\ \{ \} \space \tab \newline \return})
 
 (defn- needs-quote?
-  [^String s]
+  [^String s delim]
   (or (.isEmpty s)
       (.equalsIgnoreCase s "NULL")
-      (some text-specials s)))
+      (some text-specials s)
+      (some #(= delim %) s)))
 
 (defn- escape-for-array-text
   [^String s]
@@ -416,8 +433,9 @@
    money elements go through types/->pg-text with the element OID; `str`
    printed a timestamp element as java.util.Date.toString, in the JVM's
    local time zone."
-  ([v] (element->text v nil))
-  ([v elem-oid]
+  ([v] (element->text v nil \,))
+  ([v elem-oid] (element->text v elem-oid \,))
+  ([v elem-oid delim]
    (cond
      (or (nil? v) (= :__null__ v)) "NULL"
      (boolean? v)    (if v "t" "f")
@@ -430,9 +448,10 @@
      (array? v)      (to-pg-text v)
      (sequential? v) (if (empty? v)
                        "{}"
-                       (str "{" (str/join "," (map #(element->text % elem-oid) v)) "}"))
+                       (str "{" (str/join (str delim)
+                                          (map #(element->text % elem-oid delim) v)) "}"))
      :else           (let [s ((requiring-resolve 'datahike.pg.types/->pg-text) v elem-oid)]
-                       (if (needs-quote? s)
+                       (if (needs-quote? s delim)
                          (str "\"" (escape-for-array-text s) "\"")
                          s)))))
 
@@ -461,9 +480,11 @@
   [^PgArray a]
   (let [elts (:elements a)
         elem-oid (get @(requiring-resolve 'datahike.pg.types/elem-kw->oid) (:elem-type a))
+        delim (delim-for (:elem-type a))
         body (if (empty? elts)
                "{}"
-               (str "{" (str/join "," (map #(element->text % elem-oid) elts)) "}"))]
+               (str "{" (str/join (str delim)
+                                  (map #(element->text % elem-oid delim) elts)) "}"))]
     (if-let [pfx (lbound-prefix a)]
       (str pfx "=" body)
       body)))
@@ -528,12 +549,12 @@
    once we know the elem-type.
 
    `pending?` tracks whether the current builder represents an
-   in-progress scalar token (so a comma or close-brace knows whether
+   in-progress scalar token (so the delimiter or a close-brace knows whether
    to emit it). It's `true` after any character (or quote) has been
    consumed for the current slot, and `false` at the very start of a
-   slot (right after `{` or `,`) and after a nested `{…}` is
+   slot (right after `{` or the delimiter) and after a nested `{…}` is
    absorbed."
-  [^String s start]
+  [^String s start delim]
   (let [n (.length s)]
     (when-not (and (< start n) (= \{ (.charAt s start)))
       (throw (ex-info "Expected `{`"
@@ -576,7 +597,7 @@
           (and (not in-quote?) quoted? (Character/isWhitespace c))
           (recur (inc i) items current quoted? false false true)
 
-          (and (not in-quote?) quoted? (not (#{\, \}} c)))
+          (and (not in-quote?) quoted? (not (or (= delim c) (= \} c))))
           (throw (ex-info "Unexpected character after quoted array element"
                           {:error :invalid-text-representation :type "array"
                            :detail "unexpected character after quoted array element"
@@ -594,7 +615,7 @@
           ;; cleanly. Only valid at the start of a slot; mid-token
           ;; `{` would only come from a malformed string.
           (and (not in-quote?) (not pending?) (= c \{))
-          (let [sub (parse-tree s i)]
+          (let [sub (parse-tree s i delim)]
             (recur (+ i (long (:consumed sub)))
                    (conj items (:tree sub))
                    (StringBuilder.)
@@ -606,7 +627,7 @@
                            :detail "unexpected `{` mid-token in array literal"
                            :input s :at i}))
 
-          (and (not in-quote?) (= c \,))
+          (and (not in-quote?) (= c delim))
           ;; Close the current slot. If pending? is false, the slot
           ;; was a nested array already added to items — nothing to
           ;; close. Otherwise emit the scalar token (quoted or not).
@@ -693,7 +714,7 @@
                       {:error :invalid-text-representation :type "array"
                        :detail "malformed array literal — must start with `{` and end with `}`"
                        :input s})))
-    (let [{:keys [tree]} (parse-tree body 0)]
+    (let [{:keys [tree]} (parse-tree body 0 (delim-for elem-type))]
       (if (empty? tree)
         (array elem-type [] [0] (or lbounds [1]))
         (let [[coerced dims] (coerce-tree tree elem-type)]
