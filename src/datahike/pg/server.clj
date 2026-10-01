@@ -5847,7 +5847,16 @@
             args (parse-execute-args args-text)
             template (:sql rec)
             sql-out (substitute-prepared-params template args)]
-        (.execute ^PgWireServer$QueryHandler handler sql-out)))))
+        ;; Through `*statement-handler*` -- `nested-executor` -- and not
+        ;; the handler directly. The caller's `*cached-parsed*` is still
+        ;; in scope here, and it is the parse of THIS EXECUTE, so a bare
+        ;; `.execute` re-ran the EXECUTE instead of the SQL just
+        ;; substituted: an infinite recursion that killed the connection
+        ;; with a StackOverflowError. The simple path never showed it,
+        ;; because nothing there caches a parse to reuse.
+        (if-let [run params/*statement-handler*]
+          (run sql-out [] [])
+          (.execute ^PgWireServer$QueryHandler handler sql-out))))))
 
 (defn- handle-deallocate
   "DEALLOCATE [PREPARE] name | DEALLOCATE ALL"
@@ -13146,7 +13155,7 @@
                                    :else PgWireServer/OID_TEXT))))))
           arr))
 
-      (describeResult [_ parsed]        ;; Return the column metadata for a prepared SELECT without
+      (describeResult [this parsed]        ;; Return the column metadata for a prepared SELECT without
         ;; executing. DML returns nil (NoData).
         ;;
         ;; The OID advertised here drives pgjdbc's client-side typing
@@ -13157,6 +13166,19 @@
         ;; OID_TEXT since we don't yet have values to infer from.
 
         (cond
+          ;; `EXECUTE name(...)` produces whatever its PREPAREd template
+          ;; produces, so Describe has to report THAT shape. It reported
+          ;; NoData, and Execute then streamed DataRows the client had
+          ;; no field structure for -- pgjdbc raises "Received resultset
+          ;; tuples, but no field structure for them" and the statement
+          ;; fails. Only over the extended protocol; the simple path
+          ;; sends a RowDescription with the rows.
+          (and (= :system (:type parsed))
+               (= :execute-prepared (:system-type parsed))
+               (get @sql-prepared (:name parsed)))
+          (.describeResult ^PgWireServer$QueryHandler this
+                           (:parsed (get @sql-prepared (:name parsed))))
+
           ;; INSERT/UPDATE/DELETE … RETURNING produces rows, so its
           ;; prepared form must Describe the RETURNING column shape —
           ;; otherwise a client that Describes before Execute (asyncpg

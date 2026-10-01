@@ -96,15 +96,31 @@
   ;; all. Reading a field off that threw INSIDE PREPARE, so the
   ;; statement was never stored and the EXECUTE that followed answered
   ;; nil, a long way from the cause.
-  ;; (The EXECUTE is not driven here: SQL-level EXECUTE over the
-  ;; EXTENDED protocol closes the connection, which is a separate
-  ;; pre-existing bug and reproduces on main without any of this.)
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE pz (id int PRIMARY KEY, v text)")
     (exec! c "PREPARE ins AS INSERT INTO pz VALUES ($1, $2)")
+    (exec! c "EXECUTE ins (1, 'x')")
+    (is (= "x" (one c "SELECT v FROM pz WHERE id = 1")))
     (is (= [["ins" "{}"]]
            (rows c (str "SELECT name, result_types::text "
                         "FROM pg_prepared_statements WHERE name = 'ins'"))))))
+
+(deftest execute-does-not-re-execute-itself
+  ;; EXECUTE substitutes its arguments into the stored template and
+  ;; runs the result through the handler again. The caller's
+  ;; `*cached-parsed*` was still in scope for that nested call -- and
+  ;; it is the parse of THIS EXECUTE -- so the nested run executed the
+  ;; EXECUTE instead of the SQL just substituted, forever, and the
+  ;; connection died of a StackOverflowError. Only over the extended
+  ;; protocol: the simple path caches no parse to reuse.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE ex1 (id int PRIMARY KEY, v text)")
+    (exec! c "PREPARE ins1 AS INSERT INTO ex1 VALUES ($1, $2)")
+    (exec! c "EXECUTE ins1 (1, 'a')")
+    (exec! c "EXECUTE ins1 (2, 'b')")
+    (exec! c "PREPARE sel1(int) AS SELECT v FROM ex1 WHERE id = $1")
+    (is (= [["b"]] (rows c "EXECUTE sel1(2)")))
+    (is (= [["1" "a"] ["2" "b"]] (rows c "SELECT id, v FROM ex1 ORDER BY id")))))
 
 (deftest a-prepare-with-parameters-survives-the-extended-protocol
   ;; `$1` in a PREPARE is a placeholder in a TEMPLATE, bound later by
