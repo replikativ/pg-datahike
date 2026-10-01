@@ -640,17 +640,42 @@
       (null? b) -1
       :else (compare a b))))
 
+(defn- agg-ordered-values
+  "The values of a collection of [sort-key value] pairs, in sort-key
+   order. The shape every in-aggregate ORDER BY uses: the translator
+   pairs each value with its key, and the aggregate sorts before folding.
+
+   PostgreSQL applies an aggregate's own ORDER BY to the input rows
+   (nodeAgg.c), so it is observable in any aggregate whose result depends
+   on element order -- array_agg, string_agg, and the whole json family."
+  [coll desc?]
+  (map second (sort-by first
+                       (if desc?
+                         (fn [a b] (akey-compare b a))
+                         akey-compare)
+                       coll)))
+
 (defn filter-array-agg-ordered
   "SQL array_agg(expr ORDER BY … ASC) — `coll` is a collection of
    [sort-key value] pairs; sort ascending by sort-key, then box the values."
   [coll]
-  (box-array-agg (map second (sort-by first akey-compare coll))))
+  (box-array-agg (agg-ordered-values coll false)))
 
 (defn filter-array-agg-ordered-desc
   "SQL array_agg(expr ORDER BY … DESC) — descending counterpart of
    filter-array-agg-ordered."
   [coll]
-  (box-array-agg (map second (sort-by first (fn [a b] (akey-compare b a)) coll))))
+  (box-array-agg (agg-ordered-values coll true)))
+
+;; The json family had no ordered form at all, so `json_agg(x ORDER BY x)`
+;; silently returned the rows in whatever order the scan produced. It
+;; agreed with PostgreSQL only when that order already matched -- which is
+;; how a test asserting `[1, 6]` passed while the ORDER BY did nothing.
+
+(defn filter-json-agg-ordered [coll] (filter-json-agg (agg-ordered-values coll false)))
+(defn filter-json-agg-ordered-desc [coll] (filter-json-agg (agg-ordered-values coll true)))
+(defn filter-jsonb-agg-ordered [coll] (filter-jsonb-agg (agg-ordered-values coll false)))
+(defn filter-jsonb-agg-ordered-desc [coll] (filter-jsonb-agg (agg-ordered-values coll true)))
 
 (defn pg-many-ref-array
   "Per-row Datalog fn for `:db.cardinality/many :db.type/ref` SQL
