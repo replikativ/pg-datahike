@@ -9,7 +9,22 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
-postgres_source="${POSTGRES_SOURCE:-${repo_root}/../postgres}"
+# The PINNED checkout by default, matching campaign.edn's :postgres-ref
+# and the oracle. It used to default to a maintainer's own `../postgres`,
+# which moves: it had moved to REL_19_BETA1 while the campaign pinned
+# REL_17_7, so the suite RAN a newer PostgreSQL's regression files and
+# the manifest recorded a reference nothing had been measured against.
+# POSTGRES_SOURCE still overrides.
+campaign_ref="$(sed -n 's/^ *:postgres-ref *"\([^"]*\)".*/\1/p' \
+                "${repo_root}/test/integration/postgres-regress/campaign.edn" | head -1)"
+pinned_source="${repo_root}/.internal/postgres-${campaign_ref}"
+if [[ -n "${POSTGRES_SOURCE:-}" ]]; then
+  postgres_source="${POSTGRES_SOURCE}"
+elif [[ -d "${pinned_source}/src/test/regress" ]]; then
+  postgres_source="${pinned_source}"
+else
+  postgres_source="${repo_root}/../postgres"
+fi
 pg_major="${PG_REGRESS_MAJOR:-17}"
 pg_regress="${PG_REGRESS_BIN:-/usr/lib/postgresql/${pg_major}/lib/pgxs/src/test/regress/pg_regress}"
 pg_bindir="${PG_REGRESS_BINDIR:-/usr/lib/postgresql/${pg_major}/bin}"

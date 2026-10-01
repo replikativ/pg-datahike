@@ -35,8 +35,32 @@
             [clojure.java.io :as io]
             [clojure.string :as str]))
 
+(def campaign-ref
+  "The PostgreSQL the campaign measures against, from campaign.edn. One
+   source of truth: the oracle, the regression sources, and the
+   manifest's own `:postgres-ref` all have to be this, or the number
+   asserts a reference it was not measured against."
+  (:postgres-ref (edn/read-string
+                  (slurp "test/integration/postgres-regress/campaign.edn"))))
+
 (def regress-root
+  "The regression sources. The PINNED checkout by default.
+
+   This used to default to `~/Development/postgres`, a maintainer's own
+   checkout, which moves. It had moved to REL_19_BETA1 while
+   campaign.edn pinned REL_17_7 and the oracle was PostgreSQL 17 -- so
+   the manifest recorded a reference nothing had been measured against,
+   and 22 of the 174 measured files did not exist in 17 at all (SQL/PGQ,
+   temporal keys, VIRTUAL generated columns), while `generated.sql` --
+   17's file for a feature that IS in scope -- was not measured, because
+   the file list came from 19 where it had been split in two.
+
+   `PG_REGRESS_SRC` still overrides, for deliberately measuring against
+   another version."
   (or (System/getenv "PG_REGRESS_SRC")
+      (let [pinned (io/file ".internal" (str "postgres-" campaign-ref)
+                            "src" "test" "regress")]
+        (when (.isDirectory pinned) (str pinned)))
       (str (System/getProperty "user.home") "/Development/postgres/src/test/regress")))
 
 (def manifest-file "test/integration/postgres-regress/agreement.edn")
