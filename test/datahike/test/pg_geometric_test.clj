@@ -53,6 +53,9 @@
 (defn- state-of [^Connection c sql]
   (try (one c sql) nil (catch SQLException e (.getSQLState e))))
 
+(defn- message-of [^Connection c sql]
+  (try (one c sql) nil (catch SQLException e (.getMessage e))))
+
 (deftest every-spelling-canonicalises
   (with-open [c (jdbc)]
     (testing "point takes parens or not, and prints the shortest number"
@@ -162,3 +165,63 @@
       (is (= "[(1e+300,Infinity),(0,0)]"
              (one c "select '[(1e+300,Inf),(0,0)]'::lseg")))
       (is (= "<(1e+16,2),300000>" (one c "select '<(1e16,2),3e5>'::circle"))))))
+
+(deftest the-scanner-requires-what-postgresql-requires
+  ;; The parsing was `replace every delimiter with a space, split on
+  ;; whitespace, check the delimiter shape separately`, which cannot see
+  ;; WHERE a character sits. `pair_decode` requires the comma between a
+  ;; point's two coordinates, and `path_decode` requires the brackets to
+  ;; balance.
+  (with-open [c (jdbc)]
+    (is (= "22P02" (state-of c "SELECT '(1 2)'::point")))
+    (is (= "22P02" (state-of c "SELECT '[(1,2)(3,4)]'::path")))
+    (is (= "22P02" (state-of c "SELECT '((1,2)'::polygon")))
+    (is (= "22P02" (state-of c "SELECT '(1,2)'::lseg")))
+    (testing "but the legal spacings stay legal -- float8in_internal
+              skips trailing whitespace before reporting where it
+              stopped, so the structural comma is found after the spaces"
+      (is (= "(1,2)" (one c "SELECT '( 1 , 2 )'::point")))
+      (is (= "(1,2)" (one c "SELECT '  (1,2)  '::point")))
+      (is (= "(1,2)" (one c "SELECT '1,2'::point"))))))
+
+(deftest line-through-two-points-uses-line-construct
+  ;; Not `divide through by the leading non-zero coefficient` -- that
+  ;; stored a different value from PostgreSQL for every slope but +/-1,
+  ;; and `[(1,2),(3,4)]` (slope 1) is why a sweep missed it.
+  (with-open [c (jdbc)]
+    (is (= "{2,-1,-1}" (one c "SELECT '(1,1),(3,5)'::line")))
+    (is (= "{2,-1,-1}" (one c "SELECT '(3,5),(1,1)'::line")))
+    (testing "vertical is x = C and horizontal is y = C"
+      (is (= "{-1,0,0}" (one c "SELECT '(0,0),(0,5)'::line")))
+      (is (= "{0,-1,0}" (one c "SELECT '(0,0),(5,0)'::line"))))
+    (testing "line_in's two specific messages, which were generic"
+      (is (= "ERROR: invalid line specification: A and B cannot both be zero"
+             (message-of c "SELECT '{0,0,1}'::line")))
+      (is (= "ERROR: invalid line specification: must be two distinct points"
+             (message-of c "SELECT '(1,2),(1,2)'::line"))))))
+
+(deftest box-reorders-with-float8-lt-not-with-max
+  ;; `float8_lt` is `!isnan(a) && (isnan(b) || a < b)` -- NaN is LARGER
+  ;; than everything, and each coordinate is reordered independently.
+  ;; max/min propagate NaN into both corners instead.
+  (with-open [c (jdbc)]
+    (is (= "(NaN,1),(1,0)" (one c "SELECT '(NaN,0),(1,1)'::box")))
+    (is (= "(NaN,1),(1,0)" (one c "SELECT '(1,1),(NaN,0)'::box")))
+    (testing "the documented four-number form, which was refused"
+      (is (= "(3,4),(1,2)" (one c "SELECT '(1,2,3,4)'::box"))))))
+
+(deftest coordinates_are_range_checked_everywhere
+  ;; `Double/parseDouble` saturates; strtod reports ERANGE. And the
+  ;; character class gating path and polygon excluded the letters of
+  ;; Inf, NaN and 0x, so the non-finite and hex work reached five of the
+  ;; seven types.
+  (with-open [c (jdbc)]
+    (is (= "22003" (state-of c "SELECT '(1e400,2)'::point")))
+    (is (= "22003" (state-of c "SELECT '(1e-400,2)'::point")))
+    (is (= "[(1,Infinity)]" (one c "SELECT '[(1,Inf)]'::path")))
+    (is (= "[(1,2),(16,4)]" (one c "SELECT '[(1,2),(0x10,4)]'::path")))
+    (is (= "((1,NaN),(2,3))" (one c "SELECT '((1,NaN),(2,3))'::polygon")))
+    (is (= "((1,2),(16,4))" (one c "SELECT '((1,2),(0x10,4))'::polygon")))
+    (testing "circle_in rejects a negative radius and must accept NaN"
+      (is (= "22P02" (state-of c "SELECT '<(0,0),-1>'::circle")))
+      (is (= "<(0,0),NaN>" (one c "SELECT '<(0,0),NaN>'::circle"))))))
