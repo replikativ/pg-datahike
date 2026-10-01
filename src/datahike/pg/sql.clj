@@ -2486,6 +2486,14 @@
                     {:type :error :message (str "Unsupported SQL statement: " (type stmt))}))]
             (if (map? result) (attach-params result) result)))) ; close :else let, binding, cond, outer let
       (catch Exception e
+        ;; This catch swallows the stack trace of EVERY translation
+        ;; failure, and the message alone is often useless -- a bare
+        ;; `class java.lang.String cannot be cast to class
+        ;; clojure.lang.IFn` says nothing about which of thousands of
+        ;; lines produced it. Opt-in, off unless asked for:
+        ;;   (System/setProperty "pgdh.trace" "1")
+        (when (System/getProperty "pgdh.trace")
+          (.printStackTrace e))
          ;; Resolve the exception structurally: throw sites may carry
          ;; either :sqlstate (legacy / explicit override) or :error
          ;; (structured category). The errors namespace knows how to

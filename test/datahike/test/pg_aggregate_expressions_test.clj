@@ -264,3 +264,51 @@
          org.postgresql.util.PSQLException #"(?i)total"
          (col c 1 (str "SELECT dept, sum(n) AS total FROM ae GROUP BY dept "
                        "HAVING total > 1"))))))
+
+(deftest distinct-is-read-by-every-aggregate
+  ;; DISTINCT was read by `count` alone -- it has its own
+  ;; `filter-count-distinct` -- and silently dropped by every other
+  ;; aggregate, because the one test for it compared the RESOLVED,
+  ;; namespaced symbol against a bare `'count-distinct` and so was
+  ;; never true.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE ag (v int, g text)")
+    (exec! c "INSERT INTO ag VALUES (1,'a'),(2,'a'),(2,'a'),(5,'b')")
+    (is (= ["8"] (col c 1 "SELECT sum(DISTINCT v) FROM ag")))
+    (is (= ["2.6666666666666667"] (col c 1 "SELECT avg(DISTINCT v) FROM ag")))
+    (is (= ["a,b"] (col c 1 "SELECT string_agg(DISTINCT g, ',') FROM ag")))
+    (testing "PostgreSQL implements DISTINCT by SORTING, so a collection
+              aggregate comes out ascending -- {1,2,5}, not the scan order"
+      (is (= ["{1,2,5}"] (col c 1 "SELECT array_agg(DISTINCT v) FROM ag")))
+      (is (= ["[1, 2, 5]"] (col c 1 "SELECT json_agg(DISTINCT v) FROM ag")))
+      (is (= ["[1, 2, 5]"] (col c 1 "SELECT jsonb_agg(DISTINCT v) FROM ag"))))
+    (testing "per GROUP, not per query"
+      (is (= [["a" "2" "3" "{1,2}"] ["b" "1" "5" "{5}"]]
+             (rows c (str "SELECT g, count(DISTINCT v), sum(DISTINCT v), "
+                          "array_agg(DISTINCT v) FROM ag GROUP BY g ORDER BY g")))))
+    (testing "a DISTINCT and a non-DISTINCT aggregate in one SELECT.
+              This is why it is a wrapper per aggregate and not a
+              deduplicated find set: the find set is one per query, so
+              one of the two would always be wrong"
+      (is (= [["8" "10"]] (rows c "SELECT sum(DISTINCT v), sum(v) FROM ag")))
+      (is (= [["2.6666666666666667" "2.5000000000000000"]]
+             (rows c "SELECT avg(DISTINCT v), avg(v) FROM ag"))))
+    (testing "with FILTER, which PostgreSQL applies BEFORE deduplicating"
+      (is (= ["7"] (col c 1 "SELECT sum(DISTINCT v) FILTER (WHERE v > 1) FROM ag"))))
+    (testing "with an in-aggregate ORDER BY"
+      (is (= ["{5,2,1}"] (col c 1 "SELECT array_agg(DISTINCT v ORDER BY v DESC) FROM ag")))
+      (is (= ["b,a"] (col c 1 "SELECT string_agg(DISTINCT g, ',' ORDER BY g DESC) FROM ag"))))
+    (testing "and in a larger expression"
+      (is (= ["10"] (col c 1 "SELECT sum(DISTINCT v) + count(DISTINCT g) FROM ag"))))))
+
+(deftest bool_or_exists
+  ;; `bool_and` and its alias `every` were mapped; `bool_or` was not, so
+  ;; it answered `function bool_or(boolean) does not exist`.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE bo (v int)")
+    (exec! c "INSERT INTO bo VALUES (1),(5)")
+    (is (= ["t"] (col c 1 "SELECT bool_or(v > 3) FROM bo")))
+    (is (= ["f"] (col c 1 "SELECT bool_or(v > 9) FROM bo")))
+    (is (= ["t"] (col c 1 "SELECT bool_or(DISTINCT v > 3) FROM bo")))
+    (testing "an empty group is NULL, as for bool_and"
+      (is (= [nil] (col c 1 "SELECT bool_or(v > 3) FROM bo WHERE false"))))))

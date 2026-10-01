@@ -4552,7 +4552,18 @@
                     filter-agg (cond
                                  is-count? 'datahike.pg.query-fns/filter-count
                                  filter-precision-variant filter-precision-variant
-                                 :else (or agg-sym 'datahike.pg.query-fns/filter-sum))]
+                                 :else (or agg-sym 'datahike.pg.query-fns/filter-sum))
+                    ;; DISTINCT combines with FILTER -- PostgreSQL applies
+                    ;; the filter first and dedupes what survives. This
+                    ;; branch never read `.isDistinct`, so
+                    ;; `sum(DISTINCT v) FILTER (WHERE v > 1)` answered 9
+                    ;; where PostgreSQL says 7.
+                    filter-agg (or (when (and (.isDistinct ae) (not is-count?))
+                                     (let [d (symbol (str filter-agg "-distinct"))]
+                                       (when (resolve d) d)))
+                                   (when (and (.isDistinct ae) is-count?)
+                                     'datahike.pg.query-fns/filter-count-distinct)
+                                   filter-agg)]
                 (swap! find-elements conj (list filter-agg case-var))
                 (swap! find-aliases conj (or alias0 fname)))
               ;; No filter — treat as regular aggregate. A name that is
@@ -4658,26 +4669,38 @@
                       (when default-table
                         (swap! (:with-vars ctx) conj
                                (ctx/entity-var! ctx default-table)))
-                      (if order-els
-                        (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                               (let [kv (expr/translate-expr ctx (.getExpression o))]
-                                                 (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
-                                             order-els)
-                              sort-key (if (= 1 (count key-vars))
-                                         (first key-vars)
-                                         (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
-                              all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                  (not (.isAsc o)))
-                                                order-els)]
-                          (ctx/add-clause! ctx [(list 'vector sort-key v1 v2) pair-var])
-                          (swap! find-elements conj
-                                 (list (if all-desc?
-                                         'datahike.pg.query-fns/filter-string-agg-ordered-desc
-                                         'datahike.pg.query-fns/filter-string-agg-ordered)
-                                       pair-var)))
-                        (do
-                          (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
-                          (swap! find-elements conj (list agg-sym pair-var))))
+                      ;; `agg(DISTINCT a, b)` -- string_agg and the object
+                      ;; aggregates -- takes the same `-distinct` wrapper,
+                      ;; over the [value delimiter] pairs. `is-distinct?` was
+                      ;; read nowhere in this branch.
+                      (let [agg-sym (or (when is-distinct?
+                                          (let [d (symbol (str agg-sym "-distinct"))]
+                                            (when (resolve d) d)))
+                                        agg-sym)]
+                        (if order-els
+                          (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                 (let [kv (expr/translate-expr ctx (.getExpression o))]
+                                                   (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
+                                               order-els)
+                                sort-key (if (= 1 (count key-vars))
+                                           (first key-vars)
+                                           (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
+                                all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                    (not (.isAsc o)))
+                                                  order-els)]
+                            (ctx/add-clause! ctx [(list 'vector sort-key v1 v2) pair-var])
+                            (let [ord-sym (if all-desc?
+                                            'datahike.pg.query-fns/filter-string-agg-ordered-desc
+                                            'datahike.pg.query-fns/filter-string-agg-ordered)]
+                              (swap! find-elements conj
+                                     (list (or (when is-distinct?
+                                                 (let [d (symbol (str ord-sym "-distinct"))]
+                                                   (when (resolve d) d)))
+                                               ord-sym)
+                                           pair-var))))
+                          (do
+                            (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
+                            (swap! find-elements conj (list agg-sym pair-var)))))
                       (swap! find-aliases conj (or alias0 fname)))
                           ;; Single-argument: COUNT(col), SUM(col), AVG(col), etc.
                     (let [inner-expr (first params)
@@ -4725,9 +4748,28 @@
                                     'datahike.pg.query-fns/filter-count
                                     precision-variant precision-variant
                                     :else agg-sym)
-                                ;; Distinct aggregates (e.g. SUM(DISTINCT x)) deduplicate
-                                ;; their input collection rather than doing a set scan.
-                          is-dh-distinct? (= agg-sym 'count-distinct)]
+                                ;; `agg(DISTINCT x)` routes to the aggregate's
+                                ;; `-distinct` wrapper, which sorts and dedupes its
+                                ;; input the way nodeAgg.c does. DISTINCT was read by
+                                ;; `count` alone -- it has its own path above -- and
+                                ;; dropped by every other aggregate:
+                                ;;   sum(distinct v)          10, PostgreSQL 8
+                                ;;   avg(distinct v)          2.5, PostgreSQL 2.666…
+                                ;;   string_agg(distinct g)   a,a,b,a, PostgreSQL a,b
+                                ;;   array_agg(distinct v)    {2,1,5,2}, PostgreSQL {1,2,5}
+                                ;; A wrapper and not a deduplicated find set: the
+                                ;; find set is one per QUERY, and `sum(DISTINCT v),
+                                ;; sum(v)` needs the duplicates for one aggregate
+                                ;; and not the other.
+                                ;; `(symbol (str sym "-distinct"))`, not
+                                ;; `name`/`namespace`: both are shadowed by
+                                ;; locals in this scope, and `(name agg-sym)`
+                                ;; called a String.
+                          agg-sym (or (when (and is-distinct? (not is-count-col?))
+                                        (let [d (symbol (str agg-sym "-distinct"))]
+                                          (when (resolve d) d)))
+                                      agg-sym)
+                          is-dh-distinct? false]
                             ;; Prevent set deduplication for non-distinct aggregates:
                             ;; adding the entity var to :with preserves duplicate rows.
                             ;; Only when there IS a table -- a table-free
@@ -4771,7 +4813,21 @@
                                 ord-sym (let [[asc desc] (get ordered-aggs fname)]
                                           (if all-desc? desc asc))]
                             (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
-                            (swap! find-elements conj (list ord-sym pair-var)))
+                            ;; DISTINCT combines with an in-aggregate ORDER
+                            ;; BY: `array_agg(DISTINCT v ORDER BY v DESC)`
+                            ;; kept the duplicates because this branch
+                            ;; returns before the `-distinct` substitution
+                            ;; above. The ordered wrapper folds over
+                            ;; [key value] pairs, and PostgreSQL requires
+                            ;; the sort expression to be in the DISTINCT
+                            ;; list, so deduping the pairs is deduping the
+                            ;; values.
+                            (swap! find-elements conj
+                                   (list (or (when is-distinct?
+                                               (let [d (symbol (str ord-sym "-distinct"))]
+                                                 (when (resolve d) d)))
+                                             ord-sym)
+                                         pair-var)))
                           (swap! find-elements conj (list agg-sym v))))
                       (swap! find-aliases conj (or alias0 fname)))))))
             idx))

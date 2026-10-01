@@ -529,6 +529,17 @@
         bool (fn [v] (if (string? v) (input/parse-bool v) v))]
     (if (empty? vs) :__null__ (every? #(true? (bool %)) vs))))
 
+(defn filter-bool-or
+  "BOOL_OR over non-NULL inputs; an empty/all-NULL group is NULL.
+
+   There was no `bool_or` at all -- `bool_and`/`every` were mapped and
+   its counterpart was not -- so `bool_or(x)` answered
+   `function bool_or(boolean) does not exist`."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)
+        bool (fn [v] (if (string? v) (input/parse-bool v) v))]
+    (if (empty? vs) :__null__ (boolean (some #(true? (bool %)) vs)))))
+
 (def filtered-out
   "Marker for a row an aggregate FILTER excluded.
 
@@ -654,6 +665,29 @@
                          (fn [a b] (akey-compare b a))
                          akey-compare)
                        coll)))
+
+(defn distinct-input
+  "An aggregate's DISTINCT input. PostgreSQL implements DISTINCT by
+   SORTING the input rows and dropping adjacent equals (nodeAgg.c), so
+   the duplicates go AND the survivors come out ascending -- which is
+   observable in every aggregate whose result depends on element order:
+   `array_agg(DISTINCT v)` over 2,1,5,2 is `{1,2,5}`, not `{2,1,5}`.
+
+   `:__null__` is dropped here the way the filter-* aggregates drop it,
+   and the sort is `akey-compare`, so a NULL among the values cannot
+   throw."
+  [coll]
+  (let [ds (distinct (remove #(or (nil? %) (= :__null__ %)) coll))]
+    (try (sort akey-compare ds) (catch Throwable _ ds))))
+
+(defn distinct-agg
+  "`f` applied to its DISTINCT input. One wrapper per aggregate rather
+   than deduplicating the Datalog find set, because the find set is one
+   per QUERY: with `sum(DISTINCT v), sum(v)` in the same SELECT, one
+   aggregate needs the duplicates and the other must not see them, and
+   PostgreSQL computes each independently."
+  [f]
+  (fn [coll] (f (distinct-input coll))))
 
 (defn filter-array-agg-ordered
   "SQL array_agg(expr ORDER BY … ASC) — `coll` is a collection of
@@ -3477,6 +3511,7 @@
   {"count"          'datahike.pg.query-fns/filter-count
    "bool_and"       'datahike.pg.query-fns/filter-bool-and
    "every"          'datahike.pg.query-fns/filter-bool-and
+   "bool_or"        'datahike.pg.query-fns/filter-bool-or
    "sum"            'datahike.pg.query-fns/filter-sum
    "avg"            'datahike.pg.query-fns/filter-avg
    "min"            'datahike.pg.query-fns/filter-min
