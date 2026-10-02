@@ -89,10 +89,6 @@ reproduced and should be measured before it is believed.
 - **`&&`, `@>`, `<@` on geometric values return a bare `f`** —
   `expr.clj`'s array/jsonb fall-through. `'(0,0),(1,1)'::box &&
   '(0,0),(2,2)'::box` is `t` in PostgreSQL.
-- **`COMMIT` inside a `DO` block commits the caller's transaction**;
-  the client's `ROLLBACK` then does nothing.
-- **`DO` silently drops an EXCEPTION handler** that `CREATE FUNCTION`
-  honestly refuses.
 - **CSV `COPY … FROM STDIN` does not recognise `\.`** — documented as
   intentional in `copy/csv_format.clj`, but `copyfromparse.c` accepts it
   as the first character of a line in CSV mode too. Every CSV stdin

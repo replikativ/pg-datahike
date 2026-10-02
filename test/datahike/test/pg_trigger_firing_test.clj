@@ -168,3 +168,56 @@
                    "FOR EACH ROW EXECUTE FUNCTION ivf()")]
       (is (= "42809" (state-of c sql)))
       (is (str/includes? (message-of c sql) "Tables cannot have INSTEAD OF triggers")))))
+
+;; ============================================================================
+;; DO blocks, over the wire. A DO body's statements go through
+;; `*statement-handler*` for the same reason a trigger body's do, so
+;; these belong here rather than with the in-process plpgsql tests --
+;; and transaction control cannot be spoken for at all without a wire
+;; layer, since the implicit transaction is the wire layer's.
+;; ============================================================================
+
+(deftest commit-inside-do-cannot-end-the-callers-transaction
+  ;; `BEGIN; … DO $$ … COMMIT; … $$; … ROLLBACK;` committed the
+  ;; CALLER's transaction, so the client's ROLLBACK undid nothing and
+  ;; every row survived. PostgreSQL raises 2D000, `invalid transaction
+  ;; termination` (SPI_commit).
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE dt (a int)")
+    (.setAutoCommit c false)
+    (exec! c "INSERT INTO dt VALUES (1)")
+    (is (= "2D000" (state-of c "DO $$ BEGIN INSERT INTO dt VALUES (2); COMMIT; END $$")))
+    (.rollback c)
+    (.setAutoCommit c true)
+    (is (= [] (col1 c "SELECT a FROM dt ORDER BY a"))
+        "the ROLLBACK undoes everything, including what the DO wrote")))
+
+(deftest a-do-block-in-autocommit-may-still-manage-transactions
+  ;; The other half, which already worked and must keep working:
+  ;; outside an explicit transaction block a DO may COMMIT and start a
+  ;; new transaction, and its ROLLBACK discards its own writes.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE dt2 (a int)")
+    (exec! c "DO $$ BEGIN INSERT INTO dt2 VALUES (1); COMMIT; INSERT INTO dt2 VALUES (2); END $$")
+    (is (= ["1" "2"] (col1 c "SELECT a FROM dt2 ORDER BY a")))
+    (exec! c "DO $$ BEGIN INSERT INTO dt2 VALUES (3); ROLLBACK; END $$")
+    (is (= ["1" "2"] (col1 c "SELECT a FROM dt2 ORDER BY a")))))
+
+(deftest do-refuses-what-create-function-refuses
+  ;; A DO block parsed its body directly instead of through the gate
+  ;; CREATE FUNCTION uses, so a construct the executor cannot run was
+  ;; silently DROPPED. For an EXCEPTION handler the difference is not
+  ;; cosmetic: the error the handler was written to catch escaped to
+  ;; the client, as a division-by-zero rather than a refusal.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE de (a int)")
+    (let [body (str "BEGIN INSERT INTO de VALUES (1/0); "
+                    "EXCEPTION WHEN division_by_zero THEN "
+                    "INSERT INTO de VALUES (99); END")]
+      (is (= "0A000" (state-of c (str "DO $$ " body " $$"))))
+      (is (str/includes? (message-of c (str "DO $$ " body " $$"))
+                         "exception-handler is not supported"))
+      (testing "which is the answer CREATE FUNCTION already gave"
+        (is (= "0A000" (state-of c (str "CREATE FUNCTION fe() RETURNS void "
+                                        "LANGUAGE plpgsql AS $$ " body " $$"))))))
+    (is (= [] (col1 c "SELECT a FROM de")))))
