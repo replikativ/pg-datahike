@@ -582,8 +582,15 @@
                                    columns))
         ;; Table-level indexes: PRIMARY KEY (…), UNIQUE (…), CONSTRAINT n UNIQUE (…)
         indexes (or (.getIndexes ct) [])
-        index-pk (first (filter (fn [^Index idx]
-                                  (= "PRIMARY KEY" (.getType idx)))
+        ;; `.getType` returns the keyword AS WRITTEN -- JSqlParser does
+        ;; not normalise it -- and SQL keywords are case-insensitive. A
+        ;; case-SENSITIVE comparison here meant `primary key (x,y)` in
+        ;; lower case produced no PK at all, so the composite tuple attr
+        ;; that enforces it was never built and two identical rows went
+        ;; in where PostgreSQL raises 23505. The ALTER path next door
+        ;; already upper-cases; only this one did not.
+        index-type (fn [^Index idx] (some-> (.getType idx) str/upper-case))
+        index-pk (first (filter (fn [idx] (= "PRIMARY KEY" (index-type idx)))
                                 indexes))
         index-pk-cols (when index-pk
                         (mapv (comp params/unquote-ident str)
@@ -591,7 +598,7 @@
         index-pk-name (when index-pk
                         (params/unquote-ident (.getName ^Index index-pk)))
         index-uniques (vec (keep (fn [^Index idx]
-                                   (when (= "UNIQUE" (.getType idx))
+                                   (when (#{"UNIQUE" "UNIQUE KEY"} (index-type idx))
                                      {:cols (mapv (comp params/unquote-ident str)
                                                   (.getColumns idx))
                                       :name (some-> (.getName idx) params/unquote-ident)}))

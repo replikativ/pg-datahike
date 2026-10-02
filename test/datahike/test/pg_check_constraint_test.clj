@@ -47,6 +47,16 @@
       [:error (.getSQLState e)
        (.getMessage (.getServerErrorMessage ^org.postgresql.util.PSQLException e))])))
 
+(defn- rows
+  "All columns of every row, as strings."
+  [^Connection c sql]
+  (with-open [st (.createStatement c) rs (.executeQuery st sql)]
+    (let [n (.getColumnCount (.getMetaData rs))]
+      (loop [acc []]
+        (if (.next rs)
+          (recur (conj acc (mapv #(.getString rs (int %)) (range 1 (inc n)))))
+          acc)))))
+
 (defn- violation [constraint]
   [:error "23514" (str "new row for relation \"ck1\" violates check constraint \"" constraint "\"")])
 
@@ -339,3 +349,49 @@
       (is (= "25P02" (second (run c "SELECT 1"))))
       (.rollback c)
       (.setAutoCommit c true))))
+
+(deftest composite-primary-key-and-unique-are-enforced
+  ;; A multi-column PRIMARY KEY or UNIQUE was not enforced at all:
+  ;; duplicates went straight in where PostgreSQL raises 23505. The
+  ;; cause was a case-SENSITIVE comparison -- `(= "PRIMARY KEY"
+  ;; (.getType idx))` against JSqlParser's verbatim keyword text -- so
+  ;; the lower-case spelling everyone writes produced no PK, the derived
+  ;; tuple attribute that enforces it was never built, and it was absent
+  ;; from pg_constraint too. Single-column keys worked, which is why it
+  ;; survived: every test wrote one of those or wrote the keyword in
+  ;; upper case.
+  (with-open [c (jdbc)]
+    (doseq [[i spec] (map-indexed vector
+                                  ["x int, y int, primary key (x,y)"
+                                   "x int, y int, PRIMARY KEY (x,y)"
+                                   "x int, y int, Primary Key (x,y)"
+                                   "x int, y int, unique (x,y)"
+                                   "x int, y int, UNIQUE (x,y)"
+                                   "x int, y int, constraint pk1 primary key (x,y)"])]
+      (let [t (str "ck" i)]
+        (is (= 0 (run c (str "CREATE TABLE " t " (" spec ")"))) spec)
+        (is (= 1 (run c (str "INSERT INTO " t " VALUES (1,1)"))) spec)
+        (is (= "23505" (second (run c (str "INSERT INTO " t " VALUES (1,1)")))) spec)
+        (is (= 1 (run c (str "INSERT INTO " t " VALUES (1,2)")))
+            (str spec " -- a different key still goes in"))
+        (is (= ["2"] (run c (str "SELECT count(*) FROM " t))) spec)))))
+
+(deftest a-composite-key-is-in-pg_constraint
+  ;; It was absent entirely while a single-column key was there, because
+  ;; the derived tuple attribute is deliberately hidden from the column
+  ;; list the rows are built from.
+  (with-open [c (jdbc)]
+    (is (= 0 (run c "CREATE TABLE sp4 (x int PRIMARY KEY)")))
+    (is (= 0 (run c "CREATE TABLE sp5 (x int, y int, z int UNIQUE, PRIMARY KEY (x,y))")))
+    (is (= [["sp4_pkey" "p" "{1}" "PRIMARY KEY (x)"]
+            ["sp5_pkey" "p" "{1,2}" "PRIMARY KEY (x, y)"]
+            ["sp5_z_key" "u" "{3}" "UNIQUE (z)"]]
+           (rows c (str "SELECT conname, contype, conkey, pg_get_constraintdef(oid) "
+                        "FROM pg_constraint "
+                        "WHERE conrelid IN ('sp4'::regclass, 'sp5'::regclass) "
+                        "ORDER BY conname"))))
+    (testing "and a composite FK can reference it"
+      (is (= 0 (run c "CREATE TABLE sp6 (a int, b int, FOREIGN KEY (a,b) REFERENCES sp5 (x,y))")))
+      (is (= 1 (run c "INSERT INTO sp5 VALUES (1,1,9)")))
+      (is (= 1 (run c "INSERT INTO sp6 VALUES (1,1)")))
+      (is (= "23503" (second (run c "INSERT INTO sp6 VALUES (7,7)")))))))
