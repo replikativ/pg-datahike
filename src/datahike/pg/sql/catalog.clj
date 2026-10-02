@@ -667,6 +667,10 @@
      ;; reltype: the pg_type OID of this relation's composite row-type.
      ;; asyncpg joins composite pg_type → pg_class on `c.reltype = t.oid`.
      {:db/ident :pg_class/reltype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; `pg_tables.hastriggers` was populated and this was not, so
+     ;; `\d` -- and every tool that reads pg_class rather than the
+     ;; view -- saw no triggers on a table that has them.
+     {:db/ident :pg_class/relhastriggers :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_class") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_index"
@@ -792,6 +796,15 @@
      {:db/ident :pg_trigger/tgqual :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_trigger/tgoldtable :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_trigger/tgnewtable :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     ;; `tgattr` is int2vector in PostgreSQL; stored as its text form,
+     ;; like conkey/confkey above. It was absent, so `UPDATE OF b`
+     ;; reported no column list at all.
+     {:db/ident :pg_trigger/tgattr :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "int2vector"}
+     ;; The rendered `CREATE TRIGGER …`, the same pre-render trick
+     ;; pg_constraint uses for condef: `pg_get_triggerdef(oid)` lowers
+     ;; to a lookup of this. It was a `(constantly :__null__)` stub, so
+     ;; anything reconstructing DDL from the catalog lost every trigger.
+     {:db/ident :pg_trigger/tgdef :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_trigger") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_rewrite"
     ;; Empty: no rules (views do not yet carry their _RETURN rule object).
@@ -991,6 +1004,7 @@
      {:db/ident :information_schema_columns/is_identity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/identity_generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/is_generated :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/generation_expression :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/is_updatable :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "information_schema_columns") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "information_schema_tables"
@@ -1157,6 +1171,53 @@
                          [?e :datahike.pg.trigger/oid ?oid]
                          [?e :datahike.pg.trigger/spec ?spec]]}
                db))))
+
+(defn- trigger-attr-vector
+  "`tgattr`: the attnums of an `UPDATE OF a, b` column list, as the
+   int2vector text form PostgreSQL prints (space separated). Empty for a
+   trigger with no column list."
+  [db t]
+  (let [cols (:update-columns t)]
+    (if (empty? cols)
+      ""
+      (let [tbl-oid (pgs/table-oid db (:table t))
+            nums (keep (fn [c]
+                         (some-> (catalog-objects/column-by-name db tbl-oid c)
+                                 :datahike.pg.column/attnum))
+                       (sort cols))]
+        (str/join " " nums)))))
+
+(defn- render-triggerdef
+  "`pg_get_triggerdef(oid)`: the `CREATE TRIGGER` that would recreate
+   this trigger, rendered the way `pg_get_triggerdef_worker` does --
+   schema-qualified table, events joined by OR in PostgreSQL's own
+   order, and `EXECUTE FUNCTION`."
+  [db t]
+  (let [{:keys [name table timing level events arguments]} t
+        event-order ["insert" "delete" "update" "truncate"]
+        ev-name {"insert" "INSERT" "delete" "DELETE"
+                 "update" "UPDATE" "truncate" "TRUNCATE"}
+        evs (keep (fn [e]
+                    (when (some #(= e (clojure.core/name %)) events)
+                      (let [base (get ev-name e)]
+                        (if (and (= "update" e) (seq (:update-columns t)))
+                          (str base " OF " (str/join ", " (sort (:update-columns t))))
+                          base))))
+                  event-order)]
+    (str "CREATE "
+         (when (:constraint? t) "CONSTRAINT ")
+         "TRIGGER " name " "
+         (str/upper-case (clojure.core/name (or timing :after))) " "
+         (str/join " OR " evs)
+         " ON public." table
+         (when (or (:old-table t) (:new-table t))
+           (str " REFERENCING"
+                (when-let [o (:old-table t)] (str " OLD TABLE AS " o))
+                (when-let [n (:new-table t)] (str " NEW TABLE AS " n))))
+         " FOR EACH " (str/upper-case (clojure.core/name (or level :statement)))
+         (when (:when t) (str " WHEN (" (:when t) ")"))
+         " EXECUTE FUNCTION " (:function t) "("
+         (str/join ", " (map #(str "'" % "'") arguments)) ")")))
 
 (defn- explicit-index-descriptors [db]
   (if-not db
@@ -1391,12 +1452,20 @@
                                   :where [[?e :db/ident ?ident]
                                           [?e :pg/typmod ?typmod]]}
                                 cte-db)))
+          ;; `atthasdef` is true for a STORED generated column too --
+          ;; its expression lives in pg_attrdef, which is where pg_dump
+          ;; reads the generation clause from.
           default-idents (when cte-db
-                           (into #{}
+                           (into (into #{}
+                                       (map first)
+                                       (d/q '{:find [?ident]
+                                              :where [[?e :db/ident ?ident]
+                                                      [?e :pg/default-kind]]}
+                                            cte-db))
                                  (map first)
                                  (d/q '{:find [?ident]
                                         :where [[?e :db/ident ?ident]
-                                                [?e :pg/default-kind]]}
+                                                [?e :pg/generated-expr]]}
                                       cte-db)))]
       (into
        ;; composite-type fields: attrelid = the composite's pg_class oid
@@ -1717,21 +1786,23 @@
                           (d/q '{:find [?n]
                                  :where [[?e :datahike.pg.matview/name ?n]]}
                                cte-db))]
-       (mapv (fn [t]
-               (let [tbl-oid (or (pgs/table-oid cte-db t)
-                                 (Math/abs (.hashCode ^String t)))
-                     row-type (catalog-objects/object-by-identity
-                               cte-db catalog-objects/pg-type-oid
-                               catalog-objects/public-namespace-oid t)]
-                 {:pg_class/oid (long tbl-oid)
-                  :pg_class/relname t
-                  :pg_class/relnamespace 2200
-                  :pg_class/relkind (if (contains? matviews t) "m" "r")
-                  :pg_class/reltype
-                  (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                          (:datahike.pg.object/oid row-type) 0))
-                  (pgs/row-marker-attr "pg_class") true}))
-             (pgs/table-names user-schema)))
+       (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
+         (mapv (fn [t]
+                 (let [tbl-oid (or (pgs/table-oid cte-db t)
+                                   (Math/abs (.hashCode ^String t)))
+                       row-type (catalog-objects/object-by-identity
+                                 cte-db catalog-objects/pg-type-oid
+                                 catalog-objects/public-namespace-oid t)]
+                   {:pg_class/oid (long tbl-oid)
+                    :pg_class/relname t
+                    :pg_class/relnamespace 2200
+                    :pg_class/relkind (if (contains? matviews t) "m" "r")
+                    :pg_class/reltype
+                    (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                            (:datahike.pg.object/oid row-type) 0))
+                    :pg_class/relhastriggers (contains? triggered t)
+                    (pgs/row-marker-attr "pg_class") true}))
+               (pgs/table-names user-schema))))
      ;; Composite types get a distinct backing pg_class row (relkind 'c');
      ;; pg_type.typrelid and pg_class.reltype link the two identities.
      (into
@@ -1843,6 +1914,10 @@
              :pg_trigger/tginitdeferred false
              :pg_trigger/tgnargs (long (count arguments))
              :pg_trigger/tgqual (or (:when t) "")
+             :pg_trigger/tgattr (trigger-attr-vector cte-db t)
+             :pg_trigger/tgoldtable (or (:old-table t) "")
+             :pg_trigger/tgnewtable (or (:new-table t) "")
+             :pg_trigger/tgdef (render-triggerdef cte-db t)
              (pgs/row-marker-attr "pg_trigger") true})
           (trigger-entities cte-db))
     "pg_authid"
@@ -2089,6 +2164,15 @@
           ;; columns that don't apply to the type are simply absent (the
           ;; wire layer surfaces them as SQL NULL).
           drop-nils (fn [m] (into {} (remove (comp nil? val)) m))]
+      ;; The synthetic `db_id` column is listed here and NOT in
+      ;; pg_attribute, so the two catalogs disagree about a table's
+      ;; columns and every `ordinal_position` is one higher than
+      ;; PostgreSQL's -- `id` reports 2 where PostgreSQL says 1. It is
+      ;; not an accident: `SELECT db_id FROM t` works, and two tests
+      ;; asserting it (including `is_identity = YES` on it) were
+      ;; written deliberately. Which catalog should win is a design
+      ;; question, not a bug to fix in passing; see
+      ;; doc/review-backlog.md.
       (vec (for [[tname columns] table-columns
                  [idx col] (map-indexed vector
                                         (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
@@ -2133,7 +2217,13 @@
                :information_schema_columns/is_self_referencing    "NO"
                :information_schema_columns/is_identity            (if identity? "YES" "NO")
                :information_schema_columns/identity_generation    identity-generation
-               :information_schema_columns/is_generated           "NEVER"
+               ;; Hardcoded "NEVER", so information_schema reported a
+               ;; generated column as an ordinary one -- the view every
+               ;; portable tool reads instead of pg_attribute.
+               :information_schema_columns/is_generated
+               (if (:generated col) "ALWAYS" "NEVER")
+               :information_schema_columns/generation_expression
+               (or (:generated-expr col) "")
                :information_schema_columns/is_updatable           "YES"
                (pgs/row-marker-attr "information_schema_columns") true}))))
     "information_schema_tables"
@@ -2254,8 +2344,28 @@
                     [ident {:kind kind
                             :value (:pg/default-value p)
                             :arg (:pg/default-arg p)}])))
+          ;; A STORED generated column's expression lives in pg_attrdef
+          ;; too, and sets atthasdef -- that is where pg_dump reads the
+          ;; generation clause from. `:pg/generated-expr` is not a
+          ;; `:pg/default-kind`, so neither the rows nor the flag were
+          ;; produced and `pg_dump` emitted the column as a plain one,
+          ;; silently losing GENERATED ALWAYS AS.
+          generated-exprs
+          (when cte-db
+            (into {}
+                  (d/q '{:find [?ident ?expr]
+                         :where [[?e :db/ident ?ident]
+                                 [?e :pg/generated-expr ?expr]]}
+                       cte-db)))
+          defaults (reduce-kv (fn [m ident expr]
+                                (assoc m ident {:kind :generated :value expr}))
+                              defaults
+                              (or generated-exprs {}))
           render (fn [{:keys [kind value arg]} col]
                    (case kind
+                     ;; Already parenthesised by the DDL lowering, which
+                     ;; is the form `pg_get_expr` prints.
+                     :generated (str value)
                      :bit (str "'" value "'::\"bit\"")
                      :bit-coerced
                      (str "'" value "'::"
