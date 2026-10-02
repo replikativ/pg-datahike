@@ -2485,6 +2485,9 @@
          (resolve-value raw))))))
 
 (declare before-row-insert-triggers?)
+;; Defined with the DDL executors below; the DO-block branch above
+;; needs the same validation CREATE FUNCTION applies.
+(declare validate-plpgsql-body!)
 
 (defn- generated-column-values
   "Fill every `GENERATED ALWAYS AS (expr) STORED` column of `attrs` by
@@ -6586,8 +6589,30 @@
   (when (pos? (long (or (:ddl-version @tx-state) 0)))
     (invalidate-schema-cache!)))
 
+(defn- reject-nested-transaction-control!
+  "`COMMIT`/`ROLLBACK` inside a routine body, when the SESSION is in an
+   explicit transaction block, is 2D000 in PostgreSQL
+   (SPI_commit/_SPI_commit, `invalid transaction termination`).
+
+   Not inside one it is legal, and that half already worked: a DO block
+   in autocommit may commit and start a new transaction, and a ROLLBACK
+   in it discards its own writes. What did not work is the explicit
+   case -- `BEGIN; … DO $$ … COMMIT; … $$; … ROLLBACK;` committed the
+   CALLER's transaction, so the client's ROLLBACK then undid nothing
+   and every row survived."
+  [tx-state verb]
+  (when (and *nested-statement?*
+             (:in-tx? @tx-state)
+             (not (:implicit? @tx-state)))
+    (throw (errors/pg-error
+            :invalid-transaction-termination
+            {:message "invalid transaction termination"
+             :sqlstate "2D000"
+             :verb verb}))))
+
 (defn- handle-commit
   [{:keys [conn session-id tx-state cursors temp-tables]} _parsed]
+  (reject-nested-transaction-control! tx-state "COMMIT")
   (if (:in-tx? @tx-state)
     (if (:aborted? @tx-state)
       ;; PostgreSQL accepts COMMIT in a failed transaction, discards all
@@ -6611,6 +6636,7 @@
 
 (defn- handle-rollback
   [{:keys [session-id tx-state cursors temp-tables]} _parsed]
+  (reject-nested-transaction-control! tx-state "ROLLBACK")
   (invalidate-rolled-back-ddl! tx-state)
   (restore-temp-tables! tx-state temp-tables)
   (end-tx! session-id tx-state cursors)
@@ -7455,7 +7481,14 @@
                 (when (> params/*routine-depth* 32)
                   (throw (ex-info "stack depth limit exceeded"
                                   {:sqlstate "54001" :error :stack-depth})))
-                (pl-exec/run-body handler (pl-parse/parse-body body) [] false {}))
+                ;; The same gate CREATE FUNCTION uses. This called
+                ;; `parse-body` directly, so a construct the executor
+                ;; cannot run was silently DROPPED here while CREATE
+                ;; FUNCTION refused it with 0A000 -- most visibly an
+                ;; EXCEPTION handler, where the difference is not
+                ;; cosmetic: the error the handler was written to catch
+                ;; escaped to the client instead.
+                (pl-exec/run-body handler (validate-plpgsql-body! body) [] false {}))
               (PgWireServer$QueryResult/empty "DO"))))
         (catch clojure.lang.ExceptionInfo e
           (classified-error "" e))
