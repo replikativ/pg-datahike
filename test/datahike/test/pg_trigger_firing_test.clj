@@ -221,3 +221,29 @@
         (is (= "0A000" (state-of c (str "CREATE FUNCTION fe() RETURNS void "
                                         "LANGUAGE plpgsql AS $$ " body " $$"))))))
     (is (= [] (col1 c "SELECT a FROM de")))))
+
+(deftest the-catalog-can-reconstruct-a-trigger
+  ;; `pg_get_triggerdef` was a `(constantly :__null__)` stub, so
+  ;; anything reconstructing DDL from the catalog lost every trigger.
+  ;; `pg_class.relhastriggers` was NULL while `pg_tables.hastriggers`
+  ;; was right -- and `\d` reads the former. `tgattr` was absent, so an
+  ;; `UPDATE OF` column list was invisible.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE kt (id int PRIMARY KEY, a int)")
+    (trigfn! c "ktf" "BEGIN RETURN NEW; END")
+    (exec! c (str "CREATE TRIGGER kt_t AFTER UPDATE OF a ON kt "
+                  "FOR EACH ROW EXECUTE FUNCTION ktf()"))
+    (is (= ["t"] (col1 c "SELECT relhastriggers FROM pg_class WHERE relname = 'kt'")))
+    (is (= ["2"] (col1 c "SELECT tgattr FROM pg_trigger WHERE tgrelid = 'kt'::regclass")))
+    (is (= [(str "CREATE TRIGGER kt_t AFTER UPDATE OF a ON public.kt "
+                 "FOR EACH ROW EXECUTE FUNCTION ktf()")]
+           (col1 c (str "SELECT pg_get_triggerdef(oid) FROM pg_trigger "
+                        "WHERE tgrelid = 'kt'::regclass"))))
+    (testing "a statement-level multi-event trigger, with the events in
+              PostgreSQL's own order rather than the order written"
+      (exec! c (str "CREATE TRIGGER kt_s AFTER DELETE OR INSERT ON kt "
+                    "FOR EACH STATEMENT EXECUTE FUNCTION ktf()"))
+      (is (= [(str "CREATE TRIGGER kt_s AFTER INSERT OR DELETE ON public.kt "
+                   "FOR EACH STATEMENT EXECUTE FUNCTION ktf()")]
+             (col1 c (str "SELECT pg_get_triggerdef(oid) FROM pg_trigger "
+                          "WHERE tgname = 'kt_s'")))))))

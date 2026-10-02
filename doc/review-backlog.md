@@ -121,16 +121,25 @@ reproduced and should be measured before it is believed.
   then fail at run time with `relation "nr" does not exist`. Either wire
   `:transitions` through `fire-after-row-triggers!` or reject the DDL.
 
+## A design question, not a defect
+
+### `information_schema.columns` lists `db_id`; `pg_attribute` does not
+The synthetic `db_id` column — Datahike's entity id, and `SELECT db_id
+FROM t` really works — is prepended to `information_schema.columns` and
+absent from `pg_attribute`. So the two catalogs disagree about a table's
+columns, and every `ordinal_position` is one higher than PostgreSQL's:
+`id` reports 2 where PostgreSQL says 1, for every table.
+
+Hiding it from `information_schema` makes both catalogs agree and
+matches PostgreSQL's ordinals, and two tests fail — including one
+asserting `is_identity = YES` on `db_id`, which was written on purpose.
+Listing it in `pg_attribute` instead makes them agree the other way and
+keeps a column PostgreSQL has no equivalent for. Either is defensible
+and it changes what tools see, so it wants a decision rather than a
+drive-by fix.
+
 ## Catalog honesty
 
-- **`pg_attrdef`/`pg_get_expr` are empty for a generated column**, so
-  `pg_dump` loses the generation clause entirely.
-- **`information_schema.columns.is_generated`** is hardcoded `"NEVER"`.
-- **`pg_get_triggerdef`** returns NULL for every trigger.
-- **`pg_class.relhastriggers`** is NULL while `pg_tables.hastriggers`
-  is correct — `\d` and many tools read the former.
-- **`tgattr`** is empty for `UPDATE OF b`; `tgoldtable`/`tgnewtable`
-  are NULL for a trigger that declares transition tables.
 - **`pg_proc` holds no user functions.**
 - **The geometric catalog advertises ~25 FUNCTIONS (`area`, `center`,
   `diameter`, `npoints`, …) and the `<->` distance operator, none of

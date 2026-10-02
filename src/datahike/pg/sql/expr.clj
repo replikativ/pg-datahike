@@ -1749,6 +1749,20 @@
                [con-eid :pg_constraint/condef result-var])
         result-var)
 
+      ;; pg_get_triggerdef(oid [, pretty]) — same pattern again. It was
+      ;; a `(constantly :__null__)` stub, so anything reconstructing
+      ;; DDL from the catalog lost every trigger.
+      (= fname "pg_get_triggerdef")
+      (let [arg-oid (or (first args) :__null__)
+            trg-eid (ctx/fresh-var! ctx)]
+        (swap! (:where-clauses ctx) conj
+               [trg-eid :pg_trigger/db-row-exists true])
+        (swap! (:where-clauses ctx) conj
+               [trg-eid :pg_trigger/oid arg-oid])
+        (swap! (:where-clauses ctx) conj
+               [trg-eid :pg_trigger/tgdef result-var])
+        result-var)
+
       ;; pg_typeof(value) — PG returns regtype (text-formatted as
       ;; the type name). We resolve it at translate time using the
       ;; expression's inferred OID so the result is a constant

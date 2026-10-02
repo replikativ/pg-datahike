@@ -137,3 +137,33 @@
     (is (re-find #"virtual generated column \"b\" is not supported"
                  (message-of c (str "CREATE TABLE gv (a int, b int "
                                     "GENERATED ALWAYS AS (a+1) VIRTUAL)"))))))
+
+(deftest the-catalog-carries-the-generation-clause
+  ;; `pg_attrdef` was empty and `atthasdef` false for a generated
+  ;; column, which is where `pg_dump` reads the generation clause from
+  ;; -- so a dump emitted the column as an ordinary one and silently
+  ;; lost GENERATED ALWAYS AS. `information_schema.columns.is_generated`
+  ;; was hardcoded "NEVER", which is the view every portable tool reads
+  ;; instead of pg_attribute.
+  (with-open [c (jdbc)]
+    (exec! c (str "CREATE TABLE kt (id int PRIMARY KEY, a int, "
+                  "g int GENERATED ALWAYS AS (a*2) STORED, d int DEFAULT 7)"))
+    (testing "pg_attribute.attgenerated was already right; atthasdef was not"
+      (is (= [["id" "" "f"] ["a" "" "f"] ["g" "s" "t"] ["d" "" "t"]]
+             (rows c (str "SELECT attname, attgenerated, atthasdef FROM pg_attribute "
+                          "WHERE attrelid = 'kt'::regclass AND attnum > 0 "
+                          "ORDER BY attnum")))))
+    (testing "the expression is in pg_attrdef, parenthesised as pg_get_expr prints it"
+      (is (= [["g" "(a * 2)"] ["d" "7"]]
+             (rows c (str "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) "
+                          "FROM pg_attrdef d JOIN pg_attribute a "
+                          "ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
+                          "WHERE d.adrelid = 'kt'::regclass ORDER BY a.attnum")))))
+    (testing "and information_schema agrees"
+      (is (= [["g" "ALWAYS" "(a * 2)"]]
+             (rows c (str "SELECT column_name, is_generated, generation_expression "
+                          "FROM information_schema.columns "
+                          "WHERE table_name = 'kt' AND is_generated = 'ALWAYS'"))))
+      (is (= [["NEVER"]]
+             (rows c (str "SELECT is_generated FROM information_schema.columns "
+                          "WHERE table_name = 'kt' AND column_name = 'a'")))))))
