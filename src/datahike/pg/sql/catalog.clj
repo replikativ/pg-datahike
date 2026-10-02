@@ -2549,6 +2549,43 @@
            :pg_constraint/confkey       "{}"
            :pg_constraint/condef        condef
            (pgs/row-marker-attr "pg_constraint") true})
+        ;; COMPOSITE PRIMARY KEY / UNIQUE rows. These live on a derived
+        ;; `pg$pk_tuple` / `pg$unique_tuple_N` attribute, which is
+        ;; deliberately hidden from `columns` -- so the per-column loop
+        ;; above produced no row for them and a composite key was absent
+        ;; from pg_constraint entirely, while a single-column one was
+        ;; there. The name is re-derived rather than read back: the
+        ;; lowering computes `<table>_pkey` / `<table>_<cols>_key` and
+        ;; does not persist it, so an EXPLICITLY named composite
+        ;; constraint still reports the default name.
+        (for [[a props] (sort-by (comp str key) user-schema)
+              :when (and (keyword? a)
+                         (seq (:db/tupleAttrs props))
+                         (:db/unique props))
+              :let [tname (namespace a)
+                    cols (mapv name (:db/tupleAttrs props))
+                    primary? (= :db.unique/identity (:db/unique props))
+                    contype (if primary? "p" "u")
+                    cname (if primary?
+                            (str tname "_pkey")
+                            (str tname "_" (str/join "_" cols) "_key"))
+                    tbl-oid (or (pgs/table-oid cte-db tname)
+                                (Math/abs (.hashCode ^String tname)))
+                    attnums (keep #(attnum-for tname %) cols)]]
+          {:pg_constraint/oid           (long (->oid contype cname tname))
+           :pg_constraint/conname       cname
+           :pg_constraint/contype       contype
+           :pg_constraint/conrelid      (long tbl-oid)
+           :pg_constraint/connamespace  2200
+           :pg_constraint/confrelid     0
+           :pg_constraint/condeferrable false
+           :pg_constraint/condeferred   false
+           :pg_constraint/convalidated  true
+           :pg_constraint/conkey        (->conkey attnums)
+           :pg_constraint/confkey       "{}"
+           :pg_constraint/condef        (str (if primary? "PRIMARY KEY (" "UNIQUE (")
+                                             (str/join ", " cols) ")")
+           (pgs/row-marker-attr "pg_constraint") true})
         ;; CHECK constraints — one row per persisted :pg/check-*.
         (for [{cname :name tname :table cexpr :expr} checks
               :let [tbl-oid (or (pgs/table-oid cte-db tname)

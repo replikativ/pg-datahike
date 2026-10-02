@@ -86,33 +86,21 @@ reproduced and should be measured before it is believed.
 
 ## Wrong answers, contained, not yet done
 
-- **Every COMPOSITE PRIMARY KEY and UNIQUE constraint is unenforced.**
-  Found while adding the FK unique-constraint check. A multi-column key
-  leaves no trace at all — not in the schema, not in `pg_constraint`,
-  not in `pg_indexes` — and duplicates go straight in:
-
-  ```
-  create table t (x int, y int, primary key (x,y));
-  insert into t values (1,1);
-  insert into t values (1,1);   -- accepted; PostgreSQL raises 23505
-  select count(*) from t;       -- 2
-  ```
-
-  Single-column PK and UNIQUE both work. `ddl.clj` HAS the machinery
-  (`multi-pk-tuple`, `multi-uniques`, `pg$pk_tuple`), so something
-  upstream is not producing `:pk-cols`/`:uniques` for the table-level
-  form, or the derived tuple attrs are built and never transacted. This
-  is the largest single wrong answer left in this file and wants its own
-  investigation.
-
-  It is also why the new FK check is scoped to SINGLE-column references:
-  a composite reference cannot be judged, and refusing it would be a new
-  wrong answer.
-
 - **`NOT VALID` is still a parse error** (`ALTER TABLE … ADD CHECK (…)
   NOT VALID`). `VALIDATE CONSTRAINT` is implemented, so only the
   deferred-validation half is missing.
 - **`EXECUTE` with a missing argument** substitutes a literal NULL.
+- **A unique violation does not name its constraint.** `ERROR: unique
+  violation` where PostgreSQL says
+  `duplicate key value violates unique constraint "t_pkey"` with a
+  `DETAIL: Key (x, y)=(1, 1) already exists.` Pre-existing for
+  single-column keys as well as composite ones, and the same family as
+  the FK and CHECK message gaps below.
+- **An explicitly named COMPOSITE constraint reports the default name.**
+  `CONSTRAINT pk1 PRIMARY KEY (x,y)` appears in `pg_constraint` as
+  `t_pkey`: the lowering computes the name and does not persist it on
+  the derived tuple attribute, so the catalog re-derives PostgreSQL's
+  default.
 
 - **3 of PostgreSQL's 21 `&&`/`@>`/`<@` geometric pairs are
   unimplemented** — polygon-to-polygon overlap and containment, which
