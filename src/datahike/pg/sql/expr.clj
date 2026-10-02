@@ -2637,16 +2637,21 @@
       (let [tmpl-arg (first args)
             value-args (vec (rest args))
             ;; Quote-an-identifier per PG: wrap in "..", escape internal "
+            ;; `fns/pg-str`, not `str`, at all three sites: `format`
+            ;; renders through the value's OUTPUT function, so a bytea
+            ;; is `\x61ff` and a timestamp is PostgreSQL's spelling.
+            ;; `str` gave `[B@2e349857` for the first and a JVM debug
+            ;; string for the second.
             quote-id  (fn [^Object v]
                         (let [s (cond (nil? v) ""
                                       (string? v) v
-                                      :else (str v))]
+                                      :else (fns/pg-str v))]
                           (str \" (str/replace s "\"" "\"\"") \")))
             ;; Quote-a-literal per PG: wrap in '..', escape '
+            ;; `%L` IS quote_literal, including its E'…' rule for a
+            ;; backslash -- one implementation, not a second copy.
             quote-lit (fn [^Object v]
-                        (if (nil? v)
-                          "NULL"
-                          (str \' (str/replace (str v) "'" "''") \')))
+                        (if (nil? v) "NULL" (fns/sql-quote-literal v)))
             apply-fmt (fn [tmpl values]
                         (let [n (count tmpl)
                               sb (StringBuilder.)]
@@ -2660,7 +2665,9 @@
                                     (case spec
                                       \%  (do (.append sb \%)
                                               (recur (+ i 2) vs))
-                                      \s  (do (.append sb (str (first vs)))
+                                      \s  (do (.append sb (if (nil? (first vs))
+                                                            ""
+                                                            (fns/pg-str (first vs))))
                                               (recur (+ i 2) (rest vs)))
                                       \I  (do (.append sb ^String (quote-id (first vs)))
                                               (recur (+ i 2) (rest vs)))

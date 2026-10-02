@@ -1515,6 +1515,11 @@
     (and (some? v)
          (= "datahike.pg.bits.PgBit" (.getName (class v))))
     (if (:varying? v) oid-varbit oid-bit)
+    ;; `byte[]` is bytea. Without this it fell to the :else text
+    ;; branch, so anything that renders a value by its inferred type --
+    ;; `string_agg` over a bytea column, for one -- got `[B@2e349857`,
+    ;; the array's Java identity, different on every run.
+    (instance? (Class/forName "[B") v) oid-bytea
     (instance? (Class/forName "[F") v) oid-vector
     (instance? clojure.lang.Ratio v) oid-float8
     (instance? Long v)    oid-int8
@@ -1832,6 +1837,18 @@
      (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
      (or (instance? Float v) (instance? Double v))
      (float->pg-text v (instance? Float v))
+     ;; `byteaout`: `\x` and lowercase hex, which is bytea_output's
+     ;; default. There was no branch, so a byte[] fell to `(str v)` and
+     ;; rendered as its Java identity.
+     (instance? (Class/forName "[B") v)
+     (let [^bytes b v
+           sb (StringBuilder. (+ 2 (* 2 (alength b))))]
+       (.append sb "\\x")
+       (dotimes [i (alength b)]
+         (let [x (bit-and (long (aget b i)) 0xff)]
+           (.append sb (if (< x 16) "0" ""))
+           (.append sb (Long/toHexString x))))
+       (.toString sb))
      :else (or (temporal->pg-text v src-oid) (str v)))))
 
 (defn decimal-literal
