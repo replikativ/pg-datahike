@@ -57,6 +57,26 @@ and `NEW.<generated>` is visible to a BEFORE trigger where PostgreSQL
 guarantees NULL. `ON CONFLICT DO UPDATE` never recomputes a generated
 column either, and accepts a literal assignment to one.
 
+### plpgsql EXCEPTION handlers need subtransactions
+`DO` and `CREATE FUNCTION` both refuse a body with an EXCEPTION handler
+(0A000) since #278 made them consistent. The parser already produces
+`:exception-handlers` with their conditions and bodies, a condition-name
+to SQLSTATE table already exists for `RAISE`, and errors already travel
+as ExceptionInfo with a `:sqlstate` — so catching and dispatching is a
+small change.
+
+**It would be a wrong answer without subtransaction rollback.** Entering
+a handler rolls back what the block did, and `mvcc.sql` tests exactly
+that: the block inserts 100 rows, raises, and the handler swallows it,
+after which the file asserts those rows do **not** exist. A handler that
+runs without rolling back leaves them, which is worse than the refusal —
+it is the silent wrong answer this campaign exists to remove.
+
+So this is gated on a savepoint/subtransaction mechanism, not on the
+handler itself. It costs one exact-match file (`mvcc`, 100.0 → 90.5 when
+the refusal replaced silently dropping the handler) and is the largest
+single agreement item left.
+
 ### The datetime tokeniser
 A 855-pair sweep (171 literals × 5 targets) against the oracle found
 **262 divergences**. They are not independent: `trailing-zone-re`,
