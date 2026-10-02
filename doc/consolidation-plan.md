@@ -112,6 +112,79 @@ Moved out of Phase 0:
 - **Recursive CTE `UNION ALL` deduplicates.** Execution is a Datalog rule, and set semantics are built in. Keeping duplicates needs a working-table loop, a rewrite of its own, so it becomes a separate item after Phase 1.
 - **Binary results carrying text bytes.** Binary encoding re-parses the stringified value. The real fix is the per-type binary send in Phase 1.2; until then, stop advertising binary for types without a correct send.
 
+## The October 2026 review round (closed)
+
+Eight review agents read the work of PRs #247-#268 against
+`.internal/postgres-REL_17_7/src/`, each with an oracle to diff against.
+They found ~90 defects, most of them silent wrong answers, and
+considerably more than my own verification had: my sweeps checked *values
+on the paths I thought of*, and missed statement shapes (ON CONFLICT,
+RETURNING, COPY), operator surfaces, catalog shape, what PostgreSQL
+*rejects*, and the array variant of a new type.
+
+Closed in #270-#292, each verified statement-by-statement against the
+pinned oracle:
+
+- **#270** arrays of the geometric and MAC types -- a regression the
+  type work introduced.
+- **#271** `bytea` input (`byteain`, both formats) and `::bytea` no
+  longer a no-op; `md5(bytea)` stopped hashing a Java identity.
+- **#272** the geometric coordinate scanner (`pair_decode` /
+  `path_decode`, replacing three regexes), and the comparison surface:
+  PostgreSQL has **no btree opclass** for any geometric type, so `=`,
+  `<`, ORDER BY, DISTINCT and GROUP BY were all answering by text order.
+- **#273** cursors over the extended protocol: `FETCH` described NoData
+  so every JDBC cursor read failed, and `MOVE ALL` re-ran its own plan.
+- **#274** `agg(DISTINCT x)` for every aggregate, not just `count`;
+  `bool_or` did not exist.
+- **#275** six trigger firing bugs, including `OLD` in an INSERT trigger
+  raising and `NEW` bound to `OLD` on a DELETE.
+- **#276** `ALTER TABLE DROP CONSTRAINT` was a no-op; an aggregate with a
+  constant beside it returned zero rows over an empty relation.
+- **#277** `ON DELETE CASCADE` on the path the wire takes.
+- **#278** `COMMIT` inside a `DO` block committed the caller's
+  transaction.
+- **#279** COPY: the CSV end-of-data marker, generated columns in COPY
+  TO, and all eighteen of `ProcessCopyOptions`' cross-option checks --
+  without which a rejected option still entered COPY mode and ate the
+  following statements.
+- **#280** geometric `&&`, `@>`, `<@`: 18 of PostgreSQL's 21 pairs
+  implemented, the other 3 refused rather than answering `false`.
+- **#284** the catalog's generation clause (`pg_dump` was losing
+  `GENERATED ALWAYS AS` entirely) and `pg_get_triggerdef`.
+- **#288** bytea renders through `byteaout` everywhere;
+  `quote_literal` escapes a backslash.
+- **#289** five things ALTER accepted: the generated CHECK name, the FK
+  unique-constraint check, `VALIDATE CONSTRAINT`, duplicate
+  PREPARE/DECLARE names, and a system-handler error not aborting its
+  transaction.
+- **#290** **composite PRIMARY KEY and UNIQUE were not enforced at all**
+  -- found while scoping #289, not by the review. One case-sensitive
+  comparison against a JSqlParser keyword.
+- **#291** constraint violations name their constraint and carry
+  PostgreSQL's DETAIL.
+- **#292** a self-recursive trigger killed the connection; `TG_RELID`,
+  `DROP FUNCTION` dependency checking, row-level transition tables.
+
+What the round did **not** close is in `doc/review-backlog.md`, with what
+each item costs and why it was deferred. The four largest are the
+datetime tokeniser (262 divergences in an 855-pair sweep, all of them a
+token three regexes cannot spell), COPY FROM not firing triggers,
+`ON CONFLICT`'s UPDATE-side triggers, and generated columns computing
+before BEFORE-ROW triggers.
+
+Two process lessons, both now in memory:
+
+- **One protocol tested, two served** accounted for FOUR of the findings.
+  In each the in-process handler path worked and the wire path did not,
+  and in two of them an existing test passed while the feature was
+  broken. For anything with two execution paths, test the one a client
+  uses.
+- **`tools/rl.sh` was missing 18 namespaces.** An edit to one of them
+  reloads into nothing, which is indistinguishable from a wrong fix. It
+  cost real time twice in one session before I checked the tool rather
+  than the code.
+
 ## Phase 1 — one value registry (finish #179)
 
 Target (value-layer audit §5): per-OID `{:in :out :text :recv :send :compare :storage :typmod}` and one `resolve-type-name`. Shippable steps:
@@ -138,7 +211,17 @@ A `PgInterval` carrier (months, days, micros) with input, output, compare and ar
 
 ## Phase 3 — bytea end to end
 
-Four fixes: the literal-cast fold, the column OID (17, not text), a strict `bytea-in` (hex and escape formats), and byte[] arms in the text functions and `->pg-text`. Then encode/decode, sha2, get/set_byte, convert_*. Every driver reading bytea is affected, so this needs the client suites plus a dump round-trip.
+**Mostly done, in #271 and #288.** The strict `bytea-in` (both formats,
+with `hex_decode_safe`'s whitespace and SQLSTATE rules) is in; the
+literal cast is no longer a no-op; `->pg-text` has a `byteaout` arm and
+`infer-oid-from-value` calls a `byte[]` bytea, so `string_agg`,
+`format('%s')` and `quote_literal` all render it correctly instead of
+printing a Java identity. encode/decode and the sha2 family already
+landed with #260.
+
+What remains: the **column** OID still reports text rather than 17, and
+`get_byte`/`set_byte`/`convert_*` are unimplemented. Those two want the
+client suites plus a dump round-trip, as this phase always said.
 
 ## Phase 4 — signature registry and resolvers
 
