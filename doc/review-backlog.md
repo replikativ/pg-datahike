@@ -116,9 +116,6 @@ reproduced and should be measured before it is believed.
 - **Every generated-column restriction is unenforced**, including one
   that makes the same schema give different answers depending on column
   order.
-- **Row-level transition tables** are accepted at CREATE TRIGGER and
-  then fail at run time with `relation "nr" does not exist`. Either wire
-  `:transitions` through `fire-after-row-triggers!` or reject the DDL.
 
 ## A design question, not a defect
 
@@ -146,10 +143,6 @@ drive-by fix.
   `box_intersect` and the rest, loaded from the generated data. A
   client that resolves through the catalog acts on a promise we do not
   keep.
-- **`TG_TABLE_SCHEMA` and `TG_RELID`** are not bound (42703).
-- **`DROP FUNCTION f()` succeeds while a trigger depends on it**
-  (PostgreSQL: 2BP01 naming the trigger); the next INSERT then dies
-  with 42883.
 - Error-text detail, what remains: plpgsql errors carry no `CONTEXT:`
   line, and COPY FROM errors carry no `CONTEXT: COPY t, line N` -- both
   compared by pg_regress. The unique / FK / NOT NULL / CHECK messages
