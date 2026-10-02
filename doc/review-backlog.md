@@ -89,10 +89,6 @@ reproduced and should be measured before it is believed.
 - **`&&`, `@>`, `<@` on geometric values return a bare `f`** —
   `expr.clj`'s array/jsonb fall-through. `'(0,0),(1,1)'::box &&
   '(0,0),(2,2)'::box` is `t` in PostgreSQL.
-- **`ALTER TABLE … DROP CONSTRAINT` is a silent no-op** (`sql.clj`
-  maps every non-column DROP to `{:op :drop}`). Harmless before
-  constraints could be added; now a constraint can be added and never
-  removed. No 42704 for an unknown name either.
 - **`ON DELETE CASCADE` is not applied** — `DELETE FROM parent`
   succeeds and leaves the child row behind, silently creating orphans.
 - **`COMMIT` inside a `DO` block commits the caller's transaction**;
@@ -109,8 +105,6 @@ reproduced and should be measured before it is believed.
   `array_agg(v)` over 1,2,2,5 answers `{5,1,2,2}`. PostgreSQL does not
   guarantee an order without ORDER BY, but it returns scan order and the
   regress suite compares text.
-- **`select 'x', count(*) from <empty table>`** returns 0 rows instead
-  of 1.
 - **`string_agg` over bytea** emits `[B@2e349857`.
 - **The generated CHECK name is wrong for the single-column ALTER
   case** — `ChooseConstraintName` uses `<table>_<col>_check` when the

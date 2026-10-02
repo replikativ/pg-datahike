@@ -2014,6 +2014,37 @@
                                     ") is not present in table \""
                                     parent-table "\".")})))))
 
+(defn- dropped-constraint-tx
+  "`ALTER TABLE t DROP CONSTRAINT c` -- retract the CHECK or FOREIGN KEY
+   entity named `c` on `t`, or raise 42704 when there is none.
+
+   This was a compatibility no-op, which was harmless while ALTER could
+   not ADD a constraint either. Once it could, a constraint could be
+   added and never removed: rows PostgreSQL accepts stayed refused, and
+   an unknown name answered ALTER TABLE instead of
+   `constraint \"x\" of relation \"t\" does not exist`."
+  [db table {:keys [name if-exists?]}]
+  (let [eids (into (d/q '{:find [[?e ...]]
+                          :in [$ ?tbl ?n]
+                          :where [[?e :pg/check-table ?tbl]
+                                  (or-join [?e ?n]
+                                           [?e :pg/check-conname ?n]
+                                           [?e :pg/check-name ?n])]}
+                        db table name)
+                   (d/q '{:find [[?e ...]]
+                          :in [$ ?tbl ?n]
+                          :where [[?e :pg/fk-child-table ?tbl]
+                                  (or-join [?e ?n]
+                                           [?e :pg/fk-conname ?n]
+                                           [?e :pg/fk-name ?n])]}
+                        db table name))]
+    (cond
+      (seq eids) (mapv (fn [e] [:db/retractEntity e]) eids)
+      if-exists? []
+      :else (throw (ex-info (str "constraint \"" name "\" of relation \""
+                                 table "\" does not exist")
+                            {:error :undefined-object :sqlstate "42704"})))))
+
 (defn- added-constraint-tx
   "The constraint entity an `ALTER TABLE ... ADD` writes -- the same shape
    CREATE TABLE writes, so the two spellings cannot drift apart -- after
@@ -8281,16 +8312,16 @@
             ;; returns zero rows. The earlier always-on default
             ;; synthesis turned `WHERE …→ 0 rows GROUP BY status`
             ;; into a single bogus `[null, 0]` row.
-            find-elems (:find query)
-            all-aggregates? (and (seq find-elems)
-                                 (every? (fn [elem]
-                                           (and (seq? elem)
-                                                (symbol? (first elem))))
-                                         find-elems))
-            results (or (when (and has-aggregates?
-                                   all-aggregates?
-                                   (empty? (seq results)))
-                          (expr/empty-aggregate-row query))
+            ;; `empty-aggregate-row` applies the rule and builds the
+            ;; row; it answers nil when a grouping column is present,
+            ;; which is the case that must stay at zero rows. The
+            ;; `all-aggregates?` pre-test duplicated a WEAKER version of
+            ;; that rule -- it had no way to tell a constant from a
+            ;; grouping column, because a constant reaches `:find` as a
+            ;; var bound by `[(identity "x") ?v1]` -- so `SELECT 'x',
+            ;; count(*) FROM t WHERE false` answered zero rows.
+            results (or (when (and has-aggregates? (empty? (seq results)))
+                          (expr/empty-aggregate-row query in-args))
                         results)
             ;; Volatile ORDER BY expressions belong below Sort and are
             ;; evaluated for every input row, including rows later removed by
@@ -11522,12 +11553,16 @@
                   taken (atom (into #{} (map :constraint)
                                     (concat (:checks existing) (:fks existing))))]
               (vec (mapcat (fn [{:keys [op] :as operation}]
-                             (when (contains? #{:add-check :add-foreign-key} op)
+                             (cond
+                               (contains? #{:add-check :add-foreign-key} op)
                                (let [tx (added-constraint-tx db table @taken operation)]
                                  (swap! taken into (keep (some-fn :pg/check-conname
                                                                   :pg/fk-conname))
                                         tx)
-                                 tx)))
+                                 tx)
+
+                               (= :drop-constraint op)
+                               (dropped-constraint-tx db table operation)))
                            operations)))
             attnum-data
             (when first-attnum

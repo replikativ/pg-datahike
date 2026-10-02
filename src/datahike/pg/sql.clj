@@ -2475,6 +2475,18 @@
                                           {:op :rename-column
                                            :old-name (unquote-ident (.getColumnOldName exp))
                                            :new-name (unquote-ident (.getColumnName exp))}
+                                ;; DROP CONSTRAINT. This fell into the
+                                ;; compatibility no-op below, which was
+                                ;; harmless while ALTER could not ADD a
+                                ;; constraint either -- now a constraint
+                                ;; can be added and never removed, so
+                                ;; rows PostgreSQL accepts are refused
+                                ;; forever.
+                                          (and (= op "DROP")
+                                               (.getConstraintName exp))
+                                          {:op :drop-constraint
+                                           :name (unquote-ident (.getConstraintName exp))
+                                           :if-exists? (.isUsingIfExists exp)}
                                 ;; Other DROP forms remain compatibility no-ops.
                                           (= op "DROP") {:op :drop}
                                 ;; ALTER (SET NOT NULL, TYPE change, etc.) — no-op
