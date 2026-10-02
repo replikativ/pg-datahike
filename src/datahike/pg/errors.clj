@@ -310,6 +310,19 @@
    ;; an explicit transaction block (SPI_commit, `invalid transaction
    ;; termination`).
    ;; A PREPARE naming a statement that already exists.
+   ;; A routine or trigger body nested past `routine-depth-limit`.
+   ;; PostgreSQL's own is `max_stack_depth`, and it keeps the session --
+   ;; an unguarded recursion here killed the connection instead.
+   ;; DROP of an object another object depends on (2BP01). The DETAIL
+   ;; names the dependents, as `reportDependentObjects` does.
+   :dependent-objects-still-exist
+   {:sqlstate "2BP01"
+    :format (fn [{:keys [message]}] message)}
+
+   :stack-depth-exceeded
+   {:sqlstate "54001"
+    :format (fn [{:keys [message]}] (or message "stack depth limit exceeded"))}
+
    :duplicate-prepared-statement
    {:sqlstate "42P05"
     :format (fn [{:keys [message detail]}] (or message detail))}

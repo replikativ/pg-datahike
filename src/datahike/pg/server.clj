@@ -2699,7 +2699,11 @@
 
 ;; The trigger and function registries are read here but defined with
 ;; the rest of the routine DDL, further down.
-(declare table-triggers functions-by-name+arity)
+(declare table-triggers all-triggers functions-by-name+arity)
+;; Defined with the statement-trigger machinery below; `run-one-trigger`
+;; needs it too, now that a ROW-level trigger may declare transition
+;; tables.
+(declare trigger-transitions)
 
 (defn- row-entity->columns
   "A candidate entity map as `{column value}`, dropping the internal
@@ -2790,12 +2794,19 @@
               {:message (str "function " (:function t) "() does not exist")})))
     (pl-parse/parse-body (:datahike.pg.function/body fn-ent))))
 
-(defn- tg-vars [t table-name event]
+(defn- tg-vars [t table-name event relid]
   {"tg_name" (:name t)
    "tg_when" (str/upper-case (name (:timing t)))
    "tg_level" (str/upper-case (name (:level t)))
    "tg_op" (str/upper-case (name event))
    "tg_table_name" table-name
+   ;; `TG_TABLE_SCHEMA` and `TG_RELID` were not bound at all, so a body
+   ;; mentioning either died with `column "tg_table_schema" does not
+   ;; exist` -- the name fell through to SQL resolution. Everything is
+   ;; in `public` here, and TG_RELID is the table's pg_class oid, which
+   ;; is what a body passes to `regclass` or joins on.
+   "tg_table_schema" "public"
+   "tg_relid" (long (or relid 0))
    "tg_nargs" (count (:arguments t))
    "tg_argv" (vec (:arguments t))})
 
@@ -2813,18 +2824,46 @@
                                         {:new new :old old
                                          :tg {} :types {}}))))))
 
+(def ^:private routine-depth-limit
+  "How deep a chain of routine bodies may nest. PostgreSQL's equivalent
+   is `max_stack_depth`, measured in bytes; this is the same guard at a
+   level we can see. Shared by DO blocks and by triggers -- a trigger
+   body's statements fire the table's triggers again, so a trigger that
+   writes to its own table recurses exactly like a recursive function."
+  32)
+
 (defn- run-one-trigger
   "Fire `t` for one row. Returns the row the trigger produced -- which
    for a BEFORE ROW trigger is what gets written, and nil to suppress
    it. For AFTER and statement triggers PostgreSQL ignores the return
    value, and so does the caller."
-  [db handler t table-name event new old]
-  (if-not (when-condition-holds? handler t table-name new old)
-    {:row new}
-    (pl-exec/run-trigger handler (trigger-ast db t)
-                         {:new new :old old
-                          :tg (tg-vars t table-name event)
-                          :types {}})))
+  ([db handler t table-name event new old]
+   (run-one-trigger db handler t table-name event new old nil))
+  ([db handler t table-name event new old transition-rows]
+  ;; The same depth guard a routine body gets. A trigger body's
+  ;; statements fire the table's triggers again, so a trigger that
+  ;; writes to its own table recurses -- and with no guard here the
+  ;; recursion ran until the JVM stack ended and the CONNECTION DIED
+  ;; mid-statement. PostgreSQL raises 54001, `stack depth limit
+  ;; exceeded`, and keeps the session.
+   (binding [params/*routine-depth* (inc params/*routine-depth*)]
+     (when (> params/*routine-depth* routine-depth-limit)
+       (throw (errors/pg-error
+               :stack-depth-exceeded
+               {:message "stack depth limit exceeded"
+                :hint (str "Increase the configuration parameter "
+                           "\"max_stack_depth\" (currently 2048kB), after "
+                           "ensuring the platform's stack depth limit is "
+                           "adequate.")})))
+     (if-not (when-condition-holds? handler t table-name new old)
+       {:row new}
+       (pl-exec/run-trigger handler (trigger-ast db t)
+                            {:new new :old old
+                             :tg (tg-vars t table-name event (pgs/table-oid db table-name))
+                             :types {}
+                             :transitions (when transition-rows
+                                            (trigger-transitions
+                                             db table-name t transition-rows))})))))
 
 (defn- before-row-insert-triggers?
   "Whether `table-name` has any BEFORE ROW trigger for `event`. The
@@ -2945,7 +2984,7 @@
        (doseq [t triggers]
          (when (when-condition-holds? handler t table-name nil nil)
            (pl-exec/run-trigger handler (trigger-ast db t)
-                                {:tg (tg-vars t table-name event) :types {}
+                                {:tg (tg-vars t table-name event (pgs/table-oid db table-name)) :types {}
                                  :transitions (trigger-transitions
                                                db table-name t
                                                (when (:transition-tables t) @rows))})))))
@@ -2975,7 +3014,14 @@
            handler (trigger-handler! table-name)]
        (doseq [{:keys [new old]} rows
                t triggers]
-         (run-one-trigger db handler t table-name event new old))))
+         ;; A ROW-level trigger may declare transition tables too --
+         ;; PostgreSQL allows `REFERENCING NEW TABLE AS nr … FOR EACH
+         ;; ROW`, and the relation holds the whole statement's rows, the
+         ;; same as for a statement trigger. Only the statement path
+         ;; passed `:transitions`, so the DDL was accepted and the first
+         ;; INSERT died with `relation "nr" does not exist`.
+         (run-one-trigger db handler t table-name event new old
+                          (when (:transition-tables t) rows)))))
    nil))
 
 (defn- keep-row-deletes
@@ -7536,7 +7582,7 @@
                 (throw (ex-info "DO is not available here"
                                 {:error :feature-not-supported})))
               (binding [params/*routine-depth* (inc params/*routine-depth*)]
-                (when (> params/*routine-depth* 32)
+                (when (> params/*routine-depth* routine-depth-limit)
                   (throw (ex-info "stack depth limit exceeded"
                                   {:sqlstate "54001" :error :stack-depth})))
                 ;; The same gate CREATE FUNCTION uses. This called
@@ -9709,6 +9755,22 @@
        (sort-by :name)
        vec))
 
+(defn all-triggers
+  "Every trigger in the database, with its table. `table-triggers` is
+   per-table; a DROP FUNCTION has to ask the other way round -- which
+   triggers name this function."
+  [db]
+  (->> (d/q '{:find [?e]
+              :where [[?e :datahike.pg.trigger/name _]]}
+            db)
+       (mapv (fn [[e]]
+               (let [ent (d/entity db e)]
+                 (assoc (read-string (:datahike.pg.trigger/spec ent))
+                        :name (:datahike.pg.trigger/name ent)
+                        :table (:datahike.pg.trigger/table ent)))))
+       (sort-by :name)
+       vec))
+
 (defn- exec-ddl-create-trigger
   "CREATE TRIGGER. The function must already exist and return `trigger`,
    as PostgreSQL requires."
@@ -10223,6 +10285,31 @@
                                       "\" is not unique")
                                  {:error :ambiguous-function :sqlstate "42725"
                                   :hint "Specify the argument list to select the function unambiguously."}))
+
+      ;; A trigger that names this function depends on it. PostgreSQL
+      ;; refuses with 2BP01 and names the dependents; this dropped the
+      ;; function and left the trigger pointing at nothing, so the next
+      ;; INSERT on that table died with 42883 instead -- the failure
+      ;; surfaced on an unrelated statement, far from the cause.
+      ;; CASCADE is not implemented here, so the hint is the one
+      ;; PostgreSQL gives and following it is a separate matter.
+      (seq (filter #(= fn-name (:function %)) (all-triggers db)))
+      (let [deps (filter #(= fn-name (:function %)) (all-triggers db))]
+        (classified-error
+         ""
+         (ex-info (str "cannot drop function "
+                       (if arity (function-signature db fn-name arg-types) fn-name)
+                       " because other objects depend on it")
+                  {:error :dependent-objects-still-exist
+                   :detail (str/join "\n"
+                                     (map (fn [t]
+                                            (str "trigger " (:name t) " on table "
+                                                 (:table t) " depends on function "
+                                                 (if arity
+                                                   (function-signature db fn-name arg-types)
+                                                   fn-name)))
+                                          deps))
+                   :hint "Use DROP ... CASCADE to drop the dependent objects too."})))
 
       :else
       (let [tx-data (mapv (fn [e] [:db/retractEntity (:db/id e)]) matches)]

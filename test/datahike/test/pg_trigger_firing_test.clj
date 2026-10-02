@@ -247,3 +247,65 @@
                    "FOR EACH STATEMENT EXECUTE FUNCTION ktf()")]
              (col1 c (str "SELECT pg_get_triggerdef(oid) FROM pg_trigger "
                           "WHERE tgname = 'kt_s'")))))))
+
+(deftest a-recursive-trigger-does-not-kill-the-connection
+  ;; A trigger body's statements fire the table's triggers again, so a
+  ;; trigger that writes to its own table recurses -- and with no depth
+  ;; guard the recursion ran until the JVM stack ended and the
+  ;; CONNECTION DIED mid-statement. PostgreSQL raises 54001 and keeps
+  ;; the session. Routines already had the guard; triggers did not use
+  ;; it.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE rc (a int)")
+    (trigfn! c "rcf" "BEGIN INSERT INTO rc VALUES (99); RETURN NULL; END")
+    (exec! c "CREATE TRIGGER rc_t AFTER INSERT ON rc FOR EACH ROW EXECUTE FUNCTION rcf()")
+    (is (= "54001" (state-of c "INSERT INTO rc VALUES (1)")))
+    (testing "the statement is rolled back and the session still works"
+      (is (= ["0"] (col1 c "SELECT count(*) FROM rc")))
+      (is (= ["1"] (col1 c "SELECT 1"))))))
+
+(deftest tg-table-schema-and-tg-relid-are-bound
+  ;; Neither was bound, so a body mentioning either died with
+  ;; `column "tg_table_schema" does not exist` -- the name fell through
+  ;; to SQL resolution.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tv (a int, note text)")
+    (trigfn! c "tgv" (str "BEGIN INSERT INTO tv(a, note) VALUES (0, "
+                          "TG_TABLE_SCHEMA || ':' || (TG_RELID = 'tv'::regclass::oid)::text); "
+                          "RETURN NULL; END"))
+    (exec! c "CREATE TRIGGER tv_v AFTER UPDATE ON tv FOR EACH STATEMENT EXECUTE FUNCTION tgv()")
+    (exec! c "INSERT INTO tv VALUES (1, 'x')")
+    (exec! c "UPDATE tv SET a = 2 WHERE a = 1")
+    (is (= ["public:true"] (col1 c "SELECT note FROM tv WHERE a = 0")))))
+
+(deftest dropping-a-function-a-trigger-uses-is-refused
+  ;; This dropped the function and left the trigger pointing at nothing,
+  ;; so the next INSERT on that table died with 42883 -- the failure
+  ;; surfaced on an unrelated statement, far from the cause.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE dt3 (a int)")
+    (trigfn! c "depf" "BEGIN RETURN NEW; END")
+    (exec! c "CREATE TRIGGER dt3_t AFTER INSERT ON dt3 FOR EACH ROW EXECUTE FUNCTION depf()")
+    (is (= "2BP01" (state-of c "DROP FUNCTION depf()")))
+    (is (str/includes? (message-of c "DROP FUNCTION depf()")
+                       "trigger dt3_t on table dt3 depends on function depf()"))
+    (testing "and the trigger still works, because the function is still there"
+      (exec! c "INSERT INTO dt3 VALUES (1)")
+      (is (= ["1"] (col1 c "SELECT count(*) FROM dt3"))))))
+
+(deftest a-row-level-trigger-may-declare-transition-tables
+  ;; PostgreSQL allows `REFERENCING NEW TABLE AS nr … FOR EACH ROW`, and
+  ;; the relation holds the whole STATEMENT's rows. Only the
+  ;; statement-level path passed `:transitions`, so the DDL was accepted
+  ;; and the first INSERT died with `relation "nr" does not exist`.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE rt (a int)")
+    (exec! c "CREATE TABLE rlog (n int)")
+    (trigfn! c "rtf" (str "DECLARE n int; BEGIN SELECT count(*) INTO n FROM nr; "
+                          "INSERT INTO rlog VALUES (n); RETURN NULL; END"))
+    (exec! c (str "CREATE TRIGGER rt_t AFTER INSERT ON rt "
+                  "REFERENCING NEW TABLE AS nr FOR EACH ROW EXECUTE FUNCTION rtf()"))
+    (exec! c "INSERT INTO rt VALUES (1),(2)")
+    (is (= ["2"] (col1 c "SELECT count(*) FROM rt")))
+    (testing "fired once per row, and each sees the whole statement's rows"
+      (is (= ["2" "2"] (col1 c "SELECT n FROM rlog"))))))
