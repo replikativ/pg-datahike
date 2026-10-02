@@ -156,7 +156,13 @@
       ;; executor then generates the name PostgreSQL would.
       (exec! c "ALTER TABLE t ADD CHECK (b > 0)")
       (exec! c "ALTER TABLE t ADD CHECK (b < 100)")
-      (is (= [["t_check"] ["t_check1"] ["tc"]]
+      ;; `t_b_check`, not `t_check`: ChooseConstraintName uses
+      ;; `<table>_<col>_check` when the expression references exactly one
+      ;; column, and the ALTER path used to pass nil for the column -- so
+      ;; CREATE TABLE and ALTER named the same constraint differently.
+      ;; A 17.7 oracle gives tc, tchk_b_check, tchk_b_check1 for this
+      ;; sequence.
+      (is (= [["t_b_check"] ["t_b_check1"] ["tc"]]
              (rows c (str "SELECT conname FROM pg_constraint"
                           " WHERE conrelid = 't'::regclass AND contype = 'c'"
                           " ORDER BY conname"))))

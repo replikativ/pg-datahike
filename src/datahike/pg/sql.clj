@@ -2489,6 +2489,23 @@
                                            :if-exists? (.isUsingIfExists exp)}
                                 ;; Other DROP forms remain compatibility no-ops.
                                           (= op "DROP") {:op :drop}
+                                ;; VALIDATE CONSTRAINT c. JSqlParser gives
+                                ;; it no operation and no constraint name,
+                                ;; so it fell into the `:other` no-op below
+                                ;; and answered ALTER TABLE even for a
+                                ;; constraint that does not exist. Every
+                                ;; constraint here is already validated --
+                                ;; NOT VALID is refused -- so the statement
+                                ;; is a no-op once the name resolves, which
+                                ;; is also what PostgreSQL does for an
+                                ;; already-valid one.
+                                          (re-matches #"(?i)\s*VALIDATE\s+CONSTRAINT\s+(\S+)\s*"
+                                                      (str exp))
+                                          {:op :validate-constraint
+                                           :name (unquote-ident
+                                                  (second (re-matches
+                                                           #"(?i)\s*VALIDATE\s+CONSTRAINT\s+(\S+)\s*"
+                                                           (str exp))))}
                                 ;; ALTER (SET NOT NULL, TYPE change, etc.) — no-op
                                           :else {:op :other :raw (str exp)})))
                                     expressions)]

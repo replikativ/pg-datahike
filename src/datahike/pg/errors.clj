@@ -299,6 +299,11 @@
    ;; `COMMIT`/`ROLLBACK` inside a routine body when the session is in
    ;; an explicit transaction block (SPI_commit, `invalid transaction
    ;; termination`).
+   ;; A PREPARE naming a statement that already exists.
+   :duplicate-prepared-statement
+   {:sqlstate "42P05"
+    :format (fn [{:keys [message detail]}] (or message detail))}
+
    :invalid-transaction-termination
    {:sqlstate "2D000"
     :format (fn [{:keys [message detail]}]

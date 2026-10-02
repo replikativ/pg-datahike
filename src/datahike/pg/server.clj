@@ -2053,7 +2053,16 @@
                           on-delete on-update]}]
   (case op
     :add-check
-    (let [cname (or name (ddl/generated-constraint-name taken table nil "check"))
+    (let [;; `ChooseConstraintName` uses `<table>_<col>_check` when the
+          ;; expression references exactly ONE column, and
+          ;; `<table>_check` otherwise. This passed nil for the column,
+          ;; so CREATE TABLE and ALTER named the same constraint
+          ;; differently -- `an1_a_check1` against `an1_check1` -- and
+          ;; the numbering then diverged for every later constraint of
+          ;; the table. `check-columns` is what CREATE TABLE uses.
+          cols (ddl/check-columns expr)
+          cname (or name (ddl/generated-constraint-name
+                          taken table (when (= 1 (count cols)) (first cols)) "check"))
           ast (row-constraints/parse-constraint-expression expr)]
       (validate-added-check! db table cname ast)
       [{:pg/constraint-key (ddl/constraint-key table cname)
@@ -2073,6 +2082,24 @@
       (when (empty? parent-cols)
         (throw (ex-info (str "there is no primary key for referenced table \""
                              parent-table "\"")
+                        {:error :invalid-foreign-key :sqlstate "42830"
+                         :table table :constraint cname})))
+      ;; The referenced columns must carry a UNIQUE or PRIMARY KEY
+      ;; constraint. This checked only that the parent had SOME primary
+      ;; key, so `REFERENCES p (non_unique_col)` was accepted -- and
+      ;; without a unique constraint a child row can match several
+      ;; parents, which is why PostgreSQL refuses it at DDL.
+      ;;
+      ;; Single-column references only. A COMPOSITE primary key or
+      ;; UNIQUE leaves no trace in the schema at all here -- it is not
+      ;; enforced either, which is a larger bug recorded in
+      ;; doc/review-backlog.md -- so a composite reference cannot be
+      ;; judged and stays lenient rather than being refused wrongly.
+      (when (and (= 1 (count parent-cols))
+                 (not (contains? (ddl/unique-key-sets db parent-table)
+                                 (set parent-cols))))
+        (throw (ex-info (str "there is no unique constraint matching given keys"
+                             " for referenced table \"" parent-table "\"")
                         {:error :invalid-foreign-key :sqlstate "42830"
                          :table table :constraint cname})))
       (validate-added-fk! db table cname cols parent-table parent-cols)
@@ -5994,6 +6021,14 @@
   [{:keys [sql-prepared handler sql]} parsed]
   (let [pname (:name parsed)
         tmpl  (:template parsed)]
+    ;; A name already prepared is 42P05. This overwrote it silently, so
+    ;; a client that re-prepares under a name it already holds -- which
+    ;; PostgreSQL refuses, and which the suite tests for -- got the
+    ;; SECOND statement's plan under the first one's name.
+    (when (and pname (contains? @sql-prepared pname))
+      (throw (ex-info (str "prepared statement \"" pname "\" already exists")
+                      {:error :duplicate-prepared-statement
+                       :sqlstate "42P05"})))
     (if (and pname tmpl)
       (do (swap! sql-prepared assoc pname
                  (assoc (plan-sql-prepared handler tmpl)
@@ -6058,8 +6093,15 @@
     (do (reset! sql-prepared {})
         (empty-result "DEALLOCATE ALL"))
     (:name parsed)
-    (do (swap! sql-prepared dissoc (:name parsed))
-        (empty-result "DEALLOCATE"))
+    ;; An unknown name is 26000. `dissoc` is silent on a missing key, so
+    ;; this answered DEALLOCATE for a statement that was never prepared
+    ;; -- and a client checking that its cleanup worked learned nothing.
+    (if (contains? @sql-prepared (:name parsed))
+      (do (swap! sql-prepared dissoc (:name parsed))
+          (empty-result "DEALLOCATE"))
+      (error-result (str "prepared statement \"" (:name parsed)
+                         "\" does not exist")
+                    "26000"))
     :else
     (error-result "DEALLOCATE: syntax error" "42601")))
 
@@ -6088,6 +6130,12 @@
 
       (:with-hold? parsed)
       (error-result "DECLARE CURSOR WITH HOLD is not supported" "0A000")
+
+      ;; A name already declared is 42P03. This overwrote it silently,
+      ;; so a second DECLARE replaced the first cursor's query under its
+      ;; name and the reads that followed came from the wrong one.
+      (and cname (contains? @cursors cname))
+      (error-result (str "cursor \"" cname "\" already exists") "42P03")
 
       (and cname cquery)
       (let [probe-sql (rewrite-cursor-page cquery 0 0)
@@ -11607,7 +11655,17 @@
                                  tx)
 
                                (= :drop-constraint op)
-                               (dropped-constraint-tx db table operation)))
+                               (dropped-constraint-tx db table operation)
+
+                               ;; VALIDATE CONSTRAINT: every constraint
+                               ;; here is already valid, so this is a
+                               ;; no-op -- but only once the NAME
+                               ;; resolves. It used to answer ALTER TABLE
+                               ;; for a constraint that does not exist.
+                               (= :validate-constraint op)
+                               (do (dropped-constraint-tx
+                                    db table (assoc operation :if-exists? false))
+                                   nil)))
                            operations)))
             attnum-data
             (when first-attnum
@@ -14106,7 +14164,20 @@
                                                    ::catalog-admission/certificate certificate)
                                         statement-basis))]
                             (case (:type parsed)
-                              :system                (exec-system ctx parsed)
+                              ;; PostgreSQL aborts the transaction on ANY
+                              ;; error inside a block. The exec-* paths
+                              ;; that raise set `:aborted?` themselves, but
+                              ;; a system handler returning an `error-result`
+                              ;; did not -- so `DECLARE CURSOR WITH HOLD`
+                              ;; inside a BEGIN reported its 0A000 and the
+                              ;; NEXT statement ran, where PostgreSQL
+                              ;; answers 25P02. One funnel, so every system
+                              ;; statement gets it.
+                              :system                (let [r (exec-system ctx parsed)]
+                                                       (when (and (.error ^PgWireServer$QueryResult r)
+                                                                  (:in-tx? @tx-state))
+                                                         (swap! tx-state assoc :aborted? true))
+                                                       r)
                               :select                (exec-select ctx parsed)
                               :insert                (exec-insert ctx parsed)
                             ;; Templated simple-protocol UPDATE/DELETE ride
