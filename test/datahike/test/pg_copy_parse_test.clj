@@ -92,16 +92,23 @@
     (is (= "\"" (:quote o)))
     (is (= "\\" (:escape o)))))
 
+;; FORMAT csv on these three because PostgreSQL requires it:
+;; `COPY FORCE_NOT_NULL requires CSV mode` (ProcessCopyOptions,
+;; copy.c). They used to be written without it and passed, because
+;; none of those cross-option checks existed -- the assertion was
+;; about the option PARSING, and the spelling it used is one
+;; PostgreSQL refuses.
+
 (deftest paren-form-force-not-null-list
-  (let [o (opts "COPY t FROM stdin WITH (FORCE_NOT_NULL (a, b))")]
+  (let [o (opts "COPY t FROM stdin WITH (FORMAT csv, FORCE_NOT_NULL (a, b))")]
     (is (= #{"a" "b"} (:force-not-null o)))))
 
 (deftest paren-form-force-null-star
-  (let [o (opts "COPY t FROM stdin WITH (FORCE_NULL *)")]
+  (let [o (opts "COPY t FROM stdin WITH (FORMAT csv, FORCE_NULL *)")]
     (is (= :all (:force-null o)))))
 
 (deftest paren-form-force-not-null-star
-  (let [o (opts "COPY t FROM stdin WITH (FORCE_NOT_NULL *)")]
+  (let [o (opts "COPY t FROM stdin WITH (FORMAT csv, FORCE_NOT_NULL *)")]
     (is (= :all (:force-not-null o)))))
 
 (deftest paren-form-encoding-accepted-stored

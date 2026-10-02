@@ -330,6 +330,15 @@
       (#{"text" "TEXT"} from-format)     :text
       (#{"csv" "CSV"} from-format)       :csv
       (#{"binary" "BINARY"} from-format) :binary
+      ;; A FORMAT value we do not know is an ERROR, not text. The
+      ;; `:else :text` fallthrough checked the option KEY and never
+      ;; its value, so `FORMAT bogus` silently produced text output --
+      ;; and on a COPY FROM it entered COPY mode, so the statements
+      ;; after it were eaten as row data.
+      (some? from-format)
+      (throw (ex-info (str "COPY format \"" from-format "\" not recognized")
+                      {:error :syntax-error :sqlstate "42601"
+                       :format from-format}))
       :else                              :text)))
 
 (defn- normalize-header [opts-vec]
@@ -356,79 +365,164 @@
   "Translate the raw [[\"key\" value] ...] option list (from either
    paren or legacy parser) into a normalised map with defaults
    applied. Throws :feature-not-supported for FORMAT 'binary' and
-   :syntax-error for unknown options."
-  [opts-vec]
-  (let [format (normalize-format opts-vec)
-        _ (when (= :binary format)
-            (throw (ex-info "COPY in BINARY format is not supported"
-                            {:error :feature-not-supported
-                             :feature "COPY BINARY"})))
+   :syntax-error for unknown options.
+
+   `direction` is `:from` or `:to`, and it matters: half of
+   `ProcessCopyOptions`' checks are direction-dependent, and EVERY one
+   of them has to run before the connection enters COPY mode. An
+   option COPY rejects but we accepted left psql streaming the
+   following STATEMENTS as row data -- the hazard the comment at
+   `start-copy-in!` already warns about:
+
+     COPY t FROM STDIN WITH (FORMAT csv, FORCE_QUOTE (a));
+     SELECT 'this is a statement';   -- consumed as COPY data"
+  ([opts-vec] (options->map opts-vec nil))
+  ([opts-vec direction]
+   (let [format (normalize-format opts-vec)
+         _ (when (= :binary format)
+             (throw (ex-info "COPY in BINARY format is not supported"
+                             {:error :feature-not-supported
+                              :feature "COPY BINARY"})))
         ;; Validate every option key is recognised, even if its
         ;; effect is a no-op. Catches typos like NULL_MARKER.
-        known? #{"format" "delimiter" "null" "header" "quote" "escape"
-                 "force_not_null" "force_null" "force_quote"
-                 "encoding" "freeze" "default" "oids"
-                 "csv" "binary"  ;; legacy bare keywords
-                 "on_error" "log_verbosity"}
-        _ (doseq [[k _] opts-vec]
-            (when-not (known? k)
-              (throw (ex-info (str "unknown COPY option: " k)
-                              {:error :syntax-error :option k}))))
+         known? #{"format" "delimiter" "null" "header" "quote" "escape"
+                  "force_not_null" "force_null" "force_quote"
+                  "encoding" "freeze" "default" "oids"
+                  "csv" "binary"  ;; legacy bare keywords
+                  "on_error" "log_verbosity"}
+         _ (doseq [[k _] opts-vec]
+             (when-not (known? k)
+               (throw (ex-info (str "unknown COPY option: " k)
+                               {:error :syntax-error :option k}))))
         ;; OIDS — legacy, removed in PG 12. Reject explicitly so users
         ;; don't get a silent wrong-shape parse.
-        _ (when (some (fn [[k _]] (= "oids" k)) opts-vec)
-            (throw (ex-info "OIDS is not supported (removed in PostgreSQL 12)"
-                            {:error :feature-not-supported :feature "COPY OIDS"})))
-        delim (or (some (fn [[k v]] (when (= "delimiter" k) v)) opts-vec)
-                  (case format :csv "," :text "\t"))
-        null-marker (or (some (fn [[k v]] (when (= "null" k) v)) opts-vec)
-                        (case format :csv "" :text "\\N"))
-        quote-char (or (some (fn [[k v]] (when (= "quote" k) v)) opts-vec)
-                       "\"")
-        escape-char (or (some (fn [[k v]] (when (= "escape" k) v)) opts-vec)
+         _ (when (some (fn [[k _]] (= "oids" k)) opts-vec)
+             (throw (ex-info "OIDS is not supported (removed in PostgreSQL 12)"
+                             {:error :feature-not-supported :feature "COPY OIDS"})))
+         delim (or (some (fn [[k v]] (when (= "delimiter" k) v)) opts-vec)
+                   (case format :csv "," :text "\t"))
+         null-marker (or (some (fn [[k v]] (when (= "null" k) v)) opts-vec)
+                         (case format :csv "" :text "\\N"))
+         quote-char (or (some (fn [[k v]] (when (= "quote" k) v)) opts-vec)
+                        "\"")
+         escape-char (or (some (fn [[k v]] (when (= "escape" k) v)) opts-vec)
                         ;; default = quote char
-                        quote-char)
-        encoding (some (fn [[k v]] (when (= "encoding" k) v)) opts-vec)
-        _ (when (and encoding
-                     (not (contains? pg-encoding-aliases
-                                     (str/lower-case encoding))))
-            (throw (ex-info
-                    (str "COPY encoding " encoding " is not supported; use UTF8")
-                    {:error :feature-not-supported :sqlstate "0A000"
-                     :encoding encoding})))
-        freeze? (some (fn [[k v]] (when (= "freeze" k) (boolean v))) opts-vec)
-        default-marker (some (fn [[k v]] (when (= "default" k) v)) opts-vec)
-        _ (when (and default-marker
-                     (or (str/includes? default-marker "\n")
-                         (str/includes? default-marker "\r")))
-            (throw (ex-info
-                    "COPY default representation cannot use newline or carriage return"
-                    {:error :invalid-parameter-value :sqlstate "22023"})))
-        _ (when (and default-marker (str/includes? default-marker delim))
-            (throw (ex-info
-                    "COPY delimiter character must not appear in the DEFAULT specification"
-                    {:error :feature-not-supported :sqlstate "0A000"})))
-        _ (when (and default-marker (= :csv format)
-                     (str/includes? default-marker quote-char))
-            (throw (ex-info
-                    "CSV quote character must not appear in the DEFAULT specification"
-                    {:error :feature-not-supported :sqlstate "0A000"})))
-        _ (when (and default-marker (= default-marker null-marker))
-            (throw (ex-info
-                    "NULL specification and DEFAULT specification cannot be the same"
-                    {:error :feature-not-supported :sqlstate "0A000"})))]
-    {:format         format
-     :delimiter      delim
-     :null-marker    null-marker
-     :quote          quote-char
-     :escape         escape-char
-     :header         (normalize-header opts-vec)
-     :force-not-null (normalize-force-set opts-vec "force_not_null")
-     :force-null     (normalize-force-set opts-vec "force_null")
-     :force-quote    (normalize-force-set opts-vec "force_quote")
-     :encoding       encoding
-     :freeze?        (boolean freeze?)
-     :default-marker default-marker}))
+                         quote-char)
+         encoding (some (fn [[k v]] (when (= "encoding" k) v)) opts-vec)
+         _ (when (and encoding
+                      (not (contains? pg-encoding-aliases
+                                      (str/lower-case encoding))))
+             (throw (ex-info
+                     (str "COPY encoding " encoding " is not supported; use UTF8")
+                     {:error :feature-not-supported :sqlstate "0A000"
+                      :encoding encoding})))
+         freeze? (some (fn [[k v]] (when (= "freeze" k) (boolean v))) opts-vec)
+         default-marker (some (fn [[k v]] (when (= "default" k) v)) opts-vec)
+         _ (when (and default-marker
+                      (or (str/includes? default-marker "\n")
+                          (str/includes? default-marker "\r")))
+             (throw (ex-info
+                     "COPY default representation cannot use newline or carriage return"
+                     {:error :invalid-parameter-value :sqlstate "22023"})))
+         _ (when (and default-marker (str/includes? default-marker delim))
+             (throw (ex-info
+                     "COPY delimiter character must not appear in the DEFAULT specification"
+                     {:error :feature-not-supported :sqlstate "0A000"})))
+         _ (when (and default-marker (= :csv format)
+                      (str/includes? default-marker quote-char))
+             (throw (ex-info
+                     "CSV quote character must not appear in the DEFAULT specification"
+                     {:error :feature-not-supported :sqlstate "0A000"})))
+         _ (when (and default-marker (= default-marker null-marker))
+             (throw (ex-info
+                     "NULL specification and DEFAULT specification cannot be the same"
+                     {:error :feature-not-supported :sqlstate "0A000"})))
+        ;; --- ProcessCopyOptions' cross-option checks (copy.c:686-916).
+        ;; None of these existed. Every one is reachable, and the ones
+        ;; on a COPY FROM mattered twice over: the statement was
+        ;; accepted, the connection entered COPY mode, and the SQL that
+        ;; followed was eaten as data.
+         given? (fn [k] (some (fn [[kk _]] (= k kk)) opts-vec))
+         from? (= :from direction)
+         to? (= :to direction)
+         csv? (= :csv format)
+         bad! (fn [msg state err]
+                (throw (ex-info msg {:error err :sqlstate state})))
+         _ (when (not= 1 (count delim))
+             (bad! "COPY delimiter must be a single one-byte character"
+                   "0A000" :feature-not-supported))
+         _ (when (or (str/includes? delim "\r") (str/includes? delim "\n"))
+             (bad! "COPY delimiter cannot be newline or carriage return"
+                   "22023" :invalid-parameter-value))
+         _ (when (or (str/includes? null-marker "\r") (str/includes? null-marker "\n"))
+             (bad! "COPY null representation cannot use newline or carriage return"
+                   "22023" :invalid-parameter-value))
+        ;; Non-CSV: a delimiter that COPY IN could not tell from data
+        ;; or from an escape. More letters than strictly necessary,
+        ;; "for consistency and future-proofing" as the comment says.
+         _ (when (and (not csv?)
+                      (str/includes? "\\.abcdefghijklmnopqrstuvwxyz0123456789"
+                                     (subs delim 0 1)))
+             (bad! (str "COPY delimiter cannot be \"" delim "\"")
+                   "22023" :invalid-parameter-value))
+         _ (when (and (not csv?) (given? "quote"))
+             (bad! "COPY QUOTE requires CSV mode" "0A000" :feature-not-supported))
+         _ (when (and csv? (not= 1 (count quote-char)))
+             (bad! "COPY quote must be a single one-byte character"
+                   "0A000" :feature-not-supported))
+         _ (when (and csv? (= (first delim) (first quote-char)))
+             (bad! "COPY delimiter and quote must be different"
+                   "22023" :invalid-parameter-value))
+         _ (when (and (not csv?) (given? "escape"))
+             (bad! "COPY ESCAPE requires CSV mode" "0A000" :feature-not-supported))
+         _ (when (and csv? (not= 1 (count escape-char)))
+             (bad! "COPY escape must be a single one-byte character"
+                   "0A000" :feature-not-supported))
+         _ (when (and (not csv?) (given? "force_quote"))
+             (bad! "COPY FORCE_QUOTE requires CSV mode" "0A000" :feature-not-supported))
+         _ (when (and (given? "force_quote") from?)
+             (bad! "COPY FORCE_QUOTE cannot be used with COPY FROM"
+                   "0A000" :feature-not-supported))
+         _ (when (and (not csv?) (given? "force_not_null"))
+             (bad! "COPY FORCE_NOT_NULL requires CSV mode" "0A000" :feature-not-supported))
+         _ (when (and (given? "force_not_null") to?)
+             (bad! "COPY FORCE_NOT_NULL cannot be used with COPY TO"
+                   "22023" :invalid-parameter-value))
+         _ (when (and (not csv?) (given? "force_null"))
+             (bad! "COPY FORCE_NULL requires CSV mode" "0A000" :feature-not-supported))
+         _ (when (and (given? "force_null") to?)
+             (bad! "COPY FORCE_NULL cannot be used with COPY TO"
+                   "22023" :invalid-parameter-value))
+         _ (when (str/includes? null-marker (subs delim 0 1))
+             (bad! "COPY delimiter character must not appear in the NULL specification"
+                   "22023" :invalid-parameter-value))
+         _ (when (and csv? (str/includes? null-marker (subs quote-char 0 1)))
+             (bad! "CSV quote character must not appear in the NULL specification"
+                   "22023" :invalid-parameter-value))
+         _ (when (and freeze? to?)
+             (bad! "COPY FREEZE cannot be used with COPY TO"
+                   "22023" :invalid-parameter-value))
+         _ (when (and default-marker to?)
+             (bad! "COPY DEFAULT cannot be used with COPY TO"
+                   "0A000" :feature-not-supported))
+         _ (when (and (given? "on_error") to?)
+             (bad! "COPY ON_ERROR cannot be used with COPY TO"
+                   "22023" :invalid-parameter-value))
+         _ (when (and (given? "header") to? (= :match (normalize-header opts-vec)))
+             (bad! "cannot use \"match\" with HEADER in COPY TO"
+                   "22023" :invalid-parameter-value))]
+     {:format         format
+      :delimiter      delim
+      :null-marker    null-marker
+      :quote          quote-char
+      :escape         escape-char
+      :header         (normalize-header opts-vec)
+      :force-not-null (normalize-force-set opts-vec "force_not_null")
+      :force-null     (normalize-force-set opts-vec "force_null")
+      :force-quote    (normalize-force-set opts-vec "force_quote")
+      :encoding       encoding
+      :freeze?        (boolean freeze?)
+      :default-marker default-marker})))
 
 ;; ----------------------------------------------------------------------------
 ;; Top-level parser
@@ -717,7 +811,7 @@
             :ns nil
             :table nil
             :columns nil
-            :options (options->map (consume-options-tail after-target))}))
+            :options (options->map (consume-options-tail after-target) direction)}))
        (do
          (when-not (ident-token? c2)
            (throw (ex-info "expected table name after COPY"
@@ -733,4 +827,4 @@
             :ns (:ns table-info)
             :table (:table table-info)
             :columns columns
-            :options (options->map (consume-options-tail t-after-target))}))))))
+            :options (options->map (consume-options-tail t-after-target) direction)}))))))

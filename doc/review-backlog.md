@@ -89,12 +89,6 @@ reproduced and should be measured before it is believed.
 - **`&&`, `@>`, `<@` on geometric values return a bare `f`** —
   `expr.clj`'s array/jsonb fall-through. `'(0,0),(1,1)'::box &&
   '(0,0),(2,2)'::box` is `t` in PostgreSQL.
-- **CSV `COPY … FROM STDIN` does not recognise `\.`** — documented as
-  intentional in `copy/csv_format.clj`, but `copyfromparse.c` accepts it
-  as the first character of a line in CSV mode too. Every CSV stdin
-  block in `copy.sql`/`copy2.sql` either gains a junk row or fails.
-- **`COPY tbl TO` emits generated columns**; `CopyGetAttnums` excludes
-  them from the implicit list.
 - **Collection aggregates do not preserve scan order** —
   `array_agg(v)` over 1,2,2,5 answers `{5,1,2,2}`. PostgreSQL does not
   guarantee an order without ORDER BY, but it returns scan order and the
@@ -107,9 +101,12 @@ reproduced and should be measured before it is believed.
 
 ## Missing validation (we accept what PostgreSQL rejects)
 
-- **COPY implements none of `copy.c`'s ~23 cross-option checks**, and
-  an invalid option *still enters COPY-IN mode*, swallowing the
-  statements that follow. ~23 cases catalogued in the review.
+- **`ON_ERROR` and `LOG_VERBOSITY` are accepted and ignored** — the
+  option now passes the cross-option checks and still does nothing, so
+  `ON_ERROR ignore` stops at the first bad row instead of skipping it.
+  `HEADER`/`HEADER MATCH` in TEXT format are likewise accepted and
+  unimplemented (PostgreSQL allows HEADER in text mode; only BINARY
+  rejects it).
 - **Every generated-column restriction is unenforced**, including one
   that makes the same schema give different answers depending on column
   order.

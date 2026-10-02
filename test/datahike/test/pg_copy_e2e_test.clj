@@ -775,3 +775,109 @@
       (is (= "1\tada\ta@x\tt\n" (copy-out-text c "COPY users TO STDOUT")))
       (finally
         (exec! c "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")))))
+
+;; ============================================================================
+;; What review found in COPY: the CSV end-of-data marker, generated
+;; columns in COPY TO, and the whole of ProcessCopyOptions.
+;; Expectations are a PostgreSQL 17.7 oracle's.
+;; ============================================================================
+
+(defn- state-of [^Connection c ^String sql]
+  (try (exec! c sql) nil (catch java.sql.SQLException e (.getSQLState e))))
+
+(defn- message-of [^Connection c ^String sql]
+  (try (exec! c sql) nil (catch java.sql.SQLException e (.getMessage e))))
+
+(deftest csv-recognises-the-end-of-data-marker
+  ;; The CSV decoder documented `\.` as "not recognised inside CSV
+  ;; streams". `copyfromparse.c:1383` recognises it as the FIRST
+  ;; character of a line in CSV mode too -- and psql forwards its own
+  ;; terminator to the server like any other line, so every CSV
+  ;; `COPY … FROM STDIN` block either gained a junk row or failed
+  ;; outright with `missing data for column`.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE cs1 (a text)")
+    (copy-in-text c "COPY cs1 FROM stdin WITH (FORMAT csv)" "z\ny\n\\.\n")
+    (is (= [["z"] ["y"]] (query-rows c "SELECT a FROM cs1 ORDER BY a DESC")))
+    (testing "and with more than one column, where it used to be a hard failure"
+      (exec! c "CREATE TABLE cs2 (a text, b text)")
+      (copy-in-text c "COPY cs2 FROM stdin WITH (FORMAT csv)" "p,q\nr,s\n\\.\n")
+      (is (= [["p" "q"] ["r" "s"]] (query-rows c "SELECT a,b FROM cs2 ORDER BY a"))))
+    (testing "but only as the first character of a line, and only with an
+              end of line after it -- `\\.x` is data, and so is a quoted one"
+      (exec! c "CREATE TABLE cs3 (a text)")
+      (copy-in-text c "COPY cs3 FROM stdin WITH (FORMAT csv)" "\"\\.\"\n\\.x\n\\.\n")
+      (is (= [["\\."] ["\\.x"]] (query-rows c "SELECT a FROM cs3 ORDER BY a"))))))
+
+(deftest copy-to-omits-generated-columns
+  ;; `CopyGetAttnums` excludes a generated column from the IMPLICIT
+  ;; list for COPY TO as well as COPY FROM -- which is what makes
+  ;; `COPY t TO` output readable by `COPY t FROM`. We emitted it, so
+  ;; our own output could not be reloaded.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c (str "CREATE TABLE cg (id int PRIMARY KEY, nm text, "
+                  "gen int GENERATED ALWAYS AS (id*2) STORED)"))
+    (exec! c "INSERT INTO cg VALUES (1,'a'),(2,'b')")
+    (is (= "1\ta\n2\tb\n" (copy-out-text c "COPY cg TO stdout")))
+    (is (= "id,nm\n1,a\n2,b\n" (copy-out-text c "COPY cg TO stdout (FORMAT csv, HEADER)")))
+    (testing "naming one explicitly is 42P10, as it already was for COPY FROM"
+      (is (= "42P10" (state-of c "COPY cg (gen) TO stdout"))))
+    (testing "but COPY (SELECT * …) TO is a query, and includes it"
+      (is (= "1\ta\t2\n2\tb\t4\n" (copy-out-text c "COPY (SELECT * FROM cg) TO stdout"))))))
+
+(deftest copy-validates-its-options-before-entering-copy-mode
+  ;; None of `ProcessCopyOptions`' cross-option checks existed. On a
+  ;; COPY FROM that cost twice: the statement was accepted, the
+  ;; connection entered COPY mode, and the SQL that followed was eaten
+  ;; as row data -- the hazard `start-copy-in!`'s own comment warns of.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE co (a int, b text)")
+    (doseq [[sql msg]
+            [["COPY co TO stdout (FORMAT text, FORCE_QUOTE (a))"
+              "COPY FORCE_QUOTE requires CSV mode"]
+             ["COPY co TO stdout (FORMAT csv, FORCE_NOT_NULL (b))"
+              "COPY FORCE_NOT_NULL cannot be used with COPY TO"]
+             ["COPY co TO stdout (FORMAT csv, FORCE_NULL (b))"
+              "COPY FORCE_NULL cannot be used with COPY TO"]
+             ["COPY co TO stdout (FORMAT text, QUOTE '\"')"
+              "COPY QUOTE requires CSV mode"]
+             ["COPY co TO stdout (FORMAT text, ESCAPE '\\')"
+              "COPY ESCAPE requires CSV mode"]
+             ["COPY co TO stdout (FORMAT text, DELIMITER 'a')"
+              "COPY delimiter cannot be \"a\""]
+             ["COPY co TO stdout (DELIMITER '.')"
+              "COPY delimiter cannot be \".\""]
+             ["COPY co TO stdout (FORMAT csv, DELIMITER ',', QUOTE ',')"
+              "COPY delimiter and quote must be different"]
+             ["COPY co TO stdout (FORMAT csv, QUOTE 'ab')"
+              "COPY quote must be a single one-byte character"]
+             ["COPY co TO stdout (FORMAT csv, ESCAPE 'ab')"
+              "COPY escape must be a single one-byte character"]
+             ["COPY co TO stdout (FORMAT csv, NULL ',')"
+              "COPY delimiter character must not appear in the NULL specification"]
+             ["COPY co TO stdout (FORMAT csv, NULL '\"')"
+              "CSV quote character must not appear in the NULL specification"]
+             ["COPY co TO stdout (FREEZE)"
+              "COPY FREEZE cannot be used with COPY TO"]
+             ["COPY co TO stdout (DEFAULT '\\D')"
+              "COPY DEFAULT cannot be used with COPY TO"]
+             ["COPY co TO stdout (ON_ERROR ignore)"
+              "COPY ON_ERROR cannot be used with COPY TO"]
+             ["COPY co TO stdout (FORMAT csv, HEADER match)"
+              "cannot use \"match\" with HEADER in COPY TO"]
+             ["COPY co TO stdout (DELIMITER '||')"
+              "COPY delimiter must be a single one-byte character"]
+             ["COPY co TO stdout (FORMAT bogus)"
+              "COPY format \"bogus\" not recognized"]]]
+      (is (= (str "ERROR: " msg) (message-of c sql)) sql))))
+
+(deftest a-refused-copy-from-does-not-swallow-the-next-statement
+  ;; The reason the checks have to run before COPY mode is entered.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE cw (a int, b text)")
+    (is (= "0A000" (state-of c "COPY cw FROM stdin WITH (FORMAT csv, FORCE_QUOTE (a))")))
+    (is (= [["survived"]] (query-rows c "SELECT 'survived'")))
+    (is (= "0A000" (state-of c "COPY cw FROM stdin WITH (FORMAT text, FORCE_NOT_NULL (b))")))
+    (is (= [["survived"]] (query-rows c "SELECT 'survived'")))
+    (is (= "42601" (state-of c "COPY cw FROM stdin WITH (FORMAT bogus)")))
+    (is (= [["survived"]] (query-rows c "SELECT 'survived'")))))
