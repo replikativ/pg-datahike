@@ -253,3 +253,39 @@
     (testing "but a GROUP BY still means zero groups, so zero rows"
       (is (= [] (run c "SELECT a, count(*) FROM ag0 WHERE false GROUP BY a")))
       (is (= [] (run c "SELECT count(*) FROM ag0 WHERE false GROUP BY a"))))))
+
+(deftest on-delete-cascade-over-the-wire
+  ;; There IS a cascade test, and it passed: it drives the handler in
+  ;; process, which takes `execute-delete` -- the path that already
+  ;; collected the cascade eids. The path the WIRE takes called
+  ;; `enforce-fk-restrict-on-delete!`, the compatibility shim whose own
+  ;; docstring says it walks the graph for the RESTRICT raise and
+  ;; throws the cascade eids away. So a parent row was deleted and its
+  ;; children were left behind: silent orphans, for every client.
+  (with-open [c (jdbc)]
+    (is (= 0 (run c "CREATE TABLE g1 (x int PRIMARY KEY)")))
+    (is (= 0 (run c "CREATE TABLE g2 (y int PRIMARY KEY, gx int REFERENCES g1(x) ON DELETE CASCADE)")))
+    (is (= 0 (run c "CREATE TABLE g3 (z int, gy int REFERENCES g2(y) ON DELETE CASCADE)")))
+    (is (= 3 (run c "INSERT INTO g1 VALUES (1),(2),(3)")))
+    (is (= 3 (run c "INSERT INTO g2 VALUES (10,1),(20,2),(30,3)")))
+    (is (= 3 (run c "INSERT INTO g3 VALUES (100,10),(200,20),(300,30)")))
+    (is (= 2 (run c "DELETE FROM g1 WHERE x IN (1,2)")))
+    (testing "the cascade is transitive -- g1 -> g2 -> g3 in one statement"
+      (is (= ["1"] (run c "SELECT count(*) FROM g1")))
+      (is (= ["1"] (run c "SELECT count(*) FROM g2")))
+      (is (= ["1"] (run c "SELECT count(*) FROM g3")))
+      (is (= ["300"] (run c "SELECT z FROM g3"))))
+    (testing "RESTRICT still raises rather than cascading"
+      (is (= 0 (run c "CREATE TABLE r1 (x int PRIMARY KEY)")))
+      (is (= 0 (run c "CREATE TABLE r2 (y int REFERENCES r1(x))")))
+      (is (= 1 (run c "INSERT INTO r1 VALUES (1)")))
+      (is (= 1 (run c "INSERT INTO r2 VALUES (1)")))
+      (is (= "23503" (second (run c "DELETE FROM r1"))))
+      (is (= ["1"] (run c "SELECT count(*) FROM r1"))))
+    (testing "and the cascade is part of the deleting transaction"
+      (.setAutoCommit c false)
+      (run c "DELETE FROM g1 WHERE x = 3")
+      (is (= ["0"] (run c "SELECT count(*) FROM g3")))
+      (.rollback c)
+      (is (= ["1"] (run c "SELECT count(*) FROM g3")))
+      (.setAutoCommit c true))))

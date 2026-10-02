@@ -89,8 +89,6 @@ reproduced and should be measured before it is believed.
 - **`&&`, `@>`, `<@` on geometric values return a bare `f`** —
   `expr.clj`'s array/jsonb fall-through. `'(0,0),(1,1)'::box &&
   '(0,0),(2,2)'::box` is `t` in PostgreSQL.
-- **`ON DELETE CASCADE` is not applied** — `DELETE FROM parent`
-  succeeds and leaves the child row behind, silently creating orphans.
 - **`COMMIT` inside a `DO` block commits the caller's transaction**;
   the client's `ROLLBACK` then does nothing.
 - **`DO` silently drops an EXCEPTION handler** that `CREATE FUNCTION`
