@@ -9024,7 +9024,14 @@
                     built)))
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
-              _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
+              ;; ON DELETE CASCADE. This called the compatibility shim,
+              ;; which walks the FK graph for its RESTRICT raise and
+              ;; THROWS THE CASCADE EIDS AWAY -- its own docstring says
+              ;; so and tells new callers not to use it. So a parent
+              ;; row was deleted and its children were left behind:
+              ;; silent orphans, on the path a plain `DELETE` takes.
+              cascade-eids (collect-fk-cascade-retractions!
+                            spec-db (:table parsed) eids)
               _ (fire-statement-triggers! spec-db (:table parsed) :delete :before)
               old-rows (into {} (map (fn [e] [e (entity-columns spec-db (:table parsed) e)]))
                              eids)
@@ -9035,8 +9042,13 @@
                                  (build-returning-result returning spec-db spec-db eids
                                                          (:table parsed) (:alias parsed)
                                                          (:schema spec-db) :delete))
-              ;; Apply to speculative-db with ORIGINAL entity IDs
-              spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)
+              ;; Apply to speculative-db with ORIGINAL entity IDs.
+              ;; The cascaded children go in the SAME transaction, as
+              ;; retractEntity is atomic and PostgreSQL's cascade is
+              ;; part of the deleting statement.
+              spec-tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
+                                 (map (fn [eid] [:db/retractEntity eid]))
+                                 cascade-eids)
               spec-report (dc/with spec-db spec-tx-data)
               ;; A row inserted earlier in this SQL transaction has no
               ;; committed entity to retract. Cancel its entity map and any
@@ -9048,7 +9060,7 @@
               commit-tx-data (into []
                                    (comp (remove inserted-eids)
                                          (map (fn [eid] [:db/retractEntity eid])))
-                                   eids)]
+                                   (concat eids cascade-eids))]
           (swap! tx-state (fn [ts]
                             (let [buffer (if (seq deleted-tempids)
                                            (into [] (remove #(writes-tempid? deleted-tempids %))
