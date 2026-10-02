@@ -86,6 +86,34 @@ reproduced and should be measured before it is believed.
 
 ## Wrong answers, contained, not yet done
 
+- **Every COMPOSITE PRIMARY KEY and UNIQUE constraint is unenforced.**
+  Found while adding the FK unique-constraint check. A multi-column key
+  leaves no trace at all — not in the schema, not in `pg_constraint`,
+  not in `pg_indexes` — and duplicates go straight in:
+
+  ```
+  create table t (x int, y int, primary key (x,y));
+  insert into t values (1,1);
+  insert into t values (1,1);   -- accepted; PostgreSQL raises 23505
+  select count(*) from t;       -- 2
+  ```
+
+  Single-column PK and UNIQUE both work. `ddl.clj` HAS the machinery
+  (`multi-pk-tuple`, `multi-uniques`, `pg$pk_tuple`), so something
+  upstream is not producing `:pk-cols`/`:uniques` for the table-level
+  form, or the derived tuple attrs are built and never transacted. This
+  is the largest single wrong answer left in this file and wants its own
+  investigation.
+
+  It is also why the new FK check is scoped to SINGLE-column references:
+  a composite reference cannot be judged, and refusing it would be a new
+  wrong answer.
+
+- **`NOT VALID` is still a parse error** (`ALTER TABLE … ADD CHECK (…)
+  NOT VALID`). `VALIDATE CONSTRAINT` is implemented, so only the
+  deferred-validation half is missing.
+- **`EXECUTE` with a missing argument** substitutes a literal NULL.
+
 - **3 of PostgreSQL's 21 `&&`/`@>`/`<@` geometric pairs are
   unimplemented** — polygon-to-polygon overlap and containment, which
   need `lseg_inside_poly` and segment intersection. They refuse with
@@ -94,10 +122,6 @@ reproduced and should be measured before it is believed.
   `array_agg(v)` over 1,2,2,5 answers `{5,1,2,2}`. PostgreSQL does not
   guarantee an order without ORDER BY, but it returns scan order and the
   regress suite compares text.
-- **The generated CHECK name is wrong for the single-column ALTER
-  case** — `ChooseConstraintName` uses `<table>_<col>_check` when the
-  expression references exactly one column; the ALTER path passes nil
-  for the column, so CREATE TABLE and ALTER now disagree.
 
 ## Missing validation (we accept what PostgreSQL rejects)
 
@@ -110,12 +134,6 @@ reproduced and should be measured before it is believed.
 - **Every generated-column restriction is unenforced**, including one
   that makes the same schema give different answers depending on column
   order.
-- **An FK is never checked for a unique constraint on the referenced
-  columns** (PostgreSQL: 42830) unless the parent has no PK at all.
-- **`NOT VALID` / `VALIDATE CONSTRAINT`** — the first is a parse error,
-  the second answers `ALTER TABLE` for a constraint that does not exist.
-- **Duplicate PREPARE/DECLARE names**, and `EXECUTE` with a missing
-  argument substitutes a literal NULL.
 - **Row-level transition tables** are accepted at CREATE TRIGGER and
   then fail at run time with `relation "nr" does not exist`. Either wire
   `:transitions` through `fire-after-row-triggers!` or reject the DDL.

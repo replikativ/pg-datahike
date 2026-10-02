@@ -289,3 +289,53 @@
       (.rollback c)
       (is (= ["1"] (run c "SELECT count(*) FROM g3")))
       (.setAutoCommit c true))))
+
+(deftest constraint-lifecycle-validation
+  ;; Four review findings about ALTER TABLE accepting what PostgreSQL
+  ;; refuses, plus the generated name the two paths disagreed on.
+  (with-open [c (jdbc)]
+    (testing "the generated CHECK name uses the column when the expression
+              references exactly one -- ChooseConstraintName's rule, which
+              CREATE TABLE already followed and ALTER did not"
+      (is (= 0 (run c "CREATE TABLE an1 (a int CHECK (a > 0), b int, CHECK (b > a), CHECK (b > 1))")))
+      (is (= 0 (run c "ALTER TABLE an1 ADD CHECK (a < 100)")))
+      (is (= 0 (run c "ALTER TABLE an1 ADD CHECK (a + b < 1000)")))
+      (is (= ["an1_a_check" "an1_a_check1" "an1_b_check" "an1_check" "an1_check1"]
+             (run c (str "SELECT conname FROM pg_constraint "
+                         "WHERE conrelid = 'an1'::regclass AND contype = 'c' "
+                         "ORDER BY conname")))))
+    (testing "an FK must reference a column with a unique constraint (42830)"
+      (is (= 0 (run c "CREATE TABLE nu_p (x int PRIMARY KEY, y int UNIQUE, z int)")))
+      (is (= 0 (run c "CREATE TABLE nu_c (a int)")))
+      (is (= 0 (run c "ALTER TABLE nu_c ADD FOREIGN KEY (a) REFERENCES nu_p (x)")))
+      (is (= 0 (run c "ALTER TABLE nu_c ADD FOREIGN KEY (a) REFERENCES nu_p (y)")))
+      (is (= "42830" (second (run c "ALTER TABLE nu_c ADD FOREIGN KEY (a) REFERENCES nu_p (z)")))))
+    (testing "VALIDATE CONSTRAINT resolves its name instead of answering
+              ALTER TABLE for one that does not exist"
+      (is (= 0 (run c "CREATE TABLE nv1 (a int)")))
+      (is (= 0 (run c "ALTER TABLE nv1 ADD CONSTRAINT nv1_ck CHECK (a > 0)")))
+      (is (= 0 (run c "ALTER TABLE nv1 VALIDATE CONSTRAINT nv1_ck")))
+      (is (= "42704" (second (run c "ALTER TABLE nv1 VALIDATE CONSTRAINT nope"))))
+      (is (= "23514" (second (run c "INSERT INTO nv1 VALUES (-1)")))
+          "and the constraint is still enforced afterwards"))))
+
+(deftest prepared-statement-and-cursor-names-are-unique
+  ;; Both registries were plain maps written with `assoc`, so a second
+  ;; PREPARE or DECLARE under a name already held replaced it silently --
+  ;; the reads that followed came from the wrong statement. And
+  ;; DEALLOCATE of an unknown name answered DEALLOCATE.
+  (with-open [c (jdbc)]
+    (is (= 0 (run c "DEALLOCATE ALL")))
+    (is (= 0 (run c "PREPARE p1 AS SELECT 1")))
+    (is (= "42P05" (second (run c "PREPARE p1 AS SELECT 2"))))
+    (is (= ["1"] (run c "EXECUTE p1")) "the FIRST statement is what is held")
+    (is (= 0 (run c "DEALLOCATE p1")))
+    (is (= "26000" (second (run c "DEALLOCATE nope"))))
+    (testing "and a cursor the same way, which also aborts the transaction
+              as PostgreSQL does for any error inside a block"
+      (.setAutoCommit c false)
+      (is (= 0 (run c "DECLARE c1 CURSOR FOR SELECT 1")))
+      (is (= "42P03" (second (run c "DECLARE c1 CURSOR FOR SELECT 2"))))
+      (is (= "25P02" (second (run c "SELECT 1"))))
+      (.rollback c)
+      (.setAutoCommit c true))))

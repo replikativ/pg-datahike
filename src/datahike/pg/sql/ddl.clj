@@ -69,6 +69,32 @@
                          schema)]
           [(name attr)])))))
 
+(defn unique-key-sets
+  "Every set of columns of `table-name` that a UNIQUE or PRIMARY KEY
+   constraint covers, as sets.
+
+   `primary-key-cols` finds only the PK, so an FK could reference a
+   column with no unique constraint at all -- which PostgreSQL refuses
+   with 42830, because without one a child row can match several
+   parents. Composite keys are the `pg$pk_tuple` / `pg$unique_tuple_N`
+   derived attributes; single-column ones are `:db.unique/identity`
+   (PK) or `:db.unique/value` (UNIQUE) on the column itself."
+  [db table-name]
+  (when db
+    (let [schema (:schema db)]
+      (into #{}
+            (keep (fn [[a props]]
+                    (when (and (keyword? a) (= table-name (namespace a)))
+                      (cond
+                        (seq (:db/tupleAttrs props))
+                        (when (:db/unique props)
+                          (into #{} (map name) (:db/tupleAttrs props)))
+
+                        (and (:db/unique props)
+                             (not (str/starts-with? (name a) "pg$")))
+                        #{(name a)}))))
+            schema))))
+
 (defn- attr-enum-name
   "Return the enum type attached to a persisted column attribute."
   [db attr]
@@ -187,9 +213,10 @@
   [table name]
   (str table "\u001f" name))
 
-(defn- check-columns
+(defn check-columns
   "The distinct columns a CHECK expression references, or nil when it
-   cannot be read."
+   cannot be read. Public because ALTER TABLE ADD CHECK names its
+   constraint by the same rule CREATE TABLE does."
   [^String expr]
   (when-let [ast (try (CCJSqlParserUtil/parseCondExpression expr)
                       (catch Exception _ nil))]
