@@ -3188,18 +3188,78 @@
    and every SCALAR SUBQUERY evaluator needs the identical rule --
    `SELECT (SELECT count(*) FROM t WHERE false)` is 0, not NULL -- but each
    of them ran `d/q` directly and answered NULL."
-  [query]
-  (let [find-elems (:find query)]
-    (when (and (seq find-elems)
-               (every? (fn [elem] (and (seq? elem) (symbol? (first elem)))) find-elems))
-      [(mapv (fn [elem]
-               (let [agg-name (name (first elem))]
-                 (if (contains? #{"count" "count-distinct"
-                                  "filter-count" "filter-count-distinct"}
-                                agg-name)
-                   0
-                   nil)))
-             find-elems)])))
+  ([query] (empty-aggregate-row query nil))
+  ([query in-args]
+   (let [find-elems (:find query)
+         agg? (fn [elem] (and (seq? elem) (symbol? (first elem))))
+        ;; A CONSTANT in the select list is not a grouping column, so it
+        ;; does not make the result a grouped one: `SELECT 'x',
+        ;; count(*) FROM t WHERE false` is ONE row in PostgreSQL, `x|0`.
+        ;; Requiring every find element to be an aggregate form meant
+        ;; any literal beside the aggregate -- a label, a 1, an aliased
+        ;; string -- collapsed the answer to ZERO rows.
+        ;;
+        ;; A constant does not reach `:find` as a literal: the
+        ;; translator binds it to a var with `[(identity "x") ?v1]`, so
+        ;; the test has to read the WHERE clauses. A var bound from a
+        ;; data pattern has no such clause, which is exactly the
+        ;; grouping column that must still produce zero rows.
+        ;; The query's `:in` parameters, which is where a literal
+        ;; rewritten to `$N` ends up -- `SELECT 1, count(*)` binds `?p1`
+        ;; from in-args, not from a WHERE clause.
+         param-bindings (zipmap (remove #(= '$ %) (:in query)) (or in-args []))
+         const-bindings
+        ;; Resolve to a fixpoint: a constant clause may use a var an
+        ;; earlier one bound. Only clauses whose arguments are all
+        ;; literals or already-known constants are evaluated, and the
+        ;; function must itself come from `:in` (where the translator
+        ;; puts the emitted pure functions) or be `identity`/`ground`.
+         (loop [known param-bindings, n 0]
+           (let [known'
+                 (reduce
+                  (fn [acc clause]
+                    (if (and (vector? clause) (= 2 (count clause))
+                             (seq? (first clause)) (symbol? (second clause))
+                             (not (contains? acc (second clause))))
+                      (let [[f & args] (first clause)
+                            resolved (map (fn [a]
+                                            (cond (contains? acc a) [:ok (get acc a)]
+                                                  (symbol? a) [:unknown nil]
+                                                  :else [:ok a]))
+                                          args)
+                            fv (cond (contains? #{'identity 'ground} f) identity
+                                     (contains? acc f) (get acc f)
+                                     :else nil)]
+                        (if (and (ifn? fv) (every? #(= :ok (first %)) resolved))
+                          (if-let [v (try [(apply fv (map second resolved))]
+                                          (catch Throwable _ nil))]
+                            (assoc acc (second clause) (first v))
+                            acc)
+                          acc))
+                      acc))
+                  known
+                  (:where query))]
+             (if (or (= known known') (> n 8)) known' (recur known' (inc n)))))
+         resolvable? (fn [elem]
+                       (or (agg? elem)
+                           (and (symbol? elem) (contains? const-bindings elem))
+                           (not (symbol? elem))))]
+     (when (and (seq find-elems)
+                (some agg? find-elems)
+                (every? resolvable? find-elems))
+       [(mapv (fn [elem]
+                (cond
+                  (not (agg? elem))
+                  (if (symbol? elem) (get const-bindings elem) elem)
+
+                  :else
+                  (let [agg-name (name (first elem))]
+                    (if (contains? #{"count" "count-distinct"
+                                     "filter-count" "filter-count-distinct"}
+                                   agg-name)
+                      0
+                      nil))))
+              find-elems)]))))
 
 (defn- nested-selects-in
   "Immediate SELECT nodes reachable from `node`; SELECT bodies stay opaque so

@@ -208,3 +208,48 @@
       (is (= 1 (run c "INSERT INTO w (id, b) VALUES (1, 'yes') ON CONFLICT (id) DO UPDATE SET b = 'no'"))))
     (is (= ["1|1|false" "2|2|false" "3||false" "101||false" "102|2|false"]
            (run c "SELECT id || '|' || coalesce(i::text, '') || '|' || b::text FROM w ORDER BY id")))))
+
+(deftest alter-table-drop-constraint-actually-drops
+  ;; `ALTER TABLE … DROP CONSTRAINT` mapped to a compatibility no-op.
+  ;; Harmless while ALTER could not ADD a constraint either; once it
+  ;; could, a constraint could be added and never removed, so rows
+  ;; PostgreSQL accepts stayed refused forever.
+  (with-open [c (jdbc)]
+    (is (= 0 (run c "CREATE TABLE dc1 (a int)")))
+    (is (= 0 (run c "ALTER TABLE dc1 ADD CONSTRAINT dc1_ck CHECK (a > 0)")))
+    (is (= "23514" (second (run c "INSERT INTO dc1 VALUES (-1)"))))
+    (is (= 0 (run c "ALTER TABLE dc1 DROP CONSTRAINT dc1_ck")))
+    (is (= 1 (run c "INSERT INTO dc1 VALUES (-1)"))
+        "the constraint is gone, so the row goes in")
+    (is (= ["0"] (run c (str "SELECT count(*) FROM pg_constraint "
+                             "WHERE conrelid = 'dc1'::regclass AND contype = 'c'")))
+        "and it is gone from the catalog, not just from enforcement")
+    (testing "an unknown name is 42704, not a silent ALTER TABLE"
+      (is (= "42704" (second (run c "ALTER TABLE dc1 DROP CONSTRAINT nope"))))
+      (is (= 0 (run c "ALTER TABLE dc1 DROP CONSTRAINT IF EXISTS nope"))))
+    (testing "a FOREIGN KEY drops the same way"
+      (is (= 0 (run c "CREATE TABLE dcp (x int PRIMARY KEY)")))
+      (is (= 0 (run c "CREATE TABLE dcc (y int)")))
+      (is (= 0 (run c "ALTER TABLE dcc ADD CONSTRAINT dcc_fk FOREIGN KEY (y) REFERENCES dcp (x)")))
+      (is (= "23503" (second (run c "INSERT INTO dcc VALUES (9)"))))
+      (is (= 0 (run c "ALTER TABLE dcc DROP CONSTRAINT dcc_fk")))
+      (is (= 1 (run c "INSERT INTO dcc VALUES (9)"))))))
+
+(deftest an-aggregate-with-a-constant-is-still-one-row
+  ;; A SELECT with aggregates and no GROUP BY produces exactly one row.
+  ;; The empty-relation rule required EVERY `:find` element to be an
+  ;; aggregate form, and a constant does not reach `:find` as a literal
+  ;; -- the translator binds it to a var, or rewrites it to a `$N`
+  ;; parameter -- so ANY literal beside the aggregate collapsed the
+  ;; answer to zero rows. Found while diffing an unrelated
+  ;; `SELECT 'remaining:', count(*) FROM pg_constraint …` probe.
+  (with-open [c (jdbc)]
+    (is (= 0 (run c "CREATE TABLE ag0 (a int)")))
+    (is (= ["0"] (run c "SELECT count(*) FROM ag0 WHERE false")))
+    (is (= ["x"] (run c "SELECT 'x', count(*) FROM ag0 WHERE false")))
+    (is (= ["1"] (run c "SELECT 1, count(*) FROM ag0 WHERE false")))
+    (is (= ["ab"] (run c "SELECT 'a'||'b', count(*), max(a) FROM ag0 WHERE false")))
+    (is (= ["0"] (run c "SELECT count(*), 'x' FROM ag0 WHERE false")))
+    (testing "but a GROUP BY still means zero groups, so zero rows"
+      (is (= [] (run c "SELECT a, count(*) FROM ag0 WHERE false GROUP BY a")))
+      (is (= [] (run c "SELECT count(*) FROM ag0 WHERE false GROUP BY a"))))))
