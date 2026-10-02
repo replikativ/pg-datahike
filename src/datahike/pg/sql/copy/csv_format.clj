@@ -6,8 +6,11 @@
    CSV is a *different beast* from text format:
 
      - Backslash is a literal char (no escape sequences).
-     - End-of-data marker `\\.` is **not** recognised inside CSV
-       streams (uses CopyDone / EOF instead).
+     - End-of-data marker `\\.` IS recognised, but only as the FIRST
+       character of a line (`copyfromparse.c:1383`), and only when an
+       end of line follows it. In text format it is recognised
+       anywhere. This decoder used to say it was not recognised at
+       all, which made psql's own terminator a data row.
      - NULL detection only fires on **unquoted** fields whose raw
        text matches the null marker. `\"\"` is empty-string, never
        null (unless FORCE_NULL is set for that column).
@@ -272,6 +275,43 @@
               st' (-> st (dissoc :defer?) (assoc :line-buf (StringBuilder. ^String tail)))]
           [st' rows false])
 
+        ;; `\.` as the FIRST character of a line ends the data in CSV
+        ;; mode too. This decoder documented the opposite -- and so
+        ;; psql's terminator, which it forwards to the server like any
+        ;; other line, became a DATA row: one junk row on a
+        ;; single-column table, and `missing data for column "b"` with
+        ;; two. Every CSV `COPY … FROM STDIN` block was broken.
+        ;; `copyfromparse.c:1383`: `c == '\\' && (!csv_mode ||
+        ;; first_char_in_line)`, and the marker must be followed by an
+        ;; end of line -- `\.foo` is data (NO_END_OF_COPY_GOTO).
+        (and (= :not-quoted (:state st))
+             (empty? (:row st))
+             (zero? (.length ^StringBuilder (:field-buf st)))
+             (= \\ (.charAt s i))
+             (< (unchecked-inc i) n)
+             (= \. (.charAt s (unchecked-inc i))))
+        (let [after (+ i 2)]
+          (cond
+            (>= after n)
+            (if eof?
+              [(assoc st :eod? true) rows true]
+              ;; The line may continue in the next chunk; keep it whole.
+              [(assoc st :line-buf (StringBuilder. ^String (subs s i n))) rows false])
+
+            (or (= \newline (.charAt s after)) (= \return (.charAt s after)))
+            [(assoc st :eod? true) rows true]
+
+            :else
+            ;; Not the marker after all -- fall through to the state
+            ;; machine, which treats the backslash as data.
+            (let [c (.charAt s i)
+                  next-c (when (< (unchecked-inc i) n) (.charAt s (unchecked-inc i)))
+                  result (step-char st c next-c eof?)]
+              (if (:row-complete result)
+                (recur (unchecked-inc i) (dissoc (:state result) :skip-next?)
+                       (conj rows (:row-complete result)))
+                (recur (unchecked-inc i) (dissoc result :skip-next?) rows)))))
+
         :else
         (let [c (.charAt s i)
               next-c (when (< (unchecked-inc i) n) (.charAt s (unchecked-inc i)))
@@ -307,7 +347,7 @@
           s (.toString buf)
           ;; Reset the buffer (consume-rows builds a fresh one for any tail)
           _ (.setLength buf 0)
-          [d' rows _eod?] (consume-rows decoder s false)]
+          [d' rows eod?] (consume-rows decoder s false)]
       ;; HEADER skip: if header was :true/:match and we haven't skipped
       ;; yet, drop the first emitted row.
       (let [{:keys [header columns]} (:opts d')
@@ -329,7 +369,7 @@
             rows' (if should-skip? (rest rows) rows)
             d'' (cond-> d'
                   should-skip? (assoc :header-skipped? true))]
-        [d'' (vec rows') false]))))
+        [d'' (vec rows') (boolean eod?)]))))
 
 (defn decode-finalize
   "Emit any remaining rows. Returns [rows eod?]."

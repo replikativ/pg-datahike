@@ -12723,6 +12723,31 @@
         ;; A SELECT built from the physical name therefore cannot see
         ;; the table this COPY is reading. Map it back.
         table (get (clojure.set/map-invert @(:temp-tables ctx)) table table)
+        ;; `CopyGetAttnums` excludes generated columns from the IMPLICIT
+        ;; column list, for COPY TO as well as COPY FROM, so `COPY t TO`
+        ;; emits only the ordinary ones -- and its output can therefore
+        ;; be read back by `COPY t FROM`, which refuses them. `SELECT *`
+        ;; includes them, so the implicit list has to be spelled out.
+        ;; Naming one explicitly is 42P10, the same error
+        ;; `start-copy-in!` already raises for COPY FROM.
+        gen-cols (when-not query
+                   (let [db (if (:in-tx? @(:tx-state ctx))
+                              (:speculative-db @(:tx-state ctx))
+                              (d/db (:conn ctx)))]
+                     (into #{} (comp (filter :generated) (map :name))
+                           (:columns (row-constraint-plan db table)))))
+        _ (when-let [gen (first (filter gen-cols columns))]
+            (throw (ex-info (str "column \"" gen "\" is a generated column")
+                            {:sqlstate "42P10"
+                             :error :invalid-column-reference
+                             :detail "Generated columns cannot be used in COPY."})))
+        columns (if (and (empty? columns) (seq gen-cols))
+                  (let [db (if (:in-tx? @(:tx-state ctx))
+                             (:speculative-db @(:tx-state ctx))
+                             (d/db (:conn ctx)))]
+                    (into [] (comp (remove :generated) (map :name))
+                          (:columns (row-constraint-plan db table))))
+                  columns)
         sql (or query
                 (str "SELECT "
                      (if (seq columns) (str/join ", " columns) "*")
