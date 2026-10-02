@@ -611,10 +611,31 @@
    to the row -- so `RETURN NULL` and `RETURN NEW` are distinguishable
    from a value that merely happens to be nil."
   [handler ast {:keys [new old tg types transitions]}]
-  (let [vars (merge (record-vars "new" new)
+  (let [;; The record that is not assigned for this event -- OLD on an
+        ;; INSERT, NEW on a DELETE -- still has to RESOLVE. PostgreSQL
+        ;; gives NULL for each of its fields:
+        ;;   op=INSERT new=1 old=-
+        ;;   op=DELETE new=- old=2
+        ;; Binding nothing left the name to SQL resolution, which
+        ;; answered `column "old" does not exist`, so the common
+        ;; one-function-for-every-event trigger body -- the shape
+        ;; PostgreSQL's own documentation uses -- failed outright.
+        null-record (fn [record-name cols]
+                      (into {} (mapcat (fn [[c _]]
+                                         [[(str/lower-case (str record-name "." c)) nil]
+                                          [(str/lower-case c) nil]]))
+                            cols))
+        vars (merge (when (and (nil? new) old) (null-record "new" old))
+                    (when (and (nil? old) new) (null-record "old" new))
+                    (record-vars "new" new)
                     (record-vars "old" old)
-                    (when new {"new" ::new})
-                    (when old {"old" ::old})
+                    ;; `:__null__`, not nil: that is the SQL NULL sentinel
+                    ;; everywhere else, and it is what `coalesce` skips.
+                    ;; Bound to nil, `RETURN coalesce(NEW, OLD)` in a
+                    ;; DELETE trigger returned NULL -- which SUPPRESSES the
+                    ;; delete -- so the row stayed and no AFTER trigger ran.
+                    {"new" (if new ::new :__null__)
+                     "old" (if old ::old :__null__)}
                     tg)
         st (new-state handler vars transitions)
         _ (swap! (:types st) into types)
@@ -627,14 +648,27 @@
         v (:value returned)]
     ;; The body may have ASSIGNED to NEW's fields, so the row it means
     ;; is read back out of the scope rather than taken from the input.
-    (cond
-      (= ::new v) {:row (into {} (map (fn [[c _]]
-                                        [c (get (all-vars st)
-                                                (str/lower-case (str "new." c)))]))
-                              new)}
-      (= ::old v) {:row old}
-      (nil? v) {:row nil}
-      :else {:row new})))
+    ;; The marker may come back as its own STRING: a body that computes
+    ;; the record -- `RETURN coalesce(NEW, OLD)`, the shape PostgreSQL's
+    ;; documentation uses for a one-function-per-event trigger -- runs
+    ;; that through the SQL evaluator, which renders the keyword to
+    ;; text. Both spellings are the same answer.
+    (let [marker (fn [kw] #{(str kw) (subs (str kw) 1)})
+          v (cond ((marker ::new) v) ::new
+                  ((marker ::old) v) ::old
+                  :else v)]
+      (cond
+        (= ::new v) {:row (into {} (map (fn [[c _]]
+                                          [c (get (all-vars st)
+                                                  (str/lower-case (str "new." c)))]))
+                                new)}
+        (= ::old v) {:row old}
+        (nil? v) {:row nil}
+        ;; `RETURN NEW` in a DELETE trigger, or `RETURN OLD` in an INSERT
+        ;; one: the record is unassigned, so this is `RETURN NULL`, which
+        ;; suppresses the row.
+        (= :__null__ v) {:row nil}
+        :else {:row new}))))
 
 (defn run-body
   "Run a parsed plpgsql body with `args` bound, and return

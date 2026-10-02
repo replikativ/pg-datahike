@@ -2737,8 +2737,9 @@
     true
     (let [ast (pl-parse/parse-body
                (str "BEGIN IF " (:when t) " THEN RETURN NEW; END IF; RETURN NULL; END"))]
+      ;; `(or new old)` made a DELETE's WHEN clause see OLD as NEW.
       (some? (:row (pl-exec/run-trigger handler ast
-                                        {:new (or new old) :old old
+                                        {:new new :old old
                                          :tg {} :types {}}))))))
 
 (defn- run-one-trigger
@@ -2860,9 +2861,14 @@
    fires them even when the statement matched no rows, which is most of
    what they are for."
   ([db table-name event timing]
-   (fire-statement-triggers! db table-name event timing nil))
+   (fire-statement-triggers! db table-name event timing nil nil))
   ([db table-name event timing rows]
-   (when-let [triggers (seq (matching-triggers db table-name event timing :statement nil))]
+   (fire-statement-triggers! db table-name event timing rows nil))
+  ([db table-name event timing rows changed-columns]
+   ;; Same omission as the AFTER ROW path: a literal nil meant
+   ;; `UPDATE OF col` was never compared for a statement trigger either.
+   (when-let [triggers (seq (matching-triggers db table-name event timing
+                                               :statement changed-columns))]
      (let [handler (trigger-handler! table-name)
            rows (delay (if (fn? rows) (rows) rows))]
        (doseq [t triggers]
@@ -2884,16 +2890,22 @@
    is every table, nearly always. Reading a row's full column list is a
    catalog query now (`row-entity->columns`), and doing it per INSERT
    showed up as one."
-  [db table-name event rows]
-  (when-let [triggers (and (or (fn? rows) (seq rows))
-                           (seq (matching-triggers db table-name event
-                                                   :after :row nil)))]
-    (let [rows (if (fn? rows) (rows) rows)
-          handler (trigger-handler! table-name)]
-      (doseq [{:keys [new old]} rows
-              t triggers]
-        (run-one-trigger db handler t table-name event new old))))
-  nil)
+  ([db table-name event rows] (fire-after-row-triggers! db table-name event rows nil))
+  ([db table-name event rows changed-columns]
+   (when-let [triggers (and (or (fn? rows) (seq rows))
+                            ;; `UPDATE OF col` was compared only by the
+                            ;; BEFORE path: a literal nil here meant the
+                            ;; column list was never consulted, so an
+                            ;; `AFTER UPDATE OF b` trigger fired on
+                            ;; `UPDATE t SET a = a + 10`.
+                            (seq (matching-triggers db table-name event
+                                                    :after :row changed-columns)))]
+     (let [rows (if (fn? rows) (rows) rows)
+           handler (trigger-handler! table-name)]
+       (doseq [{:keys [new old]} rows
+               t triggers]
+         (run-one-trigger db handler t table-name event new old))))
+   nil))
 
 (defn- keep-row-deletes
   "The eids whose BEFORE ROW DELETE triggers did not veto them. A
@@ -2910,8 +2922,11 @@
                   (loop [[t & more] triggers]
                     (cond
                       (nil? t) eid
+                      ;; NEW is nil for a DELETE. It was bound to OLD, so
+                      ;; a body or WHEN clause that branches on NEW read
+                      ;; OLD's values where PostgreSQL gives NULL.
                       (nil? (:row (run-one-trigger db handler t table-name
-                                                   :delete old old))) nil
+                                                   :delete nil old))) nil
                       :else (recur more)))))
               eids)))))
 
@@ -3085,8 +3100,22 @@
               ;; forward while applying only the new row-operation delta to
               ;; the speculative database.
               on-conflict? (= :on-conflict (:insert-mode parsed))
+              ;; BEFORE INSERT ROW fires for the PROPOSED row, before
+              ;; arbitration decides whether it inserts or updates
+              ;; (ExecInsert runs ExecBRInsertTriggers ahead of the
+              ;; speculative insertion). The non-conflict path runs them
+              ;; over the prepared tx-data below; the ON CONFLICT path
+              ;; produced raw ops rather than entity maps, so
+              ;; `fire-row-triggers`' `(if-not (map? entry) entry …)`
+              ;; guard passed every one through and NOTHING fired --
+              ;; a BEFORE trigger that rewrites NEW was simply skipped
+              ;; by `INSERT … ON CONFLICT`.
+              candidate (if (and on-conflict? (map? candidate))
+                          (first (fire-row-triggers base-db table-name
+                                                    [candidate] :insert))
+                          candidate)
               next-conflict-state
-              (when on-conflict?
+              (when (and on-conflict? (some? candidate))
                 ((:insert-candidate-step parsed)
                  base-db conflict-state candidate
                  (nth (first (:tx-data parsed)) 3 nil)))
@@ -3100,7 +3129,12 @@
                  (if on-conflict?
                    prepared
                    (into prepared replay-tx-data))
-                 next-conflict-state
+                 ;; A BEFORE trigger that returned NULL suppresses the
+                 ;; row, so arbitration never saw it and the state is
+                 ;; unchanged.
+                 (if (and on-conflict? (nil? candidate))
+                   conflict-state
+                   next-conflict-state)
                  next-seen-unique))
         (if (= :on-conflict (:insert-mode parsed))
           (do
@@ -3211,6 +3245,16 @@
               result (build-returning-result returning row-db db data-eids table-name
                                              (:alias parsed) schema :insert)]
           (transact-speculative-report! conn db tx-report)
+          ;; AFTER triggers fire for a RETURNING insert too. They lived
+          ;; only in the else branch, so `INSERT ... RETURNING` ran none
+          ;; of them -- while `UPDATE ... RETURNING` and `DELETE ...
+          ;; RETURNING` did, so this was INSERT alone.
+          (let [after-rows (fn [] (mapv (fn [e] {:new (row-entity->columns
+                                                       (d/db conn) table-name e)})
+                                        data-eids))]
+            (fire-after-row-triggers! (d/db conn) table-name :insert after-rows)
+            (fire-statement-triggers! (d/db conn) table-name :insert :after
+                                      after-rows))
           result)
         (do
           (when speculative?
@@ -3847,12 +3891,12 @@
           _ (check-updates-against-row-constraints!
              db table (or (:ns parsed) table) tx-data)
           _ (enforce-fk-restrict-on-update! db table tx-data)
-          _ (fire-statement-triggers! db table :update :before)
           changed-columns (set (keep (fn [op]
                                        (when (and (vector? op) (= :db/add (first op))
                                                   (keyword? (nth op 2 nil)))
                                          (name (nth op 2))))
                                      tx-data))
+          _ (fire-statement-triggers! db table :update :before nil changed-columns)
           [tx-data after-rows cancelled] (apply-before-row-updates
                                           db table tx-data changed-columns eids)
           tx-data (tx-wrap tx-data)
@@ -3869,11 +3913,11 @@
               result (build-returning-result returning db-after db eids table (:alias parsed)
                                              (:schema db-after) :update)]
           (when (seq tx-data) (transact-speculative-report! conn db tx-report))
-          (fire-after-row-triggers! db table :update after-rows)
-          (fire-statement-triggers! db table :update :after after-rows)
+          (fire-after-row-triggers! db table :update after-rows changed-columns)
+          (fire-statement-triggers! db table :update :after after-rows changed-columns)
           result)
-        (do (fire-after-row-triggers! db table :update after-rows)
-            (fire-statement-triggers! db table :update :after after-rows)
+        (do (fire-after-row-triggers! db table :update after-rows changed-columns)
+            (fire-statement-triggers! db table :update :after after-rows changed-columns)
             ;; A row a BEFORE trigger cancelled was not updated, so it
             ;; is not counted. Every other MATCHED row is, including one
             ;; whose new value equals its old.
@@ -8784,16 +8828,20 @@
                                 (cond-> reservation-only-advance?
                                   (assoc :begin-max-tx (:max-tx durable-db)))
                                 (update :eid->tempid merge new-tempids))))
+          ;; AFTER triggers fire whether or not there is a RETURNING
+          ;; clause. They sat INSIDE the `(or returning-result …)`
+          ;; fallback, so `INSERT … RETURNING` ran none of them --
+          ;; while `UPDATE … RETURNING` and `DELETE … RETURNING` did.
+          (let [after-rows (fn [] (let [after-db (:speculative-db @tx-state)]
+                                    (mapv (fn [e] {:new (row-entity->columns
+                                                         after-db table-name e)})
+                                          (filter map? (:tx-data prepared)))))]
+            (fire-after-row-triggers! (:speculative-db @tx-state)
+                                      table-name :insert after-rows)
+            (fire-statement-triggers! (:speculative-db @tx-state)
+                                      table-name :insert :after after-rows))
           (or returning-result
-              (let [after-rows (fn [] (let [after-db (:speculative-db @tx-state)]
-                                        (mapv (fn [e] {:new (row-entity->columns
-                                                             after-db table-name e)})
-                                              (filter map? (:tx-data prepared)))))]
-                (fire-after-row-triggers! (:speculative-db @tx-state)
-                                          table-name :insert after-rows)
-                (fire-statement-triggers! (:speculative-db @tx-state)
-                                          table-name :insert :after after-rows)
-                (empty-result (str "INSERT 0 " (insert-affected-count parsed))))))
+              (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
@@ -8872,12 +8920,13 @@
               _ (check-updates-against-row-constraints!
                  spec-db (:table parsed) (or (:ns parsed) (:table parsed)) tx-data)
               _ (enforce-fk-restrict-on-update! spec-db (:table parsed) tx-data)
-              _ (fire-statement-triggers! spec-db (:table parsed) :update :before)
               changed-columns (set (keep (fn [op]
                                            (when (and (vector? op) (= :db/add (first op))
                                                       (keyword? (nth op 2 nil)))
                                              (name (nth op 2))))
                                          tx-data))
+              _ (fire-statement-triggers! spec-db (:table parsed) :update :before
+                                          nil changed-columns)
               [tx-data after-rows cancelled] (apply-before-row-updates
                                               spec-db (:table parsed) tx-data
                                               changed-columns eids)
@@ -8907,9 +8956,9 @@
                                 (update :tx-buffer into (guard-catalog-tx commit-tx-data))
                                 (assoc :speculative-db db-after))))
           (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
-                                    :update after-rows)
+                                    :update after-rows changed-columns)
           (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
-                                    :update :after after-rows)
+                                    :update :after after-rows changed-columns)
           (or returning-result
               (empty-result (str "UPDATE " (- (count eids) cancelled)))))
         (catch Exception e
@@ -9063,11 +9112,20 @@
               remap (fn [eid] (get eid->tempid eid eid))
               commit-tx-data (into (mapv (fn [eid] [:db/retractEntity (remap eid)]) eids)
                                    (map (fn [[op eid attr val]] [op (remap eid) attr val]))
-                                   restart-tx)]
+                                   restart-tx)
+              ;; BEFORE/AFTER TRUNCATE triggers. They were parsed,
+              ;; stored, and reported in pg_trigger with the right
+              ;; tgtype -- and never fired, because `matching-triggers`
+              ;; was only ever called with :insert/:update/:delete. A
+              ;; TRUNCATE trigger is STATEMENT level by definition.
+              _ (doseq [t tables]
+                  (fire-statement-triggers! spec-db t :truncate :before))]
           (swap! tx-state (fn [ts]
                             (-> ts
                                 (update :tx-buffer into (guard-catalog-tx commit-tx-data))
                                 (assoc :speculative-db (:db-after spec-report)))))
+          (doseq [t tables]
+            (fire-statement-triggers! (:speculative-db @tx-state) t :truncate :after))
           (empty-result "TRUNCATE TABLE"))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
@@ -9080,8 +9138,12 @@
               tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
                             restart-tx)
               tx-data ((:tx-wrap ctx identity) tx-data)]
+          (doseq [t tables]
+            (fire-statement-triggers! db t :truncate :before))
           (when (seq tx-data)
             (transact-recorded! conn tx-data))
+          (doseq [t tables]
+            (fire-statement-triggers! (d/db conn) t :truncate :after))
           (empty-result "TRUNCATE TABLE"))
         (catch Exception e
           (classified-error "TRUNCATE error: " e))))))
@@ -9537,6 +9599,18 @@
                                            "\" for relation \"" table
                                            "\" already exists")
                                       {:error :duplicate-object :sqlstate "42710"}))
+
+        ;; INSTEAD OF is for views only (CreateTrigger, trigger.c). On a
+        ;; plain table PostgreSQL raises 42809; this accepted the DDL
+        ;; and `matching-triggers` then matched only :before/:after, so
+        ;; the trigger sat in the catalog and never fired -- a silent
+        ;; dead trigger, which is worse than the refusal.
+        (= :instead-of (:timing parsed))
+        (classified-error "" (ex-info (str "\"" table
+                                           "\" is a table")
+                                      {:error :wrong-object-type
+                                       :sqlstate "42809"
+                                       :detail "Tables cannot have INSTEAD OF triggers."}))
 
         ;; PostgreSQL's own rules for a transition relation
         ;; (CreateTrigger, trigger.c): it is the AFTER image of the
@@ -12066,6 +12140,13 @@
                  :row-marker      (pgs/row-marker-attr table)
                  :ancestor-markers ancestor-markers
                  :tempid-prefix   (str "copy-" (java.util.UUID/randomUUID) "-row-")
+                 ;; The handler a BEFORE ROW trigger's body runs its own
+                 ;; statements through. It has to be captured HERE: the
+                 ;; COPY data arrives in later protocol messages, so by
+                 ;; the time a row is processed `*statement-handler*` is
+                 ;; no longer bound and `trigger-handler!` refuses with
+                 ;; "a trigger on \"t\" cannot run in this context".
+                 :statement-handler params/*statement-handler*
                  :catalog-basis   (catalog-basis/capture db-now)
                ;; A transaction may have its own speculative DDL, so retain a
                ;; second basis for the durable branch.  Checking both before
@@ -12274,6 +12355,18 @@
                  (map vector columns row))
                 candidate (materialize-insert-candidate
                            entity constraint-plan db-now resolve-value)
+                ;; COPY FROM should run the table's BEFORE ROW INSERT
+                ;; triggers (CopyFrom calls ExecBRInsertTriggers per
+                ;; row) and it runs none. Firing them here is not
+                ;; enough: with `:statement-handler` captured at COPY
+                ;; start the body DOES run and its rewrite of NEW does
+                ;; take, but any statement the body itself issues is
+                ;; lost -- an audit `INSERT INTO log` inside the trigger
+                ;; vanished -- because COPY batches onto its own basis
+                ;; and the nested write is not part of it. Silently
+                ;; losing a trigger's writes is worse than not firing,
+                ;; so this stays off until the COPY batch model carries
+                ;; them. See doc/review-backlog.md.
                 seen (validate-plain-candidate-unique!
                       db-now (:table s) (:unique-specs s)
                       (:pending-unique s #{}) candidate)
