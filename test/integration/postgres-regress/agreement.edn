@@ -1,4 +1,4 @@
-{:measured "2026-10-01"
+{:measured "2026-10-02"
  :postgres-ref "REL_17_7"
  ;; Per-file agreement: the share of PostgreSQL's expected output
  ;; lines that appear, in order, in ours. `bb pg-regress-gate`
@@ -18,61 +18,61 @@
  :files
  {
   "advisory_lock" 97.1
-  "aggregates" 59.0
+  "aggregates" 60.1
   "alter_generic" 68.3
   "alter_operator" 71.9
-  "alter_table" 67.9
+  "alter_table" 68.1
   "arrays" 60.3
   "async" 81.0
   "bit" 100.0
   "boolean" 100.0
-  "box" 37.8
+  "box" 38.0
   "case" 85.0
   "char" 79.4
-  "circle" 40.9
-  "collate" 82.8
+  "circle" 44.3
+  "collate" 83.1
   "comments" 92.3
-  "constraints" 66.2
+  "constraints" 68.2
   "conversion" 53.4
-  "copy" 72.6
-  "copy2" 47.2
+  "copy" 75.7
+  "copy2" 51.8
   "copydml" 78.4
   "copyselect" 87.3
   "create_aggregate" 84.0
   "create_cast" 68.0
   "create_function_sql" 47.5
-  "create_index" 52.0
+  "create_index" 52.7
   "create_misc" 62.0
   "create_operator" 80.0
   "create_procedure" 50.9
   "create_schema" 66.3
   "create_table" 64.7
-  "create_table_like" 55.4
+  "create_table_like" 54.8
   "create_type" 72.8
   "create_view" 41.9
   "database" 100.0
   "date" 62.5
   "dbsize" 35.5
   "delete" 100.0
-  "domain" 64.4
+  "domain" 65.1
   "drop_if_exists" 72.8
   "drop_operator" 100.0
-  "enum" 96.2
+  "enum" 96.5
   "errors" 81.1
   "explain" 21.4
   "expressions" 83.4
   "fast_default" 73.0
   "float4" 51.9
   "float8" 72.9
-  "foreign_key" 62.8
-  "generated" 65.7
+  "foreign_key" 63.1
+  "generated" 67.0
   "geometry" 7.2
   "groupingsets" 24.1
   "horology" 17.7
   "identity" 57.2
   "inet" 28.7
-  "inherit" 51.3
-  "insert" 58.8
+  "inherit" 51.6
+  "insert" 58.9
   "insert_conflict" 68.2
   "int2" 98.0
   "int4" 95.5
@@ -86,10 +86,10 @@
   "jsonpath" 19.9
   "jsonpath_encoding" 37.5
   "largeobject" 43.3
-  "limit" 69.2
-  "line" 84.9
+  "limit" 61.6
+  "line" 89.7
   "lock" 76.6
-  "lseg" 89.8
+  "lseg" 95.9
   "macaddr" 100.0
   "macaddr8" 80.8
   "matview" 67.5
@@ -100,7 +100,7 @@
   "misc_sanity" 81.3
   "money" 95.5
   "multirangetypes" 25.2
-  "mvcc" 100.0
+  "mvcc" 90.5
   "name" 53.0
   "namespace" 70.5
   "numeric" 97.2
@@ -108,17 +108,17 @@
   "numerology" 43.8
   "oid" 95.7
   "opr_sanity" 60.6
-  "path" 52.6
+  "path" 55.7
   "pg_lsn" 81.2
   "plancache" 72.8
-  "point" 23.5
-  "polygon" 43.3
+  "point" 24.6
+  "polygon" 44.3
   "polymorphism" 55.0
-  "portals" 59.4
+  "portals" 58.6
   "portals_p2" 100.0
-  "prepare" 71.1
-  "prepared_xacts" 79.3
-  "psql" 70.2
+  "prepare" 72.1
+  "prepared_xacts" 66.2
+  "psql" 70.1
   "psql_crosstab" 54.6
   "random" 48.5
   "rangefuncs" 31.6
@@ -128,7 +128,7 @@
   "reindex_catalog" 100.0
   "returning" 53.2
   "rowtypes" 63.1
-  "rules" 41.1
+  "rules" 41.4
   "select" 84.7
   "select_distinct" 78.1
   "select_distinct_on" 81.3
@@ -136,22 +136,22 @@
   "select_implicit" 98.8
   "select_into" 64.8
   "select_views" 8.9
-  "sequence" 78.5
+  "sequence" 78.7
   "sqljson" 31.4
   "sqljson_jsontable" 42.6
   "sqljson_queryfuncs" 30.4
-  "strings" 73.6
+  "strings" 73.3
   "subselect" 57.4
   "sysviews" 61.0
   "tablesample" 62.5
-  "temp" 78.1
-  "text" 62.7
+  "temp" 77.6
+  "text" 63.0
   "time" 76.3
   "timestamp" 19.7
   "timestamptz" 23.5
   "timetz" 49.4
-  "transactions" 89.8
-  "triggers" 69.3
+  "transactions" 90.1
+  "triggers" 70.1
   "truncate" 75.3
   "tsdicts" 32.9
   "tsearch" 47.2
@@ -164,9 +164,9 @@
   "union" 53.6
   "updatable_views" 52.1
   "update" 62.7
-  "uuid" 98.5
+  "uuid" 99.5
   "varchar" 94.7
-  "window" 51.9
+  "window" 52.1
   "with" 48.4
   "xid" 39.1
   "xml" 33.2
