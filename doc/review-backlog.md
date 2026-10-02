@@ -86,9 +86,10 @@ reproduced and should be measured before it is believed.
 
 ## Wrong answers, contained, not yet done
 
-- **`&&`, `@>`, `<@` on geometric values return a bare `f`** —
-  `expr.clj`'s array/jsonb fall-through. `'(0,0),(1,1)'::box &&
-  '(0,0),(2,2)'::box` is `t` in PostgreSQL.
+- **3 of PostgreSQL's 21 `&&`/`@>`/`<@` geometric pairs are
+  unimplemented** — polygon-to-polygon overlap and containment, which
+  need `lseg_inside_poly` and segment intersection. They refuse with
+  0A000 rather than answering `f`; the other 18 are implemented.
 - **Collection aggregates do not preserve scan order** —
   `array_agg(v)` over 1,2,2,5 answers `{5,1,2,2}`. PostgreSQL does not
   guarantee an order without ORDER BY, but it returns scan order and the
@@ -131,8 +132,9 @@ reproduced and should be measured before it is believed.
 - **`tgattr`** is empty for `UPDATE OF b`; `tgoldtable`/`tgnewtable`
   are NULL for a trigger that declares transition tables.
 - **`pg_proc` holds no user functions.**
-- **The geometric catalog advertises ~25 functions and ~30 operators
-  that do not resolve** — `pg_proc` has `box_eq`, `diagonal`,
+- **The geometric catalog advertises ~25 FUNCTIONS (`area`, `center`,
+  `diameter`, `npoints`, …) and the `<->` distance operator, none of
+  which resolve** — `pg_proc` has `box_eq`, `diagonal`,
   `box_intersect` and the rest, loaded from the generated data. A
   client that resolves through the catalog acts on a promise we do not
   keep.

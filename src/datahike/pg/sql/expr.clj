@@ -7067,6 +7067,51 @@
     ;; DoubleAnd for &&. We dispatch at runtime to either the array
     ;; predicates in datahike.pg.arrays or the jsonb predicates in
     ;; datahike.pg.jsonb based on operand type.
+    ;; `&&`, `@>`, `<@` on GEOMETRIC operands. Two geometric values are
+    ;; neither an array nor jsonb, so they reached the fall-through
+    ;; below and the answer was a bare `false` -- all 21 of
+    ;; PostgreSQL's pairs for these three operators, silently wrong.
+    (and (or (instance? JsonOperator expr) (instance? DoubleAnd expr))
+         (let [^net.sf.jsqlparser.expression.BinaryExpression be expr]
+           (or (geo-type-of-oid (source-oid ctx (.getLeftExpression be)))
+               (geo-type-of-oid (source-oid ctx (.getRightExpression be))))))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression be expr
+          op-str (if (instance? JsonOperator expr)
+                   (.getStringExpression ^JsonOperator expr)
+                   "&&")
+          lt (geo-type-of-oid (source-oid ctx (.getLeftExpression be)))
+          rt (geo-type-of-oid (source-oid ctx (.getRightExpression be)))
+          _ (when-not (and lt rt (geo/spatial-op-known? op-str lt rt))
+              (throw (errors/pg-error
+                      :undefined-function
+                      {:detail (str "operator does not exist: "
+                                    (or lt "?") " " op-str " " (or rt "?"))
+                       :hint (str "No operator matches the given name and "
+                                  "argument types. You might need to add "
+                                  "explicit type casts.")})))
+          f (geo/spatial-op op-str lt rt)
+          _ (when-not f
+              ;; PostgreSQL HAS this one; we do not. Say so rather than
+              ;; answering `false`, which is what it used to do.
+              (throw (errors/pg-error
+                      :feature-not-supported
+                      {:message (str "operator " op-str " on " lt " and " rt
+                                     " is not supported")})))
+          l (translate-expr ctx (.getLeftExpression be))
+          r (translate-expr ctx (.getRightExpression be))
+          l (if (seq? l) (ctx/materialize-arg! ctx l) l)
+          r (if (seq? r) (ctx/materialize-arg! ctx r) r)
+          fn-param (symbol (str "?geo-spatial" (swap! (:var-counter ctx) inc)))
+          result-var (ctx/fresh-var! ctx)]
+      (swap! (:in-params ctx) conj fn-param)
+      (swap! (:in-args ctx) conj
+             (fn [a b]
+               (if (or (nil? a) (nil? b) (= :__null__ a) (= :__null__ b))
+                 :__null__
+                 (f (str a) (str b)))))
+      (swap! (:where-clauses ctx) conj [(list fn-param l r) result-var])
+      result-var)
+
     (or (instance? JsonOperator expr)
         (instance? DoubleAnd expr))
     (let [op-str (cond
