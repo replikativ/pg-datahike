@@ -233,7 +233,6 @@
 (defn- unique-violation! [descriptor key]
   (throw (ex-info "unique violation"
                   {:error :unique-violation
-                   :sqlstate "23505"
                    :constraint (:name descriptor)
                    :table (:table descriptor)
                    :columns (mapv :name (:keys descriptor))

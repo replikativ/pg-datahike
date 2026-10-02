@@ -90,12 +90,6 @@ reproduced and should be measured before it is believed.
   NOT VALID`). `VALIDATE CONSTRAINT` is implemented, so only the
   deferred-validation half is missing.
 - **`EXECUTE` with a missing argument** substitutes a literal NULL.
-- **A unique violation does not name its constraint.** `ERROR: unique
-  violation` where PostgreSQL says
-  `duplicate key value violates unique constraint "t_pkey"` with a
-  `DETAIL: Key (x, y)=(1, 1) already exists.` Pre-existing for
-  single-column keys as well as composite ones, and the same family as
-  the FK and CHECK message gaps below.
 - **An explicitly named COMPOSITE constraint reports the default name.**
   `CONSTRAINT pk1 PRIMARY KEY (x,y)` appears in `pg_constraint` as
   `t_pkey`: the lowering computes the name and does not persist it on
@@ -156,11 +150,14 @@ drive-by fix.
 - **`DROP FUNCTION f()` succeeds while a trigger depends on it**
   (PostgreSQL: 2BP01 naming the trigger); the next INSERT then dies
   with 42883.
-- Error-text detail: runtime FK violations carry no table or constraint
-  name and no DETAIL; CHECK violations have no
-  `DETAIL: Failing row contains (…)`; plpgsql errors carry no
-  `CONTEXT:` line; COPY FROM errors carry no `CONTEXT: COPY t, line N`,
-  which pg_regress compares.
+- Error-text detail, what remains: plpgsql errors carry no `CONTEXT:`
+  line, and COPY FROM errors carry no `CONTEXT: COPY t, line N` -- both
+  compared by pg_regress. The unique / FK / NOT NULL / CHECK messages
+  and their DETAILs now match.
+- **A composite unique violation's DETAIL is untested against the
+  oracle.** The formatter builds `Key (x, y)=(1, 1) already exists.`
+  from `:columns`/`:value`, and the single-column form is verified; the
+  composite path throws from a different site and was not diffed.
 
 ## Performance
 

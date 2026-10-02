@@ -2639,7 +2639,18 @@
                              :identity [:native attr]
                              :attr attr
                              :attrs (vec (or components [attr]))
-                             :columns (mapv name (or components [attr]))})))))
+                             :columns (mapv name (or components [attr]))
+                             ;; The index PostgreSQL names in the error:
+                             ;; `<table>_pkey` for a PRIMARY KEY,
+                             ;; `<table>_<cols>_key` for a UNIQUE. Without
+                             ;; it the formatter fell back to `_pkey` for
+                             ;; BOTH, so a plain UNIQUE violation named a
+                             ;; primary-key index that does not exist.
+                             :constraint
+                             (let [cols (mapv name (or components [attr]))]
+                               (if (= :db.unique/identity (:db/unique schema-entry))
+                                 (str table-name "_pkey")
+                                 (str table-name "_" (str/join "_" cols) "_key")))})))))
               (dbi/-schema db))
         catalog
         (into []
@@ -2677,7 +2688,6 @@
            (when (or existing? (contains? seen key))
              (throw (ex-info "unique violation"
                              {:error :unique-violation
-                              :sqlstate "23505"
                               :table table-name
                               :constraint constraint
                               :columns columns

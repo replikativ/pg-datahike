@@ -8794,7 +8794,6 @@
   [table-name {constraint-name :name :keys [cols values]}]
   (throw (ex-info "unique violation"
                   {:error :unique-violation
-                   :sqlstate "23505"
                    :table table-name
                    :constraint constraint-name
                    :columns (mapv clojure.core/name cols)
