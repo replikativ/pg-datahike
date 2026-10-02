@@ -975,6 +975,8 @@
                         v))]))
             ps))))
 
+(declare pg-str)
+
 (defn filter-string-agg
   "SQL `string_agg(expr, delimiter)` — ONE string over the whole group.
 
@@ -997,8 +999,12 @@
     (if (empty? ps)
       :__null__
       (let [d (second (first ps))]
-        (str/join (if (or (nil? d) (= :__null__ d)) "" (str d))
-                  (map (comp str first) ps))))))
+        (str/join (if (or (nil? d) (= :__null__ d)) "" (pg-str d))
+                  ;; `pg-str`, not `str`: a bytea value is a byte[], and
+                  ;; `str` rendered it as its Java identity --
+                  ;; `string_agg(b, ',')` over one bytea answered
+                  ;; `[B@2e349857`, a different string on every run.
+                  (map (comp pg-str first) ps))))))
 
 (defn filter-string-agg-ordered
   "SQL `string_agg(expr, delim ORDER BY … ASC)` — `coll` is a collection
@@ -3015,10 +3021,27 @@
       t
       (str \" (str/replace t "\"" "\"\"") \"))))
 
-(defn sql-quote-literal [v]
+(defn sql-quote-literal
+  "`quote_literal` (quote.c `quote_literal_internal`). A single quote
+   doubles, and -- the part that was missing -- so does a BACKSLASH,
+   with the whole literal then written in the `E'…'` escape-string
+   form. Without it `quote_literal('a\\b')` answered `'a\\b'`, which
+   re-reads as `ab` under standard_conforming_strings=off and is simply
+   a different string: the function exists to produce text that reads
+   back as its input.
+
+   `pg-str`, not `->s`: a bytea argument is a byte[], and the two
+   together are why `quote_literal('\\x61'::bytea)` answered
+   `'[B@2e349857'`."
+  [v]
   (if (sql-null? v)
     :__null__
-    (str \' (str/replace (->s v) "'" "''") \')))
+    (let [t (pg-str v)
+          escape? (str/includes? t "\\")
+          body (-> t
+                   (str/replace "'" "''")
+                   (cond-> escape? (str/replace "\\" "\\\\")))]
+      (str (when escape? "E") \' body \'))))
 
 (defn sql-quote-nullable
   "Like quote_literal, but a NULL becomes the unquoted string NULL."

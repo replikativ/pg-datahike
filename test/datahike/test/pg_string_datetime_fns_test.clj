@@ -240,3 +240,34 @@
     (testing "and the numeric form still means what it did"
       (is (= "hom" (one c "SELECT substring('Thomas' from 2 for 3)")))
       (is (= "Th" (one c "SELECT substring('Thomas' from 1 for 2)"))))))
+
+(deftest quote-literal-escapes-a-backslash
+  ;; `quote_literal_internal` (quote.c) doubles a single quote AND a
+  ;; BACKSLASH, writing the whole literal in the `E'…'` escape-string
+  ;; form when there is one. Without that, `quote_literal('a\b')`
+  ;; answered `'a\b'`, which re-reads as `ab` under
+  ;; standard_conforming_strings=off -- a different string, from the one
+  ;; function whose entire job is to produce text that reads back as its
+  ;; input.
+  (with-open [c (jdbc)]
+    (is (= "E'a\\\\b'" (one c "SELECT quote_literal('a\\b')")))
+    (is (= "E'a\\\\b'" (one c "SELECT quote_nullable('a\\b')")))
+    (is (= "'ab'" (one c "SELECT quote_literal('ab')"))
+        "no backslash, no E prefix")
+    (is (= "'it''s'" (one c "SELECT quote_literal('it''s')")))
+    (is (= "'42'" (one c "SELECT quote_literal(42)")))))
+
+(deftest bytea-renders-through-byteaout-everywhere
+  ;; `->pg-text` had no bytea branch and `infer-oid-from-value` called a
+  ;; byte[] text, so every path that renders a value by its inferred
+  ;; type produced `[B@2e349857` -- the array's Java identity, different
+  ;; on every run.
+  (with-open [c (jdbc)]
+    (is (= "\\x61" (one c "SELECT string_agg(b, ',') FROM (SELECT '\\x61'::bytea AS b) s")))
+    (is (= "\\x6100ff" (one c "SELECT string_agg(b, ',') FROM (SELECT '\\x6100ff'::bytea AS b) s")))
+    (is (= "\\x61ff" (one c "SELECT format('%s', '\\x61ff'::bytea)")))
+    (is (= "E'\\\\x61'" (one c "SELECT format('%L', '\\x61'::bytea)")))
+    (is (= "E'\\\\x61'" (one c "SELECT quote_literal('\\x61'::bytea)")))
+    (testing "and format('%s') on a date goes through the output function too,
+              not java.util.Date.toString"
+      (is (= "2001-02-03" (one c "SELECT format('%s', '2001-02-03'::date)"))))))

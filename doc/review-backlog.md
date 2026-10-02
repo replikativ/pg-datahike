@@ -94,7 +94,6 @@ reproduced and should be measured before it is believed.
   `array_agg(v)` over 1,2,2,5 answers `{5,1,2,2}`. PostgreSQL does not
   guarantee an order without ORDER BY, but it returns scan order and the
   regress suite compares text.
-- **`string_agg` over bytea** emits `[B@2e349857`.
 - **The generated CHECK name is wrong for the single-column ALTER
   case** — `ChooseConstraintName` uses `<table>_<col>_check` when the
   expression references exactly one column; the ALTER path passes nil
