@@ -397,3 +397,180 @@
                                     (Math/hypot (- x1 x2) (- y1 y2)))
                                   (partition 2 1 segs))))
       0.0)))
+
+;; ---------------------------------------------------------------------------
+;; Containment and overlap: `&&`, `@>`, `<@`
+;;
+;; These reached `expr.clj`'s array/jsonb fall-through, where two
+;; geometric strings are neither an array nor jsonb, so the answer was
+;; a bare `false` -- `'(0,0),(1,1)'::box && '(0,0),(2,2)'::box` was `f`
+;; where PostgreSQL says `t`. Of PostgreSQL's 21 pairs for these three
+;; operators, the 14 implemented here are the ones whose definition is
+;; a comparison or a distance; the 7 polygon and path pairs need
+;; `point_inside`'s crossing-number walk and `lseg_inside_poly`, and
+;; refuse honestly rather than answering.
+
+(defn- pt-of [s] (let [[x y] (coords s)] [x y]))
+(defn- box-of [s] (let [[hx hy lx ly] (coords s)] [hx hy lx ly]))
+(defn- circ-of [s] (let [[cx cy r] (coords s)] [cx cy r]))
+(defn- lseg-of [s] (let [[x1 y1 x2 y2] (coords s)] [x1 y1 x2 y2]))
+
+(defn- point-dt ^double [^double x1 ^double y1 ^double x2 ^double y2]
+  (Math/hypot (- x1 x2) (- y1 y2)))
+
+(defn- box-ov? [a b]
+  (let [[ahx ahy alx aly] (box-of a) [bhx bhy blx bly] (box-of b)]
+    (and (fple alx bhx) (fple blx ahx) (fple aly bhy) (fple bly ahy))))
+
+(defn- box-contain-box? [a b]
+  (let [[ahx ahy alx aly] (box-of a) [bhx bhy blx bly] (box-of b)]
+    (and (fpge ahx bhx) (fple alx blx) (fpge ahy bhy) (fple aly bly))))
+
+(defn- box-contain-point? [b p]
+  (let [[hx hy lx ly] (box-of b) [x y] (pt-of p)]
+    ;; `box_contain_point` uses EXACT comparisons, not FP*.
+    (and (>= hx x) (<= lx x) (>= hy y) (<= ly y))))
+
+(defn- circle-overlap? [a b]
+  (let [[ax ay ar] (circ-of a) [bx by br] (circ-of b)]
+    (fple (point-dt ax ay bx by) (+ ar br))))
+
+(defn- circle-contain-circle? [a b]
+  (let [[ax ay ar] (circ-of a) [bx by br] (circ-of b)]
+    (fple (point-dt ax ay bx by) (- ar br))))
+
+(defn- circle-contain-point? [c p]
+  (let [[cx cy r] (circ-of c) [x y] (pt-of p)]
+    (<= (point-dt cx cy x y) r)))
+
+(defn- line-contain-point? [l p]
+  (let [[a b c] (coords l) [x y] (pt-of p)]
+    (<= (Math/abs (+ (* a x) (* b y) c)) epsilon)))
+
+(defn- lseg-contain-point? [l p]
+  (let [[x1 y1 x2 y2] (lseg-of l) [x y] (pt-of p)]
+    (fpeq (+ (point-dt x y x1 y1) (point-dt x y x2 y2))
+          (point-dt x1 y1 x2 y2))))
+
+(defn- lseg-in-line? [s l]
+  (let [[x1 y1 x2 y2] (lseg-of s)]
+    (and (line-contain-point? l (pt x1 y1))
+         (line-contain-point? l (pt x2 y2)))))
+
+(defn- lseg-in-box? [s b]
+  (let [[x1 y1 x2 y2] (lseg-of s)]
+    (and (box-contain-point? b (pt x1 y1))
+         (box-contain-point? b (pt x2 y2)))))
+
+(def ^:private point-on-polygon
+  "`POINT_ON_POLYGON`, which `lseg_crossing` returns in place of a
+   crossing count when the point lies ON the boundary."
+  Long/MAX_VALUE)
+
+(defn- lseg-crossing
+  "`lseg_crossing` (geo_ops.c:5339). The crossing contribution of one
+   edge of a polygon translated so the test point is the origin."
+  ^long [^double x ^double y ^double prev-x ^double prev-y]
+  (let [fpzero? (fn [^double v] (<= (Math/abs v) epsilon))]
+    (if (fpzero? y)
+      (cond
+        (fpzero? x) point-on-polygon
+        (fpgt x 0.0) (if (fpzero? prev-y)
+                       (if (fpgt prev-x 0.0) 0 point-on-polygon)
+                       (if (fplt prev-y 0.0) 1 -1))
+        :else (if (fpzero? prev-y)
+                (if (fplt prev-x 0.0) 0 point-on-polygon)
+                0))
+      (let [y-sign (if (fpgt y 0.0) 1 -1)]
+        (cond
+          (fpzero? prev-y) (if (fplt prev-x 0.0) 0 y-sign)
+          (or (and (neg? y-sign) (fplt prev-y 0.0))
+              (and (pos? y-sign) (fpgt prev-y 0.0)))
+          0
+          :else
+          (cond
+            (and (fpge x 0.0) (fpgt prev-x 0.0)) (* 2 y-sign)
+            (and (fplt x 0.0) (fple prev-x 0.0)) 0
+            :else
+            (let [z (- (* (- x prev-x) y) (* (- y prev-y) x))]
+              (cond
+                (fpzero? z) point-on-polygon
+                (or (and (neg? y-sign) (fplt z 0.0))
+                    (and (pos? y-sign) (fpgt z 0.0))) 0
+                :else (* 2 y-sign)))))))))
+
+(defn- point-inside?
+  "`point_inside` (geo_ops.c:5401): the crossing-number walk, with
+   `POINT_ON_POLYGON` short-circuiting to inside. `pts` is the vertex
+   list as [[x y] …]."
+  [[^double px ^double py] pts]
+  (let [[[fx fy] & _] pts
+        x0 (- (double fx) px)
+        y0 (- (double fy) py)]
+    (loop [[[vx vy] & more] (rest pts)
+           prev-x x0, prev-y y0, total 0]
+      (if (nil? vx)
+        (let [c (lseg-crossing x0 y0 prev-x prev-y)]
+          (if (= point-on-polygon c)
+            true
+            (not (zero? (+ total c)))))
+        (let [x (- (double vx) px)
+              y (- (double vy) py)
+              c (lseg-crossing x y prev-x prev-y)]
+          (if (= point-on-polygon c)
+            true
+            (recur more x y (+ total c))))))))
+
+(defn- vertices [s] (mapv vec (partition 2 (coords s))))
+
+(defn- poly-contain-point? [poly p] (point-inside? (pt-of p) (vertices poly)))
+
+(defn- path-contain-point?
+  "`path_contain_pt`, which is `point_inside` over the path's points --
+   PostgreSQL applies it to an open path too."
+  [path p]
+  (point-inside? (pt-of p) (vertices path)))
+
+(def ^:private spatial-ops
+  "`[op left-type right-type] -> (fn [left right] boolean)`, keyed the
+   way pg_operator is. Only the pairs PostgreSQL has: anything else is
+   `operator does not exist`, which is the honest answer for, say,
+   `point && point`."
+  {["&&" "box" "box"]         box-ov?
+   ["&&" "circle" "circle"]   circle-overlap?
+   ["@>" "box" "box"]         box-contain-box?
+   ["<@" "box" "box"]         (fn [a b] (box-contain-box? b a))
+   ["@>" "box" "point"]       box-contain-point?
+   ["<@" "point" "box"]       (fn [p b] (box-contain-point? b p))
+   ["@>" "circle" "circle"]   circle-contain-circle?
+   ["<@" "circle" "circle"]   (fn [a b] (circle-contain-circle? b a))
+   ["@>" "circle" "point"]    circle-contain-point?
+   ["<@" "point" "circle"]    (fn [p c] (circle-contain-point? c p))
+   ["<@" "point" "line"]      (fn [p l] (line-contain-point? l p))
+   ["<@" "point" "lseg"]      (fn [p s] (lseg-contain-point? s p))
+   ["<@" "lseg" "line"]       lseg-in-line?
+   ["<@" "lseg" "box"]        lseg-in-box?
+   ["@>" "polygon" "point"]   poly-contain-point?
+   ["<@" "point" "polygon"]   (fn [p poly] (poly-contain-point? poly p))
+   ["@>" "path" "point"]      path-contain-point?
+   ["<@" "point" "path"]      (fn [p path] (path-contain-point? path p))})
+
+(def ^:private spatial-ops-unimplemented
+  "The pairs PostgreSQL has and this does not. Named so they refuse
+   rather than answering `false`, which is what every one of the 21
+   used to do."
+  #{["&&" "polygon" "polygon"] ["@>" "polygon" "polygon"]
+    ["<@" "polygon" "polygon"]})
+
+(defn spatial-op-known?
+  "Is `[op left-type right-type]` an operator PostgreSQL has for these
+   geometric types -- whether or not we implement it?"
+  [op lt rt]
+  (or (contains? spatial-ops [op lt rt])
+      (contains? spatial-ops-unimplemented [op lt rt])))
+
+(defn spatial-op
+  "The implementation of `[op lt rt]`, or nil when PostgreSQL has the
+   operator and this does not."
+  [op lt rt]
+  (get spatial-ops [op lt rt]))

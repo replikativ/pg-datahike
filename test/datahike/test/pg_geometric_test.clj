@@ -288,3 +288,51 @@
       (is (= "9" (one c "SELECT length('[(0,0),(3,4),(3,0)]'::path)"))))
     (testing "and length() on text is untouched"
       (is (= "3" (one c "SELECT length('abc')"))))))
+
+(deftest containment-and-overlap-are-not-false
+  ;; `&&`, `@>` and `<@` on two geometric values reached the
+  ;; array/jsonb fall-through, where neither operand is an array or
+  ;; jsonb, so the answer was a bare `false` -- all 21 of PostgreSQL's
+  ;; pairs for these three operators, silently wrong.
+  (with-open [c (jdbc)]
+    (testing "box: overlap and containment, both directions"
+      (is (= "t" (one c "SELECT '(0,0),(1,1)'::box && '(0,0),(2,2)'::box")))
+      (is (= "f" (one c "SELECT '(0,0),(1,1)'::box && '(5,5),(6,6)'::box")))
+      (is (= "t" (one c "SELECT '(0,0),(5,5)'::box @> '(1,1),(2,2)'::box")))
+      (is (= "t" (one c "SELECT '(1,1),(2,2)'::box <@ '(0,0),(5,5)'::box")))
+      (is (= "t" (one c "SELECT '(0,0),(5,5)'::box @> '(1,1)'::point")))
+      (is (= "f" (one c "SELECT '(6,6)'::point <@ '(0,0),(5,5)'::box"))))
+    (testing "circle, by centre distance against the radii"
+      (is (= "t" (one c "SELECT '<(0,0),3>'::circle && '<(4,0),2>'::circle")))
+      (is (= "f" (one c "SELECT '<(0,0),3>'::circle && '<(9,0),2>'::circle")))
+      (is (= "t" (one c "SELECT '<(1,0),2>'::circle <@ '<(0,0),5>'::circle")))
+      (is (= "t" (one c "SELECT '(1,1)'::point <@ '<(0,0),5>'::circle"))))
+    (testing "a point on a line or a segment"
+      (is (= "t" (one c "SELECT '(1,1)'::point <@ '{1,-1,0}'::line")))
+      (is (= "f" (one c "SELECT '(1,2)'::point <@ '{1,-1,0}'::line")))
+      (is (= "t" (one c "SELECT '(1,1)'::point <@ '[(0,0),(2,2)]'::lseg")))
+      (is (= "f" (one c "SELECT '(5,5)'::point <@ '[(0,0),(2,2)]'::lseg")))
+      (is (= "t" (one c "SELECT '[(0,0),(2,2)]'::lseg <@ '{1,-1,0}'::line")))
+      (is (= "t" (one c "SELECT '[(1,1),(2,2)]'::lseg <@ '(0,0),(5,5)'::box")))
+      (is (= "f" (one c "SELECT '[(1,9),(2,9)]'::lseg <@ '(0,0),(5,5)'::box"))))
+    (testing "point in polygon -- point_inside's crossing-number walk,
+              which counts a point ON the boundary as inside"
+      (let [sq "'((0,0),(5,0),(5,5),(0,5))'::polygon"]
+        (is (= "t" (one c (str "SELECT '(1,1)'::point <@ " sq))))
+        (is (= "f" (one c (str "SELECT '(9,9)'::point <@ " sq))))
+        (is (= "f" (one c (str "SELECT '(-1,-1)'::point <@ " sq))))
+        (is (= "t" (one c (str "SELECT '(0,0)'::point <@ " sq))))
+        (is (= "t" (one c (str "SELECT '(5,2)'::point <@ " sq))))
+        (is (= "t" (one c (str "SELECT " sq " @> '(1,1)'::point")))))
+      (is (= "t" (one c "SELECT '(2.5,2.5)'::point <@ '((0,0),(5,0),(0,5))'::polygon")))
+      (is (= "f" (one c "SELECT '(4,4)'::point <@ '((0,0),(5,0),(0,5))'::polygon"))))
+    (testing "the three polygon-to-polygon pairs refuse rather than
+              answering false -- PostgreSQL HAS them and this does not"
+      (is (= "0A000" (state-of c (str "SELECT '((0,0),(1,1),(2,0))'::polygon && "
+                                      "'((0,0),(1,1),(2,0))'::polygon")))))
+    (testing "and a pair PostgreSQL does not have is 42883, not false"
+      (is (= "42883" (state-of c "SELECT '(1,2)'::point && '(1,2)'::point"))))
+    (testing "arrays and jsonb are untouched"
+      (is (= "t" (one c "SELECT '{1,2}'::int[] && '{2,3}'::int[]")))
+      (is (= "t" (one c "SELECT '{1,2}'::int[] @> '{2}'::int[]")))
+      (is (= "t" (one c "SELECT '{\"a\":1}'::jsonb @> '{\"a\":1}'::jsonb"))))))
