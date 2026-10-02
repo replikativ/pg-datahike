@@ -379,6 +379,15 @@ jobs:
     # same every run; known divergences are listed with a reason in
     # test/integration/fuzz/expected-divergences.edn, and an unlisted one
     # (or a listed one that now agrees) fails the job. See the README there.
+    #
+    # The `datetime` surface is not generated: it is a FIXED corpus of 135
+    # input literals x 5 cast targets, drawn from datetime.c's own doc
+    # comments and branch conditions, with its own manifest in
+    # test/integration/fuzz/datetime-divergences.edn. That manifest is a
+    # BURN-DOWN list for the ParseDateTime/DecodeDateTime port -- every
+    # entry marked PARSER is meant to be deleted, and the two marked
+    # CARRIER are not (they need a temporal carrier with microsecond
+    # precision, which java.util.Date is not).
     docker:
       - image: cimg/openjdk:21.0
       - image: cimg/postgres:17.7
@@ -406,7 +415,7 @@ jobs:
           command: bb prep
       - start-pgwire-and-wait
       - run:
-          name: Differential fuzz (select, prepared, dml)
+          name: Differential fuzz (select, prepared, join, dml, datetime)
           command: bb fuzz all
           environment:
             REFERENCE_URL: "jdbc:postgresql://127.0.0.1:5432/postgres?user=pgtest&password=pgtest"

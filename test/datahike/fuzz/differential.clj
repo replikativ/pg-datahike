@@ -511,6 +511,180 @@
   [[status payload :as result]]
   (if (= :rows status) [:rows (vec (sort-by pr-str payload))] result))
 
+(defn- quote-lit
+  "A SQL string literal. The corpus contains no backslashes, so doubling
+   the quote is the whole escape."
+  [^String v]
+  (str \' (str/replace v "'" "''") \'))
+
+;; ---------------------------------------------------------------------------
+;; The datetime surface: a FIXED corpus, not a generated one
+;;
+;; Every other surface here samples a grammar. This one does not, because
+;; the thing under test is an INPUT FUNCTION and its spec is a finite set
+;; of literal forms -- `ParseDateTime` plus `DecodeDateTime` /
+;; `DecodeTimeOnly` (datetime.c). A generator would spend its budget on
+;; near-duplicates and still miss the forms that only appear in
+;; PostgreSQL's own documentation and regression fixtures.
+;;
+;; The corpus is drawn from datetime.c itself -- its doc comments
+;; (740-752, 950-963), the `datetktbl` tokens, and the branch conditions
+;; in `DecodeNumber` -- and from the forms `timestamp.sql` and
+;; `horology.sql` seed their tables with. Each literal is cast to all
+;; five temporal targets, because the SAME text means different things
+;; per target and that is exactly where this has gone wrong before:
+;; `'040506'` is a date to `DecodeDateTime` and a time to
+;; `DecodeTimeOnly` (datetime.c:1276 against 2010), and `date_in` runs
+;; the full timestamp decoder and THROWS AWAY the time, so
+;; `'2001-02-03 25:00:00'::date` is an error.
+;;
+;; Comparison is the value as TEXT, or both sides raising the same
+;; SQLSTATE. A literal we reject that PostgreSQL accepts is a
+;; disagreement, and so is the reverse.
+
+(def datetime-literals
+  "Input forms for the five temporal types. Grouped by what each group
+   is there to pin down, so a regression says which rule broke."
+  {:iso
+   ["2001-02-03" "2001-02-03 04:05:06" "2001-02-03T04:05:06"
+    "2001-02-03 04:05:06.5" "2001-02-03 04:05:06.123456"
+    "2001-02-03 04:05" "04:05:06" "04:05" "04:05:06.5"]
+
+   ;; `DecodeNumber`'s DateStyle switch (datetime.c:2778-2886). The
+   ;; session is MDY throughout, so these pin the MDY arm.
+   :ambiguous-numeric
+   ["01/02/03" "1/2/3" "2003-01-02" "03-01-02" "1997-02-10"
+    "02-10-1997" "10-02-1997" "19970210"]
+
+   ;; A text month changes the whole state machine: `haveTextMonth`
+   ;; flips the MONTH arm and enables the YEAR|MONTH backtrack
+   ;; (datetime.c:2813-2855), and the month->day substitution at
+   ;; datetime.c:1376-1391 is what makes the `Postgres` output style
+   ;; readable at all.
+   :text-month
+   ["Feb 10 1997" "10 Feb 1997" "1997 Feb 10" "Feb-10-1997" "10-Feb-1997"
+    "1997-Feb-10" "Feb 10, 1997" "08-Jan-99" "Jan-08-99" "99-Jan-08"
+    "jan 8 99" "Jan 1 00:00:00 2000" "25 Dec 1997"]
+
+   ;; PostgreSQL's own `Postgres` DateStyle output, which `timestamp.sql`
+   ;; seeds its table from. We reject these, so the table is half empty
+   ;; before the file's first SELECT.
+   :postgres-style
+   ["Mon Feb 10 17:32:01 1997" "Mon Feb 10 17:32:01 1997 PST"
+    "Feb 10 17:32:01 1997" "Wed Jul 11 10:51:14 2001"
+    "Tue Feb 10 17:32:01 1997"]
+
+   ;; `DecodeTimezone` (datetime.c:3007-3089): one or two hour digits, an
+   ;; optional `:mm`, an optional `:ss`, and the bare-4-digit form.
+   :numeric-zone
+   ["2001-02-03 04:05:06+05" "2001-02-03 04:05:06+05:30"
+    "2001-02-03 04:05:06+0530" "2001-02-03 04:05:06+05:30:30"
+    "2001-02-03 04:05:06-08" "2001-02-03 04:05:06 -8:00"
+    "2001-02-03 04:05:06 +00:00:00" "2001-02-03 04:05:06+5"
+    "2001-02-03 04:05:06 +0" "2001-02-03 04:05:06Z"
+    "04:05:06+05:30" "04:05:06-08"]
+
+   ;; MAX_TZDISP_HOUR is 15 and the error is 22009, which this server has
+   ;; never emitted from a literal (timestamp.h:143, datetime.c:3072).
+   :zone-range
+   ["2001-02-03 04:05:06+15:59:59" "2001-02-03 04:05:06+16"
+    "2001-02-03 04:05:06+18" "2001-02-03 04:05:06-16"]
+
+   ;; An abbreviation is a FIXED offset from `tznames/Default`; a NAME is
+   ;; a rule resolved by pg_tzset. `PST` is -08:00 always; `PST8PDT` is a
+   ;; link to America/Los_Angeles and does observe DST. Resolving the
+   ;; abbreviation as a Java zone id gets the July answer wrong by an
+   ;; hour, with no error.
+   :zone-name
+   ["2000-01-01 12:00:00 PST" "2000-07-01 12:00:00 PST"
+    "2000-01-01 12:00:00 PDT" "2000-07-01 12:00:00 PDT"
+    "2000-01-01 12:00:00 America/New_York"
+    "2000-07-01 12:00:00 America/New_York"
+    "2000-01-01 12:00:00 PST8PDT" "2000-07-01 12:00:00 PST8PDT"
+    "2000-01-01 12:00:00 GMT+8" "2000-03-15 08:14:01 GMT+8"
+    "2000-03-15 03:14:04 PST+8" "2000-01-01 12:00:00 UTC"
+    "2000-01-01 12:00:00 zulu" "2000-01-01 12:00:00 ACSST"
+    "2000-01-01 12:00:00 IDLW" "2000-01-01 12:00:00 MET DST"
+    "12:00:00 PST" "04:05:06 PST"]
+
+   ;; `datetktbl`'s RESERV tokens. These read the TRANSACTION start
+   ;; timestamp, so the harness compares only whether both sides ACCEPT
+   ;; them -- see `datetime-run`.
+   :reserved
+   ["epoch" "infinity" "-infinity" "now" "today" "tomorrow" "yesterday"
+    "allballs" "tomorrow EST" "tomorrow zulu"]
+
+   ;; Julian days (datetime.c:1025-1049, 1196-1217) and the compact
+   ;; run-together forms `DecodeNumberField` splits (2912-3005).
+   :julian-and-compact
+   ["J2451187" "J 2451187" "J0" "040506" "19970210 040506"
+    "1997021004" "970210" "0405" "2001-02-03 040506"]
+
+   ;; The dotted date works by an accident of the lexer: the first `.`
+   ;; makes the field DTK_NUMBER and only a MATCHING second `.` promotes
+   ;; it to DTK_DATE (datetime.c:810-825), so these three take three
+   ;; different paths.
+   :dotted
+   ["2000.01.01" "01.02.2003" "2000.01" "2000.01-01" "1997.038"]
+
+   ;; `23:59:60` and `24:00:00` are the same instant and both legal; the
+   ;; check is on the TOTAL microseconds, not on the seconds field
+   ;; (datetime.c:2660, date.c:1430). `24:00:00.001` is not.
+   :boundary-time
+   ["24:00:00" "24:00:00.000" "23:59:60" "24:00:00.001" "25:00:00"
+    "23:59:59.999999" "2001-02-03 24:00:00" "2001-02-03 23:59:60"
+    "2001-02-03 25:00:00" "1999-01-08 4:05:06" "12:00 AM" "12:00 PM"
+    "11:59 PM" "13:00:00 PM"]
+
+   ;; Era, weekday, and the tokens `DecodeDateTime` ignores outright
+   ;; (IGNORE_DTF uses `continue`, so they never touch fmask --
+   ;; datetime.c:1310).
+   :era-and-noise
+   ["2001-02-03 BC" "2001-02-03 04:05:06 BC" "1999-01-08 04:05:06 ad"
+    "0002-01-01 BC" "2000-01-01 Thursday" "2000-01-01 12:00:00 Thursday"
+    "today at 12:00" "2000-01-01 at 12:00"]
+
+   ;; Two-digit years: ValidateDate's rule is <70 => +2000, <100 => +1900,
+   ;; and it is NOT applied when BC is present (datetime.c:2531-2539).
+   :two-digit-year
+   ["70-01-01" "69-01-01" "00-01-01" "99-12-31" "0000-01-01"
+    "70-01-01 BC"]
+
+   ;; Range ends and the forms that must be refused.
+   :edges
+   ["5874897-12-31" "294277-01-09 04:00:54.775807" "4714-11-24 BC"
+    "1997-13-01" "1997-04-31" "1997-02-29" "2000-02-29" ""
+    "garbage" "2001-02-03 garbage" "2001-02-03 04:05:06 banana"
+    "2001-02-03 +05 +06" "59:59:59"]})
+
+(def datetime-targets
+  ["date" "time" "timetz" "timestamp" "timestamptz"])
+
+(defn- datetime-volatile?
+  "Does this literal read the clock? `now`/`today`/`tomorrow`/
+   `yesterday` resolve against the transaction start timestamp
+   (datetime.c:387-434), so the two servers cannot agree on the VALUE --
+   only on whether the literal is accepted at all."
+  [lit]
+  (boolean (re-find #"(?i)\b(now|today|tomorrow|yesterday)\b" lit)))
+
+(defn datetime-samples
+  "Every literal against every target, as fuzz samples."
+  []
+  (for [[group lits] datetime-literals
+        lit lits
+        target datetime-targets
+        :let [sql (str "SELECT " (quote-lit lit) "::" target "::text")]]
+    {:class group
+     :key sql
+     :volatile? (datetime-volatile? lit)
+     :run (fn [c]
+            (let [r (q c sql)]
+              ;; A clock-reading literal is compared on ACCEPTANCE only.
+              (if (and (datetime-volatile? lit) (= :rows (first r)))
+                [:accepted]
+                r)))}))
+
 (defn- sample
   "Draw the next sample for `surface`: {:class :key :run (fn [conn])}. The
    key identifies a distinct sample (the SQL, plus parameters when bound)."
@@ -543,9 +717,39 @@
                 {:class cls :key sql
                  :run (fn [c] (seed! c) [(exec! c sql) (table-state c)])})))
 
+(declare run-datetime-corpus run-generated-surface)
+
 (defn run-surface
   "Draw `n` samples of `surface` from `seed`, run each DISTINCT one on both
-   endpoints, and collect the disagreements."
+   endpoints, and collect the disagreements.
+
+   `:datetime` is the exception: it runs a FIXED corpus and ignores both
+   arguments. See `datetime-literals`."
+  [surface n seed]
+  (if (= surface :datetime)
+    (run-datetime-corpus)
+    (run-generated-surface surface n seed)))
+
+(defn- run-datetime-corpus
+  "The datetime surface runs its WHOLE corpus, ignoring `n` and `seed`:
+   it is a fixed set of input forms, not a grammar to sample. 135
+   literals x 5 cast targets."
+  []
+  (with-open [o (reference-conn) t (target-conn)]
+    (doseq [c [o t]] (exec! c "SET TimeZone='UTC'") (exec! c "SET DateStyle='ISO, MDY'"))
+    (let [samples (datetime-samples)]
+      {:surface :datetime :seed nil
+       :drawn (into #{} (map :key) samples)
+       :ran (frequencies (map :class samples))
+       :diffs (into []
+                    (keep (fn [{:keys [class key run]}]
+                            (let [a (run o) b (run t)]
+                              (when-not (= a b)
+                                {:surface :datetime :class class :key key
+                                 :reference a :target b}))))
+                    samples)})))
+
+(defn- run-generated-surface
   [surface n seed]
   (with-open [o (reference-conn) t (target-conn)]
     ;; pgjdbc sends the client's TimeZone at startup, overriding the
@@ -576,6 +780,13 @@
 
 (def manifest-path "test/integration/fuzz/expected-divergences.edn")
 
+(def datetime-manifest-path
+  "The datetime corpus keeps its OWN manifest. It is a fixed corpus with
+   a known end state -- every PARSER entry is meant to be deleted -- so
+   it is a burn-down list, and mixing 239 of those into the generated
+   surfaces' manifest would bury them."
+  "test/integration/fuzz/datetime-divergences.edn")
+
 (defn expected-divergences
   "The known, explained disagreements, as
    `{:exact {[surface key] reason} :patterns [{:surface :re :reason}]}`.
@@ -587,8 +798,11 @@
    string would be a list that grows with the grammar and says the same
    thing every time."
   []
-  (let [f (io/file manifest-path)
-        entries (if (.exists f) (edn/read-string (slurp f)) [])]
+  (let [read-one (fn [path]
+                   (let [f (io/file path)]
+                     (if (.exists f) (edn/read-string (slurp f)) [])))
+        entries (into (read-one manifest-path)
+                      (read-one datetime-manifest-path))]
     {:exact (into {} (keep (fn [{:keys [surface key reason]}]
                              (when key [[surface key] reason])))
                   entries)
@@ -648,7 +862,7 @@
                    [(keyword surface)])
         n (if n (Long/parseLong n) nil)
         seed (if seed (Long/parseLong seed) 20260918)
-        default-n {:select 1500 :prepared 600 :join 150 :dml 300}
+        default-n {:select 1500 :prepared 600 :join 150 :dml 300 :datetime 0}
         outcomes (doall (for [s surfaces]
                           (report (run-surface s (or n (default-n s)) seed))))
         unexpected (mapcat :unexpected outcomes)
