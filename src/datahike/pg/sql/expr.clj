@@ -2242,39 +2242,45 @@
                        ;; every row whose d was NULL.
                        (if (or (fns/sql-null? prec) (fns/sql-null? ts))
                          :__null__
-                         (let [unit (let [u (if (keyword? prec) (name prec) (str prec))]
-                                      (str/replace u #"s$" ""))]
-                           (cond
-                             (instance? java.util.Date ts)
-                             (let [zdt (.atZone (.toInstant ^java.util.Date ts)
-                                                java.time.ZoneOffset/UTC)
-                                   trunc (trunc-zdt unit zdt)]
-                               (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
+                         ;; An infinite timestamp truncates to itself --
+                         ;; there is no day for it to be the start of.
+                         ;; Reading the sentinel's instant answered
+                         ;; `292278994-08-17 00:00:00`.
+                         (if (types/infinite-datetime ts)
+                           ts
+                           (let [unit (let [u (if (keyword? prec) (name prec) (str prec))]
+                                        (str/replace u #"s$" ""))]
+                             (cond
+                               (instance? java.util.Date ts)
+                               (let [zdt (.atZone (.toInstant ^java.util.Date ts)
+                                                  java.time.ZoneOffset/UTC)
+                                     trunc (trunc-zdt unit zdt)]
+                                 (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
 
                              ;; A `date` column arrives as a LocalDate, which
                              ;; the fall-through returned UNTRUNCATED --
                              ;; `date_trunc('month', d)` answered d. PostgreSQL
                              ;; resolves a date argument to the timestamptz
                              ;; overload, so the result is an instant.
-                             (instance? java.time.LocalDate ts)
-                             (let [zdt (.atStartOfDay ^java.time.LocalDate ts
-                                                      java.time.ZoneOffset/UTC)
-                                   trunc (trunc-zdt unit zdt)]
-                               (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
+                               (instance? java.time.LocalDate ts)
+                               (let [zdt (.atStartOfDay ^java.time.LocalDate ts
+                                                        java.time.ZoneOffset/UTC)
+                                     trunc (trunc-zdt unit zdt)]
+                                 (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
 
                              ;; A `timestamp` (no zone) stays zone-less.
-                             (instance? java.time.LocalDateTime ts)
-                             (let [zdt (.atZone ^java.time.LocalDateTime ts
-                                                java.time.ZoneOffset/UTC)]
-                               (.toLocalDateTime ^java.time.ZonedDateTime (trunc-zdt unit zdt)))
+                               (instance? java.time.LocalDateTime ts)
+                               (let [zdt (.atZone ^java.time.LocalDateTime ts
+                                                  java.time.ZoneOffset/UTC)]
+                                 (.toLocalDateTime ^java.time.ZonedDateTime (trunc-zdt unit zdt)))
 
-                             (number? ts)
-                             (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
-                                                java.time.ZoneOffset/UTC)
-                                   trunc (trunc-zdt unit zdt)]
-                               (.getEpochSecond (.toInstant ^java.time.ZonedDateTime trunc)))
+                               (number? ts)
+                               (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
+                                                  java.time.ZoneOffset/UTC)
+                                     trunc (trunc-zdt unit zdt)]
+                                 (.getEpochSecond (.toInstant ^java.time.ZonedDateTime trunc)))
 
-                             :else ts))))]
+                               :else ts)))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj trunc-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param precision ts) result-var])

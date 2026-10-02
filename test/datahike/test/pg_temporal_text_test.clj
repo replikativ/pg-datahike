@@ -22,7 +22,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
 
@@ -754,3 +754,57 @@
       (is (= "-infinity" (one c "SELECT min(t)::text FROM inf")))
       (is (= "2,3,1" (one c (str "SELECT string_agg(id::text, ',' ORDER BY t)"
                                  " FROM inf")))))))
+
+(deftest infinity-survives-every-temporal-path
+  ;; `infinity` is carried as the extreme java.util.Date, which is what
+  ;; makes ordering and comparison work without a special case. Only
+  ;; the TEXT renderer and the binary ENCODER knew that, so every other
+  ;; consumer read the sentinel's instant and answered a plausible
+  ;; finite value -- year 292278994, which is Long/MAX_VALUE as a date.
+  (with-open [c (jdbc)]
+    (testing "a cast between temporal types carries it"
+      (is (= "infinity" (one c "SELECT 'infinity'::timestamp::date::text")))
+      (is (= "-infinity" (one c "SELECT '-infinity'::timestamp::date::text")))
+      (is (= "infinity" (one c "SELECT 'infinity'::date::timestamp::text")))
+      (testing "except to `time`, which has no infinity -- PostgreSQL gives NULL"
+        (is (nil? (one c "SELECT 'infinity'::timestamp::time")))))
+    (testing "arithmetic is absorbed by it"
+      (is (= "infinity" (one c "SELECT ('infinity'::date + 1)::text")))
+      (is (= "infinity" (one c "SELECT ('infinity'::date - 1)::text")))
+      (is (= "infinity" (one c "SELECT ('infinity'::timestamp - '2000-01-01'::timestamp)::text")))
+      (is (= "-infinity" (one c "SELECT ('2000-01-01'::timestamp - 'infinity'::timestamp)::text")))
+      (testing "and the same infinity twice is 22008, as PostgreSQL has it"
+        (is (thrown? SQLException
+                     (exec! c "SELECT 'infinity'::timestamp - 'infinity'::timestamp")))))
+    (testing "extract and date_part answer the float infinity"
+      (is (= "Infinity" (one c "SELECT extract(epoch from 'infinity'::timestamp)::text")))
+      (is (= "Infinity" (one c "SELECT date_part('year', 'infinity'::timestamp)::text")))
+      (is (= "-Infinity" (one c "SELECT extract(epoch from '-infinity'::timestamp)::text"))))
+    (testing "date_trunc truncates it to itself -- there is no day it starts"
+      (is (= "infinity" (one c "SELECT date_trunc('day','infinity'::timestamp)::text"))))
+    (testing "and what already worked still does"
+      ;; `::text` on a boolean is `false`/`true`, not `f`/`t` --
+      ;; the latter is psql's unaligned display, not boolout.
+      (is (= "false" (one c "SELECT isfinite('infinity'::timestamp)::text")))
+      (is (= "infinity" (one c "SELECT greatest('infinity'::timestamp, '2000-01-01'::timestamp)::text")))
+      (is (= "true" (one c "SELECT ('-infinity'::timestamp < '2000-01-01'::timestamp)::text"))))))
+
+(deftest extract-uses-postgresqls-scale-not-the-doubles
+  ;; The sub-second fields go through `int64_div_fast_to_numeric` with a
+  ;; FIXED scale (timestamp.c) -- 6 for `second` and `epoch`, 3 for
+  ;; `milliseconds` -- and `microseconds` is an integer.
+  ;; `BigDecimal/valueOf` on a double gave the shortest representation.
+  (with-open [c (jdbc)]
+    (is (= "946684800.500000"
+           (one c "SELECT extract(epoch from '2000-01-01 00:00:00.5'::timestamp)::text")))
+    (is (= "946684800.000000"
+           (one c "SELECT extract(epoch from '2000-01-01'::timestamp)::text")))
+    (is (= "0.500000"
+           (one c "SELECT extract(second from '2000-01-01 00:00:00.5'::timestamp)::text")))
+    (is (= "500.000"
+           (one c "SELECT extract(milliseconds from '2000-01-01 00:00:00.5'::timestamp)::text")))
+    (is (= "500000"
+           (one c "SELECT extract(microseconds from '2000-01-01 00:00:00.5'::timestamp)::text")))
+    (testing "and the whole-number fields carry no scale at all"
+      (is (= "2000" (one c "SELECT extract(year from '2000-01-01'::timestamp)::text")))
+      (is (= "6" (one c "SELECT extract(dow from '2000-01-01'::timestamp)::text"))))))
