@@ -125,13 +125,23 @@
    ;; --- constraint violations -----------------------------------------
    :unique-violation
    {:sqlstate "23505"
-    :format (fn [{:keys [table column constraint value]}]
+    ;; `(value: 1)` appended to the message was ours; PostgreSQL puts it
+    ;; in a DETAIL field -- `Key (x)=(1) already exists.` -- which is
+    ;; what pg_regress compares and what a client reads out of the
+    ;; ErrorResponse rather than out of the message text.
+    :format (fn [{:keys [table column constraint]}]
               (let [con (or constraint
                             (when (and table column) (str table "_" column "_key"))
                             (when table (str table "_pkey")))]
                 (when con
-                  (cond-> (str "duplicate key value violates unique constraint \"" con "\"")
-                    (some? value) (str " (value: " (pr-str value) ")")))))}
+                  (str "duplicate key value violates unique constraint \"" con "\""))))
+    :detail (fn [{:keys [column columns value]}]
+              (let [cols (or (seq columns) (when column [column]))
+                    vals (if (sequential? value) value [value])]
+                (when (and (seq cols) (some? value))
+                  (str "Key (" (str/join ", " cols) ")=("
+                       (str/join ", " (map #(if (nil? %) "null" (str %)) vals))
+                       ") already exists."))))}
 
    :not-null-violation
    {:sqlstate "23502"
@@ -704,8 +714,12 @@
         category (when category-key (get error-categories category-key))
         ;; Explicit :sqlstate is a full override — skip the category
         ;; formatter, leaving the throw site's own message intact.
-        formatted (when (and category (not explicit-sqlstate))
-                    (when-let [f (:format category)] (f data)))
+        ;; NOTE: computed from `merged-data` below, not from `data`: a
+        ;; Datahike message rewrite contributes the table and column,
+        ;; and the formatter ran before they were merged -- so a plain
+        ;; UNIQUE violation named `mu_pkey` (the table-only fallback)
+        ;; while the ErrorResponse's `n` field, built from merged-data,
+        ;; said `mu_u_key`. The message and the field disagreed.
         canceled? (:datahike/canceled data)
         ;; Datahike's own error keys (`:transact/schema`, `:transact/upsert`,
         ;; …) live in dh-error->sqlstate. Try this whenever the key
@@ -729,14 +743,26 @@
                  dh-code
                  regex-code
                  "XX000")
-        ;; Message preference: category formatter > dh-rewrite > raw.
-        final-msg (or formatted
-                      (when dh-rewrite (second dh-rewrite))
-                      msg)
         ;; Fields: union of data-driven extraction and any extras from
         ;; dh-rewrite (e.g. {:table … :column …} parsed from the msg).
         merged-data (if dh-rewrite
                       (merge (get dh-rewrite 2) data)
                       data)
+        formatted (when (and category (not explicit-sqlstate))
+                    (when-let [f (:format category)] (f merged-data)))
+        ;; Message preference: category formatter > dh-rewrite > raw.
+        final-msg (or formatted
+                      (when dh-rewrite (second dh-rewrite))
+                      msg)
+        ;; A category may also derive the DETAIL field. PostgreSQL puts
+        ;; the offending key there rather than in the message -- `Key
+        ;; (x)=(1) already exists.` -- and pg_regress compares it. An
+        ;; explicit `:detail` at the throw site still wins.
+        merged-data (if-let [df (and category (nil? (:detail merged-data))
+                                     (:detail category))]
+                      (if-let [d (df merged-data)]
+                        (assoc merged-data :detail d)
+                        merged-data)
+                      merged-data)
         fields (extract-error-fields merged-data msg)]
     [code final-msg fields]))

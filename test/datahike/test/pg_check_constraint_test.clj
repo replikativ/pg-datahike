@@ -395,3 +395,33 @@
       (is (= 1 (run c "INSERT INTO sp5 VALUES (1,1,9)")))
       (is (= 1 (run c "INSERT INTO sp6 VALUES (1,1)")))
       (is (= "23503" (second (run c "INSERT INTO sp6 VALUES (7,7)")))))))
+
+(deftest violation-messages-name-their-constraint
+  ;; Four families reported a bare placeholder -- `unique violation`,
+  ;; `foreign key violation`, `not-null violation` -- and CHECK had the
+  ;; right message with no DETAIL. The category formatters that word
+  ;; them as PostgreSQL does already existed; they were SKIPPED, because
+  ;; an explicit `:sqlstate` in the ex-data is a full override in
+  ;; `classify-exception` and those throw sites passed both it and a
+  ;; placeholder message. pg_regress compares these lines.
+  (with-open [c (jdbc)]
+    (is (= 0 (run c "CREATE TABLE mp (x int PRIMARY KEY, y int)")))
+    (is (= 1 (run c "INSERT INTO mp VALUES (1,1)")))
+    (is (= ["23505" "duplicate key value violates unique constraint \"mp_pkey\""]
+           (vec (rest (run c "INSERT INTO mp VALUES (1,2)")))))
+    (testing "a plain UNIQUE names its own index, not a primary key that
+              does not exist"
+      (is (= 0 (run c "CREATE TABLE mu (u int UNIQUE)")))
+      (is (= 1 (run c "INSERT INTO mu VALUES (5)")))
+      (is (= "duplicate key value violates unique constraint \"mu_u_key\""
+             (nth (run c "INSERT INTO mu VALUES (5)") 2))))
+    (testing "NOT NULL names the column and the relation"
+      (is (= 0 (run c "CREATE TABLE mn (n int NOT NULL)")))
+      (is (= (str "null value in column \"n\" of relation \"mn\" "
+                  "violates not-null constraint")
+             (nth (run c "INSERT INTO mn VALUES (null)") 2))))
+    (testing "and a FOREIGN KEY names the table, the constraint and the key"
+      (is (= 0 (run c "CREATE TABLE mc (a int CHECK (a > 0), b int REFERENCES mp(x))")))
+      (is (= (str "insert or update on table \"mc\" violates "
+                  "foreign key constraint \"mc_b_fkey\"")
+             (nth (run c "INSERT INTO mc VALUES (1, 99)") 2))))))

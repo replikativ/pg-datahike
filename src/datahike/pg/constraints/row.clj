@@ -6,7 +6,8 @@
    arbitration. `validate-mutation!` validates an actual INSERT/UPDATE result
    and therefore also enforces foreign keys.  Keeping those phases distinct
    mirrors PostgreSQL's ExecInsert/ExecOnConflictUpdate ordering."
-  (:require [datahike.api :as d]
+  (:require [clojure.string :as str]
+            [datahike.api :as d]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
@@ -250,6 +251,20 @@
             nil))
     nil))
 
+(defn failing-row-detail
+  "PostgreSQL's `Failing row contains (…)` DETAIL: every column of the
+   row in declaration order, `null` for a NULL, no quoting
+   (`ExecBuildSlotValueDescription`). It is what pg_regress compares for
+   a CHECK and a NOT NULL violation, and both raised with no DETAIL at
+   all."
+  [attrs columns]
+  (str "Failing row contains ("
+       (str/join ", " (map (fn [{:keys [attr]}]
+                             (let [v (get attrs attr)]
+                               (if (nil? v) "null" (str v))))
+                           columns))
+       ")."))
+
 (defn prepare-candidate
   "Materialize omitted defaults and reject NULL in NOT NULL columns.
    `coerce-fn` receives [value attr]. Sequence defaults must already have
@@ -283,8 +298,10 @@
            coerced (when (some? resolved) (coerce-fn resolved attr))]
        (when (and not-null? (nil? resolved))
          (throw (ex-info "not-null violation"
-                         {:error :not-null-violation :sqlstate "23502"
-                          :table (namespace attr) :column name})))
+                         {:error :not-null-violation
+                          :table (namespace attr) :column name
+                          :detail (failing-row-detail
+                                   (:attrs result) (:columns plan))})))
        (cond-> result
          (or present? default) (assoc-in [:attrs attr] coerced))))
    {:attrs attrs}
@@ -306,14 +323,17 @@
   (doseq [{:keys [name attr not-null?]} (:columns plan)
           :when (and not-null? (nil? (get attrs attr)))]
     (throw (ex-info "not-null violation"
-                    {:error :not-null-violation :sqlstate "23502"
-                     :table table-name :column name})))
+                    {:error :not-null-violation
+                     :table table-name :column name
+                     :detail (failing-row-detail attrs (:columns plan))})))
   (when (seq (:checks plan))
     (let [logical (logical-row table-name attrs (:columns plan))]
       (doseq [{:keys [constraint ast]} (:checks plan)
               :when (false? (eval-check-fn ast logical table-name (:schema db)))]
         (throw (errors/pg-error :check-violation
-                                {:table table-name :constraint constraint})))))
+                                {:table table-name :constraint constraint
+                                 :detail (failing-row-detail
+                                          attrs (:columns plan))})))))
   (doseq [[column-name spec] (:domain-enum plan)
           :let [value (get attrs (:attr spec))]]
     (cond
@@ -401,7 +421,18 @@
                                              (mapv % parent-attrs)))
                                     (conj (vec (vals effective-rows)) attrs))]
             :when (not (or db-hit? pending-hit))]
+      ;; `:sqlstate` here is a full override in classify-exception,
+      ;; which keeps the throw site's message -- and the message was the
+      ;; placeholder `foreign key violation`, so the category's
+      ;; formatter (which words it as PostgreSQL does) never ran. The
+      ;; category supplies 23503 anyway. The DETAIL names the key and
+      ;; the table it is not present in, as `ri_ReportViolation` does.
       (throw (ex-info "foreign key violation"
-                      {:error :foreign-key-violation :sqlstate "23503"
-                       :table table-name :constraint constraint}))))
+                      {:error :foreign-key-violation
+                       :table table-name :constraint constraint
+                       :operation :insert
+                       :parent-table parent-table
+                       :detail (str "Key (" (str/join ", " (mapv name child-attrs))
+                                    ")=(" (str/join ", " (map str child-values))
+                                    ") is not present in table \"" parent-table "\".")}))))
   nil)
