@@ -575,6 +575,15 @@ public final class PgParamCodec {
         return null;
     }
 
+    /**
+     * The carriers `datahike.pg.types` uses for `infinity` / `-infinity`:
+     * the extreme java.util.Date. Decoding must produce the SAME object
+     * the text path does, or the two spellings of one value would not
+     * compare equal.
+     */
+    static final java.util.Date PG_POS_INFINITY = new java.util.Date(Long.MAX_VALUE);
+    static final java.util.Date PG_NEG_INFINITY = new java.util.Date(Long.MIN_VALUE);
+
     /** Days between the Unix epoch (1970-01-01) and the PG epoch (2000-01-01). */
     private static final long PG_EPOCH_DAYS = 10957L;
     /** Microseconds between the Unix epoch and the PG epoch. */
@@ -1179,9 +1188,19 @@ public final class PgParamCodec {
             case PgWireServer.OID_UUID ->
                 new UUID(buf.getLong(), buf.getLong());
 
-            // date_recv — int32 days since 2000-01-01.
-            case PgWireServer.OID_DATE ->
-                LocalDate.ofEpochDay(PG_EPOCH_DAYS + buf.getInt());
+            // date_recv — int32 days since 2000-01-01. INT32_MAX/MIN are
+            // `infinity` / `-infinity`, not days: encodeBinary writes
+            // them (infiniteDateDays) and nothing read them back, so a
+            // client sending `date 'infinity'` as a BINARY parameter --
+            // which pgjdbc does for PGStatement.DATE_POSITIVE_INFINITY --
+            // got LocalDate.ofEpochDay(10957 + 2147483647), year
+            // 5881580. Silently, and only over the binary path.
+            case PgWireServer.OID_DATE -> {
+                int days = buf.getInt();
+                yield days == Integer.MAX_VALUE ? PG_POS_INFINITY
+                    : days == Integer.MIN_VALUE ? PG_NEG_INFINITY
+                    : LocalDate.ofEpochDay(PG_EPOCH_DAYS + days);
+            }
 
             // timestamp_recv / timestamptz_recv — int64 microseconds since
             // 2000-01-01 00:00:00 UTC. Return java.util.Date to match
@@ -1189,6 +1208,12 @@ public final class PgParamCodec {
             case PgWireServer.OID_TIMESTAMP,
                  PgWireServer.OID_TIMESTAMPTZ -> {
                 long pgMicros = buf.getLong();
+                // INT64_MAX/MIN are the infinities. Adding PG_EPOCH_MICROS
+                // to INT64_MAX WRAPS, so this produced roughly year
+                // -290272 -- a plausible timestamp, from the one input
+                // that cannot be one.
+                if (pgMicros == Long.MAX_VALUE) yield PG_POS_INFINITY;
+                if (pgMicros == Long.MIN_VALUE) yield PG_NEG_INFINITY;
                 long unixMicros = pgMicros + PG_EPOCH_MICROS;
                 long millis = Math.floorDiv(unixMicros, 1000L);
                 int  nanos  = (int) Math.floorMod(unixMicros, 1000L) * 1000;

@@ -1004,6 +1004,14 @@
               bc? to-bc-era)))
 
         :date (cond
+                ;; `infinity` survives a cast between temporal types: it
+                ;; is a VALUE of date, timestamp and timestamptz alike,
+                ;; not a particular instant. It is carried as the
+                ;; extreme java.util.Date, so every arm below that reads
+                ;; `.toInstant` turned it into year 292278994 --
+                ;; `'infinity'::timestamp::date` answered
+                ;; `292278994-08-17`, a plausible date and a wrong one.
+                (types/infinite-datetime v) v
                 (instance? java.time.LocalDate v) v
                 (and (string? v) (not= ::none (special-datetime v :date)))
                 (special-datetime v :date)
@@ -1039,6 +1047,12 @@
         :time (let [timetz? (contains? #{"timetz" "time with time zone"}
                                        (types/base-type-name-of type-str))
                     local (cond
+                            ;; `'infinity'::timestamp::time` is NULL in
+                            ;; PostgreSQL -- a time has no infinity, so
+                            ;; there is nothing to carry. Reading the
+                            ;; sentinel's instant gave `07:12:55.807`,
+                            ;; the time-of-day of Long/MAX_VALUE.
+                            (types/infinite-datetime v) ::infinite
                             (instance? java.time.OffsetTime v)
                             (if timetz? v (.toLocalTime ^java.time.OffsetTime v))
                             (instance? java.time.LocalTime v) v
@@ -1048,9 +1062,11 @@
                             (-> ^java.util.Date v .toInstant
                                 (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
                             :else (parse-time-input (str v) timetz?))]
-                (if (and timetz? (instance? java.time.LocalTime local))
+                (cond
+                  (= ::infinite local) :__null__
+                  (and timetz? (instance? java.time.LocalTime local))
                   (java.time.OffsetTime/of ^java.time.LocalTime local java.time.ZoneOffset/UTC)
-                  local))
+                  :else local))
 
         ;; Not a width-classified category — the OID-name types.
         (cond
