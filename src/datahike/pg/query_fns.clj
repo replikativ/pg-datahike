@@ -11,7 +11,8 @@
 
    `datahike.pg.resolve` turns these vars into the table pg-datahike resolves
    query symbols with."
-  (:require [datahike.pg.jsonb :as jsonb]
+  (:require [clojure.string]
+            [datahike.pg.jsonb :as jsonb]
             [datahike.pg.sql.fns :as fns]))
 
 (def filter-array-agg                    fns/filter-array-agg)
@@ -24,6 +25,7 @@
 (def filter-avg                          fns/filter-avg)
 (def filter-avg-numeric                  fns/filter-avg-numeric)
 (def filter-bool-and                     fns/filter-bool-and)
+(def filter-bool-or                      fns/filter-bool-or)
 (def filter-corr                         fns/filter-corr)
 (def filter-count                        fns/filter-count)
 (def filter-count-distinct               fns/filter-count-distinct)
@@ -119,3 +121,29 @@
 (def sql-time-                           fns/sql-time-)
 (def sql-timestamp-                      fns/sql-timestamp-)
 (def sql-unsupported-temporal-arithmetic fns/sql-unsupported-temporal-arithmetic)
+
+;; ---------------------------------------------------------------------------
+;; `agg(DISTINCT x)` for every aggregate above.
+;;
+;; DISTINCT was read by `count` alone -- it has its own
+;; `filter-count-distinct` -- and dropped by all the others, so
+;; `sum(DISTINCT v)` over 1,2,2,5 answered 10 and `string_agg(DISTINCT
+;; g, ',')` over a,a,b,a answered `a,a,b,a`.
+;;
+;; A wrapper per aggregate, not a deduplicated Datalog find set,
+;; because the find set is one per QUERY: `sum(DISTINCT v), sum(v)` in
+;; one SELECT needs the duplicates for one aggregate and not the other,
+;; and PostgreSQL computes each independently.
+;;
+;; Interned rather than written out, so an aggregate added above cannot
+;; be forgotten here. `datahike.pg.resolve` snapshots `ns-publics` of
+;; this namespace at load, and loads after it, so these are visible to
+;; the query engine like any other var.
+(doseq [[sym v] (into {} (ns-publics 'datahike.pg.query-fns))
+        :let [n (name sym)]
+        :when (and (clojure.string/starts-with? n "filter-")
+                   (not (clojure.string/ends-with? n "-distinct"))
+                   (fn? @v))]
+  (intern 'datahike.pg.query-fns
+          (symbol (str n "-distinct"))
+          (fns/distinct-agg @v)))
