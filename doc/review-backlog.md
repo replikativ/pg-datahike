@@ -218,14 +218,15 @@ below is what is genuinely still open.
   on both ends, so nothing currently catches it.
 
 - **`parse-timestamp-string` still passes its input through on
-  failure**, and `coerce/coerce-unknown` does `(or (timestamp-parser
-  s) s)`. So `WHERE ts = 'nonsense'` returns zero rows where
-  PostgreSQL raises 22007 — an empty result is a plausible-looking
-  answer, which makes it worse than an error. It is now a thin wrapper
-  over `timestamptz_in` and no longer carries a second grammar; the
-  remaining work is converting the callers that test `(string? p)` so
-  it can raise. About 20 call sites also pass a now-ignored
-  `:parse-timestamp` option to `cast-scalar` and can drop it.
+  failure.** The INSTANT half of this is closed —
+  `coerce/coerce-unknown` now raises for `:db.type/instant` instead of
+  handing the string back, so `WHERE ts = 'nonsense'` is 22007 and not
+  an empty result set. What is left is the generic
+  `(or (f s) s)` for every other type in the same function, and the
+  wrapper itself, which still returns its input when parsing fails
+  because some callers test `(string? p)`. About 20 call sites also
+  pass a now-ignored `:parse-timestamp` option to `cast-scalar` and
+  can drop it.
 
 - **`DetermineTimeZoneAbbrevOffset` is partial.** PostgreSQL first asks
   the zone's own transition data whether the abbreviation AS WRITTEN

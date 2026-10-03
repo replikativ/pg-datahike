@@ -27,7 +27,8 @@
    Both errors are encoded as `ex-info` with `:sqlstate`; the wire
    layer's `handler.clj` already lifts those into ErrorResponse
    messages."
-  (:require [datahike.pg.types :as types]
+  (:require [datahike.pg.errors :as errors]
+            [datahike.pg.types :as types]
             [clojure.string :as str])
   (:import [java.math BigInteger BigDecimal]
            [java.util.concurrent.atomic AtomicLong]))
@@ -432,10 +433,10 @@
 (defn coerce-unknown
   "Lenient reading of an unknown-type string literal for the storage
    types without a datahike.pg.input function (date/time, keyword,
-   symbol). Returns the typed value on success and the original string
-   on failure -- the passthrough the datetime decoder will retire
-   (consolidation plan, Phase 1.3). Every other type's literal goes
-   through datahike.pg.input, which raises instead.
+   symbol). An INSTANT now raises on unparseable text; every other
+   type still returns the original string on failure, which is the
+   remaining half of the passthrough the consolidation plan's Phase
+   1.3 retires.
 
    The `:db.type/instant` typinput needs a parse-timestamp helper
    that lives in expr.clj; instant coercion is wired separately via
@@ -444,10 +445,24 @@
   ([^String s vtype timestamp-parser]
    (cond
      (nil? s) nil
+     ;; An instant RAISES on unparseable text rather than passing it
+     ;; through. The passthrough was `(or (try (timestamp-parser s)
+     ;; (catch Throwable _ nil)) s)` -- a string handed back where a
+     ;; value was asked for, so a comparison against it silently
+     ;; matched nothing instead of raising. Retiring it is what the
+     ;; docstring above has been waiting for; the decoder now exists.
+     ;;
+     ;; The parser's own ex-info carries the right type and SQLSTATE,
+     ;; so it is let through unchanged; anything else is still an
+     ;; invalid-text error for this value.
      (= vtype :db.type/instant)
-     (or (when timestamp-parser
-           (try (timestamp-parser s) (catch Throwable _ nil)))
-         s)
+     (if timestamp-parser
+       (let [v (timestamp-parser s)]
+         (if (string? v)
+           (throw (errors/pg-error :invalid-datetime-format
+                                   {:type "timestamp" :value s}))
+           v))
+       s)
      :else
      (if-let [f (vtype->typinput vtype)]
        (or (f s) s)
