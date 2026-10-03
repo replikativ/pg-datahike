@@ -308,6 +308,32 @@
 (def ^:private mac-in
   (delay @(requiring-resolve 'datahike.pg.mac/mac-in)))
 
+;; The five temporal input functions, through the ported parser. The
+;; same `requiring-resolve` dance as the two above, and for the same
+;; reason: `cast.clj` requires THIS namespace, so naming it in the ns
+;; form would close a cycle. `datetime-ctx` is what carries the session
+;; DateStyle, so an array element reads a date in the same field order
+;; a cast does.
+(def ^:private temporal-in
+  (delay
+    (let [ctx @(requiring-resolve 'datahike.pg.sql.cast/datetime-ctx)
+          pair (fn [in-sym carrier-sym]
+                 (let [decode @(requiring-resolve in-sym)
+                       carry @(requiring-resolve carrier-sym)]
+                   (fn [^String t] (carry (decode t (ctx))))))]
+      {:date (pair 'datahike.pg.datetime.in/date-in
+                   'datahike.pg.datetime.carrier/->date)
+       :time (pair 'datahike.pg.datetime.in/time-in
+                   'datahike.pg.datetime.carrier/->time)
+       :timetz (pair 'datahike.pg.datetime.in/timetz-in
+                     'datahike.pg.datetime.carrier/->timetz)
+       :timestamp (pair 'datahike.pg.datetime.in/timestamp-in
+                        'datahike.pg.datetime.carrier/->local-datetime)
+       ;; A timestamptz is an INSTANT, so it takes the Date carrier --
+       ;; the same choice `cast-scalar` makes, for the same reason.
+       :timestamptz (pair 'datahike.pg.datetime.in/timestamptz-in
+                          'datahike.pg.datetime.carrier/->date-value)})))
+
 (def ^:private parsers
   {types/oid-bool parse-bool
    types/oid-int2 parse-int2
@@ -335,7 +361,18 @@
    types/oid-line     #(@geometric-in "line" %)
    types/oid-circle   #(@geometric-in "circle" %)
    types/oid-macaddr  #(@mac-in "macaddr" %)
-   types/oid-macaddr8 #(@mac-in "macaddr8" %)})
+   types/oid-macaddr8 #(@mac-in "macaddr8" %)
+   ;; The temporal family, for the same reason as the two above and
+   ;; missed when they were added: without an entry `coerce-token` kept
+   ;; the raw token, so `'{2024-02-30}'::date[]` held the TEXT of an
+   ;; impossible date where PostgreSQL raises 22008, and
+   ;; `'{"Jan 15, 2024"}'::date[]` did not equal `'{2024-01-15}'::date[]`.
+   ;; This table's own docstring already promised otherwise.
+   types/oid-date        #((:date @temporal-in) %)
+   types/oid-time        #((:time @temporal-in) %)
+   types/oid-timetz      #((:timetz @temporal-in) %)
+   types/oid-timestamp   #((:timestamp @temporal-in) %)
+   types/oid-timestamptz #((:timestamptz @temporal-in) %)})
 
 (defn parser
   "The input function for `oid`, or nil when that type's input is not

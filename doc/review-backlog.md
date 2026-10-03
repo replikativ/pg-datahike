@@ -192,3 +192,54 @@ drive-by fix.
   scanner rewrite. The rewrite was not measured cleanly (load average
   24 on the box at the time) and should be, on an idle machine, before
   anything is claimed either way.
+
+## Left open by the datetime parser port
+
+The port took the datetime corpus from 239 divergences to 23. A review
+of the CUTOVER then found four more datetime parsers still alive and
+three live wrong answers outside the corpus; those are fixed. What is
+below is what is genuinely still open.
+
+- **Deferred clock tokens.** `now`, `today`, `tomorrow` and
+  `yesterday` parse correctly — pass a `:now` to `decode-datetime` and
+  they work — but `cast.clj/datetime-ctx` deliberately supplies none,
+  because a cast is constant-folded into a cached plan and folding
+  `'today'::date` once would freeze it for that plan's life. They need
+  whatever deferral `now()` already has. All 23 remaining corpus
+  entries.
+
+- **`SET TimeZone` is accepted and ignored.** `SET timezone =
+  'America/New_York'` reports success, `SHOW timezone` then answers
+  `UTC`, and every `timestamptz` in and out is off by the offset. This
+  predates the port, but the port is what made it a one-line fix on
+  one side: `datetime-ctx` is now the single place the session zone is
+  read, and `resolve-offset` already takes one. What is missing is the
+  GUC plumbing and the OUTPUT side. The differential fuzzer pins UTC
+  on both ends, so nothing currently catches it.
+
+- **`parse-timestamp-string` still passes its input through on
+  failure.** The INSTANT half of this is closed —
+  `coerce/coerce-unknown` now raises for `:db.type/instant` instead of
+  handing the string back, so `WHERE ts = 'nonsense'` is 22007 and not
+  an empty result set. What is left is the generic
+  `(or (f s) s)` for every other type in the same function, and the
+  wrapper itself, which still returns its input when parsing fails
+  because some callers test `(string? p)`. About 20 call sites also
+  pass a now-ignored `:parse-timestamp` option to `cast-scalar` and
+  can drop it.
+
+- **`DetermineTimeZoneAbbrevOffset` is partial.** PostgreSQL first asks
+  the zone's own transition data whether the abbreviation AS WRITTEN
+  matches at that instant, and only falls back to the zone's offset.
+  Java exposes no tzdb abbreviation strings, so only the fallback is
+  implemented. It differs only when an abbreviation disagrees with its
+  zone's state at the date given, and only for the 50 DYNTZ entries of
+  195 — no corpus sample reaches it.
+
+- **The datetime corpus only sees one surface.** Every sample is
+  `SELECT '<lit>'::<type>::text`, so it cannot distinguish a parser
+  loss from a renderer loss, and it never exercises a column, an
+  array, COPY, a set operation or a comparison. Three real divergences
+  lived in those paths while the manifest read 25. Widening it — the
+  same literals through a column round-trip and an array — is the
+  cheapest way to stop that recurring.
