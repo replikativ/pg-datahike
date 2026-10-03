@@ -408,8 +408,14 @@
    `'Feb 10 1997'`. And in the YEAR|MONTH case it can RETROACTIVELY
    reinterpret: if the year already set came from two digits and this
    field has three or more, the earlier value was really the day, so
-   the two swap and `two-digits?` is cleared. That is what makes
-   `'99-Jan-08'` and `'1999-Jan-08'` both land correctly."
+   the two swap and `two-digits?` is cleared. `'08-Jan-99'` reaches
+   1999-01-08 that way.
+
+   It does NOT rescue `'99-Jan-08'`, and I claimed it did before
+   checking. The swap needs the LATER field to be the long one; with
+   the long field first, 99 is placed as the day and the oracle agrees
+   that the result is out of range:
+     select '99-Jan-08'::date => date/time field value out of range"
   [^String s tm fmask {:keys [text-month? date-order two-digits?]}]
   (let [n (.length s)
         [val cp] (strtoint s 0)]
