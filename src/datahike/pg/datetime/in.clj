@@ -48,15 +48,22 @@
 
 (defn- raise!
   "A `dterr` as the SQL error for `type-name` and the ORIGINAL literal.
-   The decoder never sees either, which is why the mapping lives here."
-  [kind ^String type-name ^String value]
-  (let [[cat hint] (get dterr->error kind [:invalid-datetime-format nil])]
-    (throw (errors/pg-error
-            cat
-            (cond-> {:type type-name :value value}
-              (= cat :invalid-parameter-value)
-              (assoc :message (str "time zone \"" value "\" not recognized"))
-              hint (assoc :hint hint))))))
+   The decoder never sees either, which is why the mapping lives here.
+
+   `zone-name` is the offending zone when the decoder recorded one.
+   PostgreSQL names the ZONE, not the literal -- `time zone
+   \"nonsense/zone\" not recognized` -- so a message built from the
+   literal is wrong even with the right SQLSTATE."
+  ([kind type-name value] (raise! kind type-name value nil))
+  ([kind ^String type-name ^String value zone-name]
+   (let [[cat hint] (get dterr->error kind [:invalid-datetime-format nil])]
+     (throw (errors/pg-error
+             cat
+             (cond-> {:type type-name :value value}
+               (= cat :invalid-parameter-value)
+               (assoc :message (str "time zone \""
+                                    (or zone-name value) "\" not recognized"))
+               hint (assoc :hint hint)))))))
 
 (defmacro ^:private with-dterr
   "Run `body`, turning any `dterr` into the SQL error."
@@ -64,7 +71,8 @@
   `(try ~@body
         (catch clojure.lang.ExceptionInfo e#
           (if-let [k# (::lex/dterr (ex-data e#))]
-            (raise! k# ~type-name ~value)
+            (raise! k# ~type-name ~value
+                    (:datahike.pg.datetime.parse/zone-name (ex-data e#)))
             (throw e#)))))
 
 (defn- resolve-offset
@@ -195,12 +203,23 @@
     (let [r (parse/decode-time-only (lex/tokenize s (:timetz lex/buflen-for))
                                     {:date-order date-order :now now :zone? true})
           z (:zone r)
-          at (merge (:resolve-date r) (:tm r))
-          west (if (= (:kind z) :named)
-                 (if-let [zi (zone/resolve-zone-name (:name z))]
-                   (or (zone/fixed-offset zi) (zone/determine-offset at zi))
-                   (dec/dterr :bad-timezone))
-                 (resolve-offset z at session-zone))]
+          ;; Forced only on the branches that need a date, so an
+          ;; ordinary time never reads the clock.
+          at (delay (merge @(:resolve-date r) (:tm r)))
+          west (case (:kind z)
+                 :offset (:west z)
+                 :named (if-let [zi (zone/resolve-zone-name (:name z))]
+                          ;; A FIXED zone needs no date at all, which
+                          ;; is why `'12:00 UTC'::timetz` works and
+                          ;; `'12:00 America/New_York'::timetz` does not.
+                          (or (zone/fixed-offset zi) (zone/determine-offset @at zi))
+                          (throw (ex-info "bad-timezone"
+                                          {:datahike.pg.datetime.lex/dterr :bad-timezone
+                                           :datahike.pg.datetime.parse/zone-name (:name z)})))
+                 :abbrev (zone/determine-abbrev-offset @at (:zone z))
+                 :session (or (zone/fixed-offset session-zone)
+                              (zone/determine-offset @at session-zone))
+                 0)]
       {:kind :timetz :usec (time->usec (:tm r)) :west west})))
 
 (defn timestamp-in

@@ -83,6 +83,11 @@
         (when-let [id (get @folded (.toLowerCase name))]
           (ZoneId/of id)))))
 
+(def utc
+  "The session zone until `SET TimeZone` is honoured (expr.clj:1613
+   reports UTC unconditionally)."
+  (ZoneId/of "UTC"))
+
 (def ^:private zone-cache (atom {}))
 
 (defn resolve-zone-name

@@ -28,6 +28,9 @@
    load cycle."
   (:require [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.datetime.carrier :as carrier]
+            [datahike.pg.datetime.in :as in]
+            [datahike.pg.datetime.zone :as zone]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.geo :as geo]
@@ -338,116 +341,50 @@
       (-> (pg-bits/parse-bit-literal (str v) varying?)
           (pg-bits/coerce-width w explicit?)))))
 
-(def ^:private time-input
-  ;; H:MM[:SS[.frac]] [AM|PM] [zone], or compact HHMMSS -- the forms of
-  ;; datetime.c DecodeTimeOnly that applications use. Zone: Z, UTC, or
-  ;; +-HH[[:]MM[[:]SS]].
-  #"(?i)^(?:(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?|(\d{2})(\d{2})(\d{2}))\s*(am|pm)?\s*(z|utc|[+-]\d{1,2}(?::?\d{2}(?::?\d{2})?)?)?$")
+(defn datetime-ctx
+  "What the ported parser reads from session state.
 
-(def ^:private epoch-instant
-  (java.time.LocalDateTime/of 1970 1 1 0 0 0))
+   `:now` is deliberately ABSENT, so the four clock-reading tokens --
+   `now`, `today`, `tomorrow`, `yesterday` -- fail as unparseable.
+   That is what this path needs and what the server already did: their
+   value is the STATEMENT's, and a cast is constant-folded into a
+   cached plan, so folding one would freeze it for that plan's life.
+   Supporting them needs the deferred treatment `now()` gets, and the
+   parser is ready for it -- pass a `:now` and they work.
 
-(defn special-datetime
-  "PostgreSQL's reserved datetime inputs (datetime.c's `datetktbl`),
-   for the ones whose value does not depend on when the statement runs.
-
-   `now`, `today`, `tomorrow` and `yesterday` are deliberately absent:
-   their value is the statement's, and a cast is constant-folded into a
-   cached plan, so folding one would freeze it -- the same trap a
-   volatile DEFAULT has. They need the deferred treatment `now()` gets.
-   `infinity` and `-infinity` are absent because they need a value to
-   BE, which java.util.Date has no room for without a sentinel
-   convention across storage, text, binary and comparison.
-
-   Returns `::none` rather than nil so a caller can tell a value that is
-   not special from a special value that is legitimately nil."
-  [^String s kind]
-  (case (str/lower-case (str/trim (str s)))
-    "epoch" (case kind
-              :date (java.time.LocalDate/of 1970 1 1)
-              :timestamp epoch-instant
-              ::none)
-    "allballs" (if (= :time kind) (java.time.LocalTime/of 0 0 0) ::none)
-    ;; `infinity` is a timestamp and a date, never a time -- `time_in`
-    ;; has no room for it and PostgreSQL raises. `inf` is not a
-    ;; spelling PostgreSQL accepts either.
-    ("infinity" "+infinity") (if (= :time kind) ::none types/pos-infinity)
-    "-infinity" (if (= :time kind) ::none types/neg-infinity)
-    ::none))
-
-(defn- parse-time-fields
-  "The field parser: hours, minutes, seconds, fraction, AM/PM and zone."
-  [^String input timetz?]
-  (let [s (str/trim input)
-        ;; A SPACE, not `[ T]`. PostgreSQL's time_in drops a leading
-        ;; date only in the space-separated spelling:
-        ;; `'2001-02-03 04:05:06'::time` is 04:05:06 and
-        ;; `'2001-02-03T04:05:06'::time` is 22007. Accepting the T form
-        ;; answered a time for a literal PostgreSQL refuses.
-        time-part (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2} (.+)$" s)) s)
-        type-name (if timetz? "time with time zone" "time")
-        [_ h m sec frac ch cm cs ampm zone] (re-matches time-input time-part)]
-    (when-not (or h ch)
-      (throw (errors/pg-error :invalid-datetime-format {:type type-name :value input})))
-    (let [raw-hour (Long/parseLong (or h ch))
-          minute (Long/parseLong (or m cm))
-          second (Long/parseLong (or sec cs "0"))
-          ;; Rounded to microseconds, as PostgreSQL stores them.
-          micros (if frac
-                   (.longValue (.setScale (.movePointRight (java.math.BigDecimal. (str "0." frac)) 6)
-                                          0 java.math.RoundingMode/HALF_UP))
-                   0)
-          hour (case (some-> ampm str/lower-case)
-                 "am" (if (= 12 raw-hour) 0 raw-hour)
-                 "pm" (if (< raw-hour 12) (+ raw-hour 12) raw-hour)
-                 raw-hour)
-          ;; 24:00:00 exactly is a valid PostgreSQL time; nothing later is.
-          end-of-day? (and (= 24 hour) (zero? minute) (zero? second) (nil? frac))]
-      (when (or (and (> hour 23) (not end-of-day?)) (> minute 59) (> second 59)
-                (and ampm (or (zero? raw-hour) (> raw-hour 12))))
-        (throw (errors/pg-error :datetime-field-overflow {:value input})))
-      (let [nanos-of-day (+ (* (+ (* (+ (* hour 60) minute) 60) second) 1000000000)
-                            (* micros 1000))
-            end-of-day? (= nanos-of-day 86400000000000)
-            _ (when (> nanos-of-day 86400000000000)
-                (throw (errors/pg-error :datetime-field-overflow {:value input})))
-            t (when-not end-of-day? (java.time.LocalTime/ofNanoOfDay nanos-of-day))
-            offset (when timetz?
-                     (if (or (nil? zone) (#{"z" "utc"} (str/lower-case zone)))
-                       java.time.ZoneOffset/UTC
-                       (let [[_ sign zh zm zs] (re-matches #"([+-])(\d{1,2}):?(\d{2})?:?(\d{2})?" zone)
-                             secs (+ (* 3600 (Long/parseLong zh))
-                                     (* 60 (Long/parseLong (or zm "0")))
-                                     (Long/parseLong (or zs "0")))]
-                         (java.time.ZoneOffset/ofTotalSeconds
-                          (int (if (= "-" sign) (- secs) secs))))))]
-        (cond
-          ;; 24:00:00 is a valid PostgreSQL time (pgjdbc sends LocalTime.MAX
-          ;; as it) but java.time has no end-of-day value. Time values are
-          ;; stored as their canonical text, so carry this one AS that text:
-          ;; it stores, renders and orders correctly (zero-padded).
-          end-of-day?
-          (str "24:00:00" (when timetz?
-                            ((requiring-resolve 'datahike.pg.types/offset-text) offset)))
-          (not timetz?) t
-          :else (java.time.OffsetTime/of t offset))))))
+   `:session-zone` is UTC because the server's TimeZone setting is
+   (expr.clj:1613). When that becomes settable, this is where it
+   reads from."
+  []
+  {:date-order (second types/*date-style*)
+   :session-zone zone/utc})
 
 (defn- parse-time-input
-  "PostgreSQL time / timetz input. A plain `time` ignores a zone, as
-   time_in does; `timetz` keeps it and defaults to the session zone (UTC).
-   A leading date (`2020-01-01 10:00`) is allowed and dropped. Raises 22007
-   for text that is not a time and 22008 for an out-of-range field -- it
-   used to hand the unparsed STRING back, typed as a time.
+  "PostgreSQL `time_in` / `timetz_in`, via the ported parser.
 
-   `allballs` is spelled as a word rather than as digits, so it is
-   answered here and never reaches the field parser."
+   Everything this used to spell as a regex -- the optional leading
+   date, AM/PM, the zone, `allballs`, 24:00:00 -- is now
+   `DecodeTimeOnly`'s business, and so are the forms the regex never
+   had: `040506`, `0405`, `now`, a text month refused, a weekday
+   refused."
   [^String input timetz?]
-  (let [special (special-datetime input :time)]
-    (if (= ::none special)
-      (parse-time-fields input timetz?)
-      (if timetz?
-        (java.time.OffsetTime/of ^java.time.LocalTime special java.time.ZoneOffset/UTC)
-        special))))
+  (let [ctx (datetime-ctx)]
+    (if timetz?
+      (carrier/->timetz (in/timetz-in input ctx))
+      (carrier/->time (in/time-in input ctx)))))
+
+(defn- parse-date-strict
+  "PostgreSQL `date_in`, via the ported parser. Returns a `LocalDate`
+   or an infinity sentinel, and RAISES rather than returning nil --
+   there is no longer a fallback for it to fall through to.
+
+   It used to be a three-field digit match plus a separate tail
+   validator, which between them could not read a text
+   month, a Julian day, a day-of-year, a run-together number, or the
+   `Postgres` output style that PostgreSQL's own regression files are
+   written in."
+  [^String s]
+  (carrier/->date (in/date-in s (datetime-ctx))))
 
 (defn- internal-char-in
   "PostgreSQL's charin followed by charout (utils/adt/char.c), since a
@@ -521,197 +458,12 @@
                          (when tz? " with time zone") ": \"" s "\"")
                     {:error :invalid-datetime-format :sqlstate "22007"}))))
 
-(def ^:private ymd-shape
-  "A date written as digits and separators -- the shape PostgreSQL calls
-   out of RANGE rather than bad SYNTAX when its fields do not make a
-   date."
-  ;; Routes to `parse-date-strict`, which now reads either separator by
-  ;; DateStyle order -- so slashes belong here. They did NOT while that
-  ;; parser was `uuuu-M-d`: widening this regex then sent `8/10/2017`
-  ;; to a parser that could not read slashes and turned a date
-  ;; PostgreSQL accepts into an error. Classification stays separate
-  ;; (`date-ish-shape?`), because the two jobs diverge: `Feb 30, 2024`
-  ;; is a date SHAPE that this parser must not be handed.
-  #"(?i)^\d{1,6}[-/]\d{1,6}[-/]\d{1,6}(\s+(ad|bc))?$")
-
-(defn- two-digit-year
-  "PostgreSQL maps a two-digit year 70-99 to the 1900s and 00-69 to the
-   2000s (`AdjustYearToCurrentCentury`, datetime.c)."
-  [^long y]
-  (cond (>= y 100) y (>= y 70) (+ 1900 y) :else (+ 2000 y)))
-
-(defn decode-numeric-date
-  "Three numeric date fields to a LocalDate, per `DateStyle`'s field
-   ORDER -- the half of DateStyle that says whether `8/10/2017` is
-   August 10th or the 8th of October.
-
-   PostgreSQL's rules (DecodeDateTime):
-
-     - a leading field of FOUR or more digits is the year, whatever the
-       order, so `2017-08-10` reads the same under MDY, DMY and YMD;
-     - otherwise the order assigns the fields, and a two-digit year is
-       mapped to a century;
-     - the fields are then CHECKED, not rolled: `13/10/2017` is a month
-       13 under MDY and an error, while under DMY it is the 13th of
-       October.
-
-   Returns nil when the fields do not make a date; the caller decides
-   whether that is 22008 or 22007. Separators do not matter here --
-   `8/10/2017` and `10-08-2017` differ only in punctuation, and
-   PostgreSQL reads both by order."
-  [^String f1 ^String f2 ^String f3 order]
-  (let [n1 (parse-long f1) n2 (parse-long f2) n3 (parse-long f3)]
-    (when (and n1 n2 n3)
-      (let [[y m d] (cond
-                      ;; A four-digit leading field is unambiguous and
-                      ;; wins over the order, which is why `2017-08-10`
-                      ;; is the same date under every DateStyle.
-                      (>= (count f1) 4) [n1 n2 n3]
-                      (= order :ymd)    [(two-digit-year n1) n2 n3]
-                      (= order :dmy)    [(if (>= (count f3) 4) n3 (two-digit-year n3)) n2 n1]
-                      :else             [(if (>= (count f3) 4) n3 (two-digit-year n3)) n1 n2])]
-        (try (java.time.LocalDate/of (int y) (int m) (int d))
-             (catch Exception _ nil))))))
-
-(defn- parse-date-strict
-  "A numeric date, with the fields checked rather than rolled and the
-   session's `DateStyle` order applied.
-
-   It used to be `uuuu-M-d` and nothing else, so the ORDER half of
-   DateStyle was ignored on input: `SET datestyle TO ymd` then
-   `date '1/8/1999'` answered 1999-01-08 where PostgreSQL reads day
-   1999 and raises. The rolling resolver was the other half of the
-   problem -- SMART quietly moves 1997-04-31 to the 30th, and
-   PostgreSQL rejects it."
-  [^String s]
-  (let [bc? (re-find #"(?i)\s+bc$" s)
-        body (str/trim (str/replace s #"(?i)\s+(ad|bc)$" ""))]
-    (when-let [[_ f1 f2 f3] (re-matches #"(\d{1,6})[-/](\d{1,6})[-/](\d{1,6})" body)]
-      (when-let [d (decode-numeric-date f1 f2 f3 (second types/*date-style*))]
-        ;; PostgreSQL's 1 BC is the proleptic year 0, 2 BC is -1, and so
-        ;; on -- `2040-04-10 BC` is proleptic -2039.
-        (if bc? (.withYear d (- 1 (.getYear d))) d)))))
-
-(def ^:private trailing-zone-re
-  "A numeric zone at the end of a datetime literal.
-
-   Two spellings, and the distinction is load-bearing. Attached to a
-   TIME (`12:00:00+05`) it needs no space; standing alone
-   (`2000-09-07 -07`) it must have one, because `2000-01-01` ends in
-   `-01` and an end-anchored pattern with no such guard eats the day and
-   leaves `2000-01` -- which then parses as nothing at all."
-  #"(?i)^(?:(.*\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*|(.*\d)\s+)([+-]\d{2}(?::?\d{2})?|Z)$")
-
-(defn split-trailing-zone
-  "`[head zone-offset]` for a datetime literal that carries a numeric
-   zone, else `[s nil]`.
-
-   Splitting it out is the whole point: `timestamp without time zone`
-   keeps the fields and DROPS the zone (datetime.c decodes tzp and then
-   ignores it), while `timestamptz` converts by it. Reading the literal
-   once and letting the target decide is what keeps the two answers from
-   being parsed by different code."
-  [^String s]
-  (let [t (str/trim (str s))]
-    (if-let [[_ after-time after-date z] (re-matches trailing-zone-re t)]
-      [(str/trim (or after-time after-date))
-       (if (contains? #{"Z" "z"} z)
-         java.time.ZoneOffset/UTC
-         (let [[_ sign hh mm] (re-matches #"([+-])(\d{2}):?(\d{2})?" z)]
-           (java.time.ZoneOffset/ofHoursMinutes
-            (* (if (= "-" sign) -1 1) (parse-long hh))
-            (* (if (= "-" sign) -1 1) (parse-long (or mm "0"))))))]
-      [t nil])))
-
-(defn- peel-named-zone
-  "`[head zone-name]` when the text ends in a zone NAME (`PST`,
-   `America/New_York`), else `[s nil]`. The AM/PM and era words end a
-   datetime too and are not zones."
-  [^String s]
-  (let [t (str/trim s)]
-    (if (and (re-find #"(?i)\s[A-Za-z][A-Za-z_]*(?:/[A-Za-z_+-]+)*$" t)
-             (not (re-find #"(?i)\s(AM|PM|BC|AD)$" t)))
-      (let [i (.lastIndexOf t " ")]
-        [(str/trim (subs t 0 i)) (str/trim (subs t (inc i)))])
-      [t nil])))
-
-(defn- validate-date-tail!
-  "`date_in` reads the WHOLE literal and then keeps the date, so an
-   impossible time or an unknown zone after the date is an error even
-   though neither survives into the value. Taking the first token and
-   ignoring the rest answered `2001-02-03` for
-   `'2001-02-03 25:00:00'::date`, where PostgreSQL raises 22008.
-
-   PostgreSQL accepts a trailing zone here -- numeric, `Z`, or a name it
-   recognises -- which is how pgjdbc spells a date parameter
-   (`1970-01-01 +00`). An unrecognised word is 22007.
-
-   Returns nil; raises with the whole literal and the right SQLSTATE."
-  [^String whole parse-time]
-  ;; Peeled from the WHOLE literal, not from the tail: a zone standing
-  ;; alone (`1970-01-01 +00`, which is how pgjdbc spells a date
-  ;; parameter) is recognised by what precedes it, and the tail on its
-  ;; own has no such context.
-  (let [[without-zone numeric-zone] (split-trailing-zone whole)
-        [head zone-name] (if numeric-zone
-                           [without-zone nil]
-                           (peel-named-zone without-zone))
-        after-date (second (str/split head #"[ T]" 2))]
-    (when zone-name
-      (try (types/resolve-time-zone zone-name)
-           (catch Exception _
-             (throw (ex-info (str "invalid input syntax for type date: \"" whole "\"")
-                             {:error :invalid-datetime-format :type "date"
-                              :value whole})))))
-    (when-let [t (some-> after-date str/trim not-empty)]
-      (try
-        (parse-time t false)
-        (catch clojure.lang.ExceptionInfo e
-          ;; `pg-error` records the category under :error, not :sqlstate,
-          ;; and the WIRE layer re-formats the message from ex-data -- so
-          ;; `:type` has to move too, not just the text.
-          (let [overflow? (= :datetime-field-overflow (:error (ex-data e)))]
-            (throw (ex-info
-                    (if overflow?
-                      (str "date/time field value out of range: \"" whole "\"")
-                      (str "invalid input syntax for type date: \"" whole "\""))
-                    (assoc (ex-data e)
-                           :type "date" :value whole
-                           :error (if overflow?
-                                    :datetime-field-overflow
-                                    :invalid-datetime-format))))))))))
-
-(defn- to-bc-era
-  "Reflect a parsed datetime into the BC era: PostgreSQL's 1 BC is the
-   proleptic year 0, 2 BC is -1, and so on."
-  [x]
-  (cond
-    (instance? java.time.LocalDateTime x)
-    (.withYear ^java.time.LocalDateTime x (- 1 (.getYear ^java.time.LocalDateTime x)))
-    (instance? java.util.Date x)
-    (let [ldt (java.time.LocalDateTime/ofInstant (.toInstant ^java.util.Date x)
-                                                 java.time.ZoneOffset/UTC)]
-      (java.util.Date/from (.toInstant (.withYear ldt (- 1 (.getYear ldt)))
-                                       java.time.ZoneOffset/UTC)))
-    :else x))
-
-(defn- bad-date!
-  "PostgreSQL tells a date whose FIELDS are impossible (22008) from text
-   that is not a date at all (22007)."
-  [^String s]
-  (if (date-ish-shape? s)
-    (throw (ex-info (str "date/time field value out of range: \"" s "\"")
-                    {:error :datetime-field-overflow :sqlstate "22008"}))
-    (throw (ex-info (str "invalid input syntax for type date: \"" s "\"")
-                    {:error :invalid-datetime-format :sqlstate "22007"}))))
-
 (defn cast-scalar
   "Apply a SQL cast of `v` to the target named by `type-str`.
 
    Options:
      :explicit?       — an explicit CAST reshapes silently; an assignment
                         raises instead (matters for bit width coercion).
-     :parse-timestamp — fn String → java.util.Date, from expr.clj.
      :resolve-regclass— fn String → oid, for `::regclass`.
      :resolve-regtype — fn String → oid, for `::regtype`.
      :prefer-local-datetime? — return a LocalDateTime (microsecond
@@ -724,7 +476,11 @@
    Returns `v` unchanged for a target this doesn't classify, which is
    what every call site did before and keeps unknown types passing
    through rather than erroring."
-  [v type-str {:keys [explicit? parse-timestamp resolve-regclass resolve-regtype
+  ;; `:parse-timestamp` is still accepted and IGNORED. Every caller
+  ;; passes it, and the temporal arms now use the ported parser, so
+  ;; destructuring it would only invite someone to wire it back in.
+  ;; Dropping it from the ~20 call sites is cleanup, not behaviour.
+  [v type-str {:keys [explicit? resolve-regclass resolve-regtype
                       prefer-local-datetime? src-oid]
                :or {explicit? true}}]
   (if (or (nil? v) (= :__null__ v))
@@ -844,197 +600,49 @@
             (mac/mac8->mac from)
             :else (mac/mac-in tname v)))
 
+        ;; As for `:date`: the non-string branches are carrier
+        ;; conversions and every string spelling goes to the ported
+        ;; `timestamp_in` / `timestamptz_in`.
+        ;;
+        ;; What this replaces was four parsers consulted in turn --
+        ;; a trailing-zone regex, a named-zone peeler, `LocalDateTime/parse`
+        ;; and an injected `parse-timestamp` -- each of which could
+        ;; return nil and hand on to the next, with the LAST one
+        ;; passing the input text through unparsed. A literal that none
+        ;; of them read came back as a string typed as a timestamp,
+        ;; which is the passthrough-on-failure shape: "did not parse"
+        ;; and "parsed" were the same value.
         :timestamp
-        (cond
-          (instance? java.util.Date v) v
-          (instance? java.time.LocalDateTime v) v
-          (and (string? v) (not= ::none (special-datetime v :timestamp)))
-          (let [sp (special-datetime v :timestamp)]
-            (if (instance? java.time.LocalDateTime sp)
-              (if prefer-local-datetime?
-                sp
-                (java.util.Date/from (.toInstant ^java.time.LocalDateTime sp
-                                                 java.time.ZoneOffset/UTC)))
-              ;; An infinity is already the stored value.
-              sp))
-          ;; A NAMED zone inside the literal -- `… America/New_York`,
-          ;; `… PST`. A timestamptz applies it; a plain timestamp
-          ;; ignores it (datetime.c keeps the fields and drops the
-          ;; zone). Neither happened: the zone was parsed away and the
-          ;; wall clock kept, so `'… 17:32:01 America/New_York'` read
-          ;; back as 17:32:01+00 -- five hours out, reported as
-          ;; success -- and the extended spelling did not parse at all
-          ;; and passed its own text through as a timestamptz.
-          (and (string? v)
-               (re-find #"(?i)\s[A-Za-z][A-Za-z_]*(?:/[A-Za-z_+-]+)*\s*$" (str/trim v))
-               (not (re-find #"(?i)\s(AM|PM|BC|AD)\s*$" (str/trim v))))
-          (let [t (str/trim (str v))
-                idx (.lastIndexOf t " ")
-                head (str/trim (subs t 0 idx))
-                zone (str/trim (subs t (inc idx)))
-                tz? (contains? #{"timestamptz" "timestamp with time zone"}
-                               (types/base-type-name-of type-str))
-                inner (cast-scalar head "timestamp"
-                                   {:explicit? true
-                                    :parse-timestamp parse-timestamp})]
-            (if (or (nil? inner) (string? inner))
-              ;; The head is not a timestamp either, so this is not
-              ;; the shape we took it for -- hand the WHOLE value back
-              ;; to the ordinary path so it reports on what was written.
-              v
-              (if-not tz?
-                inner
-                (let [^java.time.LocalDateTime ldt
-                      (cond
-                        (instance? java.time.LocalDateTime inner) inner
-                        (instance? java.util.Date inner)
-                        (java.time.LocalDateTime/ofInstant
-                         (.toInstant ^java.util.Date inner)
-                         java.time.ZoneOffset/UTC)
-                        :else nil)]
-                  (if (nil? ldt)
-                    inner
-                    (java.util.Date/from
-                     (.toInstant
-                      (.atZone ldt
-                               ;; The CAST lowercases the zone in its
-                               ;; message -- the datetime decoder folds
-                               ;; the token -- while AT TIME ZONE keeps
-                               ;; what was written. PostgreSQL really
-                               ;; does differ between the two.
-                               (try (types/resolve-time-zone zone)
-                                    (catch Exception _
-                                      (throw (errors/pg-error
-                                              :invalid-parameter-value
-                                              {:message
-                                               (str "time zone \""
-                                                    (str/lower-case zone)
-                                                    "\" not recognized")}))))))))))))
-          :else
-          (let [tz? (contains? #{"timestamptz" "timestamp with time zone"}
-                               (types/base-type-name-of type-str))
-                ;; A NUMERIC offset, the sibling of the named-zone
-                ;; branch above: `timestamp without time zone` keeps the
-                ;; fields it was given and DROPS the zone (datetime.c
-                ;; decodes tzp and then ignores it for DTK_DATE without
-                ;; a zone), while timestamptz converts by it. Only the
-                ;; named spelling was handled, so
-                ;; `'2000-01-01 12:00:00+05'::timestamp` answered
-                ;; 07:00:00 -- five hours out, and reported as success.
-                ;; An era suffix, as `parse-date-strict` already reads
-                ;; for `date`. Only the date path knew it, so
-                ;; `'2001-02-03 BC'::date` was right and `::timestamp`
-                ;; raised on a literal PostgreSQL reads.
-                trimmed-v (str/trim (str v))
-                bc? (boolean (re-find #"(?i)\s+bc$" trimmed-v))
-                v (if (re-find #"(?i)\s+(ad|bc)$" trimmed-v)
-                    (str/trim (str/replace trimmed-v #"(?i)\s+(ad|bc)$" ""))
-                    v)
-                ;; The zone is read ONCE and applied by the target, so
-                ;; the two types cannot be decided by different code.
-                [head zone] (split-trailing-zone (str v))
-                ;; The head carries no zone, so parsing it as an instant
-                ;; at UTC yields exactly its wall clock. That reuses the
-                ;; whole accumulated spelling table rather than growing
-                ;; a second one beside it.
-                head-local (let [p (when parse-timestamp (parse-timestamp head))]
-                             (when (instance? java.util.Date p)
-                               (java.time.LocalDateTime/ofInstant
-                                (.toInstant ^java.util.Date p)
-                                java.time.ZoneOffset/UTC)))
-                v (if zone head v)
-                norm (-> (str v) str/trim
-                         ;; ISO 8601 BASIC -- `19970210 173201`,
-                         ;; `19970210T173201`, `19970210`. PostgreSQL
-                         ;; reads the separator-less spelling; rewriting
-                         ;; it to the extended one here means both this
-                         ;; cast and the expression parser get it,
-                         ;; rather than one of them.
-                         (str/replace #"^(\d{4})(\d{2})(\d{2})([ T])(\d{2})(\d{2})(\d{2})"
-                                      "$1-$2-$3T$5:$6:$7")
-                         (str/replace #"^(\d{4})(\d{2})(\d{2})$" "$1-$2-$3")
-                         (str/replace #"(\d{4}-\d{2}-\d{2})\s+(\d)" "$1T$2"))
-                ;; LocalDateTime keeps microseconds; parse-timestamp routes
-                ;; through java.util.Date, which is millisecond-only, and
-                ;; pgjdbc asserts the full '…130861' in its error strings.
-                ;; Only the literal-fold path takes the precise branch
-                ;; today — the others feed values into stores expecting a
-                ;; Date. Unifying that is a separate change.
-                ldt (when prefer-local-datetime?
-                      (try (java.time.LocalDateTime/parse norm)
-                           (catch Exception _ nil)))]
-            (cond->
-             (or
-                ;; A literal WITH a zone is finished here: timestamptz
-                ;; converts by it, timestamp drops it. Only these two
-                ;; answers are possible and both are decided from the
-                ;; one reading above -- `'… 12:00:00 +05'` (space) and
-                ;; `'… 12:00+02'` (no seconds) used to reach neither
-                ;; branch and raise, and `'2000-09-07 -07'::timestamptz`
-                ;; answered midnight UTC instead of 07:00.
-              (when (and zone head-local)
-                (if tz?
-                  (java.util.Date/from (.toInstant ^java.time.LocalDateTime head-local
-                                                   ^java.time.ZoneOffset zone))
-                  (if prefer-local-datetime?
-                    head-local
-                    (java.util.Date/from
-                     (.toInstant ^java.time.LocalDateTime head-local
-                                 java.time.ZoneOffset/UTC)))))
-              ldt
-                ;; `norm` was computed and then only consulted on the
-                ;; branch above, so a spelling this normalises but the
-                ;; injected parser does not know -- ISO basic -- fell
-                ;; through to the raw input and a timestamp column got
-                ;; a string that is not a timestamp.
-              (let [p (when parse-timestamp (parse-timestamp (str v)))]
-                (when-not (or (nil? p) (string? p)) p))
-              (try (java.time.LocalDateTime/parse norm)
-                   (catch Exception _ nil))
-              (let [p (when parse-timestamp (parse-timestamp (str v)))]
-                (when-not (or (nil? p) (string? p)) p))
-                ;; Nothing parsed. Returning `v` here is what made
-                ;; `'2024-02-30'::timestamp` answer with its own TEXT
-                ;; and `'nonsense'::timestamp` likewise -- a value that
-                ;; is not a timestamp, indistinguishable from one that
-                ;; is. PostgreSQL raises, and distinguishes impossible
-                ;; FIELDS (22008) from text that is not a timestamp at
-                ;; all (22007).
-              (bad-timestamp! (str v) tz?))
-              bc? to-bc-era)))
+        (let [tz? (contains? #{"timestamptz" "timestamp with time zone"}
+                             (types/base-type-name-of type-str))]
+          (cond
+            (instance? java.util.Date v) v
+            (instance? java.time.LocalDateTime v) v
+            (nil? v) nil
+            :else
+            (let [r ((if tz? in/timestamptz-in in/timestamp-in)
+                     (str v) (datetime-ctx))]
+              ;; A timestamptz must stay a `java.util.Date`: that is
+              ;; what tells the renderer to print the `+00`, and a
+              ;; LocalDateTime renders without it. The cost is the
+              ;; millisecond carrier, which is why the two remaining
+              ;; corpus divergences are both timestamptz-or-timestamp
+              ;; microseconds.
+              (if (and prefer-local-datetime? (not tz?))
+                (carrier/->local-datetime r)
+                (carrier/->date-value r)))))
 
+        ;; Every string spelling goes to `date_in`. The branches above
+        ;; it are carrier conversions, not parsing -- a value that is
+        ;; already a date needs no decoder.
         :date (cond
                 (instance? java.time.LocalDate v) v
-                (and (string? v) (not= ::none (special-datetime v :date)))
-                (special-datetime v :date)
                 (instance? java.util.Date v)
                 (-> ^java.util.Date v .toInstant
                     (.atZone java.time.ZoneOffset/UTC) .toLocalDate)
                 (instance? java.time.LocalDateTime v)
                 (.toLocalDate ^java.time.LocalDateTime v)
-                :else
-                (let [s (str/trim (str v))]
-                  (if (re-matches ymd-shape s)
-                    ;; A bare `y-m-d` is decided HERE and nowhere else.
-                    ;; Falling through to the timestamp parser is what
-                    ;; rolled 1997-04-31 to the 30th and 1997-02-29 to
-                    ;; the 28th: it is lenient, and PostgreSQL is not.
-                    (or (parse-date-strict s) (bad-date! s))
-                    (or (try (let [[d & more] (str/split s #"[ T]" 2)
-                                   ld (java.time.LocalDate/parse d)]
-                               (validate-date-tail! s parse-time-input)
-                               ld)
-                             (catch clojure.lang.ExceptionInfo e (throw e))
-                             (catch Exception _ nil))
-                        (when parse-timestamp
-                          (let [d (parse-timestamp s)]
-                            (when (instance? java.util.Date d)
-                              (-> ^java.util.Date d .toInstant
-                                  (.atZone java.time.ZoneOffset/UTC) .toLocalDate))))
-                        ;; Passing the text through was a silent wrong
-                        ;; answer: `'1997-13-01'::date` answered the
-                        ;; string `1997-13-01`, a thirteenth month.
-                        (bad-date! s)))))
+                :else (parse-date-strict (str/trim (str v))))
 
         :time (let [timetz? (contains? #{"timetz" "time with time zone"}
                                        (types/base-type-name-of type-str))

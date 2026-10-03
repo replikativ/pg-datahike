@@ -192,3 +192,53 @@ drive-by fix.
   scanner rewrite. The rewrite was not measured cleanly (load average
   24 on the box at the time) and should be, on an idle machine, before
   anything is claimed either way.
+
+## Left open by the datetime parser port
+
+The port of `ParseDateTime` / `DecodeDateTime` / `DecodeTimeOnly` took
+the datetime corpus from 239 divergences to 25. All 25 are deliberate
+and the manifest names each one; these are the three pieces of work
+that would close them, none of which is parsing.
+
+- **A microsecond carrier.** `java.util.Date` is millisecond precision,
+  so `'…04:05:06.123456'::timestamptz::text` renders `.123`. The parser
+  keeps microseconds and so does `LocalDateTime`, which is why the
+  plain `::timestamp` cast is already exact — only the paths that must
+  hand back a `Date` lose them. A `timestamptz` must stay a `Date`
+  today because that is what tells the renderer to print the `+00`, so
+  this is a renderer change as much as a carrier one. 2 corpus
+  entries.
+
+- **Deferred clock tokens.** `now`, `today`, `tomorrow` and
+  `yesterday` parse correctly — pass a `:now` to `decode-datetime` and
+  they work — but `cast.clj/datetime-ctx` deliberately supplies none,
+  because a cast is constant-folded into a cached plan and folding
+  `'today'::date` once would freeze it for that plan's life. They need
+  whatever deferral `now()` already has. 23 corpus entries.
+
+- **`SET TimeZone` is not honoured.** `expr.clj:1613` reports `UTC`
+  unconditionally and `datetime-ctx` passes `zone/utc`, so a session
+  that sets another zone is silently ignored rather than refused. The
+  port makes this *easy* to fix — `:session-zone` is a single
+  parameter — but wiring the GUC through is its own change, and the
+  differential fuzzer pins UTC on both sides so nothing currently
+  catches it.
+
+Smaller, and genuinely parser-adjacent:
+
+- **`DetermineTimeZoneAbbrevOffset` is partial.** PostgreSQL first asks
+  the zone's own transition data whether the abbreviation AS WRITTEN
+  matches at that instant, and only falls back to the zone's offset.
+  Java exposes no tzdb abbreviation strings, so only the fallback is
+  implemented. It differs only when an abbreviation disagrees with its
+  zone's state at the date given, and only for the 50 DYNTZ entries of
+  195 — no corpus sample reaches it.
+
+- **`parse-timestamp-string` still passes its input through on
+  failure.** It is now a thin wrapper over `timestamptz_in`, so it no
+  longer carries a second grammar, but it still returns the input
+  string when parsing fails because a handful of callers test
+  `(string? p)` to decide what to do next. Converting those callers to
+  let it raise is the last of the passthrough-on-failure shape in the
+  temporal paths. About 20 call sites pass a now-ignored
+  `:parse-timestamp` option to `cast-scalar` and can drop it.

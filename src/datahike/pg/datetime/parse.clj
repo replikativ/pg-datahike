@@ -55,9 +55,26 @@
     {:kind :offset :west west}
     (if (zone/resolve-zone-name name)
       {:kind :named :name name}
-      (dec/dterr on-miss))))
+      ;; The ZONE goes in the error, not the whole literal: PostgreSQL
+      ;; says `time zone "nonsense/zone" not recognized`, and the C
+      ;; carries it in `extra->dtee_timezone` for exactly this.
+      (throw (ex-info (clojure.core/name on-miss)
+                      {::lex/dterr on-miss ::zone-name name})))))
 
 (def ^:private hr24 :hr24)
+
+(defn- clock!
+  "The transaction timestamp, or a refusal.
+
+   A caller that cannot supply one passes no `:now`, and the four
+   clock-reading tokens then fail as unparseable -- which is what the
+   cast path needs. Their value is the STATEMENT's, and a cast is
+   constant-folded into a cached plan, so folding `'today'::date` once
+   would freeze it for the life of that plan. Supporting them properly
+   needs the deferred treatment `now()` gets; until then refusing is
+   the honest answer and matches what the server already does."
+  [now]
+  (or now (dec/dterr :bad-format)))
 
 (defn- claim
   "Merge `tmask` into `fmask`, refusing an overlap. The C's
@@ -288,18 +305,20 @@
 
                     :reserv
                     (case val
-                      :now {:tmask (into (into dec/date-fields dec/time-fields) [:tz])
-                            :dtype :date :tm (merge tm (:tm now))
-                            :zone {:kind :offset :west (:west now)}}
+                      :now (let [n (clock! now)]
+                             {:tmask (into (into dec/date-fields dec/time-fields) [:tz])
+                              :dtype :date :tm (merge tm (:tm n))
+                              :zone {:kind :offset :west (:west n)}})
                       :today {:tmask dec/date-fields :dtype :date
-                              :tm (merge tm (select-keys (:tm now) [:year :mon :mday]))}
+                              :tm (merge tm (select-keys (:tm (clock! now))
+                                                         [:year :mon :mday]))}
                       :yesterday
-                      (let [{:keys [year mon mday]} (:tm now)
+                      (let [{:keys [year mon mday]} (:tm (clock! now))
                             [y m d] (dec/j2date (dec (dec/date2j year mon mday)))]
                         {:tmask dec/date-fields :dtype :date
                          :tm (merge tm {:year y :mon m :mday d})})
                       :tomorrow
-                      (let [{:keys [year mon mday]} (:tm now)
+                      (let [{:keys [year mon mday]} (:tm (clock! now))
                             [y m d] (dec/j2date (inc (dec/date2j year mon mday)))]
                         {:tmask dec/date-fields :dtype :date
                          :tm (merge tm {:year y :mon m :mday d})})
@@ -435,9 +454,19 @@
               (when (and zone (not= (:kind zone) :offset) partial-date?)
                 (dec/dterr :bad-format))
               {:dtype (:dtype st) :tm tm :fields fmask :zone zone
-               :resolve-date (if has-date?
-                               (select-keys tm [:year :mon :mday])
-                               (select-keys (:tm now) [:year :mon :mday]))})))
+               ;; A DELAY, because reading the clock must not be
+               ;; forced by parsing. `time_in` decodes a zone and then
+               ;; discards it, so `'04:05:06'::time` reaches here with
+               ;; a `:session` zone it will never resolve -- and a
+               ;; caller that supplies no clock (the cast path, which
+               ;; must not fold a volatile value into a cached plan)
+               ;; would have been refused for an ordinary time.
+               ;; The C reads it eagerly; it has a clock to read.
+               :resolve-date (delay
+                               (if has-date?
+                                 (select-keys tm [:year :mon :mday])
+                                 (select-keys (:tm (clock! now))
+                                              [:year :mon :mday])))})))
 
         (let [{:keys [fmask tm ptype]} st
               r (case type
@@ -546,7 +575,7 @@
                       :reserv
                       (case val
                         :now {:tmask dec/time-fields :dtype :time
-                              :tm (merge tm (select-keys (:tm now)
+                              :tm (merge tm (select-keys (:tm (clock! now))
                                                          [:hour :min :sec :usec]))}
                         :zulu {:tmask (conj dec/time-fields :tz) :dtype :time
                                :tm (merge tm {:hour 0 :min 0 :sec 0 :usec 0})
