@@ -152,13 +152,15 @@
         ;; BEFORE the multiply rather than after -- 5874897-12-31 threw
         ;; ArithmeticException here until it was.
         _ (when (> (Math/abs (long date)) 110000000)
-            (throw (errors/pg-error :datetime-field-overflow
-                                    {:message "timestamp out of range"})))
+            (throw (errors/pg-error
+                    :datetime-field-overflow
+                    {:message (str "timestamp out of range: \"" value "\"")})))
         r (+ (* date usecs-per-day) t)
         r (if west (+ r (* (long west) 1000000)) r)]
     (when (or (< r min-timestamp) (>= r end-timestamp))
-      (throw (errors/pg-error :datetime-field-overflow
-                              {:message "timestamp out of range"})))
+      (throw (errors/pg-error
+              :datetime-field-overflow
+              {:message (str "timestamp out of range: \"" value "\"")})))
     r))
 
 (defn date-in
@@ -167,7 +169,10 @@
 
    It decodes a whole TIMESTAMP and then throws the time away, so the
    time is validated first: `'2001-02-03 25:00:00'::date` is an error.
-   And it passes no `tzp`, so any zone at all is refused."
+   A zone is likewise parsed and discarded --
+   `'2000-01-01 12:00:00 PST'::date` is 2000-01-01 -- because
+   `date_in` passes a non-NULL `tzp` (date.c:134) like every other
+   input function."
   [^String s {:keys [date-order now] :as _ctx}]
   (with-dterr "date" s
     (let [r (parse/decode-datetime (lex/tokenize s (:date lex/buflen-for))

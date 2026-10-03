@@ -31,6 +31,8 @@
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.constraints.unique :as unique-constraints]
             [datahike.pg.records :as pg-rec]
+            [datahike.pg.datetime.carrier :as carrier]
+            [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.resolve :as pg-resolve]
@@ -5614,27 +5616,28 @@
        valid-at      (d/valid-at valid-at)
        valid-between (d/valid-between (first valid-between) (second valid-between))))))
 
+(def ^:private datetime-ctx
+  (delay @(requiring-resolve 'datahike.pg.sql.cast/datetime-ctx)))
+
 (defn- parse-instant
-  "Parse a timestamp string to a java.util.Date for temporal queries.
-   Supports ISO format and tx-id (long)."
+  "A timestamp string to a `java.util.Date` for temporal queries, or a
+   bare integer as a transaction id.
+
+   The timestamp goes to the ported `timestamptz_in`, the same decoder
+   a cast uses. This was `Instant/parse` with a `LocalDate/parse`
+   fallback -- ISO-only, so `SET datahike.as_of = '2024-01-15 10:00:00'`
+   was refused while the identical text in a cast was not."
   [^String s]
-  (try
-    (if (re-matches #"\d+" s)
-      ;; Transaction ID
-      (Long/parseLong s)
-      ;; ISO timestamp
-      (java.util.Date/from (java.time.Instant/parse s)))
-    (catch Exception _
-      ;; Try simpler format: 2024-01-15
-      (try
-        (java.util.Date/from
-         (.atStartOfDay (java.time.LocalDate/parse s)
-                        java.time.ZoneOffset/UTC))
-        (catch Exception _
-          (throw (ex-info "cannot parse temporal value"
-                          {:error :invalid-text-representation
-                           :type "timestamp"
-                           :value s})))))))
+  (if (re-matches #"\d+" s)
+    (Long/parseLong s)
+    (try
+      (carrier/->date-value (datetime-in/timestamptz-in
+                             s (@datetime-ctx)))
+      (catch Exception _
+        (throw (ex-info "cannot parse temporal value"
+                        {:error :invalid-text-representation
+                         :type "timestamp"
+                         :value s}))))))
 
 ;; ============================================================================
 ;; Prepared-statement support — thread cached parse result + bound params
@@ -13390,11 +13393,20 @@
         ;; COPY-IN protocol mode and reporting the typed error at
         ;; CopyDone. Throwing here made the Java loop emit XX000 while
         ;; accidentally leaving its COPY state active.
-        (copy-feed-chunk! {:conn conn
-                           :schema (:schema (d/db conn))
-                           :copy-state copy-state
-                           :tx-state tx-state}
-                          chunk-bytes))
+        ;;
+        ;; `*date-style*` must be bound HERE as well as in execute().
+        ;; It is what the ported datetime parser reads for field ORDER,
+        ;; and this callback runs on its own thread outside execute(),
+        ;; so COPY decoded every date at the root default: under
+        ;; `SET datestyle TO DMY`, a cast of `8/10/2017` gave
+        ;; 2017-10-08 and the same text through COPY gave 2017-08-10.
+        ;; Silently, and into a column.
+        (binding [types/*date-style* (or (:date-style @session-state) [:iso :mdy])]
+          (copy-feed-chunk! {:conn conn
+                             :schema (:schema (d/db conn))
+                             :copy-state copy-state
+                             :tx-state tx-state}
+                            chunk-bytes)))
 
       (copyComplete [_]
         (copy-finish! {:conn conn

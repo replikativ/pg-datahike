@@ -22,11 +22,11 @@
    The two infinities have no `java.util.Date` room, so they are the
    sentinels `types/pos-infinity` and `types/neg-infinity`.
 
-   MICROSECONDS survive `LocalDateTime` and `LocalTime` and do NOT
-   survive `java.util.Date`, which is millisecond-only. That is the
-   whole of the remaining corpus gap: two samples where
-   `04:05:06.123456` comes back `.123`. The parser is not the lossy
-   step and never was -- this conversion is."
+   MICROSECONDS survive `LocalDateTime`, `LocalTime` and
+   `OffsetDateTime`, and do NOT survive `java.util.Date`, which is
+   millisecond-only. The parser is not the lossy step and never was --
+   this conversion is, and only on the paths that must hand back a
+   `Date`."
   (:require [datahike.pg.datetime.in :as in]
             [datahike.pg.types :as types])
   (:import [java.time LocalDate LocalDateTime LocalTime OffsetTime ZoneOffset]))
@@ -72,6 +72,19 @@
     (let [{:keys [year mon mday hour min sec usec]} (in/->fields r)]
       (LocalDateTime/of (int year) (int mon) (int mday)
                         (int hour) (int min) (int sec) (int (* usec 1000))))))
+
+(defn ->offset-datetime
+  "`:timestamptz` to `OffsetDateTime` at +00.
+
+   The microsecond-preserving carrier for a timestamptz. `types/->pg-text`
+   already renders one with its offset, so this keeps BOTH the `+00`
+   that a timestamptz must print and the precision a `java.util.Date`
+   drops -- which were previously a choice of one or the other."
+  [r]
+  (case (:kind r)
+    :infinity types/pos-infinity
+    :-infinity types/neg-infinity
+    (.atOffset ^LocalDateTime (->local-datetime r) ZoneOffset/UTC)))
 
 (defn ->date-value
   "`:timestamp`/`:timestamptz` to `java.util.Date`.

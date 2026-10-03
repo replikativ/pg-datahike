@@ -622,15 +622,19 @@
             :else
             (let [r ((if tz? in/timestamptz-in in/timestamp-in)
                      (str v) (datetime-ctx))]
-              ;; A timestamptz must stay a `java.util.Date`: that is
-              ;; what tells the renderer to print the `+00`, and a
-              ;; LocalDateTime renders without it. The cost is the
-              ;; millisecond carrier, which is why the two remaining
-              ;; corpus divergences are both timestamptz-or-timestamp
-              ;; microseconds.
-              (if (and prefer-local-datetime? (not tz?))
-                (carrier/->local-datetime r)
-                (carrier/->date-value r)))))
+              ;; A timestamptz may not be a bare `LocalDateTime`: the
+              ;; renderer needs to know to print the `+00`. It used to
+              ;; become a `java.util.Date` for that, at the cost of
+              ;; microseconds -- `OffsetDateTime` carries both, and
+              ;; `types/->pg-text` already renders one.
+              ;;
+              ;; Gated on `prefer-local-datetime?` like the plain
+              ;; timestamp beside it, because the other callers feed
+              ;; values into stores that expect a Date.
+              (cond
+                (not prefer-local-datetime?) (carrier/->date-value r)
+                tz? (carrier/->offset-datetime r)
+                :else (carrier/->local-datetime r)))))
 
         ;; Every string spelling goes to `date_in`. The branches above
         ;; it are carrier conversions, not parsing -- a value that is

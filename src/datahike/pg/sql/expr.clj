@@ -4428,10 +4428,13 @@
           ;; text `nonsense` -- a value that is not a timestamp,
           ;; rendered as though it were one. `cast-scalar` raises with
           ;; the type's own message.
+          ;; `:prefer-local-datetime?` because this value is RENDERED,
+          ;; not stored -- a constant-folded cast in a projection. The
+          ;; Date carrier is millisecond-only, so without it
+          ;; `'…04:05:06.123456'::timestamp::text` folded to `.123`.
           is-ts?   (sql-cast/cast-scalar
                     inner-raw type-str
-                    {:explicit? true
-                     :parse-timestamp parse-timestamp-string})
+                    {:explicit? true :prefer-local-datetime? true})
           is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200

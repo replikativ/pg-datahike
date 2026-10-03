@@ -7,31 +7,31 @@
 ;; is not complete until its entries are pruned from this file.
 ;;
 ;; WAS 239 of 670 before the ParseDateTime/DecodeDateTime port.
-;; Every PARSER entry is gone. What is left is two things the port
-;; was never going to fix, and both say so:
+;; Every one that is left is the SAME deferral:
 ;;
-;;   DEFERRED (23) -- `now`, `today`, `tomorrow`, `yesterday`. The
-;;     parser reads them; the CAST path withholds the clock, because
-;;     a folded `'today'::date` would freeze in a cached plan.
-;;   CARRIER (2) -- java.util.Date is millisecond precision. The
-;;     parser keeps microseconds and the rendering path drops them.
+;;   DEFERRED -- `now`, `today`, `tomorrow`, `yesterday`. The parser
+;;     reads them correctly; `cast.clj/datetime-ctx` withholds the
+;;     clock on purpose, because a cast is constant-folded into a
+;;     cached plan and a folded `'today'::date` would freeze there.
+;;
+;; The 2 CARRIER entries that were here are GONE: a timestamptz now
+;; uses an OffsetDateTime, which keeps microseconds AND renders the
+;; `+00` that a java.util.Date was being used for.
+;;
+;; NOTE what this corpus does NOT see. Every sample is
+;; `SELECT '<lit>'::<type>::text`, so it cannot tell a parser loss
+;; from a renderer loss, and it never exercises a column, an array,
+;; COPY, a set operation or a comparison. Three real divergences
+;; lived in those paths while this file read 25.
 ;;
 ;; WHICH PostgreSQL: generated against the local oracle, 17.10, while
 ;; CI pins cimg/postgres:17.7. CI has run this manifest against 17.7
 ;; with neither an unexpected divergence nor a drift, so the two
 ;; releases agree on all 670 samples.
 ;;
-;; Baseline 2026-10-03: 25 of 670 samples diverge.
+;; Baseline 2026-10-03: 23 of 670 samples diverge.
 
 [{:surface :datetime,
-  :key "SELECT '2001-02-03 04:05:06.123456'::timestamp::text",
-  :reason
-  "CARRIER: java.util.Date is millisecond precision, so microseconds are lost on the way out. The PARSER keeps them -- `'...123456'::timestamp` is exact through cast.clj's LocalDateTime branch -- and this is the ::text rendering path. Not fixed by the port; needs a microsecond carrier."}
- {:surface :datetime,
-  :key "SELECT '2001-02-03 04:05:06.123456'::timestamptz::text",
-  :reason
-  "CARRIER: java.util.Date is millisecond precision, so microseconds are lost on the way out. The PARSER keeps them -- `'...123456'::timestamp` is exact through cast.clj's LocalDateTime branch -- and this is the ::text rendering path. Not fixed by the port; needs a microsecond carrier."}
- {:surface :datetime,
   :key "SELECT 'now'::date::text",
   :reason
   "DEFERRED: a clock-reading token. The parser handles these -- pass a `:now` and they work -- but `cast.clj/datetime-ctx` supplies none on purpose, because a cast is constant-folded into a cached plan and folding `today` once would freeze it for that plan's life. Needs the deferred treatment `now()` gets."}

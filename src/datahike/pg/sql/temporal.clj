@@ -39,7 +39,10 @@
    BEFORE the main SQL tokenization + rewrite pipeline; it operates
    on the raw SQL string so the downstream parser never sees the
    non-standard `FOR <AXIS>` keywords."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [datahike.pg.datetime.carrier :as carrier]
+            [datahike.pg.datetime.in :as datetime-in]
+            [datahike.pg.sql.cast :as sql-cast]))
 
 ;; ===========================================================================
 ;; Low-level scanning helpers
@@ -156,12 +159,15 @@
       (re-matches #"\d+" v)
       (java.util.Date. (Long/parseLong v))
       :else
+      ;; Every other spelling goes to the ported `timestamptz_in`, the
+      ;; same decoder a cast uses. This was `Instant/parse` plus a
+      ;; `\d{4}-\d{2}-\d{2}` special case -- ISO-only, so it rejected
+      ;; `'2030-01-15 10:00:00'`, the space-separated form that
+      ;; `timestamp_out` itself emits, and every other spelling the
+      ;; server accepts everywhere else.
       (try
-        ;; Date-only YYYY-MM-DD: pad to midnight UTC
-        (let [iso (if (re-matches #"\d{4}-\d{2}-\d{2}" v)
-                    (str v "T00:00:00Z")
-                    v)]
-          (java.util.Date/from (java.time.Instant/parse iso)))
+        (carrier/->date-value
+         (datetime-in/timestamptz-in v (sql-cast/datetime-ctx)))
         (catch Exception e
           (throw (ex-info (str "Cannot parse temporal literal: " (pr-str expr-str))
                           {:error :sql/bad-temporal-literal

@@ -195,36 +195,37 @@ drive-by fix.
 
 ## Left open by the datetime parser port
 
-The port of `ParseDateTime` / `DecodeDateTime` / `DecodeTimeOnly` took
-the datetime corpus from 239 divergences to 25. All 25 are deliberate
-and the manifest names each one; these are the three pieces of work
-that would close them, none of which is parsing.
-
-- **A microsecond carrier.** `java.util.Date` is millisecond precision,
-  so `'…04:05:06.123456'::timestamptz::text` renders `.123`. The parser
-  keeps microseconds and so does `LocalDateTime`, which is why the
-  plain `::timestamp` cast is already exact — only the paths that must
-  hand back a `Date` lose them. A `timestamptz` must stay a `Date`
-  today because that is what tells the renderer to print the `+00`, so
-  this is a renderer change as much as a carrier one. 2 corpus
-  entries.
+The port took the datetime corpus from 239 divergences to 23. A review
+of the CUTOVER then found four more datetime parsers still alive and
+three live wrong answers outside the corpus; those are fixed. What is
+below is what is genuinely still open.
 
 - **Deferred clock tokens.** `now`, `today`, `tomorrow` and
   `yesterday` parse correctly — pass a `:now` to `decode-datetime` and
   they work — but `cast.clj/datetime-ctx` deliberately supplies none,
   because a cast is constant-folded into a cached plan and folding
   `'today'::date` once would freeze it for that plan's life. They need
-  whatever deferral `now()` already has. 23 corpus entries.
+  whatever deferral `now()` already has. All 23 remaining corpus
+  entries.
 
-- **`SET TimeZone` is not honoured.** `expr.clj:1613` reports `UTC`
-  unconditionally and `datetime-ctx` passes `zone/utc`, so a session
-  that sets another zone is silently ignored rather than refused. The
-  port makes this *easy* to fix — `:session-zone` is a single
-  parameter — but wiring the GUC through is its own change, and the
-  differential fuzzer pins UTC on both sides so nothing currently
-  catches it.
+- **`SET TimeZone` is accepted and ignored.** `SET timezone =
+  'America/New_York'` reports success, `SHOW timezone` then answers
+  `UTC`, and every `timestamptz` in and out is off by the offset. This
+  predates the port, but the port is what made it a one-line fix on
+  one side: `datetime-ctx` is now the single place the session zone is
+  read, and `resolve-offset` already takes one. What is missing is the
+  GUC plumbing and the OUTPUT side. The differential fuzzer pins UTC
+  on both ends, so nothing currently catches it.
 
-Smaller, and genuinely parser-adjacent:
+- **`parse-timestamp-string` still passes its input through on
+  failure**, and `coerce/coerce-unknown` does `(or (timestamp-parser
+  s) s)`. So `WHERE ts = 'nonsense'` returns zero rows where
+  PostgreSQL raises 22007 — an empty result is a plausible-looking
+  answer, which makes it worse than an error. It is now a thin wrapper
+  over `timestamptz_in` and no longer carries a second grammar; the
+  remaining work is converting the callers that test `(string? p)` so
+  it can raise. About 20 call sites also pass a now-ignored
+  `:parse-timestamp` option to `cast-scalar` and can drop it.
 
 - **`DetermineTimeZoneAbbrevOffset` is partial.** PostgreSQL first asks
   the zone's own transition data whether the abbreviation AS WRITTEN
@@ -234,11 +235,10 @@ Smaller, and genuinely parser-adjacent:
   zone's state at the date given, and only for the 50 DYNTZ entries of
   195 — no corpus sample reaches it.
 
-- **`parse-timestamp-string` still passes its input through on
-  failure.** It is now a thin wrapper over `timestamptz_in`, so it no
-  longer carries a second grammar, but it still returns the input
-  string when parsing fails because a handful of callers test
-  `(string? p)` to decide what to do next. Converting those callers to
-  let it raise is the last of the passthrough-on-failure shape in the
-  temporal paths. About 20 call sites pass a now-ignored
-  `:parse-timestamp` option to `cast-scalar` and can drop it.
+- **The datetime corpus only sees one surface.** Every sample is
+  `SELECT '<lit>'::<type>::text`, so it cannot distinguish a parser
+  loss from a renderer loss, and it never exercises a column, an
+  array, COPY, a set operation or a comparison. Three real divergences
+  lived in those paths while the manifest read 25. Widening it — the
+  same literals through a column round-trip and an array — is the
+  cheapest way to stop that recurring.
