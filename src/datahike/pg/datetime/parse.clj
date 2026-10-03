@@ -29,7 +29,33 @@
   (:require [clojure.set :as set]
             [datahike.pg.datetime.decode :as dec]
             [datahike.pg.datetime.lex :as lex]
-            [datahike.pg.datetime.tokens :as tokens]))
+            [datahike.pg.datetime.tokens :as tokens]
+            [datahike.pg.datetime.zone :as zone]))
+
+(defn- named-zone!
+  "`pg_tzset(field[i])`, called DURING the walk as the C calls it --
+   not deferred to resolution. The difference is observable: a
+   timestamp discards its zone, so a zone validated only at resolution
+   time is never validated at all, and `'2001-02-03 garbage'::timestamp`
+   silently became 2001-02-03 instead of raising.
+
+   Returns the ZONE to record. A POSIX name carries its own offset, so
+   it comes back as `:offset` rather than `:named` -- nothing later has
+   to know that `gmt+8` is special.
+
+   `on-miss` is which error, and it is NOT the same for both callers.
+   A zone arriving as a DATE field gives DTERR_BAD_TIMEZONE, 22023,
+   `time zone ... not recognized` (datetime.c:1109). The same name
+   arriving as a STRING gives plain DTERR_BAD_FORMAT, 22007
+   (datetime.c:1434). So `Feb-10-1997` and `IDLW` fail with different
+   SQLSTATEs -- the sort of distinction only the oracle would have
+   told me about; I had both as 22023."
+  [^String name on-miss]
+  (if-let [west (zone/posix-offset name)]
+    {:kind :offset :west west}
+    (if (zone/resolve-zone-name name)
+      {:kind :named :name name}
+      (dec/dterr on-miss))))
 
 (def ^:private hr24 :hr24)
 
@@ -51,13 +77,27 @@
     {:hour h :min m :sec s :usec (- r (* s 1000000))}))
 
 (defn- time-overflows?
-  "`time_overflows` (timestamp.c:2062): the TOTAL must be under a day.
-   The check is on the sum, not on the seconds field -- which is why
-   `23:59:60` passes and `24:00:00.001` does not."
+  "`time_overflows` (date.c:1427-1444). TWO checks, and both are
+   needed.
+
+   The fields are range-checked individually first -- hour over 24,
+   minute at or over 60, second over 60 -- which is what refuses
+   `'1997.038'::time`: the run-together split makes that 19:97:00,
+   whose total is under a day but whose minute field is not a minute.
+   I had only the total check and we accepted it; the oracle gives
+   22008.
+
+   Then the TOTAL is checked separately, precisely because hour 24 and
+   second 60 are individually legal: `23:59:60` and `24:00:00` are the
+   same instant and both fine, while `24:00:00.001` is not."
   [{:keys [hour min sec usec]}]
-  (let [t (+ (* (long hour) 3600000000) (* (long min) 60000000)
-             (* (long sec) 1000000) (long usec))]
-    (or (neg? t) (> t 86400000000))))
+  (or (neg? hour) (> hour 24)
+      (neg? min) (>= min 60)
+      (neg? sec) (> sec 60)
+      (neg? usec) (> usec 1000000)
+      (> (+ (* (long hour) 3600000000) (* (long min) 60000000)
+            (* (long sec) 1000000) (long usec))
+         86400000000)))
 
 (defn- decode-special-field
   "One `:string` or `:special` field. `DecodeTimezoneAbbrev` is
@@ -150,7 +190,7 @@
                                :tmask (conj (:tmask nf) :tz)
                                :two-digits? (:two-digits? nf) :ptype nil
                                :zone {:kind :offset :west tz}})
-                            {:tmask #{:tz} :zone {:kind :named :name text}}))
+                            {:tmask #{:tz} :zone (named-zone! text :bad-timezone)}))
 
                         :else
                         (let [d (dec/decode-date text fmask ctx)]
@@ -242,7 +282,7 @@
                   (case kind
                     nil ;; UNKNOWN_FIELD: the last chance is a zone NAME.
                     (do (when-not zone? (dec/dterr :bad-format))
-                        {:tmask #{:tz} :zone {:kind :named :name text}})
+                        {:tmask #{:tz} :zone (named-zone! text :bad-format)})
 
                     :ignore-dtf :skip
 
@@ -290,11 +330,14 @@
                          :zone (update (or (:zone st) {:kind :offset :west 0})
                                        :west - val)})
 
+                    ;; `tmask = DTK_M(type)` is assigned BEFORE the
+                    ;; switch, so DTZ claims both DTZ and TZ while TZ
+                    ;; claims only TZ.
                     :dtz (do (when-not zone? (dec/dterr :bad-format))
-                             {:tmask #{:tz} :isdst 1
+                             {:tmask #{:dtz :tz} :isdst 1
                               :zone {:kind :offset :west (- val)}})
                     :tz (do (when-not zone? (dec/dterr :bad-format))
-                            {:tmask #{} :isdst 0
+                            {:tmask #{:tz} :isdst 0
                              :zone {:kind :offset :west (- val)}})
                     :dyntz (do (when-not zone? (dec/dterr :bad-format))
                                {:tmask #{:tz}
@@ -419,7 +462,7 @@
                           {:tm (merge tm (:tm nfd)) :tmask (conj (:tmask nfd) :tz)
                            :two-digits? (:two-digits? nfd)
                            :zone {:kind :offset :west tz}})
-                        {:tmask #{:tz} :zone {:kind :named :name text}})))
+                        {:tmask #{:tz} :zone (named-zone! text :bad-timezone)})))
 
                   :time (do
                           (when ptype
@@ -498,7 +541,7 @@
                   (let [[kind val] (decode-special-field text)]
                     (case kind
                       nil (do (when-not zone? (dec/dterr :bad-format))
-                              {:tmask #{:tz} :zone {:kind :named :name text}})
+                              {:tmask #{:tz} :zone (named-zone! text :bad-format)})
                       :ignore-dtf :skip
                       :reserv
                       (case val
@@ -517,10 +560,10 @@
                                    :zone (update (or (:zone st) {:kind :offset :west 0})
                                                  :west - val)})
                       :dtz (do (when-not zone? (dec/dterr :bad-format))
-                               {:tmask #{:tz} :isdst 1
+                               {:tmask #{:dtz :tz} :isdst 1
                                 :zone {:kind :offset :west (- val)}})
                       :tz (do (when-not zone? (dec/dterr :bad-format))
-                              {:tmask #{} :isdst 0
+                              {:tmask #{:tz} :isdst 0
                                :zone {:kind :offset :west (- val)}})
                       :dyntz (do (when-not zone? (dec/dterr :bad-format))
                                  {:tmask #{:tz}

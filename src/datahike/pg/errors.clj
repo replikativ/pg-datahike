@@ -270,6 +270,15 @@
     :format (fn [{:keys [value message]}]
               (or message (str "date/time field value out of range: \"" value "\"")))}
 
+   ;; DTERR_TZDISP_OVERFLOW. A SEPARATE SQLSTATE from the two above --
+   ;; `'…+16'` is 22009, not 22008 -- and the only way to raise it from
+   ;; a literal is a zone displacement past MAX_TZDISP_HOUR.
+   :invalid-tz-displacement
+   {:sqlstate "22009"
+    :format (fn [{:keys [value message]}]
+              (or message
+                  (str "time zone displacement out of range: \"" value "\"")))}
+
    :cannot-coerce
    {:sqlstate "42846"
     :format (fn [{:keys [source target message]}]
