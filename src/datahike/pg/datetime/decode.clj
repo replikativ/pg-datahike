@@ -14,7 +14,9 @@
    ERRORS are `ex-info` carrying `::dterr`, mirroring the C's DTERR_*
    returns. The entry points map those to SQLSTATEs; nothing here knows
    about SQL."
-  (:require [datahike.pg.datetime.lex :as lex]))
+  (:require [clojure.set :as set]
+            [datahike.pg.datetime.lex :as lex]
+            [datahike.pg.datetime.tokens :as tokens]))
 
 (defn dterr
   "A DTERR_* return, as a throw. The C returns these as ints and every
@@ -293,3 +295,236 @@
         (dterr :field-overflow))
       {:hour hour :min minute :sec sec
        :usec (Math/round (* fsec 1000000.0))})))
+
+;; ---------------------------------------------------------------------------
+;; The number decoders (datetime.c:2778-3005)
+;;
+;; `fmask` and `tmask` are SETS of field keywords here, where the C uses
+;; bitmasks. The bitmask exists so C can test several fields at once;
+;; the tests it actually performs are set membership, set equality and
+;; set difference, which read better as what they are. The two masks
+;; mean different things and the distinction is load-bearing: `fmask` is
+;; what has ALREADY been set, `tmask` is what THIS field set, and the
+;; caller rejects an overlap -- that is how `'2001-02-03 +05 +06'`
+;; becomes an error rather than a last-one-wins.
+;; ---------------------------------------------------------------------------
+
+(def date-fields
+  "DTK_DATE_M. A complete date."
+  #{:year :month :day})
+
+(def time-fields
+  "DTK_TIME_M. A complete time."
+  #{:hour :minute :second})
+
+(defn- atoi
+  "`atoi`: leading digits as an int, 0 if there are none. It does NOT
+   fail on trailing garbage, which the callers rely on."
+  ^long [^String s]
+  (let [n (.length s)
+        end (loop [k (if (and (pos? n) (#{\+ \-} (.charAt s 0))) 1 0)]
+              (if (and (< k n) (Character/isDigit (.charAt s k))) (recur (inc k)) k))]
+    (if (or (zero? end) (and (= end 1) (#{\+ \-} (.charAt s 0))))
+      0
+      (Long/parseLong (subs s 0 end)))))
+
+(defn decode-number-field
+  "`DecodeNumberField` (datetime.c:2912-3005): a run-together number
+   like `19970210`, `040506` or `19970210.5`.
+
+   Returns `{:kind :date|:time :tm {…} :tmask #{…} :two-digits? bool}`,
+   or throws. `fmask` decides WHICH it can be, so the same digits mean
+   different things in different positions -- that is the function's
+   whole job, and it is why `'040506'` is a date to `DecodeDateTime` and
+   a time to `DecodeTimeOnly`.
+
+   A decimal point changes everything. The fraction is taken, the string
+   is TRUNCATED at the point (`*(cp) = 0`, datetime.c:2938) and `len`
+   recomputed -- and because the date branch is an `else if` on that
+   same test, a number carrying a point can only ever be a TIME. So
+   `040506.5` is a time, while bare `040506` depends on context.
+
+   The date split is positional: the last two characters are the day,
+   the two before that the month, everything left the year. `(len - 4)
+   == 2` means the year part was two characters, which sets
+   `two-digits?` and brings the 1970-2069 rule into play."
+  [^String s fmask]
+  (let [dot (.indexOf s (int \.))
+        [fsec s len]
+        (if (>= dot 0)
+          (let [frac (if (= (inc dot) (.length s))
+                       0.0
+                       (try (Double/parseDouble (subs s dot))
+                            (catch NumberFormatException _ (dterr :bad-format))))
+                t (subs s 0 dot)]
+            [(Math/round (* frac 1000000.0)) t (.length t)])
+          [0 s (.length s)])
+        have-date? (= (set (filter fmask date-fields)) date-fields)
+        have-time? (= (set (filter fmask time-fields)) time-fields)]
+    (cond
+      (and (neg? dot) (not have-date?) (>= len 6))
+      {:kind :date
+       :tm {:mday (atoi (subs s (- len 2)))
+            :mon (atoi (subs s (- len 4) (- len 2)))
+            :year (atoi (subs s 0 (- len 4)))}
+       :tmask date-fields
+       :two-digits? (= (- len 4) 2)}
+
+      (and (not have-time?) (= len 6))
+      {:kind :time
+       :tm {:hour (atoi (subs s 0 2)) :min (atoi (subs s 2 4))
+            :sec (atoi (subs s 4 6)) :usec fsec}
+       :tmask time-fields}
+
+      (and (not have-time?) (= len 4))
+      {:kind :time
+       :tm {:hour (atoi (subs s 0 2)) :min (atoi (subs s 2 4))
+            :sec 0 :usec fsec}
+       :tmask time-fields}
+
+      :else (dterr :bad-format))))
+
+(defn decode-number
+  "`DecodeNumber` (datetime.c:2778-2910): ONE plain number field, placed
+   according to what is already known and to DateStyle.
+
+   Takes the `tm` so far and returns an updated one:
+   `{:tm :tmask :two-digits? :kind}`. `:kind` is present only when the
+   field was handed on to `decode-number-field`, which is the one path
+   that can set a TIME from what looked like a date field.
+
+   `date-order` is DateStyle's field order: `:ymd`, `:dmy` or `:mdy`.
+
+   The day-of-year rule comes FIRST, before the switch: three
+   characters, a year already set and nothing else, value 1..366. That
+   is why `'1997 038'` is 7 February, and why the rule cannot be folded
+   into the `:year`-only case below it. Note it claims MONTH and DAY in
+   its tmask as well as DOY -- it has not set them, but `ValidateDate`
+   will, and claiming them is what stops a later field also setting
+   them.
+
+   `text-month?` changes the answer in two places. With a text month
+   already seen, a 3+ digit number is the YEAR rather than the day --
+   `'Feb 10 1997'`. And in the YEAR|MONTH case it can RETROACTIVELY
+   reinterpret: if the year already set came from two digits and this
+   field has three or more, the earlier value was really the day, so
+   the two swap and `two-digits?` is cleared. That is what makes
+   `'99-Jan-08'` and `'1999-Jan-08'` both land correctly."
+  [^String s tm fmask {:keys [text-month? date-order two-digits?]}]
+  (let [n (.length s)
+        [val cp] (strtoint s 0)]
+    (when (= cp 0) (dterr :bad-format))
+    (let [dot? (and (< cp n) (= (.charAt s cp) \.))]
+      (cond
+        ;; More than two digits before a point means the whole field is
+        ;; a run-together number, not a value with a fraction.
+        (and dot? (> cp 2))
+        (merge {:two-digits? two-digits?}
+               (decode-number-field s (into fmask date-fields)))
+
+        (and (not dot?) (< cp n)) (dterr :bad-format)
+
+        :else
+        (let [fsec (if dot? (Math/round (* (parse-fraction s cp) 1000000.0)) 0)
+              known (set (filter fmask date-fields))
+              [upd tmask td]
+              (cond
+                (and (= n 3) (= known #{:year}) (>= val 1) (<= val 366))
+                [{:yday val} #{:doy :month :day} two-digits?]
+
+                (empty? known)
+                (cond
+                  (or (>= n 3) (= date-order :ymd)) [{:year val} #{:year}]
+                  (= date-order :dmy) [{:mday val} #{:day} two-digits?]
+                  :else [{:mon val} #{:month} two-digits?])
+
+                (= known #{:year}) [{:mon val} #{:month} two-digits?]
+
+                (= known #{:month})
+                (if (and text-month? (or (>= n 3) (= date-order :ymd)))
+                  [{:year val} #{:year}]
+                  [{:mday val} #{:day} two-digits?])
+
+                (= known #{:year :month})
+                (if (and text-month? (>= n 3) two-digits?)
+                  ;; The retroactive swap. The YEAR is already set, so
+                  ;; only DAY is claimed -- and the 2-digit flag goes,
+                  ;; because the new year is not two digits.
+                  [{:mday (:year tm) :year val} #{:day} false]
+                  [{:mday val} #{:day} two-digits?])
+
+                (= known #{:day}) [{:mon val} #{:month} two-digits?]
+                (= known #{:month :day}) [{:year val} #{:year}]
+
+                (= known date-fields)
+                [::delegate nil two-digits?]
+
+                :else (dterr :bad-format))]
+          (if (= upd ::delegate)
+            (merge {:two-digits? two-digits?} (decode-number-field s fmask))
+            {:tm (cond-> (merge tm upd) (pos? fsec) (assoc :usec fsec))
+             :tmask tmask
+             ;; Only a YEAR set by THIS field can be two-digit, and the
+             ;; flag is recomputed rather than carried
+             ;; (datetime.c:2908-2909).
+             :two-digits? (if (= tmask #{:year}) (<= n 2) td)}))))))
+
+(defn decode-date
+  "`DecodeDate` (datetime.c:2694-2776): a whole `:date` FIELD -- the
+   thing the lexer tagged, like `2001-02-03` or `10-feb-1997`.
+
+   It re-splits the field into alnum runs and then makes TWO passes,
+   and the two-pass structure is the point: every text run is resolved
+   first, so that when the numbers are placed the decoder already knows
+   whether a month was named. Without that, `'10-Feb-1997'` and
+   `'Feb-10-1997'` could not both work -- the first number is a day in
+   one and a month in the other, and only the text pass can tell them
+   apart before the numbers are read.
+
+   A text run may ONLY be a month or an ignorable token. A weekday
+   inside a date field is a format error, where a weekday as a separate
+   field is silently dropped.
+
+   Returns `{:tm :fields :two-digits? :text-month?}`, or throws."
+  [^String s fmask {:keys [date-order] :as opts}]
+  (let [runs (->> (re-seq #"[A-Za-z]+|[0-9]+" s) vec)]
+    (when (empty? runs) (dterr :bad-format))
+    (when (> (count runs) lex/max-fields) (dterr :bad-format))
+    ;; Pass one: the text runs.
+    (let [[tm fmask text-month? numeric]
+          (reduce
+           (fn [[tm fm tmo acc] run]
+             (if (Character/isLetter (.charAt ^String run 0))
+               (let [[type val] (tokens/special-token run)]
+                 (cond
+                   (= type :ignore-dtf) [tm fm tmo acc]
+                   (= type :month)
+                   (do (when (contains? fm :month) (dterr :bad-format))
+                       [(assoc tm :mon val) (conj fm :month) true acc])
+                   ;; Anything else -- a weekday, a zone, a reserved
+                   ;; word -- is a format error INSIDE a date field,
+                   ;; though a weekday standing alone is dropped.
+                   :else (dterr :bad-format)))
+               [tm fm tmo (conj acc run)]))
+           [{} fmask false []]
+           runs)
+          ;; Pass two: the numbers, now that the month is known.
+          [tm fmask two-digits?]
+          (reduce
+           (fn [[tm fm td] run]
+             (let [{:keys [tm' tmask two-digits?]}
+                   (let [r (decode-number run tm fm
+                                          (assoc opts :text-month? text-month?
+                                                 :date-order date-order
+                                                 :two-digits? td))]
+                     {:tm' (:tm r) :tmask (:tmask r) :two-digits? (:two-digits? r)})]
+               (when (seq (set/intersection fm tmask)) (dterr :bad-format))
+               [tm' (into fm tmask) two-digits?]))
+           [tm fmask false]
+           numeric)]
+      ;; A date field must produce a COMPLETE date. DOY and TZ are
+      ;; excluded from the test because DOY stands in for month and day
+      ;; and TZ is not a date field at all.
+      (when (not= (set/difference fmask #{:doy :tz}) date-fields)
+        (dterr :bad-format))
+      {:tm tm :fields fmask :two-digits? two-digits? :text-month? text-month?})))

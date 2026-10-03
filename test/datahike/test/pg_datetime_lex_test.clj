@@ -106,3 +106,57 @@
             distinction is not observable from SQL, so this pins only
             that we refuse it, not where."
     (is (thrown? clojure.lang.ExceptionInfo (lex/tokenize "Été")))))
+
+(deftest the-whitespace-set-is-Cs-not-Javas
+  ;; C's `isspace` in any single-byte locale is EXACTLY six characters.
+  ;; `Character/isWhitespace` is strictly larger -- it adds the four
+  ;; ASCII separators U+001C..U+001F and a dozen Unicode spaces -- and
+  ;; in the C every one of those falls through the whole branch chain
+  ;; to DTERR_BAD_FORMAT. Using the Java predicate made the port accept
+  ;; input the oracle refuses:
+  ;;   select '2000-01-01' || E'\x1C' || '12:00' :: timestamp  =>  22007
+  ;; and \x1C is reachable from any client, no Unicode needed.
+  (testing "the six that ARE spaces"
+    (doseq [c [\space \tab \newline \return \formfeed \u000B]]
+      (is (= [["2000-01-01" :date] ["12:00" :time]]
+             (lx (str "2000-01-01" c "12:00")))
+          (str "U+" (format "%04X" (int c))))))
+  (testing "and the ones Java calls space and C does not"
+    (doseq [c [\u001C \u001D \u001E \u001F]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (lex/tokenize (str "2000-01-01" c "12:00")))
+          (str "U+" (format "%04X" (int c))))))
+  (testing "including in the sign branch's skip"
+    (is (= [["+05" :tz]] (lx "+ 05")))
+    (is (thrown? clojure.lang.ExceptionInfo (lex/tokenize (str "+" \u001C "05"))))))
+
+(deftest the-work-buffer-is-a-real-input-length-limit
+  ;; `APPEND_CHAR` fails on the character landing at offset
+  ;; `buflen - 1`, and each completed field spends one more byte on its
+  ;; NUL. `buflen` is chosen by the CALLER, so the same literal can be
+  ;; too long for one type and fit in another. The boundaries below were
+  ;; verified against the oracle to the character.
+  (let [z (fn [n] (apply str (repeat n "0")))
+        ok? (fn [s b] (try (lex/tokenize s b) true
+                           (catch clojure.lang.ExceptionInfo _ false)))
+        ts (:timestamp lex/buflen-for)
+        dt (:date lex/buflen-for)]
+    (is (= 153 ts))
+    (is (= 129 dt))
+    (testing "timestamp, buflen 153: 132 trailing zeros fit and 133 do not"
+      (is (ok? (str "2001-02-03 04:05:06." (z 132)) ts))
+      (is (not (ok? (str "2001-02-03 04:05:06." (z 133)) ts))))
+    (testing "date, buflen 129: a 128-character field fits, 129 does not"
+      (is (ok? (str (z 118) "2000-01-01") dt))
+      (is (not (ok? (str (z 119) "2000-01-01") dt))))
+    (testing "and the SAME literal can fit one type and not another"
+      (let [s (str "04:05:06." (z 140))]
+        (is (ok? s ts))
+        (is (not (ok? s dt)))))
+    (testing "skipped whitespace and discarded punctuation cost nothing"
+      (is (ok? (str "2000-01-01" (apply str (repeat 200 " ")) "12:00") ts))
+      (is (ok? (str "2000-01-01" (apply str (repeat 200 ",")) "12:00") ts)))
+    (testing "the default arity is the timestamp buffer"
+      (is (ok? (str "2001-02-03 04:05:06." (z 132)) ts))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (lex/tokenize (str "2001-02-03 04:05:06." (z 133))))))))
