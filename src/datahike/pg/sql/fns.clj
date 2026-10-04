@@ -409,6 +409,23 @@
   [v]
   (get types/oid->pg-name (types/infer-oid-from-value v) "unknown"))
 
+(defn- temporal-instant
+  "A timestamp carrier as a `java.time.Instant`. Both `java.util.Date`
+   and `LocalDateTime` denote a UTC instant in this codebase; the
+   LocalDateTime one is simply the carrier that keeps microseconds."
+  ^java.time.Instant [v]
+  (if (instance? java.time.LocalDateTime v)
+    (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
+    (.toInstant ^java.util.Date v)))
+
+(defn- mixed-temporal?
+  "One value is a `java.util.Date` and the other a `LocalDateTime`.
+   Same-carrier pairs fall through to `compare`, which is already
+   right for each and keeps the common path allocation-free."
+  [a b]
+  (or (and (instance? java.util.Date a) (instance? java.time.LocalDateTime b))
+      (and (instance? java.time.LocalDateTime a) (instance? java.util.Date b))))
+
 (defn order-cmp
   "`compare`, with two corrections.
 
@@ -440,6 +457,20 @@
     (numeric-special-cmp a b)
     (nan-num? a) (if (nan-num? b) 0 1)
     (nan-num? b) -1
+    ;; A timestamp can arrive as either carrier and the two are not
+    ;; mutually Comparable. `LocalDateTime` is used where microseconds
+    ;; must survive; the two INFINITIES have no LocalDateTime
+    ;; representation and are always the extreme `java.util.Date`. So
+    ;; `greatest('infinity'::timestamp, '2000-01-01'::timestamp)`
+    ;; compares one of each and threw
+    ;; "class java.util.Date cannot be cast to class
+    ;; java.time.chrono.ChronoLocalDateTime".
+    ;;
+    ;; Normalising to the instant is correct rather than merely
+    ;; type-matching: both carriers denote a UTC instant here, and the
+    ;; infinity sentinels are the extreme Dates precisely so that they
+    ;; order as infinities under instant comparison.
+    (and (mixed-temporal? a b)) (compare (temporal-instant a) (temporal-instant b))
     :else (compare a b)))
 
 (defn order-key-cmp
