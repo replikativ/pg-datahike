@@ -24,10 +24,17 @@
 ;; COPY, a set operation or a comparison. Three real divergences
 ;; lived in those paths while this file read 25.
 ;;
-;; WHICH PostgreSQL: generated against the local oracle, 17.10, while
-;; CI pins cimg/postgres:17.7. CI has run this manifest against 17.7
-;; with neither an unexpected divergence nor a drift, so the two
-;; releases agree on all 670 samples.
+;; WHICH PostgreSQL: generated against the local oracle, which is
+;; 17.10, while CI pins cimg/postgres:17.7.
+;;
+;; An earlier version of this header claimed CI had checked that the
+;; two releases agree. IT HAD NOT. `:datetime` was missing from the
+;; all-surfaces vector in `differential.clj/-main`, so `bb fuzz all`
+;; -- the command the CI job runs -- skipped this corpus entirely for
+;; the whole life of the port, while the step's NAME said it ran it.
+;; That is fixed; the 17.7 comparison is now actually performed on
+;; every CI run, and a divergence between the releases will surface
+;; here as an unexpected entry or a drift.
 ;;
 ;; Baseline 2026-10-03: 23 of 670 samples diverge.
 
