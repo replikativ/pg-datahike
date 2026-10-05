@@ -409,6 +409,23 @@
   [v]
   (get types/oid->pg-name (types/infer-oid-from-value v) "unknown"))
 
+(defn- temporal-instant
+  "A timestamp carrier as a `java.time.Instant`. Both `java.util.Date`
+   and `LocalDateTime` denote a UTC instant in this codebase; the
+   LocalDateTime one is simply the carrier that keeps microseconds."
+  ^java.time.Instant [v]
+  (if (instance? java.time.LocalDateTime v)
+    (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
+    (.toInstant ^java.util.Date v)))
+
+(defn- mixed-temporal?
+  "One value is a `java.util.Date` and the other a `LocalDateTime`.
+   Same-carrier pairs fall through to `compare`, which is already
+   right for each and keeps the common path allocation-free."
+  [a b]
+  (or (and (instance? java.util.Date a) (instance? java.time.LocalDateTime b))
+      (and (instance? java.time.LocalDateTime a) (instance? java.util.Date b))))
+
 (defn order-cmp
   "`compare`, with two corrections.
 
@@ -440,6 +457,20 @@
     (numeric-special-cmp a b)
     (nan-num? a) (if (nan-num? b) 0 1)
     (nan-num? b) -1
+    ;; A timestamp can arrive as either carrier and the two are not
+    ;; mutually Comparable. `LocalDateTime` is used where microseconds
+    ;; must survive; the two INFINITIES have no LocalDateTime
+    ;; representation and are always the extreme `java.util.Date`. So
+    ;; `greatest('infinity'::timestamp, '2000-01-01'::timestamp)`
+    ;; compares one of each and threw
+    ;; "class java.util.Date cannot be cast to class
+    ;; java.time.chrono.ChronoLocalDateTime".
+    ;;
+    ;; Normalising to the instant is correct rather than merely
+    ;; type-matching: both carriers denote a UTC instant here, and the
+    ;; infinity sentinels are the extreme Dates precisely so that they
+    ;; order as infinities under instant comparison.
+    (and (mixed-temporal? a b)) (compare (temporal-instant a) (temporal-instant b))
     :else (compare a b)))
 
 (defn order-key-cmp
@@ -1931,6 +1962,11 @@
   (null-safe
    (fn date-plus [a b]
      (cond
+       ;; `infinity` absorbs the arithmetic: there is no day after it.
+       ;; `->local-date` read the sentinel's instant instead, so
+       ;; `'infinity'::date + 1` answered `292278994-08-18`.
+       (types/infinite-datetime a) a
+       (types/infinite-datetime b) b
        (number? b) (.plusDays (->local-date a) (long b))
        (number? a) (.plusDays (->local-date b) (long a))
        :else (throw (errors/pg-error :undefined-function
@@ -1939,10 +1975,20 @@
 (def sql-date-
   (null-safe
    (fn date-minus [a b]
-     (if (number? b)
-       (.plusDays (->local-date a) (- (long b)))
-       ;; date - date is a plain integer count of days, not an interval.
-       (- (.toEpochDay (->local-date a)) (.toEpochDay (->local-date b)))))))
+     (let [ia (types/infinite-datetime a)
+           ib (types/infinite-datetime b)]
+       (cond
+         ;; `date - date` where both are the SAME infinity is 22008, as
+         ;; for timestamps; otherwise infinity absorbs.
+         (and ia ib (= ia ib))
+         (throw (errors/pg-error :datetime-field-overflow
+                                 {:message "interval out of range"}))
+         ia a
+         ib (if (= :neg ib) types/pos-infinity types/neg-infinity)
+         (number? b) (.plusDays (->local-date a) (- (long b)))
+         ;; date - date is a plain integer count of days, not an interval.
+         :else
+         (- (.toEpochDay (->local-date a)) (.toEpochDay (->local-date b))))))))
 
 (defn- duration->pg-interval
   "Render a java.time.Duration in PostgreSQL's default interval style. This
@@ -1992,8 +2038,23 @@
 (def sql-timestamp-
   (null-safe
    (fn timestamp-minus [a b]
-     (duration->pg-interval
-      (java.time.Duration/between (->instant b) (->instant a))))))
+     ;; `infinity - anything` is `infinity`, and PostgreSQL raises
+     ;; 22008 only for `infinity - infinity` of the SAME sign. Reading
+     ;; the sentinel's instant gave `213503982334 days 14:25:51.615` --
+     ;; the span to Long/MAX_VALUE, a plausible interval and a wrong
+     ;; one.
+     (let [ia (types/infinite-datetime a)
+           ib (types/infinite-datetime b)]
+       (cond
+         (and ia ib (= ia ib))
+         (throw (errors/pg-error
+                 :datetime-field-overflow
+                 {:message "interval out of range"}))
+         ia (if (= :neg ia) "-infinity" "infinity")
+         ib (if (= :neg ib) "infinity" "-infinity")
+         :else
+         (duration->pg-interval
+          (java.time.Duration/between (->instant b) (->instant a))))))))
 
 (defn- ->local-time
   ^java.time.LocalTime [v]
@@ -3258,6 +3319,8 @@
               offset (.getOffset (.getRules zid) (java.time.Instant/now))]
           (.withOffsetSameInstant t offset))))))
 
+(declare sql-extract*)
+
 (defn sql-extract
   "`EXTRACT(field FROM value)` / `date_part(field, value)`. PostgreSQL
    returns NUMERIC, so the result is a BigDecimal -- `extract(epoch …)`
@@ -3266,41 +3329,76 @@
   (if (or (sql-null? field) (sql-null? v))
     :__null__
     (let [f (str/lower-case (str/replace (str field) #"^'|'$" ""))
-          zdt (->zdt v)]
-      (if (nil? zdt)
-        :__null__
-        (let [n (case f
-                  ("year" "years" "y")      (.getYear zdt)
-                  ("month" "months" "mon")  (.getMonthValue zdt)
-                  ("day" "days" "d")        (.getDayOfMonth zdt)
-                  ("hour" "hours" "h")      (.getHour zdt)
-                  ("minute" "minutes" "min") (.getMinute zdt)
-                  "second"                  (+ (.getSecond zdt)
-                                               (/ (double (.getNano zdt)) 1e9))
-                  "milliseconds"            (+ (* 1000.0 (.getSecond zdt))
-                                               (/ (double (.getNano zdt)) 1e6))
-                  "microseconds"            (+ (* 1000000.0 (.getSecond zdt))
-                                               (/ (double (.getNano zdt)) 1e3))
-                  "quarter"                 (inc (quot (dec (.getMonthValue zdt)) 3))
+          inf (types/infinite-datetime v)]
+      (if inf
+        ;; Every field of an infinite timestamp is +/-Infinity, except
+        ;; the ones that do not depend on the instant. Reading the
+        ;; sentinel's calendar fields answered 292278994 for the year
+        ;; and 9223372036854776 for the epoch -- plausible numbers,
+        ;; both wrong. PostgreSQL returns the float infinity
+        ;; (`timestamp_part`, timestamp.c).
+        (if (contains? #{"epoch" "year" "years" "y" "month" "months" "mon"
+                         "day" "days" "d" "hour" "hours" "h"
+                         "minute" "minutes" "min" "second" "seconds" "sec"
+                         "milliseconds" "microseconds" "quarter" "decade"
+                         "century" "millennium" "julian" "isoyear"}
+                       f)
+          (if (= :neg inf) Double/NEGATIVE_INFINITY Double/POSITIVE_INFINITY)
+          ;; `isfinite`-style fields that are not a magnitude -- dow,
+          ;; doy, timezone -- are 0 rather than infinite.
+          0)
+        (sql-extract* f v)))))
+
+(defn- sql-extract*
+  [f v]
+  (let [zdt (->zdt v)]
+    (if (nil? zdt)
+      :__null__
+      (let [n (case f
+                ("year" "years" "y")      (.getYear zdt)
+                ("month" "months" "mon")  (.getMonthValue zdt)
+                ("day" "days" "d")        (.getDayOfMonth zdt)
+                ("hour" "hours" "h")      (.getHour zdt)
+                ("minute" "minutes" "min") (.getMinute zdt)
+                "second"                  (+ (.getSecond zdt)
+                                             (/ (double (.getNano zdt)) 1e9))
+                "milliseconds"            (+ (* 1000.0 (.getSecond zdt))
+                                             (/ (double (.getNano zdt)) 1e6))
+                "microseconds"            (+ (* 1000000.0 (.getSecond zdt))
+                                             (/ (double (.getNano zdt)) 1e3))
+                "quarter"                 (inc (quot (dec (.getMonthValue zdt)) 3))
                   ;; PostgreSQL's dow is 0=Sunday; java.time is 1=Monday..7=Sunday.
-                  "dow"                     (mod (.getValue (.getDayOfWeek zdt)) 7)
-                  "isodow"                  (.getValue (.getDayOfWeek zdt))
-                  "doy"                     (.getDayOfYear zdt)
-                  "epoch"                   (+ (double (.toEpochSecond zdt))
-                                               (/ (double (.getNano zdt)) 1e9))
-                  "week"                    (.get zdt (.weekOfWeekBasedYear
-                                                       java.time.temporal.WeekFields/ISO))
-                  "isoyear"                 (.get zdt (.weekBasedYear
-                                                       java.time.temporal.WeekFields/ISO))
-                  "decade"                  (quot (.getYear zdt) 10)
-                  "century"                 (quot (+ (.getYear zdt) 99) 100)
-                  "millennium"              (quot (+ (.getYear zdt) 999) 1000)
-                  (throw (ex-info (str "unit \"" f "\" not recognized")
-                                  {:error :invalid-parameter-value
-                                   :message (str "unit \"" f "\" not recognized")})))]
-          (if (integer? n)
-            (java.math.BigDecimal/valueOf (long n))
-            (java.math.BigDecimal/valueOf (double n))))))))
+                "dow"                     (mod (.getValue (.getDayOfWeek zdt)) 7)
+                "isodow"                  (.getValue (.getDayOfWeek zdt))
+                "doy"                     (.getDayOfYear zdt)
+                "epoch"                   (+ (double (.toEpochSecond zdt))
+                                             (/ (double (.getNano zdt)) 1e9))
+                "week"                    (.get zdt (.weekOfWeekBasedYear
+                                                     java.time.temporal.WeekFields/ISO))
+                "isoyear"                 (.get zdt (.weekBasedYear
+                                                     java.time.temporal.WeekFields/ISO))
+                "decade"                  (quot (.getYear zdt) 10)
+                "century"                 (quot (+ (.getYear zdt) 99) 100)
+                "millennium"              (quot (+ (.getYear zdt) 999) 1000)
+                (throw (ex-info (str "unit \"" f "\" not recognized")
+                                {:error :invalid-parameter-value
+                                 :message (str "unit \"" f "\" not recognized")})))]
+          ;; PostgreSQL's scale per field, not the double's own: the
+          ;; sub-second fields go through `int64_div_fast_to_numeric`
+          ;; with a FIXED scale (timestamp.c) -- 6 for `second` and
+          ;; `epoch`, 3 for `milliseconds` -- and `microseconds` is an
+          ;; integer. `BigDecimal/valueOf` on a double gave the
+          ;; shortest representation instead: `946684800.5` where
+          ;; PostgreSQL writes `946684800.500000`, and `500000.0` for a
+          ;; whole number of microseconds.
+        (let [scale (case f
+                      ("second" "seconds" "sec" "epoch") 6
+                      "milliseconds" 3
+                      0)]
+          (-> (if (integer? n)
+                (java.math.BigDecimal/valueOf (long n))
+                (java.math.BigDecimal/valueOf (double n)))
+              (.setScale (int scale) java.math.RoundingMode/HALF_UP)))))))
 
 (defn sql-substring
   "PostgreSQL's `substring(str, start [, len])` (text_substring in
