@@ -246,10 +246,11 @@ below is what is genuinely still open.
 
 ## Left open by the interval port (Phase 2)
 
-The port took the interval corpus from 835 divergences to 27. None of
-the 27 is the parser. They are three things:
+The port took the interval corpus from 835 divergences to 18, and
+every remaining entry is the SAME issue -- stored intervals. The
+parser, the carrier, the output and the arithmetic are done.
 
-- **Stored intervals are stringified (18 entries).** A VALUES or
+- **Stored intervals are stringified (all 18 remaining entries).** A VALUES or
   derived relation is materialised into datahike, and
   `stmt.clj`'s `value-category` has no interval case, so the column
   becomes `:db.type/string` and the carrier is lost on write —
@@ -261,16 +262,53 @@ the 27 is the parser. They are three things:
   0.8.1903), or the `vector` precedent: refuse GROUP BY/DISTINCT over
   a stored interval column with 0A000, which is at least honest.
 
-- **The arithmetic operators (5 entries).** `date-arith-op` still
-  refuses `timestamp ± interval` and friends with 42883. Note that
-  month addition is **not** microsecond addition: it goes through
-  `j2date`/`date2j` with day clamping, so `'2001-01-31' + '1 mon'` is
-  2001-02-28. 18 of the sweep's interval entries are these operator
-  functions and need no new bodies beyond the carrier.
+- **A fold-result cache conflates cmp-equal interval literals, and it
+  gates the arithmetic.** This is the one blocking defect, and it is
+  now well characterised.
+
+  Signature: the same query SHAPE with two cmp-equal interval
+  literals, where the first one's folded result is reused for the
+  second. Measured on a freshly restarted server each time:
+
+  ```
+  '2001-01-31'::ts + '1 mon'   first  -> 2001-02-28  (correct)
+  '2001-01-31'::ts + '30 days' after  -> 2001-02-28  (WRONG, PG: 03-02)
+
+  '2001-01-31'::ts + '30 days' first  -> 2001-03-02  (correct)
+  '2001-01-31'::ts + '1 mon'   after  -> 2001-03-02  (WRONG, PG: 02-28)
+
+  '2001-01-31'::ts + '1 day'   then '2 days'  -> 02-01, 02-02 (both right)
+  ```
+
+  That last line is the diagnostic one: literals that are NOT cmp-equal
+  do not collide, so the cache key does include the value — it just
+  cannot tell `1 mon` from `30 days`, because `PgInterval.equals` is
+  `interval_cmp_value` and those two ARE equal.
+
+  Ruled out by clearing each and re-testing: datahike's
+  `query-result-cache`, our `sql/*parse-cache*`, the identity-keyed
+  statement caches in `server.clj`, and literal templating (`array` is
+  on `template.clj`'s `no-template-idents`, and the arithmetic shapes
+  differ in SQL text anyway). Not yet located.
+
+  **The arithmetic is implemented and correct** — `interval/arith.clj`
+  with 39 assertions against the oracle, including the month-clamp
+  cases — and deliberately NOT wired into `date-arith-op`. Enabling it
+  turns this into a silent wrong DATE, which is what Phase 0 exists to
+  prevent. Wiring it up is a three-line change in `date-arith-op` plus
+  the `query_fns` exports, once the cache is fixed.
+
+  The root tension, which will recur for any type given a
+  non-structural equality: `interval_cmp_value` equality is correct for
+  ORDER BY, GROUP BY and DISTINCT, but it is **not a congruence for
+  arithmetic** — `1 mon` and `30 days` are equal and
+  `timestamp + 1 mon` differs from `timestamp + 30 days`. PostgreSQL
+  has the same property and is safe because its plan cache keys on
+  query text, not on folded values.
 
 - **`array[<interval>]::text` substitutes a cmp-equal value (4
-  entries),** and this one is a genuine consequence of the carrier
-  design rather than a missing feature. What is established: it is
+  entries)** — the same defect seen through a different surface, and
+  how it was first noticed. What is established: it is
   session-order dependent — each case is correct as the *first* query
   on a fresh server and wrong inside a corpus run; the single case
   `array['1 mon -30 days'::interval]::text` is wrong even fresh,

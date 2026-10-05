@@ -101,6 +101,20 @@
   ^PgInterval [months days micros]
   (PgInterval. (int months) (int days) (long micros)))
 
+(defn months
+  "The carrier's month field.
+
+   An ACCESSOR rather than direct `.-months` field access with a type
+   hint, because a hint is resolved at compile time and a `deftype`
+   reload mints a NEW class: a namespace hinted against the old one
+   then fails with the memorable
+   `PgInterval cannot be cast to class PgInterval`. Going through
+   functions in this namespace means a reload of it is enough."
+  ^long [^PgInterval iv] (.-months iv))
+
+(defn days ^long [^PgInterval iv] (.-days iv))
+(defn micros ^long [^PgInterval iv] (.-micros iv))
+
 (defn interval? [v] (instance? PgInterval v))
 
 (defn fields
