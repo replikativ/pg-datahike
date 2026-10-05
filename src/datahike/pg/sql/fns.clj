@@ -1990,38 +1990,6 @@
          :else
          (- (.toEpochDay (->local-date a)) (.toEpochDay (->local-date b))))))))
 
-(defn- duration->pg-interval
-  "Render a java.time.Duration in PostgreSQL's default interval style. This
-   is an interim value representation: interval columns are still stored as
-   text, but typed temporal subtraction must not fall through to numeric
-   arithmetic."
-  [^java.time.Duration duration]
-  (let [total-nanos (+ (*' (.getSeconds duration) 1000000000)
-                       (.getNano duration))
-        negative? (neg? total-nanos)
-        n (if negative? (- total-nanos) total-nanos)
-        day-nanos (*' 86400 1000000000)
-        days (quot n day-nanos)
-        rem-nanos (rem n day-nanos)
-        hours (quot rem-nanos (*' 3600 1000000000))
-        rem-nanos (rem rem-nanos (*' 3600 1000000000))
-        minutes (quot rem-nanos (*' 60 1000000000))
-        rem-nanos (rem rem-nanos (*' 60 1000000000))
-        seconds (quot rem-nanos 1000000000)
-        nanos (rem rem-nanos 1000000000)
-        fraction (when (pos? nanos)
-                   (str "." (str/replace (format "%09d" (long nanos)) #"0+$" "")))
-        clock (format "%s%02d:%02d:%02d%s"
-                      (if negative? "-" "")
-                      (long hours) (long minutes) (long seconds) (or fraction ""))
-        body (if (pos? days)
-               (let [signed-days (if negative? (- days) days)]
-                 ;; PostgreSQL pluralises -1 (the value is not +1), hence
-                 ;; "-1 days -02:00:00" rather than a global sign prefix.
-                 (str signed-days " day" (when (not= signed-days 1) "s") " " clock))
-               clock)]
-    body))
-
 (defn- ->instant
   ^java.time.Instant [v]
   (cond
@@ -2035,6 +2003,30 @@
                   :feature-not-supported
                   {:feature "timestamp arithmetic outside the supported Java time range"}))))
 
+(def ^:private interval-of
+  (delay @(requiring-resolve 'datahike.pg.interval.core/interval)))
+
+(def ^:private interval-justify-hours*
+  (delay @(requiring-resolve 'datahike.pg.interval.core/justify-hours)))
+
+(defn- micros-between->interval
+  "`timestamp_mi` / `time_mi_time`: the microsecond difference as an
+   interval, then `justify_hours` -- which is what the C does as its
+   last step (timestamp.c:2861) and is the whole reason
+   `'2001-01-02' - '2001-01-01'` prints as `1 day` rather than
+   `24:00:00`.
+
+   This replaces `duration->pg-interval`, which produced interval TEXT.
+   That was the only interval PRODUCER in the codebase, and once an
+   interval LITERAL became a carrier the two no longer compared:
+   `(ts2 - ts1) < interval '1 minute'` failed with
+   `operator does not exist: text < text`. It was also wrong on its own
+   terms -- it always printed the clock part, so
+   `'2001-01-02'::ts - '2001-01-01'::ts` was `1 day 00:00:00` where
+   PostgreSQL gives `1 day`."
+  [^long micros]
+  (@interval-justify-hours* (@interval-of 0 0 micros)))
+
 (def sql-timestamp-
   (null-safe
    (fn timestamp-minus [a b]
@@ -2043,6 +2035,13 @@
      ;; the sentinel's instant gave `213503982334 days 14:25:51.615` --
      ;; the span to Long/MAX_VALUE, a plausible interval and a wrong
      ;; one.
+     ;;
+     ;; The infinite results are the SENTINELS, not the strings
+     ;; "infinity"/"-infinity" this returned before intervals had a
+     ;; carrier. `->pg-text` renders either the same way, but only the
+     ;; sentinel composes with interval comparison -- and
+     ;; `interval_in('infinity')` already returns it, so the two
+     ;; producers now agree on what an infinite interval IS.
      (let [ia (types/infinite-datetime a)
            ib (types/infinite-datetime b)]
        (cond
@@ -2050,11 +2049,12 @@
          (throw (errors/pg-error
                  :datetime-field-overflow
                  {:message "interval out of range"}))
-         ia (if (= :neg ia) "-infinity" "infinity")
-         ib (if (= :neg ib) "infinity" "-infinity")
+         ia (if (= :neg ia) types/neg-infinity types/pos-infinity)
+         ib (if (= :neg ib) types/pos-infinity types/neg-infinity)
          :else
-         (duration->pg-interval
-          (java.time.Duration/between (->instant b) (->instant a))))))))
+         (let [d (java.time.Duration/between (->instant b) (->instant a))]
+           (micros-between->interval
+            (+ (*' (.getSeconds d) 1000000) (quot (.getNano d) 1000)))))))))
 
 (defn- ->local-time
   ^java.time.LocalTime [v]
@@ -2067,8 +2067,9 @@
 (def sql-time-
   (null-safe
    (fn time-minus [a b]
-     (duration->pg-interval
-      (java.time.Duration/between (->local-time b) (->local-time a))))))
+     (let [d (java.time.Duration/between (->local-time b) (->local-time a))]
+       (micros-between->interval
+        (+ (*' (.getSeconds d) 1000000) (quot (.getNano d) 1000)))))))
 
 (def sql-unsupported-temporal-arithmetic
   (null-safe
@@ -4769,6 +4770,42 @@
             (java.util.Date. millis))
         :__null__))))
 
+;; `requiring-resolve` because interval/core.clj requires types.clj,
+;; which this namespace is below. Same shape as the geo and mac
+;; delegations in input.clj.
+(def ^:private interval-justify-hours
+  (delay @(requiring-resolve 'datahike.pg.interval.core/justify-hours)))
+(def ^:private interval-justify-days
+  (delay @(requiring-resolve 'datahike.pg.interval.core/justify-days)))
+(def ^:private interval-justify-interval
+  (delay @(requiring-resolve 'datahike.pg.interval.core/justify-interval)))
+
+(def ^:private interval-coerce
+  "An argument to a justify_* function as a carrier. A STORED interval
+   arrives as its canonical text, because a `deftype` has no datahike
+   value type yet -- so it is re-parsed here. That is the cost the
+   consolidation plan's Phase 2 step 6 removes; until then it is one
+   `interval_in` per call rather than a wrong answer."
+  (delay
+    (let [in @(requiring-resolve 'datahike.pg.interval.core/interval-in)
+          iv? @(requiring-resolve 'datahike.pg.interval.core/interval?)]
+      (fn [v] (cond (iv? v) v
+                    ;; `INTERVAL_NOT_FINITE` short-circuits every
+                    ;; justify_* in the C, so an infinity passes
+                    ;; through unchanged rather than being re-parsed.
+                    (types/infinite-datetime v) v
+                    (string? v) (in v)
+                    :else (throw (errors/pg-error
+                                  :invalid-datetime-format
+                                  {:type "interval" :value (str v)})))))))
+
+(defn- justify-fn
+  "One justify_* wrapper: coerce the argument to a carrier, unless it
+   is an infinity, which passes straight through."
+  [impl-delay]
+  (fn [v]
+    (if (types/infinite-datetime v) v (@impl-delay (@interval-coerce v)))))
+
 (def ^:private legacy-sql-fn->clj-fn
   {"upper"    (fn [v] (str/upper-case (pg-str v)))
    "lower"    (fn [v] (str/lower-case (pg-str v)))
@@ -4776,6 +4813,17 @@
    ;; number of MAP ENTRIES (2), not its bit width. PG's length() on a
    ;; bit string is the bit count; octet_length is ceil(bits/8).
    "length"   sql-length
+   ;; The three justify_* functions. `justify_interval` is also the
+   ;; canonical form for the interval_cmp equivalence class, which is
+   ;; what the differential corpus projects values through -- `::text`
+   ;; is spelling, and PostgreSQL prints `1 mon` and `30 days`
+   ;; differently while comparing them equal.
+   ;; `INTERVAL_NOT_FINITE` short-circuits each of these in the C, so
+   ;; an infinity is returned unchanged -- it is not a carrier and
+   ;; cannot be justified.
+   "justify_hours" (justify-fn interval-justify-hours)
+   "justify_days" (justify-fn interval-justify-days)
+   "justify_interval" (justify-fn interval-justify-interval)
    "abs"      (special-abs clojure.core/abs)
    "floor"    (special-passthrough sql-floor)
    "ceil"     (special-passthrough sql-ceil)
@@ -5050,6 +5098,7 @@
    "point" #{2}
    "getdatabaseencoding" #{0}
    "pg_client_encoding"  #{0}
+   "justify_hours" #{1} "justify_days" #{1} "justify_interval" #{1}
    "abs"      #{1} "sign"    #{1} "sqrt"  #{1} "cbrt"  #{1}
    "exp"      #{1} "ln"      #{1} "log10" #{1}
    "floor"    #{1} "ceil"    #{1} "ceiling" #{1}

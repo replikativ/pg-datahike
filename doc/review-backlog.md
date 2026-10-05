@@ -243,3 +243,60 @@ below is what is genuinely still open.
   lived in those paths while the manifest read 25. Widening it — the
   same literals through a column round-trip and an array — is the
   cheapest way to stop that recurring.
+
+## Left open by the interval port (Phase 2)
+
+The port took the interval corpus from 835 divergences to 27. None of
+the 27 is the parser. They are three things:
+
+- **Stored intervals are stringified (18 entries).** A VALUES or
+  derived relation is materialised into datahike, and
+  `stmt.clj`'s `value-category` has no interval case, so the column
+  becomes `:db.type/string` and the carrier is lost on write —
+  equality and GROUP BY then compare text. Expression-position
+  intervals are correct today, which is most of the sweep. Closing
+  this needs datahike's extension-defined value types
+  (`datahike.value-type/register!`, present in the
+  `custom-values` worktree at `8201082d` but **not** in the pinned
+  0.8.1903), or the `vector` precedent: refuse GROUP BY/DISTINCT over
+  a stored interval column with 0A000, which is at least honest.
+
+- **The arithmetic operators (5 entries).** `date-arith-op` still
+  refuses `timestamp ± interval` and friends with 42883. Note that
+  month addition is **not** microsecond addition: it goes through
+  `j2date`/`date2j` with day clamping, so `'2001-01-31' + '1 mon'` is
+  2001-02-28. 18 of the sweep's interval entries are these operator
+  functions and need no new bodies beyond the carrier.
+
+- **`array[<interval>]::text` substitutes a cmp-equal value (4
+  entries),** and this one is a genuine consequence of the carrier
+  design rather than a missing feature. What is established: it is
+  session-order dependent — each case is correct as the *first* query
+  on a fresh server and wrong inside a corpus run; the single case
+  `array['1 mon -30 days'::interval]::text` is wrong even fresh,
+  giving `{00:00:00}`; and `cast-scalar` on the array,
+  `arrays/to-pg-text`, and `'<lit>'::interval::text` without the array
+  are each correct in isolation. What is ruled out: datahike's
+  query-result cache (`clear-query-cache!` does not help), the
+  identity-keyed statement caches in `server.clj`, and literal
+  templating (`array` is already on `template.clj`'s
+  `no-template-idents`). What is not yet found: the value-keyed
+  substitution between the SQL path's array construction and its
+  rendering.
+
+  **It is not in the corpus**, and that is deliberate: whether a given
+  literal diverges depends on what ran earlier in the session, so the
+  sample is nondeterministic and the manifest cannot pin it. Keeping it
+  made `bb fuzz interval` fail on some runs and pass on others, which
+  trains you to ignore the gate. It needs a deterministic reproduction
+  before it can be gated, and the four cases above are the leads.
+
+  The underlying tension is worth stating because it will recur for
+  any type we give a non-structural equality: `PgInterval`'s `.equals`
+  **must** be `interval_cmp_value` for GROUP BY and DISTINCT to be
+  correct, but that equivalence is *coarser than the observable text* —
+  `1 mon` and `30 days` are equal and print differently. So anything
+  that looks a value up by equality may legitimately hand back the
+  other spelling. PostgreSQL has the same property and avoids the
+  problem by keying its caches on query text rather than on folded
+  values. Same family as the datahike BigDecimal-scale collision.

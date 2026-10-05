@@ -4151,6 +4151,7 @@
         ;; (value->string) can emit the right PG text format.
         any-ts? (or is-ts? is-date? is-time?)
         is-uuid? (= :uuid cast-cat)
+        is-interval? (= :interval cast-cat)
         is-bit? (or (= :bit cast-cat) (= :varbit cast-cat))
         is-array? (= :array cast-cat)
         is-vector? (= :vector cast-cat)
@@ -4441,6 +4442,12 @@
           is-ts?   (sql-cast/cast-scalar
                     inner-raw type-str
                     {:explicit? true :prefer-local-datetime? true})
+          ;; Delegate, like every sibling. There was no interval branch
+          ;; here OR in `cast-scalar`, so a folded interval cast
+          ;; returned `inner-raw` -- the user's own text -- and
+          ;; `'1 mon'::interval = '30 days'::interval` became a STRING
+          ;; comparison, answering false where PostgreSQL says true.
+          is-interval? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200

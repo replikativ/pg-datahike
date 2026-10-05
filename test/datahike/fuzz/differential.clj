@@ -717,7 +717,270 @@
                 {:class cls :key sql
                  :run (fn [c] (seed! c) [(exec! c sql) (table-state c)])})))
 
-(declare run-datetime-corpus run-generated-surface)
+;; ---------------------------------------------------------------------------
+;; The interval surface: a FIXED corpus, like the datetime one, and for
+;; the same reason -- `interval_in` is an input function whose spec is a
+;; finite set of literal forms, not a grammar to sample.
+;;
+;; It differs from the datetime corpus in one way that matters. That one
+;; projects every sample through `::text`, and its own header admits the
+;; cost: it cannot tell a parser loss from a renderer loss, and it never
+;; exercises a column, an array, a comparison or GROUP BY. Three real
+;; divergences lived in those paths while it read 25. So this corpus
+;; projects each literal SIX ways, and the projections are chosen to
+;; separate the things that can independently be wrong.
+;;
+;; The value projection is `justify_interval`, not `::text` and not
+;; `extract(epoch …)`:
+;;
+;;   `::text` is spelling, and PostgreSQL deliberately PRINTS cmp-equal
+;;   intervals differently -- `1 mon` and `30 days` are `=` and render
+;;   as themselves.
+;;
+;;   `extract(epoch …)` is NOT a canonical key: `epoch('1 year')` is
+;;   31557600 and `epoch('360 days')` is 31104000, while the two are
+;;   `=`. `interval_part`'s DTK_EPOCH arm uses 365.25 days for whole
+;;   years and 30 for the month remainder.
+;;
+;;   `justify_interval` IS canonical for the `interval_cmp` equivalence
+;;   class -- checked on the oracle over eight cmp-equal pairs.
+;; ---------------------------------------------------------------------------
+
+(def interval-literals
+  "Input forms for `interval_in`, grouped by the rule each group pins.
+   Drawn from `DecodeInterval`'s own branches (datetime.c:3364-3749),
+   `DecodeISO8601Interval` (3829-4033) and every token in `deltatktbl`
+   (187-251)."
+  {;; `EncodeInterval` INTSTYLE_POSTGRES round-trips.
+   :postgres-style
+   ["1 day" "1 mon" "30 days" "24:00:00" "720:00:00" "1 year 2 mons"
+    "-1 years -2 mons" "6 years 5 mons 4 days 03:02:01" "1 day 01:00:00"
+    "-1 days +02:03:04" "1 mon -30 days" "00:00:00" "01:02:03.456789"]
+
+   ;; The `@` IGNORE_DTF prefix, and AGO -- which is accepted ONLY as
+   ;; the last field and negates all four (datetime.c:3680, 3719-3730).
+   :verbose-and-ago
+   ["@ 1 day" "@ 1 day ago" "@ 1 year 2 mons ago" "@ 0" "1 year ago"
+    "-1 year ago" "1 2:03:04.5 ago" "ago" "@" "1 day ago 2 hours"
+    "infinity ago"]
+
+   ;; The SQL-standard years-months and day-time literals. `1-13` must
+   ;; be FIELD_OVERFLOW: the check is `val2 < 0 || val2 >= 12`.
+   :sql-standard
+   ["1-2" "-1-2" "+1-2" "1-13" "1--1" "1 2:03:04" "-1 2:03:04"
+    "1-2 3 4:05:06" "+1-2 +3 +4:05:06"]
+
+   ;; Every branch of DecodeISO8601Interval, including the basic and
+   ;; `-`-extended alternative forms.
+   :iso-8601
+   ["P1Y2M3DT4H5M6S" "P12Y" "PT0S" "P1D" "PT1H" "P1.5D" "P0.5Y" "P1W"
+    "P1.5W" "P-1DT2H3M4S" "P00010203" "P00010203T040506" "P0001-02-03"
+    "P0001-02-03T04:05:06" "PT040506" "PT04:05:06"
+    "P" "P1X" "PT1X" "1Y" "P1Y1Y"]
+
+   ;; Every one of deltatktbl's unit spellings, plus the three that
+   ;; resolve only through the `datetktbl` FALLBACK that
+   ;; `DecodeInterval`'s DTK_STRING arm reaches after DecodeUnits
+   ;; misses (datetime.c:3659-3663). The two tables disagree on
+   ;; purpose: `m` is MINUTE in deltatktbl and MONTH in datetktbl.
+   :units-exhaustive
+   ["1 c" "1 cent" "1 centuries" "1 century" "1 d" "1 day" "1 days"
+    "1 dec" "1 decade" "1 decades" "1 decs" "1 h" "1 hour" "1 hours"
+    "1 hr" "1 hrs" "1 m" "1 microsecond" "1 mil" "1 millennia"
+    "1 millennium" "1 millisecond" "1 mils" "1 min" "1 mins" "1 minute"
+    "1 minutes" "1 mon" "1 mons" "1 month" "1 months" "1 ms" "1 msec"
+    "1 msecond" "1 mseconds" "1 msecs" "1 s" "1 sec" "1 second"
+    "1 seconds" "1 secs" "1 us" "1 usec" "1 usecond" "1 useconds"
+    "1 usecs" "1 w" "1 week" "1 weeks" "1 y" "1 year" "1 years" "1 yr"
+    "1 yrs" "1 mm" "1 j" "1 at" "1 on" "at 1 day"]
+
+   ;; `DecodeUnits` compares with `strncmp(…, TOKMAXLEN)` where
+   ;; TOKMAXLEN is 10, and FOUR deltatktbl keys are exactly ten
+   ;; characters -- `microsecon`, `millisecon`, `timezone_h`,
+   ;; `timezone_m`. So it is a real PREFIX match and a plain map lookup
+   ;; is WRONG, unlike for the two datetime tables where
+   ;; `tokens/prefix-safe?` holds.
+   ;;
+   ;; And four units resolve in deltatktbl but have NO arm in
+   ;; DecodeInterval's switch, so they reach `default` and are format
+   ;; errors. A table-driven implementation would accept them.
+   :prefix-ten-and-unreachable
+   ["2 microsecon" "2 microsecondsXX" "1 millisecon" "1 millisecondXYZ"
+    "1 timezone_hXX" "1 qtr" "1 quarter" "1 timezone" "1 timezone_hour"
+    "1 timezone_minute"]
+
+   ;; AdjustFractDays / AdjustFractYears / AdjustFractMicroseconds, and
+   ;; the `rint` inside AdjustFractYears.
+   :fractional
+   ["1.5 months" "0.5 mons" "-0.5 mons" "1.5 years" "0.5 weeks"
+    "1.5 weeks" "0.5 days" "1.5 hours" "1.5 sec" "1.5" ".5" "1."
+    "0.0833333 years" "1.5 decades" "1.5 centuries" "1.5 millennia"]
+
+   ;; The `range` switch (datetime.c:3476-3514): what a BARE number
+   ;; means depends on the typmod. `'1'::interval` is one second,
+   ;; `interval '1' hour` is one hour.
+   :bare-numbers
+   ["100" "1:2" "01:00:00" "+01:00" "-01:00" "17h" "1" "0"]
+
+   :infinity ["infinity" "-infinity" "+infinity"]
+
+   ;; INTERVAL_NOBEGIN/NOEND are all three fields at their extremes, so
+   ;; the sentinel is reachable by arithmetic and PostgreSQL refuses the
+   ;; literal that would construct it.
+   :overflow
+   ["2147483648 months" "178000000 years" "2147483647 mons"
+    "-2147483648 mons" "9223372036854775807 us"
+    "9223372036854775808 us" "2147483647 days"
+    "-178956970 years -8 mons -2147483648 days -2562047788:00:54.775808"]
+
+   :refusals
+   ["" "garbage" "1 day garbage" "1 day 2 day" "1 day 1 day"
+    "01:00:00 02:00:00" "+" "-" "1 day +" "--1 day" "1 2 3 4 5"]})
+
+(def interval-equality-sets
+  "Spellings PostgreSQL compares EQUAL, and near-misses that must stay
+   distinct. `interval_cmp_value` makes a month 30 days and a day 24
+   hours, so these are the pairs a text carrier cannot group correctly
+   -- which is the whole reason the carrier exists."
+  [["1 mon" "30 days" "720 hours" "43200 minutes"]
+   ["1 day" "24 hours" "1440 min" "86400 sec"]
+   ["1 year" "12 mons" "360 days"]
+   ["1 mon -30 days" "0" "0 sec" "PT0S"]
+   ["-1 mon" "-30 days"]
+   ["1 mon 1 day" "31 days"]
+   ["2 mons -1 day" "59 days"]
+   ["90 mons" "2700 days"]])
+
+(def interval-distinct-sets
+  "Near-misses: cmp-UNEQUAL and easy to conflate."
+  [["1 mon" "29 days"] ["1 mon" "31 days"] ["1 year" "365 days"]])
+
+(defn- iv [^String lit] (quote-lit lit))
+
+(defn interval-samples
+  "Six projections per literal, chosen to separate things that can
+   independently be wrong:
+
+     1 `::interval::text`          parser AND renderer together
+     2 `justify_interval(...)`     the VALUE, independent of spelling
+     3 round-trip through a COLUMN  storage
+     4 `= '1 mon'`                  equality against a fixed reference
+     5 `::interval` unprojected     the bare cast's own error, if any
+
+   THERE IS NO ARRAY PROJECTION, and its absence is deliberate.
+   `ARRAY[<interval>]::text` substitutes a cmp-equal but different
+   representative, and WHETHER a given literal diverges depends on
+   what ran earlier in the same session -- so the sample is
+   nondeterministic and a manifest cannot pin it. Keeping it made
+   `bb fuzz interval` fail with an unexpected divergence on some runs
+   and pass on others, which trains you to ignore the gate. The bug is
+   real and is in doc/review-backlog.md with everything established
+   about it; it needs a deterministic reproduction before it can be
+   gated. (The datetime corpus has no array projection either, and
+   this is the one place that gap is load-bearing rather than an
+   oversight.)
+
+   Projection 1 alone is what the datetime corpus does, and its header
+   records why that was not enough."
+  []
+  (for [[group lits] interval-literals
+        lit lits
+        [proj sql]
+        [[:text (str "SELECT " (iv lit) "::interval::text")]
+         [:value (str "SELECT justify_interval(" (iv lit) "::interval)::text")]
+         [:column (str "SELECT a::text FROM (VALUES (" (iv lit)
+                       "::interval)) t(a)")]
+         [:equal (str "SELECT (" (iv lit) "::interval = '1 mon'::interval)")]
+         [:bare (str "SELECT " (iv lit) "::interval")]]]
+    {:class group
+     :key sql
+     :run (fn [c] (q c sql))}))
+
+(defn interval-relational-samples
+  "Ordering, grouping and set operations, which cannot be expressed per
+   literal. These are the samples a text carrier fails even when every
+   literal above round-trips: PostgreSQL groups `1 mon` with `30 days`
+   and orders them as a tie.
+
+   The spelling of a TIE is plan-dependent -- `GROUP BY` over
+   {1 mon, 30 days} returned `1 mon` on the oracle and `UNION` returned
+   `30 days` -- so nothing here asserts which representative wins. Only
+   counts, and `justify_interval` projections, are compared.
+
+   One trap, which cost me a false report while writing these: a bare
+   name in ORDER BY resolves against the SELECT list first, so
+   `SELECT v::text AS s … ORDER BY v` sorts by the TEXT. The sort key
+   is qualified throughout."
+  []
+  (let [vals (fn [lits] (str "(VALUES "
+                             (str/join ", " (map #(str "(" (iv %) "::interval)") lits))
+                             ") t(v)"))]
+    (concat
+     (for [set' interval-equality-sets]
+       {:class :equality
+        :key (str "SELECT count(*), count(DISTINCT t.v) FROM " (vals set'))
+        :run (fn [c] (q c (str "SELECT count(*), count(DISTINCT t.v) FROM "
+                               (vals set'))))})
+     (for [set' interval-equality-sets]
+       {:class :grouping
+        :key (str "SELECT count(*) FROM " (vals set') " GROUP BY t.v")
+        :run (fn [c] (unordered (q c (str "SELECT count(*) FROM " (vals set')
+                                          " GROUP BY t.v"))))})
+     (for [set' interval-distinct-sets]
+       {:class :distinct-near-miss
+        :key (str "SELECT count(DISTINCT t.v) FROM " (vals set'))
+        :run (fn [c] (q c (str "SELECT count(DISTINCT t.v) FROM " (vals set'))))})
+     (for [set' interval-equality-sets]
+       {:class :ordering
+        :key (str "SELECT justify_interval(t.v)::text FROM " (vals set')
+                  " ORDER BY t.v, justify_interval(t.v)::text")
+        :run (fn [c] (q c (str "SELECT justify_interval(t.v)::text FROM "
+                               (vals set')
+                               " ORDER BY t.v, justify_interval(t.v)::text")))})
+     [{:class :aggregate
+       :key "SELECT min(t.v)::text, max(t.v)::text FROM (VALUES ('1 mon'::interval), ('29 days'::interval), ('31 days'::interval)) t(v)"
+       :run (fn [c] (q c "SELECT min(t.v)::text, max(t.v)::text FROM (VALUES ('1 mon'::interval), ('29 days'::interval), ('31 days'::interval)) t(v)"))}
+      {:class :aggregate
+       :key "SELECT greatest('1 mon'::interval, '24 hours'::interval)::text"
+       :run (fn [c] (q c "SELECT greatest('1 mon'::interval, '24 hours'::interval)::text"))}
+      {:class :membership
+       :key "SELECT '1 mon'::interval IN ('30 days'::interval)"
+       :run (fn [c] (q c "SELECT '1 mon'::interval IN ('30 days'::interval)"))}
+      {:class :membership
+       :key "SELECT '1 mon'::interval = ANY(ARRAY['30 days'::interval])"
+       :run (fn [c] (q c "SELECT '1 mon'::interval = ANY(ARRAY['30 days'::interval])"))}
+      {:class :set-op
+       :key "SELECT count(*) FROM (SELECT '1 mon'::interval INTERSECT SELECT '30 days'::interval) s"
+       :run (fn [c] (q c "SELECT count(*) FROM (SELECT '1 mon'::interval INTERSECT SELECT '30 days'::interval) s"))}
+      {:class :set-op
+       :key "SELECT count(*) FROM (SELECT '1 mon'::interval EXCEPT SELECT '30 days'::interval) s"
+       :run (fn [c] (q c "SELECT count(*) FROM (SELECT '1 mon'::interval EXCEPT SELECT '30 days'::interval) s"))}
+      {:class :arithmetic
+       :key "SELECT ('2001-01-31'::timestamp + '1 mon'::interval)::text"
+       :run (fn [c] (q c "SELECT ('2001-01-31'::timestamp + '1 mon'::interval)::text"))}
+      {:class :arithmetic
+       :key "SELECT ('2001-03-31'::timestamp - '1 mon'::interval)::text"
+       :run (fn [c] (q c "SELECT ('2001-03-31'::timestamp - '1 mon'::interval)::text"))}
+      {:class :arithmetic
+       :key "SELECT ('2001-01-02'::timestamp - '2001-01-01'::timestamp)::text"
+       :run (fn [c] (q c "SELECT ('2001-01-02'::timestamp - '2001-01-01'::timestamp)::text"))}
+      {:class :arithmetic
+       :key "SELECT ('2001-01-01'::timestamp - '2001-01-02'::timestamp)::text"
+       :run (fn [c] (q c "SELECT ('2001-01-01'::timestamp - '2001-01-02'::timestamp)::text"))}
+      {:class :arithmetic
+       :key "SELECT ('1 day'::interval * 2)::text"
+       :run (fn [c] (q c "SELECT ('1 day'::interval * 2)::text"))}
+      {:class :arithmetic
+       :key "SELECT (- '1 day'::interval)::text"
+       :run (fn [c] (q c "SELECT (- '1 day'::interval)::text"))}
+      {:class :arithmetic
+       :key "SELECT ('1 mon'::interval + '1 day'::interval)::text"
+       :run (fn [c] (q c "SELECT ('1 mon'::interval + '1 day'::interval)::text"))}
+      {:class :aggregate
+       :key "SELECT sum(t.v)::text FROM (VALUES ('1 mon'::interval), ('1 day'::interval)) t(v)"
+       :run (fn [c] (q c "SELECT sum(t.v)::text FROM (VALUES ('1 mon'::interval), ('1 day'::interval)) t(v)"))}])))
+
+(declare run-datetime-corpus run-interval-corpus run-generated-surface)
 
 (defn run-surface
   "Draw `n` samples of `surface` from `seed`, run each DISTINCT one on both
@@ -726,9 +989,36 @@
    `:datetime` is the exception: it runs a FIXED corpus and ignores both
    arguments. See `datetime-literals`."
   [surface n seed]
-  (if (= surface :datetime)
-    (run-datetime-corpus)
+  (case surface
+    :datetime (run-datetime-corpus)
+    :interval (run-interval-corpus)
     (run-generated-surface surface n seed)))
+
+(defn- run-interval-corpus
+  "The whole interval corpus, both halves. Like `:datetime` this is a
+   FIXED set and ignores `n` and `seed`.
+
+   `IntervalStyle` is pinned alongside TimeZone and DateStyle: it
+   changes `interval_out` completely (`postgres` vs `sql_standard` vs
+   `iso_8601` vs `postgres_verbose`) and it also changes DECODING, via
+   `DecodeInterval`'s `force_negative` branch."
+  []
+  (with-open [o (reference-conn) t (target-conn)]
+    (doseq [c [o t]]
+      (exec! c "SET TimeZone='UTC'")
+      (exec! c "SET DateStyle='ISO, MDY'")
+      (exec! c "SET IntervalStyle='postgres'"))
+    (let [samples (concat (interval-samples) (interval-relational-samples))]
+      {:surface :interval :seed nil
+       :drawn (into #{} (map :key) samples)
+       :ran (frequencies (map :class samples))
+       :diffs (into []
+                    (keep (fn [{:keys [class key run]}]
+                            (let [a (run o) b (run t)]
+                              (when-not (= a b)
+                                {:surface :interval :class class :key key
+                                 :reference a :target b}))))
+                    samples)})))
 
 (defn- run-datetime-corpus
   "The datetime surface runs its WHOLE corpus, ignoring `n` and `seed`:
@@ -780,6 +1070,12 @@
 
 (def manifest-path "test/integration/fuzz/expected-divergences.edn")
 
+(def interval-manifest-path
+  "The interval corpus keeps its own manifest, for the same reason the
+   datetime one does: it is a burn-down list with a known end state,
+   not a record of accepted differences."
+  "test/integration/fuzz/interval-divergences.edn")
+
 (def datetime-manifest-path
   "The datetime corpus keeps its OWN manifest. It is a fixed corpus with
    a known end state -- every PARSER entry is meant to be deleted -- so
@@ -801,8 +1097,9 @@
   (let [read-one (fn [path]
                    (let [f (io/file path)]
                      (if (.exists f) (edn/read-string (slurp f)) [])))
-        entries (into (read-one manifest-path)
-                      (read-one datetime-manifest-path))]
+        entries (reduce into [] (map read-one [manifest-path
+                                               datetime-manifest-path
+                                               interval-manifest-path]))]
     {:exact (into {} (keep (fn [{:keys [surface key reason]}]
                              (when key [[surface key] reason])))
                   entries)
@@ -866,11 +1163,12 @@
                    ;; The gate was decoration, and the manifest header
                    ;; claimed a 17.7-vs-17.10 agreement that nothing had
                    ;; ever checked.
-                   [:select :prepared :join :dml :datetime]
+                   [:select :prepared :join :dml :datetime :interval]
                    [(keyword surface)])
         n (if n (Long/parseLong n) nil)
         seed (if seed (Long/parseLong seed) 20260918)
-        default-n {:select 1500 :prepared 600 :join 150 :dml 300 :datetime 0}
+        default-n {:select 1500 :prepared 600 :join 150 :dml 300
+                   :datetime 0 :interval 0}
         outcomes (doall (for [s surfaces]
                           (report (run-surface s (or n (default-n s)) seed))))
         unexpected (mapcat :unexpected outcomes)

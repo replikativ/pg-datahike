@@ -270,6 +270,16 @@
     :format (fn [{:keys [value message]}]
               (or message (str "date/time field value out of range: \"" value "\"")))}
 
+   ;; DTERR_INTERVAL_OVERFLOW. `interval_in` REMAPS DTERR_FIELD_OVERFLOW
+   ;; to this (timestamp.c:941-943), so an out-of-range interval field
+   ;; is 22015 and not the 22008 the datetime types raise. `'1-13'` and
+   ;; `'2147483648 months'` are both 22015.
+   :interval-field-overflow
+   {:sqlstate "22015"
+    :format (fn [{:keys [value message]}]
+              (or message
+                  (str "interval field value out of range: \"" value "\"")))}
+
    ;; DTERR_TZDISP_OVERFLOW. A SEPARATE SQLSTATE from the two above --
    ;; `'…+16'` is 22009, not 22008 -- and the only way to raise it from
    ;; a literal is a zone displacement past MAX_TZDISP_HOUR.

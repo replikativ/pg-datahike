@@ -30,6 +30,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.datetime.carrier :as carrier]
             [datahike.pg.datetime.in :as in]
+            [datahike.pg.interval.core :as iv]
             [datahike.pg.datetime.zone :as zone]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
@@ -635,6 +636,17 @@
                 (not prefer-local-datetime?) (carrier/->date-value r)
                 tz? (carrier/->offset-datetime r)
                 :else (carrier/->local-datetime r)))))
+
+        ;; `interval_in`, via the ported decoder. There was NO interval
+        ;; arm at all before this, so an interval literal fell through
+        ;; to `cast-scalar`'s unknown-target `:else v` and
+        ;; `'garbage'::interval` returned the text `garbage`.
+        :interval
+        (cond
+          (iv/interval? v) v
+          (types/infinite-datetime v) v
+          (nil? v) nil
+          :else (iv/interval-in (str/trim (str v))))
 
         ;; Every string spelling goes to `date_in`. The branches above
         ;; it are carrier conversions, not parsing -- a value that is

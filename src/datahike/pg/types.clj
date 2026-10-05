@@ -1615,6 +1615,12 @@
   (str (format "%02d:%02d:" (.getHour t) (.getMinute t))
        (seconds-text (.getSecond t) (.getNano t))))
 
+(def ^:private interval-carrier?
+  (delay @(requiring-resolve 'datahike.pg.interval.core/interval?)))
+
+(def ^:private interval->text
+  (delay @(requiring-resolve 'datahike.pg.interval.core/->pg-text-postgres)))
+
 (defn offset-text
   "EncodeTimezone: +HH, then :MM and :SS only when non-zero."
   [^java.time.ZoneOffset o]
@@ -1790,6 +1796,12 @@
      ;; type that can hold it.
      (= :pos (infinite-datetime v)) "infinity"
      (= :neg (infinite-datetime v)) "-infinity"
+     ;; `interval_out`. Reached by `requiring-resolve` because
+     ;; `interval/core.clj` requires THIS namespace for the infinity
+     ;; sentinels. `->pg-text` is the single funnel -- `::text`, array
+     ;; elements, record fields, COPY, pg_dump and `to_jsonb` all come
+     ;; through here -- so this is the only place an interval renders.
+     (@interval-carrier? v) (@interval->text v)
      (instance? java.time.LocalDate v)     (date->pg-text v)
      (instance? java.time.LocalTime v)     (time-text v)
      (instance? java.time.OffsetTime v)
