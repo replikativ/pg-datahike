@@ -284,6 +284,13 @@ the 27 is the parser. They are three things:
   substitution between the SQL path's array construction and its
   rendering.
 
+  **It is not in the corpus**, and that is deliberate: whether a given
+  literal diverges depends on what ran earlier in the session, so the
+  sample is nondeterministic and the manifest cannot pin it. Keeping it
+  made `bb fuzz interval` fail on some runs and pass on others, which
+  trains you to ignore the gate. It needs a deterministic reproduction
+  before it can be gated, and the four cases above are the leads.
+
   The underlying tension is worth stating because it will recur for
   any type we give a non-structural equality: `PgInterval`'s `.equals`
   **must** be `interval_cmp_value` for GROUP BY and DISTINCT to be

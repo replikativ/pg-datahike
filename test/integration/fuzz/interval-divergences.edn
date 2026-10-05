@@ -7,7 +7,7 @@
 ;;
 ;; WAS 835 of 1043 when this corpus was committed -- an interval
 ;; was the user's own text and `cast-scalar` had no interval arm.
-;; Now 27. What is left is three things, and none of them
+;; Now 23. What is left is three things, and none of them
 ;; is the parser:
 ;;
 ;;   STORED CARRIER (18) -- a VALUES or derived relation is
@@ -24,8 +24,8 @@
 ;;     per-entry reason for what is ruled out. A consequence of
 ;;     the carrier's equivalence being coarser than its text.
 ;;
-;; Baseline 2026-10-05: 27 of 1043 samples diverge.
-;; By reason: {"ARITHMETIC" 5, "STORED CARRIER" 18, "VALUE SUBSTITUTION in `array[<interval>]" 4}
+;; Baseline 2026-10-05: 23 of 876 samples diverge.
+;; By reason: {"ARITHMETIC" 5, "STORED CARRIER" 18}
 
 [{:surface :interval,
   :key "SELECT ('1 day'::interval * 2)::text",
@@ -47,22 +47,6 @@
   :key "SELECT (- '1 day'::interval)::text",
   :reason
   "ARITHMETIC: the operator functions -- the 14 {date,time,timetz,timestamp,timestamptz}_{pl,mi}_interval plus interval_pl/mi/um/mul/div. `date-arith-op` still refuses them with 42883. Month addition is NOT microsecond addition: it goes through j2date/date2j with day clamping, so `'2001-01-31' + '1 mon'` is 2001-02-28."}
- {:surface :interval,
-  :key "SELECT ARRAY['1 mon -30 days'::interval]::text",
-  :reason
-  "VALUE SUBSTITUTION in `array[<interval>]::text`: it returns a cmp-equal but DIFFERENT representative. ESTABLISHED: (1) it is session-order dependent -- each of these is CORRECT as the first query on a fresh server, and wrong inside a corpus run; (2) `array['1 mon -30 days'::interval]::text` is wrong even fresh, giving `{00:00:00}`; (3) `cast-scalar` on the array and `arrays/to-pg-text` are both correct in isolation, as is `'<lit>'::interval::text` without the array. RULED OUT: datahike's query-result cache (clear-query-cache! does not help), the identity-keyed statement caches in server.clj, and literal templating (`array` is already on template.clj's `no-template-idents`). NOT YET FOUND: the value-keyed substitution between the SQL path's array construction and its rendering. It is a consequence of giving the carrier cmp-based equality -- the equivalence is COARSER than the observable text, so anything that looks a value up by equality may return the other spelling. Same family as the datahike BigDecimal-scale collision."}
- {:surface :interval,
-  :key "SELECT ARRAY['24:00:00'::interval]::text",
-  :reason
-  "VALUE SUBSTITUTION in `array[<interval>]::text`: it returns a cmp-equal but DIFFERENT representative. ESTABLISHED: (1) it is session-order dependent -- each of these is CORRECT as the first query on a fresh server, and wrong inside a corpus run; (2) `array['1 mon -30 days'::interval]::text` is wrong even fresh, giving `{00:00:00}`; (3) `cast-scalar` on the array and `arrays/to-pg-text` are both correct in isolation, as is `'<lit>'::interval::text` without the array. RULED OUT: datahike's query-result cache (clear-query-cache! does not help), the identity-keyed statement caches in server.clj, and literal templating (`array` is already on template.clj's `no-template-idents`). NOT YET FOUND: the value-keyed substitution between the SQL path's array construction and its rendering. It is a consequence of giving the carrier cmp-based equality -- the equivalence is COARSER than the observable text, so anything that looks a value up by equality may return the other spelling. Same family as the datahike BigDecimal-scale collision."}
- {:surface :interval,
-  :key "SELECT ARRAY['30 days'::interval]::text",
-  :reason
-  "VALUE SUBSTITUTION in `array[<interval>]::text`: it returns a cmp-equal but DIFFERENT representative. ESTABLISHED: (1) it is session-order dependent -- each of these is CORRECT as the first query on a fresh server, and wrong inside a corpus run; (2) `array['1 mon -30 days'::interval]::text` is wrong even fresh, giving `{00:00:00}`; (3) `cast-scalar` on the array and `arrays/to-pg-text` are both correct in isolation, as is `'<lit>'::interval::text` without the array. RULED OUT: datahike's query-result cache (clear-query-cache! does not help), the identity-keyed statement caches in server.clj, and literal templating (`array` is already on template.clj's `no-template-idents`). NOT YET FOUND: the value-keyed substitution between the SQL path's array construction and its rendering. It is a consequence of giving the carrier cmp-based equality -- the equivalence is COARSER than the observable text, so anything that looks a value up by equality may return the other spelling. Same family as the datahike BigDecimal-scale collision."}
- {:surface :interval,
-  :key "SELECT ARRAY['720:00:00'::interval]::text",
-  :reason
-  "VALUE SUBSTITUTION in `array[<interval>]::text`: it returns a cmp-equal but DIFFERENT representative. ESTABLISHED: (1) it is session-order dependent -- each of these is CORRECT as the first query on a fresh server, and wrong inside a corpus run; (2) `array['1 mon -30 days'::interval]::text` is wrong even fresh, giving `{00:00:00}`; (3) `cast-scalar` on the array and `arrays/to-pg-text` are both correct in isolation, as is `'<lit>'::interval::text` without the array. RULED OUT: datahike's query-result cache (clear-query-cache! does not help), the identity-keyed statement caches in server.clj, and literal templating (`array` is already on template.clj's `no-template-idents`). NOT YET FOUND: the value-keyed substitution between the SQL path's array construction and its rendering. It is a consequence of giving the carrier cmp-based equality -- the equivalence is COARSER than the observable text, so anything that looks a value up by equality may return the other spelling. Same family as the datahike BigDecimal-scale collision."}
  {:surface :interval,
   :key
   "SELECT count(*) FROM (VALUES ('-1 mon'::interval), ('-30 days'::interval)) t(v) GROUP BY t.v",
