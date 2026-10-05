@@ -43,6 +43,30 @@
 
 (defn- overflow! [] (dt-dec/dterr :field-overflow))
 
+(defn- strtoi64
+  "`strtoi64`: an optional sign then digits, as a LONG. Returns
+   `[value end-index]`.
+
+   The interval decoder needs int64 where the datetime one needed
+   int32: `DecodeInterval` reads its value with `strtoi64`
+   (datetime.c:3477) and uses `strtoint` only for the `-mm` tail.
+   Reusing the datetime `strtoint` here made
+   `'2147483648 months'` raise a ZONE-displacement error, so it
+   reported 22007 where PostgreSQL reports 22015. Out of int64 range
+   is FIELD_OVERFLOW, which `interval_in` then remaps to 22015."
+  [^String s ^long i]
+  (let [n (.length s)
+        neg? (and (< i n) (= (.charAt s i) \-))
+        plus? (and (< i n) (= (.charAt s i) \+))
+        start (if (or neg? plus?) (inc i) i)
+        end (loop [k start]
+              (if (and (< k n) (Character/isDigit (.charAt s k))) (recur (inc k)) k))]
+    (if (= end start)
+      [0 i]
+      (let [v (try (Long/parseLong (subs s start end))
+                   (catch NumberFormatException _ (overflow!)))]
+        [(if neg? (- v) v) end]))))
+
 (def empty-itm
   "`ClearPgItmIn`."
   {:usec 0 :mday 0 :mon 0 :year 0})
@@ -229,11 +253,11 @@
    whatever the typmod said."
   [^String s type]
   (let [n (.length s)
-        [v cp] (#'dt-dec/strtoint s 0)
+        [v cp] (strtoi64 s 0)
         c (when (< cp n) (.charAt s cp))]
     (cond
       (= c \-)
-      (let [[v2 cp2] (#'dt-dec/strtoint s (inc cp))]
+      (let [[v2 cp2] (strtoi64 s (inc cp))]
         ;; `val2 < 0 || val2 >= MONTHS_PER_YEAR` is FIELD_OVERFLOW, not
         ;; a format error -- `'1-13'` is 22015, not 22007.
         (when (or (neg? v2) (>= v2 months-per-year)) (overflow!))
@@ -305,7 +329,12 @@
                ftype (:type f)
                neg-time (fn [^long u]
                           (if (and force-negative? (pos? u)) (- u) u))
-               [itm' tmask type' dtype' pending' before'']
+               ;; A vector, or `::skip` for an IGNORE_DTF token. It must
+               ;; NOT be destructured before the check: destructuring a
+               ;; KEYWORD as a sequence binds nil to everything, so
+               ;; `'1 at'` produced a nil accumulator and an XX000
+               ;; where PostgreSQL gives one second.
+               step
                (case ftype
                  ;; `DecodeTimeCommon` sets `*tmask = DTK_TIME_M`, so a
                  ;; time field CLAIMS hour, minute and second. With an
@@ -367,9 +396,9 @@
                        (dt-dec/dterr :bad-format))))
 
                  (dt-dec/dterr :bad-format))]
-           (if (= itm' ::skip)
+           (if (= step ::skip)
              (recur (dec i) itm fmask type dtype unit-pending? before?)
-             (do
+             (let [[itm' tmask type' dtype' pending' before''] step]
                (when (seq (set/intersection fmask tmask))
                  (dt-dec/dterr :bad-format))
                (recur (dec i) itm' (into fmask tmask) type' dtype'

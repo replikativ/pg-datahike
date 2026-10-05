@@ -39,7 +39,11 @@
    `toString` is NOT the SQL rendering. Output goes through
    `types/->pg-text`, which is the single funnel for `::text`, array
    elements, record fields, COPY, pg_dump and `to_jsonb`."
-  (:require [clojure.string :as str])
+  (:require [clojure.string :as str]
+            [datahike.pg.datetime.lex :as lex]
+            [datahike.pg.errors :as errors]
+            [datahike.pg.interval.decode :as decode]
+            [datahike.pg.types :as types])
   (:import [java.math BigInteger]))
 
 (def ^:const months-per-year 12)
@@ -180,3 +184,123 @@
              (format "%02d" (Math/abs (long min))) ":"
              (append-seconds sec usec true)))
       s)))
+
+;; ---------------------------------------------------------------------------
+;; interval_in (timestamp.c:900-960)
+;; ---------------------------------------------------------------------------
+
+(defn interval-in
+  "`interval_in`. Text to a `PgInterval`, or the infinity sentinels.
+
+   THE FALLBACK ORDER IS EXACT and is the part worth getting right:
+   `ParseDateTime` then `DecodeInterval`, and `DecodeISO8601Interval`
+   is tried ONLY when that returned DTERR_BAD_FORMAT specifically --
+   not on an overflow. So an input the ordinary decoder rejects as out
+   of range must NOT be retried as ISO, or `'2147483648 months'` would
+   fall through and be refused with the wrong error.
+
+   And FIELD_OVERFLOW is REMAPPED to INTERVAL_OVERFLOW, SQLSTATE
+   22015 -- `interval field value out of range` -- not the 22008 the
+   datetime types raise (timestamp.c:941-943)."
+  ([^String s] (interval-in s nil))
+  ([^String s range]
+   (let [range (or range decode/full-range)
+         attempt
+         (fn [] (try
+                  [:ok (decode/decode-interval
+                        (lex/tokenize s (:interval lex/buflen-for)) range false)]
+                  (catch clojure.lang.ExceptionInfo e
+                    (if-let [k (::lex/dterr (ex-data e))] [:err k] (throw e)))))
+         [tag v] (attempt)
+         [tag v] (if (= v :bad-format)
+                   (try [:ok (decode/decode-iso8601-interval s)]
+                        (catch clojure.lang.ExceptionInfo e
+                          (if-let [k (::lex/dterr (ex-data e))] [:err k] (throw e))))
+                   [tag v])]
+     (if (= tag :err)
+       (throw (errors/pg-error
+               (case v
+                 (:field-overflow :interval-overflow) :interval-field-overflow
+                 :invalid-datetime-format)
+               {:type "interval" :value s}))
+       (case (:dtype v)
+         :delta (interval (:months v) (:days v) (:micros v))
+         :late types/pos-infinity
+         :early types/neg-infinity)))))
+
+;; ---------------------------------------------------------------------------
+;; justify_hours / justify_days / justify_interval (timestamp.c:2952-3060)
+;;
+;; `justify_interval` is also the CANONICAL FORM for the
+;; `interval_cmp` equivalence class -- cmp-equal intervals justify to
+;; the same three fields, checked over eight pairs on the oracle. That
+;; is why the differential corpus projects values through it: `::text`
+;; is spelling, and PostgreSQL prints `1 mon` and `30 days`
+;; differently while comparing them equal.
+;; ---------------------------------------------------------------------------
+
+(defn- tmodulo
+  "`TMODULO(t, q, u)`: q gets the quotient, t the remainder, both
+   TRUNCATED toward zero. Returns `[remainder quotient]`."
+  [^long t ^long u]
+  (let [q (quot t u)] [(- t (* q u)) q]))
+
+(defn justify-hours
+  "`interval_justify_hours`: whole days out of the time field, then a
+   sign correction so day and time agree in sign."
+  ^PgInterval [^PgInterval iv]
+  (let [[t wholeday] (tmodulo (.-micros iv) usecs-per-day)
+        d (+ (.-days iv) wholeday)
+        [d t] (cond
+                (and (pos? d) (neg? t)) [(dec d) (+ t usecs-per-day)]
+                (and (neg? d) (pos? t)) [(inc d) (- t usecs-per-day)]
+                :else [d t])]
+    (interval (.-months iv) d t)))
+
+(defn justify-days
+  "`interval_justify_days`: whole months out of the day field, with the
+   same sign correction."
+  ^PgInterval [^PgInterval iv]
+  (let [wholemonth (quot (.-days iv) 30)
+        d (- (.-days iv) (* wholemonth 30))
+        m (+ (.-months iv) wholemonth)
+        [m d] (cond
+                (and (pos? m) (neg? d)) [(dec m) (+ d 30)]
+                (and (neg? m) (pos? d)) [(inc m) (- d 30)]
+                :else [m d])]
+    (interval m d (.-micros iv))))
+
+(defn justify-interval
+  "`interval_justify_interval`. Not simply justify-days after
+   justify-hours: the FIRST month extraction runs only when day and
+   time already agree in sign, and the final sign correction looks at
+   the time field too -- `month > 0 && (day < 0 || (day == 0 && time <
+   0))`. Composing the other two gives a different answer for a mixed
+   interval."
+  ^PgInterval [^PgInterval iv]
+  (let [m0 (.-months iv) d0 (.-days iv) t0 (.-micros iv)
+        [m1 d1] (if (or (and (pos? d0) (pos? t0)) (and (neg? d0) (neg? t0)))
+                  (let [wm (quot d0 30)] [(+ m0 wm) (- d0 (* wm 30))])
+                  [m0 d0])
+        [t2 wholeday] (tmodulo t0 usecs-per-day)
+        d2 (+ d1 wholeday)
+        wm2 (quot d2 30)
+        d3 (- d2 (* wm2 30))
+        m3 (+ m1 wm2)
+        [m4 d4] (cond
+                  (and (pos? m3) (or (neg? d3) (and (zero? d3) (neg? t2))))
+                  [(dec m3) (+ d3 30)]
+                  (and (neg? m3) (or (pos? d3) (and (zero? d3) (pos? t2))))
+                  [(inc m3) (- d3 30)]
+                  :else [m3 d3])
+        ;; A SECOND sign correction, between day and time, which the
+        ;; month/day one above does not cover. Without it
+        ;; `justify_interval('-1 2:03:04')` came out as
+        ;; `-1 days +02:03:04` where the oracle gives `-21:56:56`: the
+        ;; month correction cannot fire when there are no months, and a
+        ;; day and a time of opposite sign are left as they are.
+        [d5 t5] (cond
+                  (and (pos? d4) (neg? t2)) [(dec d4) (+ t2 usecs-per-day)]
+                  (and (neg? d4) (pos? t2)) [(inc d4) (- t2 usecs-per-day)]
+                  :else [d4 t2])]
+    (interval m4 d5 t5)))
