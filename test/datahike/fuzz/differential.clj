@@ -858,7 +858,15 @@
    manifest entry the run drew that now agrees."
   [& [surface n seed]]
   (let [surfaces (if (or (nil? surface) (= "all" surface))
-                   [:select :prepared :join :dml]
+                   ;; `:datetime` MUST be in this list. It was not, for the
+                   ;; whole life of the datetime port: `default-n` had an
+                   ;; entry for it and this vector did not, so `bb fuzz
+                   ;; all` -- which is what CI runs -- silently skipped
+                   ;; the corpus while the CI step's NAME said it ran.
+                   ;; The gate was decoration, and the manifest header
+                   ;; claimed a 17.7-vs-17.10 agreement that nothing had
+                   ;; ever checked.
+                   [:select :prepared :join :dml :datetime]
                    [(keyword surface)])
         n (if n (Long/parseLong n) nil)
         seed (if seed (Long/parseLong seed) 20260918)
