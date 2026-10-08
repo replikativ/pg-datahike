@@ -410,21 +410,46 @@
   (get types/oid->pg-name (types/infer-oid-from-value v) "unknown"))
 
 (defn- temporal-instant
-  "A timestamp carrier as a `java.time.Instant`. Both `java.util.Date`
-   and `LocalDateTime` denote a UTC instant in this codebase; the
-   LocalDateTime one is simply the carrier that keeps microseconds."
+  "A temporal carrier as a `java.time.Instant`, or nil for anything that
+   is not one. `java.util.Date`, `Instant`, `LocalDateTime` and
+   `LocalDate` all denote a UTC instant in this codebase; LocalDateTime
+   is simply the carrier that keeps microseconds, and LocalDate the one
+   a `date` column uses.
+
+   There were TWO functions of this name in this namespace, the second
+   shadowing the first from its definition on: a narrow one that handled
+   only Date and LocalDateTime and THREW on anything else, and this one.
+   `order-cmp` got the narrow one and the `<` family got this one, so
+   `WHERE d < '2030-01-01'` on a `date` column worked through the
+   operator and threw through ORDER BY -- and when the two comparators
+   were merged, the surviving arm was the narrow one and a CHECK
+   constraint comparing a LocalDate against a java.util.Date started
+   answering 42883 instead of 23514. Hence one definition, placed before
+   its first user."
   ^java.time.Instant [v]
-  (if (instance? java.time.LocalDateTime v)
+  (cond
+    (instance? java.util.Date v) (.toInstant ^java.util.Date v)
+    (instance? java.time.Instant v) v
+    (instance? java.time.LocalDateTime v)
     (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
-    (.toInstant ^java.util.Date v)))
+    (instance? java.time.LocalDate v)
+    (.toInstant (.atStartOfDay ^java.time.LocalDate v) java.time.ZoneOffset/UTC)
+    :else nil))
 
 (defn- mixed-temporal?
-  "One value is a `java.util.Date` and the other a `LocalDateTime`.
-   Same-carrier pairs fall through to `compare`, which is already
-   right for each and keeps the common path allocation-free."
+  "Two DIFFERENT temporal carriers, which are not mutually Comparable --
+   a `java.util.Date` against a `LocalDateTime`, or either against the
+   `LocalDate` a `date` column carries.
+
+   The class check comes first and settles the common case: two values
+   of one carrier fall through to `compare`, which is already right for
+   each, so the ordinary path stays allocation-free."
   [a b]
-  (or (and (instance? java.util.Date a) (instance? java.time.LocalDateTime b))
-      (and (instance? java.time.LocalDateTime a) (instance? java.util.Date b))))
+  (and (not (identical? (class a) (class b)))
+       (some? (temporal-instant a))
+       (some? (temporal-instant b))))
+
+(declare record-order-cmp)
 
 (defn order-cmp
   "`compare`, with two corrections.
@@ -451,6 +476,26 @@
   (cond
     (and (bytes? a) (bytes? b))
     (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
+    ;; UUID is ordered as 16 UNSIGNED bytes (`uuid_cmp`, uuid.c), and
+    ;; `java.util.UUID.compareTo` compares its two longs SIGNED -- so
+    ;; any uuid with the high bit set sorts on the wrong side. This arm
+    ;; lived only in `sql-order-cmp`, the comparator the `<` family
+    ;; uses, so `WHERE a < b` and `ORDER BY a` disagreed on exactly
+    ;; those values. One comparator, one answer.
+    (and (instance? java.util.UUID a) (instance? java.util.UUID b))
+    (let [^java.util.UUID ua a
+          ^java.util.UUID ub b
+          high (Long/compareUnsigned (.getMostSignificantBits ua)
+                                     (.getMostSignificantBits ub))]
+      (if (zero? high)
+        (Long/compareUnsigned (.getLeastSignificantBits ua)
+                              (.getLeastSignificantBits ub))
+        high))
+    (and (pg-rec/record? a) (pg-rec/record? b)) (record-order-cmp a b)
+    ;; PostgreSQL has no operator between a composite and a scalar.
+    (or (pg-rec/record? a) (pg-rec/record? b))
+    (throw (ex-info "cannot compare record and non-record values"
+                    {:error :datatype-mismatch :sqlstate "42804"}))
     (and (pg-vector/vector-value? a) (pg-vector/vector-value? b))
     (pg-vector/compare-values a b)
     (or (types/numeric-special? a) (types/numeric-special? b))
@@ -666,7 +711,20 @@
    that sentinel everywhere else in this namespace, and it is what a
    nullable ORDER BY column actually binds to — so ordering by one threw
    `class clojure.lang.Keyword cannot be cast to class java.lang.String`
-   rather than sorting it last."
+   rather than sorting it last.
+
+   The scalar comparison is `order-cmp`, not `compare`. This function
+   had its own `:else (compare a b)`, which made an aggregate's ORDER BY
+   the one sort in the system that disagreed with every other:
+   `string_agg(v::text, ',' ORDER BY v)` over uuids sorted them SIGNED,
+   so a uuid with the high bit set came out first, and ordering by a
+   `bytea` key threw `class [B cannot be cast to class
+   java.lang.Comparable` because a byte array is not Comparable at all.
+   `order-cmp` answers both, along with intervals, composites and NaN.
+
+   The general `(= a b) 0` shortcut is gone with it: `=` is false for
+   two NaNs and identity for two byte arrays, so it answered those two
+   cases WORSE than the comparator it was short-circuiting."
   [a b]
   (let [null? (fn [x] (or (nil? x) (= :__null__ x)))]
     (cond
@@ -677,10 +735,10 @@
               (empty? b) 1
               :else (let [c (akey-compare (first a) (first b))]
                       (if (zero? c) (recur (subvec a 1) (subvec b 1)) c))))
-      (= a b) 0
+      (and (null? a) (null? b)) 0
       (null? a) 1
       (null? b) -1
-      :else (compare a b))))
+      :else (order-cmp a b))))
 
 (defn- agg-ordered-values
   "The values of a collection of [sort-key value] pairs, in sort-key
@@ -709,17 +767,50 @@
   (delay @(requiring-resolve 'datahike.pg.interval.core/value-key)))
 
 (defn value-key
-  "A value as its SQL-equality key, for the `clojure.core` operations
-   that take no comparator -- `distinct`, `set`, `clojure.set/*`.
+  "A value as its SQL-EQUALITY key, for the `clojure.core` operations
+   that take no comparator -- `distinct`, `set`, `clojure.set/*`,
+   `contains?` -- and for any grouping key we build ourselves.
 
-   Only intervals differ from themselves here, and for the reason
-   PostgreSQL keeps two equalities: the carrier's `.equals` is
-   REPRESENTATIONAL (`datumIsEqual`, so plan caches cannot conflate
-   `1 mon` with `30 days`), while SQL's `=`, DISTINCT, GROUP BY and the
-   set operations use the opclass's `interval_eq`. This supplies the
-   second one where the operation itself cannot take it."
+   PostgreSQL decides GROUP BY, DISTINCT and the set operations with
+   the type's own equality and hash from the opclass
+   (`execTuplesHashPrepare`, executor/execGrouping.c). Clojure's `=`
+   disagrees with it for FOUR families, each a silent wrong answer
+   where it bites -- all four verified against the oracle:
+
+     NaN          `=` is false, PostgreSQL groups NaNs together
+                  (float8_cmp_internal orders NaN above everything and
+                  equal to itself), so `GROUP BY` split every NaN into
+                  its own group.
+     byte[]       `=` is IDENTITY, so two equal bytea values never
+                  grouped. PostgreSQL compares the bytes.
+     BigDecimal   `(= 1.0M 1.00M)` is false because the scales differ,
+                  while `1.0::numeric = 1.00::numeric` is TRUE. Note
+                  this is the same shape as interval: equal values that
+                  PRINT differently (`1.00::numeric::text` is `1.00`),
+                  so the equality is COARSER than the text and cannot
+                  be `.equals`.
+     PgInterval   `.equals` is representational on purpose -- see
+                  `interval/core.clj` -- so the opclass equality has to
+                  be supplied here.
+
+   A float array (pgvector) is left alone: PostgreSQL has no equality
+   operator for it at all, and `stmt.clj` refuses GROUP BY over one
+   rather than guessing.
+
+   The key is only ever compared with other keys, never rendered -- the
+   surviving ROW is the original value, because PostgreSQL keeps the
+   first-seen spelling of a tie."
   [v]
-  (if (@interval-pred v) (@interval-value-key v) v))
+  (cond
+    (@interval-pred v) (@interval-value-key v)
+    ;; One canonical NaN, so every NaN keys alike. `Double/NaN` itself
+    ;; cannot be the key: `(= Double/NaN Double/NaN)` is false.
+    (nan-num? v) ::nan
+    (bytes? v) (vec ^bytes v)
+    ;; `stripTrailingZeros` makes 1.0M and 1.00M the same key. It also
+    ;; normalises 1E+1 and 10, which `numeric_eq` likewise calls equal.
+    (instance? java.math.BigDecimal v) (.stripTrailingZeros ^java.math.BigDecimal v)
+    :else v))
 
 (defn row-value-key
   "`value-key` over a result ROW, for the set operations."
@@ -1309,18 +1400,6 @@
       :db.type/float  (float v)
       v)))
 
-(defn- temporal-instant
-  "Canonical instant for the temporal carriers used by SQL translation."
-  [v]
-  (cond
-    (instance? java.util.Date v) (.toInstant ^java.util.Date v)
-    (instance? java.time.Instant v) v
-    (instance? java.time.LocalDateTime v)
-    (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
-    (instance? java.time.LocalDate v)
-    (.toInstant (.atStartOfDay ^java.time.LocalDate v) java.time.ZoneOffset/UTC)
-    :else nil))
-
 (declare sql-eq?)
 
 (def ^:private record-no-equality-oids
@@ -1489,65 +1568,35 @@
    hence a default rather than a required argument."
   "<")
 
-(defn- sql-order-cmp [a b]
-  (cond
-    (and (pg-rec/record? a) (pg-rec/record? b))
-    (record-order-cmp a b)
+(defn- sql-order-cmp
+  "The comparator the `<` family uses. `order-cmp` IS the comparator
+   now -- records, temporal carriers, unsigned bytea and uuid, vectors,
+   NaN and the numeric specials all live there -- and this adds the one
+   thing only an OPERATOR needs: when two values have no ordering at
+   all, PostgreSQL names the two types and says it has no such
+   operator, where `compare` leaks the JVM's own
+   `class java.lang.Long cannot be cast to class java.lang.String`
+   under XX000.
 
-    (or (pg-rec/record? a) (pg-rec/record? b))
-    (throw (ex-info "cannot compare record and non-record values"
-                    {:error :datatype-mismatch
-                     :sqlstate "42804"}))
-
-    (and (temporal-instant a) (temporal-instant b))
-    (compare (temporal-instant a) (temporal-instant b))
-
-    (and (bytes? a) (bytes? b))
-    (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
-
-    (and (instance? java.util.UUID a) (instance? java.util.UUID b))
-    (let [^java.util.UUID a a
-          ^java.util.UUID b b
-          high (Long/compareUnsigned (.getMostSignificantBits a)
-                                     (.getMostSignificantBits b))]
-      (if (zero? high)
-        (Long/compareUnsigned (.getLeastSignificantBits a)
-                              (.getLeastSignificantBits b))
-        high))
-
-    (or (nan-num? a) (nan-num? b)
-        (types/numeric-special? a) (types/numeric-special? b))
-    (order-cmp a b)
-
-    ;; `compare` throws a raw ClassCastException for two values of
-    ;; unrelated classes, and the client got the JVM's own sentence --
-    ;; `class java.lang.Long cannot be cast to class java.lang.String`
-    ;; -- under XX000. Whatever put text opposite a number is a defect
-    ;; further up, but leaking a JVM message tells nobody what
-    ;; happened: PostgreSQL names the two types and says it has no
-    ;; such operator.
-    ;;
-    ;; Except against an UNBOUND PARAMETER. A derived table is
-    ;; materialised at TRANSLATE time, before Bind has supplied
-    ;; anything, so `WHERE id <= $1` reaches here as Long vs ParamRef
-    ;; -- and the ClassCastException is load-bearing: it is how that
-    ;; pass learns the relation cannot be computed yet and leaves it
-    ;; empty for the runtime to redo. Answering with a SQL error
-    ;; instead made `SELECT * FROM (SELECT … WHERE id <= ?) x` fail at
-    ;; Parse. Only a comparison of two real VALUES is a type error.
-    :else
-    (try (compare a b)
-         (catch ClassCastException e
-           (when (or (unbound-param? a) (unbound-param? b))
-             (throw e))
-           (throw (errors/pg-error
-                   :undefined-function
-                   {:message (str "operator does not exist: "
-                                  (runtime-type-name a) " " *cmp-op* " "
-                                  (runtime-type-name b))
-                    :hint (str "No operator matches the given name and "
-                               "argument types. You might need to add "
-                               "explicit type casts.")}))))))
+   Keeping two comparators is what let `ORDER BY a` and `WHERE a < b`
+   disagree on uuids: the unsigned arm was only in this one. The split
+   is now error-reporting only."
+  [a b]
+  (try (order-cmp a b)
+       (catch ClassCastException e
+         ;; An UNBOUND PARAMETER is a different failure -- a derived
+         ;; table can reach here before Bind -- and must not be
+         ;; reported as a missing operator.
+         (when (or (unbound-param? a) (unbound-param? b))
+           (throw e))
+         (throw (errors/pg-error
+                 :undefined-function
+                 {:message (str "operator does not exist: "
+                                (runtime-type-name a) " " *cmp-op* " "
+                                (runtime-type-name b))
+                  :hint (str "No operator matches the given name and "
+                             "argument types. You might need to add "
+                             "explicit type casts.")})))))
 
 (defn- nan-cmp-op
   "PostgreSQL orders NaN ABOVE every non-NaN for float and numeric
@@ -1805,6 +1854,10 @@
    when the O(1) hit misses, so the common same-type case stays O(1)."
   [vals v]
   (or (contains? vals v)
+      ;; The set membership is `=`-based, which misses NaN, bytea, a
+      ;; numeric of a different scale and an interval -- so try the
+      ;; SQL-equality keys before falling back to the linear scan.
+      (contains? (into #{} (map value-key) vals) (value-key v))
       (boolean (some #(sql-eq? % v) vals))))
 
 (defn- int-width-error [tname]

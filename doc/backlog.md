@@ -701,6 +701,133 @@ out: a different asyncpg build (CI compiles it; the local `.venv` may
 not), Python 3.11 in CI vs 3.12 locally, and accumulated tables in the
 long-lived local database changing what introspection returns.
 
+## Which stored types a text carrier gets wrong
+
+Most PostgreSQL types that Datahike stores as `:db.type/string` are
+stored *faithfully*, because PostgreSQL's own equality and ordering for
+them agree with string equality and string ordering of the canonical
+text. That is a testable criterion, so it was measured against the
+oracle (PG 17.10) rather than assumed. A text carrier is unfaithful
+exactly when one of two things holds:
+
+- **equality coarser than text** — two values compare equal but print
+  differently, so a text key *splits* one group;
+- **ordering ≠ text ordering** — so `ORDER BY` over the text key
+  *misorders*.
+
+| type | eq coarser than text | order ≠ text order | carrier | verdict |
+|---|---|---|---|---|
+| `interval` | yes (`1 mon` = `30 days`) | no | string | **unfaithful** |
+| `jsonb` | yes (`{"a":1.0}` = `{"a":1.00}`) | yes (`null` < `"a"`) | string | **unfaithful** |
+| `inet`/`cidr` | no | yes (`9.0.0.0` < `10.0.0.0`) | string (fallback) | **unfaithful** |
+| `numeric` | yes (`1.0` = `1.00`) | yes (`9` < `10`) | **bigdec** | native; `value-key` collapses the scale |
+| `time`/`timetz` | no | no | string | **faithful** — zero-padded canonical text sorts correctly, and `timetz_cmp` breaks a UTC tie on the zone itself, so it never groups two spellings |
+| `uuid`, `macaddr`, `varbit`, `bpchar` | no | no | native/string | faithful |
+
+So `time`/`timetz`-as-text is not a shortcut to be repaid; it is
+correct. Three types need more than text, and only `interval` is
+currently in the corpus.
+
+### Write-side canonicalization cannot fix `interval`
+
+`jsonb`, the geometric types and `macaddr` are all handled by
+canonicalizing on write, keyed on `:pg/type` (stmt.clj ~7990). That
+works there because PostgreSQL *itself* canonicalizes those on input.
+It cannot work for `interval`: PostgreSQL **preserves the
+representation** in storage and keeps a coarser equality over it.
+Verified on the oracle — a table holding `'1 mon'` and `'30 days'`
+returns both spellings unchanged, yet `GROUP BY v` over the two yields
+**one** group. Canonicalizing on write would destroy a distinction a
+real server keeps.
+
+`interval_out` text *is* a lossless carrier, though:
+`v::text::interval = v` and `v::text::interval::text = v::text` both
+hold for every probe including `-2147483648 days` and
+`178000000 years`. So the storage layer loses nothing by holding text —
+what is missing is only that the query layer must see a `PgInterval`
+rather than a string, which is what `fns/value-key` already keys on.
+
+### If a native Datahike value type is used instead
+
+The comparator handed to Datahike must be the **representational**
+order over `(months, days, micros)` — *not* `PgInterval.compareTo`,
+which is `interval_cmp_value`. Datahike compares datom values with the
+registered comparator (`datom.cljc`, `(:compare …)`) and its index is a
+sorted set, so a comparator that returns 0 for two values that are not
+`.equals` collides them and **loses a datom**: `1 mon` and `30 days`
+compare 0 and are deliberately not equal. The required invariant
+(`compare(a,b) == 0 iff a == b`) holds for the representational order
+and fails for the opclass order. PostgreSQL's own opclass ordering stays
+where it belongs — in `fns/order-cmp`, serving `ORDER BY`.
+
+### GROUP BY over NaN and `bytea` — Datahike's query layer disagrees with its own index
+
+`GROUP BY` is not performed by pg-datahike: it becomes the non-aggregate
+`:find` elements of a Datalog query, so Datahike's own result set does
+the grouping. `fns/value-key` therefore cannot reach it, and two cases
+are still wrong (measured on the live server against the oracle):
+
+| query | ours | PG 17.10 |
+|---|---|---|
+| `GROUP BY v` over two `'NaN'::float8` | 2 groups | 1 |
+| `GROUP BY v` over two `'\x01'::bytea` | 2 groups | 1 |
+| `GROUP BY v` over `1.0::numeric`, `1.00::numeric` | 1 | 1 |
+
+`numeric` is already right because `clojure.core/=` compares two
+`BigDecimal`s numerically and `hasheq` agrees; `NaN` and `byte[]` are
+not, because `=` on boxed doubles is `==` (so `NaN ≠ NaN`) and on arrays
+is identity.
+
+What makes this a Datahike question rather than a PostgreSQL one is that
+**Datahike's index already treats both as single values** — verified
+directly:
+
+```text
+cardinality/many attribute, same NaN twice      → 1 datom
+cardinality/many attribute, equal byte[] twice  → 1 datom
+[:db/retract e :v/d Double/NaN]                 → removes it
+```
+
+while a query over two entities holding those same values returns
+
+```text
+(d/q '{:find [?v (count ?e)] …})  →  [[##NaN 1] [##NaN 1]]
+```
+
+So the index says one value and the query says two. That is
+self-inconsistent for Datahike on its own terms, before PostgreSQL
+semantics enter the picture, and fixing it there fixes our `GROUP BY`
+for free. The alternative — merging groups after the fact in
+pg-datahike — only composes for some aggregates and leaves the
+inconsistency in place.
+
+### The corpus cannot currently see any of this
+
+Every divergence in the two sections above was found by hand-probing the
+oracle, not by `bb fuzz`, and that is a coverage hole rather than luck:
+the `ft` fixture has a `float8` column but no row holding `NaN`, and no
+`bytea` column at all, so the grammar cannot emit a `GROUP BY` or a
+`DISTINCT` over either. The one `select` divergence the corpus does
+report is `to_char` (an honest `0A000`).
+
+Adding a case to the `select` surface is the wrong fix: it dispatches on
+`(.nextInt r 60)` with all sixty cases used, so widening the range
+shifts the PRNG stream and moves every existing sample -- the baseline
+would change for reasons that have nothing to do with the change being
+measured. The right shape is a new ENUMERATED surface beside `datetime`
+and `interval` (`seed null`, an explicit sample list, its own
+manifest), covering per type: `GROUP BY`, `DISTINCT`, `=`, `IN`,
+`PARTITION BY`, aggregate `ORDER BY`, and a set operation.
+
+It should be committed as a FAILING gate with each divergence
+enumerated, so the Datahike fix lands as a measured burn-down rather
+than an assertion. Both halves need it: the `value-key` families
+(`fns.clj`) are verified only by hand-written probes today, and the
+`GROUP BY` ones cannot be fixed here at all. When adding it, check that
+`bb fuzz all` actually runs it -- a surface in `default-n` but missing
+from `-main`'s vector runs in neither CI nor `all`, which has happened
+once already.
+
 ## Test-surface note
 
 Before this round the entire JSON surface was **6 assertions**, all

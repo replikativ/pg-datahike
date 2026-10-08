@@ -9049,26 +9049,6 @@
              :ns (:ns plan)}
       returning (assoc :returning returning))))
 
-(defn- insert-select-order-cmp [order-spec]
-  (fn [a b]
-    (let [av (if (sequential? a) a [a])
-          bv (if (sequential? b) b [b])]
-      (loop [specs (partition 3 order-spec)]
-        (if-let [[idx dir nulls] (first specs)]
-          (let [va (nth av idx nil)
-                vb (nth bv idx nil)
-                a-null? (or (nil? va) (= :__null__ va))
-                b-null? (or (nil? vb) (= :__null__ vb))
-                nulls-first? (if nulls (= nulls :first) (= dir :desc))
-                c (cond
-                    (and a-null? b-null?) 0
-                    a-null? (if nulls-first? -1 1)
-                    b-null? (if nulls-first? 1 -1)
-                    (= dir :desc) (fns/order-cmp vb va)
-                    :else (fns/order-cmp va vb))]
-            (if (zero? c) (recur (rest specs)) c))
-          0)))))
-
 (defn- resolve-order-keys
   [results order-spec resolve-value]
   (if (and resolve-value (seq order-spec))
@@ -9085,7 +9065,7 @@
 
 (defn- shape-insert-select-results [results parsed resolve-value]
   (let [sql-cmp (when (seq (:sql-order-by parsed))
-                  (insert-select-order-cmp (:sql-order-by parsed)))
+                  (fns/null-safe-order-cmp (:sql-order-by parsed)))
         ;; An ORDER BY key is evaluated for every input row before LIMIT. Only
         ;; resolve those key cells here; non-key volatile projections remain
         ;; deferred until their candidate survives shaping.
@@ -9101,7 +9081,7 @@
                   results)
         results (resolve-order-keys results (:project-order-by parsed) resolve-value)
         project-cmp (when (seq (:project-order-by parsed))
-                      (insert-select-order-cmp (:project-order-by parsed)))
+                      (fns/null-safe-order-cmp (:project-order-by parsed)))
         results (if project-cmp (sort project-cmp results) results)]
     (if (seq (:project-set parsed))
       (cond->> results
