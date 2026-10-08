@@ -12143,14 +12143,33 @@
         find-aliases (vec (:find-aliases (first executed)))
         wire-oids (int-array (map types/oid->wire-int result-oids))
         ;; Combine results based on operation type
+        ;; UNION / INTERSECT / EXCEPT compare rows under SQL equality,
+        ;; which for an interval is the opclass's `interval_eq` and not
+        ;; the carrier's `.equals` -- that one is representational, so
+        ;; plan caches cannot conflate `1 mon` with `30 days`. PostgreSQL
+        ;; hands the opclass's eq and hash functions to its SetOp node
+        ;; (`execTuplesMatchPrepare`); we canonicalise the row key
+        ;; instead, which is exact.
+        ;;
+        ;; The surviving ROW is the original, not the key: `'30 days'
+        ;; UNION '1 mon'` must still print `30 days`, because PostgreSQL
+        ;; keeps the first-seen spelling of a tie.
+        key-of fns/row-value-key
         combined (case op
                    :union-all (mapcat :results executed)
-                   :union     (distinct (mapcat :results executed))
-                   :intersect (let [sets (map #(set (:results %)) executed)]
-                                (apply clojure.set/intersection sets))
-                   :except    (let [first-set (set (:results (first executed)))
-                                    rest-sets (map #(set (:results %)) (rest executed))]
-                                (apply clojure.set/difference first-set rest-sets))
+                   :union     (fns/distinct-by-value (mapcat :results executed))
+                   :intersect (let [key-sets (map #(into #{} (map key-of) (:results %))
+                                                  (rest executed))]
+                                (filterv (fn [r] (every? #(contains? % (key-of r))
+                                                         key-sets))
+                                         (fns/distinct-by-value
+                                          (:results (first executed)))))
+                   :except    (let [key-sets (map #(into #{} (map key-of) (:results %))
+                                                  (rest executed))]
+                                (filterv (fn [r] (not-any? #(contains? % (key-of r))
+                                                           key-sets))
+                                         (fns/distinct-by-value
+                                          (:results (first executed)))))
                    (mapcat :results executed))
         ;; The trailing ORDER BY applies to the COMBINED result. Without
         ;; this, `EXCEPT` returned set/difference's arbitrary order and an

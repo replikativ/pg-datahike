@@ -77,14 +77,45 @@
 
 (deftype PgInterval [^int months ^int days ^long micros]
   Object
+  ;; REPRESENTATION equality, which is PostgreSQL's `datumIsEqual`
+  ;; (utils/adt/datum.c:207) -- the function `_equalConst` uses to
+  ;; compare two constants in a plan. Its own comment says it "will
+  ;; return false if there are 2 different representations of the same
+  ;; value", and that is deliberate.
+  ;;
+  ;; This is NOT `interval_eq`. PostgreSQL keeps two equalities with two
+  ;; jobs: node/plan comparison is representational, while GROUP BY,
+  ;; DISTINCT and hash joins go through the opclass's `interval_eq` and
+  ;; `interval_hash` (`execTuplesHashPrepare`, executor/execGrouping.c).
+  ;;
+  ;; We collapsed both onto `.equals`, and since `clojure.core/=` IS our
+  ;; node equality, every `=`-keyed structure -- plan caches, fold
+  ;; memos, anything written later -- inherited VALUE equality and
+  ;; could not tell `1 mon` from `30 days`. That returned
+  ;; `'2001-01-31'::timestamp + '30 days'` as February 28 when a
+  ;; cmp-equal literal had been folded first in the same query shape.
+  ;;
+  ;; `interval_cmp_value` equality is correct for ORDER BY and GROUP BY
+  ;; and is NOT A CONGRUENCE FOR ARITHMETIC: `1 mon` and `30 days` are
+  ;; equal, and adding them to a timestamp gives different days. So it
+  ;; cannot be the equality that caches use.
   (equals [_ other]
     (and (instance? PgInterval other)
-         (zero? (.compareTo (cmp-span months days micros)
-                            (cmp-span (.-months ^PgInterval other)
-                                      (.-days ^PgInterval other)
-                                      (.-micros ^PgInterval other))))))
+         (= months (.-months ^PgInterval other))
+         (= days (.-days ^PgInterval other))
+         (= micros (.-micros ^PgInterval other))))
+  ;; UNCHECKED int arithmetic. A `hashCode` must return an int and is
+  ;; expected to wrap; Clojure's `*` and `+` are CHECKED on the int
+  ;; path, so the obvious `(-> h (* 31) (+ days))` threw
+  ;; `integer overflow` for ordinary values -- which surfaced as XX000
+  ;; on every interval query, not as a hashing problem.
   (hashCode [_]
-    (Long/hashCode (span->low64 (cmp-span months days micros))))
+    (unchecked-add-int
+     (unchecked-multiply-int
+      31 (unchecked-add-int
+          (unchecked-multiply-int 31 (Long/hashCode micros))
+          days))
+     months))
   ;; For a REPL and for error messages only. The SQL rendering is
   ;; `types/->pg-text`; see the namespace docstring.
   (toString [this] (->pg-text-postgres this))
@@ -100,6 +131,61 @@
   "A carrier from the decoder's three fields."
   ^PgInterval [months days micros]
   (PgInterval. (int months) (int days) (long micros)))
+
+(defn value-eq?
+  "`interval_eq`: the opclass equality, which is `interval_cmp_value`.
+   `'1 mon' = '30 days'` is TRUE here and false under `.equals`.
+
+   Every SQL site that means the `=` OPERATOR must call this, the way
+   PostgreSQL routes `=` to `interval_eq` rather than to node equality:
+   `sql-eq?`, `sql-distinct?`, `sql-in?`, and anything comparing two
+   intervals for SQL purposes."
+  [a b]
+  (and (instance? PgInterval a) (instance? PgInterval b)
+       (zero? (.compareTo (cmp-span (.-months ^PgInterval a) (.-days ^PgInterval a)
+                                    (.-micros ^PgInterval a))
+                          (cmp-span (.-months ^PgInterval b) (.-days ^PgInterval b)
+                                    (.-micros ^PgInterval b))))))
+
+(defn value-hash
+  "`interval_hash`: the opclass hash, consistent with `value-eq?`. Used
+   where a GROUPING key must collapse cmp-equal intervals.
+
+   `interval_hash` narrows the INT128 span to its low 64 bits before
+   hashing, so two spans differing by exactly 2^64 microseconds hash
+   together in PostgreSQL -- and here."
+  ^long [^PgInterval iv]
+  (Long/hashCode (span->low64 (cmp-span (.-months iv) (.-days iv) (.-micros iv)))))
+
+(defn value-key
+  "A key under which cmp-EQUAL intervals collide and unequal ones do
+   not: the `interval_cmp_value` span itself.
+
+   This is what to group, dedupe or set-operate on when SQL semantics
+   call for the opclass equality but the operation is a `clojure.core`
+   one that takes no comparator -- `set`, `distinct`,
+   `clojure.set/intersection`. PostgreSQL passes the opclass's eq and
+   hash functions down to those operations instead
+   (`execTuplesHashPrepare`); canonicalising the key is the equivalent
+   available to us, and it is EXACT rather than approximate, because
+   two intervals are value-equal precisely when their spans are."
+  [iv]
+  (cmp-span (.-months ^PgInterval iv) (.-days ^PgInterval iv)
+            (.-micros ^PgInterval iv)))
+
+(defn months
+  "The carrier's month field.
+
+   An ACCESSOR rather than direct `.-months` field access with a type
+   hint, because a hint is resolved at compile time and a `deftype`
+   reload mints a NEW class: a namespace hinted against the old one
+   then fails with the memorable
+   `PgInterval cannot be cast to class PgInterval`. Going through
+   functions in this namespace means a reload of it is enough."
+  ^long [^PgInterval iv] (.-months iv))
+
+(defn days ^long [^PgInterval iv] (.-days iv))
+(defn micros ^long [^PgInterval iv] (.-micros iv))
 
 (defn interval? [v] (instance? PgInterval v))
 

@@ -127,17 +127,66 @@
     (is (= "interval"
            (one c "SELECT pg_typeof(time '03:04:05' - time '01:02:03')")))))
 
-(deftest unsupported-temporal-families-do-not-leak-host-casts
+(deftest interval-arithmetic-matches-postgresql
+  ;; These assertions used to require 42883. The refusals existed
+  ;; because an interval was TEXT -- sending that carrier through
+  ;; numeric arithmetic leaked a String->Number cast to the client --
+  ;; and they lift now that it has a structural value. Every
+  ;; expectation is the oracle's own answer.
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE spans (span interval)")
     (exec! c "INSERT INTO spans VALUES ('1 day')")
     (is (= "interval" (one c "SELECT pg_typeof(span) FROM spans")))
+    (is (= "-1 days" (one c "SELECT (-('1 day'::interval))::text")))
+    (is (= "2 days" (one c "SELECT ('1 day'::interval * 2)::text")))
+    (is (= "00:00:00"
+           (one c "SELECT ('1 day'::interval - '1 day'::interval)::text")))
+    (testing "and over a STORED interval column, not just a literal"
+      (is (= "-1 days" (one c "SELECT (-span)::text FROM spans")))
+      (is (= "00:00:00" (one c "SELECT (span - span)::text FROM spans")))
+      (is (= "1 mon 1 day"
+             (one c "SELECT (span + '1 mon'::interval)::text FROM spans"))))
+    (testing "the MONTH stage clamps the day to the target month and the
+              DAY stage does not. These two intervals are cmp-EQUAL and
+              give different answers, which is exactly why the carrier's
+              `.equals` is representational and not `interval_cmp_value`
+              -- a cache keyed on the latter returned February 28 for
+              both."
+      (is (= "2001-02-28 00:00:00"
+             (one c "SELECT ('2001-01-31'::timestamp + '1 mon'::interval)::text")))
+      (is (= "2001-03-02 00:00:00"
+             (one c "SELECT ('2001-01-31'::timestamp + '30 days'::interval)::text")))
+      (is (= "2001-02-28 00:00:00"
+             (one c "SELECT ('2001-03-31'::timestamp - '1 mon'::interval)::text"))))
+    (testing "and in the OTHER order, which is what the collision needed"
+      (is (= "2001-03-02 00:00:00"
+             (one c "SELECT ('2001-01-31'::timestamp + '30 days'::interval)::text")))
+      (is (= "2001-02-28 00:00:00"
+             (one c "SELECT ('2001-01-31'::timestamp + '1 mon'::interval)::text"))))
+    (testing "a time takes the interval's MICROSECONDS only, wrapped into
+              a day -- it has nowhere to put months or days"
+      (is (= "14:00:00" (one c "SELECT ('12:00:00'::time + '2 hours'::interval)::text")))
+      (is (= "12:00:00" (one c "SELECT ('12:00:00'::time + '1 mon'::interval)::text")))
+      (is (= "01:00:00" (one c "SELECT ('23:00:00'::time + '2 hours'::interval)::text"))))
+    (testing "the two equalities, side by side: `=` is the OPCLASS
+              equality while the carrier's own is representational"
+      ;; `::text` on a boolean is `true`/`false`, not `t`/`f` -- the
+      ;; latter is what the WIRE sends, not what the cast produces.
+      (is (= "true" (one c "SELECT ('1 mon'::interval = '30 days'::interval)::text")))
+      (is (= "false" (one c "SELECT ('1 mon'::interval = '29 days'::interval)::text")))
+      (is (= "true" (one c "SELECT ('1 mon'::interval IN ('30 days'::interval))::text")))
+      (is (= "1 mon 1 day"
+             (one c "SELECT ('1 mon'::interval + '1 day'::interval)::text")))
+      (is (= "31 days"
+             (one c "SELECT ('30 days'::interval + '1 day'::interval)::text"))
+          "cmp-equal operands, different results -- not a congruence"))))
+
+(deftest unsupported-temporal-families-do-not-leak-host-casts
+  (with-open [c (jdbc)]
+    ;; `time + time` is not an operator in PostgreSQL either -- it says
+    ;; `operator is not unique` (42725) where we say 42883. Both refuse;
+    ;; the SQLSTATE difference is recorded, not asserted as correct.
     (is (= "42883" (sqlstate c "SELECT time '03:04:05' + time '01:02:03'")))
-    (is (= "42883" (sqlstate c "SELECT -('1 day'::interval)")))
-    (is (= "42883" (sqlstate c "SELECT '1 day'::interval * 2")))
-    (is (= "42883" (sqlstate c "SELECT '1 day'::interval - '1 day'::interval")))
-    (is (= "42883" (sqlstate c "SELECT -span FROM spans")))
-    (is (= "42883" (sqlstate c "SELECT span - span FROM spans")))
     (is (= "0A000"
            (sqlstate c "SELECT to_char(timestamp '2020-01-01', 'YYYY-MM-DD')")))
     (is (= "0A000" (sqlstate c "SELECT to_char('1 day'::interval, 'YYYY')")))))

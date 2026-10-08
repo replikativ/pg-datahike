@@ -4152,6 +4152,7 @@
         any-ts? (or is-ts? is-date? is-time?)
         is-uuid? (= :uuid cast-cat)
         is-interval? (= :interval cast-cat)
+        is-interval? (= :interval cast-cat)
         is-bit? (or (= :bit cast-cat) (= :varbit cast-cat))
         is-array? (= :array cast-cat)
         is-vector? (= :vector cast-cat)
@@ -4447,6 +4448,7 @@
           ;; returned `inner-raw` -- the user's own text -- and
           ;; `'1 mon'::interval = '30 days'::interval` became a STRING
           ;; comparison, answering false where PostgreSQL says true.
+          is-interval? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           is-interval? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::regnamespace — resolve schema name to namespace OID
@@ -4783,6 +4785,45 @@
       'datahike.pg.query-fns/sql-timestamp-
       (and (= op-sym '-) (= types/oid-time loid) (= types/oid-time roid))
       'datahike.pg.query-fns/sql-time-
+
+        ;; interval +/- interval.
+      (and (contains? #{'+ '-} op-sym)
+           (= types/oid-interval loid) (= types/oid-interval roid))
+      (if (= op-sym '+) 'datahike.pg.query-fns/sql-interval+
+          'datahike.pg.query-fns/sql-interval-)
+
+        ;; timestamp/date +/- interval. The three interval fields are
+        ;; applied in three stages with DIFFERENT semantics, so this can
+        ;; never be numeric addition: months carry and then CLAMP the day
+        ;; to the target month's length, days go through Julian-day
+        ;; arithmetic with no clamping, microseconds are added last. So
+        ;; `'2001-01-31' + '1 mon'` is February 28 and
+        ;; `'2001-01-31' + '30 days'` is March 2 -- two intervals that
+        ;; are cmp-EQUAL giving different answers, which is why
+        ;; `interval_cmp_value` must not be the carrier's `.equals`.
+      (and (contains? #{'+ '-} op-sym)
+           (or (timestamp? loid) (date? loid)) (= types/oid-interval roid))
+      (if (= op-sym '+) 'datahike.pg.query-fns/sql-timestamp+interval
+          'datahike.pg.query-fns/sql-timestamp-interval)
+      (and (= op-sym '+) (= types/oid-interval loid)
+           (or (timestamp? roid) (date? roid)))
+      'datahike.pg.query-fns/sql-interval+timestamp
+
+        ;; time +/- interval takes the MICROSECONDS only, wrapped into a
+        ;; day: a time has nowhere to put months or days.
+      (and (contains? #{'+ '-} op-sym)
+           (= types/oid-time loid) (= types/oid-interval roid))
+      (if (= op-sym '+) 'datahike.pg.query-fns/sql-time+interval
+          'datahike.pg.query-fns/sql-time-interval)
+
+        ;; interval * number, number * interval, interval / number.
+      (and (= op-sym '*) (= types/oid-interval loid) (not (temporal? roid)))
+      'datahike.pg.query-fns/sql-interval*
+      (and (= op-sym '*) (= types/oid-interval roid) (not (temporal? loid)))
+      'datahike.pg.query-fns/sql-number*interval
+      (and (= op-sym '/) (= types/oid-interval loid) (not (temporal? roid)))
+      'datahike.pg.query-fns/sql-interval-div
+
         ;; Any other typed temporal combination must not reach numeric +/-,
         ;; whose Number casts leak a JVM implementation error.
       (or (temporal? loid) (temporal? roid))
@@ -6902,10 +6943,10 @@
         ;; `-` wraps it back to itself. `(* -1 x)` could not express that
         ;; because the multiplication carries no width.
         \- (if (= source-type types/oid-interval)
-             ;; Intervals are still text-backed. Until they have a
-             ;; structural value, never send that carrier through numeric
-             ;; multiplication and leak String->Number to a client.
-             (list 'datahike.pg.query-fns/sql-unsupported-temporal-arithmetic inner)
+             ;; `interval_um`: negate all three fields. Not `* -1`,
+             ;; because multiplication cascades fractional months into
+             ;; days and fractional days into seconds.
+             (list 'datahike.pg.query-fns/sql-interval-neg inner)
              (let [w (when-not (number? inner)
                        (int-width-of ctx (.getExpression se)))]
                (cond

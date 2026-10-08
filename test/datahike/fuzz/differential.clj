@@ -864,21 +864,21 @@
      1 `::interval::text`          parser AND renderer together
      2 `justify_interval(...)`     the VALUE, independent of spelling
      3 round-trip through a COLUMN  storage
-     4 `= '1 mon'`                  equality against a fixed reference
-     5 `::interval` unprojected     the bare cast's own error, if any
+     4 as an ARRAY element          element in/out
+     5 `= '1 mon'`                  equality against a fixed reference
+     6 `::interval` unprojected     the bare cast's own error, if any
 
-   THERE IS NO ARRAY PROJECTION, and its absence is deliberate.
-   `ARRAY[<interval>]::text` substitutes a cmp-equal but different
-   representative, and WHETHER a given literal diverges depends on
-   what ran earlier in the same session -- so the sample is
-   nondeterministic and a manifest cannot pin it. Keeping it made
-   `bb fuzz interval` fail with an unexpected divergence on some runs
-   and pass on others, which trains you to ignore the gate. The bug is
-   real and is in doc/review-backlog.md with everything established
-   about it; it needs a deterministic reproduction before it can be
-   gated. (The datetime corpus has no array projection either, and
-   this is the one place that gap is load-bearing rather than an
-   oversight.)
+   The ARRAY projection was removed for a while and is back, and
+   the reason is worth keeping. `ARRAY[<interval>]::text` used to
+   return a cmp-equal but DIFFERENT representative --
+   `array['1 mon']` printing as the 30-days spelling -- and whether a
+   given literal diverged depended on what had run earlier in the
+   session, so no manifest could pin it and the gate was flaky.
+   That was the visible end of a cache keyed on the carrier's
+   `.equals`, which was `interval_cmp_value` and so could not tell
+   `1 mon` from `30 days`. The carrier now uses REPRESENTATION
+   equality, as PostgreSQL's `datumIsEqual` does for plan
+   constants, and these samples are deterministic again.
 
    Projection 1 alone is what the datetime corpus does, and its header
    records why that was not enough."
@@ -890,6 +890,7 @@
          [:value (str "SELECT justify_interval(" (iv lit) "::interval)::text")]
          [:column (str "SELECT a::text FROM (VALUES (" (iv lit)
                        "::interval)) t(a)")]
+         [:array (str "SELECT ARRAY[" (iv lit) "::interval]::text")]
          [:equal (str "SELECT (" (iv lit) "::interval = '1 mon'::interval)")]
          [:bare (str "SELECT " (iv lit) "::interval")]]]
     {:class group

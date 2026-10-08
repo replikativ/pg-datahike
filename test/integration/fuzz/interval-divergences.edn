@@ -7,7 +7,7 @@
 ;;
 ;; WAS 835 of 1043 when this corpus was committed -- an interval
 ;; was the user's own text and `cast-scalar` had no interval arm.
-;; Now 23. What is left is three things, and none of them
+;; Now 18. What is left is three things, and none of them
 ;; is the parser:
 ;;
 ;;   STORED CARRIER (18) -- a VALUES or derived relation is
@@ -24,30 +24,10 @@
 ;;     per-entry reason for what is ruled out. A consequence of
 ;;     the carrier's equivalence being coarser than its text.
 ;;
-;; Baseline 2026-10-05: 23 of 876 samples diverge.
-;; By reason: {"ARITHMETIC" 5, "STORED CARRIER" 18}
+;; Baseline 2026-10-06: 18 of 1043 samples diverge.
+;; By reason: {"STORED CARRIER" 18}
 
 [{:surface :interval,
-  :key "SELECT ('1 day'::interval * 2)::text",
-  :reason
-  "ARITHMETIC: the operator functions -- the 14 {date,time,timetz,timestamp,timestamptz}_{pl,mi}_interval plus interval_pl/mi/um/mul/div. `date-arith-op` still refuses them with 42883. Month addition is NOT microsecond addition: it goes through j2date/date2j with day clamping, so `'2001-01-31' + '1 mon'` is 2001-02-28."}
- {:surface :interval,
-  :key "SELECT ('1 mon'::interval + '1 day'::interval)::text",
-  :reason
-  "ARITHMETIC: the operator functions -- the 14 {date,time,timetz,timestamp,timestamptz}_{pl,mi}_interval plus interval_pl/mi/um/mul/div. `date-arith-op` still refuses them with 42883. Month addition is NOT microsecond addition: it goes through j2date/date2j with day clamping, so `'2001-01-31' + '1 mon'` is 2001-02-28."}
- {:surface :interval,
-  :key "SELECT ('2001-01-31'::timestamp + '1 mon'::interval)::text",
-  :reason
-  "ARITHMETIC: the operator functions -- the 14 {date,time,timetz,timestamp,timestamptz}_{pl,mi}_interval plus interval_pl/mi/um/mul/div. `date-arith-op` still refuses them with 42883. Month addition is NOT microsecond addition: it goes through j2date/date2j with day clamping, so `'2001-01-31' + '1 mon'` is 2001-02-28."}
- {:surface :interval,
-  :key "SELECT ('2001-03-31'::timestamp - '1 mon'::interval)::text",
-  :reason
-  "ARITHMETIC: the operator functions -- the 14 {date,time,timetz,timestamp,timestamptz}_{pl,mi}_interval plus interval_pl/mi/um/mul/div. `date-arith-op` still refuses them with 42883. Month addition is NOT microsecond addition: it goes through j2date/date2j with day clamping, so `'2001-01-31' + '1 mon'` is 2001-02-28."}
- {:surface :interval,
-  :key "SELECT (- '1 day'::interval)::text",
-  :reason
-  "ARITHMETIC: the operator functions -- the 14 {date,time,timetz,timestamp,timestamptz}_{pl,mi}_interval plus interval_pl/mi/um/mul/div. `date-arith-op` still refuses them with 42883. Month addition is NOT microsecond addition: it goes through j2date/date2j with day clamping, so `'2001-01-31' + '1 mon'` is 2001-02-28."}
- {:surface :interval,
   :key
   "SELECT count(*) FROM (VALUES ('-1 mon'::interval), ('-30 days'::interval)) t(v) GROUP BY t.v",
   :reason

@@ -697,6 +697,45 @@
                          akey-compare)
                        coll)))
 
+(def ^:private interval-value-eq
+  (delay @(requiring-resolve 'datahike.pg.interval.core/value-eq?)))
+
+(def ^:private interval-pred
+  (delay @(requiring-resolve 'datahike.pg.interval.core/interval?)))
+
+(defn- interval-value? [v] (@interval-pred v))
+
+(def ^:private interval-value-key
+  (delay @(requiring-resolve 'datahike.pg.interval.core/value-key)))
+
+(defn value-key
+  "A value as its SQL-equality key, for the `clojure.core` operations
+   that take no comparator -- `distinct`, `set`, `clojure.set/*`.
+
+   Only intervals differ from themselves here, and for the reason
+   PostgreSQL keeps two equalities: the carrier's `.equals` is
+   REPRESENTATIONAL (`datumIsEqual`, so plan caches cannot conflate
+   `1 mon` with `30 days`), while SQL's `=`, DISTINCT, GROUP BY and the
+   set operations use the opclass's `interval_eq`. This supplies the
+   second one where the operation itself cannot take it."
+  [v]
+  (if (@interval-pred v) (@interval-value-key v) v))
+
+(defn row-value-key
+  "`value-key` over a result ROW, for the set operations."
+  [row]
+  (if (sequential? row) (mapv value-key row) (value-key row)))
+
+(defn distinct-by-value
+  "`distinct`, under SQL equality rather than `.equals`."
+  [coll]
+  (->> coll (reduce (fn [[seen out] v]
+                      (let [k (row-value-key v)]
+                        (if (contains? seen k) [seen out]
+                            [(conj seen k) (conj out v)])))
+                    [#{} []])
+       second))
+
 (defn distinct-input
   "An aggregate's DISTINCT input. PostgreSQL implements DISTINCT by
    SORTING the input rows and dropping adjacent equals (nodeAgg.c), so
@@ -708,7 +747,7 @@
    and the sort is `akey-compare`, so a NULL among the values cannot
    throw."
   [coll]
-  (let [ds (distinct (remove #(or (nil? %) (= :__null__ %)) coll))]
+  (let [ds (distinct-by-value (remove #(or (nil? %) (= :__null__ %)) coll))]
     (try (sort akey-compare ds) (catch Throwable _ ds))))
 
 (defn distinct-agg
@@ -1413,6 +1452,17 @@
     (and (pg-arr/array? a) (string? b)) (sql-eq? a (pg-arr/from-pg-text b (:elem-type a)))
     (and (pg-arr/array? b) (string? a)) (sql-eq? (pg-arr/from-pg-text a (:elem-type b)) b)
     (and (bytes? a) (bytes? b)) (java.util.Arrays/equals ^bytes a ^bytes b)
+    ;; INTERVAL uses the OPCLASS equality, not `.equals`. The carrier's
+    ;; `.equals` is representational -- PostgreSQL's `datumIsEqual`, the
+    ;; one `_equalConst` uses to compare plan constants -- so `1 mon` and
+    ;; `30 days` are different VALUES there and must not be here:
+    ;; `'1 mon'::interval = '30 days'::interval` is TRUE in PostgreSQL,
+    ;; because the `=` operator is `interval_eq`.
+    ;;
+    ;; This is the same split PostgreSQL maintains: node comparison is
+    ;; `datumIsEqual` (bytes), and GROUP BY / `=` / hash joins go through
+    ;; the opclass's eq and hash functions (`execTuplesHashPrepare`).
+    (and (interval-value? a) (interval-value? b)) (@interval-value-eq a b)
     ;; DATE and TIMESTAMP use different JVM carriers across literal, cast,
     ;; stored-column and set-operation paths. PostgreSQL resolves the
     ;; cross-type operator before execution; compare their canonical temporal
@@ -2070,6 +2120,136 @@
      (let [d (java.time.Duration/between (->local-time b) (->local-time a))]
        (micros-between->interval
         (+ (*' (.getSeconds d) 1000000) (quot (.getNano d) 1000)))))))
+
+(def ^:private interval-coerce
+  "An argument to a justify_* function as a carrier. A STORED interval
+   arrives as its canonical text, because a `deftype` has no datahike
+   value type yet -- so it is re-parsed here. That is the cost the
+   consolidation plan's Phase 2 step 6 removes; until then it is one
+   `interval_in` per call rather than a wrong answer."
+  (delay
+    (let [in @(requiring-resolve 'datahike.pg.interval.core/interval-in)
+          iv? @(requiring-resolve 'datahike.pg.interval.core/interval?)]
+      (fn [v] (cond (iv? v) v
+                    ;; `INTERVAL_NOT_FINITE` short-circuits every
+                    ;; justify_* in the C, so an infinity passes
+                    ;; through unchanged rather than being re-parsed.
+                    (types/infinite-datetime v) v
+                    (string? v) (in v)
+                    :else (throw (errors/pg-error
+                                  :invalid-datetime-format
+                                  {:type "interval" :value (str v)})))))))
+
+(def ^:private iv-arith
+  "The interval arithmetic namespace, by `requiring-resolve` for the
+   same reason as the rest of the interval delegation here: it sits
+   above this namespace."
+  (delay (let [r (fn [sym] @(requiring-resolve sym))]
+           {:add (r 'datahike.pg.interval.arith/add)
+            :subtract (r 'datahike.pg.interval.arith/subtract)
+            :negate (r 'datahike.pg.interval.arith/negate)
+            :multiply (r 'datahike.pg.interval.arith/multiply)
+            :divide (r 'datahike.pg.interval.arith/divide)
+            :timestamp-plus (r 'datahike.pg.interval.arith/timestamp-plus)
+            :timestamp-minus (r 'datahike.pg.interval.arith/timestamp-minus)
+            :time-plus (r 'datahike.pg.interval.arith/time-plus)
+            :time-minus (r 'datahike.pg.interval.arith/time-minus)})))
+
+(def ^:private ts-conv
+  "How `timestamp-plus` takes a timestamp apart and puts it back.
+
+   The carrier varies by call site -- `java.util.Date`,
+   `LocalDateTime`, `OffsetDateTime` -- so the conversion is injected
+   rather than assumed, and the OUTPUT carrier matches the input's.
+   A `java.util.Date` in, a `java.util.Date` out: changing the carrier
+   mid-expression is how a `+00` or a microsecond goes missing."
+  (delay
+    {:ts->fields
+     (fn [ts]
+       (let [ldt (cond
+                   (instance? java.time.LocalDateTime ts) ts
+                   (instance? java.time.OffsetDateTime ts)
+                   (.toLocalDateTime ^java.time.OffsetDateTime ts)
+                   (instance? java.time.LocalDate ts)
+                   (.atStartOfDay ^java.time.LocalDate ts)
+                   :else (java.time.LocalDateTime/ofInstant
+                          (->instant ts) java.time.ZoneOffset/UTC))]
+         {:year (.getYear ^java.time.LocalDateTime ldt)
+          :mon (.getMonthValue ^java.time.LocalDateTime ldt)
+          :mday (.getDayOfMonth ^java.time.LocalDateTime ldt)
+          :usec-of-day (quot (.toNanoOfDay (.toLocalTime ^java.time.LocalDateTime ldt))
+                             1000)}))}))
+
+(defn- rebuild-timestamp
+  "Fields plus the interval's microseconds back to `proto`'s carrier."
+  [proto {:keys [year mon mday usec-of-day]} ^long extra-micros]
+  (let [total (+ (long usec-of-day) extra-micros)
+        days (long (Math/floorDiv total 86400000000))
+        rem (long (Math/floorMod total 86400000000))
+        ldt (-> (java.time.LocalDate/of (int year) (int mon) (int mday))
+                (.plusDays days)
+                (.atStartOfDay)
+                (.plusNanos (* rem 1000)))]
+    (cond
+      (instance? java.time.LocalDate proto) (.toLocalDate ldt)
+      (instance? java.time.LocalDateTime proto) ldt
+      (instance? java.time.OffsetDateTime proto)
+      (.atOffset ldt java.time.ZoneOffset/UTC)
+      :else (java.util.Date/from (.toInstant ldt java.time.ZoneOffset/UTC)))))
+
+(defn- ts-interval-op
+  "`op-key` names the arith function rather than holding it, so the
+   delay is forced on first CALL and not while this namespace loads --
+   `iv-arith` resolves through `interval.arith`, which sits above here."
+  [op-key]
+  (null-safe
+   (fn [a b]
+     (let [f (get @iv-arith op-key)
+           ;; `interval + timestamp` commutes, so either operand may be
+           ;; the interval.
+           [ts iv] (if (interval-value? a) [b a] [a b])
+           conv {:ts->fields (:ts->fields @ts-conv)
+                 :fields->ts (fn [tm m] (rebuild-timestamp ts tm m))}]
+       (if (types/infinite-datetime iv)
+         (f ts iv conv)
+         (f ts (@interval-coerce iv) conv))))))
+
+(def sql-timestamp+interval (ts-interval-op :timestamp-plus))
+(def sql-timestamp-interval (ts-interval-op :timestamp-minus))
+(def sql-interval+timestamp sql-timestamp+interval)
+
+(def sql-interval-neg
+  "`interval_um`. Unary negation, which is NOT `* -1`: multiplication
+   cascades fractional months into days and fractional days into
+   seconds, so `'1 mon' * -1` and `-'1 mon'` would agree only by
+   accident."
+  (null-safe (fn [a] ((:negate @iv-arith) (@interval-coerce a)))))
+
+(def sql-interval+
+  (null-safe (fn [a b] ((:add @iv-arith) (@interval-coerce a) (@interval-coerce b)))))
+(def sql-interval-
+  (null-safe (fn [a b] ((:subtract @iv-arith) (@interval-coerce a) (@interval-coerce b)))))
+(def sql-interval*
+  (null-safe (fn [a b] ((:multiply @iv-arith) (@interval-coerce a) (double b)))))
+(def sql-number*interval
+  (null-safe (fn [a b] ((:multiply @iv-arith) (@interval-coerce b) (double a)))))
+(def sql-interval-div
+  (null-safe (fn [a b] ((:divide @iv-arith) (@interval-coerce a) (double b)))))
+
+(def sql-time+interval
+  (null-safe
+   (fn [a b]
+     (let [t (->local-time a)]
+       (java.time.LocalTime/ofNanoOfDay
+        (* 1000 ((:time-plus @iv-arith) (quot (.toNanoOfDay t) 1000)
+                                        (@interval-coerce b))))))))
+(def sql-time-interval
+  (null-safe
+   (fn [a b]
+     (let [t (->local-time a)]
+       (java.time.LocalTime/ofNanoOfDay
+        (* 1000 ((:time-minus @iv-arith) (quot (.toNanoOfDay t) 1000)
+                                         (@interval-coerce b))))))))
 
 (def sql-unsupported-temporal-arithmetic
   (null-safe
@@ -4779,25 +4959,6 @@
   (delay @(requiring-resolve 'datahike.pg.interval.core/justify-days)))
 (def ^:private interval-justify-interval
   (delay @(requiring-resolve 'datahike.pg.interval.core/justify-interval)))
-
-(def ^:private interval-coerce
-  "An argument to a justify_* function as a carrier. A STORED interval
-   arrives as its canonical text, because a `deftype` has no datahike
-   value type yet -- so it is re-parsed here. That is the cost the
-   consolidation plan's Phase 2 step 6 removes; until then it is one
-   `interval_in` per call rather than a wrong answer."
-  (delay
-    (let [in @(requiring-resolve 'datahike.pg.interval.core/interval-in)
-          iv? @(requiring-resolve 'datahike.pg.interval.core/interval?)]
-      (fn [v] (cond (iv? v) v
-                    ;; `INTERVAL_NOT_FINITE` short-circuits every
-                    ;; justify_* in the C, so an infinity passes
-                    ;; through unchanged rather than being re-parsed.
-                    (types/infinite-datetime v) v
-                    (string? v) (in v)
-                    :else (throw (errors/pg-error
-                                  :invalid-datetime-format
-                                  {:type "interval" :value (str v)})))))))
 
 (defn- justify-fn
   "One justify_* wrapper: coerce the argument to a carrier, unless it
