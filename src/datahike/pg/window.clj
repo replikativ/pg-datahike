@@ -73,8 +73,15 @@
   (let [indexed (map-indexed vector rows)
         groups (if (empty? partition-by-idxs)
                  [indexed]
+                 ;; PARTITION BY groups under SQL equality, which
+                 ;; `clojure.core/=` is not for NaN, bytea, a numeric
+                 ;; with a different scale, or an interval -- so the key
+                 ;; goes through `fns/value-key`. Without it a NaN
+                 ;; partitioned alone and two equal bytea values
+                 ;; partitioned apart.
                  (vals (group-by (fn [[_i row]]
-                                   (mapv #(nth row % nil) partition-by-idxs))
+                                   (mapv #(fns/value-key (nth row % nil))
+                                         partition-by-idxs))
                                  indexed)))
         cmp (when (seq order-by) (make-window-comparator order-by))]
     (if cmp

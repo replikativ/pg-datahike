@@ -32,14 +32,24 @@ FILES=$(clojure -M -e '
 # to 7GB and starved the machine. Recycle it periodically.
 RECYCLE=${AGREEMENT_RECYCLE:-30}
 SRVLOG="${SCRATCH:-/tmp}/server.log"
+# A cold JVM boot here is minutes, not seconds, and it competes with
+# whatever else is on the machine: a 120s deadline killed a measure at
+# file 90 of 155 two seconds before the server announced itself. The
+# deadline is generous on purpose -- the cost of waiting is a slower
+# run, the cost of giving up early is losing the whole measurement.
+BOOT_TRIES=${AGREEMENT_BOOT_TRIES:-150}
 restart_server() {
-  pkill -9 -f start_pgwire 2>/dev/null
-  sleep 2
-  : > "$SRVLOG"
-  nohup clojure -M:server >>"$SRVLOG" 2>&1 &
-  for _ in $(seq 1 60); do
+  for attempt in 1 2; do
+    pkill -9 -f start_pgwire 2>/dev/null
     sleep 2
-    grep -qa "Press Ctrl+C" "$SRVLOG" 2>/dev/null && return 0
+    : > "$SRVLOG"
+    nohup clojure -M:server >>"$SRVLOG" 2>&1 &
+    for _ in $(seq 1 "$BOOT_TRIES"); do
+      sleep 2
+      grep -qa "Press Ctrl+C" "$SRVLOG" 2>/dev/null && return 0
+    done
+    echo "server did not announce itself within $((BOOT_TRIES * 2))s (attempt $attempt); last log lines:" >&2
+    tail -5 "$SRVLOG" >&2
   done
   return 1
 }
