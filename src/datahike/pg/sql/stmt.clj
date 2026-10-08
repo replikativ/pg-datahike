@@ -2761,14 +2761,30 @@
                                 (:query sub-parsed) (:in-args sub-parsed)
                                 (:compound-exprs sub-parsed)))
                        (:find-aliases sub-parsed))
+         ;; The DERIVED set-operation path, which must compare rows the
+         ;; same way the top-level one does: under SQL equality, which
+         ;; for an interval is the opclass's `interval_eq` and not the
+         ;; carrier's `.equals` -- that one is representational so plan
+         ;; caches cannot conflate `1 mon` with `30 days`. Two copies of
+         ;; this logic is why the top-level fix alone left
+         ;; `SELECT … FROM (SELECT a INTERSECT SELECT b) s` wrong.
+         key-of fns/row-value-key
          sub-results (case (:op branch-parsed)
                        :union-all (mapcat identity branch-rows)
-                       :union     (distinct (mapcat identity branch-rows))
-                       :intersect (let [sets (map set branch-rows)]
-                                    (apply clojure.set/intersection sets))
-                       :except    (let [[a & bs] branch-rows]
-                                    (reduce (fn [acc r] (apply disj acc r))
-                                            (set a) bs))
+                       :union     (fns/distinct-by-value
+                                   (mapcat identity branch-rows))
+                       :intersect (let [key-sets (map #(into #{} (map key-of) %)
+                                                      (rest branch-rows))]
+                                    (filterv (fn [r] (every? #(contains? % (key-of r))
+                                                             key-sets))
+                                             (fns/distinct-by-value
+                                              (first branch-rows))))
+                       :except    (let [key-sets (map #(into #{} (map key-of) %)
+                                                      (rest branch-rows))]
+                                    (filterv (fn [r] (not-any? #(contains? % (key-of r))
+                                                               key-sets))
+                                             (fns/distinct-by-value
+                                              (first branch-rows))))
                       ;; nil → not a UNION, single branch
                        (first branch-rows))
         ;; Window functions inside a derived table or CTE. The window pass

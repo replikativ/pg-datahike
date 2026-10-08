@@ -697,6 +697,45 @@
                          akey-compare)
                        coll)))
 
+(def ^:private interval-value-eq
+  (delay @(requiring-resolve 'datahike.pg.interval.core/value-eq?)))
+
+(def ^:private interval-pred
+  (delay @(requiring-resolve 'datahike.pg.interval.core/interval?)))
+
+(defn- interval-value? [v] (@interval-pred v))
+
+(def ^:private interval-value-key
+  (delay @(requiring-resolve 'datahike.pg.interval.core/value-key)))
+
+(defn value-key
+  "A value as its SQL-equality key, for the `clojure.core` operations
+   that take no comparator -- `distinct`, `set`, `clojure.set/*`.
+
+   Only intervals differ from themselves here, and for the reason
+   PostgreSQL keeps two equalities: the carrier's `.equals` is
+   REPRESENTATIONAL (`datumIsEqual`, so plan caches cannot conflate
+   `1 mon` with `30 days`), while SQL's `=`, DISTINCT, GROUP BY and the
+   set operations use the opclass's `interval_eq`. This supplies the
+   second one where the operation itself cannot take it."
+  [v]
+  (if (@interval-pred v) (@interval-value-key v) v))
+
+(defn row-value-key
+  "`value-key` over a result ROW, for the set operations."
+  [row]
+  (if (sequential? row) (mapv value-key row) (value-key row)))
+
+(defn distinct-by-value
+  "`distinct`, under SQL equality rather than `.equals`."
+  [coll]
+  (->> coll (reduce (fn [[seen out] v]
+                      (let [k (row-value-key v)]
+                        (if (contains? seen k) [seen out]
+                            [(conj seen k) (conj out v)])))
+                    [#{} []])
+       second))
+
 (defn distinct-input
   "An aggregate's DISTINCT input. PostgreSQL implements DISTINCT by
    SORTING the input rows and dropping adjacent equals (nodeAgg.c), so
@@ -708,7 +747,7 @@
    and the sort is `akey-compare`, so a NULL among the values cannot
    throw."
   [coll]
-  (let [ds (distinct (remove #(or (nil? %) (= :__null__ %)) coll))]
+  (let [ds (distinct-by-value (remove #(or (nil? %) (= :__null__ %)) coll))]
     (try (sort akey-compare ds) (catch Throwable _ ds))))
 
 (defn distinct-agg
@@ -1413,6 +1452,17 @@
     (and (pg-arr/array? a) (string? b)) (sql-eq? a (pg-arr/from-pg-text b (:elem-type a)))
     (and (pg-arr/array? b) (string? a)) (sql-eq? (pg-arr/from-pg-text a (:elem-type b)) b)
     (and (bytes? a) (bytes? b)) (java.util.Arrays/equals ^bytes a ^bytes b)
+    ;; INTERVAL uses the OPCLASS equality, not `.equals`. The carrier's
+    ;; `.equals` is representational -- PostgreSQL's `datumIsEqual`, the
+    ;; one `_equalConst` uses to compare plan constants -- so `1 mon` and
+    ;; `30 days` are different VALUES there and must not be here:
+    ;; `'1 mon'::interval = '30 days'::interval` is TRUE in PostgreSQL,
+    ;; because the `=` operator is `interval_eq`.
+    ;;
+    ;; This is the same split PostgreSQL maintains: node comparison is
+    ;; `datumIsEqual` (bytes), and GROUP BY / `=` / hash joins go through
+    ;; the opclass's eq and hash functions (`execTuplesHashPrepare`).
+    (and (interval-value? a) (interval-value? b)) (@interval-value-eq a b)
     ;; DATE and TIMESTAMP use different JVM carriers across literal, cast,
     ;; stored-column and set-operation paths. PostgreSQL resolves the
     ;; cross-type operator before execution; compare their canonical temporal
@@ -2070,11 +2120,6 @@
      (let [d (java.time.Duration/between (->local-time b) (->local-time a))]
        (micros-between->interval
         (+ (*' (.getSeconds d) 1000000) (quot (.getNano d) 1000)))))))
-
-(def ^:private interval-pred
-  (delay @(requiring-resolve 'datahike.pg.interval.core/interval?)))
-
-(defn- interval-value? [v] (@interval-pred v))
 
 (def ^:private interval-coerce
   "An argument to a justify_* function as a carrier. A STORED interval

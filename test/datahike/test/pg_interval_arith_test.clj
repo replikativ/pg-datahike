@@ -3,19 +3,15 @@
    interval`, `interval ± interval`, `-interval`, `interval * n`,
    `interval / n` and `time ± interval`.
 
-   THESE ARE NOT WIRED INTO SQL YET, deliberately. The implementation
-   is correct -- every expectation below is the oracle's own answer --
-   but enabling it in `date-arith-op` surfaces a fold-result cache that
-   conflates cmp-EQUAL interval literals, so
-   `'2001-01-31'::timestamp + '30 days'::interval` can return February
-   28 (the `+ 1 mon` answer) when a cmp-equal literal ran first in the
-   same query shape. Shipping that would be a silent wrong DATE, which
-   is exactly what the consolidation plan's Phase 0 exists to prevent.
-   See doc/review-backlog.md.
+   These are the unit tests for the implementation; the SQL-level
+   behaviour is covered by `pg_date_arithmetic_test` and by the
+   differential corpus.
 
-   So these tests exercise the functions directly. When the cache
-   defect is fixed, wiring them up should make them pass through SQL
-   unchanged."
+   Every expectation is the oracle's own answer. The month-clamp cases
+   matter most: `'2001-01-31' + '1 mon'` and `+ '30 days'` are
+   cmp-EQUAL intervals that must give different days, which is the
+   concrete reason `interval_cmp_value` cannot be the carrier's
+   `.equals`."
   (:require [clojure.test :refer [deftest is testing]]
             [datahike.pg.interval.arith :as ia]
             [datahike.pg.interval.core :as ic]
@@ -86,7 +82,10 @@
             arithmetic"
     (is (= "1 mon 1 day" (s' (ia/add (iv "1 mon") (iv "1 day")))))
     (is (= "31 days" (s' (ia/add (iv "30 days") (iv "1 day")))))
-    (is (= (iv "1 mon") (iv "30 days")) "but they still compare equal")))
+    (is (ic/value-eq? (iv "1 mon") (iv "30 days"))
+        "they are still VALUE-equal, under the opclass equality")
+    (is (not= (iv "1 mon") (iv "30 days"))
+        "and NOT `.equals`-equal, which is what keeps caches honest")))
 
 (deftest multiply-and-divide-cascade-fractions-downward
   ;; `interval_mul`: a fraction of a month becomes days at 30 per

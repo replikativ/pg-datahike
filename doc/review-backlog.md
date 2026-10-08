@@ -248,7 +248,8 @@ below is what is genuinely still open.
 
 The port took the interval corpus from 835 divergences to 18, and
 every remaining entry is the SAME issue -- stored intervals. The
-parser, the carrier, the output and the arithmetic are done.
+parser, the carrier, the output and the arithmetic are done, and the
+cmp-equality collision that gated the arithmetic is fixed (below).
 
 - **Stored intervals are stringified (all 18 remaining entries).** A VALUES or
   derived relation is materialised into datahike, and
@@ -262,79 +263,51 @@ parser, the carrier, the output and the arithmetic are done.
   0.8.1903), or the `vector` precedent: refuse GROUP BY/DISTINCT over
   a stored interval column with 0A000, which is at least honest.
 
-- **A fold-result cache conflates cmp-equal interval literals, and it
-  gates the arithmetic.** This is the one blocking defect, and it is
-  now well characterised.
+- **FIXED: the cmp-equality collision.** Recorded because the shape
+  will recur for any type we give a non-structural equality.
 
-  Signature: the same query SHAPE with two cmp-equal interval
-  literals, where the first one's folded result is reused for the
-  second. Measured on a freshly restarted server each time:
+  The carrier's `.equals` was `interval_cmp_value`, and
+  `clojure.core/=` is our node equality -- so every `=`-keyed structure
+  (plan caches, fold memos, `set`, `distinct`, `clojure.set/*`)
+  inherited VALUE equality and could not tell `1 mon` from `30 days`.
+  `'2001-01-31'::timestamp + '30 days'` returned February 28 when a
+  cmp-equal literal had been folded first in the same query shape, and
+  `array['1 mon']` printed as the 30-days spelling.
 
-  ```
-  '2001-01-31'::ts + '1 mon'   first  -> 2001-02-28  (correct)
-  '2001-01-31'::ts + '30 days' after  -> 2001-02-28  (WRONG, PG: 03-02)
+  The fault was collapsing two equalities into one. **PostgreSQL keeps
+  them separate**, and `../postgres` says so outright:
 
-  '2001-01-31'::ts + '30 days' first  -> 2001-03-02  (correct)
-  '2001-01-31'::ts + '1 mon'   after  -> 2001-03-02  (WRONG, PG: 02-28)
+  - plan/node comparison is `datumIsEqual` (`utils/adt/datum.c:207`),
+    which `_equalConst` calls, and whose own comment says it "will
+    return false if there are 2 different representations of the same
+    value";
+  - GROUP BY, DISTINCT, `=` and hash joins use the opclass's eq and
+    hash functions, resolved by `execTuplesHashPrepare`
+    (`executor/execGrouping.c`) to `interval_eq` / `interval_hash`.
 
-  '2001-01-31'::ts + '1 day'   then '2 days'  -> 02-01, 02-02 (both right)
-  ```
+  Identical in REL_17_7 and REL_19_BETA1. PostgreSQL's plan cache also
+  cannot collide by value at all: a `CachedPlanSource` is owned by a
+  named prepared statement and holds its `query_string`, so plans are
+  looked up by identity and never searched for one "equal to" another.
 
-  That last line is the diagnostic one: literals that are NOT cmp-equal
-  do not collide, so the cache key does include the value — it just
-  cannot tell `1 mon` from `30 days`, because `PgInterval.equals` is
-  `interval_cmp_value` and those two ARE equal.
+  The fix mirrors the split: `.equals`/`.hashCode` are representational,
+  `compareTo` stays the btree opclass, `value-eq?` / `value-hash` /
+  `value-key` supply the opclass equality, and the SQL sites that mean
+  the `=` OPERATOR call it explicitly -- `sql-eq?` (and through it
+  `sql-distinct?`, `IN`, `= ANY`), `distinct-input`, and both
+  set-operation paths.
 
-  Ruled out by clearing each and re-testing: datahike's
-  `query-result-cache`, our `sql/*parse-cache*`, the identity-keyed
-  statement caches in `server.clj`, and literal templating (`array` is
-  on `template.clj`'s `no-template-idents`, and the arithmetic shapes
-  differ in SQL text anyway). Not yet located.
+  **Why the cmp equality cannot serve both:** it is not a congruence
+  for arithmetic. `1 mon` and `30 days` are value-equal while
+  `timestamp + 1 mon` and `timestamp + 30 days` are not.
 
-  **The arithmetic is implemented and correct** — `interval/arith.clj`
-  with 39 assertions against the oracle, including the month-clamp
-  cases — and deliberately NOT wired into `date-arith-op`. Enabling it
-  turns this into a silent wrong DATE, which is what Phase 0 exists to
-  prevent. Wiring it up is a three-line change in `date-arith-op` plus
-  the `query_fns` exports, once the cache is fixed.
+  Two things to carry forward. There are **two** set-operation
+  implementations -- top-level in `server.clj` and derived/CTE in
+  `stmt.clj` -- and fixing only the first left
+  `SELECT ... FROM (SELECT a INTERSECT SELECT b) s` wrong; any future
+  equality change must touch both. And a `hashCode` must use
+  *unchecked* int arithmetic: Clojure's `*` and `+` are checked on the
+  int path, so the obvious accumulator threw `integer overflow` and
+  surfaced as XX000 on every interval query.
 
-  The root tension, which will recur for any type given a
-  non-structural equality: `interval_cmp_value` equality is correct for
-  ORDER BY, GROUP BY and DISTINCT, but it is **not a congruence for
-  arithmetic** — `1 mon` and `30 days` are equal and
-  `timestamp + 1 mon` differs from `timestamp + 30 days`. PostgreSQL
-  has the same property and is safe because its plan cache keys on
-  query text, not on folded values.
 
-- **`array[<interval>]::text` substitutes a cmp-equal value (4
-  entries)** — the same defect seen through a different surface, and
-  how it was first noticed. What is established: it is
-  session-order dependent — each case is correct as the *first* query
-  on a fresh server and wrong inside a corpus run; the single case
-  `array['1 mon -30 days'::interval]::text` is wrong even fresh,
-  giving `{00:00:00}`; and `cast-scalar` on the array,
-  `arrays/to-pg-text`, and `'<lit>'::interval::text` without the array
-  are each correct in isolation. What is ruled out: datahike's
-  query-result cache (`clear-query-cache!` does not help), the
-  identity-keyed statement caches in `server.clj`, and literal
-  templating (`array` is already on `template.clj`'s
-  `no-template-idents`). What is not yet found: the value-keyed
-  substitution between the SQL path's array construction and its
-  rendering.
-
-  **It is not in the corpus**, and that is deliberate: whether a given
-  literal diverges depends on what ran earlier in the session, so the
-  sample is nondeterministic and the manifest cannot pin it. Keeping it
-  made `bb fuzz interval` fail on some runs and pass on others, which
-  trains you to ignore the gate. It needs a deterministic reproduction
-  before it can be gated, and the four cases above are the leads.
-
-  The underlying tension is worth stating because it will recur for
-  any type we give a non-structural equality: `PgInterval`'s `.equals`
-  **must** be `interval_cmp_value` for GROUP BY and DISTINCT to be
-  correct, but that equivalence is *coarser than the observable text* —
-  `1 mon` and `30 days` are equal and print differently. So anything
-  that looks a value up by equality may legitimately hand back the
-  other spelling. PostgreSQL has the same property and avoids the
-  problem by keying its caches on query text rather than on folded
-  values. Same family as the datahike BigDecimal-scale collision.

@@ -152,29 +152,55 @@
             `'P1Y1Y'::interval` is 2 years on the oracle too"
     (is (= [24 0 0] (iso "P1Y1Y")))))
 
-(deftest the-carrier-owns-equality-ordering-and-hashing
+(deftest the-carrier-keeps-two-equalities
+  ;; PostgreSQL keeps two, with two jobs, and so do we:
+  ;;
+  ;;   `.equals`/`.hashCode`  REPRESENTATION, which is `datumIsEqual`
+  ;;     (utils/adt/datum.c:207) -- the function `_equalConst` uses to
+  ;;     compare two constants in a plan. Its comment says it "will
+  ;;     return false if there are 2 different representations of the
+  ;;     same value", and that is the point.
+  ;;   `value-eq?`/`value-hash`  the OPCLASS equality, `interval_eq`
+  ;;     and `interval_hash`, which GROUP BY, DISTINCT, `=` and hash
+  ;;     joins use (`execTuplesHashPrepare`, executor/execGrouping.c).
+  ;;
+  ;; Collapsing them onto `.equals` made every `=`-keyed structure --
+  ;; plan caches, fold memos -- unable to tell `1 mon` from `30 days`,
+  ;; and `'2001-01-31'::timestamp + '30 days'` returned February 28
+  ;; when a cmp-equal literal had been folded first.
+  ;;
+  ;; The reason the cmp equality cannot serve both: it is NOT A
+  ;; CONGRUENCE FOR ARITHMETIC. `1 mon` and `30 days` are value-equal
+  ;; and adding them to a timestamp gives different days.
   (let [i ic/interval]
-    (testing "a month is 30 days and a day is 24 hours, so these are
-              EQUAL -- and the hash agrees, which is what makes GROUP
-              BY and DISTINCT correct without any comparator"
-      (is (= (i 1 0 0) (i 0 30 0)))
-      (is (= (i 0 1 0) (i 0 0 86400000000)))
-      (is (= (i 12 0 0) (i 0 360 0)))
-      (is (= (i 1 -30 0) (i 0 0 0)))
-      (is (= (hash (i 1 0 0)) (hash (i 0 30 0))))
-      (is (= (hash (i 12 0 0)) (hash (i 0 360 0)))))
-    (testing "near-misses stay distinct"
-      (is (not= (i 1 0 0) (i 0 29 0)))
-      (is (not= (i 1 0 0) (i 0 31 0)))
-      (is (not= (i 12 0 0) (i 0 365 0))))
-    (testing "so the Clojure collections that no comparator can reach
-              are correct by construction"
-      (is (= 2 (count (set [(i 1 0 0) (i 0 30 0) (i 0 29 0)]))))
-      (is (= 2 (count (group-by identity [(i 1 0 0) (i 0 30 0) (i 0 29 0)]))))
-      (is (= 2 (count (distinct [(i 1 0 0) (i 0 30 0) (i 0 29 0)]))))
-      (is (contains? (set [(i 0 30 0)]) (i 1 0 0))))
-    (testing "Comparable, which is what `fns/order-cmp`'s existing
-              `:else (compare a b)` already routes to"
+    (testing "representation equality: cmp-equal spellings are DISTINCT"
+      (is (not= (i 1 0 0) (i 0 30 0)))
+      (is (not= (i 0 1 0) (i 0 0 86400000000)))
+      (is (not= (i 12 0 0) (i 0 360 0)))
+      (is (not= (hash (i 1 0 0)) (hash (i 0 30 0))))
+      (is (= 3 (count (set [(i 1 0 0) (i 0 30 0) (i 0 29 0)])))
+          "so a cache keyed on `=` cannot conflate them")
+      (is (= (i 1 2 3) (i 1 2 3)) "and identical fields are still equal"))
+    (testing "opclass equality: a month is 30 days and a day is 24 hours"
+      (is (ic/value-eq? (i 1 0 0) (i 0 30 0)))
+      (is (ic/value-eq? (i 0 1 0) (i 0 0 86400000000)))
+      (is (ic/value-eq? (i 12 0 0) (i 0 360 0)))
+      (is (ic/value-eq? (i 1 -30 0) (i 0 0 0)))
+      (is (= (ic/value-hash (i 1 0 0)) (ic/value-hash (i 0 30 0))))
+      (is (= (ic/value-hash (i 12 0 0)) (ic/value-hash (i 0 360 0)))))
+    (testing "near-misses stay distinct under BOTH"
+      (is (not (ic/value-eq? (i 1 0 0) (i 0 29 0))))
+      (is (not (ic/value-eq? (i 1 0 0) (i 0 31 0))))
+      (is (not (ic/value-eq? (i 12 0 0) (i 0 365 0))))
+      (is (not= (i 1 0 0) (i 0 29 0))))
+    (testing "`value-key` collapses exactly the opclass equivalence
+              class, which is what the clojure.core operations that take
+              no comparator are given instead -- `distinct`, `set`,
+              `clojure.set/*`"
+      (is (= (ic/value-key (i 1 0 0)) (ic/value-key (i 0 30 0))))
+      (is (not= (ic/value-key (i 1 0 0)) (ic/value-key (i 0 29 0)))))
+    (testing "Comparable stays the BTREE opclass, so ORDER BY and the
+              comparison operators are unaffected by the change above"
       (is (neg? (compare (i 0 29 0) (i 1 0 0))))
       (is (pos? (compare (i 0 31 0) (i 1 0 0))))
       (is (zero? (compare (i 1 0 0) (i 0 30 0))))
@@ -182,7 +208,7 @@
              (sort [(i 0 31 0) (i 1 0 0) (i 0 29 0)]))))
     (testing "and the span is computed in 128 bits, because
               `month * 30 * 86400000000` overflows int64"
-      (is (= (i 2147483647 0 0) (i 2147483647 0 0)))
+      (is (ic/value-eq? (i 2147483647 0 0) (i 2147483647 0 0)))
       (is (pos? (compare (i 2147483647 0 0) (i 2147483646 0 0)))))))
 
 (deftest interval-out-under-the-postgres-style
