@@ -364,3 +364,54 @@
       (is (= [["t"] []] (with-warnings a "SELECT pg_advisory_unlock_shared(7)")))
       (is (= [["f"] ["you don't own a lock of type ShareLock"]]
              (with-warnings a "SELECT pg_advisory_unlock_shared(7)"))))))
+
+(deftest set-timezone-is-stored-and-read-back
+  ;; `SET TimeZone` was accepted and discarded, so `SHOW timezone`
+  ;; answered the compiled-in UTC whatever the session asked for -- a
+  ;; client that set a zone and read it back was told its request had
+  ;; not taken.
+  ;;
+  ;; The sign convention is PostgreSQL's and NOT ISO: a bare numeric
+  ;; value is POSIX, where positive means WEST of Greenwich. Verified
+  ;; against timestamptz.out; mapping these through `ZoneId/of` would
+  ;; put every offset out by twice its value.
+  (with-open [a (connect-to "alpha")]
+    (is (= "UTC" (scalar a "SHOW timezone")) "the default")
+    (testing "a zone name round-trips, and SHOW agrees with current_setting"
+      (exec! a "SET timezone = 'Europe/Berlin'")
+      (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
+      (is (= "Europe/Berlin" (scalar a "SELECT current_setting('timezone')")))
+      (is (= "Europe/Berlin" (scalar a "SHOW TimeZone")) "spelling is case-insensitive"))
+    (testing "a bare numeric offset is POSIX-signed: positive is WEST"
+      (doseq [[set-to shows] [["'04:30'"  "-04:30"]
+                              ["'-04:30'" "+04:30"]
+                              ["'+02:00'" "-02:00"]
+                              ["'-13:00'" "+13:00"]
+                              ["'00:30'"  "-00:30"]]]
+        (exec! a (str "SET TIME ZONE " set-to))
+        (is (= shows (scalar a "SHOW timezone"))
+            (str "SET TIME ZONE " set-to))))
+    (testing "RESET and DEFAULT go back to UTC"
+      (exec! a "RESET timezone")
+      (is (= "UTC" (scalar a "SHOW timezone")))
+      (exec! a "SET timezone = 'Europe/Berlin'")
+      (exec! a "SET timezone = DEFAULT")
+      (is (= "UTC" (scalar a "SHOW timezone"))))
+    (testing "an unrecognised zone raises 22023 rather than being ignored"
+      (is (= "22023" (state a "SET timezone = 'Mars/Phobos'")))
+      (is (= "UTC" (scalar a "SHOW timezone")) "and the old value stands"))
+    (testing "a POSIX TZ string carrying its own rules is refused, not guessed"
+      ;; Java's reading of `UTC-2` is not POSIX's, and PostgreSQL's
+      ;; expected output does not pin it. doc/backlog.md records it.
+      (is (= "22023" (state a "SET timezone = 'CST7CDT'"))))))
+
+(deftest timezone-is-per-session
+  (with-open [a (connect-to "alpha")
+              b (connect-to "beta")]
+    (exec! a "SET timezone = 'Europe/Berlin'")
+    (exec! b "SET timezone = 'America/New_York'")
+    (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
+    (is (= "America/New_York" (scalar b "SHOW timezone")))
+    (testing "and current_setting, which reads through a cached plan"
+      (is (= "Europe/Berlin" (scalar a "SELECT current_setting('timezone')")))
+      (is (= "America/New_York" (scalar b "SELECT current_setting('timezone')"))))))

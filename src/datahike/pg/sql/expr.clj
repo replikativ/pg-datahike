@@ -1704,6 +1704,8 @@
                                     (str/join ", " p))
                     ("datestyle" "date_style")
                     (when-let [d (:date-style st)] (types/date-style-text d))
+                    ("timezone" "time zone" "time_zone")
+                    (when-let [z (:time-zone st)] (types/time-zone-text z))
                     "hnsw.ef_search" (some-> (:hnsw-ef-search st) str)
                     nil))))
             impl-fn (fn [name & [missing-ok]]

@@ -16,6 +16,7 @@
    4. SQL name → category (for CAST type classification)"
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [datahike.pg.errors :as errors]
             [datahike.pg.pg-catalog :as pg-catalog])
   (:import [datahike.pg PgWireServer]))
 
@@ -1689,6 +1690,69 @@
                [st ord]))
            [style order]
            (str/split (str (or v "")) #","))))
+
+(defn parse-time-zone
+  "Read a `TimeZone` / `TIME ZONE` value into a `java.time.ZoneId`, or
+   nil for the forms that mean \"back to the default\" (`DEFAULT`,
+   `LOCAL`). Throws `:invalid-parameter-value` for anything else, which
+   is 22023, as PostgreSQL does for an unrecognised zone.
+
+   **A bare numeric value uses the POSIX sign convention: positive means
+   WEST of Greenwich, so the offset is the NEGATION of what it reads
+   like.** Verified against PostgreSQL 17's timestamptz.out:
+
+       SET timezone = '04:30'   ->  offset -04:30
+       SET timezone = '-04:30'  ->  offset +04:30
+       SET timezone = '+02:00'  ->  offset -02:00
+       SET timezone = '-13:00'  ->  offset +13:00
+       SET timezone = '00:30'   ->  offset -00:30
+
+   This is the opposite of `ZoneId/of`, which reads them as ISO. Mapping
+   them straight through would have put every rendered timestamptz out
+   by TWICE the offset. The inversion applies to this bare-string form
+   only -- NOT to zone names, not to a timestamp literal's own offset,
+   and not to `SET TIME ZONE INTERVAL ... HOUR TO MINUTE`, which is
+   SQL-standard and reads positive as east.
+
+   A POSIX TZ string carrying its own offset or DST rules (`UTC-2`,
+   `CST7CDT`) is refused rather than guessed: Java's reading of `UTC-2`
+   is not POSIX's, and PostgreSQL's expected output does not pin it.
+   doc/backlog.md records it."
+  [v]
+  (let [raw (str/trim (str/replace (str (or v "")) #"^'|'$" ""))
+        low (str/lower-case raw)]
+    (cond
+      (str/blank? raw) nil
+      (contains? #{"default" "local"} low) nil
+
+      ;; A numeric offset, with or without a sign: POSIX, so negate.
+      (re-matches #"[+-]?\d{1,2}(:\d{2}(:\d{2})?)?" raw)
+      (let [signed (if (re-find #"^[+-]" raw) raw (str "+" raw))
+            iso (java.time.ZoneOffset/of ^String
+                 (if (re-find #":" signed) signed (str signed ":00")))]
+        (java.time.ZoneOffset/ofTotalSeconds (- (.getTotalSeconds iso))))
+
+      ;; A POSIX TZ string: an alphabetic prefix followed by an offset
+      ;; or DST rule. Refused, not guessed.
+      (re-matches #"(?i)[a-z]{3,}[+-]?\d.*" raw)
+      (throw (errors/pg-error
+              :invalid-parameter-value
+              {:message (str "unrecognized time zone name: \"" raw "\"")}))
+
+      :else
+      (try (java.time.ZoneId/of raw)
+           (catch Exception _
+             (throw (errors/pg-error
+                     :invalid-parameter-value
+                     {:message (str "invalid value for parameter \"TimeZone\": \""
+                                    raw "\"")})))))))
+
+(defn time-zone-text
+  "A `ZoneId` rendered the way `SHOW TimeZone` renders it. A fixed
+   offset prints as PostgreSQL prints it, `Z` becoming `UTC`."
+  [^java.time.ZoneId z]
+  (let [s (str (or z "UTC"))]
+    (if (= "Z" s) "UTC" s)))
 
 (defn date-style-text
   "`[style order]` rendered the way `SHOW DateStyle` renders it."

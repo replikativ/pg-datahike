@@ -1637,6 +1637,14 @@
                       (str/join ", " path)
                       (get show-settings "search_path")))
 
+      ;; `SHOW timezone` reported the compiled-in UTC whatever the
+      ;; session had SET, which is how a client that sets a zone and
+      ;; reads it back (psql's \set, pgjdbc's connection setup) was
+      ;; told its own request had not taken.
+      (contains? #{"timezone" "time zone" "time_zone"} setting-name)
+      (show-setting "TimeZone"
+                    (types/time-zone-text (:time-zone @session-state)))
+
       ;; `SHOW DateStyle` reports the session's own setting, not the
       ;; startup default -- a client that SETs it and reads it back
       ;; (psql's \set, pg_dump's prelude) was told ISO whatever it asked
@@ -6868,7 +6876,7 @@
 (def ^:private session-guc-keys
   "Session-state keys that behave as resettable GUCs. RESET ALL clears
    these but preserves connection-identity keys (e.g. :db-name)."
-  [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search :date-style
+  [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search :date-style :time-zone
    :valid-at :valid-from :valid-to :statement-timeout :isolation :read-only?
    :float-sum])
 
@@ -6891,6 +6899,9 @@
 
       (contains? #{"datestyle" "date_style"} setting)
       (swap! session-state dissoc :date-style)
+
+      (contains? #{"timezone" "time zone" "time_zone"} setting)
+      (swap! session-state dissoc :time-zone)
 
       (= "hnsw.ef_search" setting)
       (swap! session-state dissoc :hnsw-ef-search)
@@ -7497,6 +7508,17 @@
           ;; and was accepted and then ignored -- every value rendered
           ;; ISO whatever the session asked for. PostgreSQL's own
           ;; regression suite runs under `Postgres, MDY`.
+          ;; `SET TimeZone` / `SET TIME ZONE` was accepted and then
+          ;; discarded, so `SHOW timezone` answered UTC whatever the
+          ;; session asked for. The value is stored as a `ZoneId`;
+          ;; `types/parse-time-zone` owns the conventions, including
+          ;; that a bare numeric offset is POSIX-signed.
+          (when (contains? #{"timezone" "time zone" "time_zone"} setting)
+            (let [raw (or (:value parsed)
+                          (str/join "," (:values parsed)))]
+              (if-let [z (types/parse-time-zone raw)]
+                (swap! session-state assoc :time-zone z)
+                (swap! session-state dissoc :time-zone))))
           (when (contains? #{"datestyle" "date_style"} setting)
             (let [raw (or (:value parsed)
                           (str/join "," (:values parsed)))]
