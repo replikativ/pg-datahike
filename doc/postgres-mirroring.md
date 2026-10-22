@@ -142,12 +142,22 @@ query with `LIMIT n OFFSET pos` (`rewrite-cursor-page`). At the default
 to its offset: **O(n²)**. This is not FDW-specific -- pgjdbc with a
 fetch size, psycopg named cursors and plpgsql cursors all pay it.
 
-Worse, it may be a **correctness** bug and not only a cost: paging by
-`LIMIT/OFFSET` across re-executions is only sound under a *total* order,
-and EXPLAIN shows an injected `:order-by [1 :asc]`. If column 1 has
-duplicates, a `FETCH` can repeat one row and skip another. **Verify this
-before anything else here** -- if it reproduces it is an S1 entry, not a
-performance item.
+It looked like it might also be a **correctness** bug, because paging by
+`LIMIT/OFFSET` across re-executions is only sound under a *total* order
+and the order injected for a cursor without `ORDER BY` is
+`[1 :asc]` -- non-total as soon as the first column has duplicates.
+**Measured, and it does not reproduce:** 24 rows with 6 per
+first-column value, paged at 1, 3, 5 and 7, return every row exactly
+once. Each `FETCH` re-executes against the same frozen
+`:speculative-db` captured at `BEGIN`, and the executor is
+deterministic over an immutable snapshot, so successive executions
+agree on the tie order. `cursor-paging-does-not-repeat-or-skip-rows`
+in `pg_cursor_protocol_test.clj` pins that property, so a future
+paging or planner change cannot quietly take it away.
+
+So this is a performance item, not an S1 -- which also means the fix is
+free to change the strategy (hold an iterator, or materialize once per
+cursor) without a correctness argument to preserve.
 
 ## Open questions
 

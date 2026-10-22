@@ -98,3 +98,42 @@
     (update! c "CLOSE cur")
     (.commit c)
     (is (= [1] (rows c "SELECT 1")))))
+
+(defn- pairs [^Connection c sql]
+  (with-open [s (.createStatement c) r (.executeQuery s sql)]
+    (loop [acc []]
+      (if (.next r) (recur (conj acc [(.getInt r 1) (.getInt r 2)])) acc))))
+
+(deftest cursor-paging-does-not-repeat-or-skip-rows
+  ;; Each FETCH re-runs the stored query with `LIMIT n OFFSET pos`
+  ;; (`rewrite-cursor-page`) rather than holding a position in one
+  ;; result. Paging across RE-EXECUTIONS is only sound under a TOTAL
+  ;; order, and the order injected for a cursor without ORDER BY is
+  ;; `[1 :asc]`. If the first column has duplicates that order does not
+  ;; decide which row wins a tie, so two executions are free to
+  ;; disagree -- which would let one page repeat a row an earlier page
+  ;; already returned, and skip another entirely.
+  ;;
+  ;; So the first column here is deliberately NON-unique (6 rows per
+  ;; value) while the second identifies the row. The assertion is the
+  ;; property a cursor must have whatever the paging strategy is:
+  ;; every row exactly once.
+  (with-open [c (jdbc)]
+    (update! c "CREATE TABLE pag (id int, g int)")
+    (update! c (str "INSERT INTO pag (id, g) VALUES "
+                    (clojure.string/join
+                     ", " (for [i (range 24)] (format "(%d, %d)" i (mod i 4))))))
+    (doseq [page [1 3 5 7]]
+      (testing (str "fetch_size " page)
+        (update! c "BEGIN")
+        (update! c "DECLARE pc CURSOR FOR SELECT g, id FROM pag")
+        (let [seen (loop [acc []]
+                     (let [batch (pairs c (str "FETCH " page " FROM pc"))]
+                       (if (seq batch) (recur (into acc batch)) acc)))
+              ids (mapv second seen)]
+          (update! c "CLOSE pc")
+          (update! c "COMMIT")
+          (is (= 24 (count ids)) "no page may be short or over-long in total")
+          (is (= (set (range 24)) (set ids)) "every row appears")
+          (is (= (sort ids) (range 24))
+              "and exactly once -- a repeat here means a page re-executed under a non-total order"))))))
