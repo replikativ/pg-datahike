@@ -95,7 +95,20 @@ TIMEDOUT=""
 # Start one up front if the port is dead.
 server_up() { (exec 3<>/dev/tcp/127.0.0.1/15432) 2>/dev/null; }
 
-if ! server_up; then
+# `probe` exists to measure a change you just made, so REUSING a live
+# server defeats its whole purpose: the one a previous run left behind
+# (nothing here stops it at the end) is running the code from before the
+# edit. That is not a hypothetical -- a 4-file probe silently reused a
+# 52-minute-old server and reported +0.0 for a fix whose own unit tests
+# passed, because the measured server predated it.
+#
+# `measure` and `gate` keep reusing a warm server: they are run against
+# a tree that is not being edited, and a cold JVM boot per run is
+# minutes.
+if [ "$MODE" = "probe" ]; then
+  echo "probe: restarting the server so it carries the current tree" >&2
+  restart_server || { echo "server did not come back" >&2; exit 1; }
+elif ! server_up; then
   echo "no server on 15432; starting one" >&2
   restart_server || { echo "server did not come back" >&2; exit 1; }
 fi

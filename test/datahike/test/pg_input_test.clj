@@ -507,3 +507,37 @@
         "was XX000")
     (is (= ["NaN"] (run c "SELECT (?::numeric)::text" "NaN")))
     (is (= ["4294967295"] (run c "SELECT (?::oid)::text" "-1")))))
+
+(deftest int2vector-and-oidvector-input-delegate-to-the-element-type
+  ;; Neither has an input function of its own: PostgreSQL parses each
+  ;; element with the ELEMENT type's one, so a failure names that type
+  ;; and that element -- not the vector, and not the whole string.
+  ;;
+  ;; Before, these types were absent from the accepted surface, so
+  ;; `pg_input_is_valid(' 1 3  5 ', 'int2vector')` answered f for a
+  ;; VALID vector, and pg_input_error_info reported
+  ;; `invalid input syntax for type int2vector: "1 asdf"` where
+  ;; PostgreSQL reports `... for type smallint: "asdf"`.
+  ;;
+  ;; Expectations are PostgreSQL 17's, from int2.out and oid.out.
+  (with-open [c (jdbc)]
+    (testing "a valid vector is valid, with leading, trailing and repeated spaces"
+      (is (= ["t"] (run c "SELECT pg_input_is_valid(' 1 3  5 ', 'int2vector')")))
+      (is (= ["t"] (run c "SELECT pg_input_is_valid('1 2', 'oidvector')"))))
+    (testing "an invalid element makes it invalid"
+      (is (= ["f"] (run c "SELECT pg_input_is_valid('1 asdf', 'int2vector')")))
+      (is (= ["f"] (run c "SELECT pg_input_is_valid('1 50000', 'int2vector')"))))
+    (testing "the error names the ELEMENT type and the failing element"
+      (is (= ["invalid input syntax for type smallint: \"asdf\""]
+             (run c "SELECT message FROM pg_input_error_info('1 asdf', 'int2vector')")))
+      (is (= ["value \"50000\" is out of range for type smallint"]
+             (run c "SELECT message FROM pg_input_error_info('50000', 'int2vector')")))
+      (is (= ["value \"9999999999\" is out of range for type oid"]
+             (run c "SELECT message FROM pg_input_error_info('01 9999999999', 'oidvector')"))))
+    (testing "and the SQLSTATE is the element type's"
+      (is (= ["22P02"]
+             (run c "SELECT sql_error_code FROM pg_input_error_info('1 asdf', 'int2vector')")))
+      (is (= ["22003"]
+             (run c "SELECT sql_error_code FROM pg_input_error_info('50000', 'int2vector')"))))
+    (testing "a valid vector reports no error at all"
+      (is (= [nil] (run c "SELECT message FROM pg_input_error_info(' 1 3  5 ', 'int2vector')"))))))
