@@ -1594,7 +1594,7 @@
 
       (contains? #{"current_user" "session_user" "user" "system_user"} fname)
       (let [fn-param (symbol (str "?cur-user" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [] "datahike")]
+            impl-fn (fn [] types/pg-role-name)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -1620,9 +1620,15 @@
                       "lc_messages"                "C"
                       "lc_collate"                 "C"
                       "lc_ctype"                   "C"
-                      "is_superuser"               "off"
-                      "session_authorization"      "datahike"
-                      "application_name"           "datahike"
+                      ;; `pg_roles.rolsuper` and `pg_authid.rolsuper`
+                      ;; report TRUE for this role, with the stated
+                      ;; reason that the server enforces no privileges
+                      ;; -- one login role, everything permitted. This
+                      ;; said "off", contradicting them from the same
+                      ;; server. `on` is what the rest of it honours.
+                      "is_superuser"               "on"
+                      "session_authorization"      types/pg-role-name
+                      "application_name"           types/pg-role-name
                       "transaction_isolation"      "read committed"
                       "transaction_read_only"      "off"
                       "default_transaction_isolation" "read committed"
@@ -1710,7 +1716,7 @@
       ;; static handler role.
       (= fname "pg_get_userbyid")
       (let [fn-param (symbol (str "?get-user" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [_oid] "datahike")]
+            impl-fn (fn [_oid] types/pg-role-name)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -6581,7 +6587,7 @@
          (nil? (.getTable ^Column expr))
          (contains? #{"current_user" "session_user" "user" "system_user"}
                     (str/lower-case (.getColumnName ^Column expr))))
-    "datahike"
+    types/pg-role-name
 
     ;; JSqlParser surfaces bare LOCALTIME / LOCALTIMESTAMP as unqualified
     ;; Columns even though SQL defines them as value functions. This must
