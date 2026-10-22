@@ -22,10 +22,36 @@ else
   echo "Collecting outputs in $COLLECTED (kept)" >&2
 fi
 
+# AGREEMENT_FILES restricts the run to named files. `agreement.clj`
+# accepts it for `probe` only: `measure` rewrites the manifest from what
+# it measured, so a subset would drop every other file's baseline.
+if [ -n "${AGREEMENT_FILES:-}" ]; then
+  if [ "$MODE" != "probe" ]; then
+    echo "AGREEMENT_FILES is only supported with 'probe'" >&2
+    exit 2
+  fi
+  # Validate the names BEFORE running anything: agreement.clj also
+  # checks, but it runs after the file loop, so a typo there costs a
+  # whole run and a started server.
+  FILES=$(printf '%s' "$AGREEMENT_FILES" | tr ',' ' ')
+  if ! clojure -M -e "
+(require (quote [clojure.string :as str]))
+(load-file \"test/integration/postgres-regress/agreement.clj\")
+(let [in-scope (set (agreement/application-facing))
+      asked (str/split \"$FILES\" #\"\\s+\")
+      bad (remove in-scope (remove str/blank? asked))]
+  (when (seq bad)
+    (binding [*out* *err*]
+      (println \"not in scope (see scope.edn):\" (str/join \" \" bad)))
+    (System/exit 2)))" 2>&1; then
+    exit 2
+  fi
+else
 FILES=$(clojure -M -e '
 (require (quote [clojure.string :as str]) (quote [clojure.java.io :as io]))
 (load-file "test/integration/postgres-regress/agreement.clj")
 (println (str/join " " (agreement/application-facing)))' 2>/dev/null | tail -1)
+fi
 
 # The harness bootstraps a database per file inside the long-lived
 # server, and the server keeps them: after ninety-odd files it had grown
