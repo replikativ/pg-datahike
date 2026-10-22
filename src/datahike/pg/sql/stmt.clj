@@ -2916,6 +2916,15 @@
                             (instance? java.util.Date v)              :datetime
                             (instance? java.util.UUID v)              :uuid
                             (pg-vector/vector-value? v)                :vector
+                            ;; A byte array has a Datahike value type of its
+                            ;; own and must not reach the `:db.type/string`
+                            ;; fallback, whose coercer is `str`: a `bytea`
+                            ;; through a derived relation was stored as
+                            ;; "[B@380a589f" and `SELECT b::text FROM (SELECT
+                            ;; b FROM t) s` answered that. Same defect a
+                            ;; `PgArray` had -- see col-array-elem below --
+                            ;; and the same shape of fix.
+                            (bytes? v)                                :bytes
                             (or (number? v) (types/numeric-special? v)) :numeric
                             (or (string? v) (keyword? v) (symbol? v)) :string
                             :else                                     :unknown))
@@ -2941,6 +2950,7 @@
                              (= cats #{:datetime}) :db.type/instant
                              (= cats #{:uuid})     :db.type/uuid
                              (= cats #{:vector})   :db.type/float-array
+                             (= cats #{:bytes})    :db.type/bytes
                              (= cats #{:string})   :db.type/string
 
                              (= cats #{:numeric})

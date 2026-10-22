@@ -828,6 +828,73 @@ than an assertion. Both halves need it: the `value-key` families
 from `-main`'s vector runs in neither CI nor `all`, which has happened
 once already.
 
+### Text ordering is PostgreSQL's `C` collation, not the cluster's
+
+**S1 for any locale-initialised cluster.** Measured on a real table with
+a `text NOT NULL` column, `ORDER BY t` over `a`, `B`, `b`, `A`:
+
+```
+ours    A,B,a,b
+oracle  a,A,b,B      (datcollate = en_US.UTF-8)
+oracle  A,B,a,b      with ORDER BY t COLLATE "C"
+```
+
+So our order is exactly PostgreSQL's `C` collation, which is
+`String.compareTo` -- `fns/order-cmp`'s `:else (compare a b)`. A cluster
+created with a locale, which is the common case, sorts text differently
+in every query that orders, ranks, groups with ordering, or compares
+with `<`.
+
+Why no gate has ever caught it: **PostgreSQL's own regression suite runs
+under `C`**, so the per-file agreement measurement compares against
+expected output that agrees with us. The differential corpus uses only
+`'aa'`, `'bb'`, `'dd'`, `''` and `'%a%'` -- same case, so every
+collation agrees on them.
+
+This is a DECISION, not a bug with an obvious fix:
+
+- `C` is what we implement, is self-consistent, and matches the regress
+  suite. Claiming it means saying so, and reporting it through
+  `pg_database.datcollate` / `pg_collation` rather than reporting
+  `en_US.UTF-8` while behaving as `C`. **Check what we currently
+  report** -- claiming a locale we do not implement is the actual
+  defect.
+- A real collation needs ICU or `java.text.Collator`, and per-column and
+  per-query `COLLATE` clauses mean ONE order cannot serve every query.
+  PostgreSQL builds a separate index per collation; a pushed-down
+  `ORDER BY` can only be served for the index's own collation, and
+  everything else has to sort in our layer.
+
+Note what is NOT in scope here. `ORDER BY` over `uuid` and over `bytea`
+WAS checked on the same table and both agree with the oracle
+(`00,7f,80,ff` and `\x01,\x7f,\x80,\xff` -- unsigned, as
+`uuid_cmp`/`byteacmp` have them), even though Datahike's own index
+orders both SIGNED. So the index's order is not reaching these queries;
+only text diverges today. The signed/unsigned question becomes live the
+moment an `ORDER BY` is served FROM the index -- see
+[[datahike-index-order]] below.
+
+### Datahike's index order differs from PostgreSQL's for three types
+
+Not reachable today, but it bounds what `ORDER BY` pushdown can ever do
+(`stmt.clj:7016` already pushes `ORDER BY` to Datahike's `:order-by`
+when the column is non-nullable with default NULLS ordering).
+
+| type | Datahike index | PostgreSQL |
+|---|---|---|
+| `bytea` | **signed** bytes on the JVM | unsigned (`byteacmp`) |
+| `uuid` | **signed** longs (`UUID.compareTo`) | unsigned 16 bytes (`uuid_cmp`) |
+| `text` | `String.compareTo` | the column's collation |
+| `numeric`, `-0.0`/`0.0`, NaN (after replikativ/datahike#1109) | agree | agree |
+
+Datahike's `array.cljc` already records the first one as deliberately
+deferred -- "changing it WOULD reorder existing stored indexes holding
+high bytes" -- so this is an index-breaking change by its own account,
+to be combined with a serializer change that already requires a
+rebuild. The NaN half landed separately because it is NOT breaking for
+a healthy database: only NaN moves, and an index holding one had
+already lost data.
+
 ## Test-surface note
 
 Before this round the entire JSON surface was **6 assertions**, all

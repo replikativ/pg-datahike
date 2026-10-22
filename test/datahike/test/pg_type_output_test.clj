@@ -127,3 +127,45 @@
       (is (.next rs))
       (is (= java.time.LocalTime/MAX (.getObject rs 1 java.time.LocalTime))))
     (is (= "22008" (state c "SELECT '24:00:01'::time")))))
+
+(deftest bytea-survives-a-derived-relation
+  ;; A derived relation re-infers each column's type from the VALUES it
+  ;; carries. A byte[] matched no category, fell through to the
+  ;; `:db.type/string` arm -- whose coercer is `str` -- and the column
+  ;; was stored as the Java identity. Same defect a `PgArray` had.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tb (id int, b bytea)")
+    (exec! c "INSERT INTO tb VALUES (1, '\\x0001ff'::bytea)")
+    (is (= [["\\x0001ff"]] (rows c "SELECT b::text FROM tb"))
+        "the base case was never broken")
+    (testing "through a derived relation"
+      (is (= [["\\x0001ff"]] (rows c "SELECT b::text FROM (SELECT b FROM tb) s")))
+      (is (= [["\\x0001ff"]] (rows c "SELECT s.b::text FROM (SELECT b FROM tb) s")))
+      ;; KNOWN DIVERGENCE, not a consequence of the value fix above.
+      ;; `dh-type->oid` maps :db.type/bytes to oid-text while
+      ;; `dh-type->pg-name` maps it to "bytea" (types.clj:539 vs :562),
+      ;; so the reported column OID is 25 where PostgreSQL says 17. The
+      ;; VALUE is correct either way -- that is what the assertions above
+      ;; pin. Flipping the OID changes every bytea column's wire framing,
+      ;; so it wants the pgjdbc/psycopg suites and a pg_dump round-trip:
+      ;; consolidation-plan Phase 3. When that lands, this flips to
+      ;; "bytea" and the `::text` expectations stay as they are.
+      (is (= [["text"]] (rows c "SELECT pg_typeof(b) FROM (SELECT b FROM tb) s"))
+          "reported OID is still text; see Phase 3"))))
+
+(deftest text-order-matches-the-collation-we-report
+  ;; Text comparison here is `fns/order-cmp`'s `compare`, i.e.
+  ;; `String.compareTo`, which is byte order: exactly what PostgreSQL
+  ;; gives under `COLLATE "C"` and NOT what it gives under a locale.
+  ;; Reporting `en_US.UTF-8` while sorting as `C` told every client that
+  ;; reads `datcollate` something untrue. These two assertions have to
+  ;; move together -- the claim is only honest while the order matches.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tc (t text)")
+    (exec! c "INSERT INTO tc VALUES ('a'), ('B'), ('b'), ('A')")
+    (is (= [["A"] ["B"] ["a"] ["b"]] (rows c "SELECT t FROM tc ORDER BY t"))
+        "byte order; a locale-initialised cluster answers a,A,b,B")
+    (is (= [["C" "C"]]
+           (rows c (str "SELECT datcollate, datctype FROM pg_database"
+                        " WHERE datname = current_database()")))
+        "and the catalog reports the collation we actually implement")))

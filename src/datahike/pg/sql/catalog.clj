@@ -1663,8 +1663,20 @@
                  :pg_database/datdba 10
                  :pg_database/oid (long oid)
                  :pg_database/encoding 6                   ; UTF8
-                 :pg_database/datcollate "en_US.UTF-8"
-                 :pg_database/datctype "en_US.UTF-8"
+                 ;; `C`, because `C` is what we SORT as. Text comparison is
+                 ;; `fns/order-cmp`'s `compare`, i.e. `String.compareTo`,
+                 ;; which is byte order -- the same order PostgreSQL gives
+                 ;; under `COLLATE "C"` and NOT the order it gives under a
+                 ;; locale. Measured: `ORDER BY t` over a, B, b, A answers
+                 ;; A,B,a,b here and a,A,b,B on a cluster whose datcollate is
+                 ;; en_US.UTF-8. Reporting the locale while sorting as `C`
+                 ;; told every client that reads `datcollate` something
+                 ;; untrue, so this reports the collation we implement.
+                 ;; A real locale-aware collation needs ICU or
+                 ;; java.text.Collator AND per-column/per-query COLLATE, and
+                 ;; is tracked in doc/backlog.md.
+                 :pg_database/datcollate "C"
+                 :pg_database/datctype "C"
                  :pg_database/datistemplate template?
                  :pg_database/datallowconn allow-conn?
                  :pg_database/datconnlimit -1
