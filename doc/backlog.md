@@ -446,6 +446,56 @@ whatever reaches that branch is not the shape it appears to be, and the
 check was left out rather than shipped unverified. Start by printing
 the parsed map for `CREATE INDEX i ON t USING HASH (a, b)`.
 
+### A temp table that shadows a permanent one created in ANOTHER session
+
+`varchar.sql`'s whole remaining gap, measured 2026-10-22. PostgreSQL's
+file opens with
+
+```sql
+-- (This temporarily hides the table created in test_setup.sql)
+CREATE TEMP TABLE VARCHAR_TBL(f1 varchar(1));
+...
+DROP TABLE VARCHAR_TBL;     -- unhides test_setup's varchar(4) one
+```
+
+and every later statement is about the `varchar(4)` table. We keep
+reporting `value too long for type character varying(1)` after the
+DROP, so the temp one is still being resolved.
+
+**Shadowing itself works.** Measured in ONE session: a temp
+`varchar(1)` hides a permanent `varchar(4)`, the temp enforces length
+1, `DROP TABLE` removes the temp, the permanent row comes back AND the
+permanent length is restored (a 4-character insert is accepted again).
+
+What differs in the regression run is that the permanent table was
+created by the FIXTURE BOOTSTRAP -- a separate `psql` session -- before
+the file ran. So this is temp-versus-permanent name resolution ACROSS
+sessions, not shadowing as such. PostgreSQL resolves an unqualified
+name through `pg_temp` first and so drops the temp; we appear to resolve
+or drop the other one.
+
+Reproducing it needs the cross-session fixture setup, not a single
+connection, which is why it is recorded rather than fixed here.
+
+### `pg_advisory_unlock` of a lock you do not hold emits no WARNING
+
+`advisory_lock.sql`'s whole remaining gap: eight lines, all
+`WARNING:  you don't own a lock of type ExclusiveLock` (and
+`ShareLock`). PostgreSQL returns false AND warns; we return false
+silently. Mechanical, and the only thing that file is missing.
+
+### `comments.sql`: a quoted string inside a nested comment
+
+One statement, five expected lines: we answer `syntax error at or near
+"\'embedded\'"` where PostgreSQL returns `deeply nested example`.
+PostgreSQL's block comments NEST, and a quote inside one is just text.
+
+### `mvcc.sql` needs a plpgsql EXCEPTION handler
+
+Four lines. We answer `plpgsql exception-handler is not supported`,
+then `current transaction is aborted`. Phase 7.3 work, not a small fix,
+but it is the file's only blocker.
+
 ## S3 — missing
 
 - ~~`#>`, `#>>`~~ — **FIXED (496a1da)**. The check now excludes those two
