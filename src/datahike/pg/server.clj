@@ -11102,7 +11102,11 @@
               (when-not (= "btree" method)
                 (throw (errors/pg-error
                         :feature-not-supported
-                        {:message (str method " does not support unique indexes")})))
+                        ;; PostgreSQL's own wording, from its message
+                        ;; catalog: `access method "%s" does not support
+                        ;; unique indexes`. Ours omitted the framing.
+                        {:message (str "access method \"" method
+                                       "\" does not support unique indexes")})))
               (when-let [unsupported
                          (first
                           (for [{:keys [params]} (:column-specs parsed)
@@ -11282,6 +11286,25 @@
              ctx parsed :stratum attr config catalog-tx oid)
             (record-compatibility-index!
              conn tx-state parsed catalog-tx {:allow-index-backfill? true})))
+
+        ;; A PostgreSQL hash index serves EQUALITY and nothing else,
+        ;; which is exactly what Datahike's native AVET/AEVT already
+        ;; serve -- so, like btree above, the declaration is accepted as
+        ;; compatibility metadata. Rejecting it meant `CREATE INDEX ...
+        ;; USING HASH` failed outright, and uuid.sql then counted two
+        ;; `guid%` indexes in pg_class where PostgreSQL counts three.
+        ;; `unique?` is already refused for every non-btree method by the
+        ;; gate above, with PostgreSQL's wording.
+        ;;
+        ;; NOT enforced here, and a known divergence: PostgreSQL also
+        ;; refuses a MULTICOLUMN hash index (`access method "hash" does
+        ;; not support multicolumn indexes`). We accept one. No file in
+        ;; scope exercises it, and a guard on `(count (:columns parsed))`
+        ;; did not fire when tested, so the shape that reaches here is
+        ;; not what it appears -- left measured-but-unfixed rather than
+        ;; shipped unverified.
+        (= "hash" method)
+        (record-compatibility-index! conn tx-state parsed catalog-tx)
 
         :else
         (throw
