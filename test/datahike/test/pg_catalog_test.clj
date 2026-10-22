@@ -1127,3 +1127,27 @@
   (testing "a user relation was already correct, and stays correct"
     (is (= "42703" (:sqlstate (ex "SELECT nope FROM strictcat"))))
     (is (nil? (:err (ex "SELECT id FROM strictcat"))))))
+
+(deftest columns-the-client-surfaces-demanded
+  ;; Both of these were found by making unknown columns raise: each was
+  ;; being read by a real client and silently answered NULL.
+  (testing "pg_type.typarray -- SQLAlchemy reads it at connect time"
+    ;; It is typelem's inverse: the array type whose ELEMENT is this
+    ;; type. While it was NULL, every array type SQLAlchemy set up was
+    ;; built from a null, and 16 of 16 dialect operations broke the
+    ;; moment it raised instead.
+    (is (= [["int4" "1007"] ["text" "1009"]]
+           (rows (str "SELECT typname, typarray FROM pg_type"
+                      " WHERE typname IN ('int4','text') ORDER BY typname"))))
+    (is (= [["_int4" "0"]]
+           (rows "SELECT typname, typarray FROM pg_type WHERE typname = '_int4'"))
+        "an array type has no array type of its own, which PostgreSQL spells 0"))
+  (testing "pg_class.relacl -- asyncpg selects WHERE relacl IS NOT NULL"
+    ;; PostgreSQL leaves relacl NULL whenever privileges are DEFAULT. We
+    ;; have no privilege system, so NULL for every relation is the
+    ;; truthful answer; the point is that READING it is legal.
+    (is (nil? (:err (ex "CREATE TABLE aclcat (id integer)"))))
+    (is (= [["aclcat" nil]]
+           (rows "SELECT relname, relacl FROM pg_class WHERE relname = 'aclcat'")))
+    (is (= [["0"]] (rows "SELECT count(*) FROM pg_class WHERE relacl IS NOT NULL"))
+        "no rows, rather than raising -- which is what the client asks for")))

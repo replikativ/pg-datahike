@@ -312,6 +312,13 @@
      ;; typelem: element type OID for array types (0 for scalars). Clients
      ;; (asyncpg's TYPE_BY_OID, libpq) read it to detect/decode arrays.
      {:db/ident :pg_type/typelem :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; typarray: the INVERSE of typelem -- the array type OID that has
+     ;; this type as its element, 0 when there is none. SQLAlchemy's
+     ;; connect-time type introspection selects it, so while it resolved
+     ;; to NULL every array type it set up was built from a null, and
+     ;; every statement in the session carried that. 16 of 16 dialect
+     ;; operations broke the moment the column started raising instead.
+     {:db/ident :pg_type/typarray :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      ;; typdelim: element delimiter (',' for all but a few types). asyncpg's
      ;; typeinfo reads elem_t.typdelim and does `elemdelim[0]` while BUILDING an
      ;; array codec — a null there throws and the whole composite fails to
@@ -676,6 +683,13 @@
      ;; `\d` -- and every tool that reads pg_class rather than the
      ;; view -- saw no triggers on a table that has them.
      {:db/ident :pg_class/relhastriggers :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     ;; relacl is NULL in PostgreSQL whenever a relation has DEFAULT
+     ;; privileges. We have no privilege system, so NULL for every
+     ;; relation is the truthful answer, and the column is declared so
+     ;; that reading it is legal -- asyncpg selects
+     ;; `WHERE relacl IS NOT NULL`, which must return no rows rather
+     ;; than raise. Never populated.
+     {:db/ident :pg_class/relacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
      {:db/ident (pgs/row-marker-attr "pg_class") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_index"
@@ -1374,6 +1388,11 @@
                           (name (or (when elem :A) (get types/oid->category oid :U)))
                           :pg_type/typispreferred (contains? types/preferred-oids oid)
                           :pg_type/typelem (long (or elem 0))
+                          ;; The array type whose element is this one:
+                          ;; `int4` -> `_int4`. Arrays themselves have none.
+                          :pg_type/typarray (long (or (when-not elem
+                                                        (name->oid (str "_" tname)))
+                                                      0))
                           :pg_type/typdelim ","
                           :pg_type/typnamespace 2200
                           (pgs/row-marker-attr "pg_type") true}))
@@ -1388,7 +1407,7 @@
                                {:pg_type/oid oid :pg_type/typname name
                                 :pg_type/typlen -1 :pg_type/typtype "c"
                                 :pg_type/typcategory "C" :pg_type/typispreferred false
-                                :pg_type/typelem 0
+                                :pg_type/typelem 0 :pg_type/typarray 0
                                 :pg_type/typrelid
                                 (long (or (:datahike.pg.object/oid relation) 0))
                                 :pg_type/typdelim ","
@@ -1399,7 +1418,7 @@
                         {:pg_type/oid oid :pg_type/typname name
                          :pg_type/typlen 4 :pg_type/typtype "e"
                          :pg_type/typcategory "E" :pg_type/typispreferred false
-                         :pg_type/typelem 0 :pg_type/typdelim ","
+                         :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typdelim ","
                          :pg_type/typnamespace 2200
                          (pgs/row-marker-attr "pg_type") true})
                       (pgs/enum-types cte-db))
@@ -1413,7 +1432,7 @@
                      :pg_type/typname name
                      :pg_type/typlen -1 :pg_type/typtype "c"
                      :pg_type/typcategory "C" :pg_type/typispreferred false
-                     :pg_type/typelem 0 :pg_type/typrelid
+                     :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid
                      (long (or (:datahike.pg.object/oid relation) 0))
                      :pg_type/typdelim "," :pg_type/typnamespace 2200
                      (pgs/row-marker-attr "pg_type") true}))
@@ -1430,7 +1449,7 @@
                   :pg_type/typname name
                   :pg_type/typlen -1 :pg_type/typtype "d"
                   :pg_type/typcategory "U" :pg_type/typispreferred false
-                  :pg_type/typelem 0 :pg_type/typrelid 0
+                  :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
                   :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
                   :pg_type/typnotnull (boolean not-null)
                   :pg_type/typdelim "," :pg_type/typnamespace 2200
