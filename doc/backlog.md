@@ -496,6 +496,31 @@ Four lines. We answer `plpgsql exception-handler is not supported`,
 then `current transaction is aborted`. Phase 7.3 work, not a small fix,
 but it is the file's only blocker.
 
+### A POSIX TZ string with its own offset or DST rules
+
+`SET timezone = 'UTC-2'` (horology.sql) and `'CST7CDT'` are refused with
+22023 rather than guessed. Two reasons, and both would have to be
+settled together:
+
+- **Java disagrees with POSIX on the sign.** `ZoneId/of "UTC-2"` gives
+  `UTC-02:00`, two hours WEST. POSIX reads the offset in a TZ string as
+  the amount to add to local time to reach UTC, so `UTC-2` is two hours
+  EAST. Picking one by eye is a coin flip on a silent two-hour error.
+- **PostgreSQL's expected output does not pin it.** horology.out's only
+  statement after `SET TimeZone = 'UTC-2'` tests date range limits, so
+  the offset never appears. There is nothing to check an answer against
+  without running an oracle.
+
+A full POSIX TZ string can also carry DST transition rules
+(`CST6CDT,M3.2.0,M11.1.0`), which Java's `ZoneId` cannot express at
+all -- those need a rule-based zone built by hand.
+
+One statement each, in one file each. `types/parse-time-zone` refuses
+the whole shape (an alphabetic prefix followed by a digit) so the
+failure is loud and specific rather than an accidental
+mis-parse. Everything clients actually send -- zone names, signed and
+unsigned numeric offsets, DEFAULT, LOCAL -- is supported and verified.
+
 ## S3 — missing
 
 - ~~`#>`, `#>>`~~ — **FIXED (496a1da)**. The check now excludes those two
