@@ -4723,6 +4723,20 @@
     "uuid" types/oid-uuid
     nil))
 
+(def ^:private vector-element-type
+  "int2vector and oidvector have no input function of their own: PG parses
+   each element with the ELEMENT type's one, so a failure names that type
+   and that element -- `pg_input_error_info('1 asdf', 'int2vector')` says
+   `invalid input syntax for type smallint: \"asdf\"`, not int2vector and
+   not the whole string."
+  {"int2vector" "int2" "oidvector" "oid"})
+
+(defn- vector-elements
+  "The whitespace-separated elements of a vector literal. PG accepts
+   leading, trailing and repeated separators -- `' 1 3  5 '` is valid."
+  [s]
+  (remove str/blank? (str/split (str/trim (str s)) #"\s+")))
+
 (defn pg-input-valid?
   "Pure subset of pg_input_is_valid(text, regtype) for application-facing
    scalar types. The function deliberately invokes the same input helpers as
@@ -4751,6 +4765,9 @@
            (do (sql-cast/cast-to-bit s (str type-name) false) true)
            ("char" "character" "varchar" "character varying" "text" "name")
            (char-value)
+           ("int2vector" "oidvector")
+           (let [elem (vector-element-type base)]
+             (every? #(pg-input-valid? % elem) (vector-elements s)))
            false))))
     (catch Throwable _ false)))
 
@@ -4808,9 +4825,18 @@
             ;; pg_input_error_info must not repeat that identical string in
             ;; its separate DETAIL column.
             [msg (when (not= msg detail) detail) nil code])))
-      (if (pg-input-valid? value type-name)
-        [nil nil nil nil]
-        [message nil nil sqlstate]))))
+      (if-let [elem (vector-element-type base)]
+        ;; Report the FIRST failing element through the element type's own
+        ;; diagnostic, which is what PG does -- including that type's own
+        ;; convention for which substring it names.
+        (or (first (keep (fn [e]
+                           (let [r (pg-input-error-info e elem)]
+                             (when (first r) r)))
+                         (vector-elements value)))
+            [nil nil nil nil])
+        (if (pg-input-valid? value type-name)
+          [nil nil nil nil]
+          [message nil nil sqlstate])))))
 
 (defn sql-array-fill
   "PostgreSQL array_fill(value, dimensions [, lower_bounds])."
