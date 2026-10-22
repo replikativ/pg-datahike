@@ -1607,7 +1607,22 @@
       ;; the caller passes missing_ok=true, in which case we return
       ;; NULL. The version is PgWireServer's, the release we implement.
       (= fname "current_setting")
-      (let [fn-param (symbol (str "?cur-setting" (swap! (:var-counter ctx) inc)))
+      (let [;; The value now comes from the session, so the PLAN must not
+            ;; be shared between sessions -- the same cached plan would
+            ;; otherwise serve one connection's search_path to another.
+            ;; Marked unconditionally rather than only for the settings
+            ;; that are session-tracked, because the GUC name arrives as
+            ;; a value and is not always known while translating. These
+            ;; are overwhelmingly connect-time probes, so the lost
+            ;; sharing is cheap and the alternative is a correctness bug.
+            _ (params/session-dependent!)
+            ;; Captured HERE, while the binding is in scope: a Datalog
+            ;; function runs off this connection's thread, where the
+            ;; dynamic var is nil. Reading it inside impl-fn silently
+            ;; returned the compiled-in default -- which is how the first
+            ;; attempt at this fix still answered the old value.
+            state params/*session-state*
+            fn-param (symbol (str "?cur-setting" (swap! (:var-counter ctx) inc)))
             settings {"server_version"             datahike.pg.PgWireServer/SERVER_VERSION
                       "server_version_num"         datahike.pg.PgWireServer/SERVER_VERSION_NUM
                       "client_encoding"            "UTF8"
@@ -1647,13 +1662,40 @@
                       ;; renderer does -- so reporting the real default
                       ;; is truthful, and SHOW returning empty was not.
                       "extra_float_digits"         "1"}
+            ;; GUC names are CASE-INSENSITIVE in PostgreSQL:
+            ;; `current_setting('SEARCH_PATH')` answers, and here it
+            ;; raised 42704 because the lookup was a plain `get` on a
+            ;; mixed-case map (TimeZone, DateStyle).
+            defaults (into {} (map (fn [[k v]] [(str/lower-case k) v])) settings)
+            ;; And the value has to come from the SESSION, not a literal.
+            ;; `SET search_path = 'myschema'` made `SHOW search_path`
+            ;; answer myschema while `current_setting('search_path')`
+            ;; still answered the compiled-in default -- two read points
+            ;; for one setting, disagreeing. `set_config` already wrote
+            ;; the session state; only this reader ignored it.
+            ;;
+            ;; Spelled to match `handle-show`'s own formatting for each
+            ;; setting, because the whole point is that the two agree.
+            session-value
+            (fn [folded]
+              (when state
+                (let [st @state]
+                  (case folded
+                    "search_path" (when-let [p (:search-path st)]
+                                    (str/join ", " p))
+                    ("datestyle" "date_style")
+                    (when-let [d (:date-style st)] (types/date-style-text d))
+                    "hnsw.ef_search" (some-> (:hnsw-ef-search st) str)
+                    nil))))
             impl-fn (fn [name & [missing-ok]]
-                      (or (get settings (str name))
-                          (when missing-ok :__null__)
-                          (throw (ex-info "unrecognized configuration parameter"
-                                          {:error :undefined-object
-                                           :kind "configuration parameter"
-                                           :name name}))))]
+                      (let [folded (str/lower-case (str name))]
+                        (or (session-value folded)
+                            (get defaults folded)
+                            (when missing-ok :__null__)
+                            (throw (ex-info "unrecognized configuration parameter"
+                                            {:error :undefined-object
+                                             :kind "configuration parameter"
+                                             :name name})))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
