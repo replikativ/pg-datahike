@@ -1433,7 +1433,26 @@
                   (case op
                     :lock       (do (locks/advisory-lock! key sid xact? mode) "")
                     :try-lock   (boolean (locks/advisory-lock-try! key sid xact? mode))
-                    :unlock     (boolean (locks/advisory-unlock! key sid mode))
+                    ;; PostgreSQL returns false AND warns when you did
+                    ;; not hold the lock (lock.c's LockRelease ->
+                    ;; `you don't own a lock of type %s`). We returned
+                    ;; false silently, which was advisory_lock.sql's
+                    ;; entire remaining gap: eight WARNING lines, four
+                    ;; per statement, one per unlock in the SELECT list.
+                    ;;
+                    ;; The notices atom is captured while TRANSLATING,
+                    ;; like the session state above: this runs as a
+                    ;; Datalog function, off this connection's thread,
+                    ;; where the dynamic var is nil and the warning
+                    ;; would be silently dropped.
+                    :unlock     (let [held? (boolean (locks/advisory-unlock! key sid mode))]
+                                  (when-not held?
+                                    (params/notice!
+                                     "WARNING"
+                                     (str "you don't own a lock of type "
+                                          (if (= :shared mode)
+                                            "ShareLock" "ExclusiveLock"))))
+                                  held?)
                     ;; `pg_advisory_unlock_all()` releases the SESSION-level
                     ;; locks; a transaction-level one is held until the
                     ;; transaction ends, which is what PostgreSQL's own
