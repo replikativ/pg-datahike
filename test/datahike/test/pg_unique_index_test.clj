@@ -633,3 +633,28 @@
   (is (not (:allow-index-backfill? (dbi/-config (d/db *conn*)))))
   (is (thrown? clojure.lang.ExceptionInfo
                (d/transact *conn* [{:db/ident :uniq_savepoint/b :db/index true}]))))
+
+(deftest a-hash-index-is-accepted-as-equality-metadata
+  ;; A PostgreSQL hash index serves EQUALITY and nothing else, which is
+  ;; exactly what Datahike's native AVET/AEVT already serve -- so the
+  ;; declaration is compatibility metadata, as a btree one already was.
+  ;;
+  ;; Rejecting it outright with `index method hash is not supported for
+  ;; this column` made `CREATE INDEX ... USING HASH` fail, and uuid.sql
+  ;; then counted two `guid%` indexes in pg_class where PostgreSQL
+  ;; counts three. That one refusal was uuid's entire remaining gap.
+  (is (nil? (state "CREATE TABLE hx (guid_field uuid, id int)")))
+  (is (nil? (state "CREATE INDEX hx_btree ON hx USING BTREE (guid_field)")))
+  (is (nil? (state "CREATE INDEX hx_hash ON hx USING HASH (guid_field)")))
+  (testing "and both are visible in pg_class, as PostgreSQL's own count query reads them"
+    (is (= [["2"]]
+           (rows (str "SELECT count(*) FROM pg_class"
+                      " WHERE relkind='i' AND relname LIKE 'hx%'")))))
+  (testing "a UNIQUE hash index is refused, in PostgreSQL's words"
+    (let [r (execute "CREATE UNIQUE INDEX hx_uh ON hx USING HASH (guid_field)")]
+      (is (= "0A000" (:state r)))
+      (is (= "access method \"hash\" does not support unique indexes" (:error r)))))
+  (testing "a unique BTREE index is still accepted"
+    (is (nil? (state "CREATE UNIQUE INDEX hx_ub ON hx USING BTREE (guid_field)"))))
+  (testing "an unknown access method is still refused"
+    (is (= "0A000" (state "CREATE INDEX hx_brin ON hx USING BRIN (id)")))))
