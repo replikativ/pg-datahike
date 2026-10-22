@@ -278,3 +278,48 @@
       (exec! a "INSERT INTO ij_b VALUES (1, 'p'), (3, 'q')")
       (is (= [["x" "p"]]
              (rows a "SELECT a.nm, b.tag FROM ij_a a, ij_b b WHERE a.id = b.id"))))))
+
+(deftest current-setting-reads-the-executing-session
+  ;; `current_setting` read a compiled-in map, so it was a SECOND read
+  ;; point for a setting `SHOW` already answered from the session --
+  ;; and the two disagreed: after `SET search_path = 'myschema'`,
+  ;; `SHOW` said myschema and `current_setting` said the default.
+  ;; `set_config` had been writing the session state all along; only
+  ;; this reader ignored it.
+  (with-open [a (connect-to "alpha")]
+    (testing "GUC names are case-insensitive in PostgreSQL"
+      ;; This raised 42704, because the lookup was a plain `get` on a
+      ;; map with mixed-case keys (TimeZone, DateStyle).
+      (is (= (scalar a "SELECT current_setting('search_path')")
+             (scalar a "SELECT current_setting('SEARCH_PATH')")))
+      (is (= "UTC" (scalar a "SELECT current_setting('timezone')")))
+      (is (= "UTC" (scalar a "SELECT current_setting('TimeZone')"))))
+    (testing "SET is visible to current_setting, and agrees with SHOW"
+      (exec! a "SET search_path = 'myschema'")
+      (is (= "myschema" (scalar a "SHOW search_path")))
+      (is (= "myschema" (scalar a "SELECT current_setting('search_path')"))
+          "one setting, one value, whichever way it is read"))
+    (testing "set_config too"
+      (is (= "other" (scalar a "SELECT set_config('search_path', 'other', false)")))
+      (is (= "other" (scalar a "SELECT current_setting('search_path')")))
+      (is (= "other" (scalar a "SHOW search_path"))))
+    (testing "an unknown parameter still raises, and missing_ok still nils"
+      (is (= "42704" (state a "SELECT current_setting('nosuch.gucname')")))
+      (is (nil? (scalar a "SELECT current_setting('nosuch.gucname', true)"))))))
+
+(deftest current-setting-is-not-shared-between-sessions
+  ;; The hazard this namespace exists for. Now that the value comes from
+  ;; the session, a cached plan must not serve the translating session's
+  ;; setting to another -- the statement is marked session-dependent.
+  (with-open [a (connect-to "alpha")
+              b (connect-to "beta")]
+    (exec! a "SET search_path = 'from_alpha'")
+    (exec! b "SET search_path = 'from_beta'")
+    ;; `a` translates first; `b` must not inherit its plan's answer.
+    (is (= "from_alpha" (scalar a "SELECT current_setting('search_path')")))
+    (is (= "from_beta" (scalar b "SELECT current_setting('search_path')")))
+    (testing "and in an expression, not just the sole projection"
+      (is (= ["from_alpha" "x"]
+             (row a "SELECT current_setting('search_path'), 'x'")))
+      (is (= ["from_beta" "x"]
+             (row b "SELECT current_setting('search_path'), 'x'"))))))
