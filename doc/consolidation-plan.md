@@ -348,6 +348,19 @@ to protect, and to check on the pgbench path before and after (see
 `doc/benchmarks.md` and the baseline in memory). A per-row callout would be an
 N+1 and is the thing 7.2 and 7.3 must avoid wherever the shape allows.
 
+## Beyond the phases — mirroring a live PostgreSQL
+
+A separate direction, not a phase: a pg-datahike database that follows a
+live PostgreSQL over logical replication and answers with our semantics
+plus `FOR SYSTEM_TIME AS OF`, and the reverse path of a running
+PostgreSQL querying us through `postgres_fdw`. See
+[postgres-mirroring.md](postgres-mirroring.md) for the decisions, the
+constraints that have to hold before any code, and the seams worth
+landing early. Two of its prerequisites are phases here already --
+catalog fidelity (Phase 4, and the `sysviews` cluster) and the single
+settings store (Phase 1.5) -- so the order does not change; the document
+records what must not be built the wrong way in the meantime.
+
 ## Process per phase
 
 - Oracle-verified tests, taken from the report's "tests to add" sections.
