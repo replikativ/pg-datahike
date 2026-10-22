@@ -522,6 +522,23 @@
    precision`; persisted hints must be resolvable by `pg-name->oid` again."
   (into {} (map (fn [[pg-name oid]] [oid pg-name])) pg-name->oid))
 
+(def ^:const pg-role-oid
+  "OID of the single role we expose. 10 is what a stock PostgreSQL gives
+   its bootstrap superuser, so anything keying off it sees a familiar
+   value.
+
+   Lives here because the role is answered from three layers -- the
+   catalog (pg_roles, pg_authid), the translator (current_user,
+   session_user, user, system_user, session_authorization) and the
+   server -- and `types` is the one namespace all of them already
+   require. It was spelled as a literal in five places in expr.clj
+   alone."
+  10)
+
+(def ^:const pg-role-name
+  "The role every connection authenticates as."
+  "datahike")
+
 (def dh-type->oid
   "Map Datahike :db/valueType to PostgreSQL type OID for wire protocol."
   {:db.type/string  oid-text

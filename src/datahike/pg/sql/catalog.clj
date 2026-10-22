@@ -53,16 +53,14 @@
 
 (def ^:private unquote-ident params/unquote-ident)
 
-(def ^:const pg-role-oid
-  "OID of the single role we expose. 10 is what a stock PostgreSQL gives
-   its bootstrap superuser, so anything keying off it sees a familiar
-   value."
-  10)
+(def pg-role-oid
+  "See `datahike.pg.types/pg-role-oid`. Kept as a name here because
+   callers reference it."
+  types/pg-role-oid)
 
-(def ^:const pg-role-name
-  "The role every connection authenticates as — see server.clj, which
-   answers the same name for current_user / session_user."
-  "datahike")
+(def pg-role-name
+  "See `datahike.pg.types/pg-role-name`."
+  types/pg-role-name)
 
 (def ^:private built-in-catalog-tables
   "Virtual catalog tables this layer materializes on demand. Extension
