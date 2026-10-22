@@ -1174,6 +1174,24 @@
   [ci tname]
   (contains? (:registered-columns ci) tname))
 
+(defn known-columns?
+  "True when `tname`'s SQL column set is KNOWN -- either a durable
+   CREATE/ALTER registry, or a derived virtual table whose attributes
+   the index holds.
+
+   This is the predicate for \"may we say a column does not exist\".
+   `registered-relation?` alone was too narrow: a catalog relation
+   (`pg_class`, `information_schema_columns`, ...) is materialized from
+   `catalog-schema-for` into the db it is queried against, so the index
+   DOES hold its columns -- but it has no CREATE/ALTER registry, so the
+   undefined-column check was skipped and every unknown identifier fell
+   through to `(keyword tname cname)`, which resolves to nothing and
+   renders NULL. PostgreSQL raises 42703, and a client predicate over
+   such a column silently dropped every row."
+  [ci tname]
+  (or (contains? (:registered-columns ci) tname)
+      (contains? (:columns ci) tname)))
+
 (defn ambiguous? [x] (= ambiguous x))
 
 (defn table-names

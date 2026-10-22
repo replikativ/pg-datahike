@@ -257,6 +257,32 @@ must be escaped, and the number grammar is strict RFC 8259. Accepting
 malformed input is how invalid documents reach storage, so this is a
 gate rather than a cosmetic gap.
 
+### `pg_get_function_result` and friends are identity stubs
+
+`pg_get_function_result`, `pg_get_functiondef` and
+`pg_get_function_identity_arguments` are all `(constantly "")`
+(`fns.clj:3784-3786`) -- they ignore their `oid` argument entirely.
+
+So psql's `\df` lists every function with an EMPTY result type and
+empty arguments, and reports no error. Found while making unknown
+catalog columns raise: `\df` selects `p.oid` and passes it to these
+functions, and the only reason the existing test passed was that
+`p.oid` resolved to NULL and the stub did not care. The test asserted
+"parses and executes", which these satisfy while answering nothing.
+
+The data to answer properly is already loaded. `pg-cat/procs` carries
+`:oid :proname :args :ret :kind :strict :volatile :retset :variadic`
+for every function in the generated registry, and `type-by-oid` turns
+an argument or return OID into a type name. So this is a rendering job
+against data we have, not a missing capability:
+`pg_get_function_arguments` joins `:args` through `type-by-oid`,
+`pg_get_function_result` renders `:ret` (with `SETOF` when `:retset`).
+
+Same shape as the size functions beside them (`pg_table_size` and
+friends are `(constantly 0)`), but those are honest -- we genuinely
+have no on-disk size -- whereas a function's signature is something we
+know.
+
 ## S2 — wrong errors
 
 ### `json` accepts operators PostgreSQL does not have

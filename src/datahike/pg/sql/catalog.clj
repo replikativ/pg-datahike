@@ -649,7 +649,12 @@
      {:db/ident :pg_settings/setting :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_settings") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_proc"
-    [{:db/ident :pg_proc/proname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+    [;; psql's `\df` selects `p.oid` and passes it to
+     ;; pg_get_function_result / pg_get_function_arguments. Without this
+     ;; the reference resolved to NULL instead of raising, so `\df`
+     ;; "worked" while calling those functions with NULL.
+     {:db/ident :pg_proc/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_proc/proname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_proc/provolatile :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_proc/pronamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_proc/pronargs :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -1692,7 +1697,13 @@
       (pgs/row-marker-attr "pg_settings") true}]
     "pg_proc"
     (mapv (fn [[pname vol nargs ret args & [namespace-oid]]]
-            {:pg_proc/proname pname
+            {;; The REAL oid from the generated pg_proc registry when the
+             ;; name is there, so a client that joins on it reaches the
+             ;; same row PostgreSQL would. The hash fallback matches what
+             ;; pg_class does for a table with no assigned oid.
+             :pg_proc/oid (long (or (some :oid (get pg-cat/procs-by-name pname))
+                                    (Math/abs (.hashCode ^String pname))))
+             :pg_proc/proname pname
              :pg_proc/provolatile vol
              :pg_proc/pronamespace (long (or namespace-oid 11))
              :pg_proc/pronargs (long nargs)

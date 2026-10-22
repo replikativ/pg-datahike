@@ -225,7 +225,7 @@
             canonical (when-let [a (pgs/canonical-attr ci table-name col-name)]
                         (when-not (pgs/ambiguous? a) a))
             _ (when (and (not derived?)
-                         (pgs/registered-relation? ci table-name)
+                         (pgs/known-columns? ci table-name)
                           ;; A bare relation name is a whole-row reference;
                           ;; its lowering happens after column resolution.
                          (not (and (nil? table-alias)

@@ -1085,3 +1085,45 @@
     (is (= "42702" (:sqlstate (ex "SELECT tableoid FROM person a, person b")))))
   (testing "a derived relation has no tableoid"
     (is (= "42703" (:sqlstate (ex "SELECT tableoid FROM (SELECT 1) s"))))))
+
+(deftest unknown-catalog-column-raises-rather-than-answering-null
+  ;; The undefined-column check used to be gated on
+  ;; `registered-relation?` -- a durable CREATE/ALTER column registry.
+  ;; A catalog relation has none, so the check was skipped and ANY
+  ;; identifier fell through to `(keyword table col)`, resolving to
+  ;; nothing and rendering NULL. PostgreSQL raises 42703.
+  ;;
+  ;; The consequence was not a stray NULL but DROPPED ROWS: `NOT NULL`
+  ;; is NULL and never true, so a predicate over such a column filtered
+  ;; everything out. That is why postgres_fdw's IMPORT FOREIGN SCHEMA
+  ;; -- whose probe ends `AND NOT c.relispartition` -- silently imported
+  ;; nothing and reported no error.
+  (is (nil? (:err (ex "CREATE TABLE strictcat (id integer)"))))
+  (testing "a column no PostgreSQL catalog has"
+    (let [r (ex "SELECT this_column_never_existed FROM pg_class")]
+      (is (= "42703" (:sqlstate r)))
+      (is (re-find #"this_column_never_existed" (or (:err r) "")))))
+  (testing "a real PostgreSQL column we do not serve"
+    (doseq [[rel col] [["pg_class" "relispartition"]
+                       ["pg_class" "relpages"]
+                       ["pg_attribute" "attlen"]
+                       ["pg_type" "typinput"]]]
+      (is (= "42703" (:sqlstate (ex (str "SELECT " col " FROM " rel))))
+          (str rel "." col " must raise, not answer NULL"))))
+  (testing "a predicate over one no longer silently empties the result"
+    ;; The shape that broke IMPORT FOREIGN SCHEMA. Before: 0 rows and no
+    ;; error, where the unfiltered count is non-zero.
+    (is (pos? (count (rows "SELECT relname FROM pg_class WHERE relname = 'strictcat'"))))
+    (is (= "42703" (:sqlstate (ex (str "SELECT relname FROM pg_class"
+                                       " WHERE relname = 'strictcat'"
+                                       "   AND NOT relispartition"))))))
+  (testing "columns we DO serve still answer"
+    (is (= [["strictcat"]]
+           (rows "SELECT relname FROM pg_class WHERE relname = 'strictcat'")))
+    ;; psql's \df passes p.oid to pg_get_function_result; it resolved to
+    ;; NULL before, so \df "worked" while calling that with NULL.
+    (is (every? (fn [[o]] (and o (pos? (Long/parseLong o))))
+                (rows "SELECT oid FROM pg_proc LIMIT 5"))))
+  (testing "a user relation was already correct, and stays correct"
+    (is (= "42703" (:sqlstate (ex "SELECT nope FROM strictcat"))))
+    (is (nil? (:err (ex "SELECT id FROM strictcat"))))))
