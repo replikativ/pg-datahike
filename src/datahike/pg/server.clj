@@ -1266,25 +1266,60 @@
   [db]
   (or (get-in (dbi/-config db) [:store :id]) ::default-db))
 
-(defn- record-commit-writes! [db-key max-tx eas]
+(defn- record-commit-writes!
+  "Record one commit's write set. `prev-max-tx` is the max-tx of the
+   transaction's OWN db-before, which is what lets `ring-write-eas`
+   verify coverage by CHAINING entries instead of counting them."
+  [db-key prev-max-tx max-tx eas]
   (swap! recent-commit-writes
          (fn [q]
-           (let [q (conj q {:db-key db-key :max-tx max-tx :eas eas})]
+           (let [q (conj q {:db-key db-key :prev-max-tx prev-max-tx
+                            :max-tx max-tx :eas eas})]
              (if (> (count q) recent-commit-ring-size) (pop q) q)))))
 
 (defn- ring-write-eas
   "Union of ring write-sets for `db-key`'s commits with max-tx in
-   (begin, current]. Returns ::gap unless every tx in that window is
-   present (datahike increments max-tx by one per transact, so coverage
-   is checkable)."
+   (begin, current]. Returns ::gap unless every commit in that window is
+   present.
+
+   Coverage is established by CHAINING, not by counting. Each entry
+   carries its own `:prev-max-tx`, so the window is covered exactly when
+   the entries form an unbroken chain from `begin-max-tx` to
+   `current-max-tx`: the oldest entry's predecessor IS begin, each
+   entry's predecessor is the one before it, and the newest lands on
+   current.
+
+   It used to compare `(count entries)` against
+   `(- current-max-tx begin-max-tx)`, which assumed max-tx advances by
+   exactly one per transact. That is true today and NOT true under a
+   Datomic-style shared `t` counter, where entities and transactions
+   draw from one 42-bit counter and `tx = (3<<42)|t`: the difference
+   then over-counts, every window reads ::gap, and every COMMIT falls
+   back to the whole-database conflict scan (about 1 s at 3M datoms,
+   per `transact-recorded!`). Chaining is independent of how much
+   max-tx advances, so the ring keeps working across that change.
+
+   A commit that bypasses the ring (COPY batches, direct DDL) breaks the
+   chain and still reads ::gap, which is the conservative answer the
+   checker wants."
   [db-key begin-max-tx current-max-tx]
-  (let [entries (filter #(and (= db-key (:db-key %))
-                              (> (:max-tx %) begin-max-tx)
-                              (<= (:max-tx %) current-max-tx))
-                        @recent-commit-writes)
-        want (- current-max-tx begin-max-tx)]
+  (let [entries (->> @recent-commit-writes
+                     (filter #(and (= db-key (:db-key %))
+                                   (> (:max-tx %) begin-max-tx)
+                                   (<= (:max-tx %) current-max-tx)))
+                     (sort-by :max-tx))
+        chained? (and (seq entries)
+                      (= begin-max-tx (:prev-max-tx (first entries)))
+                      (= current-max-tx (:max-tx (last entries)))
+                      (every? (fn [[a b]] (= (:max-tx a) (:prev-max-tx b)))
+                              (partition 2 1 entries)))]
     (cond
-      (or (not= want (count entries))
+      ;; No advance at all: nothing committed in the window. Same answer
+      ;; the count-based version gave for an empty selection.
+      (and (empty? entries) (= begin-max-tx current-max-tx))
+      ::sequence-only
+
+      (or (not chained?)
           (some #(= ::opaque (:eas %)) entries))
       ::gap
 
@@ -1430,7 +1465,8 @@
                       (every? direct-sequence-value-write? tx-data))
                ::sequence-only
                (tx-buffer-eas tx-data db-before))]
-     (record-commit-writes! (db-ring-key db-after) (:max-tx db-after) eas)
+     (record-commit-writes! (db-ring-key db-after)
+                            (:max-tx (:db-before report)) (:max-tx db-after) eas)
      report)))
 
 (defn- transact-speculative-report!
@@ -1466,7 +1502,8 @@
                         [[:db.fn/call guarded-expand expected-max-tx expanded]]))
           db-after (:db-after report)
           eas (tx-buffer-eas expanded db-before)]
-      (record-commit-writes! (db-ring-key db-after) (:max-tx db-after) eas)
+      (record-commit-writes! (db-ring-key db-after)
+                             (:max-tx (:db-before report)) (:max-tx db-after) eas)
       report)))
 
 (defn- eas-overlap?
