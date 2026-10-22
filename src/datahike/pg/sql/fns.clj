@@ -39,6 +39,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
+            [datahike.pg.geo :as geo]
             [datahike.pg.mac :as mac]
             [datahike.pg.input :as input]
             [datahike.pg.jsonb :as jb]
@@ -5173,6 +5174,21 @@
                                 (str (long d))
                                 (str d))))]
                (str "(" (f x) "," (f y) ")")))
+   ;; lseg(point, point). PG's geometric types are stored here in their
+   ;; canonical TEXT form, so the constructor is a reformat -- but it
+   ;; routes each argument through `point-in` rather than concatenating,
+   ;; so a malformed point raises 22P02 where it would otherwise be
+   ;; smuggled into an lseg literal. Strict, like PG's own: NULL in,
+   ;; NULL out.
+   ;;
+   ;; lseg.sql's only remaining divergence was this function missing:
+   ;; `INSERT INTO LSEG_TBL VALUES (lseg(point(11, 22), point(33,44)))`
+   ;; failed, the row was absent, and the later `select *` counted 7
+   ;; rows where PostgreSQL counts 8.
+   "lseg" (fn [p1 p2]
+            (when-not (or (sql-null? p1) (sql-null? p2))
+              (str "[" (geo/point-in (str p1) "point")
+                   "," (geo/point-in (str p2) "point") "]")))
    "getdatabaseencoding"  (fn [] "UTF8")
    "pg_client_encoding"   (fn [] "UTF8")
    ;; degrees/radians route through PG's checked multiply/divide, so
@@ -5336,6 +5352,7 @@
 (def ^:private legacy-sql-fn-arities
   {"pi"       #{0}
    "point" #{2}
+   "lseg" #{2}
    "getdatabaseencoding" #{0}
    "pg_client_encoding"  #{0}
    "justify_hours" #{1} "justify_days" #{1} "justify_interval" #{1}
