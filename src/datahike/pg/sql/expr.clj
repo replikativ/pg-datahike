@@ -8115,6 +8115,17 @@
      ;; the predicate below, which uses jsonb-eq?.
      (when (and (= op '=) *conjunctive-where*
                 (instance? Column left) (instance? Column right)
+                ;; `current_user`, `user`, `session_user`, `current_schema`,
+                ;; `localtime` ... are PG keywords that take no parentheses,
+                ;; so JSqlParser surfaces them as unqualified Columns. Two
+                ;; Columns here looked like an implicit join, and
+                ;; `WHERE rolname = current_user` unified rolname with a
+                ;; `pg_roles.current_user` attribute that does not exist --
+                ;; binding nothing and answering NO ROWS for a query whose
+                ;; row is right there. `translate-expr` already knows these
+                ;; are values; this branch has to let them reach it.
+                (not (bare-session-value-column? left))
+                (not (bare-session-value-column? right))
                 (nil? (.getArrayConstructor ^Column left))
                 (nil? (.getArrayConstructor ^Column right))
                 (not (jsonb-column? ctx left))

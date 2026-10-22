@@ -242,3 +242,39 @@
              (rows c "SELECT encoding, datallowconn, datconnlimit FROM pg_database
                        WHERE datname = current_database()"))))))
 
+(deftest a-bare-session-keyword-compares-as-a-value
+  ;; `current_user`, `user`, `session_user`, `current_schema` and the
+  ;; LOCALTIME family are PostgreSQL keywords that take no parentheses,
+  ;; so JSqlParser surfaces them as unqualified Columns. The equality
+  ;; path saw two Columns, read it as an implicit join, and unified
+  ;; `rolname` with a `pg_roles.current_user` attribute that does not
+  ;; exist -- so `WHERE rolname = current_user` bound nothing and
+  ;; answered NO ROWS with the matching row sitting right there.
+  ;;
+  ;; `CAST(current_user AS text)` worked throughout, which is what
+  ;; localised it: the value path always knew; only the join shortcut
+  ;; did not.
+  (with-open [a (connect-to "alpha")]
+    (is (= "datahike" (scalar a "SELECT current_user"))
+        "the premise")
+    (is (= [["datahike"]] (rows a "SELECT rolname FROM pg_roles WHERE rolname = current_user")))
+    (testing "either side, and the other spellings"
+      (is (= [["datahike"]] (rows a "SELECT rolname FROM pg_roles WHERE current_user = rolname")))
+      (is (= [["datahike"]] (rows a "SELECT rolname FROM pg_roles WHERE rolname = user")))
+      (is (= [["datahike"]] (rows a "SELECT rolname FROM pg_roles WHERE rolname = session_user"))))
+    (testing "and it still agrees with the cast form that always worked"
+      (is (= (rows a "SELECT rolname FROM pg_roles WHERE rolname = current_user")
+             (rows a "SELECT rolname FROM pg_roles WHERE rolname = CAST(current_user AS text)"))))
+    (testing "a non-matching comparison is still empty, not accidentally true"
+      ;; There is no schema named `datahike`, so PostgreSQL answers no
+      ;; rows here too -- the fix must not turn the predicate into a
+      ;; tautology.
+      (is (= [] (rows a "SELECT n.nspname FROM pg_namespace n WHERE n.nspname = current_user")))
+      (is (seq (rows a "SELECT n.nspname FROM pg_namespace n WHERE n.nspname = 'public'"))))
+    (testing "a real implicit join between two columns still joins"
+      (exec! a "CREATE TABLE ij_a (id int, nm text)")
+      (exec! a "CREATE TABLE ij_b (id int, tag text)")
+      (exec! a "INSERT INTO ij_a VALUES (1, 'x'), (2, 'y')")
+      (exec! a "INSERT INTO ij_b VALUES (1, 'p'), (3, 'q')")
+      (is (= [["x" "p"]]
+             (rows a "SELECT a.nm, b.tag FROM ij_a a, ij_b b WHERE a.id = b.id"))))))
