@@ -17,6 +17,75 @@ feature need different urgency.
 
 ## S1 — silent wrong answers
 
+### Any unknown column on a catalog relation answers NULL instead of raising
+
+Measured 2026-10-22 through pgjdbc against an in-process server, on a
+database holding one user table:
+
+```
+SELECT relispartition FROM pg_class LIMIT 1               => [nil]
+SELECT reltuples, relpages FROM pg_class LIMIT 1          => [nil nil]
+SELECT count(*) FROM pg_class                             => 1
+SELECT count(*) FROM pg_class WHERE NOT relispartition    => 0     <-- every row dropped
+SELECT oid FROM pg_proc LIMIT 1                           => [nil]
+SELECT prokind FROM pg_proc LIMIT 1                       => [nil]
+SELECT attlen FROM pg_attribute LIMIT 1                   => [nil]
+SELECT typinput FROM pg_type LIMIT 1                       => [nil]
+SELECT this_column_never_existed FROM pg_class LIMIT 1    => [nil]
+```
+
+The last line is the point: this is **not** a list of columns to add.
+Any identifier at all resolves to NULL against a catalog relation, where
+PostgreSQL raises `42703 undefined_column`. A predicate over one then
+silently drops every row, because `NOT NULL` is NULL and never true.
+
+**This is why `IMPORT FOREIGN SCHEMA` silently imports nothing.**
+postgres_fdw's probe ends `AND NOT c.relispartition ORDER BY ...`; with
+that predicate removed the same query returns correct relnames, types,
+notnull flags and collations. The user sees an empty foreign schema and
+no error. Same mechanism will quietly mis-answer any client predicate
+over a column we do not serve.
+
+What we serve, counted from the per-relation schemas declared in
+`catalog.clj` (so this is what exists, not an estimate), against
+PostgreSQL 17's catalog headers in
+`.internal/postgres-REL_17_7/src/include/catalog/`:
+
+| relation | ours / PG 17 | notable absences |
+|---|---|---|
+| `pg_class` | 6 / 33 | relispartition, reltuples, relpages, relhasindex, relpersistence, relreplident, relam, relowner, relnatts, relchecks |
+| `pg_statistic` | 6 / 31 | the whole stakind/stanumbers/stavalues family |
+| `pg_proc` | 6 / 30 | **oid**, prokind, proisstrict, procost, proargnames, proargmodes |
+| `pg_type` | 13 / 32 | typinput, typoutput, typarray, typbyval, typalign |
+| `pg_constraint` | 11 / 26 | conindid, confupdtype, confdeltype, confmatchtype |
+| `pg_attribute` | 12 / 26 | attlen, attalign, attbyval, attislocal, attinhcount, attcompression |
+| `pg_index` | 10 / 21 | indclass, indcollation, indoption, indimmediate |
+| `pg_database` | 10 / 18 | datacl, datlocprovider, datcollversion |
+
+`pg_proc.oid` deserves its own line: every `regprocedure` join,
+`pg_get_function_identity_arguments(p.oid)` and join to
+`pg_depend`/`pg_description` reads it, and it answers NULL.
+
+Also measured and separate: `SELECT count(*) FROM pg_class` is **1** on
+a database with one user table. PostgreSQL's `pg_class` holds a row per
+catalog relation and index too, so a client enumerating relations sees
+only user tables.
+
+**The fix is the class, not the columns.** An unknown column on a
+catalog relation must raise `42703`. Adding `relispartition` fixes one
+postgres_fdw query and leaves the next client's predicate to fail the
+same way. Expect the strict behaviour to surface queries that "work"
+today by accidentally reading NULL -- that is the point, but it means
+the six validation surfaces decide what gets added alongside the
+strictness, rather than the strictness landing alone.
+
+Honest constraint on what to add: a column whose value we cannot know
+should be absent or raise, not fabricated. `reltuples` from the marker
+attribute's datom count is real; `relpages`, `relfilenode` and
+`relfrozenxid` are not, and inventing them would be the same defect in
+the other direction -- see the rule recorded for empty catalog views.
+
+
 ### String literals escape-process backslashes
 
 > **FIXED on `fix/backslash-literals`**
