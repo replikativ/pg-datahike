@@ -225,14 +225,39 @@
             canonical (when-let [a (pgs/canonical-attr ci table-name col-name)]
                         (when-not (pgs/ambiguous? a) a))
             _ (when (and (not derived?)
-                         (pgs/registered-relation? ci table-name)
+                         (pgs/known-columns? ci table-name)
                           ;; A bare relation name is a whole-row reference;
                           ;; its lowering happens after column resolution.
                          (not (and (nil? table-alias)
                                    (or (contains? table-aliases col-name)
                                        (= default-table col-name))))
                          (nil? override)
-                         (nil? canonical))
+                         (nil? canonical)
+                         ;; For a CATALOG relation, only a QUALIFIED
+                         ;; reference is decidable here. PostgreSQL
+                         ;; resolves a bare name against every relation
+                         ;; in scope -- inner first, then the enclosing
+                         ;; query -- and a correlated subquery writes
+                         ;; the outer column bare:
+                         ;;
+                         ;;   SELECT enumlabel FROM pg_enum WHERE NOT EXISTS
+                         ;;     (SELECT 1 FROM pg_type WHERE pg_type.oid = enumtypid)
+                         ;;
+                         ;; `resolve-column` sees only this scope --
+                         ;; correlation is detected later, in expr, from
+                         ;; explicitly passed outer aliases -- so a bare
+                         ;; name absent from THIS relation may still be
+                         ;; defined, and reporting it would reject a
+                         ;; valid query. A qualifier names its relation,
+                         ;; so absence IS decidable.
+                         ;;
+                         ;; This is why the bare form stays permissive
+                         ;; for catalogs; doc/backlog.md records it, and
+                         ;; records that the same bare correlated
+                         ;; reference already fails on a USER relation
+                         ;; today, which is the gap to close first.
+                         (or (not (pgs/catalog-relation-name? table-name))
+                             (some? table-alias)))
                 (throw (ex-info (str "column \"" col-name "\" does not exist")
                                 {:error :undefined-column
                                  :sqlstate "42703"
@@ -667,12 +692,23 @@
   true)
 
 (defn- catalog-attr?
-  "The virtual pg_catalog / information_schema namespaces. Their column
-   sets are whatever we chose to materialise, and driver introspection
-   asks for more than that on purpose — the empty-catalog machinery
-   answers those as NULL. Applying the check here would turn every
-   unimplemented catalog column into a hard error for a driver that is
-   only probing."
+  "The virtual pg_catalog / information_schema namespaces.
+
+   This exemption now applies to BARE references only. A QUALIFIED
+   catalog column is checked in `resolve-column`, because a catalog
+   relation's materialised column set IS its whole column set, and
+   answering an unknown one as NULL is not merely incomplete: `NOT NULL`
+   is NULL and never true, so a predicate over it silently drops every
+   row. That is what made postgres_fdw's IMPORT FOREIGN SCHEMA import
+   nothing and report success.
+
+   The old reasoning here -- that driver introspection asks for more
+   than we materialise, so erroring would break a driver that is only
+   probing -- held up only halfway when tested. Both surfaces it broke
+   (SQLAlchemy on pg_type.typarray, asyncpg on pg_class.relacl) were
+   reading columns PostgreSQL HAS, which a correct driver may assume;
+   serving them was the right answer, and nothing was probing for a
+   column that does not exist upstream."
   [attr]
   (when-let [ns (namespace attr)]
     (or (str/starts-with? ns "pg_")

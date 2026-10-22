@@ -16,8 +16,15 @@
    `:schema-flexibility :write`. Under `:read` a plain scalar attribute
    has no schema entry at all, so every column of a working query would
    look undefined; those databases stay permissive, which is the whole
-   point of that mode. Catalog namespaces (pg_*, information_schema) are
-   likewise exempt — they are synthesised, not schema-backed.
+   point of that mode.
+
+   Catalog namespaces (pg_*, information_schema) were likewise exempt.
+   They are no longer, for a QUALIFIED reference: being synthesised is
+   exactly why their materialised column set IS the whole set, so
+   `c.relispartition` raises. A BARE catalog reference stays permissive,
+   because `resolve-column` cannot see the enclosing query and a
+   correlated subquery writes its outer column bare. See
+   `unknown-catalog-column-raises-rather-than-answering-null`.
 
    Expectations captured from PostgreSQL 17."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]

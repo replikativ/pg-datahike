@@ -1174,6 +1174,35 @@
   [ci tname]
   (contains? (:registered-columns ci) tname))
 
+(defn catalog-relation-name?
+  "True for the synthesised pg_catalog / information_schema relations.
+   Their names are the namespace convention: `information_schema.x` is
+   materialized as `information_schema_x`."
+  [tname]
+  (and (string? tname)
+       (or (str/starts-with? tname "pg_")
+           (str/starts-with? tname "information_schema"))))
+
+(defn known-columns?
+  "True when `tname`'s SQL column set is EXHAUSTIVELY known, so \"absent\"
+   may be reported as \"does not exist\".
+
+   Two sources qualify. A durable CREATE/ALTER registry, as before. And
+   a CATALOG relation whose columns the index holds: those are
+   synthesised from `catalog-schema-for`, so what we materialized IS the
+   whole column set.
+
+   Deliberately NOT \"anything in `:columns`\". Under
+   `:schema-flexibility :read` a plain scalar attribute has no schema
+   entry at all, so a user relation appears in `:columns` via whichever
+   attribute happens to be declared while real columns of it do not --
+   and reporting those as undefined breaks working queries against a
+   documented configuration. See `read-flexibility-stays-permissive`."
+  [ci tname]
+  (or (contains? (:registered-columns ci) tname)
+      (and (catalog-relation-name? tname)
+           (contains? (:columns ci) tname))))
+
 (defn ambiguous? [x] (= ambiguous x))
 
 (defn table-names
