@@ -407,6 +407,45 @@ plausible wrong answer rather than an error.
 
 ---
 
+### An unordered `SELECT *` does not return insertion order
+
+`select_implicit`'s whole remaining gap, measured 2026-10-22, is four
+lines across two queries of this shape:
+
+```sql
+SELECT count(b) INTO TABLE test_missing_target2 FROM ... GROUP BY x.b ORDER BY x.b;
+SELECT * FROM test_missing_target2;
+-- PG:    1 2 3 4
+-- ours:  3 4 1 2
+```
+
+No `ORDER BY`, so SQL guarantees nothing -- but PostgreSQL's seq scan
+returns heap order, which for a freshly populated table is INSERTION
+order, and `SELECT ... INTO ... ORDER BY` inserted in that order. Its
+regression suite relies on this throughout.
+
+Matching it means an unordered scan returning rows in the order their
+entities were created. Worth knowing before chasing it: whether our
+`INTO` preserves the producing query's order at all, and what our
+unordered scan currently orders by (entity id is the likely answer, in
+which case the gap is in `INTO`, not in the scan).
+
+This is the second-largest kind of residual in the near-miss band after
+error wording, and it is NOT gameable by emitting more output -- the
+rows are all there, in the wrong order.
+
+### A multicolumn hash index is accepted
+
+PostgreSQL refuses it: `access method "hash" does not support
+multicolumn indexes`. We accept it. Found while adding hash-index
+support; no file in scope exercises it.
+
+A guard on `(count (:columns parsed))` did **not** fire when tested,
+even though `:columns` is built as `(mapv :name column-specs)` -- so
+whatever reaches that branch is not the shape it appears to be, and the
+check was left out rather than shipped unverified. Start by printing
+the parsed map for `CREATE INDEX i ON t USING HASH (a, b)`.
+
 ## S3 — missing
 
 - ~~`#>`, `#>>`~~ — **FIXED (496a1da)**. The check now excludes those two
