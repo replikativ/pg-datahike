@@ -336,3 +336,31 @@
       (is (= "t" (one c "SELECT '{1,2}'::int[] && '{2,3}'::int[]")))
       (is (= "t" (one c "SELECT '{1,2}'::int[] @> '{2}'::int[]")))
       (is (= "t" (one c "SELECT '{\"a\":1}'::jsonb @> '{\"a\":1}'::jsonb"))))))
+
+(deftest lseg-constructs-from-two-points
+  ;; `lseg(point, point)`. lseg.sql's only remaining divergence was this
+  ;; function missing: `INSERT INTO LSEG_TBL VALUES (lseg(point(11, 22),
+  ;; point(33,44)))` failed with `function lseg(point, point) does not
+  ;; exist`, the row was absent, and the later `select *` counted 7 rows
+  ;; where PostgreSQL counts 8.
+  ;;
+  ;; Expectations are PostgreSQL 17's, from lseg.out.
+  (with-open [c (jdbc)]
+    (is (= "[(11,22),(33,44)]" (one c "SELECT lseg(point(11, 22), point(33,44))"))
+        "PG's canonical lseg form, brackets and no spaces")
+    (testing "the arguments may be any point spelling, including text"
+      (is (= "[(1,2),(3,4)]" (one c "SELECT lseg('(1,2)', '(3,4)')"))))
+    (testing "strict, as PG's own is"
+      (is (nil? (one c "SELECT lseg(point(11,22), NULL)")))
+      (is (nil? (one c "SELECT lseg(NULL, NULL)"))))
+    (testing "a malformed point RAISES rather than being smuggled into an lseg"
+      ;; The reason this routes each argument through point input instead
+      ;; of concatenating two strings.
+      (is (= "22P02" (state-of c "SELECT lseg('garbage', point(1,2))")))
+      (is (= "22P02" (state-of c "SELECT lseg(point(1,2), '(1,')"))))
+    (testing "the result is an lseg, usable where one is expected"
+      (exec! c "CREATE TABLE lseg_ctor (s lseg)")
+      (exec! c "INSERT INTO lseg_ctor VALUES (lseg(point(11, 22), point(33,44)))")
+      (is (= "[(11,22),(33,44)]" (one c "SELECT s FROM lseg_ctor")))
+      (is (= "1" (one c "SELECT count(*) FROM lseg_ctor"))
+          "the row PostgreSQL's row count was missing"))))
