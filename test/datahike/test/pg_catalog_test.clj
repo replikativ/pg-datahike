@@ -1104,8 +1104,8 @@
       (is (= "42703" (:sqlstate r)))
       (is (re-find #"this_column_never_existed" (or (:err r) "")))))
   (testing "a real PostgreSQL column we do not serve"
-    (doseq [[rel col] [["pg_class" "relispartition"]
-                       ["pg_class" "relpages"]
+    (doseq [[rel col] [["pg_class" "relpages"]
+                       ["pg_class" "relfilenode"]
                        ["pg_attribute" "attlen"]
                        ["pg_type" "typinput"]]]
       (is (= "42703" (:sqlstate (ex (str "SELECT r." col " FROM " rel " r"))))
@@ -1117,7 +1117,20 @@
            (rows "SELECT c.relname FROM pg_class c WHERE c.relname = 'strictcat'")))
     (is (= "42703" (:sqlstate (ex (str "SELECT c.relname FROM pg_class c"
                                        " WHERE c.relname = 'strictcat'"
-                                       "   AND NOT c.relispartition"))))))
+                                       "   AND c.relpages = 0"))))))
+  (testing "relispartition IS served now, and false, because a client demanded it"
+    ;; postgres_fdw's IMPORT FOREIGN SCHEMA probe ends
+    ;; `AND NOT c.relispartition`. Declaring it was not enough -- an
+    ;; absent value reads NULL and NOT NULL is never true, so the import
+    ;; silently yielded nothing. Verified end to end against a real
+    ;; PG 17 + postgres_fdw: the foreign table now imports with all its
+    ;; columns, types and NOT NULL flags.
+    (is (= [["f"]]
+           (rows "SELECT c.relispartition FROM pg_class c WHERE c.relname = 'strictcat'")))
+    (is (= [["strictcat"]]
+           (rows (str "SELECT c.relname FROM pg_class c"
+                      " WHERE c.relname = 'strictcat' AND NOT c.relispartition")))
+        "the exact predicate shape that broke IMPORT FOREIGN SCHEMA"))
   (testing "a BARE reference to a catalog column stays permissive, on purpose"
     ;; `resolve-column` sees only this scope. PostgreSQL resolves a bare
     ;; name against every relation in scope including the ENCLOSING

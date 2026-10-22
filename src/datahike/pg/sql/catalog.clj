@@ -681,6 +681,14 @@
      ;; `\d` -- and every tool that reads pg_class rather than the
      ;; view -- saw no triggers on a table that has them.
      {:db/ident :pg_class/relhastriggers :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     ;; relispartition: false on every row, because we have no
+     ;; partitioning. It must be POPULATED, not merely declared --
+     ;; an absent value reads NULL, and postgres_fdw's IMPORT
+     ;; FOREIGN SCHEMA probe ends `AND NOT c.relispartition`,
+     ;; where NOT NULL is NULL and never true, so every row is
+     ;; dropped and the import silently yields nothing. Verified
+     ;; against a real PG 17 with postgres_fdw.
+     {:db/ident :pg_class/relispartition :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      ;; relacl is NULL in PostgreSQL whenever a relation has DEFAULT
      ;; privileges. We have no privilege system, so NULL for every
      ;; relation is the truthful answer, and the column is declared so
@@ -1836,6 +1844,7 @@
                    {:pg_class/oid (long tbl-oid)
                     :pg_class/relname t
                     :pg_class/relnamespace 2200
+                    :pg_class/relispartition false
                     :pg_class/relkind (if (contains? matviews t) "m" "r")
                     :pg_class/reltype
                     (long (if (= :row-type (:datahike.pg.object/kind row-type))
@@ -1853,6 +1862,7 @@
                 {:pg_class/oid (long (or (:datahike.pg.object/oid relation) oid))
                  :pg_class/relname name
                  :pg_class/relnamespace 2200
+                 :pg_class/relispartition false
                  :pg_class/relkind "c"
                  :pg_class/reltype oid
                  (pgs/row-marker-attr "pg_class") true}))
@@ -1872,6 +1882,7 @@
                             (Math/abs (.hashCode ^String nm))))
                   :pg_class/relname nm
                   :pg_class/relnamespace 2200
+                  :pg_class/relispartition false
                   :pg_class/relkind "S"
                   :pg_class/reltype 0
                   (pgs/row-marker-attr "pg_class") true}))
@@ -1889,6 +1900,7 @@
                              (Math/abs (.hashCode ^String name))))
                    :pg_class/relname name
                    :pg_class/relnamespace 2200
+                   :pg_class/relispartition false
                    :pg_class/relkind "v"
                    :pg_class/reltype
                    (long (if (= :row-type (:datahike.pg.object/kind row-type))
@@ -1899,6 +1911,7 @@
                 {:pg_class/oid (:datahike.pg.object/oid object)
                  :pg_class/relname (:datahike.pg.object/name object)
                  :pg_class/relnamespace 2200
+                 :pg_class/relispartition false
                  :pg_class/relkind "i"
                  :pg_class/reltype 0
                  (pgs/row-marker-attr "pg_class") true})
@@ -1912,6 +1925,7 @@
                 {:pg_class/oid oid
                  :pg_class/relname name
                  :pg_class/relnamespace 2200
+                 :pg_class/relispartition false
                  :pg_class/relkind "i"
                  :pg_class/reltype 0
                  (pgs/row-marker-attr "pg_class") true})
