@@ -1087,20 +1087,20 @@
     (is (= "42703" (:sqlstate (ex "SELECT tableoid FROM (SELECT 1) s"))))))
 
 (deftest unknown-catalog-column-raises-rather-than-answering-null
-  ;; The undefined-column check used to be gated on
-  ;; `registered-relation?` -- a durable CREATE/ALTER column registry.
-  ;; A catalog relation has none, so the check was skipped and ANY
-  ;; identifier fell through to `(keyword table col)`, resolving to
-  ;; nothing and rendering NULL. PostgreSQL raises 42703.
+  ;; The undefined-column check was gated on `registered-relation?` -- a
+  ;; durable CREATE/ALTER column registry. A catalog relation has none,
+  ;; so the check was skipped and ANY identifier fell through to
+  ;; `(keyword table col)`, resolving to nothing and rendering NULL.
+  ;; PostgreSQL raises 42703.
   ;;
   ;; The consequence was not a stray NULL but DROPPED ROWS: `NOT NULL`
   ;; is NULL and never true, so a predicate over such a column filtered
-  ;; everything out. That is why postgres_fdw's IMPORT FOREIGN SCHEMA
-  ;; -- whose probe ends `AND NOT c.relispartition` -- silently imported
+  ;; everything out. That is why postgres_fdw's IMPORT FOREIGN SCHEMA --
+  ;; whose probe ends `AND NOT c.relispartition` -- silently imported
   ;; nothing and reported no error.
   (is (nil? (:err (ex "CREATE TABLE strictcat (id integer)"))))
   (testing "a column no PostgreSQL catalog has"
-    (let [r (ex "SELECT this_column_never_existed FROM pg_class")]
+    (let [r (ex "SELECT c.this_column_never_existed FROM pg_class c")]
       (is (= "42703" (:sqlstate r)))
       (is (re-find #"this_column_never_existed" (or (:err r) "")))))
   (testing "a real PostgreSQL column we do not serve"
@@ -1108,23 +1108,33 @@
                        ["pg_class" "relpages"]
                        ["pg_attribute" "attlen"]
                        ["pg_type" "typinput"]]]
-      (is (= "42703" (:sqlstate (ex (str "SELECT " col " FROM " rel))))
+      (is (= "42703" (:sqlstate (ex (str "SELECT r." col " FROM " rel " r"))))
           (str rel "." col " must raise, not answer NULL"))))
   (testing "a predicate over one no longer silently empties the result"
-    ;; The shape that broke IMPORT FOREIGN SCHEMA. Before: 0 rows and no
+    ;; The shape that broke IMPORT FOREIGN SCHEMA: before, 0 rows and no
     ;; error, where the unfiltered count is non-zero.
-    (is (pos? (count (rows "SELECT relname FROM pg_class WHERE relname = 'strictcat'"))))
-    (is (= "42703" (:sqlstate (ex (str "SELECT relname FROM pg_class"
-                                       " WHERE relname = 'strictcat'"
-                                       "   AND NOT relispartition"))))))
-  (testing "columns we DO serve still answer"
     (is (= [["strictcat"]]
-           (rows "SELECT relname FROM pg_class WHERE relname = 'strictcat'")))
+           (rows "SELECT c.relname FROM pg_class c WHERE c.relname = 'strictcat'")))
+    (is (= "42703" (:sqlstate (ex (str "SELECT c.relname FROM pg_class c"
+                                       " WHERE c.relname = 'strictcat'"
+                                       "   AND NOT c.relispartition"))))))
+  (testing "a BARE reference to a catalog column stays permissive, on purpose"
+    ;; `resolve-column` sees only this scope. PostgreSQL resolves a bare
+    ;; name against every relation in scope including the ENCLOSING
+    ;; query, and a correlated subquery writes the outer column bare, so
+    ;; a bare name absent from this relation is not decidably undefined.
+    ;; Raising here rejected `SELECT enumlabel FROM pg_enum WHERE NOT
+    ;; EXISTS (SELECT 1 FROM pg_type WHERE pg_type.oid = enumtypid)`,
+    ;; which is valid. doc/backlog.md records what closing this needs.
+    (is (nil? (:err (ex "SELECT relispartition FROM pg_class")))
+        "a known limitation, pinned so it is not mistaken for coverage"))
+  (testing "columns we DO serve still answer"
     ;; psql's \df passes p.oid to pg_get_function_result; it resolved to
     ;; NULL before, so \df "worked" while calling that with NULL.
     (is (every? (fn [[o]] (and o (pos? (Long/parseLong o))))
                 (rows "SELECT oid FROM pg_proc LIMIT 5"))))
   (testing "a user relation was already correct, and stays correct"
+    ;; Unqualified too: a registered relation's column set IS exhaustive.
     (is (= "42703" (:sqlstate (ex "SELECT nope FROM strictcat"))))
     (is (nil? (:err (ex "SELECT id FROM strictcat"))))))
 

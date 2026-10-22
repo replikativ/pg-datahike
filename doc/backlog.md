@@ -283,6 +283,56 @@ friends are `(constantly 0)`), but those are honest -- we genuinely
 have no on-disk size -- whereas a function's signature is something we
 know.
 
+### A bare correlated outer column raises 42703 on a user relation
+
+```sql
+SELECT b FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.x = a)
+```
+
+raises `column "a" does not exist`. The qualified spelling
+(`t2.x = t1.a`) works. PostgreSQL resolves a bare name against every
+relation in scope, inner first and then the ENCLOSING query, so the
+unqualified form is valid and common -- it is how PostgreSQL's own
+regression suite writes `NOT EXISTS` anti-joins.
+
+`resolve-column` sees only the current scope. Correlation is detected
+later, in `expr`, from outer aliases passed explicitly
+(`correlated-subquery-refs`), and the ctx a subquery resolves against
+carries no outer `table-aliases`. So by the time the name is looked up,
+the information needed to resolve it is not there.
+
+Found while making unknown catalog columns raise: the catalog case had
+been surviving on the blanket catalog exemption, which answered the
+unresolved outer reference as NULL. **That means
+`enum-catalog-has-no-orphaned-labels`'s third assertion was passing
+without resolving anything** -- it expects `[]`, and an unresolvable
+correlated reference also yields a result the assertion accepts.
+
+Closing it is a translator change, not a catalog one: `resolve-column`
+needs the enclosing scope's relations, or the check has to run after
+correlation analysis. Until then the bare form stays permissive for
+catalog relations too, and
+`unknown-catalog-column-raises-rather-than-answering-null` pins that as
+a known limitation rather than coverage.
+
+### Catalog columns PostgreSQL has and we do not, now loud for a qualified reference
+
+Unchanged in substance from the entry above on unknown catalog columns:
+`pg_class` serves 6 of 33, `pg_statistic` 6 of 31, `pg_proc` 6 of 30,
+`pg_type` 14 of 32 (typarray added), `pg_attribute` 12 of 26.
+
+What changed is the failure mode for a QUALIFIED reference: `42703`
+instead of a NULL that drops rows. Which columns to add is decided by
+what the client surfaces demand -- that is how `pg_type.typarray`,
+`pg_class.relacl` and `pg_proc.oid` were found -- not by declaring all
+of them up front, which also has a cost worth measuring first, since
+catalog schema and data are materialized per query via `d/db-with`.
+
+Honest constraint, unchanged: a column whose value we cannot know must
+be absent or raise, never fabricated. `reltuples` from the marker
+attribute's datom count is real; `relpages`, `relfilenode` and
+`relfrozenxid` are not.
+
 ## S2 — wrong errors
 
 ### `json` accepts operators PostgreSQL does not have

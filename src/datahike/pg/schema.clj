@@ -1174,23 +1174,34 @@
   [ci tname]
   (contains? (:registered-columns ci) tname))
 
-(defn known-columns?
-  "True when `tname`'s SQL column set is KNOWN -- either a durable
-   CREATE/ALTER registry, or a derived virtual table whose attributes
-   the index holds.
+(defn catalog-relation-name?
+  "True for the synthesised pg_catalog / information_schema relations.
+   Their names are the namespace convention: `information_schema.x` is
+   materialized as `information_schema_x`."
+  [tname]
+  (and (string? tname)
+       (or (str/starts-with? tname "pg_")
+           (str/starts-with? tname "information_schema"))))
 
-   This is the predicate for \"may we say a column does not exist\".
-   `registered-relation?` alone was too narrow: a catalog relation
-   (`pg_class`, `information_schema_columns`, ...) is materialized from
-   `catalog-schema-for` into the db it is queried against, so the index
-   DOES hold its columns -- but it has no CREATE/ALTER registry, so the
-   undefined-column check was skipped and every unknown identifier fell
-   through to `(keyword tname cname)`, which resolves to nothing and
-   renders NULL. PostgreSQL raises 42703, and a client predicate over
-   such a column silently dropped every row."
+(defn known-columns?
+  "True when `tname`'s SQL column set is EXHAUSTIVELY known, so \"absent\"
+   may be reported as \"does not exist\".
+
+   Two sources qualify. A durable CREATE/ALTER registry, as before. And
+   a CATALOG relation whose columns the index holds: those are
+   synthesised from `catalog-schema-for`, so what we materialized IS the
+   whole column set.
+
+   Deliberately NOT \"anything in `:columns`\". Under
+   `:schema-flexibility :read` a plain scalar attribute has no schema
+   entry at all, so a user relation appears in `:columns` via whichever
+   attribute happens to be declared while real columns of it do not --
+   and reporting those as undefined breaks working queries against a
+   documented configuration. See `read-flexibility-stays-permissive`."
   [ci tname]
   (or (contains? (:registered-columns ci) tname)
-      (contains? (:columns ci) tname)))
+      (and (catalog-relation-name? tname)
+           (contains? (:columns ci) tname))))
 
 (defn ambiguous? [x] (= ambiguous x))
 
