@@ -323,3 +323,44 @@
              (row a "SELECT current_setting('search_path'), 'x'")))
       (is (= ["from_beta" "x"]
              (row b "SELECT current_setting('search_path'), 'x'"))))))
+
+(defn- with-warnings
+  "First row, plus the statement's SQLWarnings in order."
+  [^Connection c sql]
+  (with-open [st (.createStatement c) rs (.executeQuery st sql)]
+    (.next rs)
+    (let [n (.getColumnCount (.getMetaData rs))
+          vals (mapv #(.getString rs (int %)) (range 1 (inc n)))]
+      [vals (loop [w (.getWarnings st) acc []]
+              (if w (recur (.getNextWarning w) (conj acc (.getMessage w))) acc))])))
+
+(deftest unlocking-a-lock-you-do-not-hold-warns
+  ;; PostgreSQL returns false AND warns (lock.c's LockRelease:
+  ;; `you don't own a lock of type %s`). We returned false silently,
+  ;; which was advisory_lock.sql's entire remaining gap -- eight
+  ;; WARNING lines, four per statement, one per unlock in the SELECT
+  ;; list, with the mode named.
+  ;;
+  ;; Expectations are PostgreSQL 17's, from advisory_lock.out.
+  (with-open [a (connect-to "alpha")]
+    (testing "one warning per failed unlock, in SELECT-list order, naming the mode"
+      (is (= [["f" "f" "f" "f"]
+              ["you don't own a lock of type ExclusiveLock"
+               "you don't own a lock of type ShareLock"
+               "you don't own a lock of type ExclusiveLock"
+               "you don't own a lock of type ShareLock"]]
+             (with-warnings a (str "SELECT pg_advisory_unlock(1),"
+                                   " pg_advisory_unlock_shared(2),"
+                                   " pg_advisory_unlock(1, 1),"
+                                   " pg_advisory_unlock_shared(2, 2)")))))
+    (testing "a lock you DO hold releases quietly"
+      (is (= [[""] []] (with-warnings a "SELECT pg_advisory_lock(1)")))
+      (is (= [["t"] []] (with-warnings a "SELECT pg_advisory_unlock(1)")))
+      (testing "and unlocking it twice warns the second time"
+        (is (= [["f"] ["you don't own a lock of type ExclusiveLock"]]
+               (with-warnings a "SELECT pg_advisory_unlock(1)")))))
+    (testing "the shared half names ShareLock"
+      (is (= [[""] []] (with-warnings a "SELECT pg_advisory_lock_shared(7)")))
+      (is (= [["t"] []] (with-warnings a "SELECT pg_advisory_unlock_shared(7)")))
+      (is (= [["f"] ["you don't own a lock of type ShareLock"]]
+             (with-warnings a "SELECT pg_advisory_unlock_shared(7)"))))))
