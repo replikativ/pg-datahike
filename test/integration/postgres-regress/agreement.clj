@@ -165,18 +165,44 @@
                 (format "  %-24s %.1f%% -> %.1f%%  (+%.1f)" name recorded now (- now recorded)))]
     {:problems (vec problems) :gains (vec gains)}))
 
+(defn- subset-names
+  "`AGREEMENT_FILES`, space- or comma-separated, restricted to files that
+   are actually in scope. Only `probe` honours it -- see -main."
+  []
+  (when-let [raw (System/getenv "AGREEMENT_FILES")]
+    (let [asked (remove str/blank? (str/split (str/trim raw) #"[,\s]+"))
+          in-scope (set (application-facing))
+          unknown (remove in-scope asked)]
+      (when (seq unknown)
+        (println "not in scope (see scope.edn):" (str/join " " unknown))
+        (System/exit 2))
+      (vec asked))))
+
 (defn -main
-  "Usage: agreement <measure|gate> <collected-results-dir>
+  "Usage: agreement <measure|gate|probe> <collected-results-dir>
 
    The caller has already run the regression files and gathered their
    `.out` files into one directory; this only measures and compares, so
    the slow part stays in the harness and the O(n*m) comparison stays
-   on the JVM."
+   on the JVM.
+
+   `probe` reports per-file agreement against the recorded manifest and
+   writes NOTHING. It exists so a campaign can iterate on a handful of
+   files without paying for all 154 -- and it is a separate mode rather
+   than a flag on `measure` on purpose: `measure` rewrites `:files` from
+   what it measured, so measuring a SUBSET would silently drop every
+   other file's baseline and leave the gate unable to see a regression
+   in them. `AGREEMENT_FILES` is therefore honoured by `probe` alone."
   [& [mode results-dir]]
   (when-not (and mode results-dir)
-    (println "usage: agreement <measure|gate> <results-dir>")
+    (println "usage: agreement <measure|gate|probe> <results-dir>")
     (System/exit 2))
-  (let [names (application-facing)
+  (when (and (System/getenv "AGREEMENT_FILES") (not= mode "probe"))
+    (println (str "AGREEMENT_FILES is only honoured by `probe`. Using it with `"
+                  mode "` would rewrite the manifest from a subset and drop"
+                  " every other file's baseline."))
+    (System/exit 2))
+  (let [names (or (subset-names) (application-facing))
         measured (into {} (keep (fn [n]
                                   (when-let [[pct _ _] (agreement n results-dir)]
                                     [n (Double/parseDouble (format "%.1f" pct))])))
@@ -207,6 +233,23 @@
                                     (format "  \"%s\" %.1f" n p)))
                    "\n }}\n"))
         (println (format "measured %d files, wrote %s" (count measured) manifest-file)))
+
+      "probe"
+      (let [manifest (try (edn/read-string (slurp manifest-file)) (catch Exception _ {}))
+            recorded (:files manifest)]
+        (println (format "%-26s %7s %7s %s" "file" "now" "was" "delta"))
+        (doseq [n (sort names)
+                :let [now (get measured n)
+                      was (get recorded n)]]
+          (println (format "%-26s %7s %7s %s"
+                           n
+                           (if now (format "%.1f" now) "-")
+                           (if was (format "%.1f" was) "-")
+                           (cond (nil? now) "NOT MEASURABLE"
+                                 (nil? was) "new"
+                                 (>= now 99.95) (if (>= was 99.95) "exact" "EXACT (was not)")
+                                 :else (format "%+.1f" (- now was))))))
+        (println "\nprobe only -- nothing written. Run `bb pg-regress-measure` to re-baseline."))
 
       "gate"
       (let [manifest (edn/read-string (slurp manifest-file))
