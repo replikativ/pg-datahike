@@ -1643,8 +1643,7 @@
       ;; reads it back (psql's \set, pgjdbc's connection setup) was
       ;; told its own request had not taken.
       (contains? #{"timezone" "time zone" "time_zone"} setting-name)
-      (show-setting "TimeZone"
-                    (types/time-zone-text (:time-zone @session-state)))
+      (show-setting "TimeZone" (guc/read-setting session-state "timezone"))
 
       ;; `SHOW DateStyle` reports the session's own setting, not the
       ;; startup default -- a client that SETs it and reads it back
@@ -1653,6 +1652,11 @@
       (contains? #{"datestyle" "date_style"} setting-name)
       (show-setting "DateStyle"
                     (types/date-style-text (or (:date-style @session-state) [:iso :mdy])))
+
+      ;; A setting we do not model but the session has SET: answered
+      ;; back, as PostgreSQL does.
+      (get-in @session-state [:gucs setting-name])
+      (show-setting setting-name (get-in @session-state [:gucs setting-name]))
 
       (contains? show-settings setting-name)
       (show-setting setting-name (get show-settings setting-name))
@@ -5569,6 +5573,29 @@
         (= kind :reset) 0
         (= kind :set)   (when value (parse-statement-timeout-value value))))))
 
+(def ^:private startup-non-settings
+  "StartupMessage keys that are not session settings, or that are read
+   on their own path (DateStyle, statement_timeout, client_encoding)."
+  #{"user" "database" "options" "replication" "datestyle" "client_encoding"
+    "statement_timeout"})
+
+(defn- startup-settings
+  "The session settings a StartupMessage carries: its own parameters
+   (`TimeZone`, `application_name`, …) and each `-c name=value` in
+   `options`, which is how PGOPTIONS arrives. Later wins, as in
+   PostgreSQL, where `options` is applied after the parameters."
+  [^java.util.Map startup-params]
+  (let [params (for [[k v] startup-params
+                     :let [k (str/lower-case (str k))]
+                     :when (not (contains? startup-non-settings k))]
+                 [k (str v)])
+        opts (for [[_ k v] (re-seq #"(?i)-c\s*([a-z_][a-z0-9_.]*)=(\S+)"
+                                   (str (.get startup-params "options")))
+                   :let [k (str/lower-case k)]
+                   :when (not (contains? startup-non-settings k))]
+               [k v])]
+    (vec (concat params opts))))
+
 (defn- parse-startup-statement-timeout
   "Extract `-c statement_timeout=VALUE` from a StartupMessage options
    parameter. libpq/psql use this form for PGOPTIONS. Other startup options
@@ -6905,7 +6932,7 @@
    these but preserves connection-identity keys (e.g. :db-name)."
   [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search :date-style :time-zone
    :valid-at :valid-from :valid-to :statement-timeout :isolation :read-only?
-   :float-sum])
+   :float-sum :time-zone-text :gucs])
 
 (defn- handle-reset
   "RESET ALL / RESET <var>. The datahike.* temporal vars and
@@ -13339,6 +13366,7 @@
   "The handler `make-query-handler` scopes; see there."
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
                                               initial-statement-timeout initial-date-style
+                                              initial-settings
                                               release-conn-on-close?
                                               dispatch-stats
                                               on-create-database on-delete-database
@@ -13373,6 +13401,14 @@
                               (assoc :statement-timeout initial-statement-timeout)
                               initial-date-style
                               (assoc :date-style initial-date-style)))
+        ;; A StartupMessage parameter IS a session setting in PostgreSQL:
+        ;; libpq turns PGTZ into `TimeZone`, and pg_regress runs every
+        ;; file under `PGTZ=America/Los_Angeles`, which we answered in
+        ;; UTC. One PostgreSQL would refuse is skipped rather than
+        ;; failing the connection.
+        _ (doseq [[k v] initial-settings]
+            (try (guc/set-setting! session-state k [v])
+                 (catch Exception _ nil)))
         ;; session-id is unique per handler so the global lock-registry can
         ;; distinguish this connection's locks from others'.
         session-id (str (java.util.UUID/randomUUID))
@@ -14689,9 +14725,11 @@
                                   (->> (re-find #"(?i)-c\s*datestyle=([^\s]+)"))
                                   second))
                       (types/parse-date-style [:iso :mdy]))
+              initial-settings (startup-settings startup-params)
               handler-opts (cond-> (assoc opts
                                           :db-name requested
-                                          :registered-databases names)
+                                          :registered-databases names
+                                          :initial-settings initial-settings)
                              (some? initial-timeout)
                              (assoc :initial-statement-timeout initial-timeout)
                              (some? initial-date-style)

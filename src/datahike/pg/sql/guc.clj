@@ -64,6 +64,12 @@
    "hnsw.ef_search"         :hnsw-ef-search
    "pg_datahike.float_sum"  :float-sum})
 
+(def ^:private read-only-settings
+  "GUCs PostgreSQL reports but never lets a session change."
+  #{"server_version" "server_version_num" "server_encoding" "lc_collate"
+    "lc_ctype" "is_superuser" "block_size" "max_identifier_length"
+    "integer_datetimes" "segment_size" "wal_block_size"})
+
 (defn reset-setting!
   "Clear one GUC, returning it to its compiled-in default. Returns true
    when the name is one we model.
@@ -72,9 +78,14 @@
    NULL, …)` does: `guc.c`'s `set_config_by_name` passes a NULL value
    straight to `set_config_option`, where it means \"reset to default\"."
   [session-state name]
-  (if-let [k (get setting-keys (some-> name str str/lower-case))]
-    (do (when session-state (swap! session-state dissoc k)) true)
-    false))
+  (let [folded (some-> name str str/lower-case)]
+    (if-let [k (get setting-keys folded)]
+      (do (when session-state
+            (swap! session-state dissoc k)
+            (when (= :time-zone k) (swap! session-state dissoc :time-zone-text)))
+          true)
+      (do (when session-state (swap! session-state update :gucs dissoc folded))
+          false))))
 
 (defn set-setting!
   "Apply one session GUC. `name` is the setting as written (folded
@@ -106,13 +117,13 @@
       (= "search_path" setting)
       (do (set-search-path! session-state values) true)
 
-      ;; `types/parse-time-zone` owns the conventions, including that a
-      ;; bare numeric offset is POSIX-signed (positive means WEST). An
-      ;; unparseable value clears the setting, which is what SET did.
+      ;; `types/time-zone-setting` owns the conventions -- three of them,
+      ;; disagreeing about the sign -- and what SHOW answers for each.
+      ;; DEFAULT / LOCAL clear the setting.
       (contains? #{"timezone" "time zone" "time_zone"} setting)
-      (do (if-let [z (types/parse-time-zone raw)]
-            (swap! session-state assoc :time-zone z)
-            (swap! session-state dissoc :time-zone))
+      (do (if-let [{:keys [zone text]} (types/time-zone-setting raw)]
+            (swap! session-state assoc :time-zone zone :time-zone-text text)
+            (swap! session-state dissoc :time-zone :time-zone-text))
           true)
 
       (contains? #{"datestyle" "date_style"} setting)
@@ -146,7 +157,20 @@
         (swap! session-state assoc :hnsw-ef-search value)
         true)
 
-      :else false)))
+      ;; Read-only in PostgreSQL too: 55P02, not a silent no-op.
+      (contains? read-only-settings setting)
+      (throw (ex-info (str "parameter \"" setting "\" cannot be changed")
+                      {:sqlstate "55P02"}))
+
+      ;; One we do not model is still a setting: PostgreSQL stores it
+      ;; and answers it back. `application_name` was answered with the
+      ;; role name whatever had been set, and a custom dotted one --
+      ;; `set_config('request.jwt.sub', …)`, how PostgREST hands a
+      ;; request's identity to row-level security -- was not stored at
+      ;; all, so the `current_setting` after it raised 42704.
+      :else
+      (do (swap! session-state assoc-in [:gucs setting] raw)
+          false))))
 
 (def ^:private default-settings
   "The GUCs we report a value for, whether or not we model them. These
@@ -217,9 +241,10 @@
         ("datestyle" "date_style")
         (when-let [d (:date-style st)] (types/date-style-text d))
         ("timezone" "time zone" "time_zone")
-        (when-let [z (:time-zone st)] (types/time-zone-text z))
+        (or (:time-zone-text st)
+            (when-let [z (:time-zone st)] (types/time-zone-text z)))
         "hnsw.ef_search" (some-> (:hnsw-ef-search st) str)
-        nil))))
+        (get-in st [:gucs folded])))))
 
 (defn read-setting
   "One GUC as text, exactly as `SHOW` reports it, or nil when we neither

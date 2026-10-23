@@ -1925,19 +1925,44 @@
             (and (kw=? a "read") (kw=? b "write")) false
             :else (recur (inc i))))))))
 
+(defn- interval-hours
+  "HOUR TO MINUTE interval text (`'+05:30'`, `'-8'`) as decimal hours
+   (`\"5.5\"`); nil when it is not that shape."
+  [s]
+  (when-let [[_ sign h m] (re-matches #"\s*([+-]?)(\d{1,2})(?::(\d{2}))?\s*" (str s))]
+    (let [hours (+ (parse-long h) (/ (parse-long (or m "0")) 60.0))]
+      (str (when (= "-" sign) "-") hours))))
+
 (defn- classify-set*
   "Generic SET name = value branch (no isolation special-casing)."
   [toks]
   (let [[var-name after-var] (read-dotted-name toks)
-        ;; Skip optional = or TO
-        after-eq (if (or (= "=" (:text (first after-var)))
-                         (kw=? (first after-var) "to"))
-                   (rest after-var) after-var)
+        ;; Skip optional = or TO. `timezone=-7` lexes as the one
+        ;; operator `=-`, so its sign is put back as a token of its own.
+        eq-text (:text (first after-var))
+        after-eq (cond
+                   (or (= "=" eq-text) (kw=? (first after-var) "to"))
+                   (rest after-var)
+                   (and (= :op (:type (first after-var))) (#{"=-" "=+"} eq-text))
+                   (cons {:type :op :text (subs eq-text 1)} (rest after-var))
+                   :else after-var)
         first-val (first after-eq)
+        second-val (second after-eq)
         value-str (cond
                     (nil? first-val) nil
                     (= :string (:type first-val)) (:value first-val)
                     (= :number (:type first-val)) (:text first-val)
+                    ;; The lexer has no signed numbers, so `SET timezone =
+                    ;; -7` is `-` then `7`; reading only the first token
+                    ;; gave nil, which silently RESET the zone to UTC.
+                    (and (= :op (:type first-val)) (#{"-" "+"} (:text first-val))
+                         (= :number (:type second-val)))
+                    (str (:text first-val) (:text second-val))
+                    ;; SET TIME ZONE INTERVAL '+05:30' HOUR TO MINUTE --
+                    ;; SQL-standard, so east is positive. It reaches the
+                    ;; zone reader as hours, which reads them that way.
+                    (and (kw=? first-val "interval") (= :string (:type second-val)))
+                    (interval-hours (:value second-val))
                     (ident-tok? first-val) (ident-text first-val)
                     :else nil)
         result {:kind :set :var var-name :value value-str}]
