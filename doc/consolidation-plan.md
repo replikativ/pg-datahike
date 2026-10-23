@@ -185,6 +185,125 @@ Two process lessons, both now in memory:
   cost real time twice in one session before I checked the tool rather
   than the code.
 
+## Where things stand, re-read from the code (2026-10-23)
+
+The phase texts below were written ahead of the work and had drifted:
+several items they list as open had landed, and a few they imply are
+done are not. This section was rebuilt by reading `src/` (three review
+agents, no measurement), and it wins where the two disagree. Scores in
+`agreement.edn` date from 2026-10-02 and predate #299/#300 (interval)
+and #303 (bytea), so the datetime and interval numbers are stale; the
+re-measure (about 90 minutes) comes before any ranking is trusted.
+
+### Status
+
+| Phase | State | What is actually left |
+|---|---|---|
+| 1.1 output by OID | partial | `value->string` (server.clj) is still a second renderer beside `->pg-text`, which is not total: bool via `str` gives `true`, and PgArray/PgBit/PgRecord fall to `str` -- reachable from `concat`/`\|\|`. `record_out` escapes `"` as `\"` (PostgreSQL doubles it). `to_jsonb` renders by class, not OID. dump.clj has its own rules (`[B@…` for bytes). |
+| 1.2 registry | not started | no per-OID map; `dh-type->oid :bytes` says text while `dh-type->pg-name` says bytea; Java `ARRAY_TO_ELEM` is hand-kept; binary send re-parses our text. |
+| 1.3 input | mostly | bool/ints/float/numeric/uuid done; datetime decoder done (#297) but `parse-timestamp-string` still has live callers (stmt.clj, sql.clj's UNNEST fill, copy.clj) and `PgParamCodec.decodeText` leaves the temporal OIDs as String; money is not in `input/parsers`; `pg_input_is_valid` answers false for valid temporal/money/time input. |
+| 1.4 comparison | partial (#301) | four equality notions remain: `sql-eq?`, `value-key`, `unique/canonical-key-value`, and raw Clojure `=` for top-level DISTINCT, `count(DISTINCT)`, NOT IN lists, IN-subquery set ops, GROUP BY. `akey-compare` drops per-key direction and NULLS FIRST in an aggregate's ORDER BY. timetz sorts as text. |
+| 1.5 TimeZone | done | (#318/#319/#321, corrected by #331/#332) -- but see "TimeZone reaches only I/O" below. |
+| 2 interval | mostly | carrier, decoder, arithmetic, justify_* done. Left: `age`, `make_interval`, `date_bin` (catalog rows only), a real `OVERLAPS`, the `interval '1' minute to second` qualifier syntax, `to_char(interval)`. |
+| 3 bytea | partial | column OID still text; `get_byte`/`set_byte`/`convert_*` missing; a UTF-8 fallback passthrough remains (stmt.clj). |
+| 4 registry/resolver | data only | `pg_catalog.edn` feeds volatility and pg_proc OIDs, but resolution is still hand tables; no name/OID resolver: `regclass` falls back to a hash and never raises 42P01, `regnamespace` is 2200, every `has_*_privilege` is true. |
+| 5 text | not started | regex is raw java.util.regex; LIKE drops a trailing escape instead of 22025; no SIMILAR TO; string functions count UTF-16 units; `format()` has no positions/width/22023; SRF producer still truncates to long and returns `[]` on a zero step. |
+| 6 gaps | mostly open | `to_char`/`to_date`/`to_timestamp` on datetimes not started; `now()` is per statement, in ms; `current_date` is UTC; float precision items open; `bit_*`, `covar_*`, `regr_*`, `any_value` missing. |
+| 7.2 SETOF in FROM | done | |
+| 7.3 plpgsql | partial | executor covers the control flow; refused at CREATE: EXCEPTION, EXECUTE, RETURN QUERY EXECUTE, GET DIAGNOSTICS, cursors, ALIAS, ASSERT. |
+| 7.4 triggers | mostly done | row/statement level, transition tables, TRUNCATE, INSTEAD OF -- lacking only what plpgsql lacks. |
+
+### Found by the review of #318–#325, and what became of it
+
+Fixed: cursor row caps the page rewrite could not read, and PostgreSQL's
+cursor positions incl. SCROLL (#328); `power()` of a negative base to a
+huge integral exponent (#329); the wire scanners and dollar quotes /
+E'' / unterminated comments (#330); unmodeled settings stored, startup
+parameters applied, TimeZone's three readings (#331); settings are
+transactional (#332).
+
+Open, in this plan:
+- **CREATE TABLE AS skips most of the SELECT pipeline** (`sql.clj`
+  `translate-create-table-as`): HAVING, window functions, DISTINCT ON,
+  expressions over aggregates, and the one row an aggregate gives over
+  no input. A materialized view built this way and then REFRESHed (which
+  goes through INSERT…SELECT) can hold different rows. The fix is to run
+  the SELECT through the same executor INSERT…SELECT uses, not to keep
+  patching this path.
+- **TimeZone reaches only I/O.** #319 applied the session zone to
+  timestamptz input/output by design, but PostgreSQL also uses it for
+  `timestamptz::date`, `extract`, `date_trunc`, `date::timestamptz`,
+  `to_char`, `current_date` and interval arithmetic across DST -- all of
+  which we compute in UTC. Invisible while the zone is UTC; wrong as
+  soon as it is not, and pg_regress runs under America/Los_Angeles,
+  which #331 now honours.
+- **ParameterStatus is never sent after a change**, and the startup set
+  is hard-coded (DateStyle ISO even when the client asked otherwise).
+- **`U&'…'` literals** -- doc/backlog.md.
+
+### Order from here
+
+Each step ships as PRs with the gates named in "Process per phase".
+
+1. **Re-measure** (`bb pg-regress-measure`, ~90 min, needs the machine).
+2. **CREATE TABLE AS through the shared SELECT executor** -- a silent
+   wrong-answer class, so ahead of features.
+3. **TimeZone inside the datetime functions** -- same reason; the list
+   above is the test plan.
+4. **Phase 1.4, one equality and one ordering**, in this order: an
+   equality/ordering fuzzer surface committed as a failing gate; merge
+   `canonical-key-value` into `value-key` and route every raw-`=` site
+   through it; one ordering wrapper with a per-key `[dir nulls]` spec;
+   PgArray and timetz arms in `order-cmp`. Each is a burn-down of the
+   gate.
+5. **Phase 1.1/1.2**: `->pg-text` total and `value->string` reduced to
+   it; `to_jsonb` by OID; dump.clj through `->pg-text`; then the
+   registry skeleton.
+6. **Phase 1.3 cutover**: `pg_input_is_valid` through `input/parse`;
+   money `:in`; temporal text parameters; retire `parse-timestamp-string`.
+7. **`format()` port** (`text_format`) -- `text`, and plpgsql's RAISE
+   and EXECUTE need it.
+8. **Interval functions** and the qualifier rewrite, then **formatting.c**
+   (`to_char` output, then `to_date`/`to_timestamp` input) -- the biggest
+   lever on `horology`, `timestamp`, `timestamptz`, `timetz`.
+9. Small independent items: missing aggregates; bytea OID 17 with
+   `get_byte`/`set_byte`; the SRF zero-step error; transaction-stable
+   `now()`; code points.
+10. **Phase 4 resolver** (relation/type/namespace/function, `to_reg*`,
+    `has_*`), then **postgres_fdw stage 0** (EXPLAIN cost line, protocol
+    DEALLOCATE, size functions, parenthesized joins).
+11. **plpgsql EXCEPTION** (on savepoints), then EXECUTE (needs 7) and GET
+    DIAGNOSTICS.
+12. Registry-driven resolution and float precision; then ARE.
+
+### Decisions that are the owner's
+
+1. **ARE**: port PostgreSQL's regex engine, or translate to
+   java.util.regex and document the divergence (`'a|ab'` matches `ab`
+   in PostgreSQL, `a` in Java).
+2. **Privileges**: keep `has_*_privilege` answering true (Metabase
+   relies on it), or the single-superuser model with errors for unknown
+   objects.
+3. **`pg_relation_size`**: 0, an estimate from datom counts, or the
+   store's real size -- postgres_fdw plans from it.
+4. **EXPLAIN**: a PostgreSQL-shaped cost line, or keep the truthful
+   Datalog output.
+5. **`foreign_data`** into scope, against `scope.edn`'s server-extension
+   boundary.
+6. **`now()` precision**: microseconds needs a carrier other than
+   `java.util.Date`.
+7. **bytea column OID 17**: in Phase 1.2 or with Phase 3 (wire framing
+   changes either way).
+8. **Text-stored time/timetz/interval/array columns**: decode per OID at
+   comparison, or native carriers (which must keep `compare == 0` iff
+   `=` for the index).
+9. **Datahike `:order-by` push-down**: give it a pluggable comparator,
+   or always sort server-side for keys whose OID orders differently.
+10. **Text order**: switch to code-point order (C collation); Datahike's
+    index compares strings the same way today, so range seeks move too.
+11. **GROUP BY equality**: wait for datahike#1109, or merge groups here.
+12. **Regress gate cadence**: per phase, or per PR.
+
 ## Phase 1 — one value registry (finish #179)
 
 Target (value-layer audit §5): per-OID `{:in :out :text :recv :send :compare :storage :typmod}` and one `resolve-type-name`. Shippable steps:
