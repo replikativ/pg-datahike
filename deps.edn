@@ -36,6 +36,11 @@
   :test {:extra-paths ["test"]
          :extra-deps  {lambdaisland/kaocha  {:mvn/version "1.91.1392"}
                        org.postgresql/postgresql {:mvn/version "42.7.3"}}
+         ;; pgjdbc sends the JVM's zone as the TimeZone startup
+         ;; parameter, and the server honours it as PostgreSQL does, so
+         ;; the suite's rendered timestamptz values depend on it. Pinned
+         ;; to UTC so they do not depend on the machine.
+         :jvm-opts    ["-Duser.timezone=UTC"]
          :main-opts   ["-m" "kaocha.runner"]}
 
   ;; Dev REPL with test code on the classpath + nREPL for editor hook-up.

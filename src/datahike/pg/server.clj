@@ -1641,8 +1641,7 @@
       ;; reads it back (psql's \set, pgjdbc's connection setup) was
       ;; told its own request had not taken.
       (contains? #{"timezone" "time zone" "time_zone"} setting-name)
-      (show-setting "TimeZone"
-                    (types/time-zone-text (:time-zone @session-state)))
+      (show-setting "TimeZone" (guc/read-setting session-state "timezone"))
 
       ;; `SHOW DateStyle` reports the session's own setting, not the
       ;; startup default -- a client that SETs it and reads it back
@@ -1651,6 +1650,11 @@
       (contains? #{"datestyle" "date_style"} setting-name)
       (show-setting "DateStyle"
                     (types/date-style-text (or (:date-style @session-state) [:iso :mdy])))
+
+      ;; A setting we do not model but the session has SET: answered
+      ;; back, as PostgreSQL does.
+      (get-in @session-state [:gucs setting-name])
+      (show-setting setting-name (get-in @session-state [:gucs setting-name]))
 
       (contains? show-settings setting-name)
       (show-setting setting-name (get show-settings setting-name))
@@ -5567,6 +5571,29 @@
         (= kind :reset) 0
         (= kind :set)   (when value (parse-statement-timeout-value value))))))
 
+(def ^:private startup-non-settings
+  "StartupMessage keys that are not session settings, or that are read
+   on their own path (DateStyle, statement_timeout, client_encoding)."
+  #{"user" "database" "options" "replication" "datestyle" "client_encoding"
+    "statement_timeout"})
+
+(defn- startup-settings
+  "The session settings a StartupMessage carries: its own parameters
+   (`TimeZone`, `application_name`, …) and each `-c name=value` in
+   `options`, which is how PGOPTIONS arrives. Later wins, as in
+   PostgreSQL, where `options` is applied after the parameters."
+  [^java.util.Map startup-params]
+  (let [params (for [[k v] startup-params
+                     :let [k (str/lower-case (str k))]
+                     :when (not (contains? startup-non-settings k))]
+                 [k (str v)])
+        opts (for [[_ k v] (re-seq #"(?i)-c\s*([a-z_][a-z0-9_.]*)=(\S+)"
+                                   (str (.get startup-params "options")))
+                   :let [k (str/lower-case k)]
+                   :when (not (contains? startup-non-settings k))]
+               [k v])]
+    (vec (concat params opts))))
+
 (defn- parse-startup-statement-timeout
   "Extract `-c statement_timeout=VALUE` from a StartupMessage options
    parameter. libpq/psql use this form for PGOPTIONS. Other startup options
@@ -6548,6 +6575,7 @@
              :local-sequence-generations {}
              :local-sequence-identities #{}
              :temp-tables-before @temp-tables)
+      (guc/begin! session-state)
       (tag-tx-status (empty-result "BEGIN") tx-state))))
 
 (defn- open-implicit-tx!
@@ -6575,11 +6603,12 @@
 (defn- handle-savepoint
   "Savepoint names are unique within a tx but may be reused after RELEASE.
    Outside a tx PG raises 25P01."
-  [{:keys [tx-state temp-tables]} parsed]
+  [{:keys [tx-state temp-tables session-state]} parsed]
   (let [name (:name parsed)]
     (if-not (:in-tx? @tx-state)
       (error-result "SAVEPOINT can only be used in transaction blocks" "25P01")
-      (do (swap! tx-state update :savepoints (fnil conj [])
+      (do (guc/savepoint! session-state name)
+          (swap! tx-state update :savepoints (fnil conj [])
                  {:name name
                   :speculative-db (:speculative-db @tx-state)
                   :tx-buffer (:tx-buffer @tx-state)
@@ -6603,7 +6632,7 @@
   "RELEASE SAVEPOINT name — discards the named savepoint and any more
    recent. Row locks acquired since the savepoint become part of the
    outer scope (NOT released). PG raises 3B001 if name isn't active."
-  [{:keys [tx-state]} parsed]
+  [{:keys [tx-state session-state]} parsed]
   (let [name (:name parsed)
         stack (:savepoints @tx-state)
         idx (when (and name (seq stack))
@@ -6619,7 +6648,9 @@
           (error-result (str "savepoint \"" name "\" does not exist") "3B001"))
       :else
       (do (swap! tx-state update :savepoints subvec 0 idx)
-          (empty-result "RELEASE SAVEPOINT")))))
+          (guc/release-savepoint! session-state name)
+          ;; PostgreSQL's tag is bare `RELEASE`.
+          (empty-result "RELEASE")))))
 
 (defonce ^:private commit-check-lock
   ;; Serializes conflict-check + d/transact in transact-tx-buffer! (and
@@ -6891,7 +6922,7 @@
              :verb verb}))))
 
 (defn- handle-commit
-  [{:keys [conn session-id tx-state cursors temp-tables]} _parsed]
+  [{:keys [conn session-id tx-state cursors temp-tables session-state]} _parsed]
   (reject-nested-transaction-control! tx-state "COMMIT")
   (if (:in-tx? @tx-state)
     (if (:aborted? @tx-state)
@@ -6901,22 +6932,26 @@
       ;; explicit ROLLBACK.
       (do (invalidate-rolled-back-ddl! tx-state)
           (restore-temp-tables! tx-state temp-tables)
+          (guc/rollback! session-state)
           (end-tx! session-id tx-state cursors)
           (tag-tx-status (empty-result "ROLLBACK") tx-state))
       (try
         (transact-tx-buffer! conn tx-state)
+        (guc/commit! session-state)
         (end-tx! session-id tx-state cursors)
         (tag-tx-status (empty-result "COMMIT") tx-state)
         (catch Exception e
           (invalidate-rolled-back-ddl! tx-state)
           (restore-temp-tables! tx-state temp-tables)
+          (guc/rollback! session-state)
           (end-tx! session-id tx-state cursors)
           (classified-error "COMMIT failed: " e))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
-  [{:keys [session-id tx-state cursors temp-tables]} _parsed]
+  [{:keys [session-id tx-state cursors temp-tables session-state]} _parsed]
   (reject-nested-transaction-control! tx-state "ROLLBACK")
+  (guc/rollback! session-state)
   (invalidate-rolled-back-ddl! tx-state)
   (restore-temp-tables! tx-state temp-tables)
   (end-tx! session-id tx-state cursors)
@@ -6927,7 +6962,7 @@
    savepoint (which remains active). Locks acquired after the target
    are released. Raises 25P01 outside a tx, 3B001 if the savepoint
    name isn't active."
-  [{:keys [tx-state temp-tables]} parsed]
+  [{:keys [tx-state temp-tables session-state]} parsed]
   (let [sp-stack (:savepoints @tx-state)
         name (:name parsed)
         target-idx (when (seq sp-stack)
@@ -6959,6 +6994,7 @@
                            reg to-release))))
         (when (> current-ddl-version target-ddl-version)
           (invalidate-schema-cache!))
+        (guc/rollback-to-savepoint! session-state name)
         (reset! temp-tables target-temp-tables)
         (swap! tx-state assoc
                :aborted? false
@@ -7006,7 +7042,7 @@
    these but preserves connection-identity keys (e.g. :db-name)."
   [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search :date-style :time-zone
    :valid-at :valid-from :valid-to :statement-timeout :isolation :read-only?
-   :float-sum])
+   :float-sum :time-zone-text :gucs])
 
 (defn- handle-reset
   "RESET ALL / RESET <var>. The datahike.* temporal vars and
@@ -7018,13 +7054,18 @@
    asyncpg's pool reset sends `RESET ALL` on every release."
   [{:keys [session-state]} parsed]
   (let [setting (some-> (:var parsed) str/lower-case)]
-    (if (= "all" setting)
-      (swap! session-state #(apply dissoc % session-guc-keys))
-      ;; `guc/setting-keys` maps each GUC name to the key it writes, so
-      ;; this cannot name a setting that `SET` writes somewhere else --
-      ;; it held its own copy of the same names before, which is the
-      ;; shape the `set_config` bug grew out of.
-      (guc/reset-setting! session-state setting)))
+    ;; RESET is a SET to the default, and as transactional.
+    (guc/scoped!
+     session-state false
+     #(if (= "all" setting)
+        ;; Back to what the session started with, as for RESET <var>.
+        (swap! session-state (fn [st] (merge (apply dissoc st session-guc-keys)
+                                             (:guc-startup st))))
+        ;; `guc/setting-keys` maps each GUC name to the key it writes, so
+        ;; this cannot name a setting that `SET` writes somewhere else --
+        ;; it held its own copy of the same names before, which is the
+        ;; shape the `set_config` bug grew out of.
+        (guc/reset-setting! session-state setting))))
   (empty-result "RESET"))
 
 ;; --- Advisory-lock handlers -------------------------------------------------
@@ -7629,8 +7670,12 @@
         (let [setting (some-> (:var parsed) str/lower-case)
               values  (if (seq (:values parsed))
                         (vec (:values parsed))
-                        [(:value parsed)])]
-          (guc/set-setting! session-state setting values))
+                        [(:value parsed)])
+              local?  (boolean (:local? parsed))]
+          (when (and local? (not (guc/in-transaction-block? session-state)))
+            (params/notice! "WARNING" "SET LOCAL can only be used in transaction blocks"))
+          (guc/scoped! session-state local?
+                       #(guc/set-setting! session-state setting values)))
         (empty-result "SET"))
       :prepare          (handle-prepare ctx parsed)
       :execute-prepared (handle-execute-prepared ctx parsed)
@@ -7698,16 +7743,20 @@
       ;; as text and asyncpg reads it back, so returning empty-string
       ;; was not harmless: echo the value argument.
       (let [[setting value] (:args parsed)]
-        (guc/set-setting! session-state setting [value])
         ;; PostgreSQL answers with the setting as it now stands
         ;; (`set_config_by_name` ends in `GetConfigOptionByName`), not
         ;; with the string passed in: a NULL value resets and answers
-        ;; the DEFAULT, and `'+02:00'` answers the canonical `-02:00`.
+        ;; the DEFAULT, and `'europe/berlin'` answers `Europe/Berlin`.
         ;; Echoing was close enough only while nothing was stored. A
-        ;; name we neither model nor default still echoes.
+        ;; name we neither model nor default still echoes. Read inside
+        ;; the scope: outside a transaction a local change is undone
+        ;; as it leaves, as `guc/scoped!` explains.
         (single-row-result "set_config" PgWireServer/OID_TEXT
-                           (or (guc/read-setting session-state setting)
-                               value)))
+                           (guc/scoped! session-state (boolean (:local? parsed))
+                                        (fn []
+                                          (guc/set-setting! session-state setting [value])
+                                          (or (guc/read-setting session-state setting)
+                                              value)))))
 
       :do-block
       ;; `DO [LANGUAGE l] $$ … $$` -- an anonymous code block. It is a
@@ -13440,6 +13489,7 @@
   "The handler `make-query-handler` scopes; see there."
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
                                               initial-statement-timeout initial-date-style
+                                              initial-settings
                                               release-conn-on-close?
                                               dispatch-stats
                                               on-create-database on-delete-database
@@ -13474,6 +13524,12 @@
                               (assoc :statement-timeout initial-statement-timeout)
                               initial-date-style
                               (assoc :date-style initial-date-style)))
+        ;; A StartupMessage parameter IS a session setting in PostgreSQL:
+        ;; libpq turns PGTZ into `TimeZone`, and pg_regress runs every
+        ;; file under `PGTZ=America/Los_Angeles`, which we answered in
+        ;; UTC. One PostgreSQL would refuse is skipped rather than
+        ;; failing the connection.
+        _ (guc/apply-startup-settings! session-state initial-settings)
         ;; session-id is unique per handler so the global lock-registry can
         ;; distinguish this connection's locks from others'.
         session-id (str (java.util.UUID/randomUUID))
@@ -14790,9 +14846,11 @@
                                   (->> (re-find #"(?i)-c\s*datestyle=([^\s]+)"))
                                   second))
                       (types/parse-date-style [:iso :mdy]))
+              initial-settings (startup-settings startup-params)
               handler-opts (cond-> (assoc opts
                                           :db-name requested
-                                          :registered-databases names)
+                                          :registered-databases names
+                                          :initial-settings initial-settings)
                              (some? initial-timeout)
                              (assoc :initial-statement-timeout initial-timeout)
                              (some? initial-date-style)

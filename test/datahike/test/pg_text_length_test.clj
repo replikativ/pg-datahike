@@ -95,10 +95,19 @@
       (is (= "3" (one c "SELECT count(*)::text FROM t"))))))
 
 (deftest extra-float-digits-is-reported
+  ;; pgjdbc sends `extra_float_digits=2` in its StartupMessage and then
+  ;; `SET extra_float_digits = 3` (ConnectionFactoryImpl), and a startup
+  ;; parameter is a session setting -- so this session reads 3, and
+  ;; RESET goes back to the 2 it started with, as PostgreSQL's would.
+  ;; Above 0 it means shortest-round-trip, which is what our float
+  ;; renderer produces.
   (with-open [c (jdbc)]
-    (is (= "1" (one c "SHOW extra_float_digits"))
-        "SHOW answered an empty string; PostgreSQL's default is 1, and
-         above 0 it means shortest-round-trip -- which is what our float
-         renderer already produces")
-    (is (= "1" (one c "SELECT current_setting('extra_float_digits')"))
-        "current_setting raised 42704 for it")))
+    (is (= "3" (one c "SHOW extra_float_digits"))
+        "SHOW answered an empty string, then the default 1 whatever the
+         client had asked for")
+    (is (= "3" (one c "SELECT current_setting('extra_float_digits')"))
+        "current_setting raised 42704 for it")
+    (exec! c "SET extra_float_digits = 0")
+    (exec! c "RESET extra_float_digits")
+    (is (= "2" (one c "SHOW extra_float_digits"))
+        "RESET goes back to the value the session started with")))

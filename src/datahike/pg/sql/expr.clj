@@ -1686,23 +1686,34 @@
       (= fname "set_config")
       (let [state params/*session-state*
             fn-param (symbol (str "?set-config" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [setting value & _]
+            impl-fn (fn [setting value & [is-local]]
                       (let [v (when-not (or (nil? value) (= :__null__ value))
                                 (str value))
                             named? (not (or (nil? setting)
-                                            (= :__null__ setting)))]
-                        (when (and state named?)
-                          (guc/set-setting! state (str setting) [v]))
-                        ;; The answer is the setting AS IT NOW STANDS,
-                        ;; which is only the same as `v` when the value
-                        ;; was accepted verbatim: a reset (`v` nil)
-                        ;; answers the default, and `'+02:00'` answers
-                        ;; the canonical `-02:00`. Falls back to the
-                        ;; echo for a name we neither model nor default,
-                        ;; which must not raise -- see the `jit` note.
-                        (or (when named? (guc/read-setting state setting))
-                            v
-                            :__null__)))]
+                                            (= :__null__ setting)))
+                            ;; The third argument is `is_local`: the
+                            ;; change lasts only to the end of the
+                            ;; transaction, as `SET LOCAL`'s does.
+                            local? (contains? #{true "t" "true" "on"} is-local)
+                            ;; The answer is the setting AS IT NOW STANDS,
+                            ;; which is only the same as `v` when the value
+                            ;; was accepted verbatim: a reset (`v` nil)
+                            ;; answers the default, and `'europe/berlin'`
+                            ;; answers `Europe/Berlin`. Falls back to the
+                            ;; echo for a name we neither model nor
+                            ;; default, which must not raise -- see the
+                            ;; `jit` note. Read INSIDE the scope, because
+                            ;; outside a transaction a local change is
+                            ;; undone as it leaves.
+                            answer #(or (when named? (guc/read-setting state setting))
+                                        v
+                                        :__null__)]
+                        (if (and state named?)
+                          (guc/scoped! state local?
+                                       (fn []
+                                         (guc/set-setting! state (str setting) [v])
+                                         (answer)))
+                          (answer))))]
         (params/session-dependent!)
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)

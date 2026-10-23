@@ -1714,32 +1714,62 @@
            [style order]
            (str/split (str (or v "")) #","))))
 
-(defn parse-time-zone
-  "Read a `TimeZone` / `TIME ZONE` value into a `java.time.ZoneId`, or
-   nil for the forms that mean \"back to the default\" (`DEFAULT`,
-   `LOCAL`). Throws `:invalid-parameter-value` for anything else, which
-   is 22023, as PostgreSQL does for an unrecognised zone.
+(def ^:private tz-names
+  "Every zone name we accept, by its folded spelling, to the spelling
+   `SHOW` answers with. PostgreSQL matches zone names case-insensitively
+   (`SET timezone = 'europe/berlin'` answers `Europe/Berlin`); `ZoneId/of`
+   does not, so a lower-case name was 22023.
 
-   **A bare numeric value uses the POSIX sign convention: positive means
-   WEST of Greenwich, so the offset is the NEGATION of what it reads
-   like.** Verified against PostgreSQL 17's timestamptz.out:
+   EST, MST and HST are fixed-offset zones in PostgreSQL's tzdata, and
+   are only aliases in Java's, so they are added by hand. `Z` is NOT a
+   PostgreSQL zone name although `ZoneId/of` takes it."
+  (delay
+    (into {"est" ["EST" (java.time.ZoneOffset/ofHours -5)]
+           "mst" ["MST" (java.time.ZoneOffset/ofHours -7)]
+           "hst" ["HST" (java.time.ZoneOffset/ofHours -10)]}
+          (map (fn [^String id] [(str/lower-case id) [id (java.time.ZoneId/of id)]]))
+          (java.time.ZoneId/getAvailableZoneIds))))
 
-       SET timezone = '04:30'   ->  offset -04:30
-       SET timezone = '-04:30'  ->  offset +04:30
-       SET timezone = '+02:00'  ->  offset -02:00
-       SET timezone = '-13:00'  ->  offset +13:00
-       SET timezone = '00:30'   ->  offset -00:30
+(defn- tz-offset-text
+  "Seconds east of Greenwich as `+HH[:MM[:SS]]`, as a TimeZone's `SHOW`
+   text writes it."
+  [^long secs]
+  (let [a (Math/abs secs)
+        h (quot a 3600) m (quot (rem a 3600) 60) sec (rem a 60)]
+    (str (if (neg? secs) "-" "+") (format "%02d" h)
+         (when (or (pos? m) (pos? sec)) (format ":%02d" m))
+         (when (pos? sec) (format ":%02d" sec)))))
 
-   This is the opposite of `ZoneId/of`, which reads them as ISO. Mapping
-   them straight through would have put every rendered timestamptz out
-   by TWICE the offset. The inversion applies to this bare-string form
-   only -- NOT to zone names, not to a timestamp literal's own offset,
-   and not to `SET TIME ZONE INTERVAL ... HOUR TO MINUTE`, which is
-   SQL-standard and reads positive as east.
+(defn- invalid-time-zone [raw]
+  (errors/pg-error
+   :invalid-parameter-value
+   {:message (str "invalid value for parameter \"TimeZone\": \"" raw "\"")}))
 
-   A POSIX TZ string carrying its own offset or DST rules (`UTC-2`,
-   `CST7CDT`) is refused rather than guessed: Java's reading of `UTC-2`
-   is not POSIX's, and PostgreSQL's expected output does not pin it.
+(defn time-zone-setting
+  "Read a `TimeZone` / `TIME ZONE` value into `{:zone ZoneId :text s}` --
+   the zone to compute in and what `SHOW TimeZone` answers -- or nil for
+   the forms that mean \"back to the default\" (`DEFAULT`, `LOCAL`).
+   Throws `:invalid-parameter-value` (22023) for anything else.
+
+   PostgreSQL's `check_timezone` has THREE readings, and they disagree
+   about the sign. Each was read off PostgreSQL 17:
+
+   - **A plain number is hours EAST**, ISO-signed: `'+2'`, `5`, `-7.5`.
+     `SHOW` gives it in POSIX notation with an abbreviation, `<+02>-02`
+     and `<-07:30>+07:30`. `SET TIME ZONE INTERVAL '+05:30' HOUR TO
+     MINUTE` is this form too, by the time it gets here.
+   - **Anything else is a POSIX TZ string**, and POSIX counts positive
+     as WEST: `'+02:00'` is two hours west, `'04:30'` four and a half,
+     `'UTC-2'` two hours EAST. `SHOW` answers the string as written.
+   - **A zone name**, case-insensitively, answered in its canonical
+     spelling.
+
+   This took two attempts. The first read every bare offset as POSIX,
+   which is right for `'+02:00'` (the only shape timestamptz.out pins)
+   and wrong for `'+2'` and `SET timezone = 5`, by twice the offset.
+
+   A POSIX string carrying DST rules (`EST5EDT,M3.2.0,M11.1.0`, or a
+   `CST7CDT` that tzdata does not name) is refused rather than guessed;
    doc/backlog.md records it."
   [v]
   (let [raw (str/trim (str/replace (str (or v "")) #"^'|'$" ""))
@@ -1748,31 +1778,33 @@
       (str/blank? raw) nil
       (contains? #{"default" "local"} low) nil
 
-      ;; A numeric offset, with or without a sign: POSIX, so negate.
-      (re-matches #"[+-]?\d{1,2}(:\d{2}(:\d{2})?)?" raw)
-      (let [signed (if (re-find #"^[+-]" raw) raw (str "+" raw))
-            iso (java.time.ZoneOffset/of ^String
-                 (if (re-find #":" signed) signed (str signed ":00")))]
-        (java.time.ZoneOffset/ofTotalSeconds (- (.getTotalSeconds iso))))
-
-      ;; A POSIX TZ string: an alphabetic prefix followed by an offset
-      ;; or DST rule. Refused, not guessed.
-      (re-matches #"(?i)[a-z]{3,}[+-]?\d.*" raw)
-      (throw (errors/pg-error
-              :invalid-parameter-value
-              {:message (str "unrecognized time zone name: \"" raw "\"")}))
+      (re-matches #"[+-]?\d+(\.\d+)?" raw)
+      (let [secs (Math/round (* 3600.0 (Double/parseDouble raw)))]
+        (when (> (Math/abs secs) (* 18 3600)) (throw (invalid-time-zone raw)))
+        {:zone (java.time.ZoneOffset/ofTotalSeconds (int secs))
+         :text (str "<" (tz-offset-text secs) ">" (tz-offset-text (- secs)))})
 
       :else
-      (try (java.time.ZoneId/of raw)
-           (catch Exception _
-             (throw (errors/pg-error
-                     :invalid-parameter-value
-                     {:message (str "invalid value for parameter \"TimeZone\": \""
-                                    raw "\"")})))))))
+      (if-let [[canonical zone] (get @tz-names low)]
+        {:zone zone :text canonical}
+        ;; POSIX `[STD]offset`, no DST part: positive is west.
+        (if-let [[_ sign h m] (re-matches #"(?:[A-Za-z]{3,})?([+-]?)(\d{1,2})(?::(\d{2}))?" raw)]
+          (let [west (+ (* 3600 (parse-long h)) (* 60 (parse-long (or m "0"))))
+                secs (if (= "-" sign) west (- west))]
+            (when (> (Math/abs secs) (* 18 3600)) (throw (invalid-time-zone raw)))
+            {:zone (java.time.ZoneOffset/ofTotalSeconds (int secs)) :text raw})
+          (throw (invalid-time-zone raw)))))))
+
+(defn parse-time-zone
+  "The `ZoneId` a `TimeZone` value names, or nil for the default. See
+   `time-zone-setting`, which also gives what `SHOW` answers."
+  [v]
+  (:zone (time-zone-setting v)))
 
 (defn time-zone-text
-  "A `ZoneId` rendered the way `SHOW TimeZone` renders it. A fixed
-   offset prints as PostgreSQL prints it, `Z` becoming `UTC`."
+  "A `ZoneId` rendered the way `SHOW TimeZone` renders it, for a zone
+   that was not SET by name -- `time-zone-setting`'s `:text` is the
+   answer when there is one. `Z` becomes `UTC`."
   [^java.time.ZoneId z]
   (let [s (str (or z "UTC"))]
     (if (= "Z" s) "UTC" s)))

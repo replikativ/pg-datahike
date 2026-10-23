@@ -64,6 +64,12 @@
    "hnsw.ef_search"         :hnsw-ef-search
    "pg_datahike.float_sum"  :float-sum})
 
+(def ^:private read-only-settings
+  "GUCs PostgreSQL reports but never lets a session change."
+  #{"server_version" "server_version_num" "server_encoding" "lc_collate"
+    "lc_ctype" "is_superuser" "block_size" "max_identifier_length"
+    "integer_datetimes" "segment_size" "wal_block_size"})
+
 (defn reset-setting!
   "Clear one GUC, returning it to its compiled-in default. Returns true
    when the name is one we model.
@@ -72,9 +78,24 @@
    NULL, …)` does: `guc.c`'s `set_config_by_name` passes a NULL value
    straight to `set_config_option`, where it means \"reset to default\"."
   [session-state name]
-  (if-let [k (get setting-keys (some-> name str str/lower-case))]
-    (do (when session-state (swap! session-state dissoc k)) true)
-    false))
+  (let [folded (some-> name str str/lower-case)
+        ;; Back to the value the session STARTED with, which is not the
+        ;; compiled-in default when the StartupMessage set it: under
+        ;; PGTZ=Asia/Tokyo, `RESET timezone` answers Asia/Tokyo.
+        put-back (fn [st path]
+                   (let [start (get-in st (into [:guc-startup] path) ::absent)]
+                     (cond
+                       (not= ::absent start) (assoc-in st path start)
+                       (= 1 (count path)) (dissoc st (first path))
+                       :else (update-in st (pop path) dissoc (peek path)))))]
+    (if-let [k (get setting-keys folded)]
+      (do (when session-state
+            (swap! session-state
+                   (fn [st] (cond-> (put-back st [k])
+                              (= :time-zone k) (put-back [:time-zone-text])))))
+          true)
+      (do (when session-state (swap! session-state put-back [:gucs folded]))
+          false))))
 
 (defn set-setting!
   "Apply one session GUC. `name` is the setting as written (folded
@@ -106,13 +127,13 @@
       (= "search_path" setting)
       (do (set-search-path! session-state values) true)
 
-      ;; `types/parse-time-zone` owns the conventions, including that a
-      ;; bare numeric offset is POSIX-signed (positive means WEST). An
-      ;; unparseable value clears the setting, which is what SET did.
+      ;; `types/time-zone-setting` owns the conventions -- three of them,
+      ;; disagreeing about the sign -- and what SHOW answers for each.
+      ;; DEFAULT / LOCAL clear the setting.
       (contains? #{"timezone" "time zone" "time_zone"} setting)
-      (do (if-let [z (types/parse-time-zone raw)]
-            (swap! session-state assoc :time-zone z)
-            (swap! session-state dissoc :time-zone))
+      (do (if-let [{:keys [zone text]} (types/time-zone-setting raw)]
+            (swap! session-state assoc :time-zone zone :time-zone-text text)
+            (swap! session-state dissoc :time-zone :time-zone-text))
           true)
 
       (contains? #{"datestyle" "date_style"} setting)
@@ -146,7 +167,33 @@
         (swap! session-state assoc :hnsw-ef-search value)
         true)
 
-      :else false)))
+      ;; Read-only in PostgreSQL too: 55P02, not a silent no-op.
+      (contains? read-only-settings setting)
+      (throw (ex-info (str "parameter \"" setting "\" cannot be changed")
+                      {:sqlstate "55P02"}))
+
+      ;; One we do not model is still a setting: PostgreSQL stores it
+      ;; and answers it back. `application_name` was answered with the
+      ;; role name whatever had been set, and a custom dotted one --
+      ;; `set_config('request.jwt.sub', …)`, how PostgREST hands a
+      ;; request's identity to row-level security -- was not stored at
+      ;; all, so the `current_setting` after it raised 42704.
+      :else
+      (do (swap! session-state assoc-in [:gucs setting] raw)
+          false))))
+
+(defn apply-startup-settings!
+  "Apply a StartupMessage's settings, `[[name value] …]`, and remember
+   the result as what RESET goes back to. One PostgreSQL would refuse is
+   skipped rather than failing the connection."
+  [session-state settings]
+  (doseq [[k v] settings]
+    (try (set-setting! session-state k [v])
+         (catch Exception _ nil)))
+  (swap! session-state
+         (fn [st] (assoc st :guc-startup
+                         (select-keys st (conj (vec (distinct (vals setting-keys)))
+                                               :time-zone-text :gucs))))))
 
 (def ^:private default-settings
   "The GUCs we report a value for, whether or not we model them. These
@@ -217,9 +264,10 @@
         ("datestyle" "date_style")
         (when-let [d (:date-style st)] (types/date-style-text d))
         ("timezone" "time zone" "time_zone")
-        (when-let [z (:time-zone st)] (types/time-zone-text z))
+        (or (:time-zone-text st)
+            (when-let [z (:time-zone st)] (types/time-zone-text z)))
         "hnsw.ef_search" (some-> (:hnsw-ef-search st) str)
-        nil))))
+        (get-in st [:gucs folded])))))
 
 (defn read-setting
   "One GUC as text, exactly as `SHOW` reports it, or nil when we neither
@@ -232,3 +280,132 @@
   (let [folded (str/lower-case (str name))]
     (or (session-value session-state folded)
         (get folded-defaults folded))))
+
+;; ---------------------------------------------------------------------------
+;; Transaction scope
+;;
+;; A setting is transactional in PostgreSQL. ROLLBACK undoes a SET made
+;; inside the block, ROLLBACK TO SAVEPOINT undoes one made after the
+;; savepoint, and `SET LOCAL` / `set_config(…, true)` last only to the end
+;; of the transaction even when it COMMITs. All of these used to persist
+;; for the session.
+;;
+;; The model is two layers, kept in the session-state atom under
+;; `:guc-tx` while an EXPLICIT transaction is open: the effective values
+;; are the session-state keys themselves, as always, and `:session` is
+;; what they will be after COMMIT -- the values at BEGIN plus every
+;; non-LOCAL change since. COMMIT installs `:session`, ROLLBACK installs
+;; `:begin`. Kept here rather than in the server's tx-state because
+;; `set_config` runs inside a translated query, which can reach the
+;; session-state atom and nothing else.
+
+(def ^:private scoped-keys
+  "The session-state keys `set-setting!` and `reset-setting!` write --
+   the settings this scope covers. NOT statement_timeout, the isolation
+   defaults or the datahike.* temporal settings: those are written on
+   paths of their own, and snapshotting them here would have COMMIT
+   quietly put back a value one of those paths had just changed."
+  [:search-path :hnsw-ef-search :date-style :time-zone :time-zone-text
+   :float-sum :gucs])
+
+(defn- snapshot [st] (select-keys st scoped-keys))
+
+(defn- restore [st snap] (merge (apply dissoc st scoped-keys) snap))
+
+(defn- setting-paths
+  "Every path a GUC lives at: a top-level key, or one entry of `:gucs`."
+  [& snaps]
+  (into #{}
+        (mapcat (fn [snap]
+                  (concat (map vector (keys (dissoc snap :gucs)))
+                          (map (fn [k] [:gucs k]) (keys (:gucs snap))))))
+        snaps))
+
+(defn- carry-changes
+  "`layer` with every setting that differs between `before` and `after`
+   changed the same way."
+  [layer before after]
+  (reduce (fn [layer path]
+            (let [b (get-in before path ::absent)
+                  a (get-in after path ::absent)]
+              (cond
+                (= a b) layer
+                (= ::absent a) (if (= 1 (count path))
+                                 (dissoc layer (first path))
+                                 (update layer :gucs dissoc (second path)))
+                :else (assoc-in layer path a))))
+          layer
+          (setting-paths before after)))
+
+(defn in-transaction-block? [session-state]
+  (boolean (some-> session-state deref :guc-tx)))
+
+(defn scoped!
+  "Run `f`, which changes settings in `session-state`, under the
+   transaction scope: a non-LOCAL change inside a block also reaches the
+   layer COMMIT keeps; a LOCAL one does not. Outside a block a LOCAL
+   change is undone straight away -- for `SET LOCAL` PostgreSQL warns
+   and changes nothing; for `set_config(…, true)` it keeps the value to
+   the end of the statement, and here the call's own answer is all that
+   sees it. Returns what `f` returns."
+  [session-state local? f]
+  (if (nil? session-state)
+    (f)
+    (let [before (snapshot @session-state)
+          r (f)
+          after (snapshot @session-state)]
+      (cond
+        (and (in-transaction-block? session-state) (not local?))
+        (swap! session-state update-in [:guc-tx :session] carry-changes before after)
+
+        (and local? (not (in-transaction-block? session-state)))
+        (swap! session-state restore before))
+      r)))
+
+(defn begin! [session-state]
+  (let [snap (snapshot @session-state)]
+    (swap! session-state assoc :guc-tx {:begin snap :session snap :savepoints []})))
+
+(defn commit! [session-state]
+  (swap! session-state
+         (fn [st] (if-let [tx (:guc-tx st)]
+                    (dissoc (restore st (:session tx)) :guc-tx)
+                    st))))
+
+(defn rollback! [session-state]
+  (swap! session-state
+         (fn [st] (if-let [tx (:guc-tx st)]
+                    (dissoc (restore st (:begin tx)) :guc-tx)
+                    st))))
+
+(defn savepoint! [session-state name]
+  (swap! session-state
+         (fn [st] (if (:guc-tx st)
+                    (update-in st [:guc-tx :savepoints] conj
+                               {:name name
+                                :effective (snapshot st)
+                                :session (get-in st [:guc-tx :session])})
+                    st))))
+
+(defn- savepoint-index [st name]
+  (->> (get-in st [:guc-tx :savepoints])
+       (keep-indexed (fn [i sp] (when (= name (:name sp)) i)))
+       last))
+
+(defn rollback-to-savepoint!
+  "Back to the settings as they stood at savepoint `name`, which stays."
+  [session-state name]
+  (swap! session-state
+         (fn [st] (if-let [i (savepoint-index st name)]
+                    (let [sp (nth (get-in st [:guc-tx :savepoints]) i)]
+                      (-> (restore st (:effective sp))
+                          (assoc-in [:guc-tx :session] (:session sp))
+                          (update-in [:guc-tx :savepoints] subvec 0 (inc i))))
+                    st))))
+
+(defn release-savepoint! [session-state name]
+  (swap! session-state
+         (fn [st] (if-let [i (savepoint-index st name)]
+                    (update-in st [:guc-tx :savepoints] subvec 0 i)
+                    st))))
+

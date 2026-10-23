@@ -371,10 +371,11 @@
   ;; client that set a zone and read it back was told its request had
   ;; not taken.
   ;;
-  ;; The sign convention is PostgreSQL's and NOT ISO: a bare numeric
-  ;; value is POSIX, where positive means WEST of Greenwich. Verified
-  ;; against timestamptz.out; mapping these through `ZoneId/of` would
-  ;; put every offset out by twice its value.
+  ;; Every answer here is PostgreSQL 17's. A colon offset is a POSIX
+  ;; string -- positive means WEST -- and SHOW answers it as written; a
+  ;; plain number is hours EAST and SHOW answers it in POSIX notation.
+  ;; This test once expected `'+02:00'` to SHOW as `-02:00`, written
+  ;; down from what the implementation did rather than from PostgreSQL.
   (with-open [a (connect-to "alpha")]
     (is (= "UTC" (scalar a "SHOW timezone")) "the default")
     (testing "a zone name round-trips, and SHOW agrees with current_setting"
@@ -382,15 +383,34 @@
       (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
       (is (= "Europe/Berlin" (scalar a "SELECT current_setting('timezone')")))
       (is (= "Europe/Berlin" (scalar a "SHOW TimeZone")) "spelling is case-insensitive"))
-    (testing "a bare numeric offset is POSIX-signed: positive is WEST"
-      (doseq [[set-to shows] [["'04:30'"  "-04:30"]
-                              ["'-04:30'" "+04:30"]
-                              ["'+02:00'" "-02:00"]
-                              ["'-13:00'" "+13:00"]
-                              ["'00:30'"  "-00:30"]]]
+    (testing "a colon offset is a POSIX string, and SHOW answers it as written"
+      (doseq [[set-to shows rendered]
+              [["'04:30'"  "04:30"  "2025-12-31 19:30:00-04:30"]
+               ["'-04:30'" "-04:30" "2026-01-01 04:30:00+04:30"]
+               ["'+02:00'" "+02:00" "2025-12-31 22:00:00-02"]
+               ["'00:30'"  "00:30"  "2025-12-31 23:30:00-00:30"]]]
         (exec! a (str "SET TIME ZONE " set-to))
-        (is (= shows (scalar a "SHOW timezone"))
+        (is (= shows (scalar a "SHOW timezone")) (str "SET TIME ZONE " set-to))
+        (is (= rendered (scalar a "SELECT '2026-01-01 00:00+00'::timestamptz"))
+            (str "positive is WEST: " set-to))))
+    (testing "a plain number is hours EAST, shown in POSIX notation"
+      (doseq [[set-to shows rendered]
+              [["'+2'"  "<+02>-02"         "2026-01-01 02:00:00+02"]
+               ["5"     "<+05>-05"         "2026-01-01 05:00:00+05"]
+               ["-7"    "<-07>+07"         "2025-12-31 17:00:00-07"]
+               ["-7.5"  "<-07:30>+07:30"   "2025-12-31 16:30:00-07:30"]
+               ["INTERVAL '+05:30' HOUR TO MINUTE" "<+05:30>-05:30" "2026-01-01 05:30:00+05:30"]]]
+        (exec! a (str "SET TIME ZONE " set-to))
+        (is (= shows (scalar a "SHOW timezone")) (str "SET TIME ZONE " set-to))
+        (is (= rendered (scalar a "SELECT '2026-01-01 00:00+00'::timestamptz"))
             (str "SET TIME ZONE " set-to))))
+    (testing "a zone name is matched case-insensitively and answered canonically"
+      (exec! a "SET timezone = 'europe/berlin'")
+      (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
+      (exec! a "SET timezone = 'utc'")
+      (is (= "UTC" (scalar a "SHOW timezone")))
+      (exec! a "SET timezone = 'PST8PDT'")
+      (is (= "PST8PDT" (scalar a "SHOW timezone"))))
     (testing "RESET and DEFAULT go back to UTC"
       (exec! a "RESET timezone")
       (is (= "UTC" (scalar a "SHOW timezone")))
@@ -460,14 +480,23 @@
       ;; the answer back; a 42704 there breaks its codec pipeline.
       (is (= "off" (scalar a "SELECT set_config('jit', 'off', false)")))
       (is (= ["off" "1"] (row a "SELECT set_config('jit', 'off', false), 1")))
-      ;; We default `jit` but do not track it, so the answer is the
-      ;; default whatever is asked for. DELIBERATE: it agrees with
-      ;; `current_setting('jit')`, and a client told its request took
-      ;; and then shown otherwise is the bug this PR is about.
-      (is (= "off" (scalar a "SELECT set_config('jit', 'on', false)")))
-      (is (= "off" (scalar a "SELECT current_setting('jit')"))))
-    (testing "a name we neither model nor default is echoed"
-      (is (= "7" (scalar a "SELECT set_config('some.custom_thing', '7', false)"))))
+      ;; And it is STORED, as PostgreSQL stores it. This once answered
+      ;; `off` whatever was asked, because a setting we did not model
+      ;; was not kept -- which also made `application_name` answer the
+      ;; role name.
+      (is (= "on" (scalar a "SELECT set_config('jit', 'on', false)")))
+      (is (= "on" (scalar a "SELECT current_setting('jit')")))
+      (is (= "myapp" (scalar a "SELECT set_config('application_name', 'myapp', false)")))
+      (is (= "myapp" (scalar a "SHOW application_name"))))
+    (testing "a custom dotted name is kept and read back"
+      ;; PostgREST hands a request's identity to row-level security this
+      ;; way; the `current_setting` after it raised 42704.
+      (is (= "7" (scalar a "SELECT set_config('some.custom_thing', '7', false)")))
+      (is (= "7" (scalar a "SELECT current_setting('some.custom_thing')")))
+      (exec! a "RESET some.custom_thing")
+      (is (= "" (scalar a "SHOW some.custom_thing"))))
+    (testing "a read-only setting is PostgreSQL's 55P02"
+      (is (= "55P02" (state a "SET server_version = '1'"))))
     (testing "a recognised setting given a value it cannot take still raises"
       (is (= "22023"
              (state a "SELECT set_config('timezone', 'Mars/Phobos', false)"))))
@@ -476,11 +505,11 @@
       ;; PostgreSQL answers with the value the setting now HAS. That is
       ;; only the same as the string passed in when the value was taken
       ;; verbatim -- here it is canonicalised, and `SHOW` agrees.
-      (is (= "-02:00" (scalar a "SELECT set_config('timezone', '+02:00', false)"))
-          "POSIX sign applied, and reported the way SHOW reports it")
-      (is (= "-02:00" (scalar a "SHOW timezone")))
-      (is (= ["+04:30" "1"]
-             (row a "SELECT set_config('timezone', '-04:30', false), 1"))
+      (is (= "Europe/Berlin" (scalar a "SELECT set_config('timezone', 'europe/berlin', false)"))
+          "canonicalised, and reported the way SHOW reports it")
+      (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
+      (is (= ["<+02>-02" "1"]
+             (row a "SELECT set_config('timezone', '2', false), 1"))
           "and the translated form answers from the same reader"))
     (testing "a NULL value RESETS the setting, and answers the default"
       ;; `set_config_by_name` passes a NULL straight to
@@ -523,3 +552,66 @@
     (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
     (is (= "Asia/Tokyo" (scalar b "SHOW timezone"))
         "b wrote its own session, not a's")))
+
+(deftest settings-are-transactional
+  ;; A setting is transactional in PostgreSQL, and each answer below was
+  ;; read off PostgreSQL 17 for the same statements. All of these
+  ;; persisted for the session: ROLLBACK did not undo a SET, nor ROLLBACK
+  ;; TO SAVEPOINT one made after the savepoint, and `SET LOCAL` /
+  ;; `set_config(…, true)` outlived their transaction.
+  (with-open [a (connect-to "alpha")]
+    (let [tz #(scalar a "SHOW timezone")]
+      (testing "ROLLBACK undoes a SET, COMMIT keeps it"
+        (exec! a "BEGIN") (exec! a "SET timezone = 'Asia/Tokyo'") (exec! a "ROLLBACK")
+        (is (= "UTC" (tz)))
+        (exec! a "BEGIN") (exec! a "SET timezone = 'Asia/Tokyo'") (exec! a "COMMIT")
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "RESET timezone"))
+      (testing "SET LOCAL lasts to the end of the transaction, even one that commits"
+        (exec! a "BEGIN")
+        (exec! a "SET timezone = 'Asia/Tokyo'")
+        (exec! a "SET LOCAL timezone = 'Europe/Berlin'")
+        (is (= "Europe/Berlin" (tz)))
+        (exec! a "COMMIT")
+        (is (= "Asia/Tokyo" (tz)) "the session-level SET survives, the LOCAL one does not")
+        (exec! a "RESET timezone"))
+      (testing "SET LOCAL outside a transaction changes nothing"
+        (exec! a "SET LOCAL timezone = 'Asia/Tokyo'")
+        (is (= "UTC" (tz))))
+      (testing "set_config's is_local is SET LOCAL, in both spellings"
+        (exec! a "BEGIN")
+        (is (= "Asia/Tokyo" (scalar a "SELECT set_config('timezone', 'Asia/Tokyo', true)")))
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "COMMIT")
+        (is (= "UTC" (tz)))
+        (exec! a "BEGIN")
+        (is (= ["Asia/Tokyo" "1"] (row a "SELECT set_config('timezone', 'Asia/Tokyo', true), 1")))
+        (exec! a "COMMIT")
+        (is (= "UTC" (tz)))
+        (is (= "Asia/Tokyo" (scalar a "SELECT set_config('timezone', 'Asia/Tokyo', true)"))
+            "outside a block the call still answers the value it set")
+        (is (= "UTC" (tz)) "and it is gone once the statement is"))
+      (testing "ROLLBACK TO SAVEPOINT undoes what came after the savepoint"
+        (exec! a "BEGIN")
+        (exec! a "SET timezone = 'Asia/Tokyo'")
+        (exec! a "SAVEPOINT s")
+        (exec! a "SET timezone = 'Europe/Berlin'")
+        (exec! a "ROLLBACK TO SAVEPOINT s")
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "COMMIT")
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "RESET timezone"))
+      (testing "a failed transaction's SET is undone with it"
+        (exec! a "BEGIN")
+        (exec! a "SET search_path = myschema")
+        (is (= "22012" (state a "SELECT 1/0")))
+        (exec! a "ROLLBACK")
+        (is (= "\"$user\", public" (scalar a "SHOW search_path"))))
+      (testing "RESET ALL inside a block is undone by ROLLBACK"
+        (exec! a "SET timezone = 'Asia/Tokyo'")
+        (exec! a "BEGIN")
+        (exec! a "RESET ALL")
+        (is (= "UTC" (tz)))
+        (exec! a "ROLLBACK")
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "RESET timezone")))))
