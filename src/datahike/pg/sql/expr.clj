@@ -1410,6 +1410,15 @@
                 result-var])
         result-var)
 
+      ;; to_timestamp(text, text): the session zone places a wall clock the
+      ;; input gives no zone for.
+      (and (= fname "to_timestamp") (= 2 (count args)))
+      (do (swap! (:where-clauses ctx) conj
+                 [(list 'datahike.pg.query-fns/sql-to-timestamp-fmt
+                        (or types/*time-zone* java.time.ZoneOffset/UTC) (first args) (second args))
+                  result-var])
+          result-var)
+
       ;; timezone(zone, value) is `value AT TIME ZONE zone`.
       (and (= fname "timezone") (= 2 (count args)))
       (let [value-oid (source-oid ctx (second params))

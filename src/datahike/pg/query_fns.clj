@@ -86,6 +86,7 @@
 (def json-scalar                         jsonb/json-scalar)
 (def json-key                            jsonb/json-key)
 (def sql-to-char-datetime                fns/sql-to-char-datetime)
+(def sql-to-timestamp-fmt                fns/sql-to-timestamp-fmt)
 (def sql-wall->tstz                      fns/sql-wall->tstz)
 (def agg-sort-key                        fns/agg-sort-key)
 (def sql-timestamptz-interval            fns/sql-timestamptz-interval)

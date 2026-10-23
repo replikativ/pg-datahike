@@ -228,6 +228,7 @@
    "make_timestamptz" types/oid-timestamptz
    "make_interval"    types/oid-interval
    "to_timestamp"     types/oid-timestamptz
+   "to_date"          types/oid-date
    ;; date_bin returns its source's type, as date_trunc does.
    "date_bin"         :arg2-type
    "timezone"         :at-time-zone
