@@ -4184,6 +4184,46 @@
                               :else false)
           :else (if (or (nil? te1) (nil? te2)) :__null__ true))))))
 
+(defn sql-to-char-datetime
+  "`to_char` over a timestamp, timestamptz, date, time or interval:
+   timestamp_to_char / timestamptz_to_char / interval_to_char. `oid` is
+   the argument's type and picks the overload, as PostgreSQL's resolution
+   does: a date resolves to the timestamptz form (its fields read in
+   `zone`), a time to the interval form. An infinite value, or an empty
+   format, is NULL."
+  [oid zone v fmt]
+  (if (or (sql-null? v) (sql-null? fmt) (= "" (str fmt)) (types/infinite-datetime v))
+    :__null__
+    (let [fmt (str fmt)
+          tc @(requiring-resolve 'datahike.pg.datetime.format/to-char)
+          ^java.time.ZoneId zone (or zone java.time.ZoneOffset/UTC)]
+      (condp contains? oid
+        #{types/oid-timestamp}
+        (tc ((requiring-resolve 'datahike.pg.datetime.format/timestamp-fields)
+             (local-date-time v))
+            false fmt)
+
+        #{types/oid-timestamptz types/oid-date}
+        (let [i (if (instance? java.time.LocalDate v)
+                  (.toInstant (.atStartOfDay ^java.time.LocalDate v zone))
+                  (ts-instant v))]
+          (tc ((requiring-resolve 'datahike.pg.datetime.format/timestamptz-fields) i zone)
+              false fmt))
+
+        #{types/oid-interval types/oid-time}
+        (let [[mo d us] (if (= oid types/oid-time)
+                          (let [t (if (string? v)
+                                    ((requiring-resolve 'datahike.pg.sql.cast/cast-scalar) v "time" {})
+                                    v)]
+                            [0 0 (if (instance? java.time.LocalTime t)
+                                   (quot (.toNanoOfDay ^java.time.LocalTime t) 1000)
+                                   86400000000)])
+                          (let [iv (@interval-coerce v)
+                                [months days micros] @interval-fields]
+                            [(months iv) (days iv) (micros iv)]))]
+          (tc ((requiring-resolve 'datahike.pg.datetime.format/interval-fields) mo d us)
+              true fmt))))))
+
 (declare sql-extract* sql-extract-in)
 
 (defn sql-extract

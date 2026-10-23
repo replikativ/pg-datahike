@@ -215,6 +215,14 @@
   tokens currently use the C-locale spellings, which is also what the
   regression campaign fixes with lc_numeric = C."
   [value picture]
+  ;; A timetz has no to_char at all in PostgreSQL; the other temporal
+  ;; types are routed to datahike.pg.datetime.format by the translator,
+  ;; which knows their types.
+  (when (instance? java.time.OffsetTime value)
+    (throw (errors/pg-error :undefined-function
+                            {:message "function to_char(time with time zone, unknown) does not exist"
+                             :hint (str "No function matches the given name and argument types. "
+                                        "You might need to add explicit type casts.")})))
   (when (or (instance? java.util.Date value)
             (instance? java.time.temporal.Temporal value))
     ;; PostgreSQL's temporal and numeric pictures are separate formatter
