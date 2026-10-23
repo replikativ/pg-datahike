@@ -1239,3 +1239,14 @@ about ingest canonicalization, and all three vendored driver suites skip
 their JSON tests. That is why most of the S1 entries above survived. A
 `bb cross-engine --record` oracle file for jsonb is the cheapest way to
 stop this recurring.
+
+### `U&'…'` Unicode-escape string literals are not supported
+
+`SELECT U&'d\0061t\+000061'` answers `column "u" does not exist`;
+PostgreSQL answers `data`. JSqlParser reads `U` as an identifier and
+`&` as an operator. Found while fixing the wire scanners' E'' and
+dollar-quote handling (2026-10-23), and left alone there because it is
+a missing literal form rather than a scanner bug: it wants decoding
+(`\XXXX`, `\+XXXXXX`, and a `UESCAPE 'c'` clause) into a plain literal
+before the parser sees it, the way E'' quotes are normalised in
+`PgWireServer.stripComments`. `U&"…"` identifiers are the same shape.

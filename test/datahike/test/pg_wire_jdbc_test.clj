@@ -648,6 +648,30 @@
           (is (.next rs))
           (is (= "7" (.getString rs 1))))))))
 
+;; Every expected value below is PostgreSQL 17's for the same statement.
+(deftest test-quotes-the-statement-scanners-must-not-look-into
+  (testing "dollar quotes and E'' strings hide comments and semicolons"
+    ;; The comment stripper knew no dollar quotes, so in the first query
+    ;; it read `'s$$, '` as a string, took the real '/*x*/' for a comment
+    ;; and answered ' ' -- a silently wrong value. Neither scanner knew
+    ;; that `\'` does not end an E'' literal; JSqlParser did not either.
+    (doseq [mode ["simple" "extended"]]
+      (with-conn [c {:preferQueryMode mode}]
+        (with-open [st (.createStatement c)]
+          (doseq [[sql expected] [["SELECT $$it's$$, '/*x*/'" ["it's" "/*x*/"]]
+                                  ["SELECT E'a\\'b', '/*x*/'" ["a'b" "/*x*/"]]
+                                  ["SELECT $$a /* b */ c$$" ["a /* b */ c"]]
+                                  ["SELECT $$a -- b$$" ["a -- b"]]
+                                  ["SELECT E'a\\'b;c'" ["a'b;c"]]
+                                  ["SELECT $q$x;y$q$, 'z'" ["x;y" "z"]]
+                                  ["SELECT e'\\\\', '--x'" ["\\" "--x"]]
+                                  ["SELECT 1 AS a$b, '$$' AS c" ["1" "$$"]]]]
+            (with-open [rs (.executeQuery st sql)]
+              (is (.next rs) (str mode ": " sql))
+              (is (= expected (mapv #(.getString rs (int %))
+                                    (range 1 (inc (count expected)))))
+                  (str mode ": " sql)))))))))
+
 ;; ============================================================================
 ;; Transaction semantics (autocommit, commit, rollback, error-state-sticky)
 ;; ============================================================================
