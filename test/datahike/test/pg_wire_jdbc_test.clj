@@ -593,6 +593,61 @@
           (is (= "0" (.getString rs 1))
               "statement after error must not have executed"))))))
 
+(deftest test-nested-block-comments
+  (testing "a block comment nests, and nothing inside one is code"
+    ;; PostgreSQL's block comments NEST, so `/* a /* b */ c */` is ONE
+    ;; comment. The wire layer ended its scan at the first `*/`, which
+    ;; left the outer comment's own tail to be parsed: comments.sql
+    ;; answered `syntax error at or near "'embedded'"` where
+    ;; PostgreSQL answers `deeply nested example`.
+    ;;
+    ;; pgjdbc nests correctly (Parser.parseBlockComment counts levels),
+    ;; so the comment arrives here whole and the server has to cope.
+    ;; The shapes below are comments.sql's, verbatim.
+    (with-conn [c {:preferQueryMode "simple"}]
+      (with-open [st (.createStatement c)]
+        ;; An outer comment wrapping a query that carries its own
+        ;; comment. All of it is comment; only the trailing SELECT runs.
+        (with-open [rs (.executeQuery
+                        st (str "/* This block comment surrounds a query which itself has a block comment...\n"
+                                "SELECT /* embedded single line */ 'embedded' AS x2;\n"
+                                "*/\n"
+                                "SELECT 'after the nest' AS a"))]
+          (is (.next rs))
+          (is (= "after the nest" (.getString rs 1)))
+          (is (not (.next rs))))
+        ;; Three levels deep, spanning the statement's own target list,
+        ;; and containing an apostrophe (`aren't`) that must stay text:
+        ;; read as a string opener it swallows the rest of the message.
+        (with-open [rs (.executeQuery
+                        st (str "SELECT -- continued after the following block comments...\n"
+                                "/* Deeply nested comment.\n"
+                                "   This includes a single apostrophe to make sure we aren't decoding this part as a string.\n"
+                                "SELECT 'deep nest' AS n1;\n"
+                                "/* Second level of nesting...\n"
+                                "SELECT 'deeper nest' as n2;\n"
+                                "/* Third level of nesting...\n"
+                                "SELECT 'deepest nest' as n3;\n"
+                                "*/\n"
+                                "Hoo boy. Still two deep...\n"
+                                "*/\n"
+                                "Now just one deep...\n"
+                                "*/\n"
+                                "'deeply nested example' AS sixth"))]
+          (is (.next rs))
+          (is (= "deeply nested example" (.getString rs 1)))
+          (is (not (.next rs))))
+        ;; The semicolons inside that comment must not have split it
+        ;; into statements, so none of those SELECTs ran.
+        (is (nil? (.getWarnings st))))
+      ;; A `?` inside a nested comment is not a parameter. pgjdbc leaves
+      ;; it alone for the same reason, so the server's own parameter
+      ;; scan is what is under test.
+      (with-open [ps (.prepareStatement c "SELECT /* outer /* ? */ inner */ 7 AS n")]
+        (with-open [rs (.executeQuery ps)]
+          (is (.next rs))
+          (is (= "7" (.getString rs 1))))))))
+
 ;; ============================================================================
 ;; Transaction semantics (autocommit, commit, rollback, error-state-sticky)
 ;; ============================================================================

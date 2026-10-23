@@ -74,20 +74,29 @@
 
 (defn- skip-block-comment
   "If position i is the start of `/* … */`, return the position past the
-   closing `*/`. Otherwise return i."
+   closing `*/`. Otherwise return i.
+
+   Block comments NEST: `/* a /* b */ c */` is ONE comment, so this
+   counts depth. Stopping at the first close would leave the outer
+   comment's tail to be scanned as code, where a `?` or a `'` in it
+   reads as a parameter or a string opener."
   ^long [^String s ^long i]
   (let [n (.length s)]
     (if (and (< (inc i) n)
              (= (.charAt s i) \/)
              (= (.charAt s (inc i)) \*))
-      (loop [j (+ i 2)]
+      (loop [j (+ i 2) depth 1]
         (cond
           (>= j n) j
+          (and (= (.charAt s j) \/)
+               (< (inc j) n)
+               (= (.charAt s (inc j)) \*))
+          (recur (+ j 2) (inc depth))
           (and (= (.charAt s j) \*)
                (< (inc j) n)
                (= (.charAt s (inc j)) \/))
-          (+ j 2)
-          :else (recur (inc j))))
+          (if (= depth 1) (+ j 2) (recur (+ j 2) (dec depth)))
+          :else (recur (inc j) depth)))
       i)))
 
 (defn- skip-string-literal

@@ -133,7 +133,7 @@ for f in $FILES; do
   # blocks on the SAME LINE with `function center(text) does not
   # exist`, which is the thing worth fixing.
   #
-  # ONE file, out of 174. I measured before writing this, and then
+  # TWO files, out of 174. I measured before writing this, and then
   # again after, because the first count was wrong:
   #
   #   24 files have a missing relation as their first blocker;
@@ -143,13 +143,31 @@ for f in $FILES; do
   #    1 is `with` wanting `q1`, which is a CTE, not a table;
   #    1 is this.
   #
-  # `select_views` looked like a second case -- it wants `street` from
+  # That last line read "1 is this" until `numeric_big` turned up below,
+  # and it was wrong: the inventory ranked files by the first blocker a
+  # SELECT hit, and `numeric_big`'s is a DROP. A statement that fails
+  # because another file owns the object counts whatever its verb.
+  #
+  # `select_views` looked like a third case -- it wants `street` from
   # `create_view` -- but pairing them changes nothing: `CREATE VIEW
   # street` fails on `?#`, an operator we do not parse. Its relation is
   # missing because of us, not because of isolation.
+  #
+  # `numeric_big` is the second case, found the same way: its first ten
+  # statements are `DROP TABLE num_data;` and friends -- tables that
+  # `numeric` CREATES and never drops, which is why PostgreSQL's own
+  # schedule puts them in one database. Ten `ERROR:  table "num_data"
+  # does not exist` lines, and nothing to learn from any of them.
+  #
+  # Pairing does NOT make the file exact, and the residual it exposes is
+  # worth more than the ten lines it removes: `ln(x::numeric)` is
+  # computed in a DOUBLE, so `ln('1.0e400')` overflows to Infinity and
+  # the statement dies, and the 800-decimal LN/LOG10/POW checks differ
+  # from the eleventh significant digit on. See doc/backlog.md.
   case "$f" in
-    geometry) targets="box $f" ;;
-    *)        targets="$f" ;;
+    geometry)    targets="box $f" ;;
+    numeric_big) targets="numeric $f" ;;
+    *)           targets="$f" ;;
   esac
   # A file killed by this limit still leaves a PARTIAL .out, newer than
   # the stamp, so collecting it would measure how fast this machine is.

@@ -900,15 +900,20 @@
             (let [eol (long (.indexOf sql (int \newline) (int i)))]
               (recur (if (neg? eol) n (unchecked-inc eol)) in-sq in-dq in-dollar dollar-tag))
 
-            ;; /* block comment */
+            ;; /* block comment */ — NESTED, as PostgreSQL's are. A `?`
+            ;; or `$1` inside a comment is not a parameter, and ending
+            ;; the scan at the first `*/` of `/* a /* b */ $1 */` would
+            ;; report one.
             (and (not in-sq) (not in-dq) (not in-dollar)
                  (= c \/) (< (inc i) n) (= \* (.charAt sql (unchecked-inc i))))
-            (let [end (long (loop [j (+ i 2)]
+            (let [end (long (loop [j (+ i 2) depth 1]
                               (cond
                                 (>= (inc j) n) n
+                                (and (= \/ (.charAt sql j)) (= \* (.charAt sql (unchecked-inc j))))
+                                (recur (+ j 2) (inc depth))
                                 (and (= \* (.charAt sql j)) (= \/ (.charAt sql (unchecked-inc j))))
-                                (+ j 2)
-                                :else (recur (unchecked-inc j)))))]
+                                (if (= depth 1) (+ j 2) (recur (+ j 2) (dec depth)))
+                                :else (recur (unchecked-inc j) depth))))]
               (recur end in-sq in-dq in-dollar dollar-tag))
 
             :else
