@@ -50,6 +50,7 @@
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
             [datahike.pg.sql.oid-infer :as oid]
+            [datahike.pg.sql.guc :as guc]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.set-ops :as set-ops]
             [datahike.pg.sql.stmt :as stmt]
@@ -1675,24 +1676,6 @@
 
 (defn- effective-search-path [session-state]
   (or (:search-path @session-state) ["$user" "public"]))
-
-(defn- normalize-search-path [values]
-  (->> values
-       (mapcat #(str/split (str %) #","))
-       (map str/trim)
-       (map #(if (and (>= (count %) 2)
-                      (str/starts-with? % "\"")
-                      (str/ends-with? % "\""))
-               (subs % 1 (dec (count %)))
-               %))
-       (remove str/blank?)
-       vec))
-
-(defn- set-search-path! [session-state values]
-  (if (and (= 1 (count values))
-           (= "default" (str/lower-case (str (first values)))))
-    (swap! session-state dissoc :search-path)
-    (swap! session-state assoc :search-path (normalize-search-path values))))
 
 (defn- current-schema-name [session-state]
   (first (filter #{"public" "pg_catalog"}
@@ -6885,29 +6868,18 @@
    statement_timeout RESETs are intercepted earlier in the simple-query
    path (parse-temporal-set / parse-statement-timeout), so by the time a
    RESET reaches here it is either `RESET ALL` (clear every session GUC,
-   keeping connection identity) or an unknown single var. Real PG
-   silently accepts RESET of any settable GUC, so the single-var case is
-   a no-op. asyncpg's pool reset sends `RESET ALL` on every release."
+   keeping connection identity) or a single var. Real PG silently
+   accepts RESET of any settable GUC, so one we do not model is a no-op.
+   asyncpg's pool reset sends `RESET ALL` on every release."
   [{:keys [session-state]} parsed]
   (let [setting (some-> (:var parsed) str/lower-case)]
-    (cond
-      (= "all" setting)
+    (if (= "all" setting)
       (swap! session-state #(apply dissoc % session-guc-keys))
-
-      (= "search_path" setting)
-      (swap! session-state dissoc :search-path)
-
-      (contains? #{"datestyle" "date_style"} setting)
-      (swap! session-state dissoc :date-style)
-
-      (contains? #{"timezone" "time zone" "time_zone"} setting)
-      (swap! session-state dissoc :time-zone)
-
-      (= "hnsw.ef_search" setting)
-      (swap! session-state dissoc :hnsw-ef-search)
-
-      (= "pg_datahike.float_sum" setting)
-      (swap! session-state dissoc :float-sum)))
+      ;; `guc/setting-keys` maps each GUC name to the key it writes, so
+      ;; this cannot name a setting that `SET` writes somewhere else --
+      ;; it held its own copy of the same names before, which is the
+      ;; shape the `set_config` bug grew out of.
+      (guc/reset-setting! session-state setting)))
   (empty-result "RESET"))
 
 ;; --- Advisory-lock handlers -------------------------------------------------
@@ -7501,56 +7473,19 @@
     (case (:system-type parsed)
       :set
       (do
-        (let [setting (some-> (:var parsed) str/lower-case)]
-          (when (= "search_path" setting)
-            (set-search-path! session-state (:values parsed)))
-          ;; `SET DateStyle` chooses the date/timestamp OUTPUT format,
-          ;; and was accepted and then ignored -- every value rendered
-          ;; ISO whatever the session asked for. PostgreSQL's own
-          ;; regression suite runs under `Postgres, MDY`.
-          ;; `SET TimeZone` / `SET TIME ZONE` was accepted and then
-          ;; discarded, so `SHOW timezone` answered UTC whatever the
-          ;; session asked for. The value is stored as a `ZoneId`;
-          ;; `types/parse-time-zone` owns the conventions, including
-          ;; that a bare numeric offset is POSIX-signed.
-          (when (contains? #{"timezone" "time zone" "time_zone"} setting)
-            (let [raw (or (:value parsed)
-                          (str/join "," (:values parsed)))]
-              (if-let [z (types/parse-time-zone raw)]
-                (swap! session-state assoc :time-zone z)
-                (swap! session-state dissoc :time-zone))))
-          (when (contains? #{"datestyle" "date_style"} setting)
-            (let [raw (or (:value parsed)
-                          (str/join "," (:values parsed)))]
-              (swap! session-state assoc :date-style
-                     (types/parse-date-style
-                      raw (or (:date-style @session-state) [:iso :mdy])))))
-          ;; Compensated float summation, OFF by default. See
-          ;; `fns/*compensated-float-sum?*` for why the default cannot
-          ;; change: PostgreSQL sums float8 naively and our own
-          ;; differential gate compares against it.
-          (when (= "pg_datahike.float_sum" setting)
-            (let [v (some-> (or (:value parsed)
-                                (first (:values parsed)))
-                            str/lower-case
-                            (str/replace #"^'|'$" ""))]
-              (case v
-                "naive"       (swap! session-state dissoc :float-sum)
-                "compensated" (swap! session-state assoc :float-sum :compensated)
-                (throw (errors/pg-error
-                        :invalid-parameter-value
-                        {:message (str "pg_datahike.float_sum must be "
-                                       "'naive' or 'compensated'")})))))
-          (when (= "hnsw.ef_search" setting)
-            (let [value (try
-                          (parse-long (or (:value parsed) ""))
-                          (catch Exception _ nil))]
-              (when-not (and value (<= 1 value 1000))
-                (throw
-                 (errors/pg-error
-                  :invalid-parameter-value
-                  {:message "hnsw.ef_search must be between 1 and 1000"})))
-              (swap! session-state assoc :hnsw-ef-search value))))
+        ;; Every GUC that changes how we execute is parsed and stored
+        ;; by `guc/set-setting!`, which `set_config` calls too -- the
+        ;; two spellings of the same act used to write different
+        ;; subsets of the settings. An unrecognised name is accepted
+        ;; and ignored, as PostgreSQL does for a custom one.
+        ;; `:values` carries the whole list and is set only for
+        ;; search_path, where `:value` holds just the FIRST element --
+        ;; so the list has to win, or `SET search_path TO a, b` loses b.
+        (let [setting (some-> (:var parsed) str/lower-case)
+              values  (if (seq (:values parsed))
+                        (vec (:values parsed))
+                        [(:value parsed)])]
+          (guc/set-setting! session-state setting values))
         (empty-result "SET"))
       :prepare          (handle-prepare ctx parsed)
       :execute-prepared (handle-execute-prepared ctx parsed)
@@ -7612,14 +7547,22 @@
       :set-config
       ;; SELECT pg_catalog.set_config('search_path', '', false) —
       ;; pg_dump session-prelude, and asyncpg's `jit` toggle around type
-      ;; introspection. We don't honor the GUC (no equivalent in
-      ;; Datahike), but PostgreSQL returns the NEW VALUE as text and
-      ;; asyncpg reads it back, so returning empty-string was not
-      ;; harmless: echo the value argument.
+      ;; introspection. This is the function spelling of SET, so it
+      ;; stores through the same `guc/set-setting!`; a setting we do not
+      ;; model is accepted and ignored. PostgreSQL returns the NEW VALUE
+      ;; as text and asyncpg reads it back, so returning empty-string
+      ;; was not harmless: echo the value argument.
       (let [[setting value] (:args parsed)]
-        (when (= "search_path" (some-> setting str/lower-case))
-          (set-search-path! session-state [value]))
-        (single-row-result "set_config" PgWireServer/OID_TEXT (or value "")))
+        (guc/set-setting! session-state setting [value])
+        ;; PostgreSQL answers with the setting as it now stands
+        ;; (`set_config_by_name` ends in `GetConfigOptionByName`), not
+        ;; with the string passed in: a NULL value resets and answers
+        ;; the DEFAULT, and `'+02:00'` answers the canonical `-02:00`.
+        ;; Echoing was close enough only while nothing was stored. A
+        ;; name we neither model nor default still echoes.
+        (single-row-result "set_config" PgWireServer/OID_TEXT
+                           (or (guc/read-setting session-state setting)
+                               value)))
 
       :do-block
       ;; `DO [LANGUAGE l] $$ … $$` -- an anonymous code block. It is a

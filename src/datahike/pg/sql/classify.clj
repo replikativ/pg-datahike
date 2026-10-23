@@ -552,11 +552,14 @@
       {:kind :dh-create-branch :args (extract-fn-string-args rest-args)}
       (and dh? (fn-name=? t1 "delete_branch"))
       {:kind :dh-delete-branch :args (extract-fn-string-args rest-args)}
-      ;; pg_dump session-prelude function — sets a GUC. We don't honor
-      ;; the side-effect (the GUC has no Datahike equivalent), but we
-      ;; need to silently accept the call so the dump replays.
+      ;; pg_dump session-prelude function — sets a GUC, and the side
+      ;; effect IS honoured: `exec-system`'s :set-config arm stores
+      ;; through the same `guc/set-setting!` as `SET`. A setting we do
+      ;; not model is accepted and ignored so the dump replays.
       ;; The 3-arg form is `set_config(name, value, is_local)`; we
-      ;; accept any args.
+      ;; accept any args. Note the `sole?` gate above: a set_config that
+      ;; is not the whole projection is TRANSLATED instead (see
+      ;; datahike.pg.sql.expr), and stores by the same route.
       ;; PostgreSQL returns the NEW VALUE as text, and asyncpg reads it
       ;; back when it turns `jit` off around type introspection — so an
       ;; empty answer is not harmless here. Carry the value argument.
