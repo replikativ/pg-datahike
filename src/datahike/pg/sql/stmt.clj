@@ -1182,6 +1182,68 @@
         (persistent! result)
         (recur (.add value step) (conj! result [value]))))))
 
+(defn- temporal-series-value? [v]
+  (or (inst? v) (instance? java.time.OffsetDateTime v)
+      (instance? java.time.LocalDateTime v) (instance? java.time.LocalDate v)))
+
+(defn- temporal-series
+  "`generate_series(start, stop, step interval)` over timestamps
+   (generate_series_timestamp[tz], timestamp.c): each step is the same
+   `+ interval` the operator applies -- for a timestamptz the zone-aware
+   one, so `'1 day'` keeps the wall clock across DST. A wall clock in
+   gives timestamp rows; an instant, or a date (which resolves to the
+   timestamptz form), gives timestamptz.
+
+   This answered NO rows in the select list and was refused in FROM."
+  [start stop step wall?]
+  (let [zone (or types/*time-zone* java.time.ZoneOffset/UTC)
+        ;; A date is midnight of the session's day, placed in its zone.
+        as-ts (fn [v] (cond (instance? java.time.LocalDate v)
+                            (.toOffsetDateTime (.atStartOfDay ^java.time.LocalDate v zone))
+                            (string? v) (sql-cast/cast-scalar v (if wall? "timestamp" "timestamptz")
+                                                              {:prefer-local-datetime? true})
+                            :else v))
+        ;; On the timestamp path a Date is a wall clock whose UTC
+        ;; reading it is.
+        as-wall (fn [v] (if (and wall? (inst? v) (not (types/infinite-datetime v)))
+                          (java.time.LocalDateTime/ofInstant (.toInstant ^java.util.Date v)
+                                                             java.time.ZoneOffset/UTC)
+                          v))
+        start (as-wall (as-ts start))
+        stop (as-wall (as-ts stop))
+        iv (if (string? step) (sql-cast/cast-scalar step "interval" {}) step)
+        inst (fn [v] (cond (instance? java.time.OffsetDateTime v) (.toInstant ^java.time.OffsetDateTime v)
+                           (instance? java.time.LocalDateTime v)
+                           (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
+                           :else (.toInstant ^java.util.Date v)))
+        _ (when (types/infinite-datetime iv)
+            (throw (errors/pg-error :invalid-parameter-value
+                                    {:message "step size cannot be infinite"})))
+        sign (let [months @(requiring-resolve 'datahike.pg.interval.core/months)
+                   days @(requiring-resolve 'datahike.pg.interval.core/days)
+                   micros @(requiring-resolve 'datahike.pg.interval.core/micros)
+                   span (+ (* (long (months iv)) 30 86400000000)
+                           (* (long (days iv)) 86400000000)
+                           (long (micros iv)))]
+               (Long/signum span))
+        _ (when (zero? sign)
+            (throw (errors/pg-error :invalid-parameter-value
+                                    {:message "step size cannot equal zero"})))
+        step-fn (if wall?
+                  #(fns/sql-timestamp+interval % iv)
+                  #(fns/sql-timestamptz+interval zone % iv))
+        stop-i (inst stop)
+        infinite (fn [v] (types/infinite-datetime v))]
+    {:pg-type (if wall? "timestamp" "timestamptz")
+     :rows (loop [cur start acc (transient [])]
+             (let [c (if (infinite cur)
+                       (compare (if (= :pos (infinite cur)) 1 -1) 0)
+                       (compare (inst cur) stop-i))]
+               (if (if (pos? sign) (<= c 0) (>= c 0))
+                 (recur (step-fn cur)
+                        (conj! acc [(if (inst? cur) cur (java.util.Date/from (inst cur)))]))
+                 (persistent! acc))))}))
+
 (defn- coldef-pg-type
   "The `:pg/type` for a column-definition-list entry like `a int`.
 
@@ -1492,6 +1554,21 @@
                                      (types/numeric-special? %))
                                 (take 3 args))]
              (cond
+               (and (= 3 (count args)) (some temporal-series-value? [start stop]))
+               (let [oids (mapv #(if (instance? net.sf.jsqlparser.expression.StringValue %)
+                                   nil ; PostgreSQL's `unknown`
+                                   (try (oid/expr-oid % {}) (catch Throwable _ nil)))
+                                (take 2 params))
+                     ;; The arguments' TYPE decides, not their carrier: a
+                     ;; `timestamp` literal folds to a Date, as an instant
+                     ;; does. timestamp with timestamp (or an untyped
+                     ;; literal) is the timestamp form; anything else
+                     ;; resolves to timestamptz.
+                     wall? (and (some #{types/oid-timestamp} oids)
+                                (every? #(contains? #{types/oid-timestamp nil 705} %) oids))
+                     {:keys [rows pg-type]} (temporal-series start stop supplied-step wall?)]
+                 (with-ordinality ["generate_series"] rows [:db.type/instant] [pg-type]))
+
                numeric?
                (let [as-numeric #(if (integer? %) (bigdec %) %)
                      start (as-numeric start)
@@ -2998,6 +3075,27 @@
                                            (-> (coerce/coerce-numeric v :bigdec)
                                                types/numeric-value->storage))
                         :db.type/string  str
+                        ;; A `date` or `timestamp` value is a LocalDate /
+                        ;; LocalDateTime, a timestamptz literal an
+                        ;; OffsetDateTime, and the attribute takes only a
+                        ;; java.util.Date: `(SELECT date '2026-01-01' AS a)
+                        ;; v` failed with `invalid input syntax for column
+                        ;; "a"`, as did any derived table over current_date.
+                        ;; A wall clock is stored as the instant whose UTC
+                        ;; reading it is -- the convention every timestamp
+                        ;; column follows.
+                        :db.type/instant (fn [v]
+                                           (condp instance? v
+                                             java.time.LocalDate
+                                             (java.util.Date/from
+                                              (.toInstant (.atStartOfDay ^java.time.LocalDate v)
+                                                          java.time.ZoneOffset/UTC))
+                                             java.time.LocalDateTime
+                                             (java.util.Date/from
+                                              (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC))
+                                             java.time.OffsetDateTime
+                                             (java.util.Date/from (.toInstant ^java.time.OffsetDateTime v))
+                                             v))
                         identity))
         ;; Always emit a row-existence marker so `t.*` expansion in
         ;; the OUTER select has an entity anchor even when every

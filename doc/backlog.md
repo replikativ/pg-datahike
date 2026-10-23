@@ -1250,3 +1250,27 @@ a missing literal form rather than a scanner bug: it wants decoding
 (`\XXXX`, `\+XXXXXX`, and a `UESCAPE 'c'` clause) into a plain literal
 before the parser sees it, the way E'' quotes are normalised in
 `PgWireServer.stripComments`. `U&"…"` identifiers are the same shape.
+
+### Four datetime/SRF gaps found while porting generate_series over timestamps (2026-10-23)
+
+Each was checked against PostgreSQL 17 and left out of that change on
+purpose:
+
+- **A set-returning function's rows lose their order through an
+  aggregate.** `SELECT string_agg(g::text, ',') FROM generate_series(1,12)
+  g` answers `5,4,10,3,…` where PostgreSQL answers `1,2,…,12`: the
+  materialised relation's rows come back in hash order. Integer series
+  too, so it predates the timestamp form. PostgreSQL does not promise
+  that order without an ORDER BY either, but every client relies on it
+  for SRFs. The relation needs its ordinality to drive the scan.
+- **`WITH ORDINALITY AS t(g, o)`** raises `table "t" has 1 columns
+  available but 2 columns specified`: the column-alias list is checked
+  before the ordinality column is added.
+- **`(a, b) OVERLAPS (c, d) IS NULL`** is a JSqlParser syntax error;
+  PostgreSQL accepts it. Parenthesising the OVERLAPS works.
+- **`timestamptz = timestamp`** compares the timestamp's UTC reading.
+  PostgreSQL places the timestamp in the session zone first, so under
+  America/New_York `'…02:00+00'::timestamptz = '…22:00'::timestamp` is
+  true there and false here. `translate-comparison` has several paths
+  (implicit joins, quantified comparisons, coercions); it wants the
+  same `zone-crossing` applied to the timestamp operand in each.

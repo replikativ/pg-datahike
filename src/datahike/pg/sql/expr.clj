@@ -7683,6 +7683,28 @@
                     (when-let [t (.getIntervalType e)] (str " " (str/lower-case (str t)))))]
       (sql-cast/cast-scalar text "interval" {:explicit? true}))
 
+    ;; (s1, e1) OVERLAPS (s2, e2). An interval end is `start + end`,
+    ;; built as the AST it stands for so it gets the operator's own
+    ;; arithmetic -- the zone-aware one for a timestamptz.
+    (instance? net.sf.jsqlparser.expression.OverlapsCondition expr)
+    (let [^net.sf.jsqlparser.expression.OverlapsCondition e expr
+          pair (fn [^java.util.List l]
+                 (when-not (= 2 (.size l))
+                   (throw (errors/pg-error :syntax-error
+                                           {:message "wrong number of parameters on left side of OVERLAPS expression"})))
+                 (let [s (.get l 0) en (.get l 1)
+                       en (if (= types/oid-interval (source-oid ctx en))
+                            (doto (net.sf.jsqlparser.expression.operators.arithmetic.Addition.)
+                              (.setLeftExpression s)
+                              (.setRightExpression en))
+                            en)]
+                   (mapv #(let [v (translate-expr ctx %)]
+                            (if (seq? v) (ctx/materialize-arg! ctx v) v))
+                         [s en])))
+          [s1 e1] (pair (.getLeft e))
+          [s2 e2] (pair (.getRight e))]
+      (list 'datahike.pg.query-fns/sql-overlaps s1 e1 s2 e2))
+
     ;; EXTRACT(field FROM value) is its own AST node, not a Function, so it
     ;; never reached the function table at all.
     (instance? ExtractExpression expr)
@@ -9984,7 +10006,9 @@
     ;; (DoubleAnd, a different AST class) was not handled at all -- it
     ;; reached the catch-all and raised "WHERE expression of type ... is not
     ;; supported".
-    (or (instance? JsonOperator expr) (instance? DoubleAnd expr))
+    ;; OVERLAPS is three-valued for the same reason.
+    (or (instance? JsonOperator expr) (instance? DoubleAnd expr)
+        (instance? net.sf.jsqlparser.expression.OverlapsCondition expr))
     (let [v (translate-expr ctx expr)
           v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
       ;; `true?`, not `identity`: these are three-valued (NULL operand ->

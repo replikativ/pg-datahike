@@ -3920,6 +3920,40 @@
         (.atDate ^java.time.OffsetTime t ^java.time.LocalDate d)
         (.atTime ^java.time.LocalDate d ^java.time.LocalTime t)))))
 
+(defn sql-overlaps
+  "`(s1, e1) OVERLAPS (s2, e2)`: overlaps_timestamp (timestamp.c), with
+   its NULL rules. A NULL endpoint is not 'unbounded' -- it makes the
+   answer NULL exactly where it could have decided it -- and each
+   period is first put in order. The `(start, interval)` forms reach
+   here with the end already computed, as the SQL-language overloads in
+   pg_proc compute it."
+  [s1 e1 s2 e2]
+  (let [nul? sql-null?
+        gt? #(pos? (long (order-cmp %1 %2)))
+        lt? #(neg? (long (order-cmp %1 %2)))
+        period (fn [s e]
+                 (cond
+                   (and (nul? s) (nul? e)) nil
+                   (nul? s) [e nil]
+                   (nul? e) [s nil]
+                   (gt? s e) [e s]
+                   :else [s e]))
+        p1 (period s1 e1)
+        p2 (period s2 e2)]
+    (if (or (nil? p1) (nil? p2))
+      :__null__
+      (let [[ts1 te1] p1 [ts2 te2] p2]
+        (cond
+          (gt? ts1 ts2) (cond (nil? te2) :__null__
+                              (lt? ts1 te2) true
+                              (nil? te1) :__null__
+                              :else false)
+          (lt? ts1 ts2) (cond (nil? te1) :__null__
+                              (lt? ts2 te1) true
+                              (nil? te2) :__null__
+                              :else false)
+          :else (if (or (nil? te1) (nil? te2)) :__null__ true))))))
+
 (declare sql-extract* sql-extract-in)
 
 (defn sql-extract
