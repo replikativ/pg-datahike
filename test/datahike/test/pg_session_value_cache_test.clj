@@ -552,3 +552,66 @@
     (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
     (is (= "Asia/Tokyo" (scalar b "SHOW timezone"))
         "b wrote its own session, not a's")))
+
+(deftest settings-are-transactional
+  ;; A setting is transactional in PostgreSQL, and each answer below was
+  ;; read off PostgreSQL 17 for the same statements. All of these
+  ;; persisted for the session: ROLLBACK did not undo a SET, nor ROLLBACK
+  ;; TO SAVEPOINT one made after the savepoint, and `SET LOCAL` /
+  ;; `set_config(…, true)` outlived their transaction.
+  (with-open [a (connect-to "alpha")]
+    (let [tz #(scalar a "SHOW timezone")]
+      (testing "ROLLBACK undoes a SET, COMMIT keeps it"
+        (exec! a "BEGIN") (exec! a "SET timezone = 'Asia/Tokyo'") (exec! a "ROLLBACK")
+        (is (= "UTC" (tz)))
+        (exec! a "BEGIN") (exec! a "SET timezone = 'Asia/Tokyo'") (exec! a "COMMIT")
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "RESET timezone"))
+      (testing "SET LOCAL lasts to the end of the transaction, even one that commits"
+        (exec! a "BEGIN")
+        (exec! a "SET timezone = 'Asia/Tokyo'")
+        (exec! a "SET LOCAL timezone = 'Europe/Berlin'")
+        (is (= "Europe/Berlin" (tz)))
+        (exec! a "COMMIT")
+        (is (= "Asia/Tokyo" (tz)) "the session-level SET survives, the LOCAL one does not")
+        (exec! a "RESET timezone"))
+      (testing "SET LOCAL outside a transaction changes nothing"
+        (exec! a "SET LOCAL timezone = 'Asia/Tokyo'")
+        (is (= "UTC" (tz))))
+      (testing "set_config's is_local is SET LOCAL, in both spellings"
+        (exec! a "BEGIN")
+        (is (= "Asia/Tokyo" (scalar a "SELECT set_config('timezone', 'Asia/Tokyo', true)")))
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "COMMIT")
+        (is (= "UTC" (tz)))
+        (exec! a "BEGIN")
+        (is (= ["Asia/Tokyo" "1"] (row a "SELECT set_config('timezone', 'Asia/Tokyo', true), 1")))
+        (exec! a "COMMIT")
+        (is (= "UTC" (tz)))
+        (is (= "Asia/Tokyo" (scalar a "SELECT set_config('timezone', 'Asia/Tokyo', true)"))
+            "outside a block the call still answers the value it set")
+        (is (= "UTC" (tz)) "and it is gone once the statement is"))
+      (testing "ROLLBACK TO SAVEPOINT undoes what came after the savepoint"
+        (exec! a "BEGIN")
+        (exec! a "SET timezone = 'Asia/Tokyo'")
+        (exec! a "SAVEPOINT s")
+        (exec! a "SET timezone = 'Europe/Berlin'")
+        (exec! a "ROLLBACK TO SAVEPOINT s")
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "COMMIT")
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "RESET timezone"))
+      (testing "a failed transaction's SET is undone with it"
+        (exec! a "BEGIN")
+        (exec! a "SET search_path = myschema")
+        (is (= "22012" (state a "SELECT 1/0")))
+        (exec! a "ROLLBACK")
+        (is (= "\"$user\", public" (scalar a "SHOW search_path"))))
+      (testing "RESET ALL inside a block is undone by ROLLBACK"
+        (exec! a "SET timezone = 'Asia/Tokyo'")
+        (exec! a "BEGIN")
+        (exec! a "RESET ALL")
+        (is (= "UTC" (tz)))
+        (exec! a "ROLLBACK")
+        (is (= "Asia/Tokyo" (tz)))
+        (exec! a "RESET timezone")))))
