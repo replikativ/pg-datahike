@@ -31,7 +31,8 @@
    the zero pad PG compares against behaves like trailing '0' characters
    and the tie-break covers the proper-prefix case."
   (:require [clojure.string :as str]
-            [datahike.pg.errors :as errors]))
+            [datahike.pg.errors :as errors]
+            [datahike.pg.types :as types]))
 
 (set! *warn-on-reflection* true)
 
@@ -82,6 +83,11 @@
 ;; ---------------------------------------------------------------------------
 ;; Parsing
 
+;; `->pg-text` is the one output function every text conversion goes
+;; through -- concat(), ||, format(), array elements, record fields -- and
+;; without this it fell to `str` and printed the Java identity
+;; (`datahike.pg...@bb1ab8bc`).
+(types/register-output-function! pg-bit? to-pg-text)
 (defn- invalid-digit [s kind]
   (throw (errors/pg-error :invalid-text-representation
                           {:detail (str "\"" s "\" is not a valid " kind " digit")})))

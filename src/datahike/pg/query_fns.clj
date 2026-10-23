@@ -83,6 +83,8 @@
 (def sql-timestamp+interval              fns/sql-timestamp+interval)
 (def sql-timestamptz+interval            fns/sql-timestamptz+interval)
 (def sql-overlaps                        fns/sql-overlaps)
+(def json-scalar                         jsonb/json-scalar)
+(def json-key                            jsonb/json-key)
 (def sql-wall->tstz                      fns/sql-wall->tstz)
 (def agg-sort-key                        fns/agg-sort-key)
 (def sql-timestamptz-interval            fns/sql-timestamptz-interval)

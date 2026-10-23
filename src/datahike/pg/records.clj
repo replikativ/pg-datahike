@@ -96,8 +96,11 @@
                 (arr/array? v) (arr/to-pg-text v)
                 (record? v)    (to-pg-text v)
                 :else          (types/->pg-text v oid))]
+      ;; record_out (rowtypes.c) DOUBLES a quote or backslash inside a
+      ;; quoted field: `"` is `""`, `\` is `\\`. Prefixing a backslash
+      ;; gave `("a\"b",1)` where PostgreSQL prints `("a""b",1)`.
       (if (field-needs-quote? raw)
-        (str "\"" (str/replace raw #"[\"\\]" "\\\\$0") "\"")
+        (str "\"" (str/replace raw #"[\"\\]" "$0$0") "\"")
         raw))))
 
 (defn to-pg-text
@@ -105,6 +108,11 @@
   [^PgRecord r]
   (str "(" (str/join "," (map #(field-cell (:value %) (:oid %)) (:fields r))) ")"))
 
+;; `->pg-text` is the one output function every text conversion goes
+;; through -- concat(), ||, format(), array elements, record fields -- and
+;; without this it fell to `str` and printed the Java identity
+;; (`datahike.pg...@bb1ab8bc`).
+(types/register-output-function! record? to-pg-text)
 (defn register-layouts!
   "Recursively register each PgRecord's field OIDs (via `reg-fn` — a 2-arg fn
    [record-text int-array-of-field-oids], i.e. PgParamCodec/registerRecordLayout)

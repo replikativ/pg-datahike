@@ -10,7 +10,8 @@
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
-            [datahike.pg.records :as records]))
+            [datahike.pg.records :as records]
+            [datahike.pg.types :as types]))
 
 (set! *warn-on-reflection* true)
 
@@ -127,6 +128,8 @@
 
 (defn- json-object-pairs [^JsonObject o] (.-pairs o))
 
+(declare json-scalar)
+
 (defn- normalize-tree
   "Bring a freshly-parsed tree into the value model:
 
@@ -141,7 +144,9 @@
    Runs once per parse, alongside the parse we already pay for."
   [v]
   (cond
-    (nil? v)     json-null
+    ;; The engine's NULL sentinel is SQL NULL, i.e. JSON null inside a
+    ;; json value -- `json-scalar` hands it back for a NULL element.
+    (or (nil? v) (= :__null__ v)) json-null
     ;; PostgreSQL dispatches to_json/to_jsonb on the argument's DECLARED
     ;; TYPE (json_categorize_type, json.c) — an array becomes a JSON
     ;; array, a composite becomes an object, a timestamp becomes
@@ -150,14 +155,16 @@
     ;; into the object branch and leaked their internals as keys
     ;; (`{":dims": [3], ":elements": …}`). These must be tested BEFORE
     ;; the map branch.
-    (pg-arr/array? v) (mapv normalize-tree (:elements v))
+    (pg-arr/array? v) (let [eo (get types/elem-kw->oid (:elem-type v))]
+                        (mapv #(normalize-tree (json-scalar eo %)) (:elements v)))
     ;; A composite keeps its FIELD ORDER through the json family:
     ;; composite_to_json walks the tuple descriptor in order (json.c),
     ;; where jsonb sorts. A map loses that order -- and past 8 entries
     ;; reorders it outright -- so the pairs are carried as they are.
     (records/record? v)
     (->JsonObject (mapv (fn [i f]
-                          [(or (:name f) (str "f" (inc i))) (normalize-tree (:value f))])
+                          [(or (:name f) (str "f" (inc i)))
+                           (normalize-tree (json-scalar (:oid f) (:value f)))])
                         (range) (:fields v)))
     ;; A temporal value is ISO-8601, not java.util.Date's .toString
     ;; ("Sun Aug 16 19:00:16 PDT 2026").
@@ -184,6 +191,60 @@
     (integer? v) (check-numeric-range! (java.math.BigDecimal. (str v)))
     (float? v)   (check-numeric-range! (java.math.BigDecimal. (str v)))
     :else        v))
+
+(defn json-scalar
+  "A value of SQL type `oid` as PostgreSQL's `datum_to_json` makes it.
+   By TYPE, because the carrier does not say: money and numeric are both
+   BigDecimal, and date, timestamp and timestamptz are all instants.
+
+   - numbers stay numbers, except a non-finite one, which is its text;
+   - a date / timestamp / timestamptz is JsonEncodeDateTime: ISO, with a
+     `T` and a `+HH:MM` offset in the session zone, `infinity` as is;
+   - an array or composite is left for `normalize-tree`, which types its
+     elements and fields the same way;
+   - anything else -- money, time, timetz, interval, bytea, bit, uuid --
+     is its output text, as a string.
+
+   By class alone a money was a bare number, a timestamptz lost its
+   offset, `infinity` printed a year 292278994, a bytea its Java
+   identity and a bit its record fields."
+  [oid v]
+  (cond
+    ;; The sentinel, never nil: a nil binding FILTERS THE ROW, so
+    ;; `json_build_array(1, NULL)` answered no row at all.
+    (or (nil? v) (= :__null__ v)) :__null__
+    ;; A bit string is a record internally, and would otherwise be taken
+    ;; for a json object of its fields.
+    (= "datahike.pg.bits.PgBit" (.getName (class v))) (types/->pg-text v oid)
+    (or (pg-arr/array? v) (records/record? v) (map? v) (vector? v)) v
+    (boolean? v) v
+    (and (number? v) (not= oid types/oid-money))
+    (if (or (types/numeric-special? v)
+            (and (or (instance? Double v) (instance? Float v))
+                 (or (Double/isNaN (double v)) (Double/isInfinite (double v)))))
+      (types/->pg-text v oid)
+      v)
+    (contains? #{types/oid-date types/oid-timestamp types/oid-timestamptz} oid)
+    (let [t (types/->pg-text v oid)]
+      (cond
+        (contains? #{"infinity" "-infinity"} t) t
+        (= oid types/oid-date) t
+        :else (-> t
+                  (str/replace-first " " "T")
+                  (str/replace #"([+-]\d{2})$" "$1:00"))))
+    (string? v) v
+    (nil? oid) v
+    :else (types/->pg-text v oid)))
+
+(defn json-key
+  "An object key of json_object_agg / json_build_object: the key's OUTPUT
+   TEXT, whatever its type. A bare integer key was printed unquoted,
+   `{ 1 : ... }`, which is not JSON."
+  [oid v]
+  (cond
+    (or (nil? v) (= :__null__ v)) :__null__
+    (string? v) v
+    :else (types/->pg-text v oid)))
 
 (defn parse-jsonb
   "Parse a JSON string to the jsonb value model.
@@ -238,6 +299,13 @@
           (.append sb c)))))
   (.append sb \"))
 
+(defn json-string-literal
+  "`s` as a JSON string literal, quoted and escaped as PostgreSQL writes
+   one."
+  ^String [s]
+  (let [sb (StringBuilder.)]
+    (append-json-string! sb (str s))
+    (.toString sb)))
 (defn- append-number!
   "PostgreSQL renders a jsonb number with `numeric_out`: plain positional
    notation, never scientific, with exactly the literal's own scale.
