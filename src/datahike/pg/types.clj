@@ -1666,6 +1666,29 @@
 ;; unambiguous default. `*date-style*` carries the pair; the renderer is
 ;; the only reader.
 
+(def utc-zone
+  "UTC as a `ZoneId`. The TimeZone default, and what the handler binds
+   when the session has set none."
+  (java.time.ZoneId/of "UTC"))
+
+(def ^:dynamic *time-zone*
+  "The session's `TimeZone`, as a `java.time.ZoneId`. Bound per
+   statement by the handler from session state, like `*date-style*`
+   beside it.
+
+   It is read at exactly two boundaries and NOWHERE else:
+
+     - OUTPUT: the two timestamptz arms of the renderer below.
+     - INPUT: `cast/datetime-ctx`'s `:session-zone`, for text that
+       carries no explicit offset.
+
+   **It must never touch `timestamp` or `date`.** Those are wall-clock
+   values; PostgreSQL does not apply TimeZone to them, and applying it
+   would silently shift every stored value. The arms below take their
+   LocalDateTime from a UTC conversion made before the type is known,
+   and only the timestamptz branch re-derives it in this zone."
+  (java.time.ZoneId/of "UTC"))
+
 (def ^:dynamic *date-style*
   "[style order], where style is :iso | :postgres | :sql | :german and
    order is :mdy | :dmy | :ymd. PostgreSQL's own default is [:iso :mdy]."
@@ -1890,9 +1913,14 @@
        (str (time-text (.toLocalTime t)) (offset-text (.getOffset t))))
      (instance? java.time.LocalDateTime v) (timestamp->pg-text v)
      (instance? java.time.OffsetDateTime v)
-     (let [^java.time.OffsetDateTime t v]
-       (timestamp->pg-text (.toLocalDateTime (.withOffsetSameInstant t java.time.ZoneOffset/UTC))
-                           *date-style* "+00"))
+     ;; Rendered in the SESSION zone, resolving its offset AT THIS
+     ;; INSTANT -- a zone's offset moves across DST, so a fixed offset
+     ;; cannot stand in for a zone. With the default UTC this is
+     ;; byte-identical to the "+00" it used to hard-code.
+     (let [^java.time.OffsetDateTime t v
+           zdt (.atZoneSameInstant t *time-zone*)]
+       (timestamp->pg-text (.toLocalDateTime zdt) *date-style*
+                           (offset-text (.getOffset zdt))))
 
      (inst? v)
      (let [^java.time.Instant inst (if (instance? java.time.Instant v)
@@ -1901,7 +1929,14 @@
            ldt (java.time.LocalDateTime/ofInstant inst java.time.ZoneOffset/UTC)]
        (cond
          (= src-oid oid-date)        (date->pg-text (.toLocalDate ldt))
-         (= src-oid oid-timestamptz) (timestamp->pg-text ldt *date-style* "+00")
+         ;; Only this branch takes the session zone. `ldt` above is a UTC
+         ;; conversion, which is right for date and for a plain
+         ;; timestamp -- those are wall-clock, and PostgreSQL never
+         ;; applies TimeZone to them.
+         (= src-oid oid-timestamptz)
+         (let [zdt (.atZone inst *time-zone*)]
+           (timestamp->pg-text (.toLocalDateTime zdt) *date-style*
+                               (offset-text (.getOffset zdt))))
          :else                       (timestamp->pg-text ldt)))
 
      :else nil)))
