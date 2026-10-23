@@ -1837,12 +1837,17 @@
         with-hold? (boolean
                     (some (fn [[a b]]
                             (and (kw=? a "with") (kw=? b "hold")))
-                          (partition 2 1 options)))]
+                          (partition 2 1 options)))
+        scroll? (boolean
+                 (some (fn [[a b]]
+                         (and (kw=? b "scroll") (not (kw=? a "no"))))
+                       (partition 2 1 (cons nil options))))]
     (if for-idx
       (cond-> {:kind :declare-cursor
                :name (when name (str/lower-case name))
                :inner-sql (text-tail sql (:end for-tok))}
-        with-hold? (assoc :with-hold? true))
+        with-hold? (assoc :with-hold? true)
+        scroll? (assoc :scroll? true))
       {:kind :generic-sql})))
 
 (def ^:private cursor-directions
@@ -1850,18 +1855,27 @@
     "absolute" "relative"})
 
 (defn- classify-fetch-move
-  "FETCH/MOVE [direction] [count] [FROM|IN] cursor-name. Returns
-   :direction (lowercased keyword string), :count (long or nil), and
-   :name (lowercased cursor name). Each is optional except the name —
-   we capture the LAST ident that isn't a direction/FROM/IN keyword."
+  "FETCH/MOVE [direction] [count | ALL] [FROM|IN] cursor-name. Returns
+   :direction (lowercased string, nil for a bare count), :count (signed
+   long or nil), :all? when ALL was written -- alone or after FORWARD /
+   BACKWARD, so `FETCH FORWARD ALL` is not read as `FETCH FORWARD` --
+   and :name (lowercased cursor name), the LAST ident that isn't a
+   direction/FROM/IN keyword."
   [kind toks]
-  (let [direction (first (keep #(when (kw-in? % cursor-directions)
+  (let [direction (first (keep #(when (and (kw-in? % cursor-directions)
+                                           (not (kw=? % "all")))
                                   (str/lower-case (:text %)))
                                toks))
-        count-val (some #(when (= :number (:type %))
-                           (try (Long/parseLong (:text %))
-                                (catch Throwable _ nil)))
-                        toks)
+        all? (boolean (some #(kw=? % "all") toks))
+        ;; The lexer has no signed numbers: `FETCH -2` is `-` then `2`.
+        count-val (some (fn [[a b]]
+                          (when (= :number (:type b))
+                            (when-let [n (try (Long/parseLong (:text b))
+                                              (catch Throwable _ nil))]
+                              (if (and (= :op (:type a)) (= "-" (:text a)))
+                                (- n)
+                                n))))
+                        (partition 2 1 (cons nil toks)))
         name (last (keep (fn [t]
                            (when (and (or (= :ident (:type t))
                                           (= :quoted (:type t)))
@@ -1869,10 +1883,11 @@
                                       (not (kw-in? t #{"from" "in"})))
                              (ident-text t)))
                          toks))]
-    {:kind kind
-     :direction direction
-     :count count-val
-     :name (when name (str/lower-case name))}))
+    (cond-> {:kind kind
+             :direction direction
+             :count count-val
+             :name (when name (str/lower-case name))}
+      all? (assoc :all? true))))
 
 (defn- classify-close
   "CLOSE (name | ALL)"
