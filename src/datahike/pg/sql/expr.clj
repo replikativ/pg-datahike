@@ -5807,12 +5807,21 @@
                        (mapv #(set-ops/coerce-row % output-oids)
                              (run-subquery-leaf branch (or (:enriched-db p) db))))
                      (:sub-results p))]
-      (let [combined (case (:op p)
+      ;; Combined under SQL equality, as the server's own set-operation
+      ;; executor combines them -- this was `distinct` and `clojure.set`,
+      ;; so `'1 mon'::interval IN (SELECT '30 days' INTERSECT SELECT
+      ;; '1 mon')` was false. The surviving row is the first-seen one.
+      (let [key-of fns/row-value-key
+            key-sets #(map (fn [r] (into #{} (map key-of) r)) %)
+            combined (case (:op p)
                        :union-all (vec (mapcat identity rows))
-                       :union (vec (distinct (mapcat identity rows)))
-                       :intersect (vec (apply set/intersection (map set rows)))
-                       :except (let [[head & tail] rows]
-                                 (vec (reduce set/difference (set head) (map set tail))))
+                       :union (fns/distinct-by-value (mapcat identity rows))
+                       :intersect (let [ks (key-sets (rest rows))]
+                                    (filterv (fn [r] (every? #(contains? % (key-of r)) ks))
+                                             (fns/distinct-by-value (first rows))))
+                       :except (let [ks (key-sets (rest rows))]
+                                 (filterv (fn [r] (not-any? #(contains? % (key-of r)) ks))
+                                          (fns/distinct-by-value (first rows))))
                        (vec (mapcat identity rows)))
             result (apply-subquery-order-limit combined p)]
         result))
@@ -9556,9 +9565,12 @@
         ;; planner (OOM on large lists). A single `(contains? #{...} ?col)`
         ;; predicate is O(1) per row. NULL col must be filtered via
         ;; null-guard (SQL: NULL NOT IN (…) → UNKNOWN → FALSE).
+          ;; `sql-in?`, as IN uses, not `contains?`: under Clojure's `=`
+          ;; a NaN is not in a set holding NaN, so `f NOT IN ('NaN')` was
+          ;; TRUE for a NaN row -- and IN beside it said true as well.
           not-in?
           (let [val-set (set non-null-vals)]
-            (conj guards (list 'not [(list 'contains? val-set col)])))
+            (conj guards (list 'not [(list 'datahike.pg.query-fns/sql-in? val-set col)])))
 
         ;; IN with empty or NULL-only list → nothing matches
           (empty? non-null-vals)

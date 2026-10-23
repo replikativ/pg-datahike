@@ -59,8 +59,15 @@
     (is (= (fns/value-key (bigdec "1.0")) (fns/value-key (bigdec "1.00"))))
     (is (not= (fns/value-key (bigdec "1.0")) (fns/value-key (bigdec "1.1")))))
 
+  (testing "integral numbers key as numeric, across carriers"
+    ;; Oracle: SELECT 1 UNION SELECT 1.0  =>  one row; and float8_eq calls
+    ;; -0 and 0 equal.
+    (is (= (fns/value-key 1) (fns/value-key (bigdec "1.0")) (fns/value-key 1.0)))
+    (is (= (fns/value-key 0.0) (fns/value-key -0.0)))
+    (is (not= (fns/value-key 1) (fns/value-key 2))))
+
   (testing "and leaves an ordinary value untouched"
-    (doseq [v [1 "s" :k 1.5 true]]
+    (doseq [v ["s" :k 1.5 true]]
       (is (= v (fns/value-key v))))))
 
 (deftest test-aggregate-order-by-uses-one-comparator

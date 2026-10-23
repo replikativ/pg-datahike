@@ -8701,7 +8701,7 @@
             results (if (and has-distinct?
                              (nil? (:distinct-on-n parsed))
                              (empty? window-specs))
-                      (distinct (map resolve-result-value results))
+                      (fns/distinct-by-value (map resolve-result-value results))
                       results)
             ;; …and when it could not be pushed down, the limit has to be
             ;; taken HERE, off the finished rows. It used to be pushed
@@ -8916,7 +8916,7 @@
             ;; Plain DISTINCT deduplicates the concrete projected row. DISTINCT
             ;; ON was already handled by its ordered key prefix above.
             results (if (and has-distinct? (nil? (:distinct-on-n parsed)))
-                      (distinct (map resolve-result-value results))
+                      (fns/distinct-by-value (map resolve-result-value results))
                       results)
             ;; Stateful SELECT projection calls are represented as inert
             ;; markers while Datalog shapes the result. Resolve only rows that
