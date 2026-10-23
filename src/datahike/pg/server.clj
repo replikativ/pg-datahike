@@ -390,12 +390,14 @@
 
    Only when nothing AFTER the scan can still change which rows there
    are. DISTINCT, HAVING, a set-returning projection, row locking, a
-   window, and a bag-multiplicity `:with` all can, so for those the
-   limit has to be applied to the FINISHED rows instead -- which is
-   also why the safety cap has never been pushed down for them."
-  [datalog {:keys [having has-distinct? project-set for-update window-specs]}]
+   window, an ORDER BY on an output computed after the scan, and a
+   bag-multiplicity `:with` all can, so for those the limit has to be
+   applied to the FINISHED rows instead -- which is also why the safety
+   cap has never been pushed down for them."
+  [datalog {:keys [having has-distinct? project-set for-update window-specs
+                   post-window-order-by]}]
   (not (or having has-distinct? project-set for-update
-           (seq window-specs) (seq (:with datalog)))))
+           (seq window-specs) (seq post-window-order-by) (seq (:with datalog)))))
 
 ;; ============================================================================
 ;; Result formatting
@@ -8714,8 +8716,14 @@
             ;; The comment below already said so, but only the
             ;; `sql-order-by` branch acted on it, so the plain
             ;; `LIMIT`-with-a-window path kept trimming early.
+            ;; Nor when the ORDER BY is on an output that only exists
+            ;; after the compound step (`max(v) - min(v) AS spread …
+            ;; ORDER BY spread LIMIT 2`): trimming here kept the first two
+            ;; GROUPS, and sorting them afterwards could not bring back
+            ;; the one that belonged.
             results (if (or (limit-pushable? query parsed)
-                            (seq window-specs))
+                            (seq window-specs)
+                            (seq post-window-order-by))
                       results
                       (cond->> results
                         offset (drop offset)
@@ -8919,6 +8927,63 @@
         {:results results :find-aliases find-aliases
          :query query :query-db query-db}))))
 
+(defn- select-result-oids
+  "The result column OIDs of a plain SELECT, as wire ints: schema-derived,
+   blended with the parse-time OIDs, then the window outputs' and the
+   correlated subqueries' own. `exec-select` advertises these, and CREATE
+   TABLE AS builds its columns from the same ones.
+
+   Resolved against the db the query ran on: when a derived table or an
+   SRF in FROM materialised a virtual table (:enriched-db), its columns'
+   :pg/type markers (generate_series -> int4) only live there."
+  ^ints [parsed parsed-with-shape query-db]
+  (let [{:keys [window-specs find-aliases]} parsed-with-shape
+        schema-oids (compute-schema-oids parsed-with-shape query-db)
+            ;; Blend parse-time OIDs (oid-infer)
+        ;; over the -1 sentinel so empty
+        ;; result sets and aggregate /
+        ;; CAST / literal columns keep the
+        ;; correct type when value inference
+        ;; would otherwise fall back to TEXT.
+        item-oids (effective-item-oids parsed)
+        schema-oids (if (and item-oids (seq find-aliases))
+                      (let [n (count find-aliases)
+                            out (int-array n)]
+                        (dotimes [i n]
+                          (let [so (aget ^ints schema-oids i)
+                                io (when (< i (count item-oids))
+                                     (nth item-oids i))]
+                            (aset out i
+                                  (int (if io io so)))))
+                        out)
+                      schema-oids)
+        ;; Window outputs are appended after the visible base
+        ;; projection. Use their catalog-derived OIDs rather than
+        ;; runtime classes: ntile is represented by a Long here but is
+        ;; int4 in PostgreSQL, while lag/lead retain their input OID.
+        schema-oids (if (seq window-specs)
+                      (let [out (aclone ^ints schema-oids)
+                            fallback-start (- (alength out) (count window-specs))]
+                        (doseq [[i spec] (map-indexed vector window-specs)]
+                          (when-let [o (:oid spec)]
+                            (aset out (or (:out-pos spec) (+ fallback-start i)) (int o))))
+                        out)
+                      schema-oids)
+        ;; Correlated subqueries: the spliced columns aren't schema/
+        ;; item columns, so force each one's advertised OID (its
+        ;; inner-projection :oid) at its out-pos — keeping the
+        ;; execute-path encoding consistent with the RowDescription
+        ;; describeResult sent (e.g. array_agg → text[] binary).
+        schema-oids (if-let [cs (:correlated-subqueries parsed)]
+                      (let [out (aclone ^ints schema-oids)]
+                        (doseq [{:keys [out-pos oid]} (:subqueries cs)]
+                          (when (< out-pos (alength out))
+                            (aset out out-pos (types/oid->wire-int
+                                               (or oid PgWireServer/OID_TEXT)))))
+                        out)
+                      schema-oids)]
+    schema-oids))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -8928,7 +8993,6 @@
    computation for the result-set metadata."
   [ctx parsed]
   (let [{:keys [db]} ctx
-        {:keys [window-specs]} parsed
         {:keys [literal? results find-aliases query query-db]} (select-rows ctx parsed)]
     (if literal?
       ;; Table-free SELECT: return literal row(s) directly.
@@ -8971,55 +9035,7 @@
                   (.withColumnSources (first sources) (second sources))
                   (.withColumnTypmods (nth sources 2)))
               result))
-          (let [;; Resolve column OIDs against the same db the query ran on:
-            ;; when a derived table / SRF-in-FROM materialised a virtual
-            ;; table (:enriched-db), its columns' :pg/type markers (e.g.
-            ;; generate_series → int4) only live there, not on the base
-            ;; conn db.
-                schema-oids (compute-schema-oids parsed-with-shape query-db)
-            ;; Blend parse-time OIDs (oid-infer)
-            ;; over the -1 sentinel so empty
-            ;; result sets and aggregate /
-            ;; CAST / literal columns keep the
-            ;; correct type when value inference
-            ;; would otherwise fall back to TEXT.
-                item-oids (effective-item-oids parsed)
-                schema-oids (if (and item-oids (seq find-aliases))
-                              (let [n (count find-aliases)
-                                    out (int-array n)]
-                                (dotimes [i n]
-                                  (let [so (aget ^ints schema-oids i)
-                                        io (when (< i (count item-oids))
-                                             (nth item-oids i))]
-                                    (aset out i
-                                          (int (if io io so)))))
-                                out)
-                              schema-oids)
-            ;; Window outputs are appended after the visible base
-            ;; projection. Use their catalog-derived OIDs rather than
-            ;; runtime classes: ntile is represented by a Long here but is
-            ;; int4 in PostgreSQL, while lag/lead retain their input OID.
-                schema-oids (if (seq window-specs)
-                              (let [out (aclone ^ints schema-oids)
-                                    fallback-start (- (alength out) (count window-specs))]
-                                (doseq [[i spec] (map-indexed vector window-specs)]
-                                  (when-let [o (:oid spec)]
-                                    (aset out (or (:out-pos spec) (+ fallback-start i)) (int o))))
-                                out)
-                              schema-oids)
-            ;; Correlated subqueries: the spliced columns aren't schema/
-            ;; item columns, so force each one's advertised OID (its
-            ;; inner-projection :oid) at its out-pos — keeping the
-            ;; execute-path encoding consistent with the RowDescription
-            ;; describeResult sent (e.g. array_agg → text[] binary).
-                schema-oids (if-let [cs (:correlated-subqueries parsed)]
-                              (let [out (aclone ^ints schema-oids)]
-                                (doseq [{:keys [out-pos oid]} (:subqueries cs)]
-                                  (when (< out-pos (alength out))
-                                    (aset out out-pos (types/oid->wire-int
-                                                       (or oid PgWireServer/OID_TEXT)))))
-                                out)
-                              schema-oids)
+          (let [schema-oids (select-result-oids parsed parsed-with-shape query-db)
                 sources (compute-column-sources parsed-with-shape db)
                 _ (when shape-key
                     (.put ^java.util.Map select-shape-cache shape-key
@@ -9090,6 +9106,40 @@
 
     :else false))
 
+(declare query-output)
+
+(defn- with-executed-source
+  "An INSERT … SELECT's source plan with its SELECT already run, through
+   the same row producers a client's SELECT goes through, against `db`.
+
+   `materialize-insert-select` used to run the source's Datalog itself
+   and then re-apply a reduced copy of the passes that follow it, so the
+   rows inserted were not the rows the SELECT answers: HAVING kept every
+   group, window functions were missing (`INSERT has more target columns
+   than expressions`), DISTINCT ON kept every row, and an aggregate over
+   no input inserted nothing.
+
+   Only a source that needs one of those passes goes this way. Any
+   other keeps the row-at-a-time path, where each row's volatile
+   projections (nextval, a failing cast) run in order, interleave with
+   the target's defaults and stop at the first error -- as PostgreSQL's
+   projection above a scan or a Sort does. An Agg or WindowAgg node
+   computes its output from the whole input, so for those PostgreSQL
+   also finishes the source first."
+  [ctx db insert-source]
+  (let [source (:source insert-source)]
+    (if (or (= :set-operation (:type source))
+            (some #(let [v (get source %)] (if (coll? v) (seq v) v))
+                  [:having :has-aggregates? :window-specs :distinct-on-n
+                   :post-window-order-by :fetch-with-ties?
+                   ;; An unsorted LIMIT/OFFSET is the pair `exec-select`
+                   ;; pushes into Datalog; the row-at-a-time path never
+                   ;; saw it and inserted every row.
+                   :limit :offset]))
+      (let [{:keys [rows]} (query-output (assoc ctx :db db) source)]
+        (assoc insert-source :source {:literal-rows (vec rows)}))
+      insert-source)))
+
 (defn- exec-insert
   [ctx parsed]
   (let [{:keys [conn tx-state batch-state]} ctx]
@@ -9108,7 +9158,8 @@
                             spec-db)
               parsed (if source?
                        (stmt/materialize-insert-select
-                        (:insert-source parsed) source-db resolver)
+                        (with-executed-source ctx source-db (:insert-source parsed))
+                        source-db resolver)
                        parsed)
               _ (when source?
                   (reject-explicit-always-identities!
@@ -9231,7 +9282,8 @@
                           db)
             parsed (if source?
                      (stmt/materialize-insert-select
-                      (:insert-source parsed) source-db resolver)
+                      (with-executed-source ctx source-db (:insert-source parsed))
+                      source-db resolver)
                      parsed)
             _ (when source?
                 (reject-explicit-always-identities!
@@ -9538,6 +9590,13 @@
       (throw (errors/pg-error :feature-not-supported
                               {:feature (str "PARTITION BY " strategy)}))))
   (let [{:keys [conn tx-state temp-tables session-id]} ctx
+        ;; CREATE TABLE AS: run its query now, against this statement's
+        ;; snapshot, and store what the query answers.
+        parsed (if-let [inner (:ctas-select parsed)]
+                 (let [{:keys [rows aliases oids]} (query-output ctx inner)]
+                   (sql/ctas-finish (dissoc parsed :ctas-select) rows aliases oids
+                                    (:db ctx)))
+                 parsed)
         logical (:temp-logical-name parsed)
         [^PgWireServer$QueryResult result created?]
         (execute-ddl-create conn parsed tx-state session-id)]
@@ -12333,7 +12392,10 @@
       (catch Exception e
         (classified-error "DROP SEQUENCE error: " e)))))
 
-(defn- exec-set-operation
+(defn- set-operation-output
+  "The rows of a UNION / INTERSECT / EXCEPT, typed, with their aliases
+   and result OIDs (wire ints) -- what `exec-set-operation` renders and
+   CREATE TABLE AS stores."
   [ctx parsed]
   (let [{:keys [db]} ctx
         {:keys [op sub-results enriched-db]} parsed
@@ -12400,7 +12462,40 @@
                       (:sql-offset parsed) (drop (:sql-offset parsed)))
         limited (cond->> offset-rows
                   (:sql-limit parsed) (take (:sql-limit parsed)))]
-    (format-query-result limited find-aliases wire-oids)))
+    {:rows limited :aliases find-aliases :oids wire-oids}))
+
+(defn- exec-set-operation
+  [ctx parsed]
+  (let [{:keys [rows aliases oids]} (set-operation-output ctx parsed)]
+    (format-query-result rows aliases oids)))
+
+(defn- query-output
+  "Run a translated query and return its rows TYPED -- not rendered --
+   with their column aliases and result OIDs (wire ints, -1 where only
+   the values can tell). The same row producers a client's SELECT goes
+   through, so a statement that stores a query's rows stores what the
+   query answers.
+
+   CREATE TABLE AS used to run the Datalog itself and skip every pass
+   that happens after it: HAVING, window functions, DISTINCT ON,
+   expressions over aggregates, the one row an aggregate gives over no
+   input; set operations and CTEs it refused or mis-resolved."
+  [ctx inner]
+  (case (:type inner)
+    :select
+    (let [{:keys [literal? results find-aliases query query-db]} (select-rows ctx inner)
+          oids (if literal?
+                 (when-let [item-oids (effective-item-oids inner)]
+                   (int-array (map #(types/oid->wire-int (or % -1)) item-oids)))
+                 (select-result-oids inner (assoc inner :find-aliases find-aliases
+                                                  :query query)
+                                     query-db))]
+      {:rows results :aliases find-aliases :oids oids})
+    :set-operation (set-operation-output ctx inner)
+    :error (throw (ex-info (:message inner)
+                           (cond-> {} (:sqlstate inner) (assoc :sqlstate (:sqlstate inner)))))
+    (throw (errors/pg-error :feature-not-supported
+                            {:feature "CREATE TABLE AS with this kind of query"}))))
 
 (defn- exec-full-join
   [ctx parsed]

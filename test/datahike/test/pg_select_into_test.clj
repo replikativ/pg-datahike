@@ -210,9 +210,66 @@
         (is (nil? (.error (exec h (str "CREATE TABLE t4 AS SELECT a FROM src "
                                        "ORDER BY a OFFSET 99")))))
         (is (= [] (rows (exec h "SELECT a FROM t4")))))
-      (testing "FETCH … WITH TIES is refused, not silently mis-trimmed"
+      (testing "FETCH … WITH TIES stores the ties, as the SELECT answers"
+        ;; Refused while CTAS trimmed its own rows; the query now runs
+        ;; through the SELECT pipeline, which knows the sort keys.
         (let [r (exec h (str "CREATE TABLE t5 AS SELECT a FROM src "
                              "ORDER BY a FETCH FIRST 2 ROWS WITH TIES"))]
-          (is (some? (.error r)))
-          (is (= "0A000" (.sqlstate r)))))
+          (is (nil? (.error r)))
+          (is (= (count (rows (exec h "SELECT a FROM src ORDER BY a FETCH FIRST 2 ROWS WITH TIES")))
+                 (count (rows (exec h "SELECT a FROM t5")))))))
+      (finally (release! h)))))
+
+(deftest a-stored-query-stores-what-the-query-answers
+  ;; CREATE TABLE AS ran the query's Datalog itself, and INSERT … SELECT
+  ;; re-applied a reduced copy of the passes after it, so both skipped
+  ;; whatever came later. Every expectation is PostgreSQL 17's for the
+  ;; same statements.
+  (let [h (fresh-handler)
+        q #(rows (exec h %))]
+    (try
+      (exec h "CREATE TABLE src (k int, v int)")
+      (exec h "INSERT INTO src VALUES (1,10),(1,20),(1,30),(2,5),(3,7),(3,8),(3,9)")
+      (testing "CREATE TABLE AS"
+        (exec h "CREATE TABLE c1 AS SELECT k, count(*) AS n FROM src GROUP BY k HAVING count(*) > 2")
+        (is (= [["1" "3"] ["3" "3"]] (q "SELECT k, n FROM c1 ORDER BY k")) "HAVING kept every group")
+        (exec h "CREATE TABLE c2 AS SELECT count(*) AS n FROM src WHERE false")
+        (is (= [["0"]] (q "SELECT n FROM c2")) "an aggregate over no input is one row")
+        (exec h "CREATE TABLE c3 AS SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY v) AS rn FROM src")
+        (is (= [["1" "10" "1"] ["1" "20" "2"] ["1" "30" "3"] ["2" "5" "1"]
+                ["3" "7" "1"] ["3" "8" "2"] ["3" "9" "3"]]
+               (q "SELECT k, v, rn FROM c3 ORDER BY k, v"))
+            "the window column was dropped")
+        (exec h "CREATE TABLE c4 AS SELECT DISTINCT ON (k) k, v FROM src ORDER BY k, v DESC")
+        (is (= [["1" "30"] ["2" "5"] ["3" "9"]] (q "SELECT k, v FROM c4 ORDER BY k")))
+        (exec h "CREATE TABLE c5 AS SELECT k, sum(v) * 2 + 1 AS s FROM src GROUP BY k")
+        (is (= [["1" "121"] ["2" "11"] ["3" "49"]] (q "SELECT k, s FROM c5 ORDER BY k"))
+            "an expression over an aggregate was stored as `__compound_1`")
+        (exec h "CREATE TABLE c7 AS SELECT k, v FROM src UNION SELECT 9, 9")
+        (is (= [["8"]] (q "SELECT count(*) FROM c7")) "a set operation was refused")
+        (exec h "CREATE TABLE c8 AS WITH t AS (SELECT k FROM src) SELECT DISTINCT k FROM t")
+        (is (= [["1"] ["2"] ["3"]] (q "SELECT k FROM c8 ORDER BY k")) "a CTE was not resolved"))
+      (testing "INSERT … SELECT"
+        (exec h "CREATE TABLE i1 (k int, n bigint)")
+        (exec h "INSERT INTO i1 SELECT k, count(*) FROM src GROUP BY k HAVING count(*) > 2")
+        (is (= [["1" "3"] ["3" "3"]] (q "SELECT k, n FROM i1 ORDER BY k")))
+        (exec h "CREATE TABLE i2 (n bigint)")
+        (exec h "INSERT INTO i2 SELECT count(*) FROM src WHERE false")
+        (is (= [["0"]] (q "SELECT n FROM i2")))
+        (exec h "CREATE TABLE i3 (k int, v int, rn bigint)")
+        (exec h "INSERT INTO i3 SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY v) FROM src")
+        (is (= [["1" "1"] ["2" "1"] ["3" "1"]]
+               (q "SELECT k, min(rn) FROM i3 GROUP BY k ORDER BY k"))
+            "this was `INSERT has more target columns than expressions`")
+        (exec h "CREATE TABLE i4 (k int, v int)")
+        (exec h "INSERT INTO i4 SELECT DISTINCT ON (k) k, v FROM src ORDER BY k, v DESC")
+        (is (= [["1" "30"] ["2" "5"] ["3" "9"]] (q "SELECT k, v FROM i4 ORDER BY k")))
+        (exec h "CREATE TABLE i5 (k int)")
+        (exec h "INSERT INTO i5 SELECT k FROM src LIMIT 2 OFFSET 1")
+        (is (= [["2"]] (q "SELECT count(*) FROM i5")) "an unsorted LIMIT inserted every row"))
+      (testing "and the SELECT itself: ORDER BY an expression over aggregates, with LIMIT"
+        ;; The limit was taken before that sort could run, so the kept
+        ;; rows were the first two GROUPS, not the top two.
+        (is (= [["1" "20"] ["3" "2"]]
+               (q "SELECT k, max(v) - min(v) AS spread FROM src GROUP BY k ORDER BY spread DESC LIMIT 2"))))
       (finally (release! h)))))

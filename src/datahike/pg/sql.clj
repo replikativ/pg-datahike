@@ -597,128 +597,79 @@
     :else                              nil))
 
 (defn- translate-create-table-as
-  "Lower CREATE TABLE name AS SELECT into one atomic schema+data transaction.
-   CTAS is an application-facing DDL/DML boundary, not merely parser sugar:
-   column names and SQL types come from the SELECT result and the rows are
-   captured from the same database snapshot used during translation."
+  "CREATE TABLE name AS <query>: the table's DDL plus the query's own
+   translated plan, under `:ctas-select`. The query RUNS at execution,
+   through the same row producers a client's SELECT goes through (see
+   the server's `query-output`), and `ctas-finish` then builds one atomic
+   schema+data transaction from its rows and result types.
+
+   This used to run the query's Datalog itself, here at translation,
+   and so skipped every pass that happens after it: HAVING kept every
+   group, window functions and expressions over aggregates were dropped
+   or named `__compound_1`, DISTINCT ON kept every row, an aggregate
+   over no input stored no row, and set operations and CTEs were refused
+   or mis-resolved. Each of those was a table holding rows the same
+   SELECT would not have answered."
   [^CreateTable ct schema db]
-  (let [select (.getSelect ct)]
-    (when-not (instance? PlainSelect select)
-      (throw (errors/pg-error
-              :feature-not-supported
-              {:feature "CREATE TABLE AS with a non-plain SELECT"})))
-    (let [base (ddl/translate-create-table ct db)
-          selected (stmt/translate-select ^PlainSelect select schema db)
-          query-db (or (:enriched-db selected) db)
-          rows (if (seq (:in-args selected))
-                 (apply d/q (:query selected) query-db (:in-args selected))
-                 (d/q (:query selected) query-db))
-          ;; The SELECT's ORDER BY has to be applied HERE, and it was
-          ;; not. `d/q` answers with a SET unless the ordering was
-          ;; pushed into Datalog, so the rows were inserted in hash
-          ;; order: `SELECT count(b) INTO t FROM … GROUP BY x.b ORDER BY
-          ;; x.b` built a table holding 3 4 1 2 where PostgreSQL holds
-          ;; 1 2 3 4. The rows were all there, in the wrong order, and
-          ;; nothing afterwards could recover it -- the order is the
-          ;; table's contents now.
-          ;;
-          ;; `sql-order-by` is the server-side fallback the normal
-          ;; SELECT path uses (`exec-select` sorts with the same
-          ;; comparator); when the ordering was pushed into Datalog it
-          ;; is nil and `d/q` already answered in order.
-          ;;
-          ;; Sorted BEFORE hidden columns are stripped and before
-          ;; OFFSET/LIMIT, because a sort key need not be in the select
-          ;; list -- `ORDER BY x.b` above is a hidden column -- and
-          ;; because SQL orders before it trims.
-          rows (if-let [spec (seq (:sql-order-by selected))]
-                 (sort (fns/null-safe-order-cmp (vec spec)) rows)
-                 rows)
-          _ (when (seq (:project-order-by selected))
-              (throw (errors/pg-error
-                      :feature-not-supported
-                      {:feature "CREATE TABLE AS SELECT ordered by a set-returning function"})))
-          ;; FETCH FIRST n ROWS WITH TIES needs the sort keys to decide
-          ;; how far past n the ties reach, which the trim below cannot
-          ;; do. Refused loudly rather than storing the wrong number of
-          ;; rows into a table, where nothing afterwards can tell.
-          _ (when (:fetch-with-ties? selected)
-              (throw (errors/pg-error
-                      :feature-not-supported
-                      {:feature "CREATE TABLE AS SELECT with FETCH … WITH TIES"})))
-          rows (if-let [specs (seq (:project-set selected))]
-                 (let [expanded (stmt/apply-project-set rows specs)]
-                   (cond->> expanded
-                     (:project-offset selected) (drop (:project-offset selected))
-                     (:project-limit selected)  (take (:project-limit selected))))
-                 ;; OFFSET/LIMIT were dropped on the floor here, so
-                 ;; `CREATE TABLE t AS SELECT a FROM src ORDER BY a DESC
-                 ;; LIMIT 2` stored all ten rows. `translate-select`
-                 ;; routes the user's values to exactly ONE of three
-                 ;; mutually exclusive pairs -- `:project-*` when there
-                 ;; is a set-returning projection, `:sql-*` when the
-                 ;; sort is server-side, `:limit`/`:offset` otherwise
-                 ;; (those two are pushed into Datalog by `exec-select`,
-                 ;; which this path does not go through) -- so taking
-                 ;; the first non-nil cannot trim twice.
-                 (let [off (or (:sql-offset selected) (:offset selected))
-                       lim (or (:sql-limit selected) (:limit selected))]
-                   (cond->> rows
-                     off (drop off)
-                     lim (take lim))))
-          hidden (long (or (:hidden-count selected) 0))
-          visible-rows (mapv (fn [row]
-                               (let [row (if (sequential? row) (vec row) [row])]
-                                 (if (pos? hidden)
-                                   (subvec row 0 (- (count row) hidden))
-                                   row)))
-                             rows)
-          aliases (mapv (fn [idx alias]
-                          (params/unquote-ident
-                           (or alias (str "column" (inc idx)))))
-                        (range) (:find-aliases selected))
-          oids (vec (:select-item-oids selected))
-          table-name (:table-name base)
-          marker (pgs/row-marker-attr table-name)
-          col-specs (mapv (fn [idx alias]
-                            (let [oid (or (nth oids idx nil)
-                                          (some->> visible-rows
-                                                   (map #(nth % idx nil))
-                                                   (remove #(or (nil? %) (= :__null__ %)))
-                                                   first
-                                                   types/infer-oid-from-value)
-                                          types/oid-text)
-                                  vtype (or (types/dh-type-for-oid oid)
-                                            :db.type/string)
-                                  attr (keyword table-name alias)
-                                  pg-type (get types/oid->pg-type-marker oid)]
-                              {:alias alias :attr attr :oid oid :vtype vtype
-                               :schema (cond-> {:db/ident attr
-                                                :db/valueType vtype
-                                                :db/cardinality :db.cardinality/one}
-                                         pg-type (assoc :pg/type pg-type))}))
-                          (range) aliases)
-          ctas-schema (into {} (map (fn [{:keys [attr schema]}] [attr schema])) col-specs)
-          data-tx (mapv (fn [row]
-                          (reduce (fn [entity [idx {:keys [attr]}]]
-                                    (let [v (nth row idx nil)]
-                                      (if (or (nil? v) (= :__null__ v))
-                                        entity
-                                        (assoc entity attr
-                                               (stmt/coerce-insert-value
-                                                v attr ctas-schema db)))))
-                                  {:db/id (str (gensym "ctas-")) marker true}
-                                  (map-indexed vector col-specs)))
-                        visible-rows)]
-      (-> base
-          (assoc :column-order aliases)
+  (let [base (ddl/translate-create-table ct db)
+        inner (parse-sql (str (.getSelect ct)) schema db)]
+    (if (= :error (:type inner))
+      inner
+      (assoc base :ctas? true :ctas-select inner))))
+
+(defn ctas-finish
+  "Complete a CREATE TABLE AS plan from its query's output: `rows` typed,
+   `aliases` the output column names, `oids` their result OIDs (wire
+   ints; -1 or nil where only the values can tell). Returns the plan
+   with the columns' schema and the rows appended to its :tx-data."
+  [base rows find-aliases oids db]
+  (let [visible-rows (mapv (fn [row] (if (sequential? row) (vec row) [row])) rows)
+        oids (vec (map #(when (and % (pos? (long %))) (long %)) (or oids [])))
+        aliases (mapv (fn [idx alias]
+                        (params/unquote-ident
+                         (or alias (str "column" (inc idx)))))
+                      (range) find-aliases)
+        table-name (:table-name base)
+        marker (pgs/row-marker-attr table-name)
+        col-specs (mapv (fn [idx alias]
+                          (let [oid (or (nth oids idx nil)
+                                        (some->> visible-rows
+                                                 (map #(nth % idx nil))
+                                                 (remove #(or (nil? %) (= :__null__ %)))
+                                                 first
+                                                 types/infer-oid-from-value)
+                                        types/oid-text)
+                                vtype (or (types/dh-type-for-oid oid)
+                                          :db.type/string)
+                                attr (keyword table-name alias)
+                                pg-type (get types/oid->pg-type-marker oid)]
+                            {:alias alias :attr attr :oid oid :vtype vtype
+                             :schema (cond-> {:db/ident attr
+                                              :db/valueType vtype
+                                              :db/cardinality :db.cardinality/one}
+                                       pg-type (assoc :pg/type pg-type))}))
+                        (range) aliases)
+        ctas-schema (into {} (map (fn [{:keys [attr schema]}] [attr schema])) col-specs)
+        data-tx (mapv (fn [row]
+                        (reduce (fn [entity [idx {:keys [attr]}]]
+                                  (let [v (nth row idx nil)]
+                                    (if (or (nil? v) (= :__null__ v))
+                                      entity
+                                      (assoc entity attr
+                                             (stmt/coerce-insert-value
+                                              v attr ctas-schema db)))))
+                                {:db/id (str (gensym "ctas-")) marker true}
+                                (map-indexed vector col-specs)))
+                      visible-rows)]
+    (-> base
+        (assoc :column-order aliases)
           ;; PostgreSQL tags CTAS with the SELECT's row count ("SELECT 3"),
           ;; not "CREATE TABLE"; when IF NOT EXISTS skips the work it says
           ;; "CREATE TABLE AS". Both need to know this was a CTAS.
-          (assoc :ctas? true :ctas-rows (count data-tx))
-          (assoc :column-type-oids
-                 (into {} (map vector aliases oids)))
-          (update :tx-data into (concat (mapv :schema col-specs) data-tx))))))
+        (assoc :ctas? true :ctas-rows (count data-tx))
+        (assoc :column-type-oids
+               (into {} (map (juxt :alias :oid)) col-specs))
+        (update :tx-data into (concat (mapv :schema col-specs) data-tx)))))
 
 (defn- plain-selects-in
   "All PlainSelects reachable from a SELECT body, descending
