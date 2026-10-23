@@ -82,6 +82,7 @@
 (def sql-time-interval                   fns/sql-time-interval)
 (def sql-timestamp+interval              fns/sql-timestamp+interval)
 (def sql-timestamptz+interval            fns/sql-timestamptz+interval)
+(def sql-overlaps                        fns/sql-overlaps)
 (def sql-timestamptz-interval            fns/sql-timestamptz-interval)
 (def sql-make-timestamptz                fns/sql-make-timestamptz)
 (def sql-age                             fns/sql-age)

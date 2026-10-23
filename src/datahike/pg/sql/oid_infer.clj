@@ -1180,6 +1180,7 @@
         (nth (iterate step (expr-oid (.getLeftExpression e) env)) zones))
 
       (instance? net.sf.jsqlparser.expression.IntervalExpression expr) types/oid-interval
+      (instance? net.sf.jsqlparser.expression.OverlapsCondition expr) types/oid-bool
 
       ;; --- CURRENT_DATE / CURRENT_TIME / CURRENT_TIMESTAMP
       ;; (parsed as TimeKeyExpression by JSqlParser) ----------------------
