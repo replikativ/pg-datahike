@@ -11,12 +11,7 @@
 ;; NOT drift-checked -- some samples of a class agree by accident (a WHERE
 ;; that empties the result) -- so prune it by hand when its gap closes. Keep
 ;; reasons specific -- "unsupported" is not a reason; say what is missing.
-[{:surface :select
-  :key "SELECT id, to_char(d, 'YYYY-MM-DD') AS c FROM ft ORDER BY id"
-  :reason "to_char over date/timestamp is refused with 0A000: PostgreSQL's
-           formatting.c template language (YYYY, MM, Day, FM, TH, ...) is not
-           implemented. Numeric to_char works."}
- {:surface :join
+[{:surface :join
   :key-pattern "^SELECT count\\(.*FROM ft FULL JOIN"
   :reason "an aggregate over a FULL JOIN is refused with 0A000, whatever the ON
            clause says: the join is two queries whose rows are concatenated, so

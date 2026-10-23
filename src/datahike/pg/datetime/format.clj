@@ -756,19 +756,22 @@
                   (catch java.time.DateTimeException _ (out-of-range! "timestamp out of range")))
           west (long (or (:tz tm)
                          ((requiring-resolve 'datahike.pg.datetime.zone/determine-offset) tm zone)))
-          local (try (java.time.LocalDateTime/of (int (:year tm)) (int (:mon tm)) (int (:mday tm))
-                                                 (int (:hour tm)) (int (:min tm)) (int (:sec tm)))
-                     (catch java.time.DateTimeException _ (out-of-range! "timestamp out of range")))
+          ^java.time.LocalDateTime local (try (java.time.LocalDateTime/of (int (:year tm)) (int (:mon tm)) (int (:mday tm))
+                                                                          (int (:hour tm)) (int (:min tm)) (int (:sec tm)))
+                                              (catch java.time.DateTimeException _ (out-of-range! "timestamp out of range")))
           epoch-2000 946684800
           us (+ (* 1000000 (+ (.toEpochSecond local java.time.ZoneOffset/UTC) west (- epoch-2000)))
                 (long (:fsec tm)))
           ff (long (:ff tm))
-          us (if (and (pos? ff) (< ff 6))
-               (let [scale (long (Math/pow 10 (- 6 ff))) half (quot scale 2)]
-                 (if (>= us 0)
-                   (* (quot (+ us half) scale) scale)
-                   (- (* (quot (+ (- us) half) scale) scale))))
-               us)
+          ;; Boxed by the `if` otherwise: the reflective floorMod below
+          ;; then picks floorMod(long, int) on JDK 21 and answers garbage.
+          us (long
+              (if (and (pos? ff) (< ff 6))
+                (let [scale (long (Math/pow 10 (- 6 ff))) half (quot scale 2)]
+                  (if (>= us 0)
+                    (* (quot (+ us half) scale) scale)
+                    (- (* (quot (+ (- us) half) scale) scale))))
+                us))
           secs (+ epoch-2000 (Math/floorDiv us 1000000))
           nanos (* 1000 (Math/floorMod us 1000000))]
       (when (or (> (Math/abs (long (:year tm))) 294276))
