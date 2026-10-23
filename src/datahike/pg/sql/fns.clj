@@ -213,7 +213,8 @@
 (def ^:private ^:const numeric-dscale-max 16383)
 (def ^:private ^:const numeric-max-integer-digits 131072)
 
-(def ^:private ^:const dec-digits 4)                ;; DEC_DIGITS, NBASE = 10000
+(def ^:private ^:const dec-digits 4)                ;; DEC_DIGITS
+(def ^:private ^:const nbase 10000)                 ;; NBASE = 10^DEC_DIGITS
 
 (defn- nbase-weight+first
   "PostgreSQL stores a numeric as base-10000 digit groups. Return
@@ -3955,10 +3956,59 @@
                          0)]
     (+ integer-digits rscale guard)))
 
+(defn- nbase-digits+dweight
+  "`[digits dweight]` in the form estimate_ln_dweight's far-from-one
+   branch is written in: `digits` is the leading base-10000 group, or the
+   leading TWO groups combined when the value has a second, and `dweight`
+   the decimal exponent that goes with them, so that
+   `v ~= digits * 10^dweight`.
+
+   This exists so the estimate never touches `.doubleValue`. `digits` is
+   at most 8 decimal digits and `dweight` is an exponent, so
+   `log(digits) + dweight*ln(10)` is finite for ANY numeric -- which is
+   the whole point (see estimate-ln-dweight).
+
+   Group `idx` covers the decimal exponents 4*idx+3 down to 4*idx, so
+   the digit at exponent `x` sits at string index `e - x`. Deriving the
+   index from the group's exponent rather than from `idx` directly is
+   the part that is easy to get wrong: an earlier version read index
+   `e - 4*idx`, which for 1.0e100 ran off the end of \"10\" and gave
+   `digits` = 0 -- and `Math/log 0` is -Infinity, which is the very
+   thing this function exists to avoid."
+  [^java.math.BigDecimal v]
+  (let [ds (.toString (.abs (.unscaledValue v)))
+        p (count ds)
+        e (- p (.scale v) 1)                       ; exponent of the leading digit
+        weight (Math/floorDiv (long e) (long dec-digits))
+        group (fn [^long idx]
+                (let [top (+ (* dec-digits idx) (dec dec-digits)) ; top exponent
+                      from (- e top)
+                      grab (fn [^long i]
+                             (if (and (>= i 0) (< i p)) (.charAt ds (int i)) \0))]
+                  (Long/parseLong (apply str (map grab (range from (+ from dec-digits)))))))
+        limb0 (group weight)
+        ;; PostgreSQL strips trailing zero groups, so a second group
+        ;; exists only when some digit falls BELOW the first group.
+        lowest (- e (* dec-digits weight))         ; index of limb0's last digit
+        second? (some (fn [^long i] (not= \0 (.charAt ds (int i))))
+                      (range (inc lowest) p))]
+    (if second?
+      [(+ (* limb0 nbase) (group (dec weight)))
+       (- (* weight dec-digits) dec-digits)]
+      [limb0 (* weight dec-digits)])))
+
 (defn- estimate-ln-dweight
   "numeric.c estimate_ln_dweight — the decimal weight of ln(x), which is
    what decides how many digits ln has to produce. Near 1 it uses
-   ln(1+x) ~= x, because ln there is small and its weight very negative."
+   ln(1+x) ~= x, because ln there is small and its weight very negative.
+
+   The far-from-one branch is built from base-10000 GROUPS, as numeric.c
+   builds it, and not from `(.doubleValue v)`. That shortcut is what made
+   `ln('1.0e400'::numeric)` answer `ERROR:  Value out of range for long:
+   Infinity`: 1e400 has no double, so `Math/log` of it was Infinity and
+   the `long` cast of `Math/log10` of THAT threw a raw Clojure coercion
+   message at the client -- taking every row of the statement with it,
+   including the rows whose own logarithms were perfectly representable."
   ^long [^java.math.BigDecimal v]
   (cond
     (not (pos? (.signum v))) 0
@@ -3970,45 +4020,63 @@
         (let [[w f] (nbase-weight+first x)]
           (+ (* (long w) dec-digits) (long (Math/log10 (double f)))))))
     :else
-    (let [ln-var (Math/log (Math/abs (.doubleValue v)))]
+    (let [[digits dweight] (nbase-digits+dweight v)
+          ln-var (+ (Math/log (double digits)) (* (double dweight) 2.302585092994046))]
       (if (zero? ln-var) 0 (long (Math/log10 (Math/abs ln-var)))))))
 
 (defn- ln-rscale ^long [^java.math.BigDecimal a]
   (clamp-rscale (- numeric-min-sig-digits (estimate-ln-dweight a)) (.scale a)))
 
-(def ^String ^:private ln10-str
-  ;; Kept beyond NUMERIC_MIN_SIG_DIGITS because a high-scale input can ask
-  ;; log() for many more displayed digits. bd-ln's decimal range reduction
-  ;; multiplies this constant by the input exponent; a short constant made
-  ;; the tail of log(1.234567e-89) drift despite ample MathContext precision.
-  (str "2.30258509299404568401799145468436420760110148862877297603332790096757260967735248"
-       "02359972050895982983419677840422862486334095254650828067566662873690987816894829"))
-
 (defn- bd-ln
-  "ln to `prec` significant digits. Reduce x = m*10^k with 1 <= m < 10,
-   then ln(m) by the atanh series 2*atanh((m-1)/(m+1)) -- which converges
-   quickly because the argument is bounded well away from the series'
-   singularity.  Keep values near one unreduced: reducing 0.999... to
-   9.999... - ln(10) loses precisely the tiny logarithm to cancellation."
+  "ln to `prec` significant digits -- numeric.c's `ln_var`. Reduce x into
+   (0.9, 1.1) by repeated sqrt, doubling a factor each time, then sum the
+   Taylor series for 0.5*ln((1+z)/(1-z)) = atanh(z) with
+   z = (x-1)/(x+1), and multiply back by 2^(nsqrt+1).
+
+   The reduction used to be x = m*10^k with m in [1,10), finished with
+   `k * ln(10)` where ln(10) was a HARD-CODED 160-digit string. Two
+   ceilings came from that, and both showed up in `numeric_big.sql`:
+
+   - no answer could be accurate past the constant's length. Our
+     800-decimal `LN(ABS(val))` and PostgreSQL's agreed for about 160
+     significant digits and then parted company -- not a rounding
+     difference, the constant simply ran out.
+   - with m in [1,10), z reaches 0.818, so z^2 ~ 0.67 and each term buys
+     only ~0.17 decimal digits: around 4700 terms for 800 digits, which
+     the loop's `n > 2000` guard silently truncated.
+
+   The sqrt reduction needs no constant at all, and leaves |z| < 0.053,
+   where a term buys ~2.5 digits -- a few hundred for 800 decimals."
   ^java.math.BigDecimal [^java.math.BigDecimal x ^long prec]
   (let [mc (java.math.MathContext. (int (+ prec 15)))
-        near-one? (and (>= (.compareTo x (java.math.BigDecimal. "0.9")) 0)
-                       (<= (.compareTo x (java.math.BigDecimal. "1.1")) 0))
-        k (if near-one? 0 (long (- (.precision x) (.scale x) 1)))
-        m (.movePointLeft x (int k))
-        y (.divide (.subtract m java.math.BigDecimal/ONE)
-                   (.add m java.math.BigDecimal/ONE) mc)
+        p09 (java.math.BigDecimal. "0.9")
+        p11 (java.math.BigDecimal. "1.1")
+        ^java.math.BigDecimal two (java.math.BigDecimal/valueOf 2)
+        ;; Each sqrt moves x toward 1 from whichever side it is on, so
+        ;; this terminates for any positive x.
+        [^java.math.BigDecimal xr nsqrt]
+        (loop [^java.math.BigDecimal v x, n 0]
+          (if (or (<= (.compareTo v p09) 0) (>= (.compareTo v p11) 0))
+            (recur (.sqrt v mc) (inc n))
+            [v n]))
+        y (.divide (.subtract xr java.math.BigDecimal/ONE)
+                   (.add xr java.math.BigDecimal/ONE) mc)
         y2 (.multiply y y mc)
         eps (.movePointLeft java.math.BigDecimal/ONE (int (+ prec 12)))
-        series (loop [n 1 pow (.multiply y y2 mc) acc y]
-                 (if (or (> n 2000) (< (.compareTo (.abs pow) eps) 0))
-                   acc
-                   (recur (inc n)
-                          (.multiply pow y2 mc)
-                          (.add acc (.divide pow (java.math.BigDecimal/valueOf (inc (* 2 n))) mc) mc))))]
-    (.add (.multiply (java.math.BigDecimal/valueOf 2) series mc)
-          (.multiply (java.math.BigDecimal/valueOf k) (java.math.BigDecimal. ^String ln10-str) mc)
-          mc)))
+        ^java.math.BigDecimal series
+        (loop [^java.math.BigDecimal acc y
+               ^java.math.BigDecimal pow (.multiply y y2 mc)
+               k 1]
+          (if (< (.compareTo (.abs pow) eps) 0)
+            acc
+            (recur (.add acc (.divide pow (java.math.BigDecimal/valueOf
+                                           (inc (* 2 k)))
+                                      mc)
+                         mc)
+                   (.multiply pow y2 mc)
+                   (inc k))))]
+    ;; 2 for the atanh identity, and one doubling per sqrt taken.
+    (.multiply series (.pow two (int (inc nsqrt))) mc)))
 
 (defn- bd-exp
   "exp to `prec` significant digits. Halve the argument until the
@@ -4197,11 +4265,22 @@
   (bd-sqrt a (sqrt-rscale a)))
 
 (defn- numeric-exp ^java.math.BigDecimal [^java.math.BigDecimal a]
-  (let [rs (exp-rscale a)
-        result-weight (* (.doubleValue a) 0.434294481903252)
-        p (result-working-precision rs result-weight 20)
-        ^java.math.BigDecimal result (bd-exp a p)]
-    (.setScale result (int rs) java.math.RoundingMode/HALF_UP)))
+  ;; exp_var's range guard, which we did not have: an argument at or
+  ;; past NUMERIC_MAX_RESULT_SCALE * 3 overflows if positive and
+  ;; underflows to zero if negative. `exp(6000::numeric)` answered a
+  ;; 2609-digit number where PostgreSQL raises 22003 -- a number no
+  ;; `numeric` can hold, handed to the client as if it could.
+  (let [val (.doubleValue a)
+        rs (exp-rscale a)]
+    (if (>= (Math/abs val) (* numeric-max-result-scale 3))
+      (if (pos? val)
+        (throw (errors/pg-error :numeric-value-out-of-range
+                                {:message "value overflows numeric format"}))
+        (.setScale java.math.BigDecimal/ZERO (int rs)))
+      (let [result-weight (* val 0.434294481903252)
+            p (result-working-precision rs result-weight 20)
+            ^java.math.BigDecimal result (bd-exp a p)]
+        (.setScale result (int rs) java.math.RoundingMode/HALF_UP)))))
 
 (defn- numeric-ln ^java.math.BigDecimal [^java.math.BigDecimal a]
   (cond
