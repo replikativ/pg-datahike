@@ -244,36 +244,42 @@ Open, in this plan:
 ### Order from here
 
 Each step ships as PRs with the gates named in "Process per phase".
+Progress through 2026-10-23 is marked; each DONE item is gated by a
+corpus captured from PostgreSQL 17, named in its PR.
 
 1. **Re-measure** (`bb pg-regress-measure`, ~90 min, needs the machine).
-2. **CREATE TABLE AS through the shared SELECT executor** -- a silent
-   wrong-answer class, so ahead of features.
-3. **TimeZone inside the datetime functions** -- same reason; the list
-   above is the test plan.
-4. **Phase 1.4, one equality and one ordering**, in this order: an
-   equality/ordering fuzzer surface committed as a failing gate; merge
-   `canonical-key-value` into `value-key` and route every raw-`=` site
-   through it; one ordering wrapper with a per-key `[dir nulls]` spec;
-   PgArray and timetz arms in `order-cmp`. Each is a burn-down of the
-   gate.
-5. **Phase 1.1/1.2**: `->pg-text` total and `value->string` reduced to
-   it; `to_jsonb` by OID; dump.clj through `->pg-text`; then the
-   registry skeleton.
-6. **Phase 1.3 cutover**: `pg_input_is_valid` through `input/parse`;
-   money `:in`; temporal text parameters; retire `parse-timestamp-string`.
-7. **`format()` port** (`text_format`) -- `text`, and plpgsql's RAISE
-   and EXECUTE need it.
-8. **Interval functions** and the qualifier rewrite, then **formatting.c**
-   (`to_char` output, then `to_date`/`to_timestamp` input) -- the biggest
-   lever on `horology`, `timestamp`, `timestamptz`, `timetz`.
+   Still open -- and worth more now: everything below marked DONE
+   landed after the 2026-10-02 numbers.
+2. **CREATE TABLE AS through the shared SELECT executor** -- DONE (#334);
+   INSERT ... SELECT too, where a materialising pass is needed.
+3. **TimeZone inside the datetime functions** -- DONE (#335, #338).
+4. **Phase 1.4** -- the equalities and orderings that need no decision
+   are DONE (#339): NOT IN, numeric keys across carriers, set operations
+   inside IN, per-key aggregate ORDER BY, array_cmp. What is left waits
+   on decision 8 (text-stored columns) and datahike#1109 (Datalog's own
+   grouping equality); doc/backlog.md lists it. The fuzzer surface is
+   not built yet.
+5. **Phase 1.1** -- DONE for output (#340): `->pg-text` total, record_out
+   quoting, json by type. Open: dump.clj through `->pg-text`, the
+   registry skeleton (1.2), binary send off our own text.
+6. **Phase 1.3 cutover** -- `pg_input_is_valid` / `pg_input_error_info`
+   DONE (#341). Open: money `:in`, temporal text parameters,
+   `parse-timestamp-string`'s last callers.
+7. **`format()` port** -- DONE (#342), with quote_identifier. VARIADIC is
+   a parser gap (backlog).
+8. **Interval functions** -- DONE (#336: make_*, age, date_bin,
+   timezone(), to_timestamp(float), date + time; #337: generate_series
+   over timestamps, OVERLAPS). **formatting.c** -- DONE (#343: to_char
+   over datetimes and intervals, to_date, to_timestamp). Open: the
+   `interval '1' minute to second` qualifier rewrite.
 9. Small independent items: missing aggregates; bytea OID 17 with
    `get_byte`/`set_byte`; the SRF zero-step error; transaction-stable
-   `now()`; code points.
+   `now()`; code points; SRF row order through aggregates (backlog).
 10. **Phase 4 resolver** (relation/type/namespace/function, `to_reg*`,
     `has_*`), then **postgres_fdw stage 0** (EXPLAIN cost line, protocol
     DEALLOCATE, size functions, parenthesized joins).
-11. **plpgsql EXCEPTION** (on savepoints), then EXECUTE (needs 7) and GET
-    DIAGNOSTICS.
+11. **plpgsql EXCEPTION** (on savepoints), then EXECUTE and GET
+    DIAGNOSTICS -- `format()` is no longer in the way.
 12. Registry-driven resolution and float precision; then ARE.
 
 ### Decisions that are the owner's
