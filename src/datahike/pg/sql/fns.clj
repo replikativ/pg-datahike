@@ -4400,10 +4400,19 @@
               (.divide java.math.BigDecimal/ONE (.pow base (- n) mc) mc)
               (.pow base n mc))]
         (.setScale v (int rs) java.math.RoundingMode/HALF_UP))
+      ;; Through exp(e * ln|base|). A negative base got here only with
+      ;; an integral exponent (the complex case raised above), so its
+      ;; sign is the exponent's parity -- as numeric.c's power_var takes
+      ;; the absolute value and negates for an odd exponent. ln of the
+      ;; negative base itself raised an ArithmeticException.
       :else
-      (let [^java.math.BigDecimal ln-base (bd-ln base p)
+      (let [^java.math.BigDecimal ln-base (bd-ln abs-base p)
             ^java.math.BigDecimal exponent (.multiply e ln-base mc)
-            ^java.math.BigDecimal result (bd-exp exponent p)]
+            ^java.math.BigDecimal result (bd-exp exponent p)
+            ^java.math.BigDecimal result (if (and (neg? (.signum base))
+                                                  (.testBit (.toBigIntegerExact (.stripTrailingZeros e)) 0))
+                                           (.negate result)
+                                           result)]
         (.setScale result (int rs) java.math.RoundingMode/HALF_UP)))))
 
 ;; ---------------------------------------------------------------------------
