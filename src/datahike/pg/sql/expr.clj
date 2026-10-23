@@ -65,6 +65,7 @@
             [datahike.pg.plpgsql.parse :as pl-parse]
             [datahike.pg.plpgsql.exec :as pl-exec]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.guc :as guc]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.rewrite :as rw]
             [datahike.pg.sql.set-ops :as set-ops]
@@ -1642,81 +1643,13 @@
             ;; attempt at this fix still answered the old value.
             state params/*session-state*
             fn-param (symbol (str "?cur-setting" (swap! (:var-counter ctx) inc)))
-            settings {"server_version"             datahike.pg.PgWireServer/SERVER_VERSION
-                      "server_version_num"         datahike.pg.PgWireServer/SERVER_VERSION_NUM
-                      "client_encoding"            "UTF8"
-                      "server_encoding"            "UTF8"
-                      "TimeZone"                   "UTC"
-                      "DateStyle"                  "ISO, MDY"
-                      "IntervalStyle"              "postgres"
-                      "search_path"                "\"$user\", public"
-                      "standard_conforming_strings" "on"
-                      "lc_messages"                "C"
-                      "lc_collate"                 "C"
-                      "lc_ctype"                   "C"
-                      ;; `pg_roles.rolsuper` and `pg_authid.rolsuper`
-                      ;; report TRUE for this role, with the stated
-                      ;; reason that the server enforces no privileges
-                      ;; -- one login role, everything permitted. This
-                      ;; said "off", contradicting them from the same
-                      ;; server. `on` is what the rest of it honours.
-                      "is_superuser"               "on"
-                      "session_authorization"      types/pg-role-name
-                      "application_name"           types/pg-role-name
-                      "transaction_isolation"      "read committed"
-                      "transaction_read_only"      "off"
-                      "default_transaction_isolation" "read committed"
-                      ;; asyncpg probes `jit` during type introspection —
-                      ;; `SELECT current_setting('jit'), set_config('jit',
-                      ;; 'off', false)` — and a 42704 there breaks its
-                      ;; codec pipeline, not just the probe.
-                      ;; DELIBERATE DIVERGENCE: PostgreSQL defaults this
-                      ;; to `on`; we have no JIT at all, so `off` is the
-                      ;; truthful answer. A client that reads this to
-                      ;; decide whether to apply a JIT workaround gets
-                      ;; the right answer from us, not a copied default.
-                      "jit"                        "off"
-                      ;; PostgreSQL's default. Above 0 it means "print
-                      ;; shortest round-trip", which is what our float
-                      ;; renderer does -- so reporting the real default
-                      ;; is truthful, and SHOW returning empty was not.
-                      "extra_float_digits"         "1"}
-            ;; GUC names are CASE-INSENSITIVE in PostgreSQL:
-            ;; `current_setting('SEARCH_PATH')` answers, and here it
-            ;; raised 42704 because the lookup was a plain `get` on a
-            ;; mixed-case map (TimeZone, DateStyle).
-            defaults (into {} (map (fn [[k v]] [(str/lower-case k) v])) settings)
-            ;; And the value has to come from the SESSION, not a literal.
-            ;; `SET search_path = 'myschema'` made `SHOW search_path`
-            ;; answer myschema while `current_setting('search_path')`
-            ;; still answered the compiled-in default -- two read points
-            ;; for one setting, disagreeing. `set_config` already wrote
-            ;; the session state; only this reader ignored it.
-            ;;
-            ;; Spelled to match `handle-show`'s own formatting for each
-            ;; setting, because the whole point is that the two agree.
-            session-value
-            (fn [folded]
-              (when state
-                (let [st @state]
-                  (case folded
-                    "search_path" (when-let [p (:search-path st)]
-                                    (str/join ", " p))
-                    ("datestyle" "date_style")
-                    (when-let [d (:date-style st)] (types/date-style-text d))
-                    ("timezone" "time zone" "time_zone")
-                    (when-let [z (:time-zone st)] (types/time-zone-text z))
-                    "hnsw.ef_search" (some-> (:hnsw-ef-search st) str)
-                    nil))))
             impl-fn (fn [name & [missing-ok]]
-                      (let [folded (str/lower-case (str name))]
-                        (or (session-value folded)
-                            (get defaults folded)
-                            (when missing-ok :__null__)
-                            (throw (ex-info "unrecognized configuration parameter"
-                                            {:error :undefined-object
-                                             :kind "configuration parameter"
-                                             :name name})))))]
+                      (or (guc/read-setting state name)
+                          (when missing-ok :__null__)
+                          (throw (ex-info "unrecognized configuration parameter"
+                                          {:error :undefined-object
+                                           :kind "configuration parameter"
+                                           :name name}))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -1733,16 +1666,44 @@
       ;; raising 42883 that became a hard failure during PREPARE, which
       ;; asyncpg does not recover from.
       ;;
-      ;; The value is accepted and echoed rather than stored: none of the
-      ;; parameters a client sets this way changes how we execute, and
-      ;; answering with the value the client just supplied is what makes
-      ;; its read-back consistent.
+      ;; The value is STORED, through the same `guc/set-setting!` that
+      ;; `SET` uses, and then echoed -- PostgreSQL treats the two
+      ;; spellings as one act. This branch used to echo without storing,
+      ;; on the reasoning that nothing a client sets this way changes
+      ;; how we execute. That stopped being true: `set_config('timezone',
+      ;; 'Europe/Berlin', false)` has to move timestamptz output exactly
+      ;; as `SET timezone` does, and `search_path` was already honoured
+      ;; by the statement-shaped `:set-config` path in server.clj, so
+      ;; the same call answered differently depending on whether it
+      ;; stood alone. A name we do not model is still echoed, not
+      ;; refused: asyncpg toggles `jit` here.
+      ;;
+      ;; The session-state atom is captured at TRANSLATION time for the
+      ;; same reason `current_setting` captures it -- the dynamic var is
+      ;; nil on the thread this runs on -- and the plan is marked
+      ;; session-dependent so the server-wide cache cannot hand one
+      ;; session's writer to another.
       (= fname "set_config")
-      (let [fn-param (symbol (str "?set-config" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [_name value & _]
-                      (if (or (nil? value) (= :__null__ value))
-                        :__null__
-                        (str value)))]
+      (let [state params/*session-state*
+            fn-param (symbol (str "?set-config" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [setting value & _]
+                      (let [v (when-not (or (nil? value) (= :__null__ value))
+                                (str value))
+                            named? (not (or (nil? setting)
+                                            (= :__null__ setting)))]
+                        (when (and state named?)
+                          (guc/set-setting! state (str setting) [v]))
+                        ;; The answer is the setting AS IT NOW STANDS,
+                        ;; which is only the same as `v` when the value
+                        ;; was accepted verbatim: a reset (`v` nil)
+                        ;; answers the default, and `'+02:00'` answers
+                        ;; the canonical `-02:00`. Falls back to the
+                        ;; echo for a name we neither model nor default,
+                        ;; which must not raise -- see the `jit` note.
+                        (or (when named? (guc/read-setting state setting))
+                            v
+                            :__null__)))]
+        (params/session-dependent!)
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj

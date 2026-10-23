@@ -415,3 +415,111 @@
     (testing "and current_setting, which reads through a cached plan"
       (is (= "Europe/Berlin" (scalar a "SELECT current_setting('timezone')")))
       (is (= "America/New_York" (scalar b "SELECT current_setting('timezone')"))))))
+
+(deftest set-config-stores-what-set-stores
+  ;; `set_config(name, value, is_local)` is the function spelling of
+  ;; `SET`, and PostgreSQL treats them as one act. We had three writers
+  ;; for one setting: the `SET` handler stored everything, the
+  ;; whole-statement `set_config` shortcut stored only `search_path`,
+  ;; and the TRANSLATED `set_config` -- the one reached when the call is
+  ;; not the sole projection -- stored nothing at all and merely echoed.
+  ;;
+  ;; So `SET timezone = 'Europe/Berlin'` moved timestamptz output and
+  ;; `set_config('timezone', 'Europe/Berlin', false)` did not, while
+  ;; `SHOW timezone` reported whichever had run last. All three now go
+  ;; through `guc/set-setting!`.
+  (with-open [a (connect-to "alpha")]
+    (testing "the whole-statement form stores, and SHOW agrees"
+      (is (= "Europe/Berlin"
+             (scalar a "SELECT set_config('timezone', 'Europe/Berlin', false)"))
+          "the new value comes back, as PostgreSQL returns it")
+      (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
+      (is (= "Europe/Berlin" (scalar a "SELECT current_setting('timezone')"))))
+    (testing "and so does the translated form, which is not the sole projection"
+      ;; A second select item takes this past classify's `sole?` gate and
+      ;; into datahike.pg.sql.expr -- the path that stored nothing.
+      (is (= ["America/New_York" "1"]
+             (row a "SELECT set_config('timezone', 'America/New_York', false), 1")))
+      (is (= "America/New_York" (scalar a "SHOW timezone"))))
+    (testing "it reaches timestamptz output, which is the point"
+      (exec! a "SELECT set_config('timezone', 'Europe/Berlin', false)")
+      (is (= "2026-06-15 14:00:00+02"
+             (scalar a "SELECT '2026-06-15 12:00:00+00'::timestamptz")))
+      (is (= "2026-06-15 12:00:00"
+             (scalar a "SELECT '2026-06-15 12:00:00'::timestamp"))
+          "and a plain timestamp still does not move"))
+    (testing "DateStyle too, through the translated form"
+      (is (= "Postgres, DMY"
+             (scalar a "SELECT set_config('datestyle', 'Postgres, DMY', false)")))
+      (is (= "Postgres, DMY" (scalar a "SHOW datestyle"))))
+    (testing "search_path, which only the statement form used to honour"
+      (exec! a "SELECT set_config('search_path', 'myschema', false), 1")
+      (is (= "myschema" (scalar a "SHOW search_path"))))
+    (testing "a setting we do not model is answered, not refused"
+      ;; asyncpg turns `jit` off around its type introspection and reads
+      ;; the answer back; a 42704 there breaks its codec pipeline.
+      (is (= "off" (scalar a "SELECT set_config('jit', 'off', false)")))
+      (is (= ["off" "1"] (row a "SELECT set_config('jit', 'off', false), 1")))
+      ;; We default `jit` but do not track it, so the answer is the
+      ;; default whatever is asked for. DELIBERATE: it agrees with
+      ;; `current_setting('jit')`, and a client told its request took
+      ;; and then shown otherwise is the bug this PR is about.
+      (is (= "off" (scalar a "SELECT set_config('jit', 'on', false)")))
+      (is (= "off" (scalar a "SELECT current_setting('jit')"))))
+    (testing "a name we neither model nor default is echoed"
+      (is (= "7" (scalar a "SELECT set_config('some.custom_thing', '7', false)"))))
+    (testing "a recognised setting given a value it cannot take still raises"
+      (is (= "22023"
+             (state a "SELECT set_config('timezone', 'Mars/Phobos', false)"))))
+    (testing "the answer is the setting as it now stands, not the echo"
+      ;; `set_config_by_name` ends with `GetConfigOptionByName`, so
+      ;; PostgreSQL answers with the value the setting now HAS. That is
+      ;; only the same as the string passed in when the value was taken
+      ;; verbatim -- here it is canonicalised, and `SHOW` agrees.
+      (is (= "-02:00" (scalar a "SELECT set_config('timezone', '+02:00', false)"))
+          "POSIX sign applied, and reported the way SHOW reports it")
+      (is (= "-02:00" (scalar a "SHOW timezone")))
+      (is (= ["+04:30" "1"]
+             (row a "SELECT set_config('timezone', '-04:30', false), 1"))
+          "and the translated form answers from the same reader"))
+    (testing "a NULL value RESETS the setting, and answers the default"
+      ;; `set_config_by_name` passes a NULL straight to
+      ;; `set_config_option`, where it means "reset to default" -- and
+      ;; then reports what that default is.
+      (exec! a "SET timezone = 'Europe/Berlin'")
+      (is (= "UTC" (scalar a "SELECT set_config('timezone', NULL, false)")))
+      (is (= "UTC" (scalar a "SHOW timezone")))
+      (exec! a "SET timezone = 'Europe/Berlin'")
+      (is (= ["UTC" "1"] (row a "SELECT set_config('timezone', NULL, false), 1"))
+          "and through the translated form")
+      (is (= "UTC" (scalar a "SHOW timezone"))))
+    (testing "RESET still clears every setting it used to"
+      (doseq [[set-stmt var shown] [["SET timezone = 'Europe/Berlin'" "timezone" "UTC"]
+                                    ["SET datestyle = 'Postgres, DMY'" "datestyle" "ISO, MDY"]
+                                    ["SET search_path TO myschema" "search_path" "\"$user\", public"]]]
+        (exec! a set-stmt)
+        (exec! a (str "RESET " var))
+        (is (= shown (scalar a (str "SHOW " var)))
+            (str "RESET " var))))
+    (testing "SET search_path with a value LIST keeps every element"
+      ;; classify fills :value with only the FIRST element and :values
+      ;; with all of them, so reading :value here dropped the rest.
+      (exec! a "SET search_path TO alpha, beta, gamma")
+      (is (= "alpha, beta, gamma" (scalar a "SHOW search_path"))))))
+
+(deftest set-config-is-not-shared-between-sessions
+  ;; The translated `set_config` captures its session-state atom at
+  ;; TRANSLATION time, because the dynamic var is nil on the thread the
+  ;; datalog function runs on. That capture is exactly what makes a
+  ;; cached plan dangerous: the plan cache is server-wide, so without
+  ;; `params/session-dependent!` the second session would write into the
+  ;; first session's state.
+  (with-open [a (connect-to "alpha")
+              b (connect-to "beta")]
+    (is (= ["Europe/Berlin" "1"]
+           (row a "SELECT set_config('timezone', 'Europe/Berlin', false), 1")))
+    (is (= ["Asia/Tokyo" "1"]
+           (row b "SELECT set_config('timezone', 'Asia/Tokyo', false), 1")))
+    (is (= "Europe/Berlin" (scalar a "SHOW timezone")))
+    (is (= "Asia/Tokyo" (scalar b "SHOW timezone"))
+        "b wrote its own session, not a's")))
