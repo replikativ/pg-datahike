@@ -3715,15 +3715,29 @@
     (strict-scalar-subquery parse-fn run-sql inner-schema query-db
                             ctx/*relation-namespaces*)))
 
+(defn- wall-side-against-timestamptz
+  "Which operand of a comparison is a wall clock (timestamp, date) set
+   against a timestamptz -- PostgreSQL casts that one to timestamptz,
+   placing it in the session zone -- or nil."
+  [ctx left right]
+  (let [lo (source-oid ctx left) ro (source-oid ctx right)
+        wall #{types/oid-timestamp types/oid-date}]
+    (cond (and (= types/oid-timestamptz lo) (contains? wall ro)) :right
+          (and (= types/oid-timestamptz ro) (contains? wall lo)) :left)))
+
 (defn- translate-value-comparison-operands
   "Translate comparison operands in value position after applying the
    same unknown-literal typinput resolution as the WHERE lowering path."
   [ctx left right]
-  (mapv (fn [operand]
-          (if (instance? net.sf.jsqlparser.expression.Expression operand)
-            (translate-expr ctx operand)
-            operand))
-        (coerce-comparison-operands ctx left right)))
+  (let [side (wall-side-against-timestamptz ctx left right)
+        zone (or types/*time-zone* java.time.ZoneOffset/UTC)
+        [l r] (mapv (fn [operand]
+                      (if (instance? net.sf.jsqlparser.expression.Expression operand)
+                        (translate-expr ctx operand)
+                        operand))
+                    (coerce-comparison-operands ctx left right))]
+    [(if (= :left side) (list 'datahike.pg.query-fns/sql-wall->tstz zone l) l)
+     (if (= :right side) (list 'datahike.pg.query-fns/sql-wall->tstz zone r) r)]))
 
 (declare quantified-subquery->in)
 
@@ -8390,6 +8404,10 @@
                 (not (jsonb-column? ctx right))
                 (not= types/oid-vector (source-oid ctx left))
                 (not= types/oid-vector (source-oid ctx right))
+                ;; Nor between a timestamptz and a wall clock: unifying
+                ;; on the stored value compares the wall clock's UTC
+                ;; reading, where PostgreSQL places it in the zone.
+                (not (wall-side-against-timestamptz ctx left right))
                 ;; UPDATE FROM values are constants for this invocation,
                 ;; not a second Datalog relation. This gate is deliberately
                 ;; UPDATE-specific; using *from-bindings* alone also catches
@@ -8488,6 +8506,11 @@
                                (jsonb-column? ctx right)))
            vector-cmp? (or (= types/oid-vector (source-oid ctx left))
                            (= types/oid-vector (source-oid ctx right)))
+           ;; timestamptz against a timestamp or date: PostgreSQL casts
+           ;; the wall clock to timestamptz, i.e. places it in the session
+           ;; zone, before comparing. Comparing the wall clock's UTC
+           ;; reading made `tstz = ts` false under any other zone.
+           shift-side (wall-side-against-timestamptz ctx left right)
            [left right] (coerce-comparison-operands ctx left right)
            ;; Each side is either an AST node (translate-expr-bound) or
            ;; a pre-resolved typed Clojure value from coerce-unknown.
@@ -8497,6 +8520,11 @@
                (translate-expr ctx right) right)
            l (if (seq? l) (ctx/materialize-arg! ctx l) l)
            r (if (seq? r) (ctx/materialize-arg! ctx r) r)
+           in-zone #(ctx/materialize-arg!
+                     ctx (list 'datahike.pg.query-fns/sql-wall->tstz
+                               (or types/*time-zone* java.time.ZoneOffset/UTC) %))
+           l (if (= :left shift-side) (in-zone l) l)
+           r (if (= :right shift-side) (in-zone r) r)
            guards (ctx/null-guard-clauses ctx [l r])
            enum-cmp-param
            (when enum-spec

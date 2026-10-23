@@ -264,3 +264,24 @@
       (testing "date + interval is a timestamp"
         (is (= "2026-01-02 00:00:00" (one "SELECT date '2026-01-01' + interval '1 day'")))))))
 
+(deftest a-timestamptz-compares-with-a-wall-clock-in-the-session-zone
+  ;; PostgreSQL casts the timestamp (or date) to timestamptz, placing it in
+  ;; the session zone, before comparing. We compared its UTC reading, and a
+  ;; timestamptz LITERAL -- folded to an OffsetDateTime -- compared with
+  ;; nothing at all: `>` raised 42883 and `=` answered false. Every
+  ;; expectation is PostgreSQL 17's under America/New_York.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tzc (tstz timestamptz, ts timestamp, d date)")
+    (exec! c "INSERT INTO tzc VALUES ('2026-06-15 02:30+00', '2026-06-14 22:30', '2026-06-15')")
+    (exec! c "SET timezone = 'America/New_York'")
+    (let [one (fn [sql] (first (first (rows c sql))))]
+      (is (= "t" (one "SELECT '2026-06-15 02:00+00'::timestamptz = '2026-06-14 22:00'::timestamp")))
+      (is (= "t" (one "SELECT '2026-06-14 22:00'::timestamp = '2026-06-15 02:00+00'::timestamptz")))
+      (is (= "t" (one "SELECT '2026-06-15 02:00+00'::timestamptz > '2026-06-14 21:00'::timestamp")))
+      (is (= "t" (one "SELECT '2026-06-15 02:00+00'::timestamptz < date '2026-06-15'"))
+          "the date is midnight in New York, four hours after 00:00 UTC")
+      (is (= "1" (one "SELECT count(*) FROM tzc WHERE tstz = ts"))
+          "two columns: not unified on the stored value")
+      (is (= "1" (one "SELECT count(*) FROM tzc WHERE ts = tstz")))
+      (is (= "1" (one "SELECT count(*) FROM tzc WHERE tstz < d")))
+      (is (= "1" (one "SELECT count(*) FROM tzc WHERE tstz = '2026-06-14 22:30'::timestamp"))))))

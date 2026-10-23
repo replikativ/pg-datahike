@@ -436,6 +436,10 @@
     (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
     (instance? java.time.LocalDate v)
     (.toInstant (.atStartOfDay ^java.time.LocalDate v) java.time.ZoneOffset/UTC)
+    ;; A timestamptz LITERAL folds to an OffsetDateTime; without this arm
+    ;; it compared against nothing, so `'…+00'::timestamptz > ts` raised
+    ;; 42883 and `=` answered false.
+    (instance? java.time.OffsetDateTime v) (.toInstant ^java.time.OffsetDateTime v)
     :else nil))
 
 (defn- mixed-temporal?
@@ -3919,6 +3923,26 @@
       (if (instance? java.time.OffsetTime t)
         (.atDate ^java.time.OffsetTime t ^java.time.LocalDate d)
         (.atTime ^java.time.LocalDate d ^java.time.LocalTime t)))))
+
+(defn sql-wall->tstz
+  "A timestamp or date -- a wall clock -- as the timestamptz PostgreSQL
+   casts it to for a mixed comparison: placed in `zone`, the session
+   TimeZone, a repeated hour taking the later offset. A Date is read as
+   the wall clock its UTC reading is, the storage convention."
+  [^java.time.ZoneId zone v]
+  (cond
+    (sql-null? v) :__null__
+    (types/infinite-datetime v) v
+    :else
+    (let [^java.time.LocalDateTime w
+          (cond (instance? java.time.LocalDateTime v) v
+                (instance? java.time.LocalDate v) (.atStartOfDay ^java.time.LocalDate v)
+                (instance? java.util.Date v)
+                (java.time.LocalDateTime/ofInstant (.toInstant ^java.util.Date v) java.time.ZoneOffset/UTC)
+                :else nil)]
+      (if w
+        (java.util.Date/from (.toInstant (.withLaterOffsetAtOverlap (java.time.ZonedDateTime/of w zone))))
+        v))))
 
 (defn sql-overlaps
   "`(s1, e1) OVERLAPS (s2, e2)`: overlaps_timestamp (timestamp.c), with
