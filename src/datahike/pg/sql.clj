@@ -33,6 +33,7 @@
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.expr :as expr]
+            [datahike.pg.sql.fns :as fns]
             [datahike.pg.jsonb]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
@@ -612,16 +613,59 @@
           rows (if (seq (:in-args selected))
                  (apply d/q (:query selected) query-db (:in-args selected))
                  (d/q (:query selected) query-db))
+          ;; The SELECT's ORDER BY has to be applied HERE, and it was
+          ;; not. `d/q` answers with a SET unless the ordering was
+          ;; pushed into Datalog, so the rows were inserted in hash
+          ;; order: `SELECT count(b) INTO t FROM … GROUP BY x.b ORDER BY
+          ;; x.b` built a table holding 3 4 1 2 where PostgreSQL holds
+          ;; 1 2 3 4. The rows were all there, in the wrong order, and
+          ;; nothing afterwards could recover it -- the order is the
+          ;; table's contents now.
+          ;;
+          ;; `sql-order-by` is the server-side fallback the normal
+          ;; SELECT path uses (`exec-select` sorts with the same
+          ;; comparator); when the ordering was pushed into Datalog it
+          ;; is nil and `d/q` already answered in order.
+          ;;
+          ;; Sorted BEFORE hidden columns are stripped and before
+          ;; OFFSET/LIMIT, because a sort key need not be in the select
+          ;; list -- `ORDER BY x.b` above is a hidden column -- and
+          ;; because SQL orders before it trims.
+          rows (if-let [spec (seq (:sql-order-by selected))]
+                 (sort (fns/null-safe-order-cmp (vec spec)) rows)
+                 rows)
           _ (when (seq (:project-order-by selected))
               (throw (errors/pg-error
                       :feature-not-supported
                       {:feature "CREATE TABLE AS SELECT ordered by a set-returning function"})))
+          ;; FETCH FIRST n ROWS WITH TIES needs the sort keys to decide
+          ;; how far past n the ties reach, which the trim below cannot
+          ;; do. Refused loudly rather than storing the wrong number of
+          ;; rows into a table, where nothing afterwards can tell.
+          _ (when (:fetch-with-ties? selected)
+              (throw (errors/pg-error
+                      :feature-not-supported
+                      {:feature "CREATE TABLE AS SELECT with FETCH … WITH TIES"})))
           rows (if-let [specs (seq (:project-set selected))]
                  (let [expanded (stmt/apply-project-set rows specs)]
                    (cond->> expanded
                      (:project-offset selected) (drop (:project-offset selected))
                      (:project-limit selected)  (take (:project-limit selected))))
-                 rows)
+                 ;; OFFSET/LIMIT were dropped on the floor here, so
+                 ;; `CREATE TABLE t AS SELECT a FROM src ORDER BY a DESC
+                 ;; LIMIT 2` stored all ten rows. `translate-select`
+                 ;; routes the user's values to exactly ONE of three
+                 ;; mutually exclusive pairs -- `:project-*` when there
+                 ;; is a set-returning projection, `:sql-*` when the
+                 ;; sort is server-side, `:limit`/`:offset` otherwise
+                 ;; (those two are pushed into Datalog by `exec-select`,
+                 ;; which this path does not go through) -- so taking
+                 ;; the first non-nil cannot trim twice.
+                 (let [off (or (:sql-offset selected) (:offset selected))
+                       lim (or (:sql-limit selected) (:limit selected))]
+                   (cond->> rows
+                     off (drop off)
+                     lim (take lim))))
           hidden (long (or (:hidden-count selected) 0))
           visible-rows (mapv (fn [row]
                                (let [row (if (sequential? row) (vec row) [row])]

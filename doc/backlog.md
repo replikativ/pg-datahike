@@ -407,9 +407,9 @@ plausible wrong answer rather than an error.
 
 ---
 
-### An unordered `SELECT *` does not return insertion order
+### ~~An unordered `SELECT *` does not return insertion order~~ — the `INTO` half is FIXED
 
-`select_implicit`'s whole remaining gap, measured 2026-10-22, is four
+`select_implicit`'s whole remaining gap, measured 2026-10-22, was four
 lines across two queries of this shape:
 
 ```sql
@@ -419,20 +419,37 @@ SELECT * FROM test_missing_target2;
 -- ours:  3 4 1 2
 ```
 
-No `ORDER BY`, so SQL guarantees nothing -- but PostgreSQL's seq scan
-returns heap order, which for a freshly populated table is INSERTION
-order, and `SELECT ... INTO ... ORDER BY` inserted in that order. Its
-regression suite relies on this throughout.
+The entry asked which half was at fault -- the `INTO`, or the unordered
+scan. It was the `INTO`, as guessed. `translate-create-table-as` ran
+`d/q` and inserted the result directly, never reading the SELECT's
+`:sql-order-by`, and `d/q` answers with a SET unless the ordering was
+pushed into Datalog. So the rows went in in hash order, which is
+exactly `3 4 1 2`.
 
-Matching it means an unordered scan returning rows in the order their
-entities were created. Worth knowing before chasing it: whether our
-`INTO` preserves the producing query's order at all, and what our
-unordered scan currently orders by (entity id is the likely answer, in
-which case the gap is in `INTO`, not in the scan).
+Fixed by sorting with `fns/null-safe-order-cmp` -- the comparator
+`exec-select` already uses -- before hidden columns are stripped and
+before OFFSET/LIMIT, because a sort key need not be in the select list
+(`ORDER BY x.b` above is a hidden column) and SQL orders before it
+trims. This was a silent wrong answer of the worst kind: with a
+materialised table the order IS the data, and no later `ORDER BY` can
+recover it.
 
-This is the second-largest kind of residual in the near-miss band after
-error wording, and it is NOT gameable by emitting more output -- the
-rows are all there, in the wrong order.
+The test for it found a second, independent bug in the same function:
+the rows came out in the right order and then ALL of them were stored.
+`translate-select` routes the user's LIMIT/OFFSET to exactly one of
+three mutually exclusive pairs, and this path read only the
+`:project-*` pair, so every ordinary `CREATE TABLE … AS SELECT … LIMIT
+n` ignored the trim (`:limit`/`:offset` are pushed into Datalog by
+`exec-select`, which CTAS does not go through). Also fixed. `FETCH
+FIRST n ROWS WITH TIES` is now refused with 0A000 rather than
+mis-trimmed, since the tie extent needs the sort keys.
+
+**What remains**, and it is a different question: a CTAS with NO `ORDER
+BY` still stores in set order, where PostgreSQL stores the source
+table's heap order. Matching that means carrying the source scan's
+order through, and nothing in `select_implicit` needs it -- both of its
+failing statements have an `ORDER BY`. Not re-measured yet: the fix is
+expected to close the file, but the machine was busy.
 
 ### A multicolumn hash index is accepted
 

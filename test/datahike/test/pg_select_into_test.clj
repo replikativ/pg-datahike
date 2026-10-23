@@ -133,3 +133,86 @@
           (is (= "SELECT 1" (.commandTag r))))
         (is (= [["5"]] (rows (exec h "SELECT * FROM c4")))))
       (finally (release! h)))))
+
+(deftest ctas-stores-the-rows-in-the-selects-order
+  ;; `select_implicit`'s whole remaining gap, and a silent wrong answer
+  ;; of a kind nothing downstream can repair: the ORDER BY decides what
+  ;; the new table CONTAINS, because a later unordered scan returns the
+  ;; stored order.
+  ;;
+  ;;   SELECT count(b) INTO TABLE t FROM … GROUP BY x.b ORDER BY x.b;
+  ;;   SELECT * FROM t;        -- PG: 1 2 3 4   ours: 3 4 1 2
+  ;;
+  ;; `translate-create-table-as` ran `d/q` and inserted the result
+  ;; directly. `d/q` answers with a SET unless the ordering was pushed
+  ;; into Datalog, so the rows went in in hash order.
+  (let [h (fresh-handler)]
+    (try
+      (is (nil? (.error (exec h "CREATE TABLE src (a int, b int)"))))
+      ;; Four groups of different sizes, inserted in an order that is
+      ;; neither the group order nor the count order, so a table that
+      ;; happens to come out right cannot do so by accident.
+      (is (nil? (.error (exec h (str "INSERT INTO src VALUES "
+                                     "(1,30),(2,30),(3,30),"
+                                     "(4,10),"
+                                     "(5,40),(6,40),(7,40),(8,40),"
+                                     "(9,20),(10,20)")))))
+      (testing "an aggregate INTO, ordered by a column not in the select list"
+        (is (nil? (.error (exec h (str "SELECT count(a) AS c INTO TABLE agg "
+                                       "FROM src GROUP BY b ORDER BY b")))))
+        ;; b ascending is 10,20,30,40 -> counts 1,2,3,4.
+        (is (= [["1"] ["2"] ["3"] ["4"]] (rows (exec h "SELECT c FROM agg")))
+            "unordered scan returns what was stored, in the SELECT's order"))
+      (testing "and descending, so the order cannot be the counts' own"
+        (is (nil? (.error (exec h (str "SELECT count(a) AS c INTO TABLE agg_desc "
+                                       "FROM src GROUP BY b ORDER BY b DESC")))))
+        (is (= [["4"] ["3"] ["2"] ["1"]]
+               (rows (exec h "SELECT c FROM agg_desc")))))
+      (testing "a non-aggregate CTAS ordered by a visible column"
+        (is (nil? (.error (exec h (str "CREATE TABLE ord AS SELECT a FROM src "
+                                       "WHERE a <= 4 ORDER BY a DESC")))))
+        (is (= [["4"] ["3"] ["2"] ["1"]] (rows (exec h "SELECT a FROM ord")))))
+      (testing "ORDER BY with LIMIT trims AFTER ordering, as SQL says"
+        (is (nil? (.error (exec h (str "CREATE TABLE top2 AS SELECT a FROM src "
+                                       "ORDER BY a DESC LIMIT 2")))))
+        (is (= [["10"] ["9"]] (rows (exec h "SELECT a FROM top2")))))
+      (finally (release! h)))))
+
+(deftest ctas-applies-offset-and-limit
+  ;; Found by the ORDER BY test above, and a separate pre-existing bug:
+  ;; the rows came out in the right order and then ALL of them were
+  ;; stored. `translate-select` routes the user's LIMIT/OFFSET to one of
+  ;; three mutually exclusive pairs and this path read only the one that
+  ;; belongs to a set-returning projection, so every ordinary CTAS
+  ;; ignored the trim. `exec-select` pushes `:limit`/`:offset` into
+  ;; Datalog at execution; CTAS does not go through it.
+  (let [h (fresh-handler)]
+    (try
+      (is (nil? (.error (exec h "CREATE TABLE src (a int)"))))
+      (is (nil? (.error (exec h (str "INSERT INTO src VALUES "
+                                     "(1),(2),(3),(4),(5),(6),(7),(8),(9),(10)")))))
+      (testing "LIMIT with a server-side sort (:sql-limit)"
+        (is (nil? (.error (exec h (str "CREATE TABLE t1 AS SELECT a FROM src "
+                                       "ORDER BY a DESC LIMIT 3")))))
+        (is (= [["10"] ["9"] ["8"]] (rows (exec h "SELECT a FROM t1")))))
+      (testing "OFFSET and LIMIT together, still ordered"
+        (is (nil? (.error (exec h (str "CREATE TABLE t2 AS SELECT a FROM src "
+                                       "ORDER BY a OFFSET 4 LIMIT 2")))))
+        (is (= [["5"] ["6"]] (rows (exec h "SELECT a FROM t2")))))
+      (testing "LIMIT with no ORDER BY (:limit) still trims"
+        ;; Which rows is unspecified without ORDER BY; how MANY is not.
+        (let [r (exec h "CREATE TABLE t3 AS SELECT a FROM src LIMIT 4")]
+          (is (nil? (.error r)))
+          (is (= "SELECT 4" (.commandTag r))
+              "the tag counts what was stored"))
+        (is (= 4 (count (rows (exec h "SELECT a FROM t3"))))))
+      (testing "OFFSET past the end stores nothing"
+        (is (nil? (.error (exec h (str "CREATE TABLE t4 AS SELECT a FROM src "
+                                       "ORDER BY a OFFSET 99")))))
+        (is (= [] (rows (exec h "SELECT a FROM t4")))))
+      (testing "FETCH … WITH TIES is refused, not silently mis-trimmed"
+        (let [r (exec h (str "CREATE TABLE t5 AS SELECT a FROM src "
+                             "ORDER BY a FETCH FIRST 2 ROWS WITH TIES"))]
+          (is (some? (.error r)))
+          (is (= "0A000" (.sqlstate r)))))
+      (finally (release! h)))))
