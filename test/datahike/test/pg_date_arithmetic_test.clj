@@ -187,6 +187,7 @@
     ;; `operator is not unique` (42725) where we say 42883. Both refuse;
     ;; the SQLSTATE difference is recorded, not asserted as correct.
     (is (= "42883" (sqlstate c "SELECT time '03:04:05' + time '01:02:03'")))
-    (is (= "0A000"
-           (sqlstate c "SELECT to_char(timestamp '2020-01-01', 'YYYY-MM-DD')")))
-    (is (= "0A000" (sqlstate c "SELECT to_char('1 day'::interval, 'YYYY')")))))
+    ;; to_char over a timestamp or an interval used to be refused here;
+    ;; it is formatting.c's DCH side now (pg-to-char-test has the corpus).
+    (is (= "2020-01-01" (one c "SELECT to_char(timestamp '2020-01-01', 'YYYY-MM-DD')")))
+    (is (= "0000" (one c "SELECT to_char('1 day'::interval, 'YYYY')")))))

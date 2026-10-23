@@ -1410,6 +1410,15 @@
                 result-var])
         result-var)
 
+      ;; to_timestamp(text, text): the session zone places a wall clock the
+      ;; input gives no zone for.
+      (and (= fname "to_timestamp") (= 2 (count args)))
+      (do (swap! (:where-clauses ctx) conj
+                 [(list 'datahike.pg.query-fns/sql-to-timestamp-fmt
+                        (or types/*time-zone* java.time.ZoneOffset/UTC) (first args) (second args))
+                  result-var])
+          result-var)
+
       ;; timezone(zone, value) is `value AT TIME ZONE zone`.
       (and (= fname "timezone") (= 2 (count args)))
       (let [value-oid (source-oid ctx (second params))
@@ -2505,14 +2514,21 @@
         (swap! (:where-clauses ctx) conj [(list fn-param unit end-ts start-ts) result-var])
         result-var)
 
-      ;; Temporal to_char has its own picture language in PostgreSQL. The
-      ;; mapped implementation is deliberately numeric-only.
+      ;; Temporal to_char has its own picture language -- formatting.c's
+      ;; DCH side, ported in datahike.pg.datetime.format. The argument's
+      ;; TYPE picks the overload and the session zone is passed for the
+      ;; timestamptz one (safe: TimeZone is in the plan-cache key).
       (and (= fname "to_char")
            (contains? #{types/oid-date types/oid-time types/oid-timestamp
                         types/oid-timestamptz types/oid-interval}
                       (source-oid ctx (first params))))
-      (throw (errors/pg-error :feature-not-supported
-                              {:feature "to_char with a temporal value"}))
+      (do (swap! (:where-clauses ctx) conj
+                 [(list 'datahike.pg.query-fns/sql-to-char-datetime
+                        (source-oid ctx (first params))
+                        (or types/*time-zone* java.time.ZoneOffset/UTC)
+                        (first args) (second args))
+                  result-var])
+          result-var)
 
       ;; User-defined enum input is database metadata, so the pure scalar
       ;; helper cannot validate it without this translation-time closure.

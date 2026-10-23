@@ -3962,6 +3962,23 @@
           (datetime-error "22008" "interval out of range"))
         (@interval-make (int m) (int dd) us)))))
 
+(defn sql-to-timestamp-fmt
+  "`to_timestamp(text, text)` -- formatting.c's do_to_timestamp, ported in
+   datahike.pg.datetime.format. `zone` is the session TimeZone, which
+   places a wall clock the input gives no zone for."
+  [zone v fmt]
+  (if (or (sql-null? v) (sql-null? fmt))
+    :__null__
+    ((requiring-resolve 'datahike.pg.datetime.format/to-timestamp)
+     (->s v) (->s fmt) (or zone java.time.ZoneOffset/UTC))))
+
+(defn sql-to-date
+  "`to_date(text, text)`."
+  [v fmt]
+  (if (or (sql-null? v) (sql-null? fmt))
+    :__null__
+    ((requiring-resolve 'datahike.pg.datetime.format/to-date) (->s v) (->s fmt))))
+
 (defn sql-to-timestamp
   "`to_timestamp(double precision)`: Unix epoch seconds as a timestamptz."
   [v]
@@ -4183,6 +4200,46 @@
                               (nil? te2) :__null__
                               :else false)
           :else (if (or (nil? te1) (nil? te2)) :__null__ true))))))
+
+(defn sql-to-char-datetime
+  "`to_char` over a timestamp, timestamptz, date, time or interval:
+   timestamp_to_char / timestamptz_to_char / interval_to_char. `oid` is
+   the argument's type and picks the overload, as PostgreSQL's resolution
+   does: a date resolves to the timestamptz form (its fields read in
+   `zone`), a time to the interval form. An infinite value, or an empty
+   format, is NULL."
+  [oid zone v fmt]
+  (if (or (sql-null? v) (sql-null? fmt) (= "" (str fmt)) (types/infinite-datetime v))
+    :__null__
+    (let [fmt (str fmt)
+          tc @(requiring-resolve 'datahike.pg.datetime.format/to-char)
+          ^java.time.ZoneId zone (or zone java.time.ZoneOffset/UTC)]
+      (condp contains? oid
+        #{types/oid-timestamp}
+        (tc ((requiring-resolve 'datahike.pg.datetime.format/timestamp-fields)
+             (local-date-time v))
+            false fmt)
+
+        #{types/oid-timestamptz types/oid-date}
+        (let [i (if (instance? java.time.LocalDate v)
+                  (.toInstant (.atStartOfDay ^java.time.LocalDate v zone))
+                  (ts-instant v))]
+          (tc ((requiring-resolve 'datahike.pg.datetime.format/timestamptz-fields) i zone)
+              false fmt))
+
+        #{types/oid-interval types/oid-time}
+        (let [[mo d us] (if (= oid types/oid-time)
+                          (let [t (if (string? v)
+                                    ((requiring-resolve 'datahike.pg.sql.cast/cast-scalar) v "time" {})
+                                    v)]
+                            [0 0 (if (instance? java.time.LocalTime t)
+                                   (quot (.toNanoOfDay ^java.time.LocalTime t) 1000)
+                                   86400000000)])
+                          (let [iv (@interval-coerce v)
+                                [months days micros] @interval-fields]
+                            [(months iv) (days iv) (micros iv)]))]
+          (tc ((requiring-resolve 'datahike.pg.datetime.format/interval-fields) mo d us)
+              true fmt))))))
 
 (declare sql-extract* sql-extract-in)
 
@@ -5853,6 +5910,7 @@
    "make_timestamp" sql-make-timestamp
    "make_interval" sql-make-interval
    "to_timestamp" sql-to-timestamp
+   "to_date" sql-to-date
    "date_bin" sql-date-bin
    "justify_hours" (justify-fn interval-justify-hours)
    "justify_days" (justify-fn interval-justify-days)
@@ -6150,7 +6208,7 @@
    "justify_hours" #{1} "justify_days" #{1} "justify_interval" #{1}
    "make_date" #{3} "make_time" #{3} "make_timestamp" #{6}
    "make_timestamptz" #{6 7} "make_interval" #{0 1 2 3 4 5 6 7}
-   "to_timestamp" #{1} "date_bin" #{3} "age" #{1 2} "timezone" #{2}
+   "to_timestamp" #{1 2} "to_date" #{2} "date_bin" #{3} "age" #{1 2} "timezone" #{2}
    "abs"      #{1} "sign"    #{1} "sqrt"  #{1} "cbrt"  #{1}
    "exp"      #{1} "ln"      #{1} "log10" #{1}
    "floor"    #{1} "ceil"    #{1} "ceiling" #{1}

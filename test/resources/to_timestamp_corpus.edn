@@ -1,0 +1,195 @@
+;; PostgreSQL 17 corpus: to_date / to_timestamp (formatting.c DCH_from_char,
+;; do_to_timestamp) -- the regression suite's own calls and more, under
+;; America/Los_Angeles. Rows joined by newline, columns by |.
+;; Captured from a real PostgreSQL, not hand-written.
+{:zone "America/Los_Angeles"
+ :corpus [
+  ["SELECT i, to_timestamp('2018-11-02 12:34:56', 'YYYY-MM-DD HH24:MI:SS.FF' || i) FROM generate_series(1, 6) i" "1|2018-11-02 12:34:56-07
+2|2018-11-02 12:34:56-07
+3|2018-11-02 12:34:56-07
+4|2018-11-02 12:34:56-07
+5|2018-11-02 12:34:56-07
+6|2018-11-02 12:34:56-07"]
+  ["SELECT i, to_timestamp('2018-11-02 12:34:56.1', 'YYYY-MM-DD HH24:MI:SS.FF' || i) FROM generate_series(1, 6) i" "1|2018-11-02 12:34:56.1-07
+2|2018-11-02 12:34:56.1-07
+3|2018-11-02 12:34:56.1-07
+4|2018-11-02 12:34:56.1-07
+5|2018-11-02 12:34:56.1-07
+6|2018-11-02 12:34:56.1-07"]
+  ["SELECT i, to_timestamp('2018-11-02 12:34:56.12', 'YYYY-MM-DD HH24:MI:SS.FF' || i) FROM generate_series(1, 6) i" "1|2018-11-02 12:34:56.1-07
+2|2018-11-02 12:34:56.12-07
+3|2018-11-02 12:34:56.12-07
+4|2018-11-02 12:34:56.12-07
+5|2018-11-02 12:34:56.12-07
+6|2018-11-02 12:34:56.12-07"]
+  ["SELECT i, to_timestamp('2018-11-02 12:34:56.123', 'YYYY-MM-DD HH24:MI:SS.FF' || i) FROM generate_series(1, 6) i" "1|2018-11-02 12:34:56.1-07
+2|2018-11-02 12:34:56.12-07
+3|2018-11-02 12:34:56.123-07
+4|2018-11-02 12:34:56.123-07
+5|2018-11-02 12:34:56.123-07
+6|2018-11-02 12:34:56.123-07"]
+  ["SELECT i, to_timestamp('2018-11-02 12:34:56.1234', 'YYYY-MM-DD HH24:MI:SS.FF' || i) FROM generate_series(1, 6) i" "1|2018-11-02 12:34:56.1-07
+2|2018-11-02 12:34:56.12-07
+3|2018-11-02 12:34:56.123-07
+4|2018-11-02 12:34:56.1234-07
+5|2018-11-02 12:34:56.1234-07
+6|2018-11-02 12:34:56.1234-07"]
+  ["SELECT i, to_timestamp('2018-11-02 12:34:56.12345', 'YYYY-MM-DD HH24:MI:SS.FF' || i) FROM generate_series(1, 6) i" "1|2018-11-02 12:34:56.1-07
+2|2018-11-02 12:34:56.12-07
+3|2018-11-02 12:34:56.123-07
+4|2018-11-02 12:34:56.1235-07
+5|2018-11-02 12:34:56.12345-07
+6|2018-11-02 12:34:56.12345-07"]
+  ["SELECT i, to_timestamp('2018-11-02 12:34:56.123456', 'YYYY-MM-DD HH24:MI:SS.FF' || i) FROM generate_series(1, 6) i" "1|2018-11-02 12:34:56.1-07
+2|2018-11-02 12:34:56.12-07
+3|2018-11-02 12:34:56.123-07
+4|2018-11-02 12:34:56.1235-07
+5|2018-11-02 12:34:56.12346-07
+6|2018-11-02 12:34:56.123456-07"]
+  ["SELECT i, to_timestamp('2018-11-02 12:34:56.123456789', 'YYYY-MM-DD HH24:MI:SS.FF' || i) FROM generate_series(1, 6) i" nil "date/time field value out of range: \"2018-11-02 12:34:56.123456789\""]
+  ["SELECT i, to_timestamp('20181102123456123456', 'YYYYMMDDHH24MISSFF' || i) FROM generate_series(1, 6) i" "1|2018-11-02 12:34:56.1-07
+2|2018-11-02 12:34:56.12-07
+3|2018-11-02 12:34:56.123-07
+4|2018-11-02 12:34:56.1235-07
+5|2018-11-02 12:34:56.12346-07
+6|2018-11-02 12:34:56.123456-07"]
+  ["SELECT to_date('-44-02-01 BC','YYYY-MM-DD BC')" "0044-02-01"]
+  ["SELECT to_date('-44-02-01','YYYY-MM-DD')" "0044-02-01 BC"]
+  ["SELECT to_date('0000-02-01','YYYY-MM-DD')" "0001-02-01 BC"]
+  ["SELECT to_date('1 4 1902', 'Q MM YYYY')" "1902-04-01"]
+  ["SELECT to_date('2011   12 18', 'YYYY  MM DD')" "2011-12-18"]
+  ["SELECT to_date('2011  12 18', 'YYYY  MM DD')" "2011-12-18"]
+  ["SELECT to_date('2011 12  18', 'YYYY MM   DD')" "2011-12-18"]
+  ["SELECT to_date('2011 12  18', 'YYYY MM  DD')" "2011-12-18"]
+  ["SELECT to_date('2011 12  18', 'YYYY MM DD')" "2011-12-18"]
+  ["SELECT to_date('2011 12 18', 'YYYY  MM DD')" "2011-12-18"]
+  ["SELECT to_date('2011 12 18', 'YYYYxMMxDD')" "2011-12-18"]
+  ["SELECT to_date('2011 x12 x18', 'YYYYxMMxDD')" nil "invalid value \"x1\" for \"MM\""]
+  ["SELECT to_date('2011x 12x 18', 'YYYYxMMxDD')" "2011-12-18"]
+  ["SELECT to_date('2015 365', 'YYYY DDD')" "2015-12-31"]
+  ["SELECT to_date('2015 366', 'YYYY DDD')" nil "date/time field value out of range: \"2015 366\""]
+  ["SELECT to_date('2015-02-29', 'YYYY-MM-DD')" nil "date/time field value out of range: \"2015-02-29\""]
+  ["SELECT to_date('2016 365', 'YYYY DDD')" "2016-12-30"]
+  ["SELECT to_date('2016 366', 'YYYY DDD')" "2016-12-31"]
+  ["SELECT to_date('2016 367', 'YYYY DDD')" nil "date/time field value out of range: \"2016 367\""]
+  ["SELECT to_date('2016-02-29', 'YYYY-MM-DD')" "2016-02-29"]
+  ["SELECT to_date('2016-02-30', 'YYYY-MM-DD')" nil "date/time field value out of range: \"2016-02-30\""]
+  ["SELECT to_date('2016-13-10', 'YYYY-MM-DD')" nil "date/time field value out of range: \"2016-13-10\""]
+  ["SELECT to_date('2458872', 'J')" "2020-01-23"]
+  ["SELECT to_date('3 4 21 01', 'W MM CC YY')" "2001-04-15"]
+  ["SELECT to_date('44-02-01 BC','YYYY-MM-DD BC')" "0044-02-01 BC"]
+  ["SELECT to_timestamp(         0)" "1969-12-31 16:00:00-08"]
+  ["SELECT to_timestamp( 946684800)" "1999-12-31 16:00:00-08"]
+  ["SELECT to_timestamp('  2000 +JUN', 'YYYY/MON')" "2000-06-01 00:00:00-07"]
+  ["SELECT to_timestamp('  20050302', 'YYYYMMDD')" "2005-03-02 00:00:00-08"]
+  ["SELECT to_timestamp(' 2000 +JUN', 'YYYY//MON')" "2000-06-01 00:00:00-07"]
+  ["SELECT to_timestamp(' 2005 03 02', 'YYYYMMDD')" "2005-03-02 00:00:00-08"]
+  ["SELECT to_timestamp(' Infinity'::float)" "infinity"]
+  ["SELECT to_timestamp('-44-02-01 11:12:13 BC','YYYY-MM-DD HH24:MI:SS BC')" "0044-02-01 11:12:13-07:52:58"]
+  ["SELECT to_timestamp('-44-02-01 11:12:13','YYYY-MM-DD HH24:MI:SS')" "0044-02-01 11:12:13-07:52:58 BC"]
+  ["SELECT to_timestamp('-Infinity'::float)" "-infinity"]
+  ["SELECT to_timestamp('005527', 'IYYIWID')" "2006-01-01 00:00:00-08"]
+  ["SELECT to_timestamp('0097/Feb/16 --> 08:14:30', 'YYYY/Mon/DD --> HH:MI:SS')" "0097-02-16 08:14:30-07:52:58"]
+  ["SELECT to_timestamp('05121445482000', 'MMDDHH24MISSYYYY')" "2000-05-12 14:45:48-07"]
+  ["SELECT to_timestamp('05527', 'IYIWID')" "2006-01-01 00:00:00-08"]
+  ["SELECT to_timestamp('1,582nd VIII 21', 'Y,YYYth FMRM DD')" "1582-08-21 00:00:00-07:52:58"]
+  ["SELECT to_timestamp('10000000000', 'FMYYYY')" nil "value for \"YYYY\" in source string is out of range"]
+  ["SELECT to_timestamp('1985 FMMonth 12', 'YYYY \"FMMonth\" DD')" "1985-01-12 00:00:00-08"]
+  ["SELECT to_timestamp('1985 January 12', 'YYYY FMMonth DD')" "1985-01-12 00:00:00-08"]
+  ["SELECT to_timestamp('1985 \\ 12', 'YYYY \\\\ DD')" "1985-01-12 00:00:00-08"]
+  ["SELECT to_timestamp('1997 A.D. 11 16', 'YYYY B.C. MM DD')" "1997-11-16 00:00:00-08"]
+  ["SELECT to_timestamp('1997 AD 11 16', 'YYYY BC MM DD')" "1997-11-16 00:00:00-08"]
+  ["SELECT to_timestamp('1997 B.C. 11 16', 'YYYY B.C. MM DD')" "1997-11-16 00:00:00-07:52:58 BC"]
+  ["SELECT to_timestamp('1997 BC 11 16', 'YYYY BC MM DD')" "1997-11-16 00:00:00-07:52:58 BC"]
+  ["SELECT to_timestamp('1997-11-Jan-16', 'YYYY-MM-Mon-DD')" nil "conflicting values for \"Mon\" field in formatting string"]
+  ["SELECT to_timestamp('19971', 'YYYYMMDD')" nil "source string too short for \"MM\" formatting field"]
+  ["SELECT to_timestamp('19971)24', 'YYYYMMDD')" nil "invalid value \"1)\" for \"MM\""]
+  ["SELECT to_timestamp('19971116', 'YYYYMMDD')" "1997-11-16 00:00:00-08"]
+  ["SELECT to_timestamp('199711xy', 'YYYYMMDD')" nil "invalid value \"xy\" for \"DD\""]
+  ["SELECT to_timestamp('2000  +JUN', 'YYYY//MON')" "2000-06-01 00:00:00-07"]
+  ["SELECT to_timestamp('2000 + + JUN', 'YYYY   MON')" "2000-06-01 00:00:00-07"]
+  ["SELECT to_timestamp('2000 + + JUN', 'YYYY  MON')" nil "invalid value \"+\" for \"MON\""]
+  ["SELECT to_timestamp('2000 + JUN', 'YYYY MON')" "2000-06-01 00:00:00-07"]
+  ["SELECT to_timestamp('2000 ++ JUN', 'YYYY  MON')" "2000-06-01 00:00:00-07"]
+  ["SELECT to_timestamp('2000 -10', 'YYYY  TZH')" "1999-12-31 06:00:00-08"]
+  ["SELECT to_timestamp('2000 -10', 'YYYY TZH')" "2000-01-01 02:00:00-08"]
+  ["SELECT to_timestamp('2000+   JUN', 'YYYY/MON')" "2000-06-01 00:00:00-07"]
+  ["SELECT to_timestamp('20000-1116', 'YYYY-MMDD')" "20000-11-16 00:00:00-08"]
+  ["SELECT to_timestamp('2000January09Sunday', 'YYYYFMMonthDDFMDay')" "2000-01-09 00:00:00-08"]
+  ["SELECT to_timestamp('2005 03 02', 'YYYYMMDD')" "2005-03-02 00:00:00-08"]
+  ["SELECT to_timestamp('20050302', 'YYYYMMDD')" "2005-03-02 00:00:00-08"]
+  ["SELECT to_timestamp('2005300', 'YYYYDDD')" "2005-10-27 00:00:00-07"]
+  ["SELECT to_timestamp('2005364', 'IYYYIDDD')" "2006-01-01 00:00:00-08"]
+  ["SELECT to_timestamp('2005426', 'YYYYWWD')" "2005-10-15 00:00:00-07"]
+  ["SELECT to_timestamp('2005527', 'IYYYIWID')" "2006-01-01 00:00:00-08"]
+  ["SELECT to_timestamp('2005527', 'YYYYIWID')" nil "invalid combination of date conventions"]
+  ["SELECT to_timestamp('2011$03!18 23_38_15', 'YYYY-MM-DD HH24:MI:SS')" "2011-03-18 23:38:15-07"]
+  ["SELECT to_timestamp('2011-12-18   23:38:15', 'YYYY-MM-DD  HH24:MI:SS')" "2011-12-18 23:38:15-08"]
+  ["SELECT to_timestamp('2011-12-18  23:38:15', 'YYYY-MM-DD   HH24:MI:SS')" "2011-12-18 23:38:15-08"]
+  ["SELECT to_timestamp('2011-12-18  23:38:15', 'YYYY-MM-DD  HH24:MI:SS')" "2011-12-18 23:38:15-08"]
+  ["SELECT to_timestamp('2011-12-18  23:38:15', 'YYYY-MM-DD HH24:MI:SS')" "2011-12-18 23:38:15-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 +01:30', 'YYYY-MM-DD HH12:MI OF')" "2011-12-18 02:08:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 +01:30', 'YYYY-MM-DD HH12:MI TZ')" "2011-12-18 02:08:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 +01:xyz', 'YYYY-MM-DD HH12:MI OF')" nil "invalid value \"xy\" for \"OF\""]
+  ["SELECT to_timestamp('2011-12-18 11:38 +05',    'YYYY-MM-DD HH12:MI TZH')" "2011-12-17 22:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 +05:20', 'YYYY-MM-DD HH12:MI TZH:TZM')" "2011-12-17 22:18:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 +xyz', 'YYYY-MM-DD HH12:MI OF')" nil "invalid value \"xy\" for \"OF\""]
+  ["SELECT to_timestamp('2011-12-18 11:38 -05',    'YYYY-MM-DD HH12:MI TZH')" "2011-12-18 08:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 -05', 'YYYY-MM-DD HH12:MI OF')" "2011-12-18 08:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 -05', 'YYYY-MM-DD HH12:MI TZ')" "2011-12-18 08:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 -05:20', 'YYYY-MM-DD HH12:MI TZH:TZM')" "2011-12-18 08:58:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 ...', 'YYYY-MM-DD HH12:MI TZ')" nil "invalid value \"..\" for \"TZ\""]
+  ["SELECT to_timestamp('2011-12-18 11:38 20',     'YYYY-MM-DD HH12:MI TZM')" "2011-12-18 03:18:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 A.M.', 'YYYY-MM-DD HH12:MI P.M.')" "2011-12-18 11:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 AM', 'YYYY-MM-DD HH12:MI PM')" "2011-12-18 11:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 EST', 'YYYY-MM-DD HH12:MI TZ')" "2011-12-18 08:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 JUNK', 'YYYY-MM-DD HH12:MI TZ')" nil "invalid value \"JUNK\" for \"TZ\""]
+  ["SELECT to_timestamp('2011-12-18 11:38 MSK', 'YYYY-MM-DD HH12:MI TZ')" "2011-12-17 23:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 P.M.', 'YYYY-MM-DD HH12:MI P.M.')" "2011-12-18 23:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38 PM', 'YYYY-MM-DD HH12:MI PM')" "2011-12-18 23:38:00-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38-05FOO24', 'YYYY-MM-DD HH12:MITZFOOSS')" "2011-12-18 08:38:24-08"]
+  ["SELECT to_timestamp('2011-12-18 11:38ESTFOO24', 'YYYY-MM-DD HH12:MITZFOOSS')" "2011-12-18 08:38:24-08"]
+  ["SELECT to_timestamp('2011-12-18 23:38:15', 'YYYY-MM-DD  HH24:MI:SS')" "2011-12-18 23:38:15-08"]
+  ["SELECT to_timestamp('2015-02-11 86000', 'YYYY-MM-DD SSSS')" "2015-02-11 23:53:20-08"]
+  ["SELECT to_timestamp('2015-02-11 86000', 'YYYY-MM-DD SSSSS')" "2015-02-11 23:53:20-08"]
+  ["SELECT to_timestamp('2015-02-11 86400', 'YYYY-MM-DD SSSS')" nil "date/time field value out of range: \"2015-02-11 86400\""]
+  ["SELECT to_timestamp('2015-02-11 86400', 'YYYY-MM-DD SSSSS')" nil "date/time field value out of range: \"2015-02-11 86400\""]
+  ["SELECT to_timestamp('2015-02-29 15:50:55', 'YYYY-MM-DD HH24:MI:SS')" nil "date/time field value out of range: \"2015-02-29 15:50:55\""]
+  ["SELECT to_timestamp('2016-02-29 15:50:55', 'YYYY-MM-DD HH24:MI:SS')" "2016-02-29 15:50:55-08"]
+  ["SELECT to_timestamp('2016-02-30 15:50:55', 'YYYY-MM-DD HH24:MI:SS')" nil "date/time field value out of range: \"2016-02-30 15:50:55\""]
+  ["SELECT to_timestamp('2016-06-13 15:50:55', 'YYYY-MM-DD HH24:MI:SS')" "2016-06-13 15:50:55-07"]
+  ["SELECT to_timestamp('2016-06-13 15:50:55', 'YYYY-MM-DD HH:MI:SS')" nil "hour \"15\" is invalid for the 12-hour clock"]
+  ["SELECT to_timestamp('2016-06-13 15:50:60', 'YYYY-MM-DD HH24:MI:SS')" nil "date/time field value out of range: \"2016-06-13 15:50:60\""]
+  ["SELECT to_timestamp('2016-06-13 15:60:00', 'YYYY-MM-DD HH24:MI:SS')" nil "date/time field value out of range: \"2016-06-13 15:60:00\""]
+  ["SELECT to_timestamp('2016-06-13 25:00:00', 'YYYY-MM-DD HH24:MI:SS')" nil "date/time field value out of range: \"2016-06-13 25:00:00\""]
+  ["SELECT to_timestamp('2016-13-01 15:50:55', 'YYYY-MM-DD HH24:MI:SS')" nil "date/time field value out of range: \"2016-13-01 15:50:55\""]
+  ["SELECT to_timestamp('2018-11-02 12:34:56.025', 'YYYY-MM-DD HH24:MI:SS.MS')" "2018-11-02 12:34:56.025-07"]
+  ["SELECT to_timestamp('44-02-01 11:12:13 BC','YYYY-MM-DD HH24:MI:SS BC')" "0044-02-01 11:12:13-07:52:58 BC"]
+  ["SELECT to_timestamp('5527', 'IIWID')" "2006-01-01 00:00:00-08"]
+  ["SELECT to_timestamp('9-1116', 'Y-MMDD')" "2009-11-16 00:00:00-08"]
+  ["SELECT to_timestamp('95-1116', 'YY-MMDD')" "1995-11-16 00:00:00-08"]
+  ["SELECT to_timestamp('97/2/16 8:14:30', 'FMYYYY/FMMM/FMDD FMHH:FMMI:FMSS')" "0097-02-16 08:14:30-07:52:58"]
+  ["SELECT to_timestamp('97/Feb/16', 'FXYY/Mon/DD')" "1997-02-16 00:00:00-08"]
+  ["SELECT to_timestamp('97/Feb/16', 'FXYY:Mon:DD')" "1997-02-16 00:00:00-08"]
+  ["SELECT to_timestamp('97/Feb/16', 'YY:Mon:DD')" "1997-02-16 00:00:00-08"]
+  ["SELECT to_timestamp('97/Feb/16', 'YYMonDD')" nil "invalid value \"/Feb/16\" for \"Mon\""]
+  ["SELECT to_timestamp('995-1116', 'YYY-MMDD')" "1995-11-16 00:00:00-08"]
+  ["SELECT to_timestamp('Fri 1-Jan-1999', 'DY DD MON YYYY')" "1999-01-01 00:00:00-08"]
+  ["SELECT to_timestamp('Fri 1-January-1999', 'DY DD MON YYYY')" nil "invalid value \"uary\" for \"YYYY\""]
+  ["SELECT to_timestamp('Friday 1-January-1999', 'DY DD MON YYYY')" nil "invalid value \"da\" for \"DD\""]
+  ["SELECT to_timestamp('NaN'::float)" nil "timestamp cannot be NaN"]
+  ["SELECT to_timestamp(-210866803200)" "4714-11-23 16:07:02-07:52:58 BC"]
+  ["SELECT to_timestamp(1262349296.7890123)" "2010-01-01 04:34:56.789012-08"]
+  ["SELECT to_timestamp('97/Feb/16', 'YY/Mon/DD')" "1997-02-16 00:00:00-08"]
+  ["SELECT to_date('20260614', 'YYYYMMDD')" "2026-06-14"]
+  ["SELECT to_timestamp('2026-06-14 22:30:00 +02', 'YYYY-MM-DD HH24:MI:SS TZH')" "2026-06-14 13:30:00-07"]
+  ["SELECT to_timestamp('05:30 PM', 'HH:MI AM')" "0001-01-01 17:30:00-07:52:58 BC"]
+  ["SELECT to_date('14 June 2026', 'DD Month YYYY')" "2026-06-14"]
+  ["SELECT to_timestamp('2026-13-01', 'YYYY-MM-DD')" nil "date/time field value out of range: \"2026-13-01\""]
+  ["SELECT to_date('2026-06-14', '')" "0001-01-01 BC"]
+  ["SELECT to_timestamp('1500000000.5', 'J')" nil "timestamp out of range"]
+  ["SELECT to_date('2459000', 'J')" "2020-05-30"]
+  ["SELECT to_timestamp('12:34', 'HH24:MI')" "0001-01-01 12:34:00-07:52:58 BC"]
+  ["SELECT to_date('2026 W25 1', 'IYYY IW ID')" nil "invalid value \"W2\" for \"IW\""]
+  ["SELECT to_date('2026-165', 'YYYY-DDD')" "2026-06-14"]
+ ]}
