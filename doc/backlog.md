@@ -513,46 +513,53 @@ Both now share one depth-counting scanner, and `template.clj` /
 `params.clj` count depth too (`classify.clj` and `database.clj` already
 did) -- a `?` inside a nested comment was being read as a parameter.
 
-### numeric `ln` / `log` / `pow` are computed in a double
+### ~~numeric `ln` / `log` / `pow` are computed in a double~~ — FIXED, and the diagnosis above it was wrong
 
-`numeric_big.sql`, measured. Two separate failures, and the harness was
-hiding both behind ten lines of noise (its first ten statements drop
-tables that `numeric.sql` creates; they are now paired, as `geometry`
-and `box` are).
+This entry claimed `ln`/`log`/`exp`/`power` were computed in a double,
+citing `sql-ln`'s opening `(double x)`. **That was wrong, and wrong in a
+way that would have sent the next reader to the wrong function.**
+`sql-ln` is the FLOAT8 overload and is correct: PostgreSQL has both
+`ln(double precision)` and `ln(numeric)`, `pg_typeof(ln(2))` is double
+precision, and an arbitrary-precision numeric path (`bd-ln` and
+friends) already existed. The lesson is the one already recorded as
+`port_the_c_dont_pattern_match_it`: I read one function's first line
+and did not check which overload it served.
 
-**The statement dies outright above 1e308.** What reaches the client is
-`ERROR:  Value out of range for long: Infinity` -- a raw Clojure
-coercion message, not a SQLSTATE -- and it takes the whole statement,
-so two of them lose all 13 of their rows. PostgreSQL answers
-`921.03403719761827` for `ln('1.0e400'::numeric)`.
+Three real defects, all now fixed and gated by
+`test/resources/numeric_corpus.edn` (130 expressions captured from a
+real PG 17):
 
-`sql-ln` opens with `(double x)`, which is where the Infinity is born:
-1e400 has no double. Its first row, 1e100, is inside double range and
-cannot be the one that throws. I did not chase the `long` cast that
-turns the Infinity into that message -- the double is the bug, and the
-cast is downstream of it. `log`, `log10`, `exp` and `power` share the
-`(double x)` opening, so the same cliff is under all of them.
+**1. The Infinity came from the SCALE estimate, not the kernel.**
+`estimate_ln_dweight` decides the result scale, and it took
+`(.doubleValue v)`. 1e400 has no double, so `Math/log` gave Infinity
+and `(long (Math/log10 Infinity))` threw `ERROR:  Value out of range
+for long: Infinity` -- taking every row of the statement, including the
+rows whose own logarithms were representable. numeric.c builds that
+estimate from base-10000 groups, where `digits` is at most 8 decimal
+digits and `dweight` is an exponent, so it cannot overflow. Ported that
+way.
 
-**Below that cliff the answers are double-precision.** The LN, LOG10
-and POW(10, LN(x)) checks over `numeric(1000,800)` each return 9 rows
-where PostgreSQL returns none: the values agree to about the
-seventeenth significant digit and then diverge. PostgreSQL's
-`numeric_ln` is arbitrary precision and picks its result scale as
-`max(16 - ln_dweight, dscale)` -- 800 decimals for these inputs, which
-is why the comparison is exact there and cannot be for us.
+**2. The 800-decimal divergence was at digit ~160, not digit 17.**
+`bd-ln` reduced `x = m*10^k` and finished with `k * ln(10)`, where
+ln(10) was a hard-coded 160-digit string -- so no answer could be
+accurate past it. Ours and PostgreSQL's shared a 160-digit prefix and
+then parted; it was never a rounding difference. Replaced with
+numeric.c's `ln_var` reduction (repeated sqrt into (0.9, 1.1), then the
+atanh series times 2^(nsqrt+1)), which needs no constant at all. That
+also removed a second ceiling nobody had noticed: with `m` in [1,10)
+the series argument reaches 0.818, so a term bought ~0.17 decimal
+digits -- about 4700 terms for 800 decimals, which the loop's
+`n > 2000` guard silently truncated.
 
-Fixing it means a BigDecimal `ln` (and `exp`, for `power`) to a
-requested number of digits, plus PostgreSQL's scale rule. The scale
-rule is cheap and the kernel is not: `BigDecimal` has no `log`, so it
-needs the argument reduced to `m * 10^e` with `m` in [1,10) and a
-series on `ln(m)`, carried at 800+ digits. That is its own piece of
-work with its own corpus gate, in the shape of
-`doc/datetime-port.md` -- not a near-miss fix.
+**3. `exp` had no range guard**, which the corpus caught and neither
+hand-reading nor `numeric_big` did. `exp(6000::numeric)` returned a
+2609-digit number where PostgreSQL raises 22003: `exp_var` refuses an
+argument at or past `NUMERIC_MAX_RESULT_SCALE * 3`. A value no
+`numeric` can hold, handed to the client as if it could.
 
-Worth separating when it is picked up: the Infinity leak is a bad error
-for a correct question, and could be answered honestly (22003, or the
-right value via the `ln(m) + e*ln(10)` identity at double precision)
-long before the 800-digit kernel exists.
+`numeric_big.sql` is not re-measured yet -- the three LN/LOG10/POW
+checks are expected to go exact, and the file's remaining residual is
+unknown until a probe runs.
 
 ### `mvcc.sql` needs a plpgsql EXCEPTION handler
 
