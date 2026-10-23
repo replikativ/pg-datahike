@@ -968,6 +968,18 @@
 
 (defn- geo-type-of-oid [oid] (get geo-oid->type-name oid))
 
+(defn- timestamptz-zone
+  "The session TimeZone when `expr` is a timestamptz and the zone is not
+   UTC, else nil. A timestamptz is an instant, so its calendar fields,
+   its day, its month, depend on the zone they are read in; a timestamp
+   is already a wall clock. Captured at translation, which is sound
+   because TimeZone is in the plan-cache key."
+  [ctx expr]
+  (let [z types/*time-zone*]
+    (when (and z (not (contains? #{"Z" "UTC"} (str z)))
+               (= types/oid-timestamptz (source-oid ctx expr)))
+      z)))
+
 (defn- row-operand? [expr]
   (or (instance? RowConstructor expr)
       (and (instance? ParenthesedExpressionList expr)
@@ -1216,6 +1228,8 @@
       2 (vec vals)
       nil)))
 
+(declare zone-crossing)
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -1299,13 +1313,29 @@
       ;; and by application SQL generated independently of `::date`.
       (= fname "date")
       (let [fn-param (symbol (str "?date-cast" (swap! (:var-counter ctx) inc)))
+            ;; `date(timestamptz)` is `::date`, so it reads the instant's
+            ;; day in the session zone, as the cast does.
+            shift (zone-crossing (source-oid ctx (first params)) types/oid-date
+                                 types/*time-zone*)
             date-fn (fn [v]
                       (sql-cast/cast-scalar
-                       v "date" {:parse-timestamp parse-timestamp-string}))]
+                       (shift v) "date" {:parse-timestamp parse-timestamp-string}))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj date-fn)
         (swap! (:where-clauses ctx) conj
                [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; date_part(field, timestamptz) is EXTRACT's function spelling and
+      ;; reads the fields in the session zone, as EXTRACT does. Any other
+      ;; argument takes the generic path below.
+      (and (= fname "date_part") (= 2 (count args))
+           (timestamptz-zone ctx (second params)))
+      (let [[field v] args]
+        (swap! (:where-clauses ctx) conj
+               [(list 'datahike.pg.query-fns/sql-extract field v
+                      (timestamptz-zone ctx (second params)))
+                result-var])
         result-var)
 
       ;; ROW(a, b, …) — anonymous composite constructor. JSqlParser parses
@@ -2257,7 +2287,15 @@
       ;; PG's DATE_TRUNC also returns a TIMESTAMP, so Date in / Date out
       ;; is the right wire-side default.
       (= fname "date_trunc")
-      (let [[precision ts] args
+      (let [[precision ts zone-arg] args
+            ;; A timestamptz -- or a date, which resolves to the
+            ;; timestamptz overload -- is truncated on its wall clock in
+            ;; a zone: the explicit third argument, else the session's.
+            ;; In UTC, `date_trunc('day', ts)` under America/New_York
+            ;; answered 20:00 the evening before.
+            tz-input? (contains? #{types/oid-timestamptz types/oid-date}
+                                 (source-oid ctx (second params)))
+            session-zone (when tz-input? (or types/*time-zone* java.time.ZoneOffset/UTC))
             fn-param (symbol (str "?date-trunc" (swap! (:var-counter ctx) inc)))
             trunc-zdt (fn [unit ^java.time.ZonedDateTime zdt]
                         (case unit
@@ -2277,11 +2315,12 @@
                           "year"    (.truncatedTo (.withDayOfYear zdt 1)
                                                   java.time.temporal.ChronoUnit/DAYS)
                           zdt))
-            trunc-fn (fn [prec ts]
+            trunc-fn (fn [prec ts & [zone-text]]
                        ;; NULL out, not nil: a datalog binding that yields nil
                        ;; FILTERS THE ROW, so `date_trunc('month', d)` dropped
                        ;; every row whose d was NULL.
-                       (if (or (fns/sql-null? prec) (fns/sql-null? ts))
+                       (if (or (fns/sql-null? prec) (fns/sql-null? ts)
+                               (and zone-arg (fns/sql-null? zone-text)))
                          :__null__
                          ;; An infinite timestamp truncates to itself --
                          ;; there is no day for it to be the start of.
@@ -2291,40 +2330,50 @@
                            ts
                            (let [unit (let [u (if (keyword? prec) (name prec) (str prec))]
                                         (str/replace u #"s$" ""))]
-                             (cond
-                               (instance? java.util.Date ts)
-                               (let [zdt (.atZone (.toInstant ^java.util.Date ts)
-                                                  java.time.ZoneOffset/UTC)
-                                     trunc (trunc-zdt unit zdt)]
-                                 (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
+                             (let [^java.time.ZoneId zone
+                                   (cond zone-arg (types/resolve-time-zone (str zone-text))
+                                         session-zone session-zone
+                                         :else java.time.ZoneOffset/UTC)]
+                               (cond
+                                 (or (instance? java.util.Date ts)
+                                     (instance? java.time.OffsetDateTime ts))
+                                 (let [inst (if (instance? java.util.Date ts)
+                                              (.toInstant ^java.util.Date ts)
+                                              (.toInstant ^java.time.OffsetDateTime ts))
+                                       zdt (.atZone inst zone)
+                                       trunc (trunc-zdt unit zdt)]
+                                   (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
 
                              ;; A `date` column arrives as a LocalDate, which
                              ;; the fall-through returned UNTRUNCATED --
                              ;; `date_trunc('month', d)` answered d. PostgreSQL
                              ;; resolves a date argument to the timestamptz
                              ;; overload, so the result is an instant.
-                               (instance? java.time.LocalDate ts)
-                               (let [zdt (.atStartOfDay ^java.time.LocalDate ts
-                                                        java.time.ZoneOffset/UTC)
-                                     trunc (trunc-zdt unit zdt)]
-                                 (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
+                                 (instance? java.time.LocalDate ts)
+                                 (let [zdt (.atStartOfDay ^java.time.LocalDate ts zone)
+                                       trunc (trunc-zdt unit zdt)]
+                                   (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
 
                              ;; A `timestamp` (no zone) stays zone-less.
-                               (instance? java.time.LocalDateTime ts)
-                               (let [zdt (.atZone ^java.time.LocalDateTime ts
-                                                  java.time.ZoneOffset/UTC)]
-                                 (.toLocalDateTime ^java.time.ZonedDateTime (trunc-zdt unit zdt)))
+                                 (instance? java.time.LocalDateTime ts)
+                                 (let [zdt (.atZone ^java.time.LocalDateTime ts
+                                                    java.time.ZoneOffset/UTC)]
+                                   (.toLocalDateTime ^java.time.ZonedDateTime (trunc-zdt unit zdt)))
 
-                               (number? ts)
-                               (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
-                                                  java.time.ZoneOffset/UTC)
-                                     trunc (trunc-zdt unit zdt)]
-                                 (.getEpochSecond (.toInstant ^java.time.ZonedDateTime trunc)))
+                                 (number? ts)
+                                 (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
+                                                    java.time.ZoneOffset/UTC)
+                                       trunc (trunc-zdt unit zdt)]
+                                   (.getEpochSecond (.toInstant ^java.time.ZonedDateTime trunc)))
 
-                               :else ts)))))]
+                                 :else ts))))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj trunc-fn)
-        (swap! (:where-clauses ctx) conj [(list fn-param precision ts) result-var])
+        (swap! (:where-clauses ctx) conj
+               [(if zone-arg
+                  (list fn-param precision ts zone-arg)
+                  (list fn-param precision ts))
+                result-var])
         result-var)
 
       ;; DATE_ADD(unit, amount, epoch-seconds) → add amount to timestamp
@@ -4149,6 +4198,51 @@
   [f]
   (fn [v] (if (or (nil? v) (= :__null__ v)) :__null__ (f v))))
 
+(defn- zone-crossing
+  "The conversion a cast between a point in time and a wall clock needs
+   under the session zone `zone`, as a fn of the value -- identity for
+   every other cast. Applied in UTC too: the zone then changes nothing,
+   but the value still has to become the other kind -- a timestamptz
+   literal is an OffsetDateTime, which the `time` input cannot read.
+
+   A timestamptz is an instant; a timestamp or date is a wall clock,
+   held as an instant whose UTC reading IS that clock. So
+   `timestamptz::date` / `::time` / `::timestamp` read the instant's
+   wall clock IN THE ZONE, and `timestamp::timestamptz` /
+   `date::timestamptz` place the wall clock in the zone. These all ran
+   in UTC: under America/New_York, `'2026-06-15 02:00+00'::timestamptz
+   ::date` answered 2026-06-15 where PostgreSQL answers 2026-06-14.
+
+   Text is left alone -- it is parsed in the session zone already."
+  [src-oid target-oid zone]
+  (let [zone (or zone java.time.ZoneOffset/UTC)
+        instant (fn [v]
+                  (cond (instance? java.util.Date v) (.toInstant ^java.util.Date v)
+                        (instance? java.time.Instant v) v
+                        (instance? java.time.OffsetDateTime v) (.toInstant ^java.time.OffsetDateTime v)
+                        :else nil))
+        wall (fn [v]
+               (cond (instance? java.time.LocalDateTime v) v
+                     (instance? java.time.LocalDate v) (.atStartOfDay ^java.time.LocalDate v)
+                     :else (when-let [i (instant v)]
+                             (java.time.LocalDateTime/ofInstant i java.time.ZoneOffset/UTC))))]
+    (cond
+      (and (= src-oid types/oid-timestamptz)
+           (contains? #{types/oid-date types/oid-time types/oid-timestamp} target-oid))
+      (fn [v]
+        (if-let [i (when-not (types/infinite-datetime v) (instant v))]
+          (java.time.LocalDateTime/ofInstant i zone)
+          v))
+
+      (and (contains? #{types/oid-timestamp types/oid-date} src-oid)
+           (= target-oid types/oid-timestamptz))
+      (fn [v]
+        (if-let [w (when-not (types/infinite-datetime v) (wall v))]
+          (java.util.Date/from (.toInstant (.atZone ^java.time.LocalDateTime w zone)))
+          v))
+
+      :else identity)))
+
 (defn translate-cast-expr
   "Translate a CAST expression to a Datalog function binding.
    For constant values, performs the cast at translation time.
@@ -4224,12 +4318,18 @@
         ;; Datahike, so runtime class alone cannot distinguish bit B'10'
         ;; (integer 2) from text '10' (integer 10).
         src-oid (source-oid ctx inner)
-        _ (let [target-oid (source-oid ctx cast-expr)]
-            (when-not (types/cast-exists? src-oid target-oid)
-              (throw (errors/pg-error
-                      :cannot-coerce
-                      {:source (get types/oid->pg-name src-oid)
-                       :target (get types/oid->pg-name target-oid)}))))]
+        target-oid (source-oid ctx cast-expr)
+        _ (when-not (types/cast-exists? src-oid target-oid)
+            (throw (errors/pg-error
+                    :cannot-coerce
+                    {:source (get types/oid->pg-name src-oid)
+                     :target (get types/oid->pg-name target-oid)})))
+        ;; The session TimeZone, for the casts that cross between a
+        ;; point in time and a wall clock. Captured HERE: TimeZone is in
+        ;; the plan-cache key, so a plan holding it is never handed to a
+        ;; session in another zone.
+        zone-shift (zone-crossing src-oid target-oid types/*time-zone*)
+        inner-raw (zone-shift inner-raw)]
     (cond
       is-vector?
       (let [cast1 #(sql-cast/cast-scalar % type-str {:explicit? true})]
@@ -4525,7 +4625,7 @@
                   ;; whose value did not parse, instead of raising.
                   date-fn (fn [v]
                             (sql-cast/cast-scalar
-                             v type-str
+                             (zone-shift v) type-str
                              {:explicit? true
                               :parse-timestamp parse-timestamp-string}))]
               (swap! (:in-params ctx) conj fn-param)
@@ -4536,7 +4636,7 @@
             (let [fn-param (symbol (str "?cast-time" (swap! (:var-counter ctx) inc)))
                   time-fn (fn [v]
                             (sql-cast/cast-scalar
-                             v type-str
+                             (zone-shift v) type-str
                              {:explicit? true
                               :parse-timestamp parse-timestamp-string}))]
               (swap! (:in-params ctx) conj fn-param)
@@ -4554,7 +4654,7 @@
                   ts-fn (fn [v]
                           (when v
                             (sql-cast/cast-scalar
-                             v type-str
+                             (zone-shift v) type-str
                              {:explicit? true
                               :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj ts-fn-param)
@@ -4842,6 +4942,17 @@
         ;; `'2001-01-31' + '30 days'` is March 2 -- two intervals that
         ;; are cmp-EQUAL giving different answers, which is why
         ;; `interval_cmp_value` must not be the carrier's `.equals`.
+      ;;
+      ;; A timestamptz takes its months and days in the session zone,
+      ;; which travels as a leading constant (see `tz-interval-op`).
+      (and (contains? #{'+ '-} op-sym)
+           (= types/oid-timestamptz loid) (= types/oid-interval roid))
+      [(if (= op-sym '+) 'datahike.pg.query-fns/sql-timestamptz+interval
+           'datahike.pg.query-fns/sql-timestamptz-interval)
+       (or types/*time-zone* java.time.ZoneOffset/UTC)]
+      (and (= op-sym '+) (= types/oid-interval loid) (= types/oid-timestamptz roid))
+      ['datahike.pg.query-fns/sql-timestamptz+interval
+       (or types/*time-zone* java.time.ZoneOffset/UTC)]
       (and (contains? #{'+ '-} op-sym)
            (or (timestamp? loid) (date? loid)) (= types/oid-interval roid))
       (if (= op-sym '+) 'datahike.pg.query-fns/sql-timestamp+interval
@@ -5010,17 +5121,21 @@
       (let [lv (if (seq? l) (ctx/materialize-arg! ctx l) l)
             rv (if (seq? r) (ctx/materialize-arg! ctx r) r)
             int-op (int-arith-op ctx expr op-sym)
+            date-op (date-arith-op ctx expr op-sym)
             emit-op (or (pg-lsn-arith-op ctx expr op-sym)
                         (money-arith-op ctx expr op-sym)
-                        (date-arith-op ctx expr op-sym)
+                        (if (vector? date-op) (first date-op) date-op)
                         (first int-op)
                         (float4-arith-op ctx expr op-sym)
                         (get arith-op->null-safe op-sym op-sym))
-            ;; The width travels as a leading constant argument rather
-            ;; than as nine separate fns.
-            arith (if (and int-op (= emit-op (first int-op)))
+            ;; The width -- or a timestamptz's zone -- travels as a
+            ;; leading constant argument rather than as separate fns.
+            arith (cond
+                    (and (vector? date-op) (= emit-op (first date-op)))
+                    (list emit-op (second date-op) lv rv)
+                    (and int-op (= emit-op (first int-op)))
                     (list emit-op (second int-op) lv rv)
-                    (list emit-op lv rv))]
+                    :else (list emit-op lv rv))]
         (if not-prefix?
           (list 'datahike.pg.query-fns/sql-bit-not (ctx/materialize-arg! ctx arith))
           arith)))))
@@ -7496,7 +7611,9 @@
     (let [^ExtractExpression e expr
           v (translate-expr ctx (.getExpression e))
           v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
-      (list 'datahike.pg.query-fns/sql-extract (str (.getName e)) v))
+      (if-let [zone (timestamptz-zone ctx (.getExpression e))]
+        (list 'datahike.pg.query-fns/sql-extract (str (.getName e)) v zone)
+        (list 'datahike.pg.query-fns/sql-extract (str (.getName e)) v)))
 
     ;; TRIM([LEADING|TRAILING|BOTH] [chars] FROM s) is also its own node.
     ;; With a FROM, `.getExpression` is the CHARACTER SET and

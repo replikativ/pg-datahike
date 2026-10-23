@@ -530,6 +530,7 @@
         r (if (instance? StringValue right) l0 r0)
         date?    #(= % types/oid-date)
         time?    #(= % types/oid-time)
+        interval? #(= % types/oid-interval)
         timestamp? #(contains? #{types/oid-timestamp types/oid-timestamptz} %)
         money?   #(= % types/oid-money)
         money-factor? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8
@@ -550,6 +551,21 @@
       ;; clients choose their decoder from RowDescription.
       (and minus? (time? l) (time? r)) types/oid-interval
       (and minus? (timestamp? l) (timestamp? r)) types/oid-interval
+      ;; The interval operators, which fell through to numeric
+      ;; promotion and so reported `timestamptz + interval` as bigint --
+      ;; in RowDescription too, where a binary client picks its decoder.
+      ;; Result types are pg_operator's: a date with an interval is a
+      ;; timestamp, not a date. Ahead of the date rules for that reason.
+      (and (or plus? minus?) (= types/oid-timestamptz l) (interval? r)) types/oid-timestamptz
+      (and plus? (interval? l) (= types/oid-timestamptz r))             types/oid-timestamptz
+      (and (or plus? minus?) (or (= types/oid-timestamp l) (date? l)) (interval? r))
+      types/oid-timestamp
+      (and plus? (interval? l) (or (= types/oid-timestamp r) (date? r))) types/oid-timestamp
+      (and (or plus? minus?) (time? l) (interval? r))                   types/oid-time
+      (and plus? (interval? l) (time? r))                               types/oid-time
+      (and (or plus? minus?) (interval? l) (interval? r))               types/oid-interval
+      (and (or multiply? divide?) (interval? l) (not (interval? r)))    types/oid-interval
+      (and multiply? (interval? r) (not (interval? l)))                 types/oid-interval
       ;; Keyed off the date operand only — see date-arith-op in expr.clj
       ;; for why the other one is not inspected.
       (and (or plus? minus?) (date? l))    types/oid-date
