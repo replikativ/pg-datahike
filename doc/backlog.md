@@ -1268,9 +1268,6 @@ purpose:
   before the ordinality column is added.
 - **`(a, b) OVERLAPS (c, d) IS NULL`** is a JSqlParser syntax error;
   PostgreSQL accepts it. Parenthesising the OVERLAPS works.
-- **`timestamptz = timestamp`** compares the timestamp's UTC reading.
-  PostgreSQL places the timestamp in the session zone first, so under
-  America/New_York `'…02:00+00'::timestamptz = '…22:00'::timestamp` is
-  true there and false here. `translate-comparison` has several paths
-  (implicit joins, quantified comparisons, coercions); it wants the
-  same `zone-crossing` applied to the timestamp operand in each.
+- **`timestamptz = timestamp`** -- FIXED (2026-10-23): the wall clock is
+  placed in the session zone on both comparison paths, and a timestamptz
+  literal compares at all.
