@@ -137,3 +137,56 @@
           (is (= (set (range 24)) (set ids)) "every row appears")
           (is (= (sort ids) (range 24))
               "and exactly once -- a repeat here means a page re-executed under a non-total order"))))))
+
+(deftest fetch-and-move-agree-across-the-read-ahead-buffer
+  ;; Each FETCH used to re-run the stored query with exactly the
+  ;; client's page size, so reading N rows in pages of n cost N/n
+  ;; executions whose OFFSETs sum to O(N^2/n). Measured on 20k rows at
+  ;; postgres_fdw's page size of 100: 41.0s, and 139.8s with an ORDER
+  ;; BY, against 287ms for the same rows in one shot.
+  ;;
+  ;; The underlying page now GROWS geometrically and the surplus is
+  ;; buffered, which makes the total work O(N) while still letting a
+  ;; client that peeks at a few rows pay for only a few. Same 20k rows
+  ;; at page 100: 3.3s and 7.5s.
+  ;;
+  ;; The hazard that buys is `:pos`, which now counts what the
+  ;; UNDERLYING query has yielded and so runs AHEAD of the client by
+  ;; whatever sits in the buffer. MOVE reads it, so a MOVE has to drain
+  ;; the buffer first and only then advance the offset -- otherwise it
+  ;; skips the buffered rows twice. These page sizes are deliberately
+  ;; not multiples of each other or of the doubling, so the reads land
+  ;; inside a buffered chunk rather than on its boundary.
+  (with-open [c (jdbc)]
+    (update! c "CREATE TABLE mv (id int)")
+    (update! c (str "INSERT INTO mv (id) VALUES "
+                    (clojure.string/join ", " (for [i (range 40)] (format "(%d)" i)))))
+    (testing "FETCH, MOVE, FETCH -- the MOVE must skip exactly what it says"
+      (update! c "BEGIN")
+      (update! c "DECLARE mc CURSOR FOR SELECT id FROM mv ORDER BY id")
+      (is (= [0 1 2] (rows c "FETCH 3 FROM mc")))
+      ;; 3 read, so the buffer is holding read-ahead here.
+      (update! c "MOVE 5 FROM mc")
+      (is (= [8 9] (rows c "FETCH 2 FROM mc"))
+          "MOVE 5 skipped 3..7, not 3..7 twice")
+      (update! c "MOVE 1 FROM mc")
+      (is (= [11] (rows c "FETCH 1 FROM mc")))
+      (update! c "CLOSE mc")
+      (update! c "COMMIT"))
+    (testing "FETCH ALL after a partial read returns exactly the remainder"
+      (update! c "BEGIN")
+      (update! c "DECLARE ac CURSOR FOR SELECT id FROM mv ORDER BY id")
+      (is (= [0 1 2 3 4 5 6] (rows c "FETCH 7 FROM ac")))
+      (let [rest-rows (rows c "FETCH ALL FROM ac")]
+        (is (= 33 (count rest-rows)) "33 of 40 left")
+        (is (= (vec (range 7 40)) rest-rows) "in order, none repeated"))
+      (is (= [] (rows c "FETCH 1 FROM ac")) "and the cursor is spent")
+      (update! c "CLOSE ac")
+      (update! c "COMMIT"))
+    (testing "a page larger than the whole relation is not short-changed"
+      (update! c "BEGIN")
+      (update! c "DECLARE bc CURSOR FOR SELECT id FROM mv ORDER BY id")
+      (is (= 40 (count (rows c "FETCH 500 FROM bc"))))
+      (is (= [] (rows c "FETCH 500 FROM bc")))
+      (update! c "CLOSE bc")
+      (update! c "COMMIT"))))

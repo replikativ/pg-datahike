@@ -6263,18 +6263,72 @@
                       :columns (vec (.columnNames ^PgWireServer$QueryResult probe))
                       :oids    (vec (.columnOids ^PgWireServer$QueryResult probe))
                       :snap    snap
+                      ;; How many rows the UNDERLYING query has yielded
+                      ;; so far, i.e. the OFFSET the next underlying
+                      ;; page starts at -- NOT how many the client has
+                      ;; been given. `buf` holds the read-ahead surplus.
                       :pos     (atom 0)
+                      :buf     (atom [])
                       :done?   (atom false)})
               (empty-result "DECLARE CURSOR"))))
 
       :else
       (error-result "DECLARE: syntax error" "42601"))))
 
+(defn- cursor-fill!
+  "Read underlying pages into the cursor's buffer until it holds `want`
+   rows (nil = everything) or the query is exhausted.
+
+   Each underlying page is a fresh `OFFSET pos LIMIT chunk` execution
+   against the cursor's frozen snapshot, and the chunk GROWS
+   GEOMETRICALLY. That growth is the whole point. With a fixed chunk
+   equal to the client's page size, reading N rows in pages of n costs
+   N/n executions whose offsets sum to O(N^2/n) -- measured at 41.0s
+   for 20k rows at postgres_fdw's page size of 100, and 139.8s with an
+   ORDER BY, against 287ms for the same rows in one shot. Doubling
+   makes the offsets a geometric series, so the total work is O(N).
+
+   Growing rather than materialising everything at the first FETCH is
+   what keeps a client that peeks at ten rows from paying for the whole
+   relation: the first chunk is only as large as it asked for."
+  [{:keys [handler]} rec ^long want]
+  (let [pos-atom (:pos rec)
+        buf-atom (:buf rec)
+        done-atom (:done? rec)]
+    (loop []
+      (when (and (not @done-atom)
+                 (or (neg? want) (< (count @buf-atom) want)))
+        (let [start @pos-atom
+              ;; At least what is still missing, and at least twice what
+              ;; the underlying query has already produced.
+              missing (if (neg? want) 0 (- want (count @buf-atom)))
+              chunk (max missing (max 1 (* 2 start)))
+              query-sql (rewrite-cursor-page (:sql rec) start chunk)
+              page-parsed (.parse ^PgWireServer$QueryHandler handler
+                                  query-sql (int-array (map types/oid->wire-int
+                                                            (:param-oids rec))))
+              result (binding [*snapshot-db* (:snap rec)]
+                       (.executePrepared ^PgWireServer$QueryHandler handler
+                                         page-parsed
+                                         (object-array (:bound rec))))]
+          (if (.error ^PgWireServer$QueryResult result)
+            result
+            (let [rows (.rows ^PgWireServer$QueryResult result)
+                  nret (alength rows)]
+              (reset! pos-atom (+ start nret))
+              (swap! buf-atom into (seq rows))
+              ;; A short page means the underlying query is spent. The
+              ;; user's own LIMIT is already folded into the rewrite, so
+              ;; this also stops at their cap.
+              (when (< nret chunk) (reset! done-atom true))
+              (recur))))))))
+
 (defn- handle-fetch-cursor
   "FETCH [count | ALL | NEXT] [FROM|IN] name. Forward-only — PRIOR/
    BACKWARD raise 0A000."
-  [{:keys [cursors handler]} parsed]
-  (let [direction (:direction parsed)
+  [ctx parsed]
+  (let [{:keys [cursors]} ctx
+        direction (:direction parsed)
         cname (:name parsed)
         all? (= direction "all")
         n (cond all? nil
@@ -6287,35 +6341,18 @@
       (contains? #{"prior" "backward"} direction)
       (error-result "cursor can only scan forward" "0A000")
       :else
-      (let [pos-atom (:pos rec)
-            done-atom (:done? rec)
-            start @pos-atom
-            query-sql (rewrite-cursor-page (:sql rec) start n)]
-        (if @done-atom
-          (PgWireServer$QueryResult.
-           (into-array String (:columns rec))
-           (int-array (map types/oid->wire-int (:oids rec)))
-           (into-array (Class/forName "[Ljava.lang.String;") (make-array String 0 0))
-           "FETCH 0")
-          (let [page-parsed (.parse ^PgWireServer$QueryHandler handler
-                                    query-sql (int-array (map types/oid->wire-int
-                                                              (:param-oids rec))))
-                result (binding [*snapshot-db* (:snap rec)]
-                         (.executePrepared ^PgWireServer$QueryHandler handler
-                                           page-parsed
-                                           (object-array (:bound rec))))]
-            (if (.error ^PgWireServer$QueryResult result)
-              result
-              (let [rows (.rows ^PgWireServer$QueryResult result)
-                    nret (alength rows)]
-                (reset! pos-atom (+ start nret))
-                (when (or all? (and n (< nret n)))
-                  (reset! done-atom true))
-                (PgWireServer$QueryResult.
-                 (into-array String (:columns rec))
-                 (int-array (map types/oid->wire-int (:oids rec)))
-                 rows
-                 (str "FETCH " nret))))))))))
+      (let [buf-atom (:buf rec)
+            fill (cursor-fill! ctx rec (if all? -1 (long n)))]
+        (if (and fill (.error ^PgWireServer$QueryResult fill))
+          fill
+          (let [take-n (if all? (count @buf-atom) (min (long n) (count @buf-atom)))
+                page (vec (take take-n @buf-atom))]
+            (swap! buf-atom #(vec (drop take-n %)))
+            (PgWireServer$QueryResult.
+             (into-array String (:columns rec))
+             (int-array (map types/oid->wire-int (:oids rec)))
+             (into-array (Class/forName "[Ljava.lang.String;") page)
+             (str "FETCH " (count page)))))))))
 
 (defn- handle-close-cursor
   "CLOSE (name | ALL)"
@@ -6364,15 +6401,22 @@
                         (try (Long/parseLong (first (aget rows 0)))
                              (catch Throwable _ 0))
                         0)
-                start @(:pos rec)
+                ;; Where the CLIENT stands, not where the underlying
+                ;; query stands.
+                start (- @(:pos rec) (count @(:buf rec)))
                 end (long total)]
+            (reset! (:buf rec) [])
             (reset! (:pos rec) end)
             (reset! (:done? rec) true)
-            (empty-result (str "MOVE " (- end start))))))
+            (empty-result (str "MOVE " (max 0 (- end start)))))))
 
       :else
-      (let [n (or (:count parsed) 1)]
-        (swap! (:pos rec) + n)
+      (let [n (long (or (:count parsed) 1))
+            buf-atom (:buf rec)
+            from-buf (min n (count @buf-atom))]
+        (swap! buf-atom #(vec (drop from-buf %)))
+        (when (pos? (- n from-buf))
+          (swap! (:pos rec) + (- n from-buf)))
         (empty-result (str "MOVE " n))))))
 
 ;; --- Transaction handlers ---------------------------------------------------
