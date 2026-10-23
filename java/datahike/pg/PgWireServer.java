@@ -1721,6 +1721,20 @@ public final class PgWireServer {
         // client sent, which no longer exists after this line.
         handler.setQueryString(sql);
 
+        // A lexical error is raised for the whole string before anything
+        // in it runs, as PostgreSQL's raw parser does.
+        try {
+            checkUnterminatedComment(sql);
+        } catch (PgProtocolException e) {
+            sendError(out, "ERROR", e.sqlstate, e.getMessage());
+            if (txStatus[0] == 'T') {
+                handler.markTransactionFailed();
+                txStatus[0] = 'E';
+            }
+            sendReadyForQuery(out, txStatus[0]);
+            out.flush();
+            return;
+        }
         String[] statements = splitStatements(sql);
 
         // A query string that yields NO statements at all — "", ";",
@@ -1945,6 +1959,151 @@ public final class PgWireServer {
         out.flush();  // Single flush for all response messages
     }
 
+    // Index just past the lexeme starting at `i`, when it is one whose
+    // contents the statement scanners must not look into -- a string
+    // literal, a quoted identifier, a dollar-quoted string, or a comment --
+    // or `i` itself when it starts none of those. An unterminated one runs
+    // to the end of the text, as PostgreSQL's lexer reads it.
+    //
+    // ONE copy, for both splitStatements and stripComments. Each used to
+    // track quotes itself, and they disagreed: stripComments knew nothing
+    // of dollar quotes, so `SELECT $$it's$$, '/*x*/'` read `'s$$, '` as a
+    // string, took the real '/*x*/' for a comment and returned ' ' -- a
+    // wrong answer, not an error. Neither knew E'' strings, where \' does
+    // not close the literal, so `E'a\'b;c'` was split at the `;`.
+    private static int skipOpaque(String sql, int i, int len) {
+        char c = sql.charAt(i);
+        char n = i + 1 < len ? sql.charAt(i + 1) : '\0';
+        if (c == '-' && n == '-') {
+            int j = i + 2;
+            while (j < len && sql.charAt(j) != '\n') j++;
+            return j;
+        }
+        if (c == '/' && n == '*') return skipBlockComment(sql, i, len);
+        if (c == '\'') return skipQuoted(sql, i, len, '\'', isEscapeLiteral(sql, i));
+        if (c == '"') return skipQuoted(sql, i, len, '"', false);
+        if (c == '$' && (i == 0 || !isIdentChar(sql.charAt(i - 1)))) {
+            // scan.l's dolqdelim: \$({dolq_start}{dolq_cont}*)?\$ -- a tag
+            // cannot start with a digit, so `$1` stays a parameter, and a
+            // `$` inside an identifier (`a$b`) opens nothing.
+            int t = i + 1;
+            if (t < len && (Character.isLetter(sql.charAt(t)) || sql.charAt(t) == '_'
+                    || sql.charAt(t) > 127)) {
+                while (t < len && isIdentChar(sql.charAt(t)) && sql.charAt(t) != '$') t++;
+            }
+            if (t < len && sql.charAt(t) == '$') {
+                String tag = sql.substring(i, t + 1);
+                int close = sql.indexOf(tag, t + 1);
+                return close < 0 ? len : close + tag.length();
+            }
+        }
+        return i;
+    }
+
+    // E'...' (either case) honours backslash escapes; a plain literal does
+    // not, standard_conforming_strings being on. The E must stand alone: in
+    // `nameE'x'` it ends an identifier.
+    private static boolean isEscapeLiteral(String sql, int quote) {
+        return quote > 0 && (sql.charAt(quote - 1) == 'E' || sql.charAt(quote - 1) == 'e')
+                && (quote < 2 || !isIdentChar(sql.charAt(quote - 2)));
+    }
+
+    // An E'' literal with its escaped quotes written the standard way:
+    // `\'` becomes `''`, which means the same quote. JSqlParser's lexer
+    // ends the literal at `\'` (`SELECT E'a\'b'` was a TokenMgrException),
+    // and so did every scanner after it. Every other escape is left for
+    // the translator's own E'' decoding.
+    private static void appendEscapeLiteral(StringBuilder sb, String sql, int from, int to) {
+        int j = from;
+        while (j < to) {
+            char c = sql.charAt(j);
+            if (c == '\\' && j + 1 < to) {
+                if (sql.charAt(j + 1) == '\'') {
+                    sb.append("''");
+                } else {
+                    sb.append(c).append(sql.charAt(j + 1));
+                }
+                j += 2;
+            } else {
+                sb.append(c);
+                j++;
+            }
+        }
+    }
+
+    private static boolean isIdentChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '$' || c > 127;
+    }
+
+    private static int skipQuoted(String sql, int i, int len, char q, boolean backslash) {
+        int j = i + 1;
+        while (j < len) {
+            char c = sql.charAt(j);
+            if (backslash && c == '\\') {
+                j += 2;
+            } else if (c == q) {
+                if (j + 1 < len && sql.charAt(j + 1) == q) {
+                    j += 2;
+                } else {
+                    return j + 1;
+                }
+            } else {
+                j++;
+            }
+        }
+        return len;
+    }
+
+    private static boolean isComment(String sql, int i, int len) {
+        if (i + 1 >= len) return false;
+        char c = sql.charAt(i);
+        char n = sql.charAt(i + 1);
+        return (c == '-' && n == '-') || (c == '/' && n == '*');
+    }
+
+    // PostgreSQL refuses a block comment that never closes, with 42601;
+    // stripping it to the end of the text instead ran `SELECT 1 /* oops`
+    // as `SELECT 1`, and answered a nested `/* dir/*.sql */ SELECT 1` --
+    // which never closes either -- with an empty query.
+    static void checkUnterminatedComment(String sql) {
+        int len = sql.length();
+        int i = 0;
+        while (i < len) {
+            int end = skipOpaque(sql, i, len);
+            if (end == i) {
+                i++;
+                continue;
+            }
+            if (end == len && i + 1 < len && sql.charAt(i) == '/' && sql.charAt(i + 1) == '*'
+                    && !closesAtEnd(sql, i, len)) {
+                throw new PgProtocolException("42601",
+                    "unterminated /* comment at or near \"" + sql.substring(i) + "\"");
+            }
+            i = end;
+        }
+    }
+
+    // skipBlockComment answers `len` both for a comment that closes on the
+    // text's last two characters and for one that never closes.
+    private static boolean closesAtEnd(String sql, int pos, int len) {
+        int i = pos + 2;
+        int depth = 1;
+        while (i + 1 < len) {
+            char a = sql.charAt(i);
+            char b = sql.charAt(i + 1);
+            if (a == '/' && b == '*') {
+                depth++;
+                i += 2;
+            } else if (a == '*' && b == '/') {
+                i += 2;
+                if (--depth == 0) return true;
+            } else {
+                i++;
+            }
+        }
+        return false;
+    }
+
     // Scan past the block comment whose `/` sits at `pos`, returning the
     // index just past its closing delimiter, or `len` when it is never
     // closed.
@@ -1999,79 +2158,23 @@ public final class PgWireServer {
                 ? EMPTY_STATEMENTS : new String[]{sql};
         }
         List<String> stmts = new ArrayList<>();
-        boolean inSingleQuote = false;
-        boolean inDoubleQuote = false;
-        boolean inDollarQuote = false;
-        String dollarTag = null;
         int start = 0;
         int len = sql.length();
-        for (int i = 0; i < len; i++) {
-            char c = sql.charAt(i);
-
-            // Dollar-quoted string: $$...$$ or $tag$...$tag$
-            if (!inSingleQuote && !inDoubleQuote) {
-                if (inDollarQuote) {
-                    if (c == '$' && i + dollarTag.length() <= len
-                            && sql.substring(i, i + dollarTag.length()).equals(dollarTag)) {
-                        i += dollarTag.length() - 1;
-                        inDollarQuote = false;
-                        dollarTag = null;
-                    }
-                    continue;
-                }
-                if (c == '$') {
-                    // Check for dollar-quote start: $$ or $tag$
-                    int tagEnd = i + 1;
-                    while (tagEnd < len && (Character.isLetterOrDigit(sql.charAt(tagEnd))
-                            || sql.charAt(tagEnd) == '_')) tagEnd++;
-                    if (tagEnd < len && sql.charAt(tagEnd) == '$') {
-                        dollarTag = sql.substring(i, tagEnd + 1);
-                        i = tagEnd;
-                        inDollarQuote = true;
-                        continue;
-                    }
-                }
-            }
-
-            // Single-quoted string
-            if (c == '\'' && !inDoubleQuote && !inDollarQuote) {
-                if (inSingleQuote && i + 1 < len && sql.charAt(i + 1) == '\'') {
-                    i++; // escaped ''
-                } else {
-                    inSingleQuote = !inSingleQuote;
-                }
+        int i = 0;
+        while (i < len) {
+            int end = skipOpaque(sql, i, len);
+            if (end != i) {
+                i = end;
                 continue;
             }
-
-            // Double-quoted identifier
-            if (c == '"' && !inSingleQuote && !inDollarQuote) {
-                inDoubleQuote = !inDoubleQuote;
-                continue;
-            }
-
-            // Line comment: -- to end of line
-            if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-'
-                    && !inSingleQuote && !inDoubleQuote && !inDollarQuote) {
-                while (i < len && sql.charAt(i) != '\n') i++;
-                continue;
-            }
-
-            // Block comment: /* ... */
-            if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*'
-                    && !inSingleQuote && !inDoubleQuote && !inDollarQuote) {
-                // -1 because the enclosing for-loop increments i.
-                i = skipBlockComment(sql, i, len) - 1;
-                continue;
-            }
-
-            // Semicolon outside all quoted contexts
-            if (c == ';' && !inSingleQuote && !inDoubleQuote && !inDollarQuote) {
+            if (sql.charAt(i) == ';') {
                 String part = stripComments(sql.substring(start, i));
                 if (!part.trim().isEmpty()) {
                     stmts.add(part);
                 }
                 start = i + 1;
             }
+            i++;
         }
         if (start < len) {
             String part = stripComments(sql.substring(start));
@@ -2093,46 +2196,23 @@ public final class PgWireServer {
      */
     private static String stripComments(String sql) {
         StringBuilder sb = new StringBuilder(sql.length());
-        boolean inSingleQuote = false;
-        boolean inDoubleQuote = false;
         int i = 0;
         int len = sql.length();
         while (i < len) {
-            char c = sql.charAt(i);
-            // Track quoted state
-            if (c == '\'' && !inDoubleQuote) {
-                if (inSingleQuote && i + 1 < len && sql.charAt(i + 1) == '\'') {
-                    sb.append("''");
-                    i += 2;
-                    continue;
-                }
-                inSingleQuote = !inSingleQuote;
-                sb.append(c);
-                i++;
-                continue;
-            }
-            if (c == '"' && !inSingleQuote) {
-                inDoubleQuote = !inDoubleQuote;
-                sb.append(c);
-                i++;
-                continue;
-            }
-            if (!inSingleQuote && !inDoubleQuote) {
-                // Line comment: -- to end of line
-                if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
+            int end = skipOpaque(sql, i, len);
+            if (end != i) {
+                if (isComment(sql, i, len)) {
                     // Replace with space (preserve whitespace for token separation)
                     sb.append(' ');
-                    i += 2;
-                    while (i < len && sql.charAt(i) != '\n') i++;
-                    continue;
+                } else if (sql.charAt(i) == '\'' && isEscapeLiteral(sql, i)) {
+                    appendEscapeLiteral(sb, sql, i, end);
+                } else {
+                    sb.append(sql, i, end);
                 }
-                // Block comment: /* ... */
-                if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
-                    sb.append(' ');
-                    i = skipBlockComment(sql, i, len);
-                    continue;
-                }
+                i = end;
+                continue;
             }
+            char c = sql.charAt(i);
             // NOTHING is rewritten inside a string literal. Two rules used
             // to live here and both corrupted data, on every client, because
             // this method's output is what actually gets EXECUTED (the
@@ -2246,6 +2326,7 @@ public final class PgWireServer {
         // a `;`. Mirroring stripComments here closes that gap so
         // pgjdbc's Statement.execute (which always uses extended
         // query for single statements) accepts the same SQL psql does.
+        checkUnterminatedComment(rawQuery);
         String query = rawQuery.isEmpty() ? rawQuery : stripComments(rawQuery);
 
         if (WIRE_TRACE) {

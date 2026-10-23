@@ -23,7 +23,8 @@
 
    Verified against PostgreSQL 17 by differential testing; the expected
    OIDs and typlens here are what a real server returns."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer PgWireServer$QueryHandler
@@ -834,3 +835,28 @@
     (is (= [["9"]] (:rows second-bind)))
     (is (= [[nil]] (:rows null-bind)))
     (is (every? #(nil? (:error %)) [first-bind second-bind null-bind]))))
+
+(deftest the-wire-scanners-see-what-postgresql-sees
+  ;; pgjdbc splits a statement string and rejects an unterminated comment
+  ;; itself, so the server's own scanners are only reached raw. Every
+  ;; expectation is PostgreSQL 17's for the same message.
+  (testing "one Query message: semicolons inside E'' and dollar quotes do not split it"
+    ;; `\'` does not end an E'' literal, so this is two statements, not
+    ;; three; the splitter used to cut the first at its inner `;`.
+    (let [r (simple "SELECT E'a\\'b;c'; SELECT $q$x;y$q$, '/*z*/'")]
+      (is (nil? (:error r)))
+      (is (= [["a'b;c"] ["x;y" "/*z*/"]] (:rows r)))))
+  (testing "a block comment that never closes is 42601, not a shorter query"
+    ;; It was stripped to the end of the text, so `SELECT 1 /* oops` ran
+    ;; as `SELECT 1`. The nested one never closes either -- its inner
+    ;; `/*` opens a second level -- and answered an empty query.
+    (doseq [sql ["SELECT 1 /* oops" "/* dir/*.sql */ SELECT 1"]]
+      (let [r (simple sql)]
+        (is (= "42601" (get-in r [:error \C])) sql)
+        (is (= (str "unterminated /* comment at or near \"" (subs sql (str/index-of sql "/*")) "\"")
+               (get-in r [:error \M]))
+            sql)
+        (is (nil? (:rows r)) sql)))
+    (testing "and through Parse"
+      (let [r (parse-describe-execute "SELECT 1 /* oops" [] [])]
+        (is (= "42601" (get-in r [:error \C])))))))
