@@ -81,6 +81,8 @@
 (def sql-time+interval                   fns/sql-time+interval)
 (def sql-time-interval                   fns/sql-time-interval)
 (def sql-timestamp+interval              fns/sql-timestamp+interval)
+(def sql-timestamptz+interval            fns/sql-timestamptz+interval)
+(def sql-timestamptz-interval            fns/sql-timestamptz-interval)
 (def sql-timestamp-interval              fns/sql-timestamp-interval)
 (def sql-date-                           fns/sql-date-)
 (def sql-distinct?                       fns/sql-distinct?)

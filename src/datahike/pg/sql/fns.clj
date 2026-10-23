@@ -2246,7 +2246,11 @@
                 (.atStartOfDay)
                 (.plusNanos (* rem 1000)))]
     (cond
-      (instance? java.time.LocalDate proto) (.toLocalDate ldt)
+      ;; `date + interval` is a TIMESTAMP in PostgreSQL (pg_operator's
+      ;; date_pl_interval), so a date comes back as a wall clock -- the
+      ;; one carrier that is not kept. As a LocalDate it rendered as
+      ;; `2026-01-02` where PostgreSQL prints `2026-01-02 00:00:00`.
+      (instance? java.time.LocalDate proto) ldt
       (instance? java.time.LocalDateTime proto) ldt
       (instance? java.time.OffsetDateTime proto)
       (.atOffset ldt java.time.ZoneOffset/UTC)
@@ -2268,6 +2272,61 @@
        (if (types/infinite-datetime iv)
          (f ts iv conv)
          (f ts (@interval-coerce iv) conv))))))
+
+(defn- tz-interval-op
+  "`timestamptz_pl_interval` / `_mi_`: the interval's months and days
+   are taken on the wall clock IN `zone` -- the session TimeZone -- and
+   its microseconds as elapsed time. So across a DST change `+ '1 day'`
+   keeps the clock (12:00 -05 + 1 day = 12:00 -04) where `+ '24 hours'`
+   keeps the duration (13:00 -04). Taking both in UTC answered 13:00 for
+   the first.
+
+   A shift of microseconds only never visits the wall clock: an instant
+   in the repeated hour of a DST overlap would not survive the round
+   trip."
+  [op-key]
+  (null-safe
+   (fn [^java.time.ZoneId zone a b]
+     (let [f (get @iv-arith op-key)
+           [ts iv] (if (interval-value? a) [b a] [a b])
+           ^java.time.Instant inst (if (instance? java.time.OffsetDateTime ts)
+                                     (.toInstant ^java.time.OffsetDateTime ts)
+                                     (->instant ts))
+           wall (java.time.LocalDateTime/ofInstant inst zone)
+           fields-of (fn [^java.time.LocalDateTime ldt]
+                       {:year (.getYear ldt) :mon (.getMonthValue ldt)
+                        :mday (.getDayOfMonth ldt)
+                        :usec-of-day (quot (.toNanoOfDay (.toLocalTime ldt)) 1000)})
+           orig (fields-of wall)
+           conv {:ts->fields (fn [_] orig)
+                 :fields->ts
+                 (fn [{:keys [year mon mday usec-of-day] :as tm} ^long micros]
+                   (let [^java.time.Instant base
+                         (if (= tm orig)
+                           inst
+                           ;; A wall clock the zone skips (spring forward)
+                           ;; moves forward by the gap; one it repeats
+                           ;; (fall back) takes the LATER offset -- both
+                           ;; as PostgreSQL's DetermineTimeZoneOffset.
+                           (.toInstant
+                            (.withLaterOffsetAtOverlap
+                             (java.time.ZonedDateTime/of
+                              (.plusNanos (.atStartOfDay (java.time.LocalDate/of
+                                                          (int year) (int mon) (int mday)))
+                                          (* 1000 (long usec-of-day)))
+                              zone))))
+                         out (.plusNanos base (* 1000 micros))]
+                     (if (instance? java.time.OffsetDateTime ts)
+                       (.atOffset out java.time.ZoneOffset/UTC)
+                       (java.util.Date/from out))))}]
+       (if (types/infinite-datetime ts)
+         ts
+         (if (types/infinite-datetime iv)
+           (f ts iv conv)
+           (f ts (@interval-coerce iv) conv)))))))
+
+(def sql-timestamptz+interval (tz-interval-op :timestamp-plus))
+(def sql-timestamptz-interval (tz-interval-op :timestamp-minus))
 
 (def sql-timestamp+interval (ts-interval-op :timestamp-plus))
 (def sql-timestamp-interval (ts-interval-op :timestamp-minus))
@@ -3469,6 +3528,10 @@
 (defn- ->zdt ^java.time.ZonedDateTime [v]
   (cond
     (instance? java.util.Date v)          (.atZone (.toInstant ^java.util.Date v) java.time.ZoneOffset/UTC)
+    ;; A timestamptz LITERAL is folded to an OffsetDateTime. Without this
+    ;; arm `extract(hour from '…+00'::timestamptz)` was NULL in any zone.
+    (instance? java.time.OffsetDateTime v)
+    (.atZoneSameInstant ^java.time.OffsetDateTime v java.time.ZoneOffset/UTC)
     (instance? java.time.Instant v)       (.atZone ^java.time.Instant v java.time.ZoneOffset/UTC)
     (instance? java.time.LocalDate v)     (.atStartOfDay ^java.time.LocalDate v java.time.ZoneOffset/UTC)
     (instance? java.time.LocalDateTime v) (.atZone ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
@@ -3555,13 +3618,22 @@
               offset (.getOffset (.getRules zid) (java.time.Instant/now))]
           (.withOffsetSameInstant t offset))))))
 
-(declare sql-extract*)
+(declare sql-extract* sql-extract-in)
 
 (defn sql-extract
   "`EXTRACT(field FROM value)` / `date_part(field, value)`. PostgreSQL
    returns NUMERIC, so the result is a BigDecimal -- `extract(epoch …)`
-   carries sub-second digits, and an integer-typed result would drop them."
-  [field v]
+   carries sub-second digits, and an integer-typed result would drop them.
+
+   `zone` is the session TimeZone, passed by the translator when `v` is a
+   timestamptz and only then: a timestamptz's fields are its wall clock
+   IN THAT ZONE, while a timestamp's are its own."
+  ([field v] (sql-extract field v nil))
+  ([field v zone]
+   (sql-extract-in field v zone)))
+
+(defn- sql-extract-in
+  [field v zone]
   (if (or (sql-null? field) (sql-null? v))
     :__null__
     (let [f (str/lower-case (str/replace (str field) #"^'|'$" ""))
@@ -3583,14 +3655,21 @@
           ;; `isfinite`-style fields that are not a magnitude -- dow,
           ;; doy, timezone -- are 0 rather than infinite.
           0)
-        (sql-extract* f v)))))
+        (sql-extract* f v zone)))))
 
 (defn- sql-extract*
-  [f v]
-  (let [zdt (->zdt v)]
+  [f v zone]
+  (let [zdt (cond-> (->zdt v)
+              (and zone (->zdt v)) (.withZoneSameInstant ^java.time.ZoneId zone))]
     (if (nil? zdt)
       :__null__
-      (let [n (case f
+      (let [offset (.getTotalSeconds (.getOffset ^java.time.ZonedDateTime zdt))
+            n (case f
+                ;; The zone's offset, in seconds east -- for a timestamptz
+                ;; only, where the zone is the session's.
+                "timezone"                offset
+                "timezone_hour"           (quot offset 3600)
+                "timezone_minute"         (quot (rem offset 3600) 60)
                 ("year" "years" "y")      (.getYear zdt)
                 ("month" "months" "mon")  (.getMonthValue zdt)
                 ("day" "days" "d")        (.getDayOfMonth zdt)

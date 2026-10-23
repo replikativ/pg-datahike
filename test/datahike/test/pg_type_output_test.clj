@@ -217,3 +217,50 @@
       (testing "a plain timestamp literal is unaffected by the zone"
         (is (= [["2026-06-15 12:00:00"]]
                (rows c "SELECT '2026-06-15 12:00:00'::timestamp")))))))
+
+(deftest the-session-zone-reaches-the-datetime-functions
+  ;; #319 applied TimeZone to timestamptz input and output only, and
+  ;; everything that reads a timestamptz's calendar ran in UTC -- which
+  ;; nothing noticed while the zone was UTC. Every expectation is
+  ;; PostgreSQL 17's under America/New_York.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tzf (tstz timestamptz, ts timestamp, d date)")
+    (exec! c "INSERT INTO tzf VALUES ('2026-06-15 02:30+00', '2026-06-15 02:30', '2026-06-15')")
+    (exec! c "SET timezone = 'America/New_York'")
+    (let [one (fn [sql] (first (first (rows c sql))))]
+      (testing "a timestamptz's fields are its wall clock in the zone"
+        (is (= ["22" "14" "0" "-14400"]
+               (first (rows c (str "SELECT extract(hour from tstz), extract(day from tstz),"
+                                   " date_part('dow', tstz), extract(timezone from tstz)"
+                                   " FROM tzf")))))
+        (is (= "2" (one "SELECT extract(hour from ts) FROM tzf"))
+            "a timestamp's are its own"))
+      (testing "date_trunc truncates on that wall clock, or in the zone it is given"
+        (is (= "2026-06-14 00:00:00-04" (one "SELECT date_trunc('day', tstz) FROM tzf")))
+        (is (= "2026-06-01 00:00:00-04" (one "SELECT date_trunc('month', tstz) FROM tzf")))
+        (is (= "2026-06-14 11:00:00-04"
+               (one "SELECT date_trunc('day', tstz, 'Asia/Tokyo') FROM tzf"))))
+      (testing "the casts between a point in time and a wall clock"
+        (is (= ["2026-06-14" "22:30:00" "2026-06-14 22:30:00"]
+               (first (rows c "SELECT tstz::date, tstz::time, tstz::timestamp FROM tzf"))))
+        (is (= "2026-06-15 02:30:00-04" (one "SELECT ts::timestamptz FROM tzf")))
+        (is (= "2026-06-15 00:00:00-04" (one "SELECT d::timestamptz FROM tzf")))
+        (is (= "2026-06-14" (one "SELECT date(tstz) FROM tzf"))))
+      (testing "an interval's days keep the wall clock across DST; its hours do not"
+        (is (= "2026-03-08 12:00:00-04"
+               (one "SELECT '2026-03-07 12:00-05'::timestamptz + interval '1 day'")))
+        (is (= "2026-03-08 13:00:00-04"
+               (one "SELECT '2026-03-07 12:00-05'::timestamptz + interval '24 hours'")))
+        (is (= "2026-11-01 01:30:00-05"
+               (one "SELECT '2026-10-31 01:30-04'::timestamptz + interval '1 day'"))
+            "a repeated hour takes the later offset")
+        (is (= "timestamp with time zone"
+               (one "SELECT pg_typeof(tstz + interval '1 day') FROM tzf"))
+            "and the result is typed; it was reported as bigint"))
+      (testing "a timestamptz LITERAL is read too -- extract gave NULL in any zone"
+        (is (= "22" (one "SELECT extract(hour from '2026-06-15 02:00+00'::timestamptz)")))
+        (is (= "2026-06-14 00:00:00-04"
+               (one "SELECT date_trunc('day', timestamptz '2026-06-15 02:00+00')"))))
+      (testing "date + interval is a timestamp"
+        (is (= "2026-01-02 00:00:00" (one "SELECT date '2026-01-01' + interval '1 day'")))))))
+
