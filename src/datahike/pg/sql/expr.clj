@@ -1230,6 +1230,39 @@
 
 (declare zone-crossing)
 
+(def ^:private named-parameters
+  "Functions that take PostgreSQL's `name => value` arguments, by their
+   parameter names in order, with the default each takes when left out."
+  {"make_interval" [["years" 0] ["months" 0] ["weeks" 0] ["days" 0]
+                    ["hours" 0] ["mins" 0] ["secs" 0]]})
+
+(defn- named-args->positional
+  "`make_interval(days => 10)` as `make_interval(0, 0, 0, 10)`: named
+   arguments placed by name after the positional ones, with the defaults
+   filling the gaps. JSqlParser hands each named argument over as an
+   OracleNamedFunctionParameter, which no translator reads."
+  [fname arg-exprs]
+  (let [named? #(instance? net.sf.jsqlparser.expression.OracleNamedFunctionParameter %)]
+    (if-not (some named? arg-exprs)
+      arg-exprs
+      (let [spec (or (get named-parameters fname)
+                     (throw (errors/pg-error :undefined-function
+                                             {:message (str "function " fname
+                                                            " does not accept named arguments")})))
+            positional (vec (take-while (complement named?) arg-exprs))
+            by-name (into {}
+                          (map (fn [^net.sf.jsqlparser.expression.OracleNamedFunctionParameter p]
+                                 [(str/lower-case (.getName p)) (.getExpression p)]))
+                          (filter named? arg-exprs))
+            names (set (map first spec))]
+        (doseq [n (keys by-name)]
+          (when-not (contains? names n)
+            (throw (errors/pg-error :undefined-function
+                                    {:message (str "function " fname "(" n " => unknown) does not exist")}))))
+        (vec (concat positional
+                     (for [[n default] (drop (count positional) spec)]
+                       (get by-name n (net.sf.jsqlparser.expression.LongValue. (long default))))))))))
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -1253,6 +1286,7 @@
                  [params]
                  params)
         arg-exprs (when params (vec params))
+        arg-exprs (named-args->positional fname arg-exprs)
         _ (validate-function-argument-types! ctx fname arg-exprs)
         arg-exprs (coerce-function-unknowns ctx fname arg-exprs)
         lazy-args? (= fname "coalesce")
@@ -1335,6 +1369,44 @@
         (swap! (:where-clauses ctx) conj
                [(list 'datahike.pg.query-fns/sql-extract field v
                       (timestamptz-zone ctx (second params)))
+                result-var])
+        result-var)
+
+      ;; The datetime functions whose answer depends on the session
+      ;; TimeZone, which travels as a leading constant -- safe because it
+      ;; is in the plan-cache key. The zone-free constructors are plain
+      ;; table entries.
+      (= fname "make_timestamptz")
+      (do (swap! (:where-clauses ctx) conj
+                 [(apply list 'datahike.pg.query-fns/sql-make-timestamptz
+                         (or types/*time-zone* java.time.ZoneOffset/UTC) args)
+                  result-var])
+          result-var)
+
+      ;; age(timestamptz, timestamptz) reads both wall clocks in the
+      ;; session zone; age(timestamp, timestamp) reads them as they are.
+      ;; A date or an untyped literal resolves to the timestamptz form.
+      (= fname "age")
+      (let [oids (map #(source-oid ctx %) params)
+            tz? (not (some #{types/oid-timestamp} oids))
+            zone (when tz? (or types/*time-zone* java.time.ZoneOffset/UTC))]
+        (swap! (:where-clauses ctx) conj
+               [(if (= 1 (count args))
+                  (list 'datahike.pg.query-fns/sql-age-current
+                        (or types/*time-zone* java.time.ZoneOffset/UTC) tz? (first args))
+                  (apply list 'datahike.pg.query-fns/sql-age zone args))
+                result-var])
+        result-var)
+
+      ;; timezone(zone, value) is `value AT TIME ZONE zone`.
+      (and (= fname "timezone") (= 2 (count args)))
+      (let [value-oid (source-oid ctx (second params))
+            kind (condp contains? value-oid
+                   #{types/oid-timestamp} :timestamp
+                   #{types/oid-time types/oid-timetz} :timetz
+                   :timestamptz)]
+        (swap! (:where-clauses ctx) conj
+               [(list 'datahike.pg.query-fns/sql-at-time-zone (second args) (first args) kind)
                 result-var])
         result-var)
 
@@ -4922,6 +4994,12 @@
         ;; in PostgreSQL, so only `+` picks the right-hand date up.
       (and (= op-sym '+) (date? roid) (or (nil? loid) (integer? loid)))
       'datahike.pg.query-fns/sql-date+
+      ;; `date + time` is a timestamp and `date + timetz` a timestamptz
+      ;; (datetime_pl / datetimetz_pl), in either order.
+      (and (= op-sym '+)
+           (or (and (date? loid) (contains? #{types/oid-time types/oid-timetz} roid))
+               (and (date? roid) (contains? #{types/oid-time types/oid-timetz} loid))))
+      'datahike.pg.query-fns/sql-date+time
       (and (= op-sym '-) (timestamp? loid) (timestamp? roid))
       'datahike.pg.query-fns/sql-timestamp-
       (and (= op-sym '-) (= types/oid-time loid) (= types/oid-time roid))
