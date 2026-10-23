@@ -474,8 +474,15 @@ sessions, not shadowing as such. PostgreSQL resolves an unqualified
 name through `pg_temp` first and so drops the temp; we appear to resolve
 or drop the other one.
 
-Reproducing it needs the cross-session fixture setup, not a single
-connection, which is why it is recorded rather than fixed here.
+**Disproved (2026-10-23): it is not cross-session resolution either.**
+Two JDBC connections ARE that setup -- one creates the permanent
+`varchar(4)` and commits, the other creates a temp `varchar(1)` of the
+same name, inserts, and drops it -- and every step agrees with
+PostgreSQL: the temp hides the permanent, enforces length 1, `DROP`
+removes the temp, and the permanent table, its row and its length 4 come
+back (`test-temp-table-shadowing-a-permanent-one-from-another-session`,
+7 assertions). So this file's residual has a cause not yet identified;
+re-read its diff before guessing again.
 
 ### `pg_advisory_unlock` of a lock you do not hold emits no WARNING
 
