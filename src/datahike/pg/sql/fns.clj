@@ -3801,24 +3801,34 @@
   [stride source origin]
   (if (some sql-null? [stride source origin])
     :__null__
-    (cond
-      (types/infinite-datetime source) source
-      (types/infinite-datetime origin) (datetime-error "22008" "origin out of range")
-      (types/infinite-datetime stride)
-      (datetime-error "22008" "timestamps cannot be binned into infinite intervals")
-      :else
-      (let [iv (@interval-coerce stride)
-            [months days micros] @interval-fields]
-        (when-not (zero? (long (months iv)))
-          (datetime-error "0A000" "timestamps cannot be binned into intervals containing months or years"))
-        (let [stride-us (+ (* (long (days iv)) usecs-per-day) (long (micros iv)))]
-          (when (<= stride-us 0) (datetime-error "22008" "stride must be greater than zero"))
-          (let [o (epoch-usecs origin)
-                diff (- (epoch-usecs source) o)
-                modulo (rem diff stride-us)
-                result (+ o (- diff modulo))
-                result (if (neg? modulo) (- result stride-us) result)]
-            (usecs->like source result)))))))
+    ;; An untyped literal takes the type of the other operand, as
+    ;; PostgreSQL's resolution of the two timestamp arguments does.
+    (let [cast (requiring-resolve 'datahike.pg.sql.cast/cast-scalar)
+          as-other (fn [v other]
+                     (if (string? v)
+                       (cast v (if (instance? java.time.LocalDateTime other) "timestamp" "timestamptz")
+                             {:prefer-local-datetime? true})
+                       v))
+          source (as-other source origin)
+          origin (as-other origin source)]
+      (cond
+        (types/infinite-datetime source) source
+        (types/infinite-datetime origin) (datetime-error "22008" "origin out of range")
+        (types/infinite-datetime stride)
+        (datetime-error "22008" "timestamps cannot be binned into infinite intervals")
+        :else
+        (let [iv (@interval-coerce stride)
+              [months days micros] @interval-fields]
+          (when-not (zero? (long (months iv)))
+            (datetime-error "0A000" "timestamps cannot be binned into intervals containing months or years"))
+          (let [stride-us (+ (* (long (days iv)) usecs-per-day) (long (micros iv)))]
+            (when (<= stride-us 0) (datetime-error "22008" "stride must be greater than zero"))
+            (let [o (epoch-usecs origin)
+                  diff (- (epoch-usecs source) o)
+                  modulo (rem diff stride-us)
+                  result (+ o (- diff modulo))
+                  result (if (neg? modulo) (- result stride-us) result)]
+              (usecs->like source result))))))))
 
 (def ^:private month-days
   [[31 28 31 30 31 30 31 31 30 31 30 31] [31 29 31 30 31 30 31 31 30 31 30 31]])

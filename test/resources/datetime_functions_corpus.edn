@@ -60,4 +60,8 @@
   ["date '2026-01-01' + time with time zone '10:00+02'" "2026-01-01 03:00:00-05"]
   ["make_timestamptz(2026, 3, 8, 2, 30, 0)" "2026-03-08 03:30:00-04"]
   ["make_timestamptz(2026, 11, 1, 1, 30, 0)" "2026-11-01 01:30:00-05"]
+  ;; An untyped literal takes the other argument's type.
+  ["date_bin('15 minutes', '2026-06-15 10:37'::timestamp, '2026-01-01')" "2026-06-15 10:30:00"]
+  ["date_bin('15 minutes', '2026-06-15 10:37', timestamp '2026-01-01')" "2026-06-15 10:30:00"]
+  ["date_bin('1 day', '2026-06-15 02:00+00'::timestamptz, '2000-01-01')" "2026-06-14 01:00:00-04"]
 ]
