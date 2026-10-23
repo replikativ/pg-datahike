@@ -311,7 +311,7 @@
   "What a translation depends on besides its SQL, schema and catalog: the
    declared parameter types, the session's temp tables, whether the SQL is
    nested in a statement (see params/*nested-parse?*), search_path,
-   DateStyle and the database. The cache is server-wide and its keys
+   DateStyle, TimeZone and the database. The cache is server-wide and its keys
    compare by value, so two databases built by the same DDL have equal
    schemas and an equal catalog basis; without the name they would share
    a plan.

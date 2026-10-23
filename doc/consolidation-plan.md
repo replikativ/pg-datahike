@@ -198,12 +198,19 @@ Target (value-layer audit §5): per-OID `{:in :out :text :recv :send :compare :s
 
    Each PR routes cast, INSERT/UPDATE, unknown literal, COPY, text parameter and `pg_input_is_valid` through the family's `:in`.
 4. **Comparison, equality and hashing** from the registry. Merge `order-cmp`, `sql-order-cmp`, `null-safe-order-cmp` and `insert-select-order-cmp`. GROUP BY, DISTINCT, window partitions and IN-sets use the type's equality and hash, not Clojure `=`/`group-by`/`contains?`. For example, NaN = NaN in PostgreSQL, and `'1 mon' = '30 days'` for intervals. Fixes signed uuid ordering and array elements compared as strings.
-5. **Session TimeZone.** Needs the single settings store (moved here from Phase 4) and a parse-cache key that includes TimeZone and DateStyle; today `translation-cache-key` includes only search_path. Storage convention:
-   - timestamptz is stored as an absolute instant;
+5. **Session TimeZone — DONE** (#318, #319, #321). The storage convention held as written, and the parse-cache key now carries TimeZone and DateStyle alongside search_path:
+   - timestamptz is stored as an absolute instant, so there was no data migration;
    - timestamp and date are stored as UTC wall-clock;
    - TimeZone affects only timestamptz input and output, and casts between timestamp and timestamptz.
 
-   Also fix `current_setting`: it is case-sensitive and ignores SET. `set_config` doesn't store its value. `is_superuser` contradicts `pg_roles`. The role name is hard-coded three times.
+   Three things this step taught, worth keeping:
+   - **`SET timezone` is POSIX-signed.** A bare numeric value reads positive as WEST, so `'+02:00'` means `-02:00` — the negation of what `ZoneId/of` gives. Verified against `timestamptz.out` before implementing; mapping it through `ZoneId/of` would have been a silent two-hour error. Only this bare-string form; not zone names, not a literal's own offset, not `SET TIME ZONE INTERVAL`.
+   - **A session carries a `ZoneId`, not a `ZoneOffset`.** Berlin is +02 in June and +01 in January, so the offset is resolved per rendered instant. A cached offset would be an hour out for half the year.
+   - **`timestamp`/`date` share a carrier with `timestamptz`** (`->local-datetime`), so the TYPE has to decide whether the zone applies, not the carrier.
+
+   `current_setting` is case-insensitive and reads the session. `is_superuser` says `on`, agreeing with `pg_roles.rolsuper`. The role name is one `types/pg-role-name`.
+
+   `set_config` turned out to be worse than "doesn't store its value" and is settled in #321: there were THREE writers for one setting, two of which honoured only `search_path`. `datahike.pg.sql.guc` is now the one writer and the one reader — `SHOW`, `current_setting` and `set_config` all answer from `read-setting`, which is what `set_config` needs, because `set_config_by_name` ends with `GetConfigOptionByName` and answers with the setting as it now stands rather than the string passed in.
 
 ## Phase 2 — interval as a value
 
