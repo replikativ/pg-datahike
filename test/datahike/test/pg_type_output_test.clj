@@ -169,3 +169,51 @@
            (rows c (str "SELECT datcollate, datctype FROM pg_database"
                         " WHERE datname = current_database()")))
         "and the catalog reports the collation we actually implement")))
+
+(deftest session-timezone-renders-timestamptz-only
+  ;; The session TimeZone is read at exactly two boundaries: timestamptz
+  ;; OUTPUT rendering, and INPUT of text carrying no explicit offset.
+  ;;
+  ;; `timestamp` and `date` must NEVER move. They are wall-clock values,
+  ;; PostgreSQL does not apply TimeZone to them, and they share a
+  ;; carrier with timestamptz here -- so the TYPE has to decide, not the
+  ;; carrier. Applying the zone uniformly would silently shift every
+  ;; stored timestamp, which is the whole reason this test exists.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tzr (ts timestamp, tstz timestamptz, d date)")
+    (exec! c (str "INSERT INTO tzr VALUES ('2026-06-15 12:00:00',"
+                  "'2026-06-15 12:00:00+00','2026-06-15')"))
+    (let [read-all #(first (rows c "SELECT ts, tstz, d FROM tzr"))]
+      (testing "the default is UTC and renders exactly as before"
+        (is (= ["2026-06-15 12:00:00" "2026-06-15 12:00:00+00" "2026-06-15"]
+               (read-all))))
+      (testing "a named zone shifts ONLY the timestamptz, and is DST-aware"
+        ;; June in Berlin is CEST, +02 -- a ZoneOffset cached per session
+        ;; would have answered +01 here. The offset must be resolved at
+        ;; the instant being rendered.
+        (exec! c "SET timezone = 'Europe/Berlin'")
+        (is (= ["2026-06-15 12:00:00" "2026-06-15 14:00:00+02" "2026-06-15"]
+               (read-all))))
+      (testing "and in January the same zone is +01"
+        (exec! c "INSERT INTO tzr VALUES (NULL,'2026-01-15 12:00:00+00',NULL)")
+        (is (= [["2026-01-15 13:00:00+01"]]
+               (rows c (str "SELECT tstz FROM tzr WHERE tstz"
+                            " < '2026-02-01 00:00:00+00'")))))
+      (testing "a numeric zone uses PostgreSQL's POSIX sign"
+        (exec! c "SET timezone = '+02:00'")
+        (is (= "2026-06-15 10:00:00-02" (second (read-all))))
+        (exec! c "SET timezone = '-05:30'")
+        (is (= "2026-06-15 17:30:00+05:30" (second (read-all)))))
+      (testing "RESET goes back to UTC, and nothing else moved throughout"
+        (exec! c "RESET timezone")
+        (is (= ["2026-06-15 12:00:00" "2026-06-15 12:00:00+00" "2026-06-15"]
+               (read-all)))))
+    (testing "INPUT: a literal with no offset is read in the session zone"
+      (exec! c "SET timezone = 'Europe/Berlin'")
+      (is (= [["2026-06-15 12:00:00+02" "2026-06-15 14:00:00+02"]]
+             (rows c (str "SELECT '2026-06-15 12:00:00'::timestamptz,"
+                          " '2026-06-15 12:00:00+00'::timestamptz")))
+          "no offset means Berlin local; an explicit one is honoured, then rendered in Berlin")
+      (testing "a plain timestamp literal is unaffected by the zone"
+        (is (= [["2026-06-15 12:00:00"]]
+               (rows c "SELECT '2026-06-15 12:00:00'::timestamp")))))))

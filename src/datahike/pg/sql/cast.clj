@@ -353,12 +353,12 @@
    Supporting them needs the deferred treatment `now()` gets, and the
    parser is ready for it -- pass a `:now` and they work.
 
-   `:session-zone` is UTC because the server's TimeZone setting is
-   (expr.clj:1613). When that becomes settable, this is where it
-   reads from."
+   `:session-zone` is the session's `TimeZone`, which is what the
+   parser applies to text carrying NO explicit offset. It defaults to
+   UTC, so a session that never SETs a zone parses exactly as before."
   []
   {:date-order (second types/*date-style*)
-   :session-zone zone/utc})
+   :session-zone (or types/*time-zone* zone/utc)})
 
 (defn- parse-time-input
   "PostgreSQL `time_in` / `timetz_in`, via the ported parser.

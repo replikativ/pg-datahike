@@ -13502,7 +13502,8 @@
         ;; `SET datestyle TO DMY`, a cast of `8/10/2017` gave
         ;; 2017-10-08 and the same text through COPY gave 2017-08-10.
         ;; Silently, and into a column.
-        (binding [types/*date-style* (or (:date-style @session-state) [:iso :mdy])]
+        (binding [types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                  types/*time-zone* (or (:time-zone @session-state) types/utc-zone)]
           (copy-feed-chunk! {:conn conn
                              :schema (:schema (d/db conn))
                              :copy-state copy-state
@@ -13658,6 +13659,7 @@
                     ;; The date/timestamp OUTPUT format is this session's
                     ;; setting, and the renderer runs on this thread.
                     types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                    types/*time-zone* (or (:time-zone @session-state) types/utc-zone)
                     fns/*compensated-float-sum?*
                     (= :compensated (:float-sum @session-state))
                     ;; Parameter types declared by the Parse message affect
@@ -13950,6 +13952,7 @@
                     ;; path too -- a driver that binds parameters was
                     ;; getting ISO whatever the session had set.
                     types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                    types/*time-zone* (or (:time-zone @session-state) types/utc-zone)
                     fns/*compensated-float-sum?*
                     (= :compensated (:float-sum @session-state))
                     params/*statement-handler* (or params/*statement-handler* (nested-executor this))
@@ -13991,6 +13994,7 @@
                   params/*session-cursors* cursors
                   params/*query-string* @query-string
                   types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                  types/*time-zone* (or (:time-zone @session-state) types/utc-zone)
                   fns/*compensated-float-sum?*
                   (= :compensated (:float-sum @session-state))
                   params/*cancel* (current-cancel)
