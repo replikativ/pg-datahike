@@ -5341,11 +5341,51 @@
   [s]
   (remove str/blank? (str/split (str/trim (str s)) #"\s+")))
 
+(defn- type-input
+  "Any other type's input function: the cast from text, which for a
+   string IS the input function, with assignment (not explicit-cast)
+   semantics. Answers false-y for a name that is no type at all. Every
+   type outside the short table above -- date, timestamp, time, money,
+   interval, the geometric and network types, bytea, arrays -- answered
+   FALSE for valid input before, because the table was all there was."
+  [^String s type-name]
+  (let [t (types/normalize-sql-type-name (str/trim (str type-name)))]
+    (cond
+      ;; array_in, strictly: the cast is lenient, and text that is not
+      ;; brace-delimited is no array literal at all.
+      (str/ends-with? t "[]")
+      (let [elem (types/cast-array-elem-kw t)]
+        (when-not (str/starts-with? (str/triml s) "{")
+          (throw (errors/pg-error :invalid-text-representation
+                                  {:message (str "malformed array literal: \"" s "\"")})))
+        (pg-arr/from-pg-text s (or elem :text)))
+
+      (or (types/cast-category t) (contains? types/pg-name->oid t))
+      (sql-cast/cast-scalar s t {})
+
+      :else nil)))
+
+(defn- known-input-type?
+  "Whether pg_input_is_valid's second argument names a type at all. One
+   that does not is 42704 in PostgreSQL, not FALSE."
+  [type-name]
+  (let [[_ base] (re-matches #"(?is)^\s*(.+?)(?:\(([^)]*)\))?\s*$" (str type-name))
+        t (types/normalize-sql-type-name (str/trim (str base)))
+        t (if (str/ends-with? t "[]") (subs t 0 (- (count t) 2)) t)]
+    (or (types/cast-category t) (contains? types/pg-name->oid t)
+        (scalar-input-oid t)
+        (contains? #{"numeric" "decimal" "json" "jsonb" "bit" "bit varying" "varbit"
+                     "char" "character" "varchar" "character varying" "text" "name"
+                     "int2vector" "oidvector"} t))))
+
 (defn pg-input-valid?
   "Pure subset of pg_input_is_valid(text, regtype) for application-facing
    scalar types. The function deliberately invokes the same input helpers as
    casts; validation must not become a second, more permissive parser."
   [value type-name]
+  (when-not (known-input-type? type-name)
+    (throw (errors/pg-error :undefined-object
+                            {:kind "type" :name (str/trim (str type-name))})))
   (try
     (let [s (str value)
           [_ base modifier] (re-matches #"(?is)^\s*(.+?)(?:\(([^)]*)\))?\s*$"
@@ -5372,7 +5412,7 @@
            ("int2vector" "oidvector")
            (let [elem (vector-element-type base)]
              (every? #(pg-input-valid? % elem) (vector-elements s)))
-           false))))
+           (some? (type-input s type-name))))))
     (catch Throwable _ false)))
 
 (defn pg-input-error-info
@@ -5438,9 +5478,22 @@
                              (when (first r) r)))
                          (vector-elements value)))
             [nil nil nil nil])
-        (if (pg-input-valid? value type-name)
-          [nil nil nil nil]
-          [message nil nil sqlstate])))))
+        (if (or too-long? (contains? #{"char" "character" "varchar"
+                                       "character varying" "text" "name"} base))
+          (if (pg-input-valid? value type-name)
+            [nil nil nil nil]
+            [message nil nil sqlstate])
+          ;; Any other type: its input function's OWN diagnostic, as for
+          ;; the scalars above -- `'2026-02-30'::date` is 22008 "date/time
+          ;; field value out of range", not a generic 22P02.
+          (try
+            (if (some? (type-input (str value) type-name))
+              [nil nil nil nil]
+              [message nil nil sqlstate])
+            (catch Throwable e
+              (let [[code msg fields] (errors/classify-exception e)
+                    detail (when fields (.get ^java.util.Map fields "D"))]
+                [msg (when (not= msg detail) detail) nil code]))))))))
 
 (defn sql-array-fill
   "PostgreSQL array_fill(value, dimensions [, lower_bounds])."

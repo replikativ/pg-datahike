@@ -1,0 +1,33 @@
+;; PostgreSQL 17 corpus: pg_input_is_valid / pg_input_error_info over every
+;; type family -- each answered through the type's own input function.
+;; Captured from a real PostgreSQL, not hand-written.
+{:setup []
+ :corpus [
+  ["pg_input_is_valid('2026-01-01', 'date')" "t"]
+  ["pg_input_is_valid('2026-02-30', 'date')" "f"]
+  ["pg_input_is_valid('2026-01-01 10:00', 'timestamp')" "t"]
+  ["pg_input_is_valid('garbage', 'timestamp')" "f"]
+  ["pg_input_is_valid('2026-01-01 10:00+02', 'timestamptz')" "t"]
+  ["pg_input_is_valid('10:00', 'time')" "t"]
+  ["pg_input_is_valid('25:00', 'time')" "f"]
+  ["pg_input_is_valid('10:00+02', 'timetz')" "t"]
+  ["pg_input_is_valid('$1.50', 'money')" "t"]
+  ["pg_input_is_valid('abc', 'money')" "f"]
+  ["pg_input_is_valid('1 day', 'interval')" "t"]
+  ["pg_input_is_valid('1 fortnight', 'interval')" "f"]
+  ["pg_input_is_valid('(1,2)', 'point')" "t"]
+  ["pg_input_is_valid('08:00:2b:01:02:03', 'macaddr')" "t"]
+  ["pg_input_is_valid('\\x01', 'bytea')" "t"]
+  ["pg_input_is_valid('\\xzz', 'bytea')" "f"]
+  ["pg_input_is_valid('{1,2}', 'int[]')" "t"]
+  ["pg_input_is_valid('{1,a}', 'int[]')" "f"]
+  ["message, sql_error_code from pg_input_error_info('2026-02-30', 'date')" "date/time field value out of range: \"2026-02-30\"|22008"]
+  ["message, sql_error_code from pg_input_error_info('25:00', 'time')" "date/time field value out of range: \"25:00\"|22008"]
+  ["message, sql_error_code from pg_input_error_info('abc', 'money')" "invalid input syntax for type money: \"abc\"|22P02"]
+  ["pg_input_is_valid('1', 'nosuchtype')" nil "type \"nosuchtype\" does not exist"]
+  ["message, sql_error_code from pg_input_error_info('1 fortnight', 'interval')" "invalid input syntax for type interval: \"1 fortnight\"|22007"]
+  ["message, sql_error_code from pg_input_error_info('{1,a}', 'int[]')" "invalid input syntax for type integer: \"a\"|22P02"]
+  ["message, sql_error_code from pg_input_error_info('(1,', 'point')" "invalid input syntax for type point: \"(1,\"|22P02"]
+  ["pg_input_is_valid('abc', 'varchar(2)')" "f"]
+  ["pg_input_is_valid('2026-01-01', 'date[]')" "f"]
+ ]}
