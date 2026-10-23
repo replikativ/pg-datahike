@@ -484,11 +484,58 @@ connection, which is why it is recorded rather than fixed here.
 `ShareLock`). PostgreSQL returns false AND warns; we return false
 silently. Mechanical, and the only thing that file is missing.
 
-### `comments.sql`: a quoted string inside a nested comment
+### ~~`comments.sql`: a quoted string inside a nested comment~~ — FIXED
 
-One statement, five expected lines: we answer `syntax error at or near
-"\'embedded\'"` where PostgreSQL returns `deeply nested example`.
+One statement, five expected lines: we answered `syntax error at or near
+"'embedded'"` where PostgreSQL returns `deeply nested example`.
 PostgreSQL's block comments NEST, and a quote inside one is just text.
+
+The wire layer's `splitStatements` and `stripComments` both stopped at
+the first `*/`, which handed the outer comment's own tail to the parser.
+Both now share one depth-counting scanner, and `template.clj` /
+`params.clj` count depth too (`classify.clj` and `database.clj` already
+did) -- a `?` inside a nested comment was being read as a parameter.
+
+### numeric `ln` / `log` / `pow` are computed in a double
+
+`numeric_big.sql`, measured. Two separate failures, and the harness was
+hiding both behind ten lines of noise (its first ten statements drop
+tables that `numeric.sql` creates; they are now paired, as `geometry`
+and `box` are).
+
+**The statement dies outright above 1e308.** What reaches the client is
+`ERROR:  Value out of range for long: Infinity` -- a raw Clojure
+coercion message, not a SQLSTATE -- and it takes the whole statement,
+so two of them lose all 13 of their rows. PostgreSQL answers
+`921.03403719761827` for `ln('1.0e400'::numeric)`.
+
+`sql-ln` opens with `(double x)`, which is where the Infinity is born:
+1e400 has no double. Its first row, 1e100, is inside double range and
+cannot be the one that throws. I did not chase the `long` cast that
+turns the Infinity into that message -- the double is the bug, and the
+cast is downstream of it. `log`, `log10`, `exp` and `power` share the
+`(double x)` opening, so the same cliff is under all of them.
+
+**Below that cliff the answers are double-precision.** The LN, LOG10
+and POW(10, LN(x)) checks over `numeric(1000,800)` each return 9 rows
+where PostgreSQL returns none: the values agree to about the
+seventeenth significant digit and then diverge. PostgreSQL's
+`numeric_ln` is arbitrary precision and picks its result scale as
+`max(16 - ln_dweight, dscale)` -- 800 decimals for these inputs, which
+is why the comparison is exact there and cannot be for us.
+
+Fixing it means a BigDecimal `ln` (and `exp`, for `power`) to a
+requested number of digits, plus PostgreSQL's scale rule. The scale
+rule is cheap and the kernel is not: `BigDecimal` has no `log`, so it
+needs the argument reduced to `m * 10^e` with `m` in [1,10) and a
+series on `ln(m)`, carried at 800+ digits. That is its own piece of
+work with its own corpus gate, in the shape of
+`doc/datetime-port.md` -- not a near-miss fix.
+
+Worth separating when it is picked up: the Infinity leak is a bad error
+for a correct question, and could be answered honestly (22003, or the
+right value via the `ln(m) + e*ln(10)` identity at double precision)
+long before the 800-digit kernel exists.
 
 ### `mvcc.sql` needs a plpgsql EXCEPTION handler
 

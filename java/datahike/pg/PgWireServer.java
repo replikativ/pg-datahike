@@ -1945,6 +1945,42 @@ public final class PgWireServer {
         out.flush();  // Single flush for all response messages
     }
 
+    // Scan past the block comment whose `/` sits at `pos`, returning the
+    // index just past its closing delimiter, or `len` when it is never
+    // closed.
+    //
+    // Block comments NEST in PostgreSQL (ref/sql-syntax-lexical.html: "the
+    // comment effectively commences at the first /* and terminates at the
+    // matching */"), which is why this counts depth rather than stopping at
+    // the first close. Stopping there leaves the comment's own tail as
+    // code: comments.sql's `/* ... SELECT /* x */ 'embedded' AS x2; */`
+    // answered `syntax error at or near "'embedded'"`, because the scan
+    // ended on the inner delimiter and handed the rest to the parser.
+    //
+    // A `'` inside a comment is text, not a string opener, so both callers
+    // must skip the WHOLE comment in one step and never let its contents
+    // reach their quote tracking.
+    private static int skipBlockComment(String sql, int pos, int len) {
+        int i = pos + 2;
+        int depth = 1;
+        while (i + 1 < len) {
+            char a = sql.charAt(i);
+            char b = sql.charAt(i + 1);
+            if (a == '/' && b == '*') {
+                depth++;
+                i += 2;
+            } else if (a == '*' && b == '/') {
+                i += 2;
+                if (--depth == 0) {
+                    return i;
+                }
+            } else {
+                i++;
+            }
+        }
+        return len;
+    }
+
     /**
      * Split a query string into individual statements, dropping fragments
      * that hold no statement (blank, or comments only).
@@ -2023,9 +2059,8 @@ public final class PgWireServer {
             // Block comment: /* ... */
             if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*'
                     && !inSingleQuote && !inDoubleQuote && !inDollarQuote) {
-                i += 2;
-                while (i + 1 < len && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) i++;
-                i++; // skip closing /
+                // -1 because the enclosing for-loop increments i.
+                i = skipBlockComment(sql, i, len) - 1;
                 continue;
             }
 
@@ -2094,9 +2129,7 @@ public final class PgWireServer {
                 // Block comment: /* ... */
                 if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
                     sb.append(' ');
-                    i += 2;
-                    while (i + 1 < len && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) i++;
-                    if (i + 1 < len) i += 2; // skip */
+                    i = skipBlockComment(sql, i, len);
                     continue;
                 }
             }
