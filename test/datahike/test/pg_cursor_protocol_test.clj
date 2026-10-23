@@ -190,3 +190,68 @@
       (is (= [] (rows c "FETCH 500 FROM bc")))
       (update! c "CLOSE bc")
       (update! c "COMMIT"))))
+
+(deftest a-cursors-position-is-postgresqls
+  ;; Every answer below was read off PostgreSQL 17 for the same
+  ;; statements. Before this, only NEXT/FORWARD n and ALL were served:
+  ;; `FETCH FORWARD ALL` returned ONE row (the parser took FORWARD and
+  ;; never saw ALL -- what psycopg2's named-cursor fetchall() sends),
+  ;; `FETCH ABSOLUTE 4` returned rows 1..4, `FETCH LAST` the next row,
+  ;; `FETCH 0` nothing, `MOVE 10` past the end claimed `MOVE 10`.
+  (with-open [c (jdbc)]
+    (update! c "CREATE TABLE ct (g int)")
+    (update! c "INSERT INTO ct (g) VALUES (1),(2),(3),(4),(5),(6),(7),(8)")
+    (testing "a NO SCROLL cursor moves forward by every spelling"
+      (update! c "BEGIN")
+      (update! c "DECLARE c CURSOR FOR SELECT g FROM ct ORDER BY g")
+      (is (= [1 2] (rows c "FETCH FORWARD 2 FROM c")))
+      (is (= [2] (rows c "FETCH 0 FROM c")) "FETCH 0 is the current row")
+      (is (= [4] (rows c "FETCH RELATIVE 2 FROM c")))
+      (is (= [6] (rows c "FETCH ABSOLUTE 6 FROM c")))
+      (is (= 2 (update! c "MOVE 10 IN c")) "the tag counts the rows passed")
+      (is (= [] (rows c "FETCH 0 FROM c")) "past the end, on no row")
+      (update! c "COMMIT"))
+    (testing "FORWARD ALL is ALL, and LAST is the last row"
+      (update! c "BEGIN")
+      (update! c "DECLARE c CURSOR FOR SELECT g FROM ct ORDER BY g")
+      (is (= [1 2 3 4 5 6 7 8] (rows c "FETCH FORWARD ALL FROM c")))
+      (update! c "CLOSE c")
+      (update! c "DECLARE c CURSOR FOR SELECT g FROM ct ORDER BY g")
+      (is (= [7] (rows c "FETCH ABSOLUTE -2 FROM c")))
+      (is (= [8] (rows c "FETCH LAST FROM c")))
+      (update! c "COMMIT"))
+    (testing "going back on a NO SCROLL cursor is PostgreSQL's 55000"
+      (update! c "BEGIN")
+      (update! c "DECLARE c NO SCROLL CURSOR FOR SELECT g FROM ct ORDER BY g")
+      (is (= [1 2] (rows c "FETCH 2 FROM c")))
+      (let [e (try (rows c "FETCH PRIOR FROM c") nil
+                   (catch SQLException e e))]
+        (is (= "55000" (some-> e .getSQLState))))
+      (update! c "ROLLBACK"))
+    (testing "a SCROLL cursor goes back over the rows it has read"
+      (update! c "BEGIN")
+      (update! c "DECLARE c SCROLL CURSOR FOR SELECT g FROM ct ORDER BY g")
+      (is (= [1 2 3 4 5 6 7 8] (rows c "FETCH ALL FROM c")))
+      (is (= [8 7 6] (rows c "FETCH BACKWARD 3 FROM c")))
+      (is (= [5] (rows c "FETCH PRIOR FROM c")))
+      (is (= [3] (rows c "FETCH ABSOLUTE 3 FROM c")))
+      (is (= [2 1] (rows c "FETCH BACKWARD ALL FROM c")))
+      (is (= [1] (rows c "FETCH NEXT FROM c")))
+      (is (= [8] (rows c "FETCH LAST FROM c")))
+      (is (= 2 (update! c "MOVE -2 IN c")))
+      (is (= [7] (rows c "FETCH 1 FROM c")))
+      (is (= ["t"] (with-open [s (.createStatement c)
+                               r (.executeQuery s "SELECT is_scrollable FROM pg_cursors")]
+                     (loop [acc []] (if (.next r) (recur (conj acc (.getString r 1))) acc)))))
+      (update! c "COMMIT"))
+    (testing "a row cap the page rewrite cannot read still caps the cursor"
+      ;; FETCH FIRST is not a LIMIT node, so folding the page into it
+      ;; replaced the cap: FETCH ALL answered 6 of these rows, not 3.
+      (update! c "BEGIN")
+      (update! c "DECLARE c CURSOR FOR SELECT g FROM ct ORDER BY g FETCH FIRST 3 ROWS ONLY")
+      (is (= [1 2 3] (rows c "FETCH ALL FROM c")))
+      (update! c "CLOSE c")
+      (update! c "DECLARE c CURSOR FOR SELECT g FROM ct ORDER BY g LIMIT 5 OFFSET 2")
+      (is (= [3 4] (rows c "FETCH 2 FROM c")))
+      (is (= [5 6 7] (rows c "FETCH ALL FROM c")))
+      (update! c "COMMIT"))))

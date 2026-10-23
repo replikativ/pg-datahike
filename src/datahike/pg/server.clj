@@ -74,7 +74,7 @@
            [javax.net.ssl KeyManagerFactory SSLContext]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.schema Column]
-           [net.sf.jsqlparser.statement.select PlainSelect Limit Offset]
+           [net.sf.jsqlparser.statement.select Select Limit Offset]
            [net.sf.jsqlparser.expression LongValue]))
 
 (set! *warn-on-reflection* true)
@@ -1010,56 +1010,54 @@
         (error-result (str (when-not structured? prefix) msg) sqlstate)]
     (if fields (.withErrorFields result fields) result)))
 
+(defn- literal-count
+  "The value of a LIMIT/OFFSET count written as a plain integer, nil when
+   it is absent, ::opaque when it is anything else ($1, an expression)."
+  [e]
+  (cond (nil? e) nil
+        (instance? LongValue e) (.getValue ^LongValue e)
+        :else ::opaque))
+
 (defn- rewrite-cursor-page
-  "Given a user SELECT and a page offset + optional limit, produce a
-   SQL string that paginates the user's query *without* wrapping it
-   in a subquery — wrapping loses the inner ORDER BY because our SQL
-   translator doesn't propagate row order through nested selects.
+  "Given a user SELECT and a page offset + limit, produce a SQL string
+   that paginates the user's query *without* wrapping it in a subquery
+   -- wrapping loses the inner ORDER BY because our SQL translator
+   doesn't propagate row order through nested selects.
 
-   Strategy: parse the user's SQL with JSqlParser, combine the user's
-   LIMIT/OFFSET with the cursor's page position on the same
-   PlainSelect, emit the rewritten SQL.
-
-   If the user wrote their own LIMIT N (to cap the cursor's total
-   result size), we respect it — the cursor cannot fetch past that.
-   If they wrote OFFSET M, we add M to our pos so the cursor starts
-   where they said. Unparsable SQL falls through to string concat."
-  [^String cquery ^long pos ^Long page-limit]
+   The user's own LIMIT N caps the cursor (it cannot fetch past it) and
+   their OFFSET M moves where it starts, so both are FOLDED into the
+   page rather than replaced. Returns nil when the cap cannot be read
+   -- `LIMIT $1`, an expression, `FETCH FIRST n ROWS`, an unparsable
+   statement. Overwriting a cap we cannot read would page straight past
+   it, so the caller runs such a query once, whole, instead."
+  [^String cquery ^long pos ^long page-limit]
   (try
     (let [stmt (CCJSqlParserUtil/parse cquery)]
-      (if-not (instance? PlainSelect stmt)
-        (str cquery " LIMIT " (or page-limit 1) " OFFSET " pos)
-        (let [^PlainSelect ps stmt
-              user-limit (when-let [^Limit l (.getLimit ps)]
-                           (when-let [row-count (.getRowCount l)]
-                             (when (instance? LongValue row-count)
-                               (.getValue ^LongValue row-count))))
-              user-offset (when-let [^Offset o (.getOffset ps)]
-                            (when-let [ov (.getOffset o)]
-                              (when (instance? LongValue ov)
-                                (.getValue ^LongValue ov))))
-              base-offset (long (or user-offset 0))
-              effective-offset (+ base-offset pos)
-              remaining (when user-limit (max 0 (- (long user-limit) pos)))
-              effective-limit (cond
-                                (and page-limit remaining)
-                                (min page-limit remaining)
-                                page-limit page-limit
-                                remaining remaining
-                                :else nil)]
-          (if (and remaining (zero? remaining))
-            (str cquery " LIMIT 0")
-            (do (when effective-limit
-                  (let [l (Limit.)]
-                    (.setRowCount l (LongValue. (long effective-limit)))
-                    (.setLimit ps l)))
-                (when (pos? effective-offset)
-                  (let [o (Offset.)]
-                    (.setOffset o (LongValue. effective-offset))
-                    (.setOffset ps o)))
-                (.toString ps))))))
-    (catch Exception _
-      (str cquery " LIMIT " (or page-limit 1) " OFFSET " pos))))
+      (when (instance? Select stmt)
+        (let [^Select sel stmt
+              ^Limit l (.getLimit sel)
+              ^Offset o (.getOffset sel)
+              user-limit (when (and l (not (.isLimitAll l)) (not (.isLimitNull l)))
+                           (literal-count (.getRowCount l)))
+              user-offset (when o (literal-count (.getOffset o)))]
+          (when-not (or (.getFetch sel)
+                        (and l (.getOffset l))
+                        (= ::opaque user-limit)
+                        (= ::opaque user-offset))
+            (let [effective-offset (+ (long (or user-offset 0)) pos)
+                  effective-limit (if user-limit
+                                    (min page-limit (max 0 (- (long user-limit) pos)))
+                                    page-limit)
+                  l' (Limit.)]
+              (.setRowCount l' (LongValue. (long effective-limit)))
+              (.setLimit sel l')
+              (if (pos? effective-offset)
+                (let [o' (Offset.)]
+                  (.setOffset o' (LongValue. effective-offset))
+                  (.setOffset sel o'))
+                (.setOffset sel nil))
+              (.toString sel))))))
+    (catch Exception _ nil)))
 
 (defn- tx-buffer-attrs
   "Return the set of attribute keywords this tx-buffer will write.
@@ -6225,7 +6223,9 @@
       (error-result (str "cursor \"" cname "\" already exists") "42P03")
 
       (and cname cquery)
-      (let [probe-sql (rewrite-cursor-page cquery 0 0)
+      ;; The probe reads only the column shape. A query whose row cap
+      ;; cannot be folded has to run as written to get it.
+      (let [probe-sql (or (rewrite-cursor-page cquery 0 0) cquery)
             bound (vec (or *cached-bound* [nil]))
             declared (:declared-param-oids parsed)
             nparams (long (reduce max 0 (keys declared)))
@@ -6252,10 +6252,11 @@
                       :source-sql (or params/*query-string* cquery)
                       :created-at (java.util.Date.)
                       ;; What pg_cursors reports is what this cursor
-                      ;; can actually do, not what was asked for: a
-                      ;; FETCH here only scans forward and only in
-                      ;; text, whatever SCROLL or BINARY was written.
-                      :scrollable? false
+                      ;; can actually do, not what was asked for: only
+                      ;; a SCROLL cursor keeps the rows behind it, and
+                      ;; a FETCH here answers only in text, whatever
+                      ;; BINARY was written.
+                      :scrollable? (boolean (:scroll? parsed))
                       :binary?     false
                       :holdable?   (boolean (:with-hold? parsed))
                       :bound   bound
@@ -6267,17 +6268,31 @@
                       ;; so far, i.e. the OFFSET the next underlying
                       ;; page starts at -- NOT how many the client has
                       ;; been given. `buf` holds the read-ahead surplus.
+                      ;; `buf` holds rows base+1 .. pos of the
+                      ;; underlying result. A NO SCROLL cursor drops
+                      ;; rows once the client is past them, advancing
+                      ;; `base`; a SCROLL cursor keeps every row it has
+                      ;; read, which is what lets it go back.
                       :pos     (atom 0)
+                      :base    (atom 0)
                       :buf     (atom [])
-                      :done?   (atom false)})
+                      :done?   (atom false)
+                      ;; Where the CLIENT stands, as PostgreSQL counts
+                      ;; it: 0 before the first row, k on row k, and
+                      ;; one past the last row once it has run off the
+                      ;; end. `current` is the row it is ON, if any --
+                      ;; what `FETCH 0` and `FETCH RELATIVE 0` return.
+                      :cpos    (atom 0)
+                      :current (atom nil)})
               (empty-result "DECLARE CURSOR"))))
 
       :else
       (error-result "DECLARE: syntax error" "42601"))))
 
 (defn- cursor-fill!
-  "Read underlying pages into the cursor's buffer until it holds `want`
-   rows (nil = everything) or the query is exhausted.
+  "Read underlying pages into the cursor's buffer until it reaches row
+   `upto` of the underlying result (negative = everything) or the query
+   is exhausted.
 
    Each underlying page is a fresh `OFFSET pos LIMIT chunk` execution
    against the cursor's frozen snapshot, and the chunk GROWS
@@ -6290,23 +6305,26 @@
 
    Growing rather than materialising everything at the first FETCH is
    what keeps a client that peeks at ten rows from paying for the whole
-   relation: the first chunk is only as large as it asked for."
-  [{:keys [handler]} rec ^long want]
+   relation: the first chunk is only as large as it asked for. A query
+   whose own row cap cannot be folded into a page (see
+   `rewrite-cursor-page`) is the exception: it runs once, whole."
+  [{:keys [handler]} rec ^long upto]
   (let [pos-atom (:pos rec)
         buf-atom (:buf rec)
         done-atom (:done? rec)]
     (loop []
       (when (and (not @done-atom)
-                 (or (neg? want) (< (count @buf-atom) want)))
+                 (or (neg? upto) (< (long @pos-atom) upto)))
         (let [start @pos-atom
               ;; At least what is still missing, and at least twice what
               ;; the underlying query has already produced.
-              missing (if (neg? want) 0 (- want (count @buf-atom)))
+              missing (if (neg? upto) 0 (- upto start))
               chunk (max missing (max 1 (* 2 start)))
-              query-sql (rewrite-cursor-page (:sql rec) start chunk)
+              paged (rewrite-cursor-page (:sql rec) start chunk)
               page-parsed (.parse ^PgWireServer$QueryHandler handler
-                                  query-sql (int-array (map types/oid->wire-int
-                                                            (:param-oids rec))))
+                                  (or paged (:sql rec))
+                                  (int-array (map types/oid->wire-int
+                                                  (:param-oids rec))))
               result (binding [*snapshot-db* (:snap rec)]
                        (.executePrepared ^PgWireServer$QueryHandler handler
                                          page-parsed
@@ -6320,34 +6338,124 @@
               ;; A short page means the underlying query is spent. The
               ;; user's own LIMIT is already folded into the rewrite, so
               ;; this also stops at their cap.
-              (when (< nret chunk) (reset! done-atom true))
+              (when (or (nil? paged) (< nret chunk)) (reset! done-atom true))
               (recur))))))))
 
+(defn- cursor-row
+  "Row k (1-based) of the underlying result, if the buffer holds it."
+  [rec ^long k]
+  (let [i (- k (long @(:base rec)) 1)
+        buf @(:buf rec)]
+    (when (and (>= i 0) (< i (count buf)))
+      (nth buf i))))
+
+(defn- cursor-land!
+  "Put the client on row `k`: 0 is before the first row, past the end is
+   one past the last. Then let a NO SCROLL cursor forget what is behind
+   it -- every row but the one it is on."
+  [rec ^long k]
+  (let [k (cond (<= k 0) 0
+                (and @(:done? rec) (> k (long @(:pos rec)))) (inc (long @(:pos rec)))
+                :else k)
+        row (when (pos? k) (cursor-row rec k))]
+    (reset! (:cpos rec) k)
+    (reset! (:current rec) row)
+    (when-not (:scrollable? rec)
+      (let [keep-from (max 0 (dec k))
+            drop-n (- keep-from (long @(:base rec)))]
+        (when (pos? drop-n)
+          (swap! (:buf rec) #(vec (drop drop-n %)))
+          (swap! (:base rec) + drop-n))))
+    k))
+
+(defn- cursor-backward-error []
+  (classified-error "" (ex-info "cursor can only scan forward"
+                                {:sqlstate "55000"
+                                 :hint "Declare it with SCROLL option to enable backward scan."})))
+
+(defn- cursor-move!
+  "Carry out FETCH/MOVE's direction. Returns {:rows [...] :moved n} --
+   `moved` being what MOVE's tag reports -- or a QueryResult on error.
+
+   A NO SCROLL cursor does not keep the rows behind it, so anything that
+   would move it back raises PostgreSQL's own 55000 for that case.
+   PostgreSQL itself lets a cursor declared without either keyword go
+   back when its plan happens to allow it, and its documentation tells
+   applications not to rely on that; here such a cursor is NO SCROLL."
+  [ctx rec parsed]
+  (let [direction (:direction parsed)
+        all? (:all? parsed)
+        cnt (:count parsed)
+        here (long @(:cpos rec))
+        scroll? (:scrollable? rec)
+        filled (fn [^long upto]
+                 (let [f (cursor-fill! ctx rec upto)]
+                   (when (and f (.error ^PgWireServer$QueryResult f)) f)))
+        ;; The ABSOLUTE family: land on one row, answer it if it exists.
+        goto (fn [^long target]
+               (if (and (< target here) (not scroll?))
+                 (cursor-backward-error)
+                 (or (filled (max target 0))
+                     (let [k (cursor-land! rec target)
+                           r @(:current rec)]
+                       (if (and r (= k target))
+                         {:rows [r] :moved 1}
+                         {:rows [] :moved 0})))))
+        ;; The FORWARD/BACKWARD family: every row passed is answered.
+        ;; `n` negative = ALL.
+        step (fn [backward? ^long n]
+               (cond
+                 (and backward? (not scroll?) (not (zero? n)))
+                 (cursor-backward-error)
+                 (zero? n)
+                 (if-let [r @(:current rec)]
+                   {:rows [r] :moved 1}
+                   {:rows [] :moved 0})
+                 backward?
+                 (let [lo (if (neg? n) 1 (max 1 (- here n)))
+                       ks (range (dec here) (dec lo) -1)
+                       rows (vec (keep #(cursor-row rec %) ks))]
+                   (cursor-land! rec (if (neg? n) 0 (- here n)))
+                   {:rows rows :moved (count rows)})
+                 :else
+                 (or (filled (if (neg? n) -1 (+ here n)))
+                     (let [hi (if (neg? n) (long @(:pos rec)) (min (+ here n) (long @(:pos rec))))
+                           rows (vec (keep #(cursor-row rec %) (range (inc here) (inc hi))))]
+                       (cursor-land! rec (if (and (pos? n) (= hi (+ here n)))
+                                           hi
+                                           (inc (long @(:pos rec)))))
+                       {:rows rows :moved (count rows)}))))
+        signed (fn [^long n] (if (neg? n) (step true (- n)) (step false n)))]
+    (case direction
+      "first" (goto 1)
+      "last" (or (filled -1) (goto (long @(:pos rec))))
+      "absolute" (let [k (long (or cnt 0))]
+                   (if (neg? k)
+                     (or (filled -1) (goto (+ (long @(:pos rec)) 1 k)))
+                     (goto k)))
+      "relative" (goto (+ here (long (or cnt 0))))
+      "prior" (step true 1)
+      "backward" (cond all? (step true -1)
+                       cnt (signed (- (long cnt)))
+                       :else (step true 1))
+      ;; NEXT, FORWARD, ALL, or a bare count
+      (cond all? (step false -1)
+            (= "next" direction) (step false 1)
+            cnt (signed (long cnt))
+            :else (step false 1)))))
+
 (defn- handle-fetch-cursor
-  "FETCH [count | ALL | NEXT] [FROM|IN] name. Forward-only — PRIOR/
-   BACKWARD raise 0A000."
+  "FETCH [direction] [count] [FROM|IN] name."
   [ctx parsed]
   (let [{:keys [cursors]} ctx
-        direction (:direction parsed)
         cname (:name parsed)
-        all? (= direction "all")
-        n (cond all? nil
-                (:count parsed) (:count parsed)
-                :else 1)
         rec (when cname (get @cursors cname))]
-    (cond
-      (not rec)
+    (if-not rec
       (error-result (str "cursor \"" cname "\" does not exist") "34000")
-      (contains? #{"prior" "backward"} direction)
-      (error-result "cursor can only scan forward" "0A000")
-      :else
-      (let [buf-atom (:buf rec)
-            fill (cursor-fill! ctx rec (if all? -1 (long n)))]
-        (if (and fill (.error ^PgWireServer$QueryResult fill))
-          fill
-          (let [take-n (if all? (count @buf-atom) (min (long n) (count @buf-atom)))
-                page (vec (take take-n @buf-atom))]
-            (swap! buf-atom #(vec (drop take-n %)))
+      (let [r (cursor-move! ctx rec parsed)]
+        (if (instance? PgWireServer$QueryResult r)
+          r
+          (let [page (:rows r)]
             (PgWireServer$QueryResult.
              (into-array String (:columns rec))
              (int-array (map types/oid->wire-int (:oids rec)))
@@ -6368,21 +6476,20 @@
     (error-result "CLOSE: syntax error" "42601")))
 
 (defn- handle-move-cursor
-  "MOVE repositions without returning rows. MOVE N trusts the caller;
-   MOVE ALL runs a count-query against the cursor snapshot to find the
-   true end."
-  [{:keys [cursors handler]} parsed]
-  (let [direction (:direction parsed)
-        cname (:name parsed)
+  "MOVE repositions without returning rows, and its tag counts the rows
+   it actually passed. MOVE ALL from the start of a NO SCROLL cursor
+   runs a count-query against the cursor snapshot rather than reading
+   every row."
+  [{:keys [cursors handler] :as ctx} parsed]
+  (let [cname (:name parsed)
         rec (when cname (get @cursors cname))]
     (cond
       (not rec)
       (error-result (str "cursor \"" cname "\" does not exist") "34000")
 
-      (contains? #{"prior" "backward"} direction)
-      (error-result "cursor can only scan forward" "0A000")
-
-      (= direction "all")
+      (and (:all? parsed) (contains? #{nil "forward"} (:direction parsed))
+           (not (:scrollable? rec))
+           (zero? (long @(:pos rec))))
       (let [count-sql (str "SELECT count(*) FROM (" (:sql rec) ") _subq")
             ;; Through `*statement-handler*`, not the handler directly.
             ;; The caller's `*cached-parsed*` is still in scope, so a
@@ -6400,26 +6507,20 @@
                 total (if (pos? (alength rows))
                         (try (Long/parseLong (first (aget rows 0)))
                              (catch Throwable _ 0))
-                        0)
-                ;; Where the CLIENT stands, not where the underlying
-                ;; query stands.
-                start (- @(:pos rec) (count @(:buf rec)))
-                end (long total)]
+                        0)]
             (reset! (:buf rec) [])
-            (reset! (:pos rec) end)
+            (reset! (:base rec) total)
+            (reset! (:pos rec) total)
             (reset! (:done? rec) true)
-            (empty-result (str "MOVE " (max 0 (- end start)))))))
+            (reset! (:cpos rec) (inc (long total)))
+            (reset! (:current rec) nil)
+            (empty-result (str "MOVE " total)))))
 
       :else
-      (let [n (long (or (:count parsed) 1))
-            buf-atom (:buf rec)
-            from-buf (min n (count @buf-atom))]
-        (swap! buf-atom #(vec (drop from-buf %)))
-        (when (pos? (- n from-buf))
-          (swap! (:pos rec) + (- n from-buf)))
-        (empty-result (str "MOVE " n))))))
-
-;; --- Transaction handlers ---------------------------------------------------
+      (let [r (cursor-move! ctx rec parsed)]
+        (if (instance? PgWireServer$QueryResult r)
+          r
+          (empty-result (str "MOVE " (:moved r))))))))
 
 (defn- handle-begin
   [{:keys [conn tx-state session-state temp-tables]} parsed]
