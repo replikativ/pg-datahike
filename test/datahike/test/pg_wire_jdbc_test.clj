@@ -1046,3 +1046,57 @@
                        acc))]
           (is (= [["public" "pkjdbc" "id" 1 "pkjdbc_pkey"]] rows)))))))
 
+(deftest test-temp-table-shadowing-a-permanent-one-from-another-session
+  ;; `varchar.sql`'s whole remaining gap. Its file opens with
+  ;;
+  ;;   -- (This temporarily hides the table created in test_setup.sql)
+  ;;   CREATE TEMP TABLE VARCHAR_TBL(f1 varchar(1));
+  ;;   ...
+  ;;   DROP TABLE VARCHAR_TBL;   -- unhides test_setup's varchar(4) one
+  ;;
+  ;; and we kept reporting `value too long for type character varying(1)`
+  ;; after the DROP. Shadowing was already measured working inside ONE
+  ;; session; what the regression run does differently is create the
+  ;; PERMANENT table from the fixture bootstrap -- a separate psql
+  ;; session -- before the file runs. The backlog recorded it as needing
+  ;; a cross-session fixture; two JDBC connections are that fixture.
+  ;;
+  ;; The second half of this test is the one that matters most: if the
+  ;; DROP resolved to the permanent table instead of the temp, session
+  ;; A's data is gone. That would be data loss, not a wrong error.
+  (with-conn [a {}]
+    (with-open [sta (.createStatement a)]
+      (.execute sta "CREATE TABLE vshadow (f1 varchar(4))")
+      (.execute sta "INSERT INTO vshadow VALUES ('abcd')"))
+    (with-conn [b {}]
+      (with-open [stb (.createStatement b)]
+        (.execute stb "CREATE TEMP TABLE vshadow (f1 varchar(1))")
+        (testing "the temp one is resolved, and enforces ITS length"
+          (is (= "22001"
+                 (try (.execute stb "INSERT INTO vshadow VALUES ('abcd')")
+                      "no-error"
+                      (catch SQLException e (.getSQLState e)))))
+          (.execute stb "INSERT INTO vshadow VALUES ('z')")
+          (with-open [rs (.executeQuery stb "SELECT count(*) FROM vshadow")]
+            (.next rs)
+            (is (= "1" (.getString rs 1))
+                "the temp table holds only its own row")))
+        (testing "DROP removes the TEMP one, and the permanent reappears"
+          (.execute stb "DROP TABLE vshadow")
+          (with-open [rs (.executeQuery stb "SELECT f1 FROM vshadow")]
+            (is (.next rs))
+            (is (= "abcd" (.getString rs 1))
+                "the other session's permanent row"))
+          (testing "and the permanent length is in force again"
+            (is (nil? (.getWarnings stb)))
+            (.execute stb "INSERT INTO vshadow VALUES ('wxyz')")
+            (with-open [rs (.executeQuery stb "SELECT count(*) FROM vshadow")]
+              (.next rs)
+              (is (= "2" (.getString rs 1))))))))
+    (testing "the session that OWNS the permanent table still sees it"
+      ;; If the DROP had resolved to the permanent table, this is where
+      ;; the data loss shows.
+      (with-open [sta (.createStatement a)
+                  rs (.executeQuery sta "SELECT count(*) FROM vshadow")]
+        (.next rs)
+        (is (= "2" (.getString rs 1)))))))
