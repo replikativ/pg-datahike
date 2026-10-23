@@ -222,6 +222,15 @@
    "date_part"     types/oid-float8
    "extract"       types/oid-float8
    "age"           types/oid-interval
+   "make_date"        types/oid-date
+   "make_time"        types/oid-time
+   "make_timestamp"   types/oid-timestamp
+   "make_timestamptz" types/oid-timestamptz
+   "make_interval"    types/oid-interval
+   "to_timestamp"     types/oid-timestamptz
+   ;; date_bin returns its source's type, as date_trunc does.
+   "date_bin"         :arg2-type
+   "timezone"         :at-time-zone
    ;; Type checks / introspection
    ;; pg_typeof returns regtype, not text — this is the OID the
    ;; reporter of #19 saw and mistook for the bit type's own.
@@ -546,6 +555,9 @@
       ;; int8 for a value the renderer emits as `2020-01-02`, which a
       ;; binary-format client then failed to decode.
       (and minus? (date? l) (date? r))     types/oid-int4
+      (and plus? (or (and (date? l) (time? r)) (and (time? l) (date? r)))) types/oid-timestamp
+      (and plus? (or (and (date? l) (= types/oid-timetz r))
+                     (and (= types/oid-timetz l) (date? r))))  types/oid-timestamptz
       ;; These operators produce an interval, not a promoted number. The
       ;; result OID matters independently of the text rendering: binary
       ;; clients choose their decoder from RowDescription.
@@ -727,6 +739,14 @@
       (= rule :arg-array)
       (when-let [element-oid (some-> first-arg (expr-oid env))]
         (get types/element-oid->array-oid element-oid types/oid-text-array))
+      ;; `timezone(zone, v)` is `v AT TIME ZONE zone`, which swaps the
+      ;; two timestamp types; a time stays a timetz.
+      (= rule :at-time-zone)
+      (let [o (some-> (second args) (expr-oid env))]
+        (condp contains? o
+          #{types/oid-timestamp} types/oid-timestamptz
+          #{types/oid-time types/oid-timetz} types/oid-timetz
+          types/oid-timestamp))
       ;; The SECOND argument's type -- `date_trunc(unit, ts)` returns
       ;; whatever ts is.
       (= rule :arg2-type)

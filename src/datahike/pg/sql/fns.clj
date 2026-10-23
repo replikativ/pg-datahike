@@ -3618,6 +3618,308 @@
               offset (.getOffset (.getRules zid) (java.time.Instant/now))]
           (.withOffsetSameInstant t offset))))))
 
+;; ---------------------------------------------------------------------------
+;; Datetime constructors, age and date_bin -- ported from PostgreSQL 17's
+;; date.c and timestamp.c (make_date, make_time, make_timestamp_internal,
+;; make_timestamptz[_at_timezone], make_interval, float8_timestamptz,
+;; timestamp[tz]_age, timestamp[tz]_bin). The messages and SQLSTATEs are
+;; the C's, including its `%02g` rendering of the seconds.
+
+(def ^:private interval-make
+  (delay @(requiring-resolve 'datahike.pg.interval.core/interval)))
+
+(def ^:private interval-fields
+  (delay (let [r #(deref (requiring-resolve %))]
+           [(r 'datahike.pg.interval.core/months)
+            (r 'datahike.pg.interval.core/days)
+            (r 'datahike.pg.interval.core/micros)])))
+
+(def ^:private ^:const usecs-per-sec 1000000)
+(def ^:private ^:const usecs-per-day 86400000000)
+
+(defn- int-arg ^long [v]
+  (if (number? v) (long v) (Long/parseLong (str/trim (str v)))))
+
+(defn- float-arg ^double [v]
+  (if (number? v) (double v) (Double/parseDouble (str/trim (str v)))))
+
+(defn- c-g
+  "C's `%02g`: six significant digits, trailing zeros dropped, padded
+   with zeros to two characters."
+  [^double x]
+  (let [s (String/format java.util.Locale/ROOT "%.6g" (object-array [x]))
+        [mant ex] (str/split s #"e" 2)
+        mant (if (str/includes? mant ".")
+               (-> mant (str/replace #"0+$" "") (str/replace #"\.$" ""))
+               mant)
+        s (if ex (str mant "e" ex) mant)]
+    (if (< (count s) 2) (str (apply str (repeat (- 2 (count s)) "0")) s) s)))
+
+(defn- datetime-error [sqlstate msg]
+  (throw (ex-info msg {:sqlstate sqlstate})))
+
+(defn- valid-ymd
+  "ValidateDate for a Y-M-D whose negative year means BC, as the
+   proleptic ISO date java.time uses (1 BC is year 0). Raises 22008
+   naming `message-year`: make_date reports the year without its sign,
+   make_timestamp with it."
+  ^java.time.LocalDate [^long year ^long month ^long day ^long message-year]
+  (let [bc? (neg? year)
+        y (Math/abs year)
+        fail #(datetime-error "22008" (format "date field value out of range: %d-%02d-%02d"
+                                              message-year month day))]
+    (when (or (<= y 0) (< month 1) (> month 12) (< day 1) (> day 31)) (fail))
+    (let [iso-year (if bc? (- 1 y) y)]
+      (when (> day (.lengthOfMonth (java.time.YearMonth/of (int iso-year) (int month)))) (fail))
+      (java.time.LocalDate/of (int iso-year) (int month) (int day)))))
+
+(defn- time-overflows?
+  "float_time_overflows (date.c). 24:00:00 and a leap second are in range."
+  [^long hour ^long minute ^double sec]
+  (or (< hour 0) (> hour 24) (< minute 0) (>= minute 60)
+      (Double/isNaN sec)
+      (let [usec (Math/rint (* sec usecs-per-sec))]
+        (or (< usec 0) (> usec (* 60.0 usecs-per-sec))
+            (> (+ (* (+ (* hour 60) minute) 60 usecs-per-sec) (long usec)) usecs-per-day)))))
+
+(defn- time-usecs ^long [^long hour ^long minute ^double sec]
+  (+ (* (+ (* hour 60) minute) 60 usecs-per-sec) (long (Math/rint (* sec usecs-per-sec)))))
+
+(defn- time-field-error [h mi sec]
+  (datetime-error "22008" (format "time field value out of range: %d:%02d:%s" h mi (c-g sec))))
+
+(defn sql-make-date [y m d]
+  (if (some sql-null? [y m d])
+    :__null__
+    (let [y (int-arg y)]
+      (valid-ymd y (int-arg m) (int-arg d) (Math/abs y)))))
+
+(defn sql-make-time [h mi sec]
+  (if (some sql-null? [h mi sec])
+    :__null__
+    (let [h (int-arg h) mi (int-arg mi) sec (float-arg sec)]
+      (when (time-overflows? h mi sec) (time-field-error h mi sec))
+      (let [u (time-usecs h mi sec)]
+        ;; 24:00:00 is a valid `time` but not a LocalTime; the input
+        ;; function holds it however this server holds it.
+        (if (= u usecs-per-day)
+          ((requiring-resolve 'datahike.pg.sql.cast/cast-scalar) "24:00:00" "time" {})
+          (java.time.LocalTime/ofNanoOfDay (* 1000 u)))))))
+
+(defn- make-local-timestamp
+  "make_timestamp_internal, as a wall clock."
+  ^java.time.LocalDateTime [y mo d h mi sec]
+  (let [y (int-arg y) mo (int-arg mo) d (int-arg d)
+        h (int-arg h) mi (int-arg mi) sec (float-arg sec)
+        date (valid-ymd y mo d y)]
+    (when (time-overflows? h mi sec) (time-field-error h mi sec))
+    (.plusNanos (.atStartOfDay date) (* 1000 (time-usecs h mi sec)))))
+
+(defn sql-make-timestamp [y mo d h mi sec]
+  (if (some sql-null? [y mo d h mi sec])
+    :__null__
+    (make-local-timestamp y mo d h mi sec)))
+
+(defn sql-make-timestamptz
+  "`make_timestamptz(y, m, d, h, mi, s [, zone])`: the wall clock placed
+   in `zone`, else in `session-zone`, which the translator passes."
+  [session-zone y mo d h mi sec & [zone]]
+  (if (or (some sql-null? [y mo d h mi sec]) (and zone (sql-null? zone)))
+    :__null__
+    (let [ldt (make-local-timestamp y mo d h mi sec)
+          ^java.time.ZoneId z (if zone
+                                (resolve-time-zone (str zone))
+                                (or session-zone java.time.ZoneOffset/UTC))]
+      (.toOffsetDateTime
+       (.withZoneSameInstant (.withLaterOffsetAtOverlap (java.time.ZonedDateTime/of ldt z))
+                             java.time.ZoneOffset/UTC)))))
+
+(defn sql-make-interval
+  "`make_interval(years, months, weeks, days, hours, mins, secs)`, each
+   defaulting to 0."
+  [& args]
+  (let [[years months weeks days hours mins secs] (concat args (repeat 0))]
+    (if (some sql-null? [years months weeks days hours mins secs])
+      :__null__
+      (let [secs (float-arg secs)
+            _ (when (or (Double/isNaN secs) (Double/isInfinite secs))
+                (datetime-error "22008" "interval out of range"))
+            m (+ (* 12 (int-arg years)) (int-arg months))
+            dd (+ (* 7 (int-arg weeks)) (int-arg days))
+            us (+ (* (+ (* 3600 (int-arg hours)) (* 60 (int-arg mins))) usecs-per-sec)
+                  (long (Math/rint (* secs usecs-per-sec))))]
+        (when (or (> (Math/abs m) Integer/MAX_VALUE) (> (Math/abs dd) Integer/MAX_VALUE))
+          (datetime-error "22008" "interval out of range"))
+        (@interval-make (int m) (int dd) us)))))
+
+(defn sql-to-timestamp
+  "`to_timestamp(double precision)`: Unix epoch seconds as a timestamptz."
+  [v]
+  (if (sql-null? v)
+    :__null__
+    (let [secs (float-arg v)]
+      (cond
+        (Double/isNaN secs) (datetime-error "22008" "timestamp cannot be NaN")
+        (Double/isInfinite secs) (if (neg? secs) types/neg-infinity types/pos-infinity)
+        ;; DATETIME_MIN_JULIAN .. TIMESTAMP_END_JULIAN, in Unix seconds.
+        (or (< secs -210866803200.0) (>= secs 9224318016000.0))
+        (datetime-error "22008" (format "timestamp out of range: \"%s\"" (c-g secs)))
+        :else
+        (let [us (long (Math/rint (* secs usecs-per-sec)))]
+          (.atOffset (java.time.Instant/ofEpochSecond (Math/floorDiv us (long usecs-per-sec))
+                                                      (* 1000 (Math/floorMod us (long usecs-per-sec))))
+                     java.time.ZoneOffset/UTC))))))
+
+(defn- ts-instant
+  "A timestamp(tz) value as an Instant -- for a wall clock, the instant
+   whose UTC reading it is."
+  ^java.time.Instant [v]
+  (cond
+    (instance? java.time.OffsetDateTime v) (.toInstant ^java.time.OffsetDateTime v)
+    (instance? java.time.LocalDateTime v) (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
+    (instance? java.time.LocalDate v) (.toInstant (.atStartOfDay ^java.time.LocalDate v) java.time.ZoneOffset/UTC)
+    :else (->instant v)))
+
+(defn- epoch-usecs ^long [v]
+  (let [i (ts-instant v)]
+    (+ (* (.getEpochSecond i) usecs-per-sec) (quot (.getNano i) 1000))))
+
+(defn- usecs->like
+  "Microseconds since the epoch, in the carrier `proto` came in."
+  [proto ^long us]
+  (let [i (java.time.Instant/ofEpochSecond (Math/floorDiv us (long usecs-per-sec))
+                                           (* 1000 (Math/floorMod us (long usecs-per-sec))))]
+    (cond
+      (instance? java.time.LocalDateTime proto) (java.time.LocalDateTime/ofInstant i java.time.ZoneOffset/UTC)
+      (instance? java.time.OffsetDateTime proto) (.atOffset i java.time.ZoneOffset/UTC)
+      :else (java.util.Date/from i))))
+
+(defn sql-date-bin
+  "`date_bin(stride, source, origin)`: timestamp_bin / timestamptz_bin.
+   A day of the stride is 24 hours even for a timestamptz -- the C bins
+   elapsed microseconds and never consults the zone."
+  [stride source origin]
+  (if (some sql-null? [stride source origin])
+    :__null__
+    ;; An untyped literal takes the type of the other operand, as
+    ;; PostgreSQL's resolution of the two timestamp arguments does.
+    (let [cast (requiring-resolve 'datahike.pg.sql.cast/cast-scalar)
+          as-other (fn [v other]
+                     (if (string? v)
+                       (cast v (if (instance? java.time.LocalDateTime other) "timestamp" "timestamptz")
+                             {:prefer-local-datetime? true})
+                       v))
+          source (as-other source origin)
+          origin (as-other origin source)]
+      (cond
+        (types/infinite-datetime source) source
+        (types/infinite-datetime origin) (datetime-error "22008" "origin out of range")
+        (types/infinite-datetime stride)
+        (datetime-error "22008" "timestamps cannot be binned into infinite intervals")
+        :else
+        (let [iv (@interval-coerce stride)
+              [months days micros] @interval-fields]
+          (when-not (zero? (long (months iv)))
+            (datetime-error "0A000" "timestamps cannot be binned into intervals containing months or years"))
+          (let [stride-us (+ (* (long (days iv)) usecs-per-day) (long (micros iv)))]
+            (when (<= stride-us 0) (datetime-error "22008" "stride must be greater than zero"))
+            (let [o (epoch-usecs origin)
+                  diff (- (epoch-usecs source) o)
+                  modulo (rem diff stride-us)
+                  result (+ o (- diff modulo))
+                  result (if (neg? modulo) (- result stride-us) result)]
+              (usecs->like source result))))))))
+
+(def ^:private month-days
+  [[31 28 31 30 31 30 31 31 30 31 30 31] [31 29 31 30 31 30 31 31 30 31 30 31]])
+
+(defn- leap? [^long y] (and (zero? (mod y 4)) (or (pos? (mod y 100)) (zero? (mod y 400)))))
+
+(defn sql-age
+  "`age(a, b)`: timestamp_age / timestamptz_age -- the SYMBOLIC
+   difference: fields subtracted, then borrowed downward, so years and
+   months survive. `zone` is the session TimeZone for timestamptz
+   arguments, whose fields are their wall clocks there, and nil for a
+   timestamp."
+  [zone a b]
+  (if (or (sql-null? a) (sql-null? b))
+    :__null__
+    (let [ia (types/infinite-datetime a) ib (types/infinite-datetime b)]
+      (cond
+        (and ia (= ia ib)) (datetime-error "22008" "interval out of range")
+        (= :neg ia) types/neg-infinity
+        (= :pos ia) types/pos-infinity
+        (= :neg ib) types/pos-infinity
+        (= :pos ib) types/neg-infinity
+        :else
+        (let [^java.time.ZoneId z (or zone java.time.ZoneOffset/UTC)
+              ;; A date is midnight of the session's own wall clock,
+              ;; not of UTC's: routed through an instant, both dates
+              ;; landed on the evening before under America/New_York
+              ;; and borrowed from the wrong month.
+              wall (fn [v] (if (instance? java.time.LocalDate v)
+                             (.atStartOfDay ^java.time.LocalDate v)
+                             (java.time.LocalDateTime/ofInstant (ts-instant v) z)))
+              t1 (wall a) t2 (wall b)
+              flip? (< (epoch-usecs a) (epoch-usecs b))
+              f (fn [^java.time.LocalDateTime t]
+                  [(quot (.getNano t) 1000) (.getSecond t) (.getMinute t) (.getHour t)
+                   (.getDayOfMonth t) (.getMonthValue t) (.getYear t)])
+              diff (mapv - (f t1) (f t2))
+              [usec sec mn hr mday mon yr] (if flip? (mapv - diff) diff)
+              ;; Each `while (field < 0)` of the C: borrow from the next
+              ;; field up.
+              borrow (fn [lo hi base]
+                       (if (neg? lo)
+                         (let [k (long (Math/ceil (/ (- lo) (double base))))]
+                           [(+ lo (* k base)) (- hi k)])
+                         [lo hi]))
+              [usec sec] (borrow usec sec usecs-per-sec)
+              [sec mn] (borrow sec mn 60)
+              [mn hr] (borrow mn hr 60)
+              [hr mday] (borrow hr mday 24)
+              ;; The days of the month borrowed from are the EARLIER
+              ;; argument's month, whichever side it is on.
+              ^java.time.LocalDateTime ref (if flip? t1 t2)
+              ref-days (get-in month-days [(if (leap? (.getYear ref)) 1 0)
+                                           (dec (.getMonthValue ref))])
+              [mday mon] (loop [mday mday mon mon]
+                           (if (neg? mday) (recur (+ mday ref-days) (dec mon)) [mday mon]))
+              [mon yr] (borrow mon yr 12)
+              s (if flip? -1 1)]
+          (@interval-make (int (* s (+ (* 12 yr) mon)))
+                          (int (* s mday))
+                          (* s (+ (* (+ (* (+ (* hr 60) mn) 60) sec) usecs-per-sec) usec))))))))
+
+(defn sql-age-current
+  "One-argument `age(b)`: `age(current_date, b)`, current_date being
+   midnight of the statement's day in the session zone -- as a wall clock
+   for a timestamp, placed in the zone for a timestamptz (`tz?`)."
+  [session-zone tz? b]
+  (let [^java.time.ZoneId z (or session-zone java.time.ZoneOffset/UTC)
+        now (.toInstant ^java.util.Date (or (some-> (resolve 'datahike.pg.sql.params/*statement-time*) deref)
+                                            (java.util.Date.)))
+        midnight (.atStartOfDay (java.time.LocalDate/ofInstant now z))]
+    (if tz?
+      (sql-age z (.toOffsetDateTime (.atZone midnight z)) b)
+      (sql-age nil midnight b))))
+
+(defn sql-date+time
+  "`date + time` (datetime_pl) is a timestamp, and `date + timetz`
+   (datetimetz_pl) a timestamptz. Either operand may come first."
+  [a b]
+  (if (or (sql-null? a) (sql-null? b))
+    :__null__
+    (let [cast (requiring-resolve 'datahike.pg.sql.cast/cast-scalar)
+          [d t] (if (instance? java.time.LocalDate a) [a b] [b a])
+          d (if (instance? java.time.LocalDate d) d (cast d "date" {}))
+          t (if (string? t)
+              (cast t (if (re-find #"[+-]\d{1,2}(:\d{2})?$" t) "timetz" "time") {})
+              t)]
+      (if (instance? java.time.OffsetTime t)
+        (.atDate ^java.time.OffsetTime t ^java.time.LocalDate d)
+        (.atTime ^java.time.LocalDate d ^java.time.LocalTime t)))))
+
 (declare sql-extract* sql-extract-in)
 
 (defn sql-extract
@@ -5229,6 +5531,12 @@
    ;; `INTERVAL_NOT_FINITE` short-circuits each of these in the C, so
    ;; an infinity is returned unchanged -- it is not a carrier and
    ;; cannot be justified.
+   "make_date" sql-make-date
+   "make_time" sql-make-time
+   "make_timestamp" sql-make-timestamp
+   "make_interval" sql-make-interval
+   "to_timestamp" sql-to-timestamp
+   "date_bin" sql-date-bin
    "justify_hours" (justify-fn interval-justify-hours)
    "justify_days" (justify-fn interval-justify-days)
    "justify_interval" (justify-fn interval-justify-interval)
@@ -5523,6 +5831,9 @@
    "getdatabaseencoding" #{0}
    "pg_client_encoding"  #{0}
    "justify_hours" #{1} "justify_days" #{1} "justify_interval" #{1}
+   "make_date" #{3} "make_time" #{3} "make_timestamp" #{6}
+   "make_timestamptz" #{6 7} "make_interval" #{0 1 2 3 4 5 6 7}
+   "to_timestamp" #{1} "date_bin" #{3} "age" #{1 2} "timezone" #{2}
    "abs"      #{1} "sign"    #{1} "sqrt"  #{1} "cbrt"  #{1}
    "exp"      #{1} "ln"      #{1} "log10" #{1}
    "floor"    #{1} "ceil"    #{1} "ceiling" #{1}
