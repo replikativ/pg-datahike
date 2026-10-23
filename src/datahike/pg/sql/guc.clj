@@ -78,13 +78,23 @@
    NULL, …)` does: `guc.c`'s `set_config_by_name` passes a NULL value
    straight to `set_config_option`, where it means \"reset to default\"."
   [session-state name]
-  (let [folded (some-> name str str/lower-case)]
+  (let [folded (some-> name str str/lower-case)
+        ;; Back to the value the session STARTED with, which is not the
+        ;; compiled-in default when the StartupMessage set it: under
+        ;; PGTZ=Asia/Tokyo, `RESET timezone` answers Asia/Tokyo.
+        put-back (fn [st path]
+                   (let [start (get-in st (into [:guc-startup] path) ::absent)]
+                     (cond
+                       (not= ::absent start) (assoc-in st path start)
+                       (= 1 (count path)) (dissoc st (first path))
+                       :else (update-in st (pop path) dissoc (peek path)))))]
     (if-let [k (get setting-keys folded)]
       (do (when session-state
-            (swap! session-state dissoc k)
-            (when (= :time-zone k) (swap! session-state dissoc :time-zone-text)))
+            (swap! session-state
+                   (fn [st] (cond-> (put-back st [k])
+                              (= :time-zone k) (put-back [:time-zone-text])))))
           true)
-      (do (when session-state (swap! session-state update :gucs dissoc folded))
+      (do (when session-state (swap! session-state put-back [:gucs folded]))
           false))))
 
 (defn set-setting!
@@ -171,6 +181,19 @@
       :else
       (do (swap! session-state assoc-in [:gucs setting] raw)
           false))))
+
+(defn apply-startup-settings!
+  "Apply a StartupMessage's settings, `[[name value] …]`, and remember
+   the result as what RESET goes back to. One PostgreSQL would refuse is
+   skipped rather than failing the connection."
+  [session-state settings]
+  (doseq [[k v] settings]
+    (try (set-setting! session-state k [v])
+         (catch Exception _ nil)))
+  (swap! session-state
+         (fn [st] (assoc st :guc-startup
+                         (select-keys st (conj (vec (distinct (vals setting-keys)))
+                                               :time-zone-text :gucs))))))
 
 (def ^:private default-settings
   "The GUCs we report a value for, whether or not we model them. These

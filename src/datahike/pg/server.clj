@@ -6945,7 +6945,9 @@
   [{:keys [session-state]} parsed]
   (let [setting (some-> (:var parsed) str/lower-case)]
     (if (= "all" setting)
-      (swap! session-state #(apply dissoc % session-guc-keys))
+      ;; Back to what the session started with, as for RESET <var>.
+      (swap! session-state #(merge (apply dissoc % session-guc-keys)
+                                   (:guc-startup %)))
       ;; `guc/setting-keys` maps each GUC name to the key it writes, so
       ;; this cannot name a setting that `SET` writes somewhere else --
       ;; it held its own copy of the same names before, which is the
@@ -13406,9 +13408,7 @@
         ;; file under `PGTZ=America/Los_Angeles`, which we answered in
         ;; UTC. One PostgreSQL would refuse is skipped rather than
         ;; failing the connection.
-        _ (doseq [[k v] initial-settings]
-            (try (guc/set-setting! session-state k [v])
-                 (catch Exception _ nil)))
+        _ (guc/apply-startup-settings! session-state initial-settings)
         ;; session-id is unique per handler so the global lock-registry can
         ;; distinguish this connection's locks from others'.
         session-id (str (java.util.UUID/randomUUID))
