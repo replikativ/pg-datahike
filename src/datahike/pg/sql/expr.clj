@@ -2820,60 +2820,16 @@
       ;; can't just delegate. Metabase's describe-fields query uses
       ;; FORMAT('%I.%I', schema, table) to build qualified names —
       ;; not optional.
+      ;; format() -- varlena.c's text_format, ported in `fns/sql-format`.
+      ;; Each argument renders through its type's output function, so the
+      ;; types travel with the call.
       (= fname "format")
-      (let [tmpl-arg (first args)
-            value-args (vec (rest args))
-            ;; Quote-an-identifier per PG: wrap in "..", escape internal "
-            ;; `fns/pg-str`, not `str`, at all three sites: `format`
-            ;; renders through the value's OUTPUT function, so a bytea
-            ;; is `\x61ff` and a timestamp is PostgreSQL's spelling.
-            ;; `str` gave `[B@2e349857` for the first and a JVM debug
-            ;; string for the second.
-            quote-id  (fn [^Object v]
-                        (let [s (cond (nil? v) ""
-                                      (string? v) v
-                                      :else (fns/pg-str v))]
-                          (str \" (str/replace s "\"" "\"\"") \")))
-            ;; Quote-a-literal per PG: wrap in '..', escape '
-            ;; `%L` IS quote_literal, including its E'…' rule for a
-            ;; backslash -- one implementation, not a second copy.
-            quote-lit (fn [^Object v]
-                        (if (nil? v) "NULL" (fns/sql-quote-literal v)))
-            apply-fmt (fn [tmpl values]
-                        (let [n (count tmpl)
-                              sb (StringBuilder.)]
-                          (loop [i 0
-                                 vs values]
-                            (if (>= i n)
-                              (.toString sb)
-                              (let [c (.charAt ^String tmpl i)]
-                                (if (and (= c \%) (< (inc i) n))
-                                  (let [spec (.charAt ^String tmpl (inc i))]
-                                    (case spec
-                                      \%  (do (.append sb \%)
-                                              (recur (+ i 2) vs))
-                                      \s  (do (.append sb (if (nil? (first vs))
-                                                            ""
-                                                            (fns/pg-str (first vs))))
-                                              (recur (+ i 2) (rest vs)))
-                                      \I  (do (.append sb ^String (quote-id (first vs)))
-                                              (recur (+ i 2) (rest vs)))
-                                      \L  (do (.append sb ^String (quote-lit (first vs)))
-                                              (recur (+ i 2) (rest vs)))
-                                      ;; Unknown spec — keep literal so we don't
-                                      ;; silently corrupt user-format strings.
-                                      (do (.append sb \%)
-                                          (.append sb spec)
-                                          (recur (+ i 2) vs))))
-                                  (do (.append sb c)
-                                      (recur (inc i) vs))))))))
-            fmt-fn (fn [tmpl & vs]
-                     (apply-fmt (str tmpl) vs))
+      (let [oids (mapv #(source-oid ctx %) (rest params))
             fn-param (symbol (str "?pg-format" (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj fmt-fn)
+        (swap! (:in-args ctx) conj (partial fns/sql-format oids))
         (swap! (:where-clauses ctx) conj
-               [(apply list fn-param tmpl-arg value-args) result-var])
+               [(apply list fn-param args) result-var])
         result-var)
 
       ;; Unknown function.

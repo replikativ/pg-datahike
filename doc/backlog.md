@@ -1291,3 +1291,11 @@ Probed against PostgreSQL 17 while moving the raw-`=` sites onto
   PostgreSQL prints `-0`. This is the datahike#1109 equality work.
 - **VALUES rows holding an array** -- `(VALUES (ARRAY[1,2]), …)` --
   raise `VALUES CTE contains an unsupported expression`.
+
+### `VARIADIC` in a call is a parse error (2026-10-23)
+
+`SELECT format('%s, %s', VARIADIC ARRAY['x','y'])` is `syntax error at
+or near "("`: JSqlParser has no VARIADIC argument. PostgreSQL passes the
+array's elements as the arguments. A pre-parse rewrite that marks the
+argument, plus `sql-format` (and any variadic SQL function) expanding
+it, would cover it.

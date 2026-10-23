@@ -3448,17 +3448,31 @@
            hi (min n (max lo (+ lo (max 0 cnt))))]
        (str (subs t 0 (min lo n)) (->s new) (subs t hi))))))
 
+(def ^:private quoted-keywords
+  ;; Every keyword that is not UNRESERVED: quote_identifier quotes those,
+  ;; so a column named `int` or `select` is written `"int"`. A dozen words
+  ;; were listed here by hand.
+  (delay (into #{}
+               (keep (fn [[w c]] (when (not= "U" c) w)))
+               @(requiring-resolve 'datahike.pg.keywords/keyword-rows))))
+
+(defn quote-identifier
+  "ruleutils.c `quote_identifier`: bare when the name is a lowercase
+   letter or underscore followed by lowercase letters, digits and
+   underscores, and is not a keyword that needs quoting; else
+   double-quoted with `\"` doubled. `$` is NOT safe, though an
+   identifier may contain one."
+  ^String [^String t]
+  (if (and (seq t)
+           (re-matches #"[a-z_][a-z_0-9]*" t)
+           (not (contains? @quoted-keywords t)))
+    t
+    (str \" (str/replace t "\"" "\"\"") \")))
+
 (defn sql-quote-ident
-  "Double-quote an identifier only when it needs it -- PostgreSQL leaves a
-   plain lowercase identifier bare (quote_ident in ruleutils.c)."
+  "`quote_ident(text)`."
   [s]
-  (let [^String t (->s s)]
-    (if (and (seq t)
-             (re-matches #"[a-z_][a-z_0-9$]*" t)
-             (not (contains? #{"select" "from" "where" "table" "user" "order" "group"
-                               "and" "or" "not" "null" "true" "false"} t)))
-      t
-      (str \" (str/replace t "\"" "\"\"") \"))))
+  (quote-identifier (->s s)))
 
 (defn sql-quote-literal
   "`quote_literal` (quote.c `quote_literal_internal`). A single quote
@@ -3482,6 +3496,119 @@
                    (cond-> escape? (str/replace "\\" "\\\\")))]
       (str (when escape? "E") \' body \'))))
 
+(defn sql-format
+  "`format(formatstr, args…)`: varlena.c `text_format`, ported. `oids`
+   are the arguments' SQL types, which the translator knows -- each value
+   renders through its type's OUTPUT function (so a bool is `t`), and a
+   width argument is read as an integer.
+
+   `%[argpos$][flags][width]type`, the type being s, I or L: an explicit
+   `n$` position resets where the implicit ones continue from (`%s %1$s
+   %s` is a a b); `-` aligns left; `*` or `*n$` takes the width from an
+   argument, a negative one meaning left-aligned; padding counts
+   characters. A NULL is '' for %s, NULL for %L and an error for %I.
+
+   What this replaced read only %s, %I, %L and %%: positions and widths
+   were printed literally, too few arguments was silently '', an unknown
+   specifier was echoed, and %I quoted everything."
+  [oids fmt & args]
+  (if (or (nil? fmt) (= :__null__ fmt))
+    :__null__
+    (let [^String f (->s fmt)
+          end (count f)
+          nargs (inc (count args))
+          arg-at (fn [^long k] (nth args (dec k)))
+          oid-at (fn [^long k] (nth oids (dec k) nil))
+          null? #(or (nil? %) (= :__null__ %))
+          err (fn [msg & [hint]]
+                (throw (errors/pg-error :invalid-parameter-value
+                                        (cond-> {:message msg} hint (assoc :hint hint)))))
+          advance (fn [^long i]
+                    (let [i (inc i)]
+                      (when (>= i end)
+                        (err "unterminated format() type specifier"
+                             "For a single \"%\" use \"%%\"."))
+                      i))
+          digits (fn [^long i]
+                   (loop [j i n 0 found false]
+                     (if (and (< j end) (Character/isDigit (.charAt f j)))
+                       (let [n (+ (* 10 n) (- (int (.charAt f j)) 48))]
+                         (when (> n Integer/MAX_VALUE)
+                           (throw (errors/pg-error :numeric-value-out-of-range
+                                                   {:message "number is out of range"})))
+                         (recur (advance j) n true))
+                       [j n found])))
+          sb (StringBuilder.)
+          append (fn [^String s ^long width left?]
+                   (let [len (.codePointCount s 0 (.length s))
+                         [left? w] (if (neg? width) [true (- width)] [left? width])]
+                     (if (or (zero? w) (>= len w))
+                       (.append sb s)
+                       (if left?
+                         (do (.append sb s) (.append sb (apply str (repeat (- w len) \space))))
+                         (do (.append sb (apply str (repeat (- w len) \space))) (.append sb s))))))]
+      (loop [i 0 arg 1]
+        (if (>= i end)
+          (.toString sb)
+          (let [c (.charAt f i)]
+            (if (not= c \%)
+              (do (.append sb c) (recur (inc i) arg))
+              (let [i (advance i)]
+                (if (= \% (.charAt f i))
+                  (do (.append sb \%) (recur (inc i) arg))
+                  ;; text_format_parse_format
+                  (let [[i n found] (digits i)
+                        [i argpos width done?]
+                        (if found
+                          (if (not= \$ (.charAt f i))
+                            [i -1 n true]
+                            (do (when (zero? n)
+                                  (err "format specifies argument 0, but arguments are numbered from 1"))
+                                [(advance i) n 0 false]))
+                          [i -1 0 false])
+                        [i left?] (if done?
+                                    [i false]
+                                    (loop [i i l false]
+                                      (if (= \- (.charAt f i)) (recur (advance i) true) [i l])))
+                        [i widthpos width]
+                        (cond
+                          done? [i -1 width]
+                          (= \* (.charAt f i))
+                          (let [[i n found] (digits (advance i))]
+                            (if found
+                              (do (when (not= \$ (.charAt f i))
+                                    (err "width argument position must be ended by \"$\""))
+                                  (when (zero? n)
+                                    (err "format specifies argument 0, but arguments are numbered from 1"))
+                                  [(advance i) n 0])
+                              [i 0 0]))
+                          :else (let [[i n found] (digits i)] [i -1 (if found n 0)]))
+                        spec (.charAt f i)
+                        _ (when-not (#{\s \I \L} spec)
+                            (err (str "unrecognized format() type specifier \"" spec "\"")
+                                 "For a single \"%\" use \"%%\"."))
+                        ;; the width argument, if any
+                        [arg width]
+                        (if (>= widthpos 0)
+                          (let [a (if (pos? widthpos) widthpos arg)]
+                            (when (>= a nargs) (err "too few arguments for format()"))
+                            (let [v (arg-at a)]
+                              [(inc a) (cond (null? v) 0
+                                             (number? v) (long v)
+                                             :else (Long/parseLong (str/trim (types/->pg-text v (oid-at a)))))]))
+                          [arg width])
+                        a (if (pos? argpos) argpos arg)
+                        _ (when (>= a nargs) (err "too few arguments for format()"))
+                        v (arg-at a)
+                        text (when-not (null? v) (types/->pg-text v (oid-at a)))]
+                    (case spec
+                      \s (append (or text "") width left?)
+                      \L (append (if text (sql-quote-literal text) "NULL") width left?)
+                      \I (if text
+                           (append (quote-identifier text) width left?)
+                           (throw (ex-info "null values cannot be formatted as an SQL identifier"
+                                           {:sqlstate "22004"}))))
+                    (recur (inc i) (inc a))))))))))))
 (defn sql-quote-nullable
   "Like quote_literal, but a NULL becomes the unquoted string NULL."
   [v]
