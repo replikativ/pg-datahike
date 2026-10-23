@@ -6474,6 +6474,7 @@
              :local-sequence-generations {}
              :local-sequence-identities #{}
              :temp-tables-before @temp-tables)
+      (guc/begin! session-state)
       (tag-tx-status (empty-result "BEGIN") tx-state))))
 
 (defn- open-implicit-tx!
@@ -6501,11 +6502,12 @@
 (defn- handle-savepoint
   "Savepoint names are unique within a tx but may be reused after RELEASE.
    Outside a tx PG raises 25P01."
-  [{:keys [tx-state temp-tables]} parsed]
+  [{:keys [tx-state temp-tables session-state]} parsed]
   (let [name (:name parsed)]
     (if-not (:in-tx? @tx-state)
       (error-result "SAVEPOINT can only be used in transaction blocks" "25P01")
-      (do (swap! tx-state update :savepoints (fnil conj [])
+      (do (guc/savepoint! session-state name)
+          (swap! tx-state update :savepoints (fnil conj [])
                  {:name name
                   :speculative-db (:speculative-db @tx-state)
                   :tx-buffer (:tx-buffer @tx-state)
@@ -6529,7 +6531,7 @@
   "RELEASE SAVEPOINT name — discards the named savepoint and any more
    recent. Row locks acquired since the savepoint become part of the
    outer scope (NOT released). PG raises 3B001 if name isn't active."
-  [{:keys [tx-state]} parsed]
+  [{:keys [tx-state session-state]} parsed]
   (let [name (:name parsed)
         stack (:savepoints @tx-state)
         idx (when (and name (seq stack))
@@ -6545,7 +6547,9 @@
           (error-result (str "savepoint \"" name "\" does not exist") "3B001"))
       :else
       (do (swap! tx-state update :savepoints subvec 0 idx)
-          (empty-result "RELEASE SAVEPOINT")))))
+          (guc/release-savepoint! session-state name)
+          ;; PostgreSQL's tag is bare `RELEASE`.
+          (empty-result "RELEASE")))))
 
 (defonce ^:private commit-check-lock
   ;; Serializes conflict-check + d/transact in transact-tx-buffer! (and
@@ -6817,7 +6821,7 @@
              :verb verb}))))
 
 (defn- handle-commit
-  [{:keys [conn session-id tx-state cursors temp-tables]} _parsed]
+  [{:keys [conn session-id tx-state cursors temp-tables session-state]} _parsed]
   (reject-nested-transaction-control! tx-state "COMMIT")
   (if (:in-tx? @tx-state)
     (if (:aborted? @tx-state)
@@ -6827,22 +6831,26 @@
       ;; explicit ROLLBACK.
       (do (invalidate-rolled-back-ddl! tx-state)
           (restore-temp-tables! tx-state temp-tables)
+          (guc/rollback! session-state)
           (end-tx! session-id tx-state cursors)
           (tag-tx-status (empty-result "ROLLBACK") tx-state))
       (try
         (transact-tx-buffer! conn tx-state)
+        (guc/commit! session-state)
         (end-tx! session-id tx-state cursors)
         (tag-tx-status (empty-result "COMMIT") tx-state)
         (catch Exception e
           (invalidate-rolled-back-ddl! tx-state)
           (restore-temp-tables! tx-state temp-tables)
+          (guc/rollback! session-state)
           (end-tx! session-id tx-state cursors)
           (classified-error "COMMIT failed: " e))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
-  [{:keys [session-id tx-state cursors temp-tables]} _parsed]
+  [{:keys [session-id tx-state cursors temp-tables session-state]} _parsed]
   (reject-nested-transaction-control! tx-state "ROLLBACK")
+  (guc/rollback! session-state)
   (invalidate-rolled-back-ddl! tx-state)
   (restore-temp-tables! tx-state temp-tables)
   (end-tx! session-id tx-state cursors)
@@ -6853,7 +6861,7 @@
    savepoint (which remains active). Locks acquired after the target
    are released. Raises 25P01 outside a tx, 3B001 if the savepoint
    name isn't active."
-  [{:keys [tx-state temp-tables]} parsed]
+  [{:keys [tx-state temp-tables session-state]} parsed]
   (let [sp-stack (:savepoints @tx-state)
         name (:name parsed)
         target-idx (when (seq sp-stack)
@@ -6885,6 +6893,7 @@
                            reg to-release))))
         (when (> current-ddl-version target-ddl-version)
           (invalidate-schema-cache!))
+        (guc/rollback-to-savepoint! session-state name)
         (reset! temp-tables target-temp-tables)
         (swap! tx-state assoc
                :aborted? false
@@ -6944,15 +6953,18 @@
    asyncpg's pool reset sends `RESET ALL` on every release."
   [{:keys [session-state]} parsed]
   (let [setting (some-> (:var parsed) str/lower-case)]
-    (if (= "all" setting)
-      ;; Back to what the session started with, as for RESET <var>.
-      (swap! session-state #(merge (apply dissoc % session-guc-keys)
-                                   (:guc-startup %)))
-      ;; `guc/setting-keys` maps each GUC name to the key it writes, so
-      ;; this cannot name a setting that `SET` writes somewhere else --
-      ;; it held its own copy of the same names before, which is the
-      ;; shape the `set_config` bug grew out of.
-      (guc/reset-setting! session-state setting)))
+    ;; RESET is a SET to the default, and as transactional.
+    (guc/scoped!
+     session-state false
+     #(if (= "all" setting)
+        ;; Back to what the session started with, as for RESET <var>.
+        (swap! session-state (fn [st] (merge (apply dissoc st session-guc-keys)
+                                             (:guc-startup st))))
+        ;; `guc/setting-keys` maps each GUC name to the key it writes, so
+        ;; this cannot name a setting that `SET` writes somewhere else --
+        ;; it held its own copy of the same names before, which is the
+        ;; shape the `set_config` bug grew out of.
+        (guc/reset-setting! session-state setting))))
   (empty-result "RESET"))
 
 ;; --- Advisory-lock handlers -------------------------------------------------
@@ -7557,8 +7569,12 @@
         (let [setting (some-> (:var parsed) str/lower-case)
               values  (if (seq (:values parsed))
                         (vec (:values parsed))
-                        [(:value parsed)])]
-          (guc/set-setting! session-state setting values))
+                        [(:value parsed)])
+              local?  (boolean (:local? parsed))]
+          (when (and local? (not (guc/in-transaction-block? session-state)))
+            (params/notice! "WARNING" "SET LOCAL can only be used in transaction blocks"))
+          (guc/scoped! session-state local?
+                       #(guc/set-setting! session-state setting values)))
         (empty-result "SET"))
       :prepare          (handle-prepare ctx parsed)
       :execute-prepared (handle-execute-prepared ctx parsed)
@@ -7626,16 +7642,20 @@
       ;; as text and asyncpg reads it back, so returning empty-string
       ;; was not harmless: echo the value argument.
       (let [[setting value] (:args parsed)]
-        (guc/set-setting! session-state setting [value])
         ;; PostgreSQL answers with the setting as it now stands
         ;; (`set_config_by_name` ends in `GetConfigOptionByName`), not
         ;; with the string passed in: a NULL value resets and answers
-        ;; the DEFAULT, and `'+02:00'` answers the canonical `-02:00`.
+        ;; the DEFAULT, and `'europe/berlin'` answers `Europe/Berlin`.
         ;; Echoing was close enough only while nothing was stored. A
-        ;; name we neither model nor default still echoes.
+        ;; name we neither model nor default still echoes. Read inside
+        ;; the scope: outside a transaction a local change is undone
+        ;; as it leaves, as `guc/scoped!` explains.
         (single-row-result "set_config" PgWireServer/OID_TEXT
-                           (or (guc/read-setting session-state setting)
-                               value)))
+                           (guc/scoped! session-state (boolean (:local? parsed))
+                                        (fn []
+                                          (guc/set-setting! session-state setting [value])
+                                          (or (guc/read-setting session-state setting)
+                                              value)))))
 
       :do-block
       ;; `DO [LANGUAGE l] $$ … $$` -- an anonymous code block. It is a

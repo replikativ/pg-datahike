@@ -564,7 +564,11 @@
       ;; back when it turns `jit` off around type introspection — so an
       ;; empty answer is not harmless here. Carry the value argument.
       (fn-name=? t1 "set_config")
-      {:kind :set-config :args (extract-fn-string-args rest-args)}
+      (cond-> {:kind :set-config :args (extract-fn-string-args rest-args)}
+        ;; `is_local` written as the keyword `true` (the two string
+        ;; arguments cannot be one).
+        (some #(and (ident-tok? %) (kw=? % "true")) rest-args)
+        (assoc :local? true))
       (fn-name=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
       (fn-name=? t1 "txid_current")  {:kind :txid-current}
       ;; `pg_sleep`, `pg_notify` and the advisory locks used to be
@@ -1987,7 +1991,8 @@
    forms get their own kinds so the server can track the session/tx
    isolation that `SHOW transaction_isolation` must reflect."
   [toks]
-  (let [;; Skip optional LOCAL/SESSION modifier
+  (let [local? (kw=? (first toks) "local")
+        ;; Skip optional LOCAL/SESSION modifier
         toks (if (kw-in? (first toks) #{"local" "session"})
                (rest toks) toks)]
     (cond
@@ -2016,7 +2021,8 @@
           :else {:kind :set :var "transaction"}))
 
       :else
-      (classify-set* toks))))
+      (cond-> (classify-set* toks)
+        local? (assoc :local? true)))))
 
 (def ^:private psql-metacommand-names
   "Lower-case psql metacommand names that pg_dump emits unprefixed
