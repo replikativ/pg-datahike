@@ -1228,7 +1228,19 @@
       2 (vec vals)
       nil)))
 
-(declare zone-crossing)
+(declare zone-crossing jsonb-column?)
+
+(defn- json-typed-args
+  "Arguments of the json constructors as `datum_to_json` makes them, by
+   each argument's SQL type -- see `jsonb/json-scalar`. A json/jsonb
+   argument is left alone: it is already json."
+  [ctx params args]
+  (mapv (fn [p a]
+          (if (jsonb-column? ctx p)
+            a
+            (ctx/materialize-arg! ctx (list 'datahike.pg.query-fns/json-scalar
+                                            (source-oid ctx p) a))))
+        params args))
 
 (def ^:private named-parameters
   "Functions that take PostgreSQL's `name => value` arguments, by their
@@ -2603,21 +2615,24 @@
 
       ;; jsonb_build_object(k1, v1, k2, v2, ...) → in-param fn
       (= fname "json_build_object")
-      (let [fn-param (symbol (str "?json-build-obj" (swap! (:var-counter ctx) inc)))]
+      (let [fn-param (symbol (str "?json-build-obj" (swap! (:var-counter ctx) inc)))
+            args (json-typed-args ctx params args)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/json-build-object)
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
       (= fname "json_build_array")
-      (let [fn-param (symbol (str "?json-build-arr" (swap! (:var-counter ctx) inc)))]
+      (let [fn-param (symbol (str "?json-build-arr" (swap! (:var-counter ctx) inc)))
+            args (json-typed-args ctx params args)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/json-build-array)
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
       (= fname "jsonb_build_object")
-      (let [fn-param (symbol (str "?jsonb-build-obj" (swap! (:var-counter ctx) inc)))]
+      (let [fn-param (symbol (str "?jsonb-build-obj" (swap! (:var-counter ctx) inc)))
+            args (json-typed-args ctx params args)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/jsonb-build-object)
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
@@ -2625,7 +2640,8 @@
 
       ;; jsonb_build_array(v1, v2, ...) → in-param fn
       (= fname "jsonb_build_array")
-      (let [fn-param (symbol (str "?jsonb-build-arr" (swap! (:var-counter ctx) inc)))]
+      (let [fn-param (symbol (str "?jsonb-build-arr" (swap! (:var-counter ctx) inc)))
+            args (json-typed-args ctx params args)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/jsonb-build-array)
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
@@ -2669,7 +2685,8 @@
       ;; needs no separate implementation, and it is the call PostgREST
       ;; puts on every read.
       (contains? #{"to_jsonb" "to_json" "row_to_json"} fname)
-      (let [json-family? (contains? #{"to_json" "row_to_json"} fname)
+      (let [args (if (jsonb-column? ctx (first params)) args (json-typed-args ctx params args))
+            json-family? (contains? #{"to_json" "row_to_json"} fname)
             fn-param (symbol (str "?to-jsonb" (swap! (:var-counter ctx) inc)))
             ;; to_jsonb does NOT parse its argument: a text value becomes
             ;; a json STRING. Only an argument that already IS json/jsonb
@@ -4629,7 +4646,11 @@
           (sql-cast/cast-scalar inner-raw type-str
                                 {:explicit? true
                                  :parse-timestamp parse-timestamp-string})
-          is-text? (types/->pg-text inner-raw src-oid)
+          ;; booltext for a bool -- `true::text` is `true`, though its
+          ;; output function prints `t`.
+          is-text? (if (boolean? inner-raw)
+                     (if inner-raw "true" "false")
+                     (types/->pg-text inner-raw src-oid))
           is-bool? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::date — extract the LocalDate so serialization can omit the
         ;; time part ("2017-03-13" instead of "2017-03-13 00:00:00").
@@ -7485,8 +7506,15 @@
                           (pg-arr/array (:elem-type a) (conj (:elements a) b))
                           (pg-arr/array? b)
                           (pg-arr/array (:elem-type b) (into [a] (:elements b)))
-                          :else (str (types/->pg-text a l-oid)
-                                     (types/->pg-text b r-oid)))))
+                          ;; textanycat / anytextcat convert the
+                          ;; non-text side with its CAST to text, so a
+                          ;; bool is `true` here -- `'a' || true` is
+                          ;; `atrue` -- where concat(), which uses the
+                          ;; output function, prints `t`.
+                          :else (let [txt (fn [x oid] (if (boolean? x)
+                                                        (if x "true" "false")
+                                                        (types/->pg-text x oid)))]
+                                  (str (txt a l-oid) (txt b r-oid))))))
           result-var (ctx/fresh-var! ctx)]
       (swap! (:in-params ctx) conj fn-param)
       (swap! (:in-args ctx) conj concat-fn)

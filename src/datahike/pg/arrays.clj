@@ -491,6 +491,11 @@
 
 ;; --- parsing ----
 
+;; `->pg-text` is the one output function every text conversion goes
+;; through -- concat(), ||, format(), array elements, record fields -- and
+;; without this it fell to `str` and printed the Java identity
+;; (`datahike.pg...@bb1ab8bc`).
+(types/register-output-function! array? to-pg-text)
 (defn- coerce-token
   "Coerce a raw token to the target element-type. Unquoted NULL token
    → nil. Element-type drives the destination type."

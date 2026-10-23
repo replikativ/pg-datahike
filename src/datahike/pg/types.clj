@@ -1973,6 +1973,19 @@
 
      :else nil)))
 
+(defonce ^:private output-functions
+  ;; [pred render] pairs for the carriers whose namespaces sit ABOVE this
+  ;; one (arrays, bits, records require types, so types cannot require
+  ;; them). Each registers its output function when it loads.
+  (atom []))
+
+(defn register-output-function!
+  "Make `->pg-text` render values satisfying `pred` with `render`. For a
+   type whose carrier lives in a namespace above this one."
+  [pred render]
+  (swap! output-functions
+         (fn [fs] (conj (vec (remove #(= pred (first %)) fs)) [pred render]))))
+
 (defn ->pg-text
   "PostgreSQL's output function for a value (its type's `typoutput`).
 
@@ -2009,7 +2022,13 @@
            (.append sb (if (< x 16) "0" ""))
            (.append sb (Long/toHexString x))))
        (.toString sb))
-     :else (or (temporal->pg-text v src-oid) (str v)))))
+     ;; boolout is `t` / `f` -- what concat(), ||, format() and array
+     ;; elements print. `true::text` is `true` because the bool -> text
+     ;; CAST is booltext, a different function; cast.clj handles it.
+     (instance? Boolean v) (if v "t" "f")
+     :else (or (some (fn [[pred render]] (when (pred v) (render v))) @output-functions)
+               (temporal->pg-text v src-oid)
+               (str v)))))
 
 (defn decimal-literal
   "The value of an unadorned SQL decimal literal, built from its ORIGINAL

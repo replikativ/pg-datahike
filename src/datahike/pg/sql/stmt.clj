@@ -4792,6 +4792,18 @@
                           v2 (translate-arg (second params))
                           v1 (if (seq? v1) (ctx/materialize-arg! ctx v1) v1)
                           v2 (if (seq? v2) (ctx/materialize-arg! ctx v2) v2)
+                          ;; The object aggregates type their key and value
+                          ;; the way datum_to_json does -- see
+                          ;; `jsonb/json-scalar`.
+                          json-object? (contains? #{"json_object_agg" "jsonb_object_agg"} fname)
+                          v1 (if json-object?
+                               (ctx/materialize-arg! ctx (list 'datahike.pg.query-fns/json-key
+                                                               (oid/expr-oid (first params) agg-oid-env) v1))
+                               v1)
+                          v2 (if (and json-object? (not (expr/jsonb-column? ctx (second params))))
+                               (ctx/materialize-arg! ctx (list 'datahike.pg.query-fns/json-scalar
+                                                               (oid/expr-oid (second params) agg-oid-env) v2))
+                               v2)
                           pair-var (ctx/fresh-var! ctx)
                                 ;; string_agg(expr, delim ORDER BY …) — element
                                 ;; order is observable in the joined string, so
@@ -4856,6 +4868,15 @@
                           v (if (symbol? v)
                               v
                               (ctx/materialize-arg! ctx (list 'identity v)))
+                          ;; json_agg / jsonb_agg type each element the way
+                          ;; datum_to_json does: a money column aggregated
+                          ;; to bare numbers, a date to a timestamp.
+                          v (if (and (contains? #{"json_agg" "jsonb_agg"} fname)
+                                     inner-expr
+                                     (not (expr/jsonb-column? ctx inner-expr)))
+                              (ctx/materialize-arg! ctx (list 'datahike.pg.query-fns/json-scalar
+                                                              (oid/expr-oid inner-expr agg-oid-env) v))
+                              v)
                           enum-spec (when (and inner-expr
                                                (contains? #{"min" "max"} fname))
                                       (expr/enum-spec-for-exprs ctx [inner-expr]))

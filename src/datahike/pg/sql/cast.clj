@@ -556,6 +556,9 @@
                  (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)
                  (pg-arr/array? v)   (pg-arr/to-pg-text v)
                  (string? v)         v
+                 ;; booltext, the bool -> text CAST: `true`, where the
+                 ;; output function `->pg-text` uses says `t`.
+                 (boolean? v)        (if v "true" "false")
                  :else               (types/->pg-text v src-oid))
                type-str explicit?)
 

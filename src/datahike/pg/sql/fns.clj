@@ -1264,8 +1264,11 @@
       (str "{ "
            (clojure.string/join
             ", " (map (fn [p]
-                        (str ((requiring-resolve 'datahike.pg.jsonb/serialize-jsonb)
-                              (str (first p)))
+                        ;; A key is always a JSON STRING; serialising it
+                        ;; re-read `"1"` as the number 1 and printed
+                        ;; `{ 1 : ... }`.
+                        (str ((requiring-resolve 'datahike.pg.jsonb/json-string-literal)
+                              (first p))
                              " : "
                              ((requiring-resolve 'datahike.pg.jsonb/serialize-jsonb)
                               (second p))))
