@@ -1,0 +1,40 @@
+;; PostgreSQL 17 corpus: SQL equality and ordering -- NaN, signed zero,
+;; numeric scale across carriers, intervals, set operations inside IN,
+;; per-key aggregate ORDER BY, array comparison, interval canonical text.
+;; Captured from a real PostgreSQL after running :setup, not hand-written.
+{:setup [
+  "drop table if exists eqf"
+  "create table eqf (f float8, i interval, n numeric, t text, tz timetz, a int[])"
+  "insert into eqf values ('NaN', '1 mon', 1.0, 'a', '12:00+01', '{1,2}'), ('NaN', '30 days', 1.00, 'b', '11:30+00', '{1,3}'), (0.0, '1 day', 2, chr(65533), '10:00+00', '{10}'), ('-0', '24 hours', 2.0, 'z', '09:00+00', '{9}')"
+ ]
+ :corpus [
+  ["count(distinct f) from eqf" "2"]
+  ["array_length(array_agg(distinct f), 1) from eqf" "2"]
+  ["count(*) from eqf where f in ('NaN')" "2"]
+  ["count(*) from eqf where f not in ('NaN')" "2"]
+  ["count(*) from eqf where f not in ('NaN', 1.5)" "2"]
+  ["'1 mon'::interval in (select '30 days'::interval intersect select '1 mon'::interval)" "t"]
+  ["2 in (select 1 union select 2.0)" "t"]
+  ["'NaN'::float8 in (select 'NaN'::float8 intersect select 'NaN'::float8)" "t"]
+  ["count(*) from eqf where f in (select 'NaN'::float8 except select 1.0::float8)" "2"]
+  ["count(*) from (select 1 union select 1.0) s" "1"]
+  ["count(*) from (select 0.0::float8 union select '-0'::float8) s" "1"]
+  ["count(distinct x) from (values (1), (1.0), (1.00)) v(x)" "1"]
+  ["string_agg(t, ',' order by f, t desc) from eqf" "�,z,b,a"]
+  ["string_agg(t, ',' order by t desc) from eqf" "�,z,b,a"]
+  ["string_agg(distinct t, ',' order by t desc) from eqf" "�,z,b,a"]
+  ["array_to_string(array_agg(v order by v nulls first), ',', 'N') from (values (1), (null::int), (3)) x(v)" "N,1,3"]
+  ["array_to_string(array_agg(v order by v desc), ',', 'N') from (values (1), (null::int), (3)) x(v)" "N,3,1"]
+  ["array_to_string(array_agg(v order by v desc nulls last), ',', 'N') from (values (1), (null::int), (3)) x(v)" "3,1,N"]
+  ["array_to_string(array_agg(v order by v), ',', 'N') from (values (1), (null::int), (3)) x(v)" "1,3,N"]
+  ["json_agg(v order by v desc) from (values (1), (2), (3)) x(v)" "[3, 2, 1]"]
+  ["array_agg(distinct v order by v desc) from (values (1), (2), (2)) x(v)" "{2,1}"]
+  ["array[1,2] < array[1,3]" "t"]
+  ["array[1,2] < array[1,2,0]" "t"]
+  ["array[1,null] > array[1,5]" "t"]
+  ["array[2] > array[1,9]" "t"]
+  ["array['b'] < array['a','z']" "f"]
+  ["array[1.0] = array[1.00]" "t"]
+  ["i from eqf where t = 'z'" "24:00:00"]
+  ["string_agg(i::text, ',' order by f, t) from eqf" "24:00:00,1 day,1 mon,30 days"]
+ ]}

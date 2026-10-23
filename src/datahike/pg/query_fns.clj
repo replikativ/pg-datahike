@@ -84,6 +84,7 @@
 (def sql-timestamptz+interval            fns/sql-timestamptz+interval)
 (def sql-overlaps                        fns/sql-overlaps)
 (def sql-wall->tstz                      fns/sql-wall->tstz)
+(def agg-sort-key                        fns/agg-sort-key)
 (def sql-timestamptz-interval            fns/sql-timestamptz-interval)
 (def sql-make-timestamptz                fns/sql-make-timestamptz)
 (def sql-age                             fns/sql-age)

@@ -1244,6 +1244,22 @@
                         (conj! acc [(if (inst? cur) cur (java.util.Date/from (inst cur)))]))
                  (persistent! acc))))}))
 
+(defn- agg-order-key
+  "An aggregate ORDER BY element as its sort key: the expression's value
+   wrapped with the element's direction and NULL placement --
+   PostgreSQL's defaults being NULLS LAST for ASC and NULLS FIRST for
+   DESC -- for `fns/akey-compare` to honour key by key."
+  [ctx ^net.sf.jsqlparser.statement.select.OrderByElement o]
+  (let [kv (expr/translate-expr ctx (.getExpression o))
+        kv (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)
+        desc? (not (.isAsc o))
+        nulls (.getNullOrdering o)
+        nulls-first? (cond
+                       (= nulls net.sf.jsqlparser.statement.select.OrderByElement$NullOrdering/NULLS_FIRST) true
+                       (= nulls net.sf.jsqlparser.statement.select.OrderByElement$NullOrdering/NULLS_LAST) false
+                       :else desc?)]
+    (ctx/materialize-arg! ctx (list 'datahike.pg.query-fns/agg-sort-key kv desc? nulls-first?))))
+
 (defn- coldef-pg-type
   "The `:pg/type` for a column-definition-list entry like `a int`.
 
@@ -4803,15 +4819,13 @@
                                         agg-sym)]
                         (if order-els
                           (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                 (let [kv (expr/translate-expr ctx (.getExpression o))]
-                                                   (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
+                                                 (agg-order-key ctx o))
                                                order-els)
                                 sort-key (if (= 1 (count key-vars))
                                            (first key-vars)
                                            (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
-                                all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                    (not (.isAsc o)))
-                                                  order-els)]
+                                ;; Each key carries its own direction now.
+                                all-desc? false]
                             (ctx/add-clause! ctx [(list 'vector sort-key v1 v2) pair-var])
                             (let [ord-sym (if all-desc?
                                             'datahike.pg.query-fns/filter-string-agg-ordered-desc
@@ -4924,16 +4938,14 @@
                                         (seq (.getOrderByElements f)))]
                         (if order-els
                           (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                 (let [kv (expr/translate-expr ctx (.getExpression o))]
-                                                   (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
+                                                 (agg-order-key ctx o))
                                                order-els)
                                 sort-key (if (= 1 (count key-vars))
                                            (first key-vars)
                                            (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
                                 pair-var (ctx/fresh-var! ctx)
-                                all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                    (not (.isAsc o)))
-                                                  order-els)
+                                ;; Each key carries its own direction now.
+                                all-desc? false
                                 ord-sym (let [[asc desc] (get ordered-aggs fname)]
                                           (if all-desc? desc asc))]
                             (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
@@ -8124,6 +8136,16 @@
           (and (#{"time" "timetz"} pg-type) (some? val) (not= :__null__ val))
           (types/->pg-text (sql-cast/cast-scalar val pg-type {:explicit? true})
                            (if (= "time" pg-type) types/oid-time types/oid-timetz))
+
+        ;; interval columns keep their text form too, and so did the raw
+        ;; input: '24 hours' read back as `24 hours` where PostgreSQL
+        ;; prints `24:00:00`, and a malformed interval was stored. Run
+        ;; interval_in and keep its canonical output. (Comparing two
+        ;; stored intervals by VALUE -- '1 mon' = '30 days' -- is the
+        ;; open carrier decision in doc/consolidation-plan.md.)
+          (and (= "interval" pg-type) (some? val) (not= :__null__ val))
+          (types/->pg-text (sql-cast/cast-scalar val "interval" {:explicit? true})
+                           types/oid-interval)
 
         ;; pgvector's vector type is Datahike's native float array. Parse
         ;; every write through the same input function, even if it is already

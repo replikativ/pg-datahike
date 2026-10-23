@@ -1271,3 +1271,23 @@ purpose:
 - **`timestamptz = timestamp`** -- FIXED (2026-10-23): the wall clock is
   placed in the session zone on both comparison paths, and a timestamptz
   literal compares at all.
+
+### Equality and ordering that wait on a decision (Phase 1.4, 2026-10-23)
+
+Probed against PostgreSQL 17 while moving the raw-`=` sites onto
+`value-key`; these remain, and each needs a choice rather than a fix:
+
+- **Text-stored columns order and compare as text** -- decision 8 in
+  doc/consolidation-plan.md. A timetz column sorts `11:30+00` before
+  `12:00+01` (PostgreSQL compares in UTC: 11:00Z first), an int[] column
+  sorts `{10}` before `{9}`, and an interval column compares its text, so
+  `WHERE i = '30 days'` misses a stored `1 mon` and `GROUP BY i` splits
+  them. The VALUES are right now -- an interval column stores the
+  canonical text, and literal arrays compare by `array_cmp` -- but a
+  stored column is still text to every comparator.
+- **DISTINCT and GROUP BY answered inside Datalog** keep `-0` and `0`
+  (and two stored intervals that are equal) apart, because Datahike
+  groups by the value's own equality. Storage cannot fold them:
+  PostgreSQL prints `-0`. This is the datahike#1109 equality work.
+- **VALUES rows holding an array** -- `(VALUES (ARRAY[1,2]), …)` --
+  raise `VALUES CTE contains an unsupported expression`.

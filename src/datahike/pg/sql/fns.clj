@@ -455,7 +455,37 @@
        (some? (temporal-instant a))
        (some? (temporal-instant b))))
 
-(declare record-order-cmp)
+(declare record-order-cmp order-cmp)
+
+(defn- array-order-cmp
+  "`array_cmp` (arrayfuncs.c): elements in storage order, a NULL larger
+   than any non-NULL; on a tie, fewer elements sort first, then fewer
+   dimensions, then the dimensions and lower bounds themselves. Without
+   it `ARRAY[1,2] < ARRAY[1,3]` was 42883 -- a PgArray is not
+   Comparable -- and so was any ORDER BY or max() over arrays."
+  [a b]
+  (let [null? #(or (nil? %) (= :__null__ %))
+        ea (:elements a) eb (:elements b)
+        by-element (loop [i 0]
+                     (if (or (>= i (count ea)) (>= i (count eb)))
+                       0
+                       (let [x (nth ea i) y (nth eb i)
+                             c (cond (and (null? x) (null? y)) 0
+                                     (null? x) 1
+                                     (null? y) -1
+                                     :else (long (order-cmp x y)))]
+                         (if (zero? c) (recur (inc i)) c))))]
+    (if-not (zero? by-element)
+      by-element
+      (let [c (compare (count ea) (count eb))]
+        (if-not (zero? c)
+          c
+          (let [c (compare (count (:dims a)) (count (:dims b)))]
+            (if-not (zero? c)
+              c
+              (let [c (compare (vec (:dims a)) (vec (:dims b)))]
+                (if-not (zero? c) c
+                        (compare (vec (:lbounds a)) (vec (:lbounds b))))))))))))
 
 (defn order-cmp
   "`compare`, with two corrections.
@@ -498,6 +528,7 @@
                               (.getLeastSignificantBits ub))
         high))
     (and (pg-rec/record? a) (pg-rec/record? b)) (record-order-cmp a b)
+    (and (pg-arr/array? a) (pg-arr/array? b)) (array-order-cmp a b)
     ;; PostgreSQL has no operator between a composite and a scalar.
     (or (pg-rec/record? a) (pg-rec/record? b))
     (throw (ex-info "cannot compare record and non-record values"
@@ -707,6 +738,17 @@
                 (apply str))
            "]"))))
 
+(defrecord AggSortKey [v desc? nulls-first?])
+
+(defn agg-sort-key
+  "One key of an aggregate's ORDER BY carrying its own direction and
+   NULL placement, so `akey-compare` can honour them per key. One flag
+   for the whole list used to be all there was: `string_agg(t, ',' ORDER
+   BY f, t DESC)` sorted both keys ascending, and NULLS FIRST was ignored
+   -- NULLs always came last."
+  [v desc? nulls-first?]
+  (->AggSortKey v desc? nulls-first?))
+
 (defn- akey-compare
   "Null-safe comparator for in-aggregate `ORDER BY` keys. A key is a
    scalar or a vector (multiple ORDER BY columns, compared
@@ -734,6 +776,13 @@
   [a b]
   (let [null? (fn [x] (or (nil? x) (= :__null__ x)))]
     (cond
+      (and (instance? AggSortKey a) (instance? AggSortKey b))
+      (let [x (:v a) y (:v b) nf? (:nulls-first? a)]
+        (cond (and (null? x) (null? y)) 0
+              (null? x) (if nf? -1 1)
+              (null? y) (if nf? 1 -1)
+              :else (let [c (long (order-cmp x y))] (if (:desc? a) (- c) c))))
+
       (and (vector? a) (vector? b))
       (loop [a a b b]
         (cond (and (empty? a) (empty? b)) 0
@@ -816,6 +865,20 @@
     ;; `stripTrailingZeros` makes 1.0M and 1.00M the same key. It also
     ;; normalises 1E+1 and 10, which `numeric_eq` likewise calls equal.
     (instance? java.math.BigDecimal v) (.stripTrailingZeros ^java.math.BigDecimal v)
+    ;; The other numeric carriers key as numeric when they hold an
+    ;; integral value: `SELECT 1 UNION SELECT 1.0` is ONE row in
+    ;; PostgreSQL (the branches resolve to numeric), and a Long and a
+    ;; BigDecimal are never `=`. The zero arm also folds -0.0 into 0.0,
+    ;; which float8_eq calls equal and DISTINCT kept apart.
+    (and (or (instance? Double v) (instance? Float v))
+         (not (Double/isInfinite (double v)))
+         (== (double v) (Math/rint (double v)))
+         (< (Math/abs (double v)) 1.0E15))
+    (.stripTrailingZeros (java.math.BigDecimal/valueOf (long (double v))))
+    (or (instance? Long v) (instance? Integer v) (instance? Short v))
+    (.stripTrailingZeros (java.math.BigDecimal/valueOf (long v)))
+    (instance? java.math.BigInteger v)
+    (.stripTrailingZeros (java.math.BigDecimal. ^java.math.BigInteger v))
     :else v))
 
 (defn row-value-key
@@ -1852,6 +1915,19 @@
   [v lo hi]
   (sql-and3 (sql-le3? lo v) (sql-le3? v hi)))
 
+(def ^:private value-key-sets
+  ;; The literal list is ONE set object, embedded in the query and handed
+  ;; to every row, and a persistent set caches its hash -- so a weak map
+  ;; keyed on it finds the keyed copy in O(1). Rebuilding it per call made
+  ;; NOT IN, where every non-member row misses, O(rows x list).
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn- value-key-set [vals]
+  (or (.get ^java.util.Map value-key-sets vals)
+      (let [ks (into #{} (map value-key) vals)]
+        (.put ^java.util.Map value-key-sets vals ks)
+        ks)))
+
 (defn sql-in?
   "SQL `IN` over a literal list. `contains?` on a set is `=`-based and so
    inherits the cross-type numeric blindness described in `sql-eq?`;
@@ -1863,7 +1939,7 @@
       ;; The set membership is `=`-based, which misses NaN, bytea, a
       ;; numeric of a different scale and an interval -- so try the
       ;; SQL-equality keys before falling back to the linear scan.
-      (contains? (into #{} (map value-key) vals) (value-key v))
+      (contains? (value-key-set vals) (value-key v))
       (boolean (some #(sql-eq? % v) vals))))
 
 (defn- int-width-error [tname]
