@@ -8,7 +8,9 @@
    heap grew by one fixture -- ~400k datoms -- per file until the harness
    restarted it."
   (:require [clojure.test :refer [deftest is testing]]
-            [datahike.pg.cache :as pg-cache]))
+            [datahike.api :as d]
+            [datahike.pg.cache :as pg-cache]
+            [datahike.pg.schema :as schema]))
 
 (defn- collect!
   "Run the collector until `ref` clears, or give up."
@@ -51,3 +53,25 @@
     (is (= 3 (.size c)))
     (is (= (last objs) (.get c [(pg-cache/identity-key (last objs))])))
     (is (nil? (.get c [(pg-cache/identity-key (first objs))])))))
+
+(deftest ref-targets-do-not-keep-a-database-alive
+  ;; schema-hints carries the database it was read from
+  ;; (::catalog-db). The ref-targets cache keyed its inner map on the
+  ;; whole hints, so each entry held that database -- and the database
+  ;; holds its schema, the outer WeakHashMap's key, which therefore
+  ;; never became weakly reachable. Every database that had been
+  ;; queried stayed in memory: the second leak the pg_regress server
+  ;; showed after the shape-cache fix.
+  (let [ref (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+                       :schema-flexibility :write :keep-history? false}
+                  _ (d/create-database cfg)
+                  conn (d/connect cfg)
+                  _ (d/transact conn [{:db/ident :t/id :db/valueType :db.type/long
+                                       :db/cardinality :db.cardinality/one
+                                       :db/unique :db.unique/identity}])
+                  db (d/db conn)]
+              (schema/derive-ref-targets (:schema db) (schema/schema-hints db))
+              (d/release conn)
+              (d/delete-database cfg)
+              (java.lang.ref.WeakReference. db))]
+    (is (collect! ref) "the database is collectable once nothing but the cache saw it")))
