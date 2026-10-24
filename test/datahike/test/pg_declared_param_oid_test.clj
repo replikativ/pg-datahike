@@ -569,7 +569,8 @@
   (testing "a non-zero declared OID is returned verbatim, not re-inferred"
     (doseq [oid [oid-int2 oid-int4 oid-int8 oid-float4 oid-float8
                  oid-bool oid-numeric oid-varchar oid-date oid-text]]
-      (is (= [oid] (:param-oids (parse-describe-execute "SELECT $1" [oid] ["1"])))
+      (is (= [oid] (:param-oids (parse-describe-execute "SELECT $1" [oid]
+                                                        [(if (= oid oid-date) "2024-01-15" "1")])))
           (str "declared OID " oid " should survive Describe")))))
 
 (deftest undeclared-param-still-defaults-to-text
@@ -594,7 +595,10 @@
     (doseq [[oid typlen] [[oid-int2 2] [oid-int4 4] [oid-int8 8]
                           [oid-float4 4] [oid-float8 8] [oid-bool 1]
                           [oid-date 4] [oid-numeric -1] [oid-varchar -1]]]
-      (let [r (parse-describe-execute "SELECT $1" [oid] ["1"])]
+      ;; A date parameter must be a DATE: PostgreSQL rejects `1` at
+      ;; Bind, and so do we since text temporal parameters are read by
+      ;; their input function.
+      (let [r (parse-describe-execute "SELECT $1" [oid] [(if (= oid oid-date) "2024-01-15" "1")])]
         (is (= oid (:oid (first (:columns r))))
             (str "SELECT $1 declared " oid " should describe as " oid))
         (is (= typlen (:typlen (first (:columns r))))
