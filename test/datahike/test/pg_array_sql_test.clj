@@ -172,12 +172,12 @@
            (error-info "SELECT array_fill(1, array[2,2], '{}')")))))
 
 (deftest current-schemas-true
-  (testing "current_schemas(true) returns {public}"
-    (is (= [["{public}"]] (rows "SELECT current_schemas(true)")))))
+  (testing "current_schemas(true) includes the implicit catalog schema"
+    (is (= [["{pg_catalog,public}"]] (rows "SELECT current_schemas(true)")))))
 
 (deftest current-schemas-subscript-1
-  (testing "pgjdbc getSchemas idiom: (current_schemas(true))[1] → 'public'"
-    (is (= [["public"]] (rows "SELECT (current_schemas(true))[1]")))))
+  (testing "the implicit catalog schema is searched first"
+    (is (= [["pg_catalog"]] (rows "SELECT (current_schemas(true))[1]")))))
 
 (deftest current-schemas-false-subscript
   (is (= [["public"]] (rows "SELECT (current_schemas(false))[1]"))))

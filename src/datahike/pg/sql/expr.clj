@@ -1953,14 +1953,22 @@
         result-var)
 
       ;; --- Array-returning functions -------------------------------------
-      ;; current_schemas(bool) → name[]. We run with a single public
-      ;; schema; include_implicit differs conceptually in PG (true ⇒
-      ;; prepend pg_catalog) but both collapse to {public} here.
+      ;; current_schemas(bool) reports existing explicit path entries,
+      ;; optionally including pg_catalog in its implicit search position.
       (= fname "current_schemas")
-      (let [fn-param (symbol (str "?cur-schemas" (swap! (:var-counter ctx) inc)))
-            arg (or (first args) true)
-            impl-fn (fn [_include-implicit]
-                      (pg-arr/array :name ["public"]))]
+      (let [_ (params/session-dependent!)
+            state params/*session-state*
+            fn-param (symbol (str "?cur-schemas" (swap! (:var-counter ctx) inc)))
+            arg (if (seq args) (first args) true)
+            impl-fn (fn [include-implicit]
+                      (if (or (nil? include-implicit) (= :__null__ include-implicit))
+                        :__null__
+                        (let [path (vec (distinct (filter #{"public" "pg_catalog"}
+                                                          (or (some-> state deref :search-path)
+                                                              ["$user" "public"]))))]
+                          (pg-arr/array :name
+                                        (if (and include-implicit (not (some #{"pg_catalog"} path)))
+                                          (into ["pg_catalog"] path) path)))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj

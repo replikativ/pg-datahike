@@ -324,7 +324,7 @@
      ;; resolve. PG "char" (OID 18), like typtype.
      {:db/ident :pg_type/typdelim :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      ;; typnamespace: asyncpg's type-introspection INNER JOINs pg_namespace
-     ;; on it, so every type must carry one (all in `public` = 2200).
+     ;; on it, so every type must carry its actual namespace identity.
      {:db/ident :pg_type/typnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typbasetype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -334,14 +334,14 @@
      ;; the generated registry (pg_type.dat, verified against PostgreSQL
      ;; 17 type by type). type_sanity reads them, and once an unknown
      ;; catalog column raised (#306) its queries stopped running at all.
-     {:db/ident :pg_type/typinput :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
-     {:db/ident :pg_type/typoutput :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
-     {:db/ident :pg_type/typreceive :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
-     {:db/ident :pg_type/typsend :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
-     {:db/ident :pg_type/typmodin :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
-     {:db/ident :pg_type/typmodout :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
-     {:db/ident :pg_type/typanalyze :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
-     {:db/ident :pg_type/typsubscript :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typinput :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typoutput :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typreceive :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typsend :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typmodin :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typmodout :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typanalyze :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typsubscript :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
      {:db/ident :pg_type/typalign :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      {:db/ident :pg_type/typbyval :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typstorage :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
@@ -1434,6 +1434,12 @@
   [:typinput :typoutput :typreceive :typsend :typmodin :typmodout
    :typanalyze :typsubscript :typalign :typbyval :typstorage])
 
+(def ^:private type-handler-keys
+  (mapv #(keyword "pg_type" (name %)) (take 8 type-io-keys)))
+
+(defn- resolve-type-handlers [row]
+  (reduce (fn [r k] (update r k regoid/type-io-routine-oid)) row type-handler-keys))
+
 (defn- type-io-columns
   "pg_type's I/O, support and storage columns for a built-in type, from
    the generated registry; pgvector's `vector`, which PostgreSQL itself
@@ -1467,11 +1473,33 @@
 (defn- domain-type-io
   "A domain reads through domain_in / domain_recv and writes with its
    base type's output and send functions, and stores as the base does."
-  [base-oid]
-  (merge (type-io-columns base-oid)
+  [base-row]
+  (merge (select-keys base-row (conj (mapv #(keyword "pg_type" (name %)) type-io-keys)
+                                     :pg_type/typisdefined))
          {:pg_type/typinput "domain_in" :pg_type/typreceive "domain_recv"
           :pg_type/typmodin "-" :pg_type/typmodout "-" :pg_type/typanalyze "-"
           :pg_type/typsubscript "-"}))
+
+(defn- complete-type-rows [rows]
+  (let [by-oid (into {} (map (juxt :pg_type/oid identity)) rows)
+        ;; Domain chains can refer to enums, composite types or other domains.
+        ;; Resolve from the full projection rather than the builtin registry.
+        resolved (atom (into {} (remove #(= "d" (:pg_type/typtype (val %)))) by-oid))]
+    (mapv
+     (fn [row]
+       (loop [current row chain [] seen #{}]
+         (let [oid (:pg_type/oid current)]
+           (if-let [base (get @resolved oid)]
+             (let [result (reduce (fn [base domain]
+                                    (let [r (merge domain (domain-type-io base))]
+                                      (swap! resolved assoc (:pg_type/oid r) r)
+                                      r)) base (rseq chain))]
+               (resolve-type-handlers result))
+             (let [parent (get by-oid (:pg_type/typbasetype current))]
+               (when (or (nil? parent) (contains? seen oid))
+                 (throw (ex-info "Invalid domain base type chain" {:oid oid})))
+               (recur parent (conj chain current) (conj seen oid)))))))
+     rows)))
 
 (defn- complete-pg-class-rows
   "The pg_class columns every row has, by relkind, as PostgreSQL 17
@@ -1549,7 +1577,7 @@
                                                          (name->oid (str "_" tname)))
                                                        0))
                            :pg_type/typdelim ","
-                           :pg_type/typnamespace 2200
+                           :pg_type/typnamespace (if (= oid 16383) 2200 11)
                            (pgs/row-marker-attr "pg_type") true}
                           (type-io-columns oid))))
                      types/pg-type-catalog)
@@ -1607,23 +1635,21 @@
                (let [object (catalog-objects/object-by-identity
                              cte-db catalog-objects/pg-type-oid
                              catalog-objects/public-namespace-oid name)]
-                 (merge
-                  {:pg_type/oid (:datahike.pg.object/oid object)
-                   :pg_type/typname name
-                   :pg_type/typlen -1 :pg_type/typtype "d"
-                   :pg_type/typcategory "U" :pg_type/typispreferred false
-                   :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
-                   :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
-                   :pg_type/typnotnull (boolean not-null)
-                   :pg_type/typdelim "," :pg_type/typnamespace 2200
-                   (pgs/row-marker-attr "pg_type") true}
-                  (domain-type-io (pgs/resolve-type-oid cte-db base-type)))))
+                 {:pg_type/oid (:datahike.pg.object/oid object)
+                  :pg_type/typname name
+                  :pg_type/typlen -1 :pg_type/typtype "d"
+                  :pg_type/typcategory "U" :pg_type/typispreferred false
+                  :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
+                  :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
+                  :pg_type/typnotnull (boolean not-null)
+                  :pg_type/typdelim "," :pg_type/typnamespace 2200
+                  (pgs/row-marker-attr "pg_type") true}))
              (d/q '{:find [?name ?base ?not-null]
                     :where [[?e :datahike.pg.domain/name ?name]
                             [?e :datahike.pg.domain/base-type ?base]
                             [?e :datahike.pg.domain/not-null ?not-null]]}
                   cte-db)))]
-      (into base (concat composites enums row-types domains)))
+      (complete-type-rows (concat base composites enums row-types domains)))
     "pg_attribute"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           table-columns (catalog-table-columns cte-db tables)

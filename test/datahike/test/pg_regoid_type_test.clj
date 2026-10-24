@@ -77,13 +77,15 @@
     (is (nil? (regoid/input-or-nil "regprocedure" "abs(integer")))))
 
 (deftest extension-identities-remain-visible
-  (let [extensions (filter #(= 2200 (:namespace-oid %)) (regoid/routines nil))]
+  (let [extensions (filter #(= 2200 (:namespace-oid %)) (regoid/routines nil))
+        handlers #{"vector_in" "vector_out" "vector_typmod_in" "vector_recv" "vector_send"}]
     (is (= #{"vector_dims" "vector_norm" "l2_distance" "vector_l2_squared_distance"
              "l1_distance" "inner_product" "cosine_distance"}
-           (set (map :proname extensions))))
+           (set (remove handlers (map :proname extensions)))))
     (doseq [{:keys [oid proname]} extensions]
       (is (= oid (regoid/input "regproc" proname)))
-      (is (= oid (Math/abs (.hashCode ^String proname)))))))
+      (when-not (handlers proname)
+        (is (= oid (Math/abs (.hashCode ^String proname))))))))
 
 (deftest type-lexical-boundaries
   (doseq [s ["\"numeric" "\"numeric\"\"" "\"\""
