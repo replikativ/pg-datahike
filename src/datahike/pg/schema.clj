@@ -354,7 +354,14 @@
    Memoized — schema is value-typed and typically stable per conn, so
    recomputing per query is wasted work."
   [schema hints]
-  (let [hint-key (or hints {})
+  (let [;; Without ::catalog-db: schema-hints carries the database it
+        ;; was read from, and keying on it made each inner entry hold that
+        ;; database -- which holds its schema, the OUTER weak key, so the
+        ;; WeakHashMap could never release an entry. pg_regress drops a
+        ;; fixture database per file; this cache kept every one (557
+        ;; entries, ~400k datoms each, found by JFR's OldObjectSample
+        ;; paths). The derivation reads only the per-attribute hints.
+        hint-key (dissoc (or hints {}) ::catalog-db)
         ;; Two-level cache: outer is WeakHashMap by schema (releases
         ;; with conn); inner is HashMap by hints. Prevents the
         ;; cache-key vector from being GC'd-before-use that would
