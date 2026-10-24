@@ -247,9 +247,14 @@ Each step ships as PRs with the gates named in "Process per phase".
 Progress through 2026-10-23 is marked; each DONE item is gated by a
 corpus captured from PostgreSQL 17, named in its PR.
 
-1. **Re-measure** (`bb pg-regress-measure`, ~90 min, needs the machine).
-   Still open -- and worth more now: everything below marked DONE
-   landed after the 2026-10-02 numbers.
+1. **Re-measure** -- DONE 2026-10-24 (#350): mean 62.9% -> 64.4%, exact
+   10 -> 16, ~55 min. It first exhausted the machine: the server kept
+   every dropped fixture database (#345, #346, #348) and an infinite
+   timestamp series built eagerly (#345); the server heap is capped at
+   3 GB now (#351). It also found #306's catalog strictness costing psql
+   and the sanity files their output -- served columns in #347 -- and
+   two regressions of this campaign (localtime in UTC, pg_lsn without
+   input; #349).
 2. **CREATE TABLE AS through the shared SELECT executor** -- DONE (#334);
    INSERT ... SELECT too, where a materialising pass is needed.
 3. **TimeZone inside the datetime functions** -- DONE (#335, #338).
@@ -263,8 +268,10 @@ corpus captured from PostgreSQL 17, named in its PR.
    quoting, json by type. Open: dump.clj through `->pg-text`, the
    registry skeleton (1.2), binary send off our own text.
 6. **Phase 1.3 cutover** -- `pg_input_is_valid` / `pg_input_error_info`
-   DONE (#341). Open: money `:in`, temporal text parameters,
-   `parse-timestamp-string`'s last callers.
+   DONE (#341); temporal text parameters and money input DONE (#352);
+   pg_lsn input DONE (#349). Open: `parse-timestamp-string`'s last
+   callers (sql.clj's UNNEST fill passes text through on failure), and
+   typmod precision on temporal casts (backlog).
 7. **`format()` port** -- DONE (#342), with quote_identifier. VARIADIC is
    a parser gap (backlog).
 8. **Interval functions** -- DONE (#336: make_*, age, date_bin,
@@ -277,7 +284,9 @@ corpus captured from PostgreSQL 17, named in its PR.
    `now()`; code points; SRF row order through aggregates (backlog).
 10. **Phase 4 resolver** (relation/type/namespace/function, `to_reg*`,
     `has_*`), then **postgres_fdw stage 0** (EXPLAIN cost line, protocol
-    DEALLOCATE, size functions, parenthesized joins).
+    DEALLOCATE, size functions, parenthesized joins). The re-measure
+    makes `regproc` the first piece: type_sanity lost 10 points because
+    pg_type's I/O columns compare to oids and we have no regproc type.
 11. **plpgsql EXCEPTION** (on savepoints), then EXECUTE and GET
     DIAGNOSTICS -- `format()` is no longer in the way.
 12. Registry-driven resolution and float precision; then ARE.
