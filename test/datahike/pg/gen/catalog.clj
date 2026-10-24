@@ -88,7 +88,22 @@
                 :typelem (:typelem r)
                 :typcollation (get collation-oids (:typcollation r) 0)
                 :array-oid (some-> (:array_type_oid r) parse-long)
-                :typarray (:typarray r)})
+                :typarray (:typarray r)
+                ;; The I/O and support functions, as regproc names ("-"
+                ;; for none, pg_type.h's BKI_DEFAULT(-)).
+                :typinput (:typinput r)
+                :typoutput (:typoutput r)
+                :typreceive (:typreceive r "-")
+                :typsend (:typsend r "-")
+                :typmodin (:typmodin r "-")
+                :typmodout (:typmodout r "-")
+                :typanalyze (:typanalyze r "-")
+                :typsubscript (:typsubscript r "-")
+                ;; ALIGNOF_POINTER is 'd' on the 64-bit builds this mirrors
+                :typalign (if (= "ALIGNOF_POINTER" (:typalign r)) "d" (:typalign r))
+                ;; FLOAT8PASSBYVAL is true on the 64-bit builds this mirrors
+                :typbyval (contains? #{"t" "FLOAT8PASSBYVAL"} (:typbyval r))
+                :typstorage (:typstorage r "p")})
         arrays (for [t base :when (:array-oid t)]
                  {:oid (:array-oid t)
                   :typname (str "_" (:typname t))
@@ -98,7 +113,21 @@
                   :typispreferred false
                   :typdelim (:typdelim t)
                   :typelem (:typname t)
-                  :typcollation (:typcollation t)})
+                  :typcollation (:typcollation t)
+                  ;; Catalog.pm GenerateArrayTypes: BKI_ARRAY_DEFAULT where
+                  ;; pg_type.h gives one, the element's value otherwise, and
+                  ;; INT alignment unless the element needs DOUBLE.
+                  :typinput "array_in"
+                  :typoutput "array_out"
+                  :typreceive "array_recv"
+                  :typsend "array_send"
+                  :typmodin (:typmodin t)
+                  :typmodout (:typmodout t)
+                  :typanalyze "array_typanalyze"
+                  :typsubscript "array_subscript_handler"
+                  :typalign (if (= "d" (:typalign t)) "d" "i")
+                  :typbyval false
+                  :typstorage "x"})
         all (concat base arrays)
         name->oid (into {} (map (juxt :typname :oid)) all)]
     (->> all
@@ -151,16 +180,32 @@
        vec))
 
 (defn- operators [src type-oid]
-  (->> (read-dat src "pg_operator")
-       (map (fn [r] {:oid (parse-long (:oid r))
-                     :oprname (:oprname r)
-                     :kind (:oprkind r "b")
-                     :left (type-oid (:oprleft r "0"))
-                     :right (type-oid (:oprright r))
-                     :result (type-oid (:oprresult r))
-                     :code (:oprcode r)}))
-       (sort-by :oid)
-       vec))
+  (let [rows (read-dat src "pg_operator")
+        key-of (fn [r] [(:oprname r) (type-oid (:oprleft r "0")) (type-oid (:oprright r))])
+        by-key (into {} (map (juxt key-of #(parse-long (:oid %)))) rows)
+        ;; BKI_LOOKUP_OPT(pg_operator): `name(left,right)`, NONE for a
+        ;; missing side; absent is 0.
+        op-oid (fn [s]
+                 (if (or (nil? s) (= "0" s))
+                   0
+                   (let [[_ nm l r] (re-matches #"(.+)\((\w+),(\w+)\)" s)
+                         side #(if (= "NONE" %) 0 (type-oid %))]
+                     (or (get by-key [nm (side l) (side r)])
+                         (throw (ex-info "unknown operator" {:ref s}))))))]
+    (->> rows
+         (map (fn [r] {:oid (parse-long (:oid r))
+                       :oprname (:oprname r)
+                       :kind (:oprkind r "b")
+                       :left (type-oid (:oprleft r "0"))
+                       :right (type-oid (:oprright r))
+                       :result (type-oid (:oprresult r))
+                       :code (:oprcode r)
+                       :com (op-oid (:oprcom r))
+                       :negate (op-oid (:oprnegate r))
+                       :rest (:oprrest r "-")
+                       :join (:oprjoin r "-")}))
+         (sort-by :oid)
+         vec)))
 
 (defn- source-version [src]
   (let [configure (slurp (io/file src "configure.ac"))]
@@ -180,10 +225,12 @@
 (def columns
   "Column order of each table's rows in the generated file."
   {:types [:oid :typname :typlen :typtype :typcategory :typispreferred
-           :typdelim :typelem :typarray :typcollation]
+           :typdelim :typelem :typarray :typcollation
+           :typinput :typoutput :typreceive :typsend :typmodin :typmodout
+           :typanalyze :typsubscript :typalign :typbyval :typstorage]
    :casts [:source :target :context :method :func]
    :procs [:oid :proname :args :ret :kind :strict :volatile :retset :variadic]
-   :operators [:oid :oprname :kind :left :right :result :code]})
+   :operators [:oid :oprname :kind :left :right :result :code :com :negate :rest :join]})
 
 (defn sha256 [^String s]
   (let [md (java.security.MessageDigest/getInstance "SHA-256")]

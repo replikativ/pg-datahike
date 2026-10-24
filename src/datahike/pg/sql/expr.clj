@@ -123,7 +123,7 @@
 ;; Forward declarations for the mutually-recursive translate-* family.
 
 (declare jsonb-column? json-column? reject-json-operator!)
-(declare coerce-unknown-literal coerce-comparison-operands)
+(declare coerce-unknown-literal coerce-comparison-operands catalog-def-lookup!)
 
 (def ^:private ^:const max-inline-numeric-precision
   "BigDecimals wider than this travel as Datalog inputs instead of query-form
@@ -1887,47 +1887,12 @@
       ;; the surrounding SELECT composes correctly with WHERE / JOIN /
       ;; ORDER BY. Two-arg `column` form returns a single column name;
       ;; we don't model that yet — return the full def.
-      (= fname "pg_get_indexdef")
-      (let [arg-oid (or (first args) :__null__)
-            idx-eid (ctx/fresh-var! ctx)]
-        ;; Keep the lookup entity bound even when the NULL-synthesis pass
-        ;; turns its projected attributes into get-else clauses. Without an
-        ;; anchor, pg_get_indexdef(indexrelid) leaked an unbound Datahike
-        ;; variable while the surrounding pg_index scan was otherwise valid.
-        (swap! (:where-clauses ctx) conj
-               [idx-eid :pg_index/db-row-exists true])
-        (swap! (:where-clauses ctx) conj
-               [idx-eid :pg_index/indexrelid arg-oid])
-        (swap! (:where-clauses ctx) conj
-               [idx-eid :pg_index/indexdef result-var])
-        result-var)
-
-      ;; pg_get_constraintdef(oid [, pretty]) — same pattern as
-      ;; pg_get_indexdef. condef is pre-rendered at catalog-data time.
-      (= fname "pg_get_constraintdef")
-      (let [arg-oid (or (first args) :__null__)
-            con-eid (ctx/fresh-var! ctx)]
-        (swap! (:where-clauses ctx) conj
-               [con-eid :pg_constraint/db-row-exists true])
-        (swap! (:where-clauses ctx) conj
-               [con-eid :pg_constraint/oid arg-oid])
-        (swap! (:where-clauses ctx) conj
-               [con-eid :pg_constraint/condef result-var])
-        result-var)
-
-      ;; pg_get_triggerdef(oid [, pretty]) — same pattern again. It was
-      ;; a `(constantly :__null__)` stub, so anything reconstructing
-      ;; DDL from the catalog lost every trigger.
-      (= fname "pg_get_triggerdef")
-      (let [arg-oid (or (first args) :__null__)
-            trg-eid (ctx/fresh-var! ctx)]
-        (swap! (:where-clauses ctx) conj
-               [trg-eid :pg_trigger/db-row-exists true])
-        (swap! (:where-clauses ctx) conj
-               [trg-eid :pg_trigger/oid arg-oid])
-        (swap! (:where-clauses ctx) conj
-               [trg-eid :pg_trigger/tgdef result-var])
-        result-var)
+      (contains? #{"pg_get_indexdef" "pg_get_constraintdef" "pg_get_triggerdef"} fname)
+      (let [[key-attr def-attr] (case fname
+                                  "pg_get_indexdef" [:pg_index/indexrelid :pg_index/indexdef]
+                                  "pg_get_constraintdef" [:pg_constraint/oid :pg_constraint/condef]
+                                  "pg_get_triggerdef" [:pg_trigger/oid :pg_trigger/tgdef])]
+        (catalog-def-lookup! ctx (or (first args) :__null__) key-attr def-attr result-var))
 
       ;; pg_typeof(value) — PG returns regtype (text-formatted as
       ;; the type name). We resolve it at translate time using the
@@ -6477,6 +6442,33 @@
                         (seq (row-subquery-correlation-refs ctx inner)))
             parsed (analyze-scalar-subquery! ctx inner corr-refs)]
         (first (parsed-output-oids parsed))))))
+
+(defn- catalog-def-lookup!
+  "Bind `result-var` to the pre-rendered definition the catalog holds for
+   `oid` -- pg_get_indexdef / pg_get_constraintdef / pg_get_triggerdef --
+   or to NULL when it holds none.
+
+   These were inner joins against the catalog, so a NULL oid or one the
+   catalog does not name REMOVED THE ROW, where PostgreSQL answers NULL.
+   psql's \\d lists a table's indexes with
+   `pg_get_constraintdef(con.oid)` over a LEFT JOIN to pg_constraint, and
+   a plain index has no constraint: every index vanished from the
+   listing, and `SELECT pg_get_constraintdef(NULL::oid)` returned no row
+   at all. The two-armed `or-join` keeps the row either way. The variable
+   names are fresh per call, so two lookups in one statement cannot
+   capture each other's."
+  [ctx oid key-attr def-attr result-var]
+  (let [n (swap! (:var-counter ctx) inc)
+        a (symbol (str "?def-oid" n))
+        e (symbol (str "?def-e" n))
+        e2 (symbol (str "?def-e2-" n))]
+    (swap! (:where-clauses ctx) conj [(list 'identity oid) a])
+    (swap! (:where-clauses ctx) conj
+           (list 'or-join [a result-var]
+                 (list 'and [e key-attr a] [e def-attr result-var])
+                 (list 'and (list 'not-join [a] [e2 key-attr a])
+                       [(list 'ground :__null__) result-var])))
+    result-var))
 
 (defn- uncorrelated-scalar-var!
   "Bind an uncorrelated scalar subquery at query execution time."

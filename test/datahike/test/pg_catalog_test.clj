@@ -1104,10 +1104,12 @@
       (is (= "42703" (:sqlstate r)))
       (is (re-find #"this_column_never_existed" (or (:err r) "")))))
   (testing "a real PostgreSQL column we do not serve"
+    ;; relfilenode and typinput were here until psql and type_sanity
+    ;; demanded them; these four still are not served.
     (doseq [[rel col] [["pg_class" "relpages"]
-                       ["pg_class" "relfilenode"]
+                       ["pg_class" "reltuples"]
                        ["pg_attribute" "attlen"]
-                       ["pg_type" "typinput"]]]
+                       ["pg_type" "typdefault"]]]
       (is (= "42703" (:sqlstate (ex (str "SELECT r." col " FROM " rel " r"))))
           (str rel "." col " must raise, not answer NULL"))))
   (testing "a predicate over one no longer silently empties the result"

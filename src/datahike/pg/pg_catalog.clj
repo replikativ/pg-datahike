@@ -19,8 +19,11 @@
 
 (def types
   "pg_type rows: :oid :typname :typlen :typtype :typcategory
-   :typispreferred :typdelim :typelem :typarray :typcollation. Category
-   and type are one-letter strings, as in the catalog."
+   :typispreferred :typdelim :typelem :typarray :typcollation, and the
+   I/O and storage columns :typinput :typoutput :typreceive :typsend
+   :typmodin :typmodout :typanalyze :typsubscript (regproc names, \"-\"
+   for none) :typalign :typbyval :typstorage. Category and type are
+   one-letter strings, as in the catalog."
   (rows :types))
 
 (def casts
@@ -34,7 +37,8 @@
 
 (def operators
   "pg_operator rows: :oid :oprname :kind (b/l) :left (0 for prefix)
-   :right :result :code."
+   :right :result :code :com and :negate (operator OIDs, 0 for none)
+   :rest and :join (regproc names, \"-\" for none)."
   (rows :operators))
 
 (def type-by-oid (into {} (map (juxt :oid identity)) types))

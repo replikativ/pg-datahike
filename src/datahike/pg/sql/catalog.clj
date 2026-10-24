@@ -329,6 +329,22 @@
      {:db/ident :pg_type/typbasetype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typnotnull :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typcollation :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     ;; The I/O and support functions and the storage properties, from
+     ;; the generated registry (pg_type.dat, verified against PostgreSQL
+     ;; 17 type by type). type_sanity reads them, and once an unknown
+     ;; catalog column raised (#306) its queries stopped running at all.
+     {:db/ident :pg_type/typinput :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typoutput :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typreceive :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typsend :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typmodin :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typmodout :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typanalyze :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typsubscript :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_type/typalign :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_type/typbyval :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_type/typstorage :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_type/typisdefined :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_type") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_attribute"
     [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
@@ -354,6 +370,11 @@
      ;; PostgreSQL type storage strategy: p=plain, m=main, x=extended.
      ;; psql's \d+ renders this as Plain/Main/Extended.
      {:db/ident :pg_attribute/attstorage :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; psql's \d+ reads both. attcompression is the empty "char" when no
+     ;; compression method was set, which is always here; attstattarget is
+     ;; NULL by default since PostgreSQL 17, so it is declared, not filled.
+     {:db/ident :pg_attribute/attcompression :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_attribute/attstattarget :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
      ;; atttypmod: encodes NUMERIC(p, s) precision/scale (and varchar(n)
      ;; length when we add it). -1 = unconstrained — what real PG
      ;; reports for plain `NUMERIC` or `TEXT` columns. Drives
@@ -568,6 +589,12 @@
      {:db/ident :pg_operator/oprright :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_operator/oprresult :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_operator/oprcode :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     ;; From pg_operator.dat too, checked operator by operator against
+     ;; PostgreSQL 17; drop_operator and opr_sanity join on them.
+     {:db/ident :pg_operator/oprcom :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_operator/oprnegate :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_operator/oprrest :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_operator/oprjoin :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
      {:db/ident (pgs/row-marker-attr "pg_operator") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_cast"
@@ -665,6 +692,8 @@
      {:db/ident :pg_proc/pronargs :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_proc/prorettype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_proc/proargtypes :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; psql's \df filters on it; every row here is an ordinary function.
+     {:db/ident :pg_proc/prokind :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      {:db/ident (pgs/row-marker-attr "pg_proc") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_class"
     [;; Stable per-table OID — the primary key of pg_class. Populated
@@ -696,6 +725,29 @@
      ;; `WHERE relacl IS NOT NULL`, which must return no rows rather
      ;; than raise. Never populated.
      {:db/ident :pg_class/relacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
+     ;; What psql's \d, \dt, \di and \d+ read, filled for every row
+     ;; by `complete-pg-class-rows`. They raised 42703 once an unknown
+     ;; catalog column stopped answering NULL (#306), which cost psql.sql,
+     ;; generated, create_view and fast_default most of their \d output.
+     {:db/ident :pg_class/relowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_class/relam :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_class/relfilenode :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_class/reltablespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_class/reltoastrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_class/reloftype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_class/relchecks :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_class/relhasindex :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_class/relhasrules :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_class/relhassubclass :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_class/relrowsecurity :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_class/relforcerowsecurity :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_class/relispopulated :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_class/relpersistence :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_class/relreplident :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     ;; NULL in PostgreSQL unless set: no storage parameters, no
+     ;; partition bound. Declared so reading them is legal; never filled.
+     {:db/ident :pg_class/reloptions :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
+     {:db/ident :pg_class/relpartbound :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_node_tree"}
      {:db/ident (pgs/row-marker-attr "pg_class") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_index"
@@ -719,6 +771,9 @@
      {:db/ident :pg_index/indnkeyatts :db/valueType :db.type/long :db/cardinality :db.cardinality/one
       :pg/type "int2"}
      {:db/ident :pg_index/indisvalid :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     ;; psql's \d reads both; nothing is clustered or a replica identity here.
+     {:db/ident :pg_index/indisclustered :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_index/indisreplident :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      ;; indpred / indexprs are bytea in real PG but tested only for IS
      ;; NULL — a string column with "" (treated as non-null) works.
      ;; pgjdbc's query requires these to be NULL for a valid PK match,
@@ -937,6 +992,9 @@
     [{:db/ident :pg_constraint/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/conname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/contype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; The index a PRIMARY KEY / UNIQUE constraint is enforced by; 0 for
+     ;; a CHECK. psql's \d joins pg_index to pg_constraint on it.
+     {:db/ident :pg_constraint/conindid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/conrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/connamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/confrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -1371,6 +1429,95 @@
             columns)]))
      (sort-by key tables))))
 
+(def ^:private type-io-keys
+  [:typinput :typoutput :typreceive :typsend :typmodin :typmodout
+   :typanalyze :typsubscript :typalign :typbyval :typstorage])
+
+(defn- type-io-columns
+  "pg_type's I/O, support and storage columns for a built-in type, from
+   the generated registry; pgvector's `vector`, which PostgreSQL itself
+   does not ship, as its CREATE TYPE declares them."
+  [oid]
+  (let [t (or (pg-cat/type-by-oid oid)
+              (when (= oid 16383)
+                {:typinput "vector_in" :typoutput "vector_out" :typreceive "vector_recv"
+                 :typsend "vector_send" :typmodin "vector_typmod_in" :typmodout "-"
+                 :typanalyze "-" :typsubscript "-" :typalign "i" :typbyval false
+                 :typstorage "e"}))]
+    (when t
+      (assoc (into {} (map (fn [k] [(keyword "pg_type" (name k)) (get t k)])) type-io-keys)
+             :pg_type/typisdefined true))))
+
+(def ^:private record-type-io
+  "A composite or relation row type's, as PostgreSQL 17 fills them."
+  {:pg_type/typinput "record_in" :pg_type/typoutput "record_out"
+   :pg_type/typreceive "record_recv" :pg_type/typsend "record_send"
+   :pg_type/typmodin "-" :pg_type/typmodout "-" :pg_type/typanalyze "-"
+   :pg_type/typsubscript "-" :pg_type/typalign "d" :pg_type/typbyval false
+   :pg_type/typstorage "x" :pg_type/typisdefined true})
+
+(def ^:private enum-type-io
+  {:pg_type/typinput "enum_in" :pg_type/typoutput "enum_out"
+   :pg_type/typreceive "enum_recv" :pg_type/typsend "enum_send"
+   :pg_type/typmodin "-" :pg_type/typmodout "-" :pg_type/typanalyze "-"
+   :pg_type/typsubscript "-" :pg_type/typalign "i" :pg_type/typbyval true
+   :pg_type/typstorage "p" :pg_type/typisdefined true})
+
+(defn- domain-type-io
+  "A domain reads through domain_in / domain_recv and writes with its
+   base type's output and send functions, and stores as the base does."
+  [base-oid]
+  (merge (type-io-columns base-oid)
+         {:pg_type/typinput "domain_in" :pg_type/typreceive "domain_recv"
+          :pg_type/typmodin "-" :pg_type/typmodout "-" :pg_type/typanalyze "-"
+          :pg_type/typsubscript "-"}))
+
+(defn- complete-pg-class-rows
+  "The pg_class columns every row has, by relkind, as PostgreSQL 17
+   fills them (captured per relkind from a real server):
+
+     relowner        10, the bootstrap superuser, for every relation
+     relam           2 (heap) for r/m, 403 (btree) for i, else 0
+     relfilenode     the oid for r/m/i/S -- nothing has been rewritten --
+                     0 for v and c, which have no storage
+     relhasrules     true for v and m (their _RETURN rule)
+     relreplident    'd' for r/m, 'n' otherwise
+     relhasindex     whether pg_index names the relation
+     relchecks       its CHECK constraints, as pg_constraint lists them
+
+   reltoastrelid is 0. PostgreSQL's is non-zero for a table with a
+   toastable column, but it names a TOAST table, and there is none here
+   for it to name: a client that follows it must find nothing rather than
+   a dangling oid. Everything else is the default PostgreSQL gives a
+   relation with no options, no tablespace, no row security and no
+   inheritance children."
+  [cte-db user-schema rows]
+  (let [hints (pgs/schema-hints cte-db)
+        indexed (into #{}
+                      (map :relation-oid)
+                      (concat (native-index-descriptors cte-db user-schema hints)
+                              (explicit-index-descriptors cte-db)))
+        checks (frequencies (map first (d/q '{:find [?t ?e] :where [[?e :pg/check-table ?t]]} cte-db)))]
+    (mapv (fn [{kind :pg_class/relkind oid :pg_class/oid name :pg_class/relname :as row}]
+            (let [stored? (contains? #{"r" "m" "i" "S"} kind)]
+              (merge {:pg_class/relowner 10
+                      :pg_class/relam (case kind ("r" "m") 2 "i" 403 0)
+                      :pg_class/relfilenode (if stored? (long oid) 0)
+                      :pg_class/reltablespace 0
+                      :pg_class/reltoastrelid 0
+                      :pg_class/reloftype 0
+                      :pg_class/relchecks (long (if (= "r" kind) (get checks name 0) 0))
+                      :pg_class/relhasindex (contains? indexed oid)
+                      :pg_class/relhasrules (contains? #{"v" "m"} kind)
+                      :pg_class/relhassubclass false
+                      :pg_class/relrowsecurity false
+                      :pg_class/relforcerowsecurity false
+                      :pg_class/relispopulated true
+                      :pg_class/relpersistence "p"
+                      :pg_class/relreplident (if (contains? #{"r" "m"} kind) "d" "n")}
+                     row)))
+          rows)))
+
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
    per-table body; library consumers add more via the registry."
@@ -1388,20 +1535,22 @@
           base (mapv (fn [[oid tname tlen ttype]]
                        (let [elem (when (str/starts-with? tname "_")
                                     (name->oid (subs tname 1)))]
-                         {:pg_type/oid (long oid) :pg_type/typname tname
-                          :pg_type/typlen (long tlen) :pg_type/typtype ttype
-                          :pg_type/typcategory
-                          (name (or (when elem :A) (get types/oid->category oid :U)))
-                          :pg_type/typispreferred (contains? types/preferred-oids oid)
-                          :pg_type/typelem (long (or elem 0))
+                         (merge
+                          {:pg_type/oid (long oid) :pg_type/typname tname
+                           :pg_type/typlen (long tlen) :pg_type/typtype ttype
+                           :pg_type/typcategory
+                           (name (or (when elem :A) (get types/oid->category oid :U)))
+                           :pg_type/typispreferred (contains? types/preferred-oids oid)
+                           :pg_type/typelem (long (or elem 0))
                           ;; The array type whose element is this one:
                           ;; `int4` -> `_int4`. Arrays themselves have none.
-                          :pg_type/typarray (long (or (when-not elem
-                                                        (name->oid (str "_" tname)))
-                                                      0))
-                          :pg_type/typdelim ","
-                          :pg_type/typnamespace 2200
-                          (pgs/row-marker-attr "pg_type") true}))
+                           :pg_type/typarray (long (or (when-not elem
+                                                         (name->oid (str "_" tname)))
+                                                       0))
+                           :pg_type/typdelim ","
+                           :pg_type/typnamespace 2200
+                           (pgs/row-marker-attr "pg_type") true}
+                          (type-io-columns oid))))
                      types/pg-type-catalog)
           ;; User composite types (CREATE TYPE … AS (..)) — typtype 'c',
           ;; variable length, namespace public.
@@ -1410,23 +1559,27 @@
                                    (catalog-objects/object-by-identity
                                     cte-db catalog-objects/pg-class-oid
                                     catalog-objects/public-namespace-oid name)]
-                               {:pg_type/oid oid :pg_type/typname name
-                                :pg_type/typlen -1 :pg_type/typtype "c"
-                                :pg_type/typcategory "C" :pg_type/typispreferred false
-                                :pg_type/typelem 0 :pg_type/typarray 0
-                                :pg_type/typrelid
-                                (long (or (:datahike.pg.object/oid relation) 0))
-                                :pg_type/typdelim ","
-                                :pg_type/typnamespace 2200
-                                (pgs/row-marker-attr "pg_type") true}))
+                               (merge
+                                {:pg_type/oid oid :pg_type/typname name
+                                 :pg_type/typlen -1 :pg_type/typtype "c"
+                                 :pg_type/typcategory "C" :pg_type/typispreferred false
+                                 :pg_type/typelem 0 :pg_type/typarray 0
+                                 :pg_type/typrelid
+                                 (long (or (:datahike.pg.object/oid relation) 0))
+                                 :pg_type/typdelim ","
+                                 :pg_type/typnamespace 2200
+                                 (pgs/row-marker-attr "pg_type") true}
+                                record-type-io)))
                            (pgs/composite-types cte-db))
           enums (mapv (fn [{:keys [name oid]}]
-                        {:pg_type/oid oid :pg_type/typname name
-                         :pg_type/typlen 4 :pg_type/typtype "e"
-                         :pg_type/typcategory "E" :pg_type/typispreferred false
-                         :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typdelim ","
-                         :pg_type/typnamespace 2200
-                         (pgs/row-marker-attr "pg_type") true})
+                        (merge
+                         {:pg_type/oid oid :pg_type/typname name
+                          :pg_type/typlen 4 :pg_type/typtype "e"
+                          :pg_type/typcategory "E" :pg_type/typispreferred false
+                          :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typdelim ","
+                          :pg_type/typnamespace 2200
+                          (pgs/row-marker-attr "pg_type") true}
+                         enum-type-io))
                       (pgs/enum-types cte-db))
           row-types
           (mapv (fn [object]
@@ -1434,14 +1587,16 @@
                         relation (catalog-objects/object-by-identity
                                   cte-db catalog-objects/pg-class-oid
                                   catalog-objects/public-namespace-oid name)]
-                    {:pg_type/oid (:datahike.pg.object/oid object)
-                     :pg_type/typname name
-                     :pg_type/typlen -1 :pg_type/typtype "c"
-                     :pg_type/typcategory "C" :pg_type/typispreferred false
-                     :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid
-                     (long (or (:datahike.pg.object/oid relation) 0))
-                     :pg_type/typdelim "," :pg_type/typnamespace 2200
-                     (pgs/row-marker-attr "pg_type") true}))
+                    (merge
+                     {:pg_type/oid (:datahike.pg.object/oid object)
+                      :pg_type/typname name
+                      :pg_type/typlen -1 :pg_type/typtype "c"
+                      :pg_type/typcategory "C" :pg_type/typispreferred false
+                      :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid
+                      (long (or (:datahike.pg.object/oid relation) 0))
+                      :pg_type/typdelim "," :pg_type/typnamespace 2200
+                      (pgs/row-marker-attr "pg_type") true}
+                     record-type-io)))
                 (catalog-objects/objects-by-kind cte-db :row-type))
           domains
           (when (and cte-db
@@ -1451,15 +1606,17 @@
                (let [object (catalog-objects/object-by-identity
                              cte-db catalog-objects/pg-type-oid
                              catalog-objects/public-namespace-oid name)]
-                 {:pg_type/oid (:datahike.pg.object/oid object)
-                  :pg_type/typname name
-                  :pg_type/typlen -1 :pg_type/typtype "d"
-                  :pg_type/typcategory "U" :pg_type/typispreferred false
-                  :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
-                  :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
-                  :pg_type/typnotnull (boolean not-null)
-                  :pg_type/typdelim "," :pg_type/typnamespace 2200
-                  (pgs/row-marker-attr "pg_type") true}))
+                 (merge
+                  {:pg_type/oid (:datahike.pg.object/oid object)
+                   :pg_type/typname name
+                   :pg_type/typlen -1 :pg_type/typtype "d"
+                   :pg_type/typcategory "U" :pg_type/typispreferred false
+                   :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
+                   :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
+                   :pg_type/typnotnull (boolean not-null)
+                   :pg_type/typdelim "," :pg_type/typnamespace 2200
+                   (pgs/row-marker-attr "pg_type") true}
+                  (domain-type-io (pgs/resolve-type-oid cte-db base-type)))))
              (d/q '{:find [?name ?base ?not-null]
                     :where [[?e :datahike.pg.domain/name ?name]
                             [?e :datahike.pg.domain/base-type ?base]
@@ -1521,6 +1678,7 @@
                  :pg_attribute/attidentity ""
                  :pg_attribute/attgenerated ""
                  :pg_attribute/attstorage (attribute-storage (:oid f))
+                 :pg_attribute/attcompression ""
                  :pg_attribute/atttypmod
                  (long (or (:datahike.pg.column/typmod column) -1))
                  :pg_attribute/attisdropped false
@@ -1581,6 +1739,7 @@
            :pg_attribute/attidentity identity-code
            :pg_attribute/attgenerated (or (:generated col) "")
            :pg_attribute/attstorage (attribute-storage (:oid col))
+           :pg_attribute/attcompression ""
            :pg_attribute/atttypmod typmod
            :pg_attribute/attisdropped false
            (pgs/row-marker-attr "pg_attribute") true})
@@ -1605,6 +1764,7 @@
              :pg_attribute/atthasdef false
              :pg_attribute/attidentity ""
              :pg_attribute/attstorage (attribute-storage (:oid col))
+             :pg_attribute/attcompression ""
              :pg_attribute/atttypmod
              (long (or (:datahike.pg.column/typmod column-address)
                        (:typmod col) -1))
@@ -1625,6 +1785,7 @@
            :pg_attribute/atthasdef false
            :pg_attribute/attidentity ""
            :pg_attribute/attstorage "p"
+           :pg_attribute/attcompression ""
            :pg_attribute/atttypmod -1
            :pg_attribute/attisdropped true
            (pgs/row-marker-attr "pg_attribute") true}))))
@@ -1734,6 +1895,7 @@
              :pg_proc/pronargs (long nargs)
              :pg_proc/prorettype (long ret)
              :pg_proc/proargtypes (or args "")
+             :pg_proc/prokind "f"
              (pgs/row-marker-attr "pg_proc") true})
           [["now" "s" 0 1184 ""] ["current_timestamp" "s" 0 1184 ""]
            ["current_date" "s" 0 1082 ""] ["current_time" "s" 0 1266 ""]
@@ -1824,112 +1986,114 @@
            ["pg_database_size" "v" 1 20 "19"]
            ["pg_table_size" "v" 1 20 "26"]])
     "pg_class"
-    (into
+    (complete-pg-class-rows
+     cte-db user-schema
+     (into
      ;; A materialized view's rows live in an ordinary table, so it is
      ;; in table-names like any other -- but it is relkind 'm', which
      ;; is how psql's \\dm and every tool that distinguishes the two
      ;; tell them apart.
-     (let [matviews (into #{}
-                          (map first)
-                          (d/q '{:find [?n]
-                                 :where [[?e :datahike.pg.matview/name ?n]]}
-                               cte-db))]
-       (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
-         (mapv (fn [t]
-                 (let [tbl-oid (or (pgs/table-oid cte-db t)
-                                   (Math/abs (.hashCode ^String t)))
-                       row-type (catalog-objects/object-by-identity
-                                 cte-db catalog-objects/pg-type-oid
-                                 catalog-objects/public-namespace-oid t)]
-                   {:pg_class/oid (long tbl-oid)
-                    :pg_class/relname t
-                    :pg_class/relnamespace 2200
-                    :pg_class/relispartition false
-                    :pg_class/relkind (if (contains? matviews t) "m" "r")
-                    :pg_class/reltype
-                    (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                            (:datahike.pg.object/oid row-type) 0))
-                    :pg_class/relhastriggers (contains? triggered t)
-                    (pgs/row-marker-attr "pg_class") true}))
-               (pgs/table-names user-schema))))
+      (let [matviews (into #{}
+                           (map first)
+                           (d/q '{:find [?n]
+                                  :where [[?e :datahike.pg.matview/name ?n]]}
+                                cte-db))]
+        (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
+          (mapv (fn [t]
+                  (let [tbl-oid (or (pgs/table-oid cte-db t)
+                                    (Math/abs (.hashCode ^String t)))
+                        row-type (catalog-objects/object-by-identity
+                                  cte-db catalog-objects/pg-type-oid
+                                  catalog-objects/public-namespace-oid t)]
+                    {:pg_class/oid (long tbl-oid)
+                     :pg_class/relname t
+                     :pg_class/relnamespace 2200
+                     :pg_class/relispartition false
+                     :pg_class/relkind (if (contains? matviews t) "m" "r")
+                     :pg_class/reltype
+                     (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                             (:datahike.pg.object/oid row-type) 0))
+                     :pg_class/relhastriggers (contains? triggered t)
+                     (pgs/row-marker-attr "pg_class") true}))
+                (pgs/table-names user-schema))))
      ;; Composite types get a distinct backing pg_class row (relkind 'c');
      ;; pg_type.typrelid and pg_class.reltype link the two identities.
-     (into
-      (mapv (fn [{:keys [name oid]}]
-              (let [relation (catalog-objects/object-by-identity
-                              cte-db catalog-objects/pg-class-oid
-                              catalog-objects/public-namespace-oid name)]
-                {:pg_class/oid (long (or (:datahike.pg.object/oid relation) oid))
-                 :pg_class/relname name
-                 :pg_class/relnamespace 2200
-                 :pg_class/relispartition false
-                 :pg_class/relkind "c"
-                 :pg_class/reltype oid
-                 (pgs/row-marker-attr "pg_class") true}))
-            (pgs/composite-types cte-db))
+      (into
+       (mapv (fn [{:keys [name oid]}]
+               (let [relation (catalog-objects/object-by-identity
+                               cte-db catalog-objects/pg-class-oid
+                               catalog-objects/public-namespace-oid name)]
+                 {:pg_class/oid (long (or (:datahike.pg.object/oid relation) oid))
+                  :pg_class/relname name
+                  :pg_class/relnamespace 2200
+                  :pg_class/relispartition false
+                  :pg_class/relkind "c"
+                  :pg_class/reltype oid
+                  (pgs/row-marker-attr "pg_class") true}))
+             (pgs/composite-types cte-db))
       ;; Sequences are relations in PG (relkind 'S'), which is how
       ;; pg_dump, psql's \ds and ORM introspection find them at all —
       ;; without a row here a sequence is invisible to anything that
       ;; walks pg_class (issue #26).
-      (into
-       (mapv (fn [s]
-               (let [nm (:__seq__/name s)]
-                 {:pg_class/oid
-                  (long (or (:datahike.pg.object/oid
-                             (catalog-objects/object-by-identity
-                              cte-db catalog-objects/pg-class-oid
-                              catalog-objects/public-namespace-oid nm))
-                            (Math/abs (.hashCode ^String nm))))
-                  :pg_class/relname nm
-                  :pg_class/relnamespace 2200
-                  :pg_class/relispartition false
-                  :pg_class/relkind "S"
-                  :pg_class/reltype 0
-                  (pgs/row-marker-attr "pg_class") true}))
-             (sequence-entities cte-db))
-       (concat
-        (mapv (fn [{:keys [name]}]
-                (let [relation (catalog-objects/object-by-identity
-                                cte-db catalog-objects/pg-class-oid
-                                catalog-objects/public-namespace-oid name)
-                      row-type (catalog-objects/object-by-identity
-                                cte-db catalog-objects/pg-type-oid
-                                catalog-objects/public-namespace-oid name)]
+       (into
+        (mapv (fn [s]
+                (let [nm (:__seq__/name s)]
                   {:pg_class/oid
-                   (long (or (:datahike.pg.object/oid relation)
-                             (Math/abs (.hashCode ^String name))))
-                   :pg_class/relname name
+                   (long (or (:datahike.pg.object/oid
+                              (catalog-objects/object-by-identity
+                               cte-db catalog-objects/pg-class-oid
+                               catalog-objects/public-namespace-oid nm))
+                             (Math/abs (.hashCode ^String nm))))
+                   :pg_class/relname nm
                    :pg_class/relnamespace 2200
                    :pg_class/relispartition false
-                   :pg_class/relkind "v"
-                   :pg_class/reltype
-                   (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                           (:datahike.pg.object/oid row-type) 0))
+                   :pg_class/relkind "S"
+                   :pg_class/reltype 0
                    (pgs/row-marker-attr "pg_class") true}))
-              (view-entities cte-db))
-        (mapv (fn [object]
-                {:pg_class/oid (:datahike.pg.object/oid object)
-                 :pg_class/relname (:datahike.pg.object/name object)
-                 :pg_class/relnamespace 2200
-                 :pg_class/relispartition false
-                 :pg_class/relkind "i"
-                 :pg_class/reltype 0
-                 (pgs/row-marker-attr "pg_class") true})
-              (catalog-objects/objects-by-kind cte-db :index))
+              (sequence-entities cte-db))
+        (concat
+         (mapv (fn [{:keys [name]}]
+                 (let [relation (catalog-objects/object-by-identity
+                                 cte-db catalog-objects/pg-class-oid
+                                 catalog-objects/public-namespace-oid name)
+                       row-type (catalog-objects/object-by-identity
+                                 cte-db catalog-objects/pg-type-oid
+                                 catalog-objects/public-namespace-oid name)]
+                   {:pg_class/oid
+                    (long (or (:datahike.pg.object/oid relation)
+                              (Math/abs (.hashCode ^String name))))
+                    :pg_class/relname name
+                    :pg_class/relnamespace 2200
+                    :pg_class/relispartition false
+                    :pg_class/relkind "v"
+                    :pg_class/reltype
+                    (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                            (:datahike.pg.object/oid row-type) 0))
+                    (pgs/row-marker-attr "pg_class") true}))
+               (view-entities cte-db))
+         (mapv (fn [object]
+                 {:pg_class/oid (:datahike.pg.object/oid object)
+                  :pg_class/relname (:datahike.pg.object/name object)
+                  :pg_class/relnamespace 2200
+                  :pg_class/relispartition false
+                  :pg_class/relkind "i"
+                  :pg_class/reltype 0
+                  (pgs/row-marker-attr "pg_class") true})
+               (catalog-objects/objects-by-kind cte-db :index))
         ;; The IMPLICIT indexes -- a PRIMARY KEY's and a UNIQUE column's --
         ;; are relations in PostgreSQL too, and pgjdbc's getPrimaryKeys
         ;; joins pg_class a second time to read the index's name out of
         ;; them. Same descriptors pg_index and pg_indexes use, so the oid
         ;; it joins on and the name it reports cannot drift apart.
-        (mapv (fn [{:keys [oid name]}]
-                {:pg_class/oid oid
-                 :pg_class/relname name
-                 :pg_class/relnamespace 2200
-                 :pg_class/relispartition false
-                 :pg_class/relkind "i"
-                 :pg_class/reltype 0
-                 (pgs/row-marker-attr "pg_class") true})
-              (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db)))))))
+         (mapv (fn [{:keys [oid name]}]
+                 {:pg_class/oid oid
+                  :pg_class/relname name
+                  :pg_class/relnamespace 2200
+                  :pg_class/relispartition false
+                  :pg_class/relkind "i"
+                  :pg_class/reltype 0
+                  (pgs/row-marker-attr "pg_class") true})
+               (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db))))))))
     "pg_tables"
     ;; `hastriggers` was hard-coded false, which is what a client reads
     ;; to decide whether to look in pg_trigger at all.
@@ -2108,7 +2272,7 @@
           [[1663 "pg_default"] [1664 "pg_global"]])
 
     "pg_operator"
-    (mapv (fn [{:keys [oid oprname kind left right result code]}]
+    (mapv (fn [{:keys [oid oprname kind left right result code com negate rest join]}]
             {:pg_operator/oid oid :pg_operator/oprname oprname
              :pg_operator/oprnamespace 11 :pg_operator/oprowner pg-role-oid
              :pg_operator/oprkind kind
@@ -2116,6 +2280,8 @@
              :pg_operator/oprleft (or left 0) :pg_operator/oprright (or right 0)
              :pg_operator/oprresult (or result 0)
              :pg_operator/oprcode (str code)
+             :pg_operator/oprcom (long com) :pg_operator/oprnegate (long negate)
+             :pg_operator/oprrest (str rest) :pg_operator/oprjoin (str join)
              (pgs/row-marker-attr "pg_operator") true})
           pg-cat/operators)
 
@@ -2360,6 +2526,8 @@
              :pg_index/indisprimary primary?
              :pg_index/indisunique unique?
              :pg_index/indisvalid true
+             :pg_index/indisclustered false
+             :pg_index/indisreplident false
              :pg_index/indpred ""
              :pg_index/indexprs ""
              :pg_index/indexdef indexdef
@@ -2375,6 +2543,8 @@
              :pg_index/indisprimary false
              :pg_index/indisunique unique?
              :pg_index/indisvalid valid?
+             :pg_index/indisclustered false
+             :pg_index/indisreplident false
              :pg_index/indpred ""
              :pg_index/indexprs ""
              :pg_index/indexdef indexdef
@@ -2567,6 +2737,11 @@
           ;; bare/native databases usable before handler migration.
           attnum-for (fn [tname col-name]
                        (pgs/column-attnum user-schema tname col-name hints))
+          ;; A key constraint and its index share a name (`t_pkey`,
+          ;; `t_c_key`), which is how the two descriptors meet.
+          index-oids (into {}
+                           (map (fn [{:keys [table name oid]}] [[table name] oid]))
+                           (native-index-descriptors cte-db user-schema hints))
           ->conkey   (fn [attnums]
                        ;; PG int2[] text form: "{1,2}" — already PG's
                        ;; canonical wire encoding for an int2[] column.
@@ -2593,6 +2768,7 @@
           {:pg_constraint/oid           (long (->oid contype cname tname))
            :pg_constraint/conname       cname
            :pg_constraint/contype       contype
+           :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
            :pg_constraint/conrelid      (long tbl-oid)
            :pg_constraint/connamespace  2200
            :pg_constraint/confrelid     0
@@ -2629,6 +2805,7 @@
           {:pg_constraint/oid           (long (->oid contype cname tname))
            :pg_constraint/conname       cname
            :pg_constraint/contype       contype
+           :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
            :pg_constraint/conrelid      (long tbl-oid)
            :pg_constraint/connamespace  2200
            :pg_constraint/confrelid     0
@@ -2647,6 +2824,7 @@
           {:pg_constraint/oid           (long (->oid "c" cname tname))
            :pg_constraint/conname       cname
            :pg_constraint/contype       "c"
+           :pg_constraint/conindid      0
            :pg_constraint/conrelid      (long tbl-oid)
            :pg_constraint/connamespace  2200
            :pg_constraint/confrelid     0
