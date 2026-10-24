@@ -101,6 +101,7 @@
 (def sql-eq3?                            fns/sql-eq3?)
 (def sql-eq?                             fns/sql-eq?)
 (def sql-extract                         fns/sql-extract)
+(def sql-extract-date                    fns/sql-extract-date)
 (def sql-f4*                             fns/sql-f4*)
 (def sql-f4+                             fns/sql-f4+)
 (def sql-f4-                             fns/sql-f4-)

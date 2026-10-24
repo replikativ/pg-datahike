@@ -1,5 +1,6 @@
 ;; Captured from PostgreSQL 17 under TimeZone America/Los_Angeles: the SQL
-;; value functions read in the session zone, time/timetz extract, and pg_lsn_in. [sql result error-substring]
+;; value functions read in the session zone, time/timetz/date extract,
+;; date_trunc over interval and time, and pg_lsn_in. [sql result error-substring]
 {:zone "America/Los_Angeles"
  :corpus [
   ["SELECT now()::time::text = localtime::text" "t" nil]
@@ -30,4 +31,11 @@
   ["SELECT extract(timezone from '10:00'::time)" nil "unit \"timezone\" not supported for type time without time zone"]
   ["SELECT extract(fortnight from '10:00'::time)" nil "unit \"fortnight\" not recognized for type time without time zone"]
   ["SELECT date_part('hour', '10:00'::time)" "10" nil]
+  ["SELECT date_trunc('day', interval '13:45:07.25'), date_trunc('hour', interval '13:45:07.25'), date_trunc('year', interval '3 years 5 months 2 days'), date_trunc('decade', interval '-17 years -3 mons')" "00:00:00|13:00:00|3 years|-10 years" nil]
+  ["SELECT date_trunc('hour', '13:45:07.25'::time), pg_typeof(date_trunc('hour', '13:45:07.25'::time))" "13:00:00|interval" nil]
+  ["SELECT date_trunc('quarter', interval '1 year 5 months'), date_trunc('millisecond', interval '1.234567 sec')" "1 year 3 mons|00:00:01.234" nil]
+  ["SELECT date_trunc('week', interval '3 days')" nil "unit \"week\" not supported for type interval"]
+  ["SELECT date_trunc('fortnight', interval '3 days')" nil "unit \"fortnight\" not recognized for type interval"]
+  ["SELECT extract(hour from date '2024-02-29')" nil "unit \"hour\" not supported for type date"]
+  ["SELECT extract(day from date '2024-02-29'), date_part('hour', date '2024-02-29')" "29|0" nil]
  ]}

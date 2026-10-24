@@ -1,0 +1,10 @@
+;; Captured from PostgreSQL 17: money as an array element. [sql result-or-nil error-substring-or-nil]
+{:corpus [
+ ["SELECT '{$1.50,2}'::money[]" "{$1.50,$2.00}" nil]
+ ["SELECT ('{$1.50,2}'::money[])[1] + '1'::money" "$2.50" nil]
+ ["SELECT '{abc}'::money[]" nil "invalid input syntax for type money: \"abc\""]
+ ["SELECT pg_input_is_valid('{$1,x}', 'money[]')" "f" nil]
+ ["SELECT pg_input_is_valid('{$1,2}', 'money[]')" "t" nil]
+ ["SELECT '{\"($1,234.5)\"}'::money[]" "{\"-$1,234.50\"}" nil]
+ ["SELECT array_length('{1,2,3}'::money[], 1)" "3" nil]
+]}

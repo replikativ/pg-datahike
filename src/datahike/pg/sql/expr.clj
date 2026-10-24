@@ -2404,6 +2404,16 @@
                                                     java.time.ZoneOffset/UTC)]
                                    (.toLocalDateTime ^java.time.ZonedDateTime (trunc-zdt unit zdt)))
 
+                                 ;; date_trunc(text, interval) -- and a time,
+                                 ;; which resolves to it through the implicit
+                                 ;; time -> interval cast.
+                                 ((requiring-resolve 'datahike.pg.interval.core/interval?) ts)
+                                 (fns/interval-trunc prec ts)
+                                 (instance? java.time.LocalTime ts)
+                                 (fns/interval-trunc
+                                  prec ((requiring-resolve 'datahike.pg.interval.core/interval)
+                                        0 0 (quot (.toNanoOfDay ^java.time.LocalTime ts) 1000)))
+
                                  (number? ts)
                                  (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
                                                     java.time.ZoneOffset/UTC)
@@ -7742,9 +7752,13 @@
     (let [^ExtractExpression e expr
           v (translate-expr ctx (.getExpression e))
           v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
-      (if-let [zone (timestamptz-zone ctx (.getExpression e))]
-        (list 'datahike.pg.query-fns/sql-extract (str (.getName e)) v zone)
-        (list 'datahike.pg.query-fns/sql-extract (str (.getName e)) v)))
+      (cond
+        (= types/oid-date (source-oid ctx (.getExpression e)))
+        (list 'datahike.pg.query-fns/sql-extract-date (str (.getName e)) v)
+        :else
+        (if-let [zone (timestamptz-zone ctx (.getExpression e))]
+          (list 'datahike.pg.query-fns/sql-extract (str (.getName e)) v zone)
+          (list 'datahike.pg.query-fns/sql-extract (str (.getName e)) v))))
 
     ;; TRIM([LEADING|TRAILING|BOTH] [chars] FROM s) is also its own node.
     ;; With a FROM, `.getExpression` is the CHARACTER SET and
