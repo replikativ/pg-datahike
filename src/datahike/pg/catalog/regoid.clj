@@ -384,29 +384,59 @@
   ;; Preserve the existing extension catalog identities when replacing the
   ;; old hand-written pg_proc projection. These are executable functions;
   ;; PostgreSQL's core catalog does not describe their extension-assigned OIDs.
-  (mapv (fn [[name args ret]]
-          {:oid (long (Math/abs (.hashCode ^String name))) :proname name
-           :args args :ret ret :namespace-oid 2200 :kind "f"
-           :strict true :volatile "i" :retset false})
-        [["vector_dims" [16383] 23]
-         ["vector_norm" [16383] 701]
-         ["l2_distance" [16383 16383] 701]
-         ["vector_l2_squared_distance" [16383 16383] 701]
-         ["l1_distance" [16383 16383] 701]
-         ["inner_product" [16383 16383] 701]
-         ["cosine_distance" [16383 16383] 701]]))
+  (into (mapv (fn [[name args ret]]
+                {:oid (long (Math/abs (.hashCode ^String name))) :proname name
+                 :args args :ret ret :namespace-oid 2200 :kind "f"
+                 :strict true :volatile "i" :retset false})
+              [["vector_dims" [16383] 23]
+               ["vector_norm" [16383] 701]
+               ["l2_distance" [16383 16383] 701]
+               ["vector_l2_squared_distance" [16383 16383] 701]
+               ["l1_distance" [16383 16383] 701]
+               ["inner_product" [16383 16383] 701]
+               ["cosine_distance" [16383 16383] 701]])
+        ;; pgvector 0.8.0's vector--0.8.0.sql. These describe catalog
+        ;; handlers, not SQL-call dispatch. Their fixed pg-datahike OIDs
+        ;; occupy the reserved interval immediately below vector (16383)
+        ;; and the transactional user allocator (16384).
+        (mapv (fn [[oid name args ret]]
+                {:oid oid :proname name :args args :ret ret
+                 :namespace-oid 2200 :kind "f" :strict true
+                 :volatile "i" :retset false})
+              [[16378 "vector_in" [2275 26 23] 16383]
+               [16379 "vector_out" [16383] 2275]
+               [16380 "vector_typmod_in" [1263] 23]
+               [16381 "vector_recv" [2281 26 23] 16383]
+               [16382 "vector_send" [16383] 17]])))
 
 (def ^:private builtins
-  (into (mapv #(assoc % :namespace-oid 11) catalog/procs) extensions))
+  (let [rows (into (mapv #(assoc % :namespace-oid 11) catalog/procs) extensions)]
+    (when-not (= (count rows) (count (set (map :oid rows))))
+      (throw (ex-info "Duplicate static routine OID" {})))
+    rows))
 
 (def ^:private builtins-by-oid (into {} (map (juxt :oid identity)) builtins))
 (def ^:private builtins-by-name (group-by :proname builtins))
+
+(defn type-io-routine-oid
+  "Resolve a static pg_type handler reference independently of search_path.
+   Missing handlers are zero; unknown or ambiguous registry names are errors."
+  [name]
+  (if (= name "-")
+    0
+    (let [matches (get builtins-by-name name)]
+      (when-not (= 1 (count matches))
+        (throw (ex-info "Invalid catalog type handler reference" {:name name})))
+      (:oid (first matches)))))
 
 (defn- stored-routine [db e]
   (let [ent (d/entity db e)
         full-name (:datahike.pg.function/name ent)
         ;; CREATE FUNCTION currently persists public routines by bare name.
-        returns (edn/read-string (:datahike.pg.function/return-type ent))]
+        returns (edn/read-string (:datahike.pg.function/return-type ent))
+        oid (:datahike.pg.function/oid ent)]
+    (when (contains? builtins-by-oid oid)
+      (fail! "23505" (str "routine OID " oid " conflicts with a static catalog identity")))
     {:oid (:datahike.pg.function/oid ent) :proname full-name
      :namespace-oid 2200
      ;; Stored definitions currently belong to public and keep type spellings.
