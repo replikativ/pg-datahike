@@ -120,6 +120,8 @@ for f in $FILES; do
     restart_server || { echo "server did not come back" >&2; exit 1; }
   fi
   n=$((n+1))
+  printf "\r[%3d] %-28s" "$n" "$f" >&2
+  touch "$STAMP"
   # Run fixture-producing predecessors before their consumers, in the
   # pinned schedule's order and in the same disposable database. Only
   # the target file's output is collected below. test_setup already
