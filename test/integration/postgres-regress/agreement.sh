@@ -122,52 +122,19 @@ for f in $FILES; do
   n=$((n+1))
   printf "\r[%3d] %-28s" "$n" "$f" >&2
   touch "$STAMP"
-  # `geometry` reads `box_tbl`, which `box` creates -- real PostgreSQL
-  # runs the schedule against one database, so it is there. Running the
-  # prerequisite first in the same disposable database is all that
-  # takes; the fixture runner already accepts several targets.
-  #
-  # It does not move the number and is not meant to. It stops the
-  # residual reporting a harness artifact where a real gap hides:
-  # `geometry` blocked on `relation "box_tbl" does not exist` and now
-  # blocks on the SAME LINE with `function center(text) does not
-  # exist`, which is the thing worth fixing.
-  #
-  # TWO files, out of 174. I measured before writing this, and then
-  # again after, because the first count was wrong:
-  #
-  #   24 files have a missing relation as their first blocker;
-  #   13 are unimplemented CATALOGS (pg_operator, pg_statistic,
-  #      pg_ts_parser, information_schema.views, …);
-  #    9 are the file's own object, whose CREATE failed earlier;
-  #    1 is `with` wanting `q1`, which is a CTE, not a table;
-  #    1 is this.
-  #
-  # That last line read "1 is this" until `numeric_big` turned up below,
-  # and it was wrong: the inventory ranked files by the first blocker a
-  # SELECT hit, and `numeric_big`'s is a DROP. A statement that fails
-  # because another file owns the object counts whatever its verb.
-  #
-  # `select_views` looked like a third case -- it wants `street` from
-  # `create_view` -- but pairing them changes nothing: `CREATE VIEW
-  # street` fails on `?#`, an operator we do not parse. Its relation is
-  # missing because of us, not because of isolation.
-  #
-  # `numeric_big` is the second case, found the same way: its first ten
-  # statements are `DROP TABLE num_data;` and friends -- tables that
-  # `numeric` CREATES and never drops, which is why PostgreSQL's own
-  # schedule puts them in one database. Ten `ERROR:  table "num_data"
-  # does not exist` lines, and nothing to learn from any of them.
-  #
-  # Pairing does NOT make the file exact, and the residual it exposes is
-  # worth more than the ten lines it removes: `ln(x::numeric)` is
-  # computed in a DOUBLE, so `ln('1.0e400')` overflows to Infinity and
-  # the statement dies, and the 800-decimal LN/LOG10/POW checks differ
-  # from the eleventh significant digit on. See doc/backlog.md.
+  # Run fixture-producing predecessors before their consumers, in the
+  # pinned schedule's order and in the same disposable database. Only
+  # the target file's output is collected below. test_setup already
+  # provides point_tbl; the other geometry and datetime fixtures come
+  # from the explicit predecessors here. A prerequisite can itself fail;
+  # its consumer's remaining errors then describe that compatibility gap.
   case "$f" in
-    geometry)    targets="box $f" ;;
-    numeric_big) targets="numeric $f" ;;
-    *)           targets="$f" ;;
+    geometry)     targets="lseg line box path polygon circle $f" ;;
+    horology)     targets="date time timetz timestamp timestamptz interval $f" ;;
+    join)         targets="create_table create_misc $f" ;;
+    select_views) targets="create_view $f" ;;
+    numeric_big)  targets="numeric $f" ;;
+    *)            targets="$f" ;;
   esac
   # A file killed by this limit still leaves a PARTIAL .out, newer than
   # the stamp, so collecting it would measure how fast this machine is.
