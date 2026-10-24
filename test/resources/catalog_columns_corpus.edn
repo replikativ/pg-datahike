@@ -1,0 +1,50 @@
+;; Captured from PostgreSQL 17 (psql -At, rows by newline, columns by |).
+;; The catalog columns psql's \d / \df and the sanity regression files read.
+{:setup [
+  "CREATE TABLE cc_t (a int PRIMARY KEY, b text CHECK (b <> ''), c int UNIQUE)"
+  "CREATE INDEX cc_t_b ON cc_t (b)"
+  "CREATE VIEW cc_v AS SELECT a FROM cc_t"
+  "CREATE SEQUENCE cc_s"
+  "CREATE TABLE cc_plain (x int)"
+ ]
+ :corpus [
+  ["SELECT relname, relkind, relowner, relam, relfilenode <> 0, reltoastrelid = 0 OR relkind = 'r', relchecks, relhasindex, relhasrules, relrowsecurity, relforcerowsecurity, reltablespace, reloftype, relpersistence, relreplident, relispopulated, relhassubclass, reloptions IS NULL, relpartbound IS NULL FROM pg_class WHERE relname IN ('cc_t','cc_t_b','cc_t_pkey','cc_t_c_key','cc_v','cc_s','cc_plain') ORDER BY relname" "cc_plain|r|10|2|t|t|0|f|f|f|f|0|0|p|d|t|f|t|t
+cc_s|S|10|0|t|t|0|f|f|f|f|0|0|p|n|t|f|t|t
+cc_t|r|10|2|t|t|1|t|f|f|f|0|0|p|d|t|f|t|t
+cc_t_b|i|10|403|t|t|0|f|f|f|f|0|0|p|n|t|f|t|t
+cc_t_c_key|i|10|403|t|t|0|f|f|f|f|0|0|p|n|t|f|t|t
+cc_t_pkey|i|10|403|t|t|0|f|f|f|f|0|0|p|n|t|f|t|t
+cc_v|v|10|0|f|t|0|f|t|f|f|0|0|p|n|t|f|t|t"]
+  ["SELECT c.relowner, c.relam, c.relhasindex FROM pg_class c WHERE c.relname = 'cc_t'" "10|2|t"]
+  ["SELECT a.attname, a.attcompression = '', a.attstattarget IS NULL FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'cc_t' AND a.attnum > 0 ORDER BY a.attnum" "a|t|t
+b|t|t
+c|t|t"]
+  ["SELECT c2.relname, i.indisclustered, i.indisreplident, i.indisprimary, i.indisunique FROM pg_class c, pg_class c2, pg_index i WHERE c.relname = 'cc_t' AND c.oid = i.indrelid AND i.indexrelid = c2.oid ORDER BY c2.relname" "cc_t_b|f|f|f|f
+cc_t_c_key|f|f|f|t
+cc_t_pkey|f|f|t|t"]
+  ["SELECT c2.relname, pg_get_constraintdef(con.oid, true), con.contype FROM pg_class c, pg_class c2, pg_index i LEFT JOIN pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x')) WHERE c.relname = 'cc_t' AND c.oid = i.indrelid AND i.indexrelid = c2.oid ORDER BY i.indisprimary DESC, c2.relname" "cc_t_pkey|PRIMARY KEY (a)|p
+cc_t_b||
+cc_t_c_key|UNIQUE (c)|u"]
+  ["SELECT conname, contype, conindid <> 0 FROM pg_constraint WHERE conrelid = 'cc_t'::regclass ORDER BY conname" "cc_t_b_check|c|f
+cc_t_c_key|u|t
+cc_t_pkey|p|t"]
+  ["SELECT pg_get_constraintdef(NULL::oid) IS NULL, pg_get_indexdef(NULL::oid) IS NULL, pg_get_triggerdef(NULL::oid) IS NULL" "t|t|t"]
+  ["SELECT typname, typinput, typoutput, typreceive, typsend, typmodin, typmodout, typanalyze, typsubscript, typalign, typbyval, typstorage, typisdefined FROM pg_type WHERE typname IN ('int4','text','numeric','_int4','varchar','timestamptz','jsonb','name','bool','float8') ORDER BY typname" "_int4|array_in|array_out|array_recv|array_send|-|-|array_typanalyze|array_subscript_handler|i|f|x|t
+bool|boolin|boolout|boolrecv|boolsend|-|-|-|-|c|t|p|t
+float8|float8in|float8out|float8recv|float8send|-|-|-|-|d|t|p|t
+int4|int4in|int4out|int4recv|int4send|-|-|-|-|i|t|p|t
+jsonb|jsonb_in|jsonb_out|jsonb_recv|jsonb_send|-|-|-|jsonb_subscript_handler|i|f|x|t
+name|namein|nameout|namerecv|namesend|-|-|-|raw_array_subscript_handler|c|f|p|t
+numeric|numeric_in|numeric_out|numeric_recv|numeric_send|numerictypmodin|numerictypmodout|-|-|i|f|m|t
+text|textin|textout|textrecv|textsend|-|-|-|-|i|f|x|t
+timestamptz|timestamptz_in|timestamptz_out|timestamptz_recv|timestamptz_send|timestamptztypmodin|timestamptztypmodout|-|-|d|t|p|t
+varchar|varcharin|varcharout|varcharrecv|varcharsend|varchartypmodin|varchartypmodout|-|-|i|f|x|t"]
+  ["SELECT o.oprname, l.typname, r.typname, c.oprname, n.oprname, o.oprrest, o.oprjoin FROM pg_operator o JOIN pg_type l ON l.oid = o.oprleft JOIN pg_type r ON r.oid = o.oprright LEFT JOIN pg_operator c ON c.oid = o.oprcom LEFT JOIN pg_operator n ON n.oid = o.oprnegate WHERE o.oprname IN ('=','<','<>') AND l.typname = 'int4' AND r.typname IN ('int4','int8') ORDER BY 1, 3" "<|int4|int4|>|>=|scalarltsel|scalarltjoinsel
+<|int4|int8|>|>=|scalarltsel|scalarltjoinsel
+<>|int4|int4|<>|=|neqsel|neqjoinsel
+<>|int4|int8|<>|=|neqsel|neqjoinsel
+=|int4|int4|=|<>|eqsel|eqjoinsel
+=|int4|int8|=|<>|eqsel|eqjoinsel"]
+  ["SELECT p.proname, p.prokind FROM pg_proc p WHERE p.proname = 'now'" "now|f"]
+  ["SELECT oprcom FROM pg_catalog.pg_operator fk WHERE oprcom != 0 AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_operator pk WHERE pk.oid = fk.oprcom)" ""]
+ ]}
