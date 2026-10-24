@@ -70,6 +70,8 @@
              (rows h "SELECT typmodin = 0, typmodin FROM pg_type WHERE typname = 'int4'")))
       (rows h "CREATE FUNCTION array_in(v integer) RETURNS integer LANGUAGE sql AS 'SELECT v'")
       (rows h "SET search_path TO public, pg_catalog")
+      (is (= [["{public,pg_catalog}" "{public,pg_catalog}" "t"]]
+             (rows h "SELECT current_schemas(false), current_schemas(true), current_schemas(NULL) IS NULL")))
       (is (= [["t"]]
              (rows h "SELECT typinput::oid = 'pg_catalog.array_in'::regproc::oid FROM pg_type WHERE typname = '_int4'"))))))
 
