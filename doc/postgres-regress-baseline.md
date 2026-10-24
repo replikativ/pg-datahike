@@ -34,7 +34,9 @@ the additional fixture prerequisites in PR #354.
 | Files in the pinned parallel schedule | 222 |
 | Scheduled files classified as out of scope | 69 |
 | Application-facing scheduled files | 153 |
-| Files measured | 154, including the unscheduled `numeric_big` |
+| Scheduled files measured | 152; `test_setup` runs as the bootstrap |
+| Additional files measured | `numeric_big` and `reindex_catalog` |
+| Total files measured | 154 |
 | Files with 100% expected-line coverage | 16 |
 | Mean per-file agreement | 64.4% |
 | Approximate line-weighted agreement | 55.5% |
@@ -42,7 +44,8 @@ the additional fixture prerequisites in PR #354.
 The agreement runner also discovers SQL files outside the parallel schedule.
 Its denominator therefore differs from the schedule inventory. The pinned
 SQL directory contains 224 files; after excluding the 69 files in
-`scope.edn`, 155 are candidates, of which 154 have recorded scores.
+`scope.edn`, 155 are candidates, of which 154 have recorded scores;
+`test_setup` has no independent score because it runs as the bootstrap.
 A missing result must remain unmeasured rather than reuse an older artifact.
 
 The line-weighted estimate represents about 81,700 unmatched expected lines
