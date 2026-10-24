@@ -1,326 +1,137 @@
-# PostgreSQL regression baseline, measured
+# PostgreSQL regression baseline
 
-*Measured 2026-09-27 against PostgreSQL 17's own `src/test/regress`, with
-`bb pg-regress-with-fixtures` (fixtures bootstrapped, one isolated database per
-run) and the diff taken against PostgreSQL's expected output with its
-source-excerpt presentation lines (`LINE n:` and the caret) removed from both
-sides.*
+The regression campaign is pinned to PostgreSQL 17.7 (`REL_17_7`).
+The schedule inventory records which files have been classified; the output
+comparison helps locate differences in SQL behavior. Neither is a percentage
+of PostgreSQL features implemented.
 
-The campaign inventory in `campaign.edn` answers **how much of the schedule has
-been triaged**. This answers the other question: **how much of it we actually
-answer the way PostgreSQL does.**
+## What the comparison measures
 
-## What we measure
+Agreement is the share of PostgreSQL's expected output lines that appear,
+in order, in pg-datahike's output. Only source excerpts (`LINE n:` and
+carets) are removed before comparison. Commands, rows, errors and notices
+remain.
 
-`pg_regress` fails a file on any difference, so a per-file pass rate would read
-zero and say nothing. **Agreement** is measured instead: the share of
-PostgreSQL's own expected lines that appear, in order, in ours. A file at 80%
-answers four fifths of what PostgreSQL prints, which is what a
-partially-supported area looks like from a client.
+A score of 100% means every expected line occurs in order. It does **not**
+mean the outputs match exactly: extra output does not lower the score.
+Echoed SQL, formatting and cascading errors also contribute to the metric.
+Use it to find a file and its first meaningful difference; verify behavior
+with statement-level differential tests.
 
-100% means every expected line is present and in order, not that the output is
-byte-identical -- extra lines of ours do not lower it.
+The authoritative per-file scores are in
+[`agreement.edn`](../test/integration/postgres-regress/agreement.edn).
+The strict admissions in
+[`campaign.edn`](../test/integration/postgres-regress/campaign.edn)
+use a stronger comparison of complete normalized output.
 
-The per-file numbers live in `test/integration/postgres-regress/agreement.edn`
-and are enforced by `bb pg-regress-gate`; see "Keeping it" below.
+## Recorded baseline: 2026-10-24
 
-## The numbers
+The baseline recorded in PR #350 was measured against PostgreSQL 17.7 before
+the additional fixture prerequisites in PR #354.
 
-| | |
-|---|---|
-| application-facing files | **179** (245 regression files, 65 out of scope, 1 not measurable) |
-| at 100% of PostgreSQL's expected lines | **9** |
-| ≥90% | 22 |
-| ≥75% | 42 |
-| ≥50% | 117 |
-| median agreement | **59.5%** |
+| Measure | Recorded value |
+|---|---:|
+| Files in the pinned parallel schedule | 222 |
+| Scheduled files classified as out of scope | 69 |
+| Application-facing scheduled files | 153 |
+| Scheduled files measured | 152; `test_setup` runs as the bootstrap |
+| Additional files measured | `numeric_big` and `reindex_catalog` |
+| Total files measured | 154 |
+| Files with 100% expected-line coverage | 16 |
+| Mean per-file agreement | 64.4% |
+| Approximate line-weighted agreement | 55.5% |
 
-Measured again on 2026-09-27 after the routine work (SQL functions, plpgsql,
-triggers, notices). Against the 150 files common to the 2026-09-21 run, 20
-improved and 19 lost ground, with the median flat.
+The agreement runner also discovers SQL files outside the parallel schedule.
+Its denominator therefore differs from the schedule inventory. The pinned
+SQL directory contains 224 files; after excluding the 69 files in
+`scope.edn`, 155 are candidates, of which 154 have recorded scores;
+`test_setup` has no independent score because it runs as the bootstrap.
+A missing result must remain unmeasured rather than reuse an older artifact.
 
-Most of that movement is **not** real. A file whose output is mostly cascade
-realigns by a point or two whenever anything ahead of its first divergence
-changes, in either direction, so per-file agreement is noisy at the
-few-percent level. That is why the gate has a tolerance, and why a real
-regression is recognised by being several points, or by a file dropping off
-100%.
+The line-weighted estimate represents about 81,700 unmatched expected lines
+out of 183,800. It gives larger files more weight than the per-file mean;
+both measures include presentation and fixture effects as well as semantic
+differences.
 
-One of the nineteen was real, and worth the whole exercise: `date` fell 15
-points, and the cause was a **silent wrong answer** that predated this work.
-`'1997-13-01'::date` answered the string `1997-13-01` -- a date with a
-thirteenth month -- and `'1997-04-31'` quietly became the 30th. Fixed; `date`
-is now 60.9%.
+| Expected-line coverage | Files |
+|---|---:|
+| 100% | 16 |
+| 90–99% | 11 |
+| 70–89% | 37 |
+| 50–69% | 51 |
+| Below 50% | 39 |
 
-The biggest genuine gains since the first measurement:
+Separate probes with corrected prerequisites raised `geometry` from 7.2%
+to 14.9% and `horology` from 37.8% to 49.0%. These are fixture corrections,
+not changes in server behavior. They are not incorporated into the recorded
+aggregate baseline above.
 
-| file | 2026-09-21 | 2026-09-27 |
+## Remaining compatibility areas
+
+The estimates below come from classifying errors in the recorded outputs.
+They overlap: a rejected CREATE can cause many missing-relation and
+transaction-aborted errors. PostgreSQL deliberately raises errors in its own
+tests too. These counts guide investigation; they do not count independent
+defects or predict how much a feature will improve agreement.
+
+| Approximate unmatched lines | Area | Next investigation |
 |---|---|---|
-| `select_distinct_on` | 52% | 72% |
-| `select` | 56% | 72% |
-| `expressions` | 63% | 77% |
-| `plancache` | 58% | 67% |
-| `polymorphism` | 47% | 54% |
-| `drop_if_exists` | 65% | 70% |
+| 19,200 | Cascading failures | Find the first failed statement and distinguish missing fixtures from unsupported behavior |
+| 12,800 | Parser gaps | Expression indexes, window GROUPS/EXCLUDE, SEARCH/CYCLE, array assignment, DDL and geometric operators |
+| 7,400 | Missing functions | JSON path functions, record population, range constructors and tsquery functions |
+| 4,900 | SQL/JSON and JSON path | Query/value/table expressions and path evaluation |
+| 4,700 | Ranges and multiranges | Types, constructors and operators |
+| 3,100 | DDL and routines | Classify unsupported forms of functions, operators, aggregates, rules and ALTER statements individually |
+| 3,100 | Name and join resolution | Parenthesized joins, qualified names and missing FROM references |
+| 3,000 | EXPLAIN output | Separate SQL API requirements from PostgreSQL planner presentation |
+| 2,600 | Text search | Query construction and remaining operators |
+| 1,600 | Partitioning | Establish the intended routing and catalog contract |
+| 1,500 | XML | Decide the supported surface |
+| 1,400 | Remaining types | regproc family, inet/cidr and transaction identifiers |
+| 700 | MERGE | Action selection and effects |
+| 15,700 | Other errors | Compare individual statements, including expected errors |
 
-## Keeping it
+Support decisions belong to individual capabilities. A file's scope
+classification does not establish whether every statement in it should be
+supported.
+
+## Scope
+
+[`scope.edn`](../test/integration/postgres-regress/scope.edn) excludes 69
+scheduled files covering PostgreSQL physical access methods, planner and
+storage internals, physical partitioning tests, server extension hooks,
+administration and security, replication, internal sanity checks and
+platform collation matrices.
+
+Some excluded files also contain useful application-facing behavior. For
+example, PL/pgSQL execution is implemented, but the entire upstream
+`plpgsql` file is not a compatibility gate. Focused differential tests must
+establish the supported subset.
+
+Row order without ORDER BY can also differ. Investigate ordering required
+by a SQL construct independently from incidental order in expected output;
+an aggregate's ORDER BY is part of its contract.
+
+## Running the comparison
 
 ```bash
-bb pg-regress-gate      # measure, and fail if any file lost ground
-bb pg-regress-measure   # re-measure and rewrite agreement.edn after a gain
+bb pg-regress-wave inventory       # schedule classification and admissions
+bb pg-regress-gate                 # compare all results with the baseline
+bb pg-regress-measure              # run all files and rewrite agreement.edn
+AGREEMENT_FILES="geometry horology" bb pg-regress-probe
 ```
 
-Both run all 179 files and take about ninety minutes, which is why the gate is
-**not** in per-PR CI: a ninety-minute job on every push would cost more than it
-catches, given that the differential fuzzer and the unit suite already run
-there and catch regressions in minutes. Run it before and after a change that
-touches a broad surface, and whenever a slice of this document's residual is
-worked on.
+Full runs take roughly an hour on the development machine and run outside
+per-PR CI. The gate flags a file that loses more than its recorded tolerance,
+loses full expected-line coverage, or stops being measurable. A flagged drop
+needs investigation; a higher score alone does not establish correctness.
 
-## What accounts for the other half
-
-Errors we raise across the corpus, by class:
-
-| class | errors | files |
-|---|---|---|
-| SQL parse error (JSqlParser rejects the syntax) | 3072 | 93 |
-| relation does not exist (mostly a cascade from an earlier failure) | 2555 | 72 |
-| function does not exist | 2452 | 92 |
-| transaction aborted (a cascade of the above) | 707 | 33 |
-| unsupported statement (MERGE, and others JSqlParser parses but we refuse) | 564 | 28 |
-| `CREATE FUNCTION` | 549 | 67 |
-| type does not exist | 474 | 40 |
-| partitioning (`PARTITION BY`, `ATTACH PARTITION`) | 442 | 22 |
-| column does not exist | 426 | 49 |
-| `CREATE TRIGGER` | 289 | 18 |
-| `DROP FUNCTION` | 241 | 42 |
-| `CREATE RULE` | 134 | 15 |
-
-The largest single lever is **the parser**: 3072 statements never reach the
-translator. The syntax it rejects, by frequency, is SQL/JSON (`JSON_EXISTS`,
-`JSON_VALUE`, `JSON_TABLE`), XML (`xmlserialize`, `xmlparse`), window-frame
-`EXCLUDE`, `INSERT … DEFAULT VALUES`, interval qualifiers (`interval '1'
-minute to second`), and the partitioning grammar.
-
-The second is **server-side routines**: `CREATE FUNCTION` / `TRIGGER` / `RULE`
-account for 972 errors across 82 files, and they cascade — a file that cannot
-create its helper function then fails every statement that calls it.
-
-Two smaller, self-contained ones:
-
-- **Notices.** PostgreSQL prints 1352 `NOTICE` / `WARNING` / `INFO` lines across
-  73 files that we never send, because the wire layer has no `NoticeResponse`.
-  `advisory_lock` is at 268 of 276 lines and *every* remaining difference is a
-  missing WARNING.
-- **Missing functions**, led by range constructors (`numrange`, `int4range`,
-  `daterange`), `to_timestamp` / `to_date` (the `formatting.c` template
-  engine, already Phase 6), and text search (`to_tsquery`,
-  `websearch_to_tsquery`).
-
-## Known divergences we accept
-
-- **Row order without ORDER BY.** A materialised relation -- a derived table, a
-  CTE, a set operation, a function used as a relation -- returns its rows in
-  the order the store scans them, not the order its body produced. SQL does not
-  promise an order without ORDER BY, PostgreSQL happens to preserve one, and
-  its expected output records what PostgreSQL happened to do. Preserving it
-  would mean carrying an ordinal on every materialised relation and sorting by
-  it, on a path that is otherwise a scan. Measured cost of not doing it:
-  row-order-only differences are 28 lines of the 88,321 missing.
-
-## Reproducing
+For a direct upstream run with prerequisites in one disposable database:
 
 ```bash
-bb pg-regress-with-fixtures advisory_lock       # one file
-bb pg-regress-wave inventory                    # the classification, not this
+bb pg-regress-with-fixtures date time timetz timestamp timestamptz interval horology
 ```
 
-The measurement script and per-file table live with the session that produced
-them; the table below is the state on the date above.
-
-## Per-file agreement
-
-The authoritative copy is `test/integration/postgres-regress/agreement.edn`,
-which the gate reads. This table is a snapshot for reading.
-
-| file | agreement |
-|---|---|
-| `bit` | 100% |
-| `boolean` | 100% |
-| `database` | 100% |
-| `delete` | 100% |
-| `md5` | 100% |
-| `portals_p2` | 100% |
-| `reindex_catalog` | 100% |
-| `select_having` | 100% |
-| `select_implicit` | 99% |
-| `numeric_big` | 98% |
-| `int2` | 98% |
-| `numeric` | 97% |
-| `advisory_lock` | 97% |
-| `enum` | 96% |
-| `oid` | 96% |
-| `int4` | 96% |
-| `money` | 95% |
-| `varchar` | 95% |
-| `int8` | 94% |
-| `comments` | 94% |
-| `mvcc` | 90% |
-| `transactions` | 90% |
-| `case` | 84% |
-| `copyencoding` | 82% |
-| `create_aggregate` | 82% |
-| `type_sanity` | 82% |
-| `collate` | 81% |
-| `collate.utf8` | 81% |
-| `async` | 81% |
-| `uuid` | 81% |
-| `collate.windows.win1252` | 80% |
-| `create_operator` | 80% |
-| `errors` | 80% |
-| `char` | 79% |
-| `misc_sanity` | 79% |
-| `collate.linux.utf8` | 78% |
-| `lseg` | 78% |
-| `expressions` | 77% |
-| `lock` | 77% |
-| `sequence` | 76% |
-| `time` | 76% |
-| `drop_operator` | 74% |
-| `copydml` | 73% |
-| `without_overlaps` | 73% |
-| `create_type` | 73% |
-| `line` | 73% |
-| `temp` | 73% |
-| `select_distinct_on` | 73% |
-| `select` | 72% |
-| `float8` | 72% |
-| `prepared_xacts` | 72% |
-| `truncate` | 72% |
-| `fast_default` | 71% |
-| `select_distinct` | 71% |
-| `namespace` | 71% |
-| `drop_if_exists` | 70% |
-| `triggers` | 70% |
-| `limit` | 69% |
-| `euc_kr` | 69% |
-| `jsonb` | 68% |
-| `alter_generic` | 68% |
-| `alter_table` | 67% |
-| `plancache` | 67% |
-| `alter_operator` | 67% |
-| `create_cast` | 67% |
-| `foreign_key` | 67% |
-| `compression_pglz` | 66% |
-| `strings` | 66% |
-| `encoding` | 66% |
-| `psql` | 65% |
-| `text` | 65% |
-| `copy` | 65% |
-| `tablesample` | 64% |
-| `rowtypes` | 64% |
-| `stats_import` | 64% |
-| `domain` | 64% |
-| `collate.icu.utf8` | 64% |
-| `merge` | 64% |
-| `create_table` | 63% |
-| `insert_conflict` | 63% |
-| `update` | 63% |
-| `for_portion_of` | 62% |
-| `json_encoding` | 62% |
-| `numa` | 62% |
-| `date` | 61% |
-| `constraints` | 60% |
-| `nls` | 60% |
-| `copyselect` | 60% |
-| `compression_lz4` | 60% |
-| `planner_est` | 60% |
-| `macaddr` | 60% |
-| `graph_table` | 60% |
-| `json` | 59% |
-| `insert` | 59% |
-| `stats_rewrite` | 58% |
-| `select_into` | 58% |
-| `conversion` | 58% |
-| `psql_crosstab` | 58% |
-| `portals` | 58% |
-| `aggregates` | 57% |
-| `arrays` | 57% |
-| `identity` | 56% |
-| `opr_sanity` | 56% |
-| `regex` | 56% |
-| `prepare` | 56% |
-| `sqljson_jsontable` | 55% |
-| `polymorphism` | 55% |
-| `name` | 54% |
-| `psql_pipeline` | 54% |
-| `union` | 53% |
-| `updatable_views` | 53% |
-| `misc` | 52% |
-| `window` | 52% |
-| `float4` | 52% |
-| `tstypes` | 51% |
-| `create_schema` | 51% |
-| `create_procedure` | 51% |
-| `create_index` | 51% |
-| `path` | 50% |
-| `copy2` | 50% |
-| `with` | 49% |
-| `timetz` | 49% |
-| `tsearch` | 48% |
-| `create_function_sql` | 48% |
-| `interval` | 48% |
-| `polygon` | 47% |
-| `subselect` | 47% |
-| `macaddr8` | 46% |
-| `generated_virtual` | 46% |
-| `tsrf` | 46% |
-| `pg_ndistinct` | 46% |
-| `pg_dependencies` | 46% |
-| `inherit` | 46% |
-| `random` | 45% |
-| `matview` | 45% |
-| `returning` | 45% |
-| `generated_stored` | 44% |
-| `largeobject` | 43% |
-| `box` | 43% |
-| `misc_functions` | 42% |
-| `sqljson_queryfuncs` | 42% |
-| `create_view` | 42% |
-| `numerology` | 42% |
-| `typed_table` | 41% |
-| `graph_table_rls` | 41% |
-| `create_table_like` | 41% |
-| `sqljson` | 41% |
-| `xml` | 39% |
-| `xid` | 39% |
-| `rules` | 39% |
-| `create_misc` | 38% |
-| `sysviews` | 37% |
-| `create_property_graph` | 37% |
-| `dbsize` | 36% |
-| `rangetypes` | 35% |
-| `join` | 35% |
-| `jsonpath_encoding` | 34% |
-| `circle` | 33% |
-| `tsdicts` | 33% |
-| `rangefuncs` | 32% |
-| `oid8` | 32% |
-| `pg_lsn` | 31% |
-| `inet` | 28% |
-| `txid` | 28% |
-| `unicode` | 28% |
-| `regproc` | 27% |
-| `multirangetypes` | 27% |
-| `eager_aggregate` | 26% |
-| `jsonb_jsonpath` | 26% |
-| `timestamptz` | 24% |
-| `point` | 22% |
-| `jsonpath` | 20% |
-| `explain` | 20% |
-| `horology` | 20% |
-| `timestamp` | 19% |
-| `select_views` | 9% |
-| `groupingsets` | 8% |
-| `geometry` | 8% |
-| `xmlmap` | 4% |
+Keep the per-file manifest as the source of scores instead of maintaining a
+second table that can drift. Regression artifacts under `.internal/pg-regress/`
+contain the actual output and diffs needed to investigate a discrepancy.
