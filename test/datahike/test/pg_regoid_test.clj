@@ -149,6 +149,18 @@
       (is (= {:rows [["rg_copy_fn" "{rg_copy_fn,-}"] ["rg_copy_fn" "{rg_copy_fn,-}"]]}
              (query c "SELECT p, a FROM rg_copy"))))))
 
+(deftest typed-quoting-preserves-deferred-effects-and-null-behavior
+  (with-open [c (connect false)]
+    (execute! c "CREATE SEQUENCE rg_quote_sequence")
+    (is (= {:rows [["'1'"]]}
+           (query c "SELECT quote_literal(nextval('rg_quote_sequence'))")))
+    (is (= {:rows [["'2'"]]}
+           (query c "SELECT quote_nullable(nextval('rg_quote_sequence'))")))
+    (is (= {:rows [["3"]]}
+           (query c "SELECT nextval('rg_quote_sequence')")))
+    (is (= {:rows [[nil "NULL"]]}
+           (query c "SELECT quote_literal(NULL), quote_nullable(NULL)")))))
+
 (deftest builtin-oids-have-their-exact-signatures
   (with-open [c (connect false)]
     (is (= {:rows [["abs" "23" "23"]]}

@@ -2280,9 +2280,14 @@
       (let [_ (fns/check-arity! fname (count args))
             oid (source-oid ctx (first params))
             fn-param (ctx/fresh-var! ctx)
-            quote-fn (if (= fname "quote_nullable") fns/sql-quote-nullable fns/sql-quote-literal)]
+            quote-fn (if (= fname "quote_nullable") fns/sql-quote-nullable fns/sql-quote-literal)
+            render #(quote-fn (types/->pg-text % oid))]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj #(quote-fn (types/->pg-text % oid)))
+        (swap! (:in-args ctx) conj
+               (fn [v]
+                 (if (params/call-marker? v)
+                   {:fn :projection :projection-fn render :args [v]}
+                   (render v))))
         (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
         result-var)
 
