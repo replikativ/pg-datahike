@@ -24,7 +24,66 @@ byte-identical -- extra lines of ours do not lower it.
 The per-file numbers live in `test/integration/postgres-regress/agreement.edn`
 and are enforced by `bb pg-regress-gate`; see "Keeping it" below.
 
-## The numbers
+## Where it stands (2026-10-24)
+
+Measured on `main` at 91509a0 against PostgreSQL 17.7 (#350), with the
+schedule prerequisites added in #354 (geometry and horology were measuring
+missing fixture tables, not the server).
+
+| | |
+|---|---|
+| test files in PostgreSQL's schedule | **223** application-facing (69 more out of scope by decision, below) |
+| measured | **154** |
+| at 100% | **16** |
+| mean per-file agreement | **64.4%** |
+| **line-weighted agreement** | **55.5%** -- 81,700 of 183,800 expected lines still differ |
+
+The line-weighted number is the honest one: the mean flatters us because
+small files are easy. By band:
+
+| band | files | expected lines still missing |
+|---|---|---|
+| 100% | 16 | 0 |
+| 90-99% | 11 | ~370 |
+| 70-89% | 37 | ~7,800 |
+| 50-69% | 51 | ~30,300 |
+| <50% | 39 | ~43,200 |
+
+### The residual by cause
+
+Each file's missing lines attributed to its error classes in proportion to
+their counts -- coarse (a cascade's lines belong to whatever failed first, and
+some errors are ones PostgreSQL raises too), but it ranks the work. Classified
+as **support** (work to do) or **decide** (support or document as not
+supported -- for discussion once the support list is closed).
+
+| ≈ missing lines | cause | class |
+|---|---|---|
+| 19,200 | cascades: a CREATE earlier in the same file failed (2,029 of 2,394 missing-relation errors are the file's own object), or a transaction is aborted | follows its root cause |
+| 12,800 | parser gaps: 2,776 `syntax error` in 88 files -- expression indexes, `PARTITION OF`, window `GROUPS`/`EXCLUDE`, `SEARCH`/`CYCLE`, array-slice targets, `DEFERRABLE`, `SET DATA TYPE`, `MATCH FULL`, geometric operators | support; the strategy (JSqlParser upstream, fork, pre-parse rewrite or own grammar) is an owner decision |
+| 7,400 | missing functions: `jsonb_path_query` (522 calls), `*_populate_record`, range constructors, tsquery functions | support |
+| 4,900 | SQL/JSON (`JSON_QUERY`, `JSON_VALUE`, `JSON_TABLE`, `JSON_OBJECT`) and jsonpath | support |
+| 4,700 | range and multirange types | support |
+| 3,100 | DDL: CREATE RULE / AGGREGATE / OPERATOR / TYPE / FUNCTION, ALTER DOMAIN, GRANT / REVOKE | decide, per statement |
+| 3,100 | name resolution: `missing FROM-clause entry`, parenthesized join groups | support |
+| ~3,000 | EXPLAIN plan text | decide (owner decision 4) |
+| 2,600 | text search | support |
+| 1,600 | partitioning (`PARTITION BY`, `ATTACH`/`DETACH`) | decide |
+| 1,500 | XML | decide |
+| 1,400 | missing types: inet/cidr, xid/xid8/pg_snapshot, regproc, user-defined types | support (regproc first -- type_sanity) |
+| 700 | MERGE | support |
+| 15,700 | other errors -- many are errors PostgreSQL raises too (division by zero, constraint violations), so this bucket overstates | -- |
+
+### Out of scope by decision (69 files)
+
+physical access methods (brin, gin, gist, spgist, hash indexes), planner and
+storage internals (vacuum, cluster, toast, parallel query, statistics),
+physical partitioning (pruning, partition-wise joins), server extension hooks
+(plpgsql, C functions, event triggers, FDW), administration and security
+(roles, privileges, row security, tablespaces), replication, PostgreSQL's
+internal sanity files, and platform collation matrices. See `scope.edn`.
+
+## The numbers (2026-09-27)
 
 | | |
 |---|---|
