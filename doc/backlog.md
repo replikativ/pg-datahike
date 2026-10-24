@@ -623,6 +623,14 @@ unsigned numeric offsets, DEFAULT, LOCAL -- is supported and verified.
   construction.
 - Data-modifying CTEs raise 0A000; PostgreSQL executes the inner DML and
   feeds RETURNING to the outer query.
+- **A FROM-clause SRF is transacted row by row into a speculative db**
+  (`table-fn->virtual-table`). `SELECT * FROM generate_series(1, 5000000)
+  LIMIT 3` exhausted a 1 GB heap after 6.5 minutes; PostgreSQL fills a
+  tuplestore (it does not stop at the LIMIT either -- timestamp.sql says
+  so) but answers in seconds. The target-list form is lazy since the
+  unbounded-series fix and answers in milliseconds. A FROM item that is a
+  plain SRF -- no join, no correlation -- could be scanned as rows rather
+  than as datoms; joins against it are the hard part.
 
 ---
 

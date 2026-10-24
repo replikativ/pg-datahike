@@ -89,10 +89,17 @@
       (with-open [c (DriverManager/getConnection (jdbc-url port "datahike"))]
         (exec! c "CREATE DATABASE IF NOT EXISTS myapp"))
 
-      ;; DROP DATABASE removes it.
-      (with-open [c (DriverManager/getConnection (jdbc-url port "datahike"))]
-        (exec! c "DROP DATABASE myapp"))
-      (is (not (contains? (pg/databases srv) "myapp")))
+      ;; DROP DATABASE removes it -- from the registry AND from the
+      ;; store. The delete hook used to rebuild the config from the
+      ;; template, which gave an in-memory store a fresh random id, so it
+      ;; deleted nothing and every dropped database stayed in memory.
+      (let [config (:config (d/db (get @(:registry-atom srv) "myapp")))]
+        (is (d/database-exists? config))
+        (with-open [c (DriverManager/getConnection (jdbc-url port "datahike"))]
+          (exec! c "DROP DATABASE myapp"))
+        (is (not (contains? (pg/databases srv) "myapp")))
+        (is (not (d/database-exists? config))
+            "the dropped database's store is gone, not just its registry entry"))
 
       ;; DROP DATABASE IF EXISTS unknown is a no-op.
       (with-open [c (DriverManager/getConnection (jdbc-url port "datahike"))]

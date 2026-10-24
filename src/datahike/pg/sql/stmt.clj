@@ -1186,6 +1186,14 @@
   (or (inst? v) (instance? java.time.OffsetDateTime v)
       (instance? java.time.LocalDateTime v) (instance? java.time.LocalDate v)))
 
+(def ^:private ts-range-start
+  "PostgreSQL's MIN_TIMESTAMP: 4714-11-24 00:00:00 BC (astronomical -4713)."
+  (.toInstant (java.time.OffsetDateTime/of -4713 11 24 0 0 0 0 java.time.ZoneOffset/UTC)))
+
+(def ^:private ts-range-end
+  "PostgreSQL's END_TIMESTAMP: 294277-01-01 00:00:00, exclusive."
+  (.minusNanos (.toInstant (java.time.OffsetDateTime/of 294277 1 1 0 0 0 0 java.time.ZoneOffset/UTC)) 1000))
+
 (defn- temporal-series
   "`generate_series(start, stop, step interval)` over timestamps
    (generate_series_timestamp[tz], timestamp.c): each step is the same
@@ -1235,14 +1243,28 @@
         stop-i (inst stop)
         infinite (fn [v] (types/infinite-datetime v))]
     {:pg-type (if wall? "timestamp" "timestamptz")
-     :rows (loop [cur start acc (transient [])]
-             (let [c (if (infinite cur)
-                       (compare (if (= :pos (infinite cur)) 1 -1) 0)
-                       (compare (inst cur) stop-i))]
-               (if (if (pos? sign) (<= c 0) (>= c 0))
-                 (recur (step-fn cur)
-                        (conj! acc [(if (inst? cur) cur (java.util.Date/from (inst cur)))]))
-                 (persistent! acc))))}))
+     ;; LAZY, as PostgreSQL's value-per-call SRF is: the regression
+     ;; suite's own `generate_series(…, 'infinity', '1 month') LIMIT 10`
+     ;; stops after ten rows there. Built eagerly it stepped toward
+     ;; java.util.Date's limit, year 292 million, and filled any heap.
+     ;; Unlimited, it ends where PostgreSQL's does: the first value past
+     ;; the timestamp range raises, as timestamp_pl_interval does.
+     :rows (letfn [(past-range? [v]
+                     (and (not (infinite v))
+                          (let [i ^java.time.Instant (inst v)]
+                            (or (.isAfter i ts-range-end) (.isBefore i ts-range-start)))))
+                   (series [cur]
+                     (lazy-seq
+                      (when (past-range? cur)
+                        (throw (errors/pg-error :datetime-field-overflow
+                                                {:message "timestamp out of range"})))
+                      (let [c (if (infinite cur)
+                                (compare (if (= :pos (infinite cur)) 1 -1) 0)
+                                (compare (inst cur) stop-i))]
+                        (when (if (pos? sign) (<= c 0) (>= c 0))
+                          (cons [(if (inst? cur) cur (java.util.Date/from (inst cur)))]
+                                (series (step-fn cur)))))))]
+             (series start))}))
 
 (defn- agg-order-key
   "An aggregate ORDER BY element as its sort key: the expression's value
@@ -1749,13 +1771,26 @@
       ;; first column: `SELECT information_schema._pg_expandarray(a)` is
       ;; `(x,n)` per element, and `(…).n` selects a field out of it.
       (let [{:keys [aliases rows]} materialized]
+        ;; Lazy, so a LIMIT above stops an unbounded series.
         (if (> (count aliases) 1)
-          (mapv (fn [row]
-                  (pg-rec/named-record
-                   (map (fn [a v] [a (types/infer-oid-from-value v) v]) aliases row)))
-                rows)
-          (mapv first rows)))
+          (map (fn [row]
+                 (pg-rec/named-record
+                  (map (fn [a v] [a (types/infer-oid-from-value v) v]) aliases row)))
+               rows)
+          (map first rows)))
       [])))
+
+(defn- zip-longest
+  "The SRFs' values advanced in parallel to the longest, a shorter one
+   padded with NULL -- lazily, without counting any of them, because a
+   series may be unbounded and only a LIMIT above ends it
+   (`generate_series(t, 'infinity', '1 month') LIMIT 10`)."
+  [seqs]
+  (lazy-seq
+   (let [seqs (map seq seqs)]
+     (when (some some? seqs)
+       (cons (mapv #(if % (first %) :__null__) seqs)
+             (zip-longest (map rest seqs)))))))
 
 (defn apply-project-set
   "Expand base SELECT rows using PostgreSQL ProjectSet semantics.
@@ -1766,31 +1801,28 @@
   [rows specs]
   (let [apply-level
         (fn [rows level-specs]
-          (vec
-           (mapcat
-            (fn [row]
-              (let [row (if (sequential? row) (vec row) [row])
-                    values (mapv (fn [{:keys [function arg-indices]}]
-                                   (project-set-values
-                                    function (mapv #(nth row % nil) arg-indices)))
-                                 level-specs)
-                    n (reduce max 0 (map count values))]
-                (for [i (range n)]
-                  (reduce (fn [out [{:keys [out-pos field]} vs]]
-                            (let [v (if (< i (count vs)) (nth vs i) :__null__)
-                                  v (if (and field (pg-rec/record? v))
-                                      (let [fv (pg-rec/field-value v field)]
-                                        (if (= ::pg-rec/absent fv)
-                                          (throw (errors/pg-error
-                                                  :undefined-column
-                                                  {:message (str "could not identify column \""
-                                                                 field "\" in record data type")}))
-                                          (if (nil? fv) :__null__ fv)))
-                                      v)]
-                              (assoc out out-pos v)))
-                          row
-                          (map vector level-specs values)))))
-            rows)))]
+          (mapcat
+           (fn [row]
+             (let [row (if (sequential? row) (vec row) [row])
+                   values (mapv (fn [{:keys [function arg-indices]}]
+                                  (project-set-values
+                                   function (mapv #(nth row % nil) arg-indices)))
+                                level-specs)]
+               (for [tuple (zip-longest values)]
+                 (reduce (fn [out [{:keys [out-pos field]} v]]
+                           (let [v (if (and field (pg-rec/record? v))
+                                     (let [fv (pg-rec/field-value v field)]
+                                       (if (= ::pg-rec/absent fv)
+                                         (throw (errors/pg-error
+                                                 :undefined-column
+                                                 {:message (str "could not identify column \""
+                                                                field "\" in record data type")}))
+                                         (if (nil? fv) :__null__ fv)))
+                                     v)]
+                             (assoc out out-pos v)))
+                         row
+                         (map vector level-specs tuple)))))
+           rows))]
     (reduce apply-level rows
             (map second (sort-by first (group-by :level specs))))))
 

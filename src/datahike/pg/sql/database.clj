@@ -404,15 +404,20 @@
       (d/connect resolved))))
 
 (defn db-delete-from-template
-  "Build an `:on-delete-database` hook that mirrors `db-from-template`.
-   Releases the conn and best-effort deletes the backing store; the
-   template is consulted for the storage backend so file/pg/etc.
-   stores get the right delete call."
-  [server-template]
-  (fn db-delete-hook [db-name conn _parsed-options]
-    (let [{:keys [config]} (options->config server-template [])
-          resolved (-> config
-                       (interpolate-name db-name)
-                       ensure-store-id)]
+  "Build an `:on-delete-database` hook that mirrors `db-from-template`:
+   release the conn and delete ITS backing store.
+
+   The store is the one the conn was opened on, read from the conn.
+   Rebuilding it from the template, as this did, gave an in-memory store
+   a FRESH random `:id` (`ensure-store-id`), so `delete-database`
+   deleted a store that never existed -- silently, under the catch --
+   and the dropped database stayed in the memory backend's registry,
+   reachable for the life of the process. pg_regress creates and drops a
+   fixture database per file; a run kept every one of them, about 400k
+   datoms each, and that is why its harness restarted the server every
+   30 files."
+  [_server-template]
+  (fn db-delete-hook [_db-name conn _parsed-options]
+    (let [config (:config (d/db conn))]
       (try (d/release conn) (catch Throwable _))
-      (try (d/delete-database resolved) (catch Throwable _)))))
+      (d/delete-database config))))

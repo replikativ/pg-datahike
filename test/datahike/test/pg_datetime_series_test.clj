@@ -61,3 +61,26 @@
           (println " " expr "\n    want:" want "\n    got :" got))
         (is (empty? @bad)
             (str (count @bad) " of " (count corpus) " corpus entries disagree"))))))
+
+(deftest an-unbounded-series-stops-at-its-limit
+  ;; The regression suite's own statement (timestamp.sql). PostgreSQL's
+  ;; target-list SRF is value-per-call, so the LIMIT ends it after ten
+  ;; rows; built eagerly, the series stepped toward java.util.Date's
+  ;; limit and filled the heap -- 3.5 GB in two minutes, until the
+  ;; machine ran out of memory. Unlimited, it ends where PostgreSQL's
+  ;; does: `timestamp out of range` at the first value past 294276 AD.
+  ;; Expected values from PostgreSQL 17.
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (let [r (.execute h (str "select generate_series('2022-01-01 00:00'::timestamp, "
+                               "'infinity'::timestamp, '1 month'::interval) limit 10"))]
+        (is (nil? (.error r)))
+        (is (= ["2022-01-01 00:00:00" "2022-02-01 00:00:00" "2022-03-01 00:00:00"
+                "2022-04-01 00:00:00" "2022-05-01 00:00:00" "2022-06-01 00:00:00"
+                "2022-07-01 00:00:00" "2022-08-01 00:00:00" "2022-09-01 00:00:00"
+                "2022-10-01 00:00:00"]
+               (mapv #(aget ^"[Ljava.lang.String;" % 0) (.rows r)))))
+      (let [r (.execute h (str "select count(*) from (select generate_series("
+                               "'290000-01-01'::timestamp, 'infinity'::timestamp, "
+                               "'1 year'::interval)) s"))]
+        (is (= "timestamp out of range" (.error r)))))))
