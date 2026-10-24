@@ -143,7 +143,7 @@
   (into {}
         (map (fn [e] [e (:typarray (catalog-type e))]))
         [oid-bool oid-bytea oid-name oid-int2 oid-int4 oid-text oid-int8
-         oid-regproc oid-regprocedure
+         oid-regproc oid-regprocedure oid-regclass oid-regnamespace
          oid-float4 oid-float8 oid-oid oid-varchar oid-bpchar oid-date
          oid-time oid-timetz oid-timestamp oid-timestamptz oid-numeric
          oid-uuid oid-json oid-money oid-jsonb oid-tsvector oid-tsquery
@@ -176,6 +176,8 @@
    :oid         oid-oid
    :regproc     oid-regproc
    :regprocedure oid-regprocedure
+   :regclass oid-regclass
+   :regnamespace oid-regnamespace
    :varchar     oid-varchar
    :bpchar      oid-bpchar
    :date        oid-date
@@ -334,6 +336,7 @@
    "oid"               :db.type/long
    "regproc"           :db.type/long
    "regprocedure"      :db.type/long
+   "regnamespace"      :db.type/long
    "regclass"          :db.type/long
    "regtype"           :db.type/long})
 
@@ -358,6 +361,8 @@
    "integer"           :int4
    "regproc"           :regproc
    "regprocedure"      :regprocedure
+   "regclass"          :regclass
+   "regnamespace"      :regnamespace
    "int"               :int4
    "int4"              :int4
    "int2"              :int2
@@ -798,13 +803,13 @@
       t
       (clojure.string/replace t #"^\"(.*)\"$" "$1"))))
 
-(defn routine-type-spelling? [sql-type-name]
+(defn oid-alias-type-spelling? [sql-type-name]
   (boolean (and sql-type-name
-                (re-find #"(?i)(?:^|\.)\s*\"?regproc(?:edure)?\"?\s*(?:\[|$)"
+                (re-find #"(?i)(?:^|\.)\s*\"?(?:regproc(?:edure)?|regclass|regnamespace)\"?\s*(?:\[|$)"
                          (str/trim (str sql-type-name))))))
 
 (defn normalize-sql-type-name
-  "Normalize supported schema-qualified pgvector and routine alias types.
+  "Normalize supported schema-qualified pgvector and OID alias types.
    JSqlParser preserves schema qualification and identifier quotes in
    different fields depending on CAST versus DDL. PostgreSQL installs the
    extension in public by default, so these all resolve to the same type."
@@ -812,14 +817,14 @@
   (when sql-type-name
     (let [s (clojure.string/trim (str sql-type-name))
           routine-prefix
-          #"^(?:(?:(?i:pg_catalog)|\"pg_catalog\")\s*\.\s*)?((?i:regproc(?:edure)?)|\"regproc\"|\"regprocedure\")(?=\s*(?:\[|$))"
+          #"^(?:(?:(?i:pg_catalog)|\"pg_catalog\")\s*\.\s*)?((?i:(?:regproc(?:edure)?|regclass|regnamespace))|\"regproc\"|\"regprocedure\"|\"regclass\"|\"regnamespace\")(?=\s*(?:\[|$))"
           valid-prefix
           #"^(?:(?:(?i:public)|\"public\")\s*\.\s*)?(?:(?i:vector)|\"vector\")(?=\s*(?:\(|\[|$))"]
       (cond
         (re-find routine-prefix s)
         (str/replace-first s routine-prefix
                            #(str/lower-case (unquote-type-name (second %))))
-        (routine-type-spelling? s) s
+        (oid-alias-type-spelling? s) s
         :else
         (if (re-find valid-prefix s)
           (clojure.string/replace-first s valid-prefix "vector")
@@ -1193,6 +1198,8 @@
    oid-int8        :db.type/long
    oid-regproc     :db.type/long
    oid-regprocedure :db.type/long
+   oid-regclass :db.type/long
+   oid-regnamespace :db.type/long
    oid-float4      :db.type/double
    oid-float8      :db.type/double
    oid-numeric     :db.type/bigdec
@@ -1378,7 +1385,7 @@
         :geometric
         (#{"macaddr" "macaddr8"} base)        :mac
         (= "pg_lsn" base)                     :pg-lsn
-        (contains? regoid/routine-types base)  :reg-routine
+        (contains? regoid/alias-types base)  :reg-oid
         (= base "json")                       :json
         (= base "jsonb")                      :jsonb
         (= base "tsvector")                   :tsvector
@@ -2045,10 +2052,10 @@
      ;; SQL NULL, including the internal sentinel: it must never render as
      ;; text (`concat(NULL, 'x')` answered ":__null__x").
      (or (nil? v) (= :__null__ v)) nil
-     (and (string? v) (contains? regoid/routine-oids (array-oid->element-oid src-oid)))
+     (and (string? v) (contains? regoid/alias-oids (array-oid->element-oid src-oid)))
      (let [[read-array render-array] @routine-array-output]
        (render-array (read-array v (oid->elem-kw (array-oid->element-oid src-oid))) src-oid))
-     (and (contains? regoid/routine-oids src-oid) (number? v))
+     (and (contains? regoid/alias-oids src-oid) (number? v))
      (regoid/output src-oid v #(or (get oid->pg-name %)
                                    (:typname (pg-catalog/type-by-oid %))
                                    (str %)))

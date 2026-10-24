@@ -703,7 +703,7 @@
       array? nil
 
       (#{"jsonb" "json" "money" "interval" "tsvector" "tsquery" "vector"
-         "regproc" "regprocedure"} bt) bt
+         "regproc" "regprocedure" "regclass" "regnamespace"} bt) bt
 
       ;; The geometric family is carried as canonical text like jsonb, so
       ;; the hint is the only thing that lets the catalog report the

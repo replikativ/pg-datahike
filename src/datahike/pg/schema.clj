@@ -39,8 +39,8 @@
         (and (types/vector-type-spelling? type-name)
              (not= :vector (types/cast-category normalized)))
         invalid-routine-spelling?
-        (and (types/routine-type-spelling? type-name)
-             (not (contains? #{"regproc" "regprocedure"}
+        (and (types/oid-alias-type-spelling? type-name)
+             (not (contains? #{"regproc" "regprocedure" "regclass" "regnamespace"}
                              (str/replace normalized #"(?:\s*\[\s*\])+$" ""))))
         ;; Unquoted: `path` is a reserved word in JSqlParser's grammar
         ;; and is rewritten to its quoted spelling before parsing, so a

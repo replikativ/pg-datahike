@@ -14,9 +14,16 @@
 
 (def ^:dynamic *db* nil)
 (def ^:dynamic *search-path* ["$user" "public"])
+(def ^:dynamic *database-name* "datahike")
+(def ^:dynamic *relation-provider* nil)
+(def ^:dynamic *relation-db* nil)
+(def ^:dynamic *relation-cache* nil)
+(def ^:dynamic *temp-tables* {})
 
 (def routine-oids #{24 2202})
 (def routine-types #{"regproc" "regprocedure"})
+(def alias-oids (into routine-oids #{2205 4089}))
+(def alias-types (into routine-types #{"regclass" "regnamespace"}))
 
 (defn- fail! [state message]
   (throw (ex-info message {:sqlstate state})))
@@ -112,6 +119,60 @@
 (defn- namespace-name [db oid]
   (or (case oid 11 "pg_catalog" 2200 "public" nil)
       (when db (:datahike.pg.object/name (objects/namespace-by-oid db oid)))))
+
+(defn relation-object-descriptor
+  "The identity shared by pg_class projection and OID-alias lookup."
+  [db object]
+  (when object
+    {:oid (:datahike.pg.object/oid object)
+     :name (:datahike.pg.object/name object)
+     :namespace-oid (objects/object-namespace-oid db object)
+     :kind (:datahike.pg.object/kind object)}))
+
+(def ^:private system-relations
+  (mapv (fn [[name oid]] {:oid oid :name name :namespace-oid 11 :kind :table})
+        objects/catalog-relation-oids))
+
+(defn registry-relation
+  "Resolve registered or fixed catalog identities without the SQL layer.
+   SQL supplies a provider that additionally knows native inferred relations."
+  [db {:keys [oid namespace-oid name]}]
+  (or (some #(when (if oid (= oid (:oid %))
+                       (and (= namespace-oid 11) (= name (:name %)))) %) system-relations)
+      (when db
+        (relation-object-descriptor
+         db (if oid (objects/object-by-address db objects/pg-class-oid oid)
+                (objects/object-by-identity db objects/pg-class-oid namespace-oid name))))))
+
+(defn- relation [request]
+  (when-let [r ((or *relation-provider* registry-relation) (or *relation-db* *db*) request)]
+    (when (str/starts-with? (:name r) "__dh_pg_temp_")
+      (throw (ex-info "temporary relation OID aliases require temporary schema identities"
+                      {:sqlstate "0A000" :regoid-hard-error? true})))
+    r))
+
+(defn- relation-input [names]
+  (when (> (count names) 3)
+    (throw (ex-info "improper relation name (too many dotted names)"
+                    {:sqlstate "42601" :regoid-hard-error? true})))
+  (when (and (= 3 (count names)) (not= *database-name* (first names)))
+    (throw (ex-info "cross-database references are not implemented"
+                    {:sqlstate "0A000" :regoid-hard-error? true})))
+  (let [name (last names)
+        schema (when (>= (count names) 2) (nth names (- (count names) 2)))
+        temps (if (instance? clojure.lang.IDeref *temp-tables*) @*temp-tables* *temp-tables*)
+        _ (when (and (or (nil? schema) (= schema "pg_temp")) (contains? temps name))
+            (throw (ex-info "temporary relation OID aliases require temporary schema identities"
+                            {:sqlstate "0A000" :regoid-hard-error? true})))
+        path (if schema [(namespace-oid *db* schema)] (search-path *db*))
+        found (some #(relation {:namespace-oid % :name name}) (remove nil? path))]
+    (or (:oid found)
+        (fail! "42P01" (str "relation \"" (str/join "." names) "\" does not exist")))))
+
+(defn- namespace-input [names]
+  (when-not (= 1 (count names)) (fail! "42602" "invalid name syntax"))
+  (or (namespace-oid *db* (first names))
+      (fail! "3F000" (str "schema \"" (first names) "\" does not exist"))))
 
 (def ^:private integer-input
   ;; input -> types -> this namespace is a load-time dependency chain. Resolve
@@ -528,7 +589,7 @@
           :else (recur (inc i) start depth false args))))))
 
 (defn input
-  "regprocin/regprocedurein. A numeric value preserves OID identity; text
+  "OID alias input. A numeric value preserves OID identity; text
    resolves names. `to_reg*` callers use input-or-nil for soft errors."
   [kind value]
   (when-not (or (nil? value) (= :__null__ value))
@@ -538,16 +599,19 @@
               (bit-and (long value) 0xffffffff)
               (fail! "22003" "OID out of range")))
           (numeric-oid s)
-          (let [[names args] (if (= kind "regprocedure")
-                               (let [[names types] (signature s)]
-                                 [names (mapv #(type-oid *db* %) types)])
-                               [(qualified-name s) nil])
-                matches (cond->> (candidates *db* names)
-                          (some? args) (filter #(= args (:args %))))]
-            (case (count matches)
-              0 (fail! "42883" (str "function \"" s "\" does not exist"))
-              1 (:oid (first matches))
-              (fail! "42725" (str "more than one function named \"" s "\""))))))))
+          (case kind
+            "regclass" (relation-input (qualified-name s))
+            "regnamespace" (namespace-input (qualified-name s))
+            (let [[names args] (if (= kind "regprocedure")
+                                 (let [[names types] (signature s)]
+                                   [names (mapv #(type-oid *db* %) types)])
+                                 [(qualified-name s) nil])
+                  matches (cond->> (candidates *db* names)
+                            (some? args) (filter #(= args (:args %))))]
+              (case (count matches)
+                0 (fail! "42883" (str "function \"" s "\" does not exist"))
+                1 (:oid (first matches))
+                (fail! "42725" (str "more than one function named \"" s "\"")))))))))
 
 (defn input-or-nil [kind value]
   (try (input kind value)
@@ -564,8 +628,7 @@
 
 (defn- argument-type-name [arg-oid format-type]
   (if-let [t (when *db* (objects/object-by-address *db* objects/pg-type-oid arg-oid))]
-    (let [ns-oid (:datahike.pg.object/oid
-                  (d/entity *db* (get-in t [:datahike.pg.object/namespace :db/id])))
+    (let [ns-oid (objects/object-namespace-oid *db* t)
           name (:datahike.pg.object/name t)
           builtin-oid (:oid (catalog/type-by-name name))
           path (search-path *db*)
@@ -575,7 +638,7 @@
            (quote-ident name)))
     (format-type arg-oid)))
 
-(defn output
+(defn- routine-output
   "regprocout/regprocedureout. `format-type` supplies PostgreSQL's type
    spelling without coupling this catalog layer to the value-type registry."
   [oid value format-type]
@@ -592,3 +655,19 @@
           (if (= oid 2202)
             (str name "(" (str/join "," (map #(argument-type-name % format-type) (:args r))) ")") name))
         (str id)))))
+
+(defn output
+  "Render an OID alias against the current statement's identities/visibility."
+  [oid value format-type]
+  (let [id (long value)]
+    (cond
+      (zero? id) "-"
+      (= oid 4089) (if-let [name (namespace-name *db* id)] (quote-ident name) (str id))
+      (= oid 2205)
+      (if-let [{:keys [name namespace-oid]} (relation {:oid id})]
+        (let [visible? (= id (try (relation-input [name])
+                                  (catch clojure.lang.ExceptionInfo _ nil)))]
+          (str (when-not visible? (str (quote-ident (namespace-name *db* namespace-oid)) "."))
+               (quote-ident name)))
+        (str id))
+      :else (routine-output oid value format-type))))

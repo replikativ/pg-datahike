@@ -1176,7 +1176,8 @@ public final class PgParamCodec {
 
             // regprocrecv/regprocedurerecv share PostgreSQL's oidrecv.
             // Preserve the unsigned half of the OID space.
-            case PgWireServer.OID_REGPROC, PgWireServer.OID_REGPROCEDURE -> {
+            case PgWireServer.OID_REGPROC, PgWireServer.OID_REGPROCEDURE,
+                 PgWireServer.OID_REGCLASS, PgWireServer.OID_REGNAMESPACE -> {
                 if (bytes.length != 4) {
                     throw new PgWireServer.PgProtocolException("22P03",
                         "invalid binary representation for routine OID");

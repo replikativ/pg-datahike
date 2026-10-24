@@ -5889,6 +5889,14 @@
                        :arities #{1} :return-oid types/oid-regproc}
    "regprocedure"     {:impl #(regoid/input "regprocedure" %)
                        :arities #{1} :return-oid types/oid-regprocedure}
+   "regclass"         {:impl #(regoid/input "regclass" %)
+                       :arities #{1} :return-oid types/oid-regclass}
+   "regnamespace"     {:impl #(regoid/input "regnamespace" %)
+                       :arities #{1} :return-oid types/oid-regnamespace}
+   "to_regclass"      {:impl #(or (regoid/input-or-nil "regclass" %) :__null__)
+                       :arities #{1} :arg-oids [types/oid-text] :return-oid types/oid-regclass}
+   "to_regnamespace"  {:impl #(or (regoid/input-or-nil "regnamespace" %) :__null__)
+                       :arities #{1} :arg-oids [types/oid-text] :return-oid types/oid-regnamespace}
    "div"              {:unknown-args :homogeneous}
    "log"              {:unknown-args :homogeneous}
    "mod"              {:unknown-args :homogeneous}

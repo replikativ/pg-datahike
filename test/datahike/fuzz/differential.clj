@@ -982,20 +982,22 @@
        :run (fn [c] (q c "SELECT sum(t.v)::text FROM (VALUES ('1 mon'::interval), ('1 day'::interval)) t(v)"))}])))
 
 (defn- run-regoid-corpus
-  "Routine OID input/output over both protocols, compared with a live oracle."
+  "OID alias input/output over both protocols, compared with a live oracle."
   []
   (with-open [o (reference-conn) t (target-conn)]
     (doseq [c [o t]] (exec! c "SET search_path TO public"))
-    (let [queries (mapv first (:cases (edn/read-string
-                                       (slurp "test/resources/regoid_corpus.edn"))))
+    (let [queries (vec (mapcat (fn [file]
+                                 (map first (:cases (edn/read-string (slurp file)))))
+                               ["test/resources/regoid_corpus.edn"
+                                "test/resources/object_oid_corpus.edn"]))
           run (fn [c sql] [(q c sql) (prep-q c sql [])])]
       {:surface :regoid :seed nil :drawn (set queries)
-       :ran {:routine-identity (count queries)}
+       :ran {:oid-identity (count queries)}
        :diffs (into []
                     (keep (fn [sql]
                             (let [a (run o sql) b (run t sql)]
                               (when-not (= a b)
-                                {:surface :regoid :class :routine-identity :key sql
+                                {:surface :regoid :class :oid-identity :key sql
                                  :reference a :target b}))))
                     queries)})))
 

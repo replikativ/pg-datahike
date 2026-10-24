@@ -2600,7 +2600,8 @@
             ;; argument count is 42883, not a runtime ArityException
             ;; surfacing as XX000.
             _ (fns/check-arity! fname (count args))
-            _ (when (contains? #{"to_regproc" "to_regprocedure" "regproc" "regprocedure"} fname)
+            _ (when (contains? #{"to_regproc" "to_regprocedure" "regproc" "regprocedure"
+                                 "to_regclass" "to_regnamespace" "regclass" "regnamespace"} fname)
                 (params/session-dependent!))
             clj-fn (get fns/sql-fn->clj-fn fname)
             ;; Strictness is the rule, not a law -- see fns/non-strict-fns.
@@ -4342,7 +4343,7 @@
         inner-raw (translate-expr ctx inner)
         ;; Type classification from centralized registry
         cast-cat (types/cast-category type-str)
-        _ (when (= :reg-routine cast-cat) (params/session-dependent!))
+        _ (when (= :reg-oid cast-cat) (params/session-dependent!))
         is-int? (= :integer cast-cat)
         is-float? (= :float cast-cat)
         is-numeric? (= :numeric cast-cat)
@@ -4565,7 +4566,7 @@
                       (cond
                         (nil? v)              :__null__
                         (= :__null__ v)       :__null__
-                        (pg-arr/array? v)     (pg-arr/coerce-routine-elements
+                        (pg-arr/array? v)     (pg-arr/coerce-oid-elements
                                                (assoc v :elem-type (or target-elem (:elem-type v))))
                         ;; A bound array param arrives as canonical PG text
                         ;; ("{16384}") or a Clojure collection — reconstruct it
@@ -4573,7 +4574,7 @@
                         ;; the wire layer decodes to "{…}"). Without this the
                         ;; cast returned NULL and `col = any($1)` matched nothing.
                         :else                 (if-let [a (coerce-pg-array v target-elem)]
-                                                (pg-arr/coerce-routine-elements
+                                                (pg-arr/coerce-oid-elements
                                                  (assoc a :elem-type (or target-elem (:elem-type a))))
                                                 :__null__)))
             result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
@@ -4667,20 +4668,7 @@
           is-interval? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           is-interval? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
-          (= cast-cat :reg-routine) (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
-        ;; ::regnamespace — resolve schema name to namespace OID
-        ;; We support a single namespace 'public' with OID 2200
-          (= type-str "regnamespace") 2200
-        ;; ::regclass — resolve the literal name to the table OID. Prefer
-        ;; the stable :pg/table-oid from CREATE TABLE; for legacy tables
-        ;; without one, match the hashCode fallback that pg_class and
-        ;; pg_attribute synthesize so WHERE attrelid = 'x'::regclass
-        ;; actually joins. 0 for unknown names.
-          (= type-str "regclass")
-          (let [n (str inner-raw)]
-            (or (when params/*parse-db* (pgs/table-oid params/*parse-db* n))
-                (when (seq n) (Math/abs (.hashCode ^String n)))
-                0))
+          (= cast-cat :reg-oid) (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           (= type-str "regtype")
           (or (params/registered-type-oid params/*parse-db* inner-raw) inner-raw)
           :else    inner-raw)
@@ -4737,7 +4725,7 @@
               (swap! (:in-args ctx) conj (null-preserving ts-fn))
               (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
 
-            (= cast-cat :reg-routine)
+            (= cast-cat :reg-oid)
             (let [fn-param (ctx/fresh-var! ctx)]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj
@@ -4750,28 +4738,6 @@
               (swap! (:in-params ctx) conj uuid-fn-param)
               (swap! (:in-args ctx) conj (null-preserving uuid-fn))
               (swap! (:where-clauses ctx) conj [(list uuid-fn-param inner-val) result-var]))
-
-          ;; ::regnamespace — always resolve to OID 2200 (single namespace)
-            (= type-str "regnamespace")
-            (do (swap! (:where-clauses ctx) conj [(list 'identity 2200) result-var])
-                result-var)
-
-          ;; ::regclass — resolve table name to relation OID. Same
-          ;; precedence as the literal branch: :pg/table-oid, then
-          ;; hashCode fallback, then 0.
-            (= type-str "regclass")
-            (let [fn-param (symbol (str "?regclass" (swap! (:var-counter ctx) inc)))
-                  db params/*parse-db*
-                  lookup (fn [v]
-                           (when (some? v)
-                             (let [n (str v)]
-                               (or (when db (pgs/table-oid db n))
-                                   (when (seq n) (Math/abs (.hashCode ^String n)))
-                                   0))))]
-              (swap! (:in-params ctx) conj fn-param)
-              (swap! (:in-args ctx) conj lookup)
-              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
-              result-var)
 
             (= type-str "regtype")
             (let [fn-param (symbol (str "?regtype" (swap! (:var-counter ctx) inc)))

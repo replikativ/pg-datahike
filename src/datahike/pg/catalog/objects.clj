@@ -237,6 +237,14 @@
 (defn namespace-by-oid [db oid]
   (object-by-address db pg-namespace-oid oid))
 
+(defn object-namespace-oid
+  "Read a namespace reference from either a pulled object or an entity."
+  [db object]
+  (let [ref (:datahike.pg.object/namespace object)]
+    (or (:datahike.pg.object/oid ref)
+        (when-let [eid (if (number? ref) ref (:db/id ref))]
+          (:datahike.pg.object/oid (d/entity db eid))))))
+
 (defn objects-in-namespace [db namespace-oid]
   (let [db (catalog-metadata-db db)]
     (when-let [namespace-eid (:db/id (namespace-by-oid db namespace-oid))]
@@ -504,8 +512,7 @@
   (when-let [object (object-by-address db class-oid object-oid)]
     (let [object-ref [:datahike.pg.object/address-key
                       (address-key class-oid object-oid)]
-          namespace-oid (some-> (:datahike.pg.object/namespace object)
-                                :datahike.pg.object/oid)
+          namespace-oid (object-namespace-oid db object)
           old-key (:datahike.pg.object/identity-key object)
           new-key (identity-key class-oid namespace-oid new-name identity-tail)
           revision (long (or (:datahike.pg.object/revision object) 0))]

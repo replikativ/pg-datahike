@@ -217,14 +217,14 @@
     ;; for a json object of its fields.
     (= "datahike.pg.bits.PgBit" (.getName (class v))) (types/->pg-text v oid)
     (or (pg-arr/array? v)
-        (and (string? v) (contains? #{:regproc :regprocedure}
+        (and (string? v) (contains? #{:regproc :regprocedure :regclass :regnamespace}
                                     (some-> oid types/array-oid->element-oid types/oid->elem-kw))))
     (if-let [elem (some-> oid types/array-oid->element-oid types/oid->elem-kw)]
       (if (string? v) (pg-arr/from-pg-text v elem) (assoc v :elem-type elem)) v)
     (or (records/record? v) (map? v) (vector? v)) v
     (boolean? v) v
     (and (number? v)
-         (not (contains? #{types/oid-money types/oid-regproc types/oid-regprocedure} oid)))
+         (not (contains? #{types/oid-money types/oid-regproc types/oid-regprocedure types/oid-regclass types/oid-regnamespace} oid)))
     (if (or (types/numeric-special? v)
             (and (or (instance? Double v) (instance? Float v))
                  (or (Double/isNaN (double v)) (Double/isInfinite (double v)))))
