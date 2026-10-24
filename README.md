@@ -565,6 +565,20 @@ atomic `COPY … FROM stdin` (text + CSV, streaming UTF-8, NULL/default markers)
 `ALTER TABLE … ADD CONSTRAINT
 FOREIGN KEY … ON UPDATE CASCADE ON DELETE RESTRICT`.
 
+`regproc` and `regprocedure` refer to functions by their numeric OID.
+Use `'now'::regproc` for an unambiguous name or
+`'abs(integer)'::regprocedure` for an exact input signature. Overloaded
+names raise `42725`; missing functions raise `42883`. `to_regproc` and
+`to_regprocedure` return NULL for missing or ambiguous identities, while
+invalid argument type modifiers can still raise an error. Names resolve
+through `search_path`, and output uses schema qualification when needed.
+Scalar columns, arrays, COPY and typed text parameters preserve these
+identities. Scalar binary parameters use PostgreSQL's unsigned four-byte
+OID format; results use text format, and binary routine-array parameters
+are not supported. A function's presence in the generated `pg_proc`
+catalog describes its identity and signature; unsupported execution still
+fails explicitly.
+
 ### Accepted under `:compat :pg-dump` (no semantics, schema loads)
 
 `CREATE TRIGGER`, `CREATE FUNCTION` (incl. `$$…$$` body),

@@ -981,6 +981,24 @@
        :key "SELECT sum(t.v)::text FROM (VALUES ('1 mon'::interval), ('1 day'::interval)) t(v)"
        :run (fn [c] (q c "SELECT sum(t.v)::text FROM (VALUES ('1 mon'::interval), ('1 day'::interval)) t(v)"))}])))
 
+(defn- run-regoid-corpus
+  "Routine OID input/output over both protocols, compared with a live oracle."
+  []
+  (with-open [o (reference-conn) t (target-conn)]
+    (doseq [c [o t]] (exec! c "SET search_path TO public"))
+    (let [queries (mapv first (:cases (edn/read-string
+                                       (slurp "test/resources/regoid_corpus.edn"))))
+          run (fn [c sql] [(q c sql) (prep-q c sql [])])]
+      {:surface :regoid :seed nil :drawn (set queries)
+       :ran {:routine-identity (count queries)}
+       :diffs (into []
+                    (keep (fn [sql]
+                            (let [a (run o sql) b (run t sql)]
+                              (when-not (= a b)
+                                {:surface :regoid :class :routine-identity :key sql
+                                 :reference a :target b}))))
+                    queries)})))
+
 (declare run-datetime-corpus run-interval-corpus run-generated-surface)
 
 (defn run-surface
@@ -993,6 +1011,7 @@
   (case surface
     :datetime (run-datetime-corpus)
     :interval (run-interval-corpus)
+    :regoid (run-regoid-corpus)
     (run-generated-surface surface n seed)))
 
 (defn- run-interval-corpus
@@ -1164,12 +1183,12 @@
                    ;; The gate was decoration, and the manifest header
                    ;; claimed a 17.7-vs-17.10 agreement that nothing had
                    ;; ever checked.
-                   [:select :prepared :join :dml :datetime :interval]
+                   [:select :prepared :join :dml :datetime :interval :regoid]
                    [(keyword surface)])
         n (if n (Long/parseLong n) nil)
         seed (if seed (Long/parseLong seed) 20260918)
         default-n {:select 1500 :prepared 600 :join 150 :dml 300
-                   :datetime 0 :interval 0}
+                   :datetime 0 :interval 0 :regoid 0}
         outcomes (doall (for [s surfaces]
                           (report (run-surface s (or n (default-n s)) seed))))
         unexpected (mapcat :unexpected outcomes)

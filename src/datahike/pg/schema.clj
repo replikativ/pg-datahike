@@ -38,6 +38,10 @@
         invalid-vector-spelling?
         (and (types/vector-type-spelling? type-name)
              (not= :vector (types/cast-category normalized)))
+        invalid-routine-spelling?
+        (and (types/routine-type-spelling? type-name)
+             (not (contains? #{"regproc" "regprocedure"}
+                             (str/replace normalized #"(?:\s*\[\s*\])+$" ""))))
         ;; Unquoted: `path` is a reserved word in JSqlParser's grammar
         ;; and is rewritten to its quoted spelling before parsing, so a
         ;; cast to it arrived here as `"path"` and resolved to nothing.
@@ -61,6 +65,7 @@
                                         db base)))
                           (catch Throwable _ false))))]
     (boolean (and (not invalid-vector-spelling?)
+                  (not invalid-routine-spelling?)
                   (or built-in?
                       (registered? :datahike.pg.enum/name)
                       (registered? :datahike.pg.domain/name)

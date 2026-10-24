@@ -663,15 +663,15 @@
       (is (pos? (count (:rows r)))))))
 
 (deftest test-pg-proc-arg-return-types
-  (testing "prorettype and proargtypes expose best-effort type signatures"
-    (let [r (ex "SELECT prorettype, proargtypes FROM pg_proc WHERE proname = 'upper'")]
+  (testing "prorettype and proargtypes identify the exact text overload"
+    (let [r (ex "SELECT prorettype, proargtypes FROM pg_proc WHERE proname = 'upper' AND proargtypes = '25'")]
       (is (nil? (:err r)))
       (is (= 1 (count (:rows r))))
       (let [[ret args] (first (:rows r))]
         ;; upper returns text (OID 25), takes text (OID 25)
         (is (= "25" ret))
         (is (= "25" args))))
-    (let [r (ex "SELECT prorettype, proargtypes FROM pg_proc WHERE proname = 'length'")]
+    (let [r (ex "SELECT prorettype, proargtypes FROM pg_proc WHERE proname = 'length' AND proargtypes = '25'")]
       (is (nil? (:err r)))
       (let [[ret args] (first (:rows r))]
         ;; length returns int4 (OID 23), takes text (OID 25)

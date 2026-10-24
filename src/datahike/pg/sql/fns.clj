@@ -38,6 +38,7 @@
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.errors :as errors]
             [datahike.pg.geo :as geo]
             [datahike.pg.mac :as mac]
@@ -5878,6 +5879,16 @@
   {;; PostgreSQL resolves an unknown literal in these homogeneous numeric
    ;; calls from another, already-typed argument.  Lowering consumes this
    ;; metadata before translating the argument expressions.
+   "to_regproc"       {:impl #(or (regoid/input-or-nil "regproc" %) :__null__)
+                       :arities #{1} :arg-oids [types/oid-text]
+                       :return-oid types/oid-regproc}
+   "to_regprocedure"  {:impl #(or (regoid/input-or-nil "regprocedure" %) :__null__)
+                       :arities #{1} :arg-oids [types/oid-text]
+                       :return-oid types/oid-regprocedure}
+   "regproc"          {:impl #(regoid/input "regproc" %)
+                       :arities #{1} :return-oid types/oid-regproc}
+   "regprocedure"     {:impl #(regoid/input "regprocedure" %)
+                       :arities #{1} :return-oid types/oid-regprocedure}
    "div"              {:unknown-args :homogeneous}
    "log"              {:unknown-args :homogeneous}
    "mod"              {:unknown-args :homogeneous}

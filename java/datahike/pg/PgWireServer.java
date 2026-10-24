@@ -111,6 +111,7 @@ public final class PgWireServer {
     public static final int OID_INT8        = 20;   // bigint
     public static final int OID_INT2        = 21;   // smallint
     public static final int OID_INT4        = 23;   // integer
+    public static final int OID_REGPROC     = 24;
     public static final int OID_TEXT        = 25;
     public static final int OID_OID         = 26;
     public static final int OID_JSON        = 114;
@@ -123,6 +124,7 @@ public final class PgWireServer {
     public static final int OID_TIMESTAMPTZ = 1184; // timestamp with time zone
     public static final int OID_NUMERIC     = 1700;
     public static final int OID_REGTYPE     = 2206; // pg_typeof()'s result
+    public static final int OID_REGPROCEDURE = 2202;
     public static final int OID_INTERVAL    = 1186;
     public static final int OID_TIMETZ      = 1266; // time with time zone
     public static final int OID_UUID        = 2950;
@@ -3357,7 +3359,7 @@ public final class PgWireServer {
             case OID_TIMETZ -> 12;   // int64 time + int32 zone offset
             case OID_INTERVAL -> 16; // int64 time + int32 day + int32 month
             case OID_UUID -> 16;
-            case OID_REGTYPE -> 4;
+            case OID_REGPROC, OID_REGPROCEDURE, OID_REGTYPE -> 4;
             // text, varchar, bytea, numeric, json/jsonb, bit/varbit and
             // every array type are varlena.
             default -> -1;

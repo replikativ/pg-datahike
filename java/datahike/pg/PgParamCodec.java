@@ -1174,6 +1174,16 @@ public final class PgParamCodec {
             case PgWireServer.OID_INT8 ->
                 buf.getLong();
 
+            // regprocrecv/regprocedurerecv share PostgreSQL's oidrecv.
+            // Preserve the unsigned half of the OID space.
+            case PgWireServer.OID_REGPROC, PgWireServer.OID_REGPROCEDURE -> {
+                if (bytes.length != 4) {
+                    throw new PgWireServer.PgProtocolException("22P03",
+                        "invalid binary representation for routine OID");
+                }
+                yield Integer.toUnsignedLong(buf.getInt());
+            }
+
             // float4recv / float8recv — IEEE 754 bits in big-endian.
             case PgWireServer.OID_FLOAT4 ->
                 (double) Float.intBitsToFloat(buf.getInt());

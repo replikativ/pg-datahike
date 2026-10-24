@@ -28,6 +28,7 @@
    load cycle."
   (:require [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.datetime.carrier :as carrier]
             [datahike.pg.datetime.in :as in]
             [datahike.pg.interval.core :as iv]
@@ -488,6 +489,7 @@
     v
     (let [cat (types/cast-category type-str)]
       (case cat
+        :reg-routine (regoid/input (types/normalize-sql-type-name type-str) v)
         :tsvector (tsearch/canonical-tsvector v)
         :tsquery (tsearch/canonical-tsquery v)
 

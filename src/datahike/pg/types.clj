@@ -16,6 +16,7 @@
    4. SQL name → category (for CAST type classification)"
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.errors :as errors]
             [datahike.pg.pg-catalog :as pg-catalog])
   (:import [datahike.pg PgWireServer]))
@@ -30,6 +31,7 @@
 (def oid-int8       20)
 (def oid-int2       21)
 (def oid-int4       23)
+(def oid-regproc    24)
 (def oid-text       25)
 (def oid-oid        26)
 (def oid-tid        27)
@@ -74,6 +76,7 @@
 (def oid-numeric  1700)
 (def oid-uuid     2950)
 (def oid-regclass  2205)
+(def oid-regprocedure 2202)
 (def oid-regtype  2206)
 (def oid-regnamespace 4089)
 (def oid-bit      1560)
@@ -140,6 +143,7 @@
   (into {}
         (map (fn [e] [e (:typarray (catalog-type e))]))
         [oid-bool oid-bytea oid-name oid-int2 oid-int4 oid-text oid-int8
+         oid-regproc oid-regprocedure
          oid-float4 oid-float8 oid-oid oid-varchar oid-bpchar oid-date
          oid-time oid-timetz oid-timestamp oid-timestamptz oid-numeric
          oid-uuid oid-json oid-money oid-jsonb oid-tsvector oid-tsquery
@@ -170,6 +174,8 @@
    :float4      oid-float4
    :float8      oid-float8
    :oid         oid-oid
+   :regproc     oid-regproc
+   :regprocedure oid-regprocedure
    :varchar     oid-varchar
    :bpchar      oid-bpchar
    :date        oid-date
@@ -208,7 +214,8 @@
    oid-time "time", oid-timetz "timetz", oid-timestamptz "timestamptz",
    oid-interval "interval", oid-bit "bit", oid-varbit "varbit",
    oid-json "json", oid-jsonb "jsonb", oid-bytea "bytea",
-   oid-pg-lsn "pg_lsn", oid-regclass "regclass", oid-regtype "regtype",
+   oid-pg-lsn "pg_lsn", oid-regproc "regproc", oid-regprocedure "regprocedure",
+   oid-regclass "regclass", oid-regtype "regtype",
    oid-regnamespace "regnamespace", oid-tid "tid", oid-vector "vector",
    oid-tsvector "tsvector", oid-tsquery "tsquery"})
 
@@ -325,6 +332,8 @@
    "vector"            :db.type/float-array
    ;; OID / system (mapped to long)
    "oid"               :db.type/long
+   "regproc"           :db.type/long
+   "regprocedure"      :db.type/long
    "regclass"          :db.type/long
    "regtype"           :db.type/long})
 
@@ -347,6 +356,8 @@
    "name"              :name
    "citext"            :text
    "integer"           :int4
+   "regproc"           :regproc
+   "regprocedure"      :regprocedure
    "int"               :int4
    "int4"              :int4
    "int2"              :int2
@@ -492,6 +503,8 @@
     ;; `pg_proc.proargtypes`. Declaring it is what lets a value written
     ;; SPACE-separated be read as the vector it is.
     "int2vector"  oid-int2vector
+    "regproc"     oid-regproc
+    "regprocedure" oid-regprocedure
     "regclass"    oid-regclass
     "regtype"     oid-regtype
     "regnamespace" oid-regnamespace
@@ -595,6 +608,8 @@
    oid-float4     "real"
    oid-float8     "double precision"
    oid-numeric    "numeric"
+   oid-regproc    "regproc"
+   oid-regprocedure "regprocedure"
    oid-regclass   "regclass"
    oid-regtype    "regtype"
    oid-regnamespace "regnamespace"
@@ -783,25 +798,38 @@
       t
       (clojure.string/replace t #"^\"(.*)\"$" "$1"))))
 
+(defn routine-type-spelling? [sql-type-name]
+  (boolean (and sql-type-name
+                (re-find #"(?i)(?:^|\.)\s*\"?regproc(?:edure)?\"?\s*(?:\[|$)"
+                         (str/trim (str sql-type-name))))))
+
 (defn normalize-sql-type-name
-  "Normalize the built-in compatibility spelling of pgvector's type.
+  "Normalize supported schema-qualified pgvector and routine alias types.
    JSqlParser preserves schema qualification and identifier quotes in
    different fields depending on CAST versus DDL. PostgreSQL installs the
    extension in public by default, so these all resolve to the same type."
   [sql-type-name]
   (when sql-type-name
     (let [s (clojure.string/trim (str sql-type-name))
+          routine-prefix
+          #"^(?:(?:(?i:pg_catalog)|\"pg_catalog\")\s*\.\s*)?((?i:regproc(?:edure)?)|\"regproc\"|\"regprocedure\")(?=\s*(?:\[|$))"
           valid-prefix
           #"^(?:(?:(?i:public)|\"public\")\s*\.\s*)?(?:(?i:vector)|\"vector\")(?=\s*(?:\(|\[|$))"]
-      (if (re-find valid-prefix s)
-        (clojure.string/replace-first s valid-prefix "vector")
-        (if (vector-type-spelling? s)
-          s
+      (cond
+        (re-find routine-prefix s)
+        (str/replace-first s routine-prefix
+                           #(str/lower-case (unquote-type-name (second %))))
+        (routine-type-spelling? s) s
+        :else
+        (if (re-find valid-prefix s)
+          (clojure.string/replace-first s valid-prefix "vector")
+          (if (vector-type-spelling? s)
+            s
           ;; Quotes come off here so every downstream lookup sees the
           ;; bare name: `path` is rewritten to `"path"` before parsing,
           ;; because JSqlParser reserves the word. `"char"` keeps
           ;; them -- see `unquote-type-name`.
-          (clojure.string/lower-case (unquote-type-name s)))))))
+            (clojure.string/lower-case (unquote-type-name s))))))))
 
 ;; ============================================================================
 ;; Catalog data: pg_type rows for virtual table materialization
@@ -818,7 +846,7 @@
                  oid-bpchar oid-name oid-date oid-time oid-timetz oid-timestamp
                  oid-timestamptz oid-interval oid-numeric oid-uuid oid-bit
                  oid-varbit oid-jsonb oid-tsvector oid-tsquery oid-pg-lsn
-                 oid-regclass oid-regtype oid-regnamespace oid-vector
+                 oid-regproc oid-regprocedure oid-regclass oid-regtype oid-regnamespace oid-vector
                  oid-point oid-lseg oid-path oid-box oid-polygon oid-line
                  oid-circle oid-macaddr oid-macaddr8]
                 (vals element-oid->array-oid))))
@@ -1163,6 +1191,8 @@
    oid-int2        :db.type/long
    oid-int4        :db.type/long
    oid-int8        :db.type/long
+   oid-regproc     :db.type/long
+   oid-regprocedure :db.type/long
    oid-float4      :db.type/double
    oid-float8      :db.type/double
    oid-numeric     :db.type/bigdec
@@ -1348,6 +1378,7 @@
         :geometric
         (#{"macaddr" "macaddr8"} base)        :mac
         (= "pg_lsn" base)                     :pg-lsn
+        (contains? regoid/routine-types base)  :reg-routine
         (= base "json")                       :json
         (= base "jsonb")                      :jsonb
         (= base "tsvector")                   :tsvector
@@ -1980,12 +2011,22 @@
   ;; them). Each registers its output function when it loads.
   (atom []))
 
-(defn register-output-function!
-  "Make `->pg-text` render values satisfying `pred` with `render`. For a
-   type whose carrier lives in a namespace above this one."
+(defn register-typed-output-function!
+  "Register a carrier renderer receiving [value source-oid]."
   [pred render]
   (swap! output-functions
          (fn [fs] (conj (vec (remove #(= pred (first %)) fs)) [pred render]))))
+
+(defn register-output-function!
+  "Register a carrier renderer receiving only its value."
+  [pred render]
+  (register-typed-output-function! pred (fn [v _oid] (render v))))
+
+(def ^:private routine-array-output
+  ;; Array input/output live above this registry. Resolve after its namespace
+  ;; has loaded, as temporal carrier renderers do, without a load-time cycle.
+  (delay [(requiring-resolve 'datahike.pg.arrays/from-pg-text)
+          (requiring-resolve 'datahike.pg.arrays/to-pg-text)]))
 
 (defn ->pg-text
   "PostgreSQL's output function for a value (its type's `typoutput`).
@@ -2004,6 +2045,13 @@
      ;; SQL NULL, including the internal sentinel: it must never render as
      ;; text (`concat(NULL, 'x')` answered ":__null__x").
      (or (nil? v) (= :__null__ v)) nil
+     (and (string? v) (contains? regoid/routine-oids (array-oid->element-oid src-oid)))
+     (let [[read-array render-array] @routine-array-output]
+       (render-array (read-array v (oid->elem-kw (array-oid->element-oid src-oid))) src-oid))
+     (and (contains? regoid/routine-oids src-oid) (number? v))
+     (regoid/output src-oid v #(or (get oid->pg-name %)
+                                   (:typname (pg-catalog/type-by-oid %))
+                                   (str %)))
      (and (= src-oid oid-money) (number? v)) (money-text v)
      ;; `.toString` on a negative-scale BigDecimal produces an exponent
      ;; form PostgreSQL never emits.
@@ -2027,7 +2075,7 @@
      ;; elements print. `true::text` is `true` because the bool -> text
      ;; CAST is booltext, a different function; cast.clj handles it.
      (instance? Boolean v) (if v "t" "f")
-     :else (or (some (fn [[pred render]] (when (pred v) (render v))) @output-functions)
+     :else (or (some (fn [[pred render]] (when (pred v) (render v src-oid))) @output-functions)
                (temporal->pg-text v src-oid)
                (str v)))))
 

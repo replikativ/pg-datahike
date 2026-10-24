@@ -573,6 +573,54 @@
                                                         [(if (= oid oid-date) "2024-01-15" "1")])))
           (str "declared OID " oid " should survive Describe")))))
 
+(deftest declared-routine-oids-read-text-and-preserve-identity
+  (doseq [[oid input want] [[24 "1299" "now"] [24 "-" "-"]
+                            [2202 "abs(int4)" "abs(integer)"]]]
+    (let [result (parse-describe-execute "SELECT $1" [oid] [input])]
+      (is (nil? (:error result)))
+      (is (= [oid] (:param-oids result)))
+      (is (= 4 (:typlen (first (:columns result)))))
+      (is (= [[want]] (:rows result)))))
+  (let [result (parse-describe-execute "SELECT $1" [24] ["abs"])]
+    (is (= "42725" (get-in result [:error \C])))))
+
+(deftest routine-array-parameters-are-read-even-when-unused
+  (let [result (parse-describe-execute "SELECT $1" [1008] ["{1299,0}"])]
+    (is (nil? (:error result)))
+    (is (= [["{now,-}"]] (:rows result))))
+  (is (= "42725" (get-in (parse-describe-execute "SELECT 1" [1008] ["{abs}"])
+                         [:error \C]))))
+
+(deftest routine-oid-binary-parameters-preserve-unsigned-values
+  (doseq [oid [24 2202]]
+    (with-conn
+      (fn [in out]
+        (send-msg! out \P (ba (cstr "routine_binary") (cstr "SELECT $1")
+                              [:i16 1] [:i32 oid]))
+        (send-msg! out \D (ba (.getBytes "S" StandardCharsets/UTF_8) (cstr "routine_binary")))
+        (send-msg! out \B (ba (cstr "") (cstr "routine_binary")
+                              [:i16 1] [:i16 1] [:i16 1] [:i32 4] [:i32 -1] [:i16 0]))
+        (send-msg! out \E (ba (cstr "") [:i32 0]))
+        (send-msg! out \S (byte-array 0))
+        (let [result (decode (read-until-ready in))]
+          (is (nil? (:error result)))
+          (is (= [["4294967295"]] (:rows result)))
+          (is (= 4 (:typlen (first (:columns result))))))))))
+
+(deftest routine-parameter-input-error-aborts-the-transaction
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "BEGIN"))
+      (read-until-ready in)
+      (send-msg! out \P (ba (cstr "routine_input") (cstr "SELECT $1")
+                            [:i16 1] [:i32 24]))
+      (send-bind-execute-sync! out "routine_input" ["abs"])
+      (is (= "42725" (get-in (decode (read-until-ready in)) [:error \C])))
+      (send-msg! out \Q (cstr "SELECT 1"))
+      (is (= "25P02" (get-in (decode (read-until-ready in)) [:error \C])))
+      (send-msg! out \Q (cstr "ROLLBACK"))
+      (read-until-ready in))))
+
 (deftest undeclared-param-still-defaults-to-text
   (testing "a 0 slot resolves to TEXT — never 0, which sends asyncpg into
             infinite type introspection"
