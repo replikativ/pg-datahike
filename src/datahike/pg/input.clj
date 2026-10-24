@@ -18,6 +18,7 @@
   (:refer-clojure :exclude [parse-uuid])
   (:require [clojure.string :as str]
             [datahike.pg.errors :as errors]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types])
   (:import [datahike.pg PgParamCodec PgWireServer$PgProtocolException]))
@@ -357,6 +358,8 @@
    types/oid-int4 parse-int4
    types/oid-int8 parse-int8
    types/oid-oid parse-oid
+   types/oid-regproc #(regoid/input "regproc" %)
+   types/oid-regprocedure #(regoid/input "regprocedure" %)
    types/oid-float4 parse-float4
    types/oid-float8 parse-float8
    ;; numeric_in: coerce-numeric already matches it, NaN/Infinity,

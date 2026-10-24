@@ -236,7 +236,7 @@
   (when-let [expected (get-in fns/sql-function-specs [fname :arg-oids])]
     (let [actual (call-arg-oids ctx arg-exprs)]
       (when (some false?
-                  (map (fn [want got] (or (nil? got) (= want got)))
+                  (map (fn [want got] (or (nil? got) (types/implicit-coercible? got want)))
                        expected actual))
         (throw (no-such-function fname actual))))))
 
@@ -2274,6 +2274,23 @@
                [(list fn-param a b) result-var])
         result-var)
 
+      ;; Polymorphic quote_literal/quote_nullable call the argument type's
+      ;; output function before quoting, including OID aliases and money.
+      (contains? #{"quote_literal" "quote_nullable"} fname)
+      (let [_ (fns/check-arity! fname (count args))
+            oid (source-oid ctx (first params))
+            fn-param (ctx/fresh-var! ctx)
+            quote-fn (if (= fname "quote_nullable") fns/sql-quote-nullable fns/sql-quote-literal)
+            render #(quote-fn (types/->pg-text % oid))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj
+               (fn [v]
+                 (if (params/call-marker? v)
+                   {:fn :projection :projection-fn render :args [v]}
+                   (render v))))
+        (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
+        result-var)
+
       ;; CONCAT(a, b, ...) → [(str ?a ?b ...) ?result]
       (= fname "concat")
       ;; Not `str`: a temporal argument renders as java.util.Date.toString
@@ -2575,6 +2592,8 @@
             ;; argument count is 42883, not a runtime ArityException
             ;; surfacing as XX000.
             _ (fns/check-arity! fname (count args))
+            _ (when (contains? #{"to_regproc" "to_regprocedure" "regproc" "regprocedure"} fname)
+                (params/session-dependent!))
             clj-fn (get fns/sql-fn->clj-fn fname)
             ;; Strictness is the rule, not a law -- see fns/non-strict-fns.
             spec (get fns/sql-function-specs fname)
@@ -4315,6 +4334,7 @@
         inner-raw (translate-expr ctx inner)
         ;; Type classification from centralized registry
         cast-cat (types/cast-category type-str)
+        _ (when (= :reg-routine cast-cat) (params/session-dependent!))
         is-int? (= :integer cast-cat)
         is-float? (= :float cast-cat)
         is-numeric? (= :numeric cast-cat)
@@ -4528,9 +4548,8 @@
             (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
             result-var)))
 
-      ;; CAST(<expr> AS T[]) — accept an existing PgArray unchanged
-      ;; (element-type retype not supported; we only use the target to
-      ;; type an empty / untyped literal). Runtime or compile-time.
+      ;; Routine arrays resolve each leaf as an OID. Retain dimensions and
+      ;; lower bounds while changing the element type.
       is-array?
       (let [target-elem (types/cast-array-elem-kw type-str)
             fn-param (symbol (str "?cast-arr" (swap! (:var-counter ctx) inc)))
@@ -4538,16 +4557,16 @@
                       (cond
                         (nil? v)              :__null__
                         (= :__null__ v)       :__null__
-                        (pg-arr/array? v)     (pg-arr/array (or target-elem (:elem-type v))
-                                                            (:elements v))
+                        (pg-arr/array? v)     (pg-arr/coerce-routine-elements
+                                               (assoc v :elem-type (or target-elem (:elem-type v))))
                         ;; A bound array param arrives as canonical PG text
                         ;; ("{16384}") or a Clojure collection — reconstruct it
                         ;; (e.g. asyncpg sends `$1::oid[]` as binary oid[] which
                         ;; the wire layer decodes to "{…}"). Without this the
                         ;; cast returned NULL and `col = any($1)` matched nothing.
                         :else                 (if-let [a (coerce-pg-array v target-elem)]
-                                                (pg-arr/array (or target-elem (:elem-type a))
-                                                              (:elements a))
+                                                (pg-arr/coerce-routine-elements
+                                                 (assoc a :elem-type (or target-elem (:elem-type a))))
                                                 :__null__)))
             result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
             inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
@@ -4640,6 +4659,7 @@
           is-interval? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           is-interval? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
+          (= cast-cat :reg-routine) (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200
           (= type-str "regnamespace") 2200
@@ -4708,6 +4728,13 @@
               (swap! (:in-params ctx) conj ts-fn-param)
               (swap! (:in-args ctx) conj (null-preserving ts-fn))
               (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
+
+            (= cast-cat :reg-routine)
+            (let [fn-param (ctx/fresh-var! ctx)]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj
+                     (null-preserving #(sql-cast/cast-scalar % type-str {:explicit? true})))
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
 
             is-uuid?
             (let [uuid-fn-param (symbol (str "?cast-uuid" (swap! (:var-counter ctx) inc)))

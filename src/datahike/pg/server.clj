@@ -34,6 +34,7 @@
             [datahike.pg.datetime.carrier :as carrier]
             [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.errors :as errors]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.schema :as pgs]
             [datahike.pg.resolve :as pg-resolve]
             [datahike.pg.secondary :as pg-secondary]
@@ -314,6 +315,9 @@
      ;; from SQL NULL above. It must be tested BEFORE the generic
      ;; keyword branch, which would otherwise print the sentinel's name.
      (= jb/json-null v) "null"
+     (or (contains? regoid/routine-oids oid)
+         (contains? regoid/routine-oids (types/array-oid->element-oid oid)))
+     (types/->pg-text v oid)
      ;; Keep the scalar cases before the structured wrapper predicates below.
      ;; Result sets are dominated by strings, booleans and integer identifiers;
      ;; asking every such value whether it is a PgArray, PgRecord, bit string or
@@ -334,7 +338,7 @@
     ;; PgArray → PG canonical array text format `{…}` (see
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
-     (pg-arr/array? v) (pg-arr/to-pg-text v)
+     (pg-arr/array? v) (types/->pg-text v oid)
     ;; PgBit → its digit run. Before the wrapper existed a bit value WAS
     ;; a String and fell through to the string? branch below, which is
     ;; why it reported as text (#19). Same defrecord-before-string
@@ -8097,10 +8101,11 @@
 (def ^:private temporal-param-oids
   #{types/oid-date types/oid-time types/oid-timetz types/oid-timestamp types/oid-timestamptz})
 
-(defn- decode-temporal-text-params
-  "A text-format Bind value whose declared type is date, time, timetz,
-   timestamp or timestamptz, read by that type's input function -- here,
-   at Execute, because the wire layer decodes Bind outside the session:
+(defn- decode-session-text-params
+  "A text-format Bind value whose declared type is temporal or a routine
+   OID alias, read by that type's input function -- here,
+   at Execute, because the wire layer decodes Bind outside the session.
+   Routine names use its catalog snapshot and search path;
    `'2024-01-15 10:30'` as a timestamptz means 10:30 in the session's
    TimeZone, and only this scope knows it.
 
@@ -8120,8 +8125,17 @@
     bound
     (reduce-kv (fn [acc idx oid]
                  (let [v (get acc idx)]
-                   (if (and (string? v) (contains? temporal-param-oids oid))
-                     (assoc acc idx (input/parse oid v))
+                   (if (and (string? v) (or (contains? temporal-param-oids oid)
+                                            (contains? regoid/routine-oids oid)
+                                            (contains? regoid/routine-oids (types/array-oid->element-oid oid))))
+                     (assoc acc idx
+                            (try (if (contains? regoid/routine-oids (types/array-oid->element-oid oid))
+                                   (pg-arr/from-pg-text v (types/oid->elem-kw (types/array-oid->element-oid oid)))
+                                   (input/parse oid v))
+                                 (catch clojure.lang.ExceptionInfo e
+                                   (let [[code message fields] (errors/classify-exception e)]
+                                     (throw (PgWireServer$PgProtocolException.
+                                             code message fields))))))
                      acc)))
                bound
                (into {} (filter (fn [[k _]] (< 0 (long k) (count bound)))) declared))))
@@ -8590,7 +8604,8 @@
                 ;; Runtime subquery closures execute inside d/q. Bind the
                 ;; statement's effective query DB, not merely the connection's
                 ;; raw snapshot: CTEs and derived relations live in `query-db`.
-                (binding [params/*runtime-db* query-db]
+                (binding [params/*runtime-db* query-db
+                          regoid/*db* query-db]
                   (if (seq args)
                     (run-param-query q-input #(apply d/q q-input query-db args))
                     (run-param-query q-input #(d/q q-input query-db))))))
@@ -12775,6 +12790,7 @@
                  ;; us once per CopyData frame. Preserve stable-expression,
                  ;; cancellation, and timeout context across those callbacks.
                  :statement-time  params/*statement-time*
+                 :regoid-search-path (effective-search-path (:session-state ctx))
                  :scalar-subquery-cache params/*scalar-subquery-cache*
                  :cancel          params/*cancel*
                  :deadline-nanos  (let [timeout-ms (:statement-timeout
@@ -13008,7 +13024,9 @@
 
 (defn- with-copy-execution-context
   [copy-session f]
-  (binding [params/*statement-time* (:statement-time copy-session)
+  (binding [regoid/*db* (:speculative-db copy-session)
+            regoid/*search-path* (or (:regoid-search-path copy-session) ["$user" "public"])
+            params/*statement-time* (:statement-time copy-session)
             params/*scalar-subquery-cache* (:scalar-subquery-cache copy-session)
             params/*cancel* (:cancel copy-session)]
     (f)))
@@ -14201,9 +14219,16 @@
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
-        (let [bound (binding [types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+        (let [bound (binding [regoid/*db* (or (:speculative-db @tx-state) (d/db conn))
+                              regoid/*search-path* (effective-search-path session-state)
+                              types/*date-style* (or (:date-style @session-state) [:iso :mdy])
                               types/*time-zone* (or (:time-zone @session-state) types/utc-zone)]
-                      (decode-temporal-text-params (vec bound-params) (:declared-param-oids parsed)))
+                      (try
+                        (decode-session-text-params (vec bound-params) (:declared-param-oids parsed))
+                        (catch PgWireServer$PgProtocolException e
+                          (when (:in-tx? @tx-state)
+                            (swap! tx-state assoc :aborted? true))
+                          (throw e))))
               ;; The cardinality of a target-list SRF such as
               ;; generate_series(1,$1) is unknowable at Parse. Its parsed
               ;; map carries RowDescription metadata; now that Bind supplied
@@ -14222,6 +14247,8 @@
                        parsed)]
           (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
                                                       (java.util.IdentityHashMap.))
+                    regoid/*db* (or (:speculative-db @tx-state) (d/db conn))
+                    regoid/*search-path* (effective-search-path session-state)
                     params/*statement-time* (java.util.Date.)
                     params/*scalar-subquery-cache* (atom {})
                     ;; The extended protocol renders its rows here, so the
@@ -14262,6 +14289,8 @@
         (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
                                                     (java.util.IdentityHashMap.))
                   catalog/*registered-databases* registered-databases
+                  regoid/*db* (or (:speculative-db @tx-state) (d/db conn))
+                  regoid/*search-path* (effective-search-path session-state)
                   params/*statement-time* (java.util.Date.)
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
@@ -14632,6 +14661,7 @@
                                      (contains? write-parse-types (:type parsed)))
                             (open-implicit-tx! ctx))
                           (binding [params/*runtime-db* db
+                                    regoid/*db* db
                                     ;; Row projections (RETURNING, CHECK,
                                     ;; ON CONFLICT) run their plans the
                                     ;; way a SELECT runs, so a deferred

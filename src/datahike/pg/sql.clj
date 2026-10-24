@@ -20,6 +20,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.basis :as catalog-basis]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.classify :as cls]
@@ -972,6 +973,9 @@
    parse-sql wraps this with the LRU result cache."
   [^String sql schema db]
   (binding [params/*parse-db* db
+            regoid/*db* db
+            regoid/*search-path* (or (some-> params/*session-state* deref :search-path)
+                                     ["$user" "public"])
             params/*parse-sql* (params/nested-parse-fn parse-sql)
             ;; Use datahike's query PLANNER (not the legacy engine) for all
             ;; parse-time materialisation (derived tables / set-ops / CTEs /
@@ -1777,6 +1781,8 @@
                                                                    type-str (types/normalize-sql-type-name
                                                                              (str (.getDataType cdt)))
                                                                    full-str (types/normalize-sql-type-name (str cdt))
+                                                                   _ (when (= :reg-routine (types/cast-category full-str))
+                                                                       (params/session-dependent!))
                                                                    enum-values (when-not
                                                                                 (or (contains? types/pg-name->oid full-str)
                                                                                     (contains? types/pg-name->oid type-str))

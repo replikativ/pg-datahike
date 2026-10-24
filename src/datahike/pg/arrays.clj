@@ -444,7 +444,9 @@
     ;; wrong for the same reason a bare float8 was.
      (or (instance? Float v) (instance? Double v))
      ((requiring-resolve 'datahike.pg.types/float->pg-text) v (instance? Float v))
-     (and (number? v) (not= elem-oid 790)) (str v)
+     (and (number? v)
+          (not (contains? #{types/oid-money types/oid-regproc types/oid-regprocedure} elem-oid)))
+     (str v)
      (array? v)      (to-pg-text v)
      (sequential? v) (if (empty? v)
                        "{}"
@@ -477,17 +479,19 @@
    prefix when any lower bound != 1.
 
    Used by the wire layer's value->string for any PgArray value."
-  [^PgArray a]
-  (let [elts (:elements a)
-        elem-oid (get @(requiring-resolve 'datahike.pg.types/elem-kw->oid) (:elem-type a))
-        delim (delim-for (:elem-type a))
-        body (if (empty? elts)
-               "{}"
-               (str "{" (str/join (str delim)
-                                  (map #(element->text % elem-oid delim) elts)) "}"))]
-    (if-let [pfx (lbound-prefix a)]
-      (str pfx "=" body)
-      body)))
+  ([a] (to-pg-text a nil))
+  ([^PgArray a array-oid]
+   (let [elts (:elements a)
+         elem-oid (or (types/array-oid->element-oid array-oid)
+                      (types/elem-kw->oid (:elem-type a)))
+         delim (delim-for (:elem-type a))
+         body (if (empty? elts)
+                "{}"
+                (str "{" (str/join (str delim)
+                                   (map #(element->text % elem-oid delim) elts)) "}"))]
+     (if-let [pfx (lbound-prefix a)]
+       (str pfx "=" body)
+       body))))
 
 ;; --- parsing ----
 
@@ -495,7 +499,31 @@
 ;; through -- concat(), ||, format(), array elements, record fields -- and
 ;; without this it fell to `str` and printed the Java identity
 ;; (`datahike.pg...@bb1ab8bc`).
-(types/register-output-function! array? to-pg-text)
+(types/register-typed-output-function! array? to-pg-text)
+
+(defn coerce-routine-elements
+  "Resolve every routine-array leaf to its numeric identity. A cast from a
+   text ARRAY must run typinput just as an array text literal does."
+  [a]
+  (if (contains? #{:regproc :regprocedure} (:elem-type a))
+    (let [parse (input/parser (types/elem-kw->oid (:elem-type a)))
+          convert (fn convert [v]
+                    (cond
+                      (or (nil? v) (= :__null__ v)) nil
+                      (array? v) (mapv convert (:elements v))
+                      (sequential? v) (mapv convert v)
+                      :else (parse v)))]
+      (update a :elements #(mapv convert %)))
+    a))
+
+(defn to-storage-text
+  "Persist routine references as numeric identities, independent of the
+   session's search path or later function renames/deletions."
+  [a]
+  (let [a (coerce-routine-elements a)]
+    (to-pg-text (if (contains? #{:regproc :regprocedure} (:elem-type a))
+                  (assoc a :elem-type :oid) a))))
+
 (defn- coerce-token
   "Coerce a raw token to the target element-type. Unquoted NULL token
    → nil. Element-type drives the destination type."

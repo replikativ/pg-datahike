@@ -1555,7 +1555,10 @@
                     (sequential? pa)   (vec pa)
                     :else              nil)]
          (when vals
-           (with-ordinality ["unnest"] (mapv vector vals) [(vtype-of (first vals))] [nil])))
+           (let [oid (when (pg-arr/array? pa) (types/elem-kw->oid (:elem-type pa)))]
+             (with-ordinality ["unnest"] (mapv vector vals)
+               [(or (types/dh-type-for-oid oid) (vtype-of (first vals)))]
+               [(types/oid-preserving-pg-name oid)]))))
 
        ;; `information_schema._pg_expandarray(anyarray)` — one row per
        ;; element, each a RECORD (x, n): the element and its 1-based
@@ -7686,10 +7689,12 @@
                 :feature-not-supported
                 {:message "vector arrays are not supported"})))
       (if array-target?
-        (let [elem-kw (or (get types/sql-name->elem-kw type-str) :text)]
+        (let [elem-kw (or (types/cast-array-elem-kw (str col-data-type))
+                          (get types/sql-name->elem-kw type-str) :text)]
           (cond
-            (pg-arr/array? inner) (pg-arr/array elem-kw (:elements inner)
-                                                (:dims inner) (:lbounds inner))
+            (pg-arr/array? inner) (pg-arr/coerce-routine-elements
+                                   (pg-arr/array elem-kw (:elements inner)
+                                                 (:dims inner) (:lbounds inner)))
             (sequential? inner)   (pg-arr/array elem-kw (vec inner))
             (string? inner)       (pg-arr/from-pg-text inner elem-kw)
             :else                 (pg-arr/array elem-kw [inner])))
@@ -8178,6 +8183,9 @@
           ;; two spellings of one address were two values.
           (mac/mac-type? pg-type) (mac/mac-in pg-type val)
 
+          (= :reg-routine (types/cast-category pg-type))
+          (sql-cast/cast-scalar val pg-type {:explicit? false})
+
           (= "tsvector" pg-type) (tsearch/canonical-tsvector val)
 
           (= "tsquery" pg-type) (tsearch/canonical-tsquery val)
@@ -8231,7 +8239,8 @@
           (some? elem-kw)
           (cond
             (pg-arr/array? val)
-            (pg-arr/to-pg-text val)
+            (pg-arr/to-storage-text (if (contains? #{:regproc :regprocedure} elem-kw)
+                                      (assoc val :elem-type elem-kw) val))
             ;; Array TEXT, which still has to go through the array
             ;; input function. Passing it through unparsed stored
             ;; `{1,abc}` in an `int[]`, and `{{1,2},{3}}` and `{1,2`
@@ -8242,16 +8251,16 @@
             ;; the cast path has always done.
             (and (string? val)
                  (clojure.string/starts-with? (clojure.string/triml val) "{"))
-            (pg-arr/to-pg-text (pg-arr/from-pg-text val elem-kw))
+            (pg-arr/to-storage-text (pg-arr/from-pg-text val elem-kw))
             (sequential? val)
-            (pg-arr/to-pg-text (pg-arr/array elem-kw (vec val)))
+            (pg-arr/to-storage-text (pg-arr/array elem-kw (vec val)))
             :else
           ;; Last-ditch: string-coerce. Lets clients send a single
           ;; element to an array column and have it stored as a
           ;; 1-element array (PG would reject this; we tolerate to
           ;; mirror the permissive behaviour of `:db.type/string`
           ;; coercion above).
-            (pg-arr/to-pg-text (pg-arr/array elem-kw [val])))
+            (pg-arr/to-storage-text (pg-arr/array elem-kw [val])))
         ;; :db.type/ref column with a numeric/string PK value →
         ;; lookup-ref. Already-vector values (explicit `[:k v]`) pass
         ;; through unchanged. Convention-based target resolution

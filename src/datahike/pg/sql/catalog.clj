@@ -25,6 +25,7 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks]
             [datahike.pg.pg-catalog :as pg-cat]
@@ -1882,109 +1883,17 @@
       :pg_settings/setting "32"
       (pgs/row-marker-attr "pg_settings") true}]
     "pg_proc"
-    (mapv (fn [[pname vol nargs ret args & [namespace-oid]]]
-            {;; The REAL oid from the generated pg_proc registry when the
-             ;; name is there, so a client that joins on it reaches the
-             ;; same row PostgreSQL would. The hash fallback matches what
-             ;; pg_class does for a table with no assigned oid.
-             :pg_proc/oid (long (or (some :oid (get pg-cat/procs-by-name pname))
-                                    (Math/abs (.hashCode ^String pname))))
-             :pg_proc/proname pname
-             :pg_proc/provolatile vol
-             :pg_proc/pronamespace (long (or namespace-oid 11))
-             :pg_proc/pronargs (long nargs)
+    (mapv (fn [{:keys [oid proname volatile namespace-oid args ret kind]}]
+            {:pg_proc/oid (long oid)
+             :pg_proc/proname proname
+             :pg_proc/provolatile volatile
+             :pg_proc/pronamespace (long namespace-oid)
+             :pg_proc/pronargs (long (count args))
              :pg_proc/prorettype (long ret)
-             :pg_proc/proargtypes (or args "")
-             :pg_proc/prokind "f"
+             :pg_proc/proargtypes (str/join " " args)
+             :pg_proc/prokind kind
              (pgs/row-marker-attr "pg_proc") true})
-          [["now" "s" 0 1184 ""] ["current_timestamp" "s" 0 1184 ""]
-           ["current_date" "s" 0 1082 ""] ["current_time" "s" 0 1266 ""]
-           ["timeofday" "v" 0 25 ""] ["clock_timestamp" "v" 0 1184 ""]
-           ["statement_timestamp" "s" 0 1184 ""]
-           ["transaction_timestamp" "s" 0 1184 ""]
-           ["age" "i" 2 25 "1114 1114"]
-           ["date_part" "i" 2 701 "25 1114"]
-           ["date_trunc" "i" 2 1114 "25 1114"]
-           ["extract" "i" 2 701 "25 1114"]
-           ["to_char" "s" 2 25 "1114 25"]
-           ["to_date" "s" 2 1082 "25 25"]
-           ["to_timestamp" "s" 2 1184 "25 25"]
-           ["upper" "i" 1 25 "25"] ["lower" "i" 1 25 "25"]
-           ["initcap" "i" 1 25 "25"] ["length" "i" 1 23 "25"]
-           ["char_length" "i" 1 23 "25"] ["character_length" "i" 1 23 "25"]
-           ["octet_length" "i" 1 23 "25"]
-           ["trim" "i" 1 25 "25"] ["ltrim" "i" 1 25 "25"]
-           ["rtrim" "i" 1 25 "25"] ["btrim" "i" 1 25 "25"]
-           ["substr" "i" 3 25 "25 23 23"]
-           ["substring" "i" 3 25 "25 23 23"]
-           ["replace" "i" 3 25 "25 25 25"]
-           ["regexp_replace" "i" 3 25 "25 25 25"]
-           ["regexp_match" "i" 2 25 "25 25"]
-           ["split_part" "i" 3 25 "25 25 23"]
-           ["string_agg" "i" 2 25 "25 25"]
-           ["concat" "i" 2 25 "25 25"]
-           ["concat_ws" "i" 3 25 "25 25 25"]
-           ["position" "i" 2 23 "25 25"]
-           ["lpad" "i" 3 25 "25 23 25"] ["rpad" "i" 3 25 "25 23 25"]
-           ["reverse" "i" 1 25 "25"] ["repeat" "i" 2 25 "25 23"]
-           ["left" "i" 2 25 "25 23"] ["right" "i" 2 25 "25 23"]
-           ["abs" "i" 1 701 "701"] ["round" "i" 1 701 "701"]
-           ["floor" "i" 1 701 "701"] ["ceil" "i" 1 701 "701"]
-           ["ceiling" "i" 1 701 "701"]
-           ["trunc" "i" 1 701 "701"] ["sign" "i" 1 701 "701"]
-           ["mod" "i" 2 701 "701 701"]
-           ["power" "i" 2 701 "701 701"]
-           ["sqrt" "i" 1 701 "701"]
-           ["exp" "i" 1 701 "701"] ["ln" "i" 1 701 "701"]
-           ["log" "i" 2 701 "701 701"]
-           ["greatest" "i" 2 701 "701 701"]
-           ["vector_dims" "i" 1 23 "16383" 2200]
-           ["vector_norm" "i" 1 701 "16383" 2200]
-           ["l2_distance" "i" 2 701 "16383 16383" 2200]
-           ["vector_l2_squared_distance" "i" 2 701 "16383 16383" 2200]
-           ["l1_distance" "i" 2 701 "16383 16383" 2200]
-           ["inner_product" "i" 2 701 "16383 16383" 2200]
-           ["cosine_distance" "i" 2 701 "16383 16383" 2200]
-           ["least" "i" 2 701 "701 701"]
-           ["count" "i" 1 20 "2276"] ["sum" "i" 1 701 "701"]
-           ["avg" "i" 1 701 "701"] ["min" "i" 1 701 "701"]
-           ["max" "i" 1 701 "701"]
-           ["cast" "i" 2 2276 "2276 25"]
-           ["coalesce" "i" 2 2276 "2276 2276"]
-           ["nullif" "i" 2 2276 "2276 2276"]
-           ["jsonb_build_object" "i" 2 3802 "2276 2276"]
-           ["row_to_json" "i" 1 114 "2249"] ["to_json" "i" 1 114 "2276"]
-           ["jsonb_build_array" "i" 1 3802 "2276"]
-           ["jsonb_set" "i" 3 3802 "3802 1009 3802"]
-           ["jsonb_insert" "i" 3 3802 "3802 1009 3802"]
-           ["jsonb_strip_nulls" "i" 1 3802 "3802"]
-           ["jsonb_array_elements" "i" 1 3802 "3802"]
-           ["jsonb_object_keys" "i" 1 25 "3802"]
-           ["jsonb_typeof" "i" 1 25 "3802"]
-           ["jsonb_pretty" "i" 1 25 "3802"]
-           ["version" "s" 0 25 ""]
-           ["current_database" "s" 0 19 ""]
-           ["current_schema" "s" 0 19 ""]
-           ["current_user" "s" 0 19 ""]
-           ["session_user" "s" 0 19 ""]
-           ["current_setting" "s" 1 25 "25"]
-           ["set_config" "s" 3 25 "25 25 16"]
-           ["pg_backend_pid" "s" 0 23 ""] ["pg_is_in_recovery" "s" 0 16 ""]
-           ["pg_typeof" "s" 1 2206 "2276"]
-           ["format_type" "s" 2 25 "26 23"]
-           ["pg_get_userbyid" "s" 1 19 "26"]
-           ["pg_get_expr" "s" 2 25 "194 26"]
-           ["pg_get_constraintdef" "s" 1 25 "26"]
-           ["pg_get_indexdef" "s" 1 25 "26"]
-           ["has_schema_privilege" "s" 2 16 "25 25"]
-           ["has_table_privilege" "s" 2 16 "25 25"]
-           ["has_column_privilege" "s" 3 16 "25 25 25"]
-           ["obj_description" "s" 2 25 "26 25"]
-           ["col_description" "s" 2 25 "26 23"]
-           ["pg_relation_size" "v" 1 20 "26"]
-           ["pg_total_relation_size" "v" 1 20 "26"]
-           ["pg_database_size" "v" 1 20 "19"]
-           ["pg_table_size" "v" 1 20 "26"]])
+          (regoid/routines cte-db))
     "pg_class"
     (complete-pg-class-rows
      cte-db user-schema
