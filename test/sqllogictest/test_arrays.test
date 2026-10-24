@@ -71,17 +71,17 @@ b
 query T rowsort
 SELECT current_schemas(true)
 ----
-{public}
+{pg_catalog,public}
 
 query T rowsort
 SELECT (current_schemas(true))[1]
 ----
-public
+pg_catalog
 
 query T rowsort
 SELECT (pg_catalog.current_schemas(true))[1]
 ----
-public
+pg_catalog
 
 query T rowsort
 SELECT string_to_array('a,b,c', ',')
