@@ -345,19 +345,26 @@
         extension (when (and (= n "vector") (<= (count names) 2)
                              (or (nil? ns-name) (= ns-name "public")))
                     {:oid 16383 :typname "vector" :typarray 0 :typmodin ::vector})
-        user-oid (when (and db (or (nil? ns-name) (= ns-name "public")))
-                   (some (fn [[name-attr oid-attr]]
-                           (d/q {:find '[?oid .] :in '[$ ?n]
-                                 :where [['?e name-attr '?n] ['?e oid-attr '?oid]]}
-                                db n))
-                         [[:datahike.pg.enum/name :datahike.pg.enum/oid]
-                          [:datahike.pg.domain/name :datahike.pg.domain/oid]
-                          [:datahike.pg.composite/name :datahike.pg.composite/oid]]))
-        type (or builtin extension)
-        oid (or (:oid type) user-oid)]
+        path (if ns-name [(namespace-oid db ns-name)] (search-path db))
+        user-oid (when (and db (<= (count names) 2) (some #{2200} path))
+                   (or (:datahike.pg.object/oid
+                        (objects/object-by-identity db objects/pg-type-oid 2200 n))
+                       (some (fn [[name-attr oid-attr]]
+                               (d/q {:find '[?oid .] :in '[$ ?n]
+                                     :where [['?e name-attr '?n] ['?e oid-attr '?oid]]}
+                                    db n))
+                             [[:datahike.pg.enum/name :datahike.pg.enum/oid]
+                              [:datahike.pg.domain/name :datahike.pg.domain/oid]
+                              [:datahike.pg.composite/name :datahike.pg.composite/oid]])))
+        candidates (cond-> []
+                     builtin (conj [11 builtin])
+                     extension (conj [2200 extension])
+                     user-oid (conj [2200 {:oid user-oid :user? true}]))
+        type (some (fn [ns-oid] (some #(when (= ns-oid (first %)) (second %)) candidates)) path)
+        oid (:oid type)]
     (when-not oid (fail! "42704" (str "type \"" spelling "\" does not exist")))
-    (when type (check-modifiers! type mods))
-    (when (and user-oid mods) (fail! "42601" "type modifier is not allowed"))
+    (when-not (:user? type) (check-modifiers! type mods))
+    (when (and (:user? type) mods) (fail! "42601" "type modifier is not allowed"))
     (let [oid (if array? (:typarray type) oid)]
       (or (when (and oid (pos? oid)) oid)
           (fail! "42704" (str "type \"" spelling "\" does not exist"))))))
@@ -402,8 +409,12 @@
         returns (edn/read-string (:datahike.pg.function/return-type ent))]
     {:oid (:datahike.pg.function/oid ent) :proname full-name
      :namespace-oid 2200
-     :args (mapv #(type-oid db %) (edn/read-string (:datahike.pg.function/arg-types ent)))
-     :ret (type-oid db (or (:type returns) (when (:columns returns) "record") "void"))
+     ;; Stored definitions currently belong to public and keep type spellings.
+     ;; Decode them in that defining context, independently of the reader's path.
+     :args (binding [*search-path* ["public"]]
+             (mapv #(type-oid db %) (edn/read-string (:datahike.pg.function/arg-types ent))))
+     :ret (binding [*search-path* ["public"]]
+            (type-oid db (or (:type returns) (when (:columns returns) "record") "void")))
      :kind "f" :strict (boolean (:datahike.pg.function/strict? ent))
      :volatile "v" :retset (boolean (:datahike.pg.function/setof? ent))}))
 
@@ -521,6 +532,19 @@
   (if (and (re-matches #"[a-z_][a-z0-9_$]*" s) (not (contains? needs-quotes s)))
     s (str "\"" (str/replace s "\"" "\"\"") "\"")))
 
+(defn- argument-type-name [arg-oid format-type]
+  (if-let [t (when *db* (objects/object-by-address *db* objects/pg-type-oid arg-oid))]
+    (let [ns-oid (:datahike.pg.object/oid
+                  (d/entity *db* (get-in t [:datahike.pg.object/namespace :db/id])))
+          name (:datahike.pg.object/name t)
+          builtin-oid (:oid (catalog/type-by-name name))
+          path (search-path *db*)
+          shadowed? (and builtin-oid (< (.indexOf path 11) (.indexOf path ns-oid)))]
+      (str (when (or shadowed? (not (some #{ns-oid} path)))
+             (str (quote-ident (namespace-name *db* ns-oid)) "."))
+           (quote-ident name)))
+    (format-type arg-oid)))
+
 (defn output
   "regprocout/regprocedureout. `format-type` supplies PostgreSQL's type
    spelling without coupling this catalog layer to the value-type registry."
@@ -536,5 +560,5 @@
               name (str (when-not visible? (str (quote-ident (namespace-name *db* (:namespace-oid r))) "."))
                         (quote-ident (:proname r)))]
           (if (= oid 2202)
-            (str name "(" (str/join "," (map format-type (:args r))) ")") name))
+            (str name "(" (str/join "," (map #(argument-type-name % format-type) (:args r))) ")") name))
         (str id)))))

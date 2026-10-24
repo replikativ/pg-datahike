@@ -115,6 +115,27 @@
       (is (= {:rows [[(str "{" id "}")]]}
              (query c "SELECT p FROM rg_arrays WHERE p <> '{1299,0}'::regproc[]"))))))
 
+(deftest signatures-use-persistent-domain-and-row-type-identities
+  (with-open [c (connect false)]
+    (execute! c "CREATE DOMAIN rg_domain AS integer")
+    (execute! c "CREATE TYPE rg_enum AS ENUM ('a')")
+    (execute! c "CREATE TYPE rg_composite AS (v integer)")
+    (execute! c "CREATE TABLE rg_row (v integer)")
+    (doseq [type ["rg_domain" "rg_enum" "rg_composite" "rg_row"]]
+      (let [fn-name (str "fn_" type)
+            signature (str fn-name "(" type ")")]
+        (execute! c (str "CREATE FUNCTION " fn-name "(v " type ") RETURNS " type
+                         " LANGUAGE sql AS 'SELECT v'"))
+        (is (= {:rows [[signature]]}
+               (query c (str "SELECT '" signature "'::regprocedure"))))))
+    (execute! c "SET search_path TO pg_catalog")
+    (is (= {:rows [[nil]]}
+           (query c "SELECT to_regprocedure('public.fn_rg_domain(rg_domain)')")))
+    (is (= {:rows [["public.fn_rg_domain(public.rg_domain)"]]}
+           (query c "SELECT 'public.fn_rg_domain(public.rg_domain)'::regprocedure")))
+    (is (= {:rows [["4"]]}
+           (query c "SELECT count(*) FROM pg_proc WHERE proname LIKE 'fn_rg_%'")))))
+
 (deftest quoted-routine-name
   (with-open [c (connect false)]
     (execute! c "CREATE FUNCTION \"Rg.Quote\"() RETURNS integer LANGUAGE sql AS 'SELECT 1'")
