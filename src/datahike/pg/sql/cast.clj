@@ -590,6 +590,13 @@
         :geometric
         (geo/geometric-in (types/base-type-name-of type-str) v)
 
+        ;; A pg_lsn too: the cast is pg_lsn_in. A PgLsn carrier (from
+        ;; `numeric::pg_lsn` or an operator) renders to the same text.
+        :pg-lsn
+        (cond (nil? v) nil
+              (types/pg-lsn? v) (types/->pg-text v types/oid-pg-lsn)
+              :else (input/parse-pg-lsn (str v)))
+
         ;; A MAC address is held as its canonical text, so the cast is
         ;; the input function. macaddr8 <-> macaddr is a real conversion
         ;; rather than a re-parse: widening inserts ff:fe and narrowing

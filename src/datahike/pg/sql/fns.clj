@@ -4255,6 +4255,63 @@
   ([field v zone]
    (sql-extract-in field v zone)))
 
+;; datetime.c's deltatktbl, the UNITS words DecodeUnits matches -- by
+;; their first TOKMAXLEN (10) characters, which is why the table spells
+;; `microsecon`. Plus the datetktbl words extract also accepts.
+(def ^:private extract-units
+  (merge
+   (zipmap ["c" "cent" "centuries" "century"] (repeat :century))
+   (zipmap ["d" "day" "days"] (repeat :day))
+   (zipmap ["dec" "decade" "decades" "decs"] (repeat :decade))
+   (zipmap ["h" "hour" "hours" "hr" "hrs"] (repeat :hour))
+   (zipmap ["m" "min" "mins" "minute" "minutes"] (repeat :minute))
+   (zipmap ["microsecon" "us" "usec" "useconds" "usecs"] (repeat :microsec))
+   (zipmap ["mil" "millennia" "millennium" "mils"] (repeat :millennium))
+   (zipmap ["millisecon" "ms" "msec" "mseconds" "msecs"] (repeat :millisec))
+   (zipmap ["mon" "mons" "month" "months"] (repeat :month))
+   (zipmap ["qtr" "quarter"] (repeat :quarter))
+   (zipmap ["s" "sec" "second" "seconds" "secs"] (repeat :second))
+   {"timezone" :tz "timezone_h" :tz-hour "timezone_m" :tz-minute}
+   (zipmap ["w" "week" "weeks"] (repeat :week))
+   (zipmap ["y" "year" "years" "yr" "yrs"] (repeat :year))
+   {"dow" :dow "doy" :doy "isodow" :isodow "isoyear" :isoyear "julian" :julian
+    "epoch" :epoch}))
+
+(defn- time-part
+  "time_part_common / timetz_part_common (date.c), the numeric form
+   `extract` returns: the microsecond, millisecond, second, minute and
+   hour fields, the epoch, and for a timetz its zone (`offset-east`, in
+   seconds east). Every other unit PostgreSQL knows is 0A000 for these
+   types, and one it does not know 22023 -- both naming the unit as
+   written, lowercased.
+
+   A time or timetz used to extract as NULL whatever the unit, so
+   `extract(hour from '10:00'::time)` was empty and
+   `extract(day from '10:00'::time)` raised nothing."
+  [^String units ^java.time.LocalTime t offset-east]
+  (let [tname (if offset-east "time with time zone" "time without time zone")
+        unit (get extract-units (subs units 0 (min 10 (count units))))
+        us (quot (.toNanoOfDay t) 1000)
+        sec-us (+ (* 1000000 (.getSecond t)) (quot (.getNano t) 1000))
+        scaled (fn [^long n scale] (java.math.BigDecimal/valueOf n (int scale)))]
+    (case unit
+      :microsec (bigdec sec-us)
+      :millisec (scaled sec-us 3)
+      :second (scaled sec-us 6)
+      :minute (bigdec (.getMinute t))
+      :hour (bigdec (.getHour t))
+      :epoch (scaled (- us (* 1000000 (long (or offset-east 0)))) 6)
+      (:tz :tz-hour :tz-minute)
+      (if offset-east
+        (let [o (long offset-east)]
+          (bigdec (case unit :tz o :tz-hour (quot o 3600) :tz-minute (rem (quot o 60) 60))))
+        (throw (errors/pg-error :feature-not-supported
+                                {:message (str "unit \"" units "\" not supported for type " tname)})))
+      nil (throw (errors/pg-error :invalid-parameter-value
+                                  {:message (str "unit \"" units "\" not recognized for type " tname)}))
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "unit \"" units "\" not supported for type " tname)})))))
+
 (defn- sql-extract-in
   [field v zone]
   (if (or (sql-null? field) (sql-null? v))
@@ -4278,7 +4335,12 @@
           ;; `isfinite`-style fields that are not a magnitude -- dow,
           ;; doy, timezone -- are 0 rather than infinite.
           0)
-        (sql-extract* f v zone)))))
+        (cond
+          (instance? java.time.LocalTime v) (time-part f v nil)
+          (instance? java.time.OffsetTime v)
+          (time-part f (.toLocalTime ^java.time.OffsetTime v)
+                     (.getTotalSeconds (.getOffset ^java.time.OffsetTime v)))
+          :else (sql-extract* f v zone))))))
 
 (defn- sql-extract*
   [f v zone]
