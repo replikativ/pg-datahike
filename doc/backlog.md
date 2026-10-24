@@ -623,6 +623,21 @@ unsigned numeric offsets, DEFAULT, LOCAL -- is supported and verified.
   construction.
 - Data-modifying CTEs raise 0A000; PostgreSQL executes the inner DML and
   feeds RETURNING to the outer query.
+- **A temporal cast ignores its precision.** `'10:00:00.7'::time(0)` and
+  `'2026-01-01 10:00:00.7'::timestamp(0)` keep `.7`; PostgreSQL rounds
+  half up to `10:00:01` (AdjustTimeForTypmod / AdjustTimestampForTypmod,
+  applied by the cast). The SQL value functions round since the
+  localtime fix, so `now()::timestamp(0)::text = localtimestamp(0)::text`
+  is false here and true there. Found by the clock corpus; needs the
+  typmod carried into `cast-scalar` for time, timetz, timestamp and
+  timestamptz.
+- **`INSERT … VALUES (current_date)` / `DEFAULT current_date` resolve to
+  the `{:fn :now}` marker**, coerced to the column at execute time, which
+  reads the day in UTC. Verified 2026-10-24 08:15 UTC under
+  Pacific/Honolulu: both the inserted `current_date` and the DEFAULT
+  stored 2026-10-24, while PostgreSQL's current_date was 2026-10-23. The
+  SELECT-side value functions read the session zone since the localtime
+  fix; the DML marker needs the same zone.
 - **A FROM-clause SRF is transacted row by row into a speculative db**
   (`table-fn->virtual-table`). `SELECT * FROM generate_series(1, 5000000)
   LIMIT 3` exhausted a 1 GB heap after 6.5 minutes; PostgreSQL fills a

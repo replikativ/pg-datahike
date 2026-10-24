@@ -1347,6 +1347,7 @@
         (#{"point" "lseg" "box" "path" "polygon" "line" "circle"} base)
         :geometric
         (#{"macaddr" "macaddr8"} base)        :mac
+        (= "pg_lsn" base)                     :pg-lsn
         (= base "json")                       :json
         (= base "jsonb")                      :jsonb
         (= base "tsvector")                   :tsvector

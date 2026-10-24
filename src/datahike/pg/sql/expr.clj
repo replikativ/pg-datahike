@@ -123,7 +123,7 @@
 ;; Forward declarations for the mutually-recursive translate-* family.
 
 (declare jsonb-column? json-column? reject-json-operator!)
-(declare coerce-unknown-literal coerce-comparison-operands catalog-def-lookup!)
+(declare coerce-unknown-literal coerce-comparison-operands catalog-def-lookup! statement-clock)
 
 (def ^:private ^:const max-inline-numeric-precision
   "BigDecimals wider than this travel as Datalog inputs instead of query-form
@@ -1332,22 +1332,8 @@
       (contains? #{"current_timestamp" "current_time"
                    "localtimestamp" "localtime"} fname)
       (let [fn-param (symbol (str "?sql-time" (swap! (:var-counter ctx) inc)))
-            temporal-fn
-            (fn [& [precision]]
-              (let [^java.util.Date statement-time
-                    (or params/*statement-time* (java.util.Date.))
-                    instant (.toInstant statement-time)
-                    p (long (min 6 (max 0 (or precision 6))))
-                    factor (long (Math/pow 10 (- 9 p)))
-                    nanos (.getNano instant)
-                    truncated (.with instant java.time.temporal.ChronoField/NANO_OF_SECOND
-                                     (* (quot nanos factor) factor))
-                    zdt (.atZone truncated java.time.ZoneOffset/UTC)]
-                (case fname
-                  "current_timestamp" (java.util.Date/from truncated)
-                  "current_time" (.toOffsetTime (.toOffsetDateTime zdt))
-                  "localtimestamp" (.toLocalDateTime zdt)
-                  "localtime" (.toLocalTime zdt))))]
+            zone types/*time-zone*
+            temporal-fn (fn [& [precision]] (statement-clock fname precision zone))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj temporal-fn)
         (swap! (:where-clauses ctx) conj
@@ -4274,6 +4260,14 @@
           (java.time.LocalDateTime/ofInstant i zone)
           v))
 
+      ;; timestamptz::timetz is the wall clock WITH the zone's offset at
+      ;; that instant (timestamptz_timetz). It answered +00.
+      (and (= src-oid types/oid-timestamptz) (= target-oid types/oid-timetz))
+      (fn [v]
+        (if-let [i (when-not (types/infinite-datetime v) (instant v))]
+          (.toOffsetTime (.toOffsetDateTime (java.time.ZonedDateTime/ofInstant i zone)))
+          v))
+
       (and (contains? #{types/oid-timestamp types/oid-date} src-oid)
            (= target-oid types/oid-timestamptz))
       (fn [v]
@@ -6443,6 +6437,38 @@
             parsed (analyze-scalar-subquery! ctx inner corr-refs)]
         (first (parsed-output-oids parsed))))))
 
+(defn- statement-clock
+  "The SQL value functions over the statement's time, read in the session
+   zone `zone` (captured at translation, and part of the plan-cache key):
+   current_timestamp is the instant; current_time the wall clock with the
+   zone's offset at that instant; localtimestamp and localtime the wall
+   clock; current_date its day. `precision` rounds the fraction, as
+   `localtime(3)` does.
+
+   These read the clock in UTC, whatever TimeZone said: under
+   America/Los_Angeles `localtime` was seven hours ahead, `current_date`
+   was TOMORROW every evening, and `now()::time::text = localtime::text`
+   -- the regression suite's own check that the two agree -- was false
+   once the cast honoured the zone and the value functions did not."
+  [kind precision zone]
+  (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))
+        instant (.toInstant st)
+        p (long (min 6 (max 0 (or precision 6))))
+        factor (long (Math/pow 10 (- 9 p)))
+        ;; ROUNDED, half up, as AdjustTimestampForTypmod does --
+        ;; `localtimestamp(0)` at 12:00:00.7 is 12:00:01, the same as
+        ;; `now()::timestamp(0)`.
+        instant (let [i (.plusNanos instant (quot factor 2))]
+                  (.with i java.time.temporal.ChronoField/NANO_OF_SECOND
+                         (* (quot (.getNano i) factor) factor)))
+        zdt (.atZone instant ^java.time.ZoneId (or zone java.time.ZoneOffset/UTC))]
+    (case kind
+      "current_timestamp" (java.util.Date/from instant)
+      "current_time" (.toOffsetTime (.toOffsetDateTime zdt))
+      "localtimestamp" (.toLocalDateTime zdt)
+      "localtime" (.toLocalTime zdt)
+      "current_date" (.toLocalDate zdt))))
+
 (defn- catalog-def-lookup!
   "Bind `result-var` to the pre-rendered definition the catalog holds for
    `oid` -- pg_get_indexdef / pg_get_constraintdef / pg_get_triggerdef --
@@ -6835,14 +6861,8 @@
     (let [key-str (str/lower-case (.getColumnName ^Column expr))
           result-var (ctx/fresh-var! ctx)
           fn-param (symbol (str "?sql-local-time" (swap! (:var-counter ctx) inc)))
-          value-fn (fn []
-                     (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))
-                           ^java.time.Instant instant (.toInstant st)
-                           ^java.time.ZonedDateTime zdt
-                           (.atZone instant java.time.ZoneOffset/UTC)]
-                       (if (= key-str "localtime")
-                         (.toLocalTime zdt)
-                         (.toLocalDateTime zdt))))]
+          zone types/*time-zone*
+          value-fn (fn [] (statement-clock key-str nil zone))]
       (swap! (:in-params ctx) conj fn-param)
       (swap! (:in-args ctx) conj value-fn)
       (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -7600,13 +7620,9 @@
                    ;; LocalDate (not a midnight java.util.Date) so the
                    ;; result renders as "yyyy-MM-dd" with OID 1082, like
                    ;; PG's date type.
-                   (= key-str "current_date")
-                   (fn [] (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))]
-                            (-> st .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalDate)))
-                   (= key-str "current_time")
-                   (fn [] (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))]
-                            (-> st .toInstant (.atZone java.time.ZoneOffset/UTC)
-                                .toOffsetDateTime .toOffsetTime)))
+                   (contains? #{"current_date" "current_time"} key-str)
+                   (let [zone types/*time-zone*]
+                     (fn [] (statement-clock key-str nil zone)))
                    :else (fn [] (or params/*statement-time* (java.util.Date.))))
           fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))]
       (swap! (:in-params ctx) conj fn-param)

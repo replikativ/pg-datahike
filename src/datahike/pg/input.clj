@@ -299,6 +299,19 @@
 
 ;; ---------------------------------------------------------------------------
 
+(defn parse-pg-lsn
+  "pg_lsn_in_internal (utils/adt/pg_lsn.c): one to eight hex digits, a
+   slash, one to eight hex digits, and nothing else -- no whitespace, no
+   sign. Answers the canonical text pg_lsn_out prints, `%X/%X`, which is
+   how a pg_lsn is held.
+
+   There was no input function: the cast kept whatever was written, so
+   `'16AE7F7'::pg_lsn` was accepted and pg_input_is_valid said true."
+  [^String s]
+  (if-let [[_ hi lo] (re-matches #"([0-9A-Fa-f]{1,8})/([0-9A-Fa-f]{1,8})" s)]
+    (format "%X/%X" (Long/parseLong hi 16) (Long/parseLong lo 16))
+    (invalid "pg_lsn" s)))
+
 (def ^:private geometric-in
   "Resolved late: `datahike.pg.geo` reads its coordinates with
    `float8-prefix` below, so it depends on this namespace and cannot be
@@ -360,6 +373,7 @@
    types/oid-polygon  #(@geometric-in "polygon" %)
    types/oid-line     #(@geometric-in "line" %)
    types/oid-circle   #(@geometric-in "circle" %)
+   types/oid-pg-lsn   parse-pg-lsn
    types/oid-macaddr  #(@mac-in "macaddr" %)
    types/oid-macaddr8 #(@mac-in "macaddr8" %)
    ;; The temporal family, for the same reason as the two above and
