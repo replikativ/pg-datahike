@@ -116,10 +116,12 @@ for m in "${MODULES[@]}"; do
   # Parse this module's per-run summary line.
   ms="$(grep -E '^=+ .* (passed|failed|error|skipped).* =+$' "${LOG}" | tail -1)"
   if [[ -n "${ms}" ]]; then
-    mp=$(sed -n 's/.*[^0-9]\([0-9]*\) passed.*/\1/p'  <<<"${ms}" | head -1)
-    mf=$(sed -n 's/.*[^0-9]\([0-9]*\) failed.*/\1/p'  <<<"${ms}" | head -1)
-    msk=$(sed -n 's/.*[^0-9]\([0-9]*\) skipped.*/\1/p' <<<"${ms}" | head -1)
-    me=$(sed -n 's/.*[^0-9]\([0-9]*\) error.*/\1/p'   <<<"${ms}" | head -1)
+    # Require a digit: a trailing "subtests passed" otherwise matches an
+    # empty count and hides the module's ordinary passed-test count.
+    mp=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) passed.*/\1/p'  <<<"${ms}" | head -1)
+    mf=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) failed.*/\1/p'  <<<"${ms}" | head -1)
+    msk=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) skipped.*/\1/p' <<<"${ms}" | head -1)
+    me=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) error.*/\1/p'   <<<"${ms}" | head -1)
     P=$(( P + ${mp:-0} )); F=$(( F + ${mf:-0} )); S=$(( S + ${msk:-0} )); E=$(( E + ${me:-0} ))
   fi
 done
