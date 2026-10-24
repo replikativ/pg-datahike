@@ -315,8 +315,8 @@
      ;; from SQL NULL above. It must be tested BEFORE the generic
      ;; keyword branch, which would otherwise print the sentinel's name.
      (= jb/json-null v) "null"
-     (or (contains? regoid/routine-oids oid)
-         (contains? regoid/routine-oids (types/array-oid->element-oid oid)))
+     (or (contains? regoid/alias-oids oid)
+         (contains? regoid/alias-oids (types/array-oid->element-oid oid)))
      (types/->pg-text v oid)
      ;; Keep the scalar cases before the structured wrapper predicates below.
      ;; Result sets are dominated by strings, booleans and integer identifiers;
@@ -5722,6 +5722,16 @@
    the normal Simple / Extended Query paths."
   nil)
 
+(defn- statement-read-db
+  "Select a live or active transaction snapshot for alias input/output.
+   A completed transaction may retain bookkeeping but no longer owns reads."
+  [conn tx-state session-state]
+  (or *snapshot-db*
+      (let [ts @tx-state]
+        (if (:in-tx? ts)
+          (or (:speculative-db ts) (apply-temporal (d/db conn) session-state))
+          (apply-temporal (d/db conn) session-state)))))
+
 (def ^:private ^:dynamic *nested-statement?*
   "True while a routine body runs one of its own statements. A `$n` in
    such a statement is a parameter OF THE ROUTINE, already in scope --
@@ -8076,24 +8086,27 @@
         {:schema (dbi/-schema db)
          :exec
          (fn [db bound]
-           (let [args (mapv (fn [a] (if (params/param-ref? a)
-                                      (params/resolve-param-ref a #(nth bound %))
-                                      a))
-                            in-args)
-                 q-input (cond-> query
-                           (and *max-result-rows* (empty? (:with query)))
-                           (assoc :limit (inc *max-result-rows*)))
-                 res (run-param-query q-input #(apply d/q q-input db args))
-                 rows (if (pos? hidden)
-                        (mapv #(subvec (vec %) 0 keep-n) res)
-                        res)
-                 result (format-query-result rows aliases schema-oids
-                                             (when sources (nth sources 2)))]
-             (if sources
-               (-> ^PgWireServer$QueryResult result
-                   (.withColumnSources (first sources) (second sources))
-                   (.withColumnTypmods (nth sources 2)))
-               result)))}))))
+           (binding [regoid/*db* db
+                     regoid/*relation-db* db
+                     params/*runtime-db* db]
+             (let [args (mapv (fn [a] (if (params/param-ref? a)
+                                        (params/resolve-param-ref a #(nth bound %))
+                                        a))
+                              in-args)
+                   q-input (cond-> query
+                             (and *max-result-rows* (empty? (:with query)))
+                             (assoc :limit (inc *max-result-rows*)))
+                   res (run-param-query q-input #(apply d/q q-input db args))
+                   rows (if (pos? hidden)
+                          (mapv #(subvec (vec %) 0 keep-n) res)
+                          res)
+                   result (format-query-result rows aliases schema-oids
+                                               (when sources (nth sources 2)))]
+               (if sources
+                 (-> ^PgWireServer$QueryResult result
+                     (.withColumnSources (first sources) (second sources))
+                     (.withColumnTypmods (nth sources 2)))
+                 result))))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Temporal parameters sent as text
@@ -8126,10 +8139,10 @@
     (reduce-kv (fn [acc idx oid]
                  (let [v (get acc idx)]
                    (if (and (string? v) (or (contains? temporal-param-oids oid)
-                                            (contains? regoid/routine-oids oid)
-                                            (contains? regoid/routine-oids (types/array-oid->element-oid oid))))
+                                            (contains? regoid/alias-oids oid)
+                                            (contains? regoid/alias-oids (types/array-oid->element-oid oid))))
                      (assoc acc idx
-                            (try (if (contains? regoid/routine-oids (types/array-oid->element-oid oid))
+                            (try (if (contains? regoid/alias-oids (types/array-oid->element-oid oid))
                                    (pg-arr/from-pg-text v (types/oid->elem-kw (types/array-oid->element-oid oid)))
                                    (input/parse oid v))
                                  (catch clojure.lang.ExceptionInfo e
@@ -8605,7 +8618,8 @@
                 ;; statement's effective query DB, not merely the connection's
                 ;; raw snapshot: CTEs and derived relations live in `query-db`.
                 (binding [params/*runtime-db* query-db
-                          regoid/*db* query-db]
+                          regoid/*db* query-db
+                          regoid/*relation-db* (or regoid/*relation-db* regoid/*db* db)]
                   (if (seq args)
                     (run-param-query q-input #(apply d/q q-input query-db args))
                     (run-param-query q-input #(d/q q-input query-db))))))
@@ -12791,6 +12805,8 @@
                  ;; cancellation, and timeout context across those callbacks.
                  :statement-time  params/*statement-time*
                  :regoid-search-path (effective-search-path (:session-state ctx))
+                 :regoid-database-name (:db-name @(:session-state ctx))
+                 :regoid-temp-tables (:temp-tables ctx)
                  :scalar-subquery-cache params/*scalar-subquery-cache*
                  :cancel          params/*cancel*
                  :deadline-nanos  (let [timeout-ms (:statement-timeout
@@ -13025,7 +13041,12 @@
 (defn- with-copy-execution-context
   [copy-session f]
   (binding [regoid/*db* (:speculative-db copy-session)
+            regoid/*relation-db* (:speculative-db copy-session)
             regoid/*search-path* (or (:regoid-search-path copy-session) ["$user" "public"])
+            regoid/*relation-provider* catalog/relation-identity
+            regoid/*relation-cache* (atom nil)
+            regoid/*database-name* (or (:regoid-database-name copy-session) "datahike")
+            regoid/*temp-tables* (:regoid-temp-tables copy-session)
             params/*statement-time* (:statement-time copy-session)
             params/*scalar-subquery-cache* (:scalar-subquery-cache copy-session)
             params/*cancel* (:cancel copy-session)]
@@ -14219,8 +14240,13 @@
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
-        (let [bound (binding [regoid/*db* (or (:speculative-db @tx-state) (d/db conn))
+        (let [bound (binding [regoid/*db* (statement-read-db conn tx-state session-state)
+                              regoid/*relation-db* nil
                               regoid/*search-path* (effective-search-path session-state)
+                              regoid/*relation-provider* catalog/relation-identity
+                              regoid/*relation-cache* (or regoid/*relation-cache* (atom nil))
+                              regoid/*database-name* (or (:db-name @session-state) "datahike")
+                              regoid/*temp-tables* temp-tables
                               types/*date-style* (or (:date-style @session-state) [:iso :mdy])
                               types/*time-zone* (or (:time-zone @session-state) types/utc-zone)]
                       (try
@@ -14247,8 +14273,13 @@
                        parsed)]
           (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
                                                       (java.util.IdentityHashMap.))
-                    regoid/*db* (or (:speculative-db @tx-state) (d/db conn))
+                    regoid/*db* (statement-read-db conn tx-state session-state)
+                    regoid/*relation-db* nil
                     regoid/*search-path* (effective-search-path session-state)
+                    regoid/*relation-provider* catalog/relation-identity
+                    regoid/*relation-cache* (or regoid/*relation-cache* (atom nil))
+                    regoid/*database-name* (or (:db-name @session-state) "datahike")
+                    regoid/*temp-tables* temp-tables
                     params/*statement-time* (java.util.Date.)
                     params/*scalar-subquery-cache* (atom {})
                     ;; The extended protocol renders its rows here, so the
@@ -14289,8 +14320,13 @@
         (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
                                                     (java.util.IdentityHashMap.))
                   catalog/*registered-databases* registered-databases
-                  regoid/*db* (or (:speculative-db @tx-state) (d/db conn))
+                  regoid/*db* (statement-read-db conn tx-state session-state)
+                  regoid/*relation-db* nil
                   regoid/*search-path* (effective-search-path session-state)
+                  regoid/*relation-provider* catalog/relation-identity
+                  regoid/*relation-cache* (or regoid/*relation-cache* (atom nil))
+                  regoid/*database-name* (or (:db-name @session-state) "datahike")
+                  regoid/*temp-tables* temp-tables
                   params/*statement-time* (java.util.Date.)
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
@@ -14662,6 +14698,7 @@
                             (open-implicit-tx! ctx))
                           (binding [params/*runtime-db* db
                                     regoid/*db* db
+                                    regoid/*relation-db* db
                                     ;; Row projections (RETURNING, CHECK,
                                     ;; ON CONFLICT) run their plans the
                                     ;; way a SELECT runs, so a deferred

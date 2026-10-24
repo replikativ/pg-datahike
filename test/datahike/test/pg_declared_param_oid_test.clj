@@ -26,6 +26,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as objects]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer PgWireServer$QueryHandler
             PgWireServer$QueryHandlerFactory PgWireServer$QueryResult]
@@ -46,6 +47,7 @@
 (def oid-int4-array 1007)
 
 (def ^:dynamic *port* nil)
+(def ^:dynamic *conn* nil)
 
 (defn- fixture [f]
   (pg/reset-lock-registry!)
@@ -59,7 +61,7 @@
           server (PgWireServer. 0 "127.0.0.1" factory)]
       (.start server)
       (try
-        (binding [*port* (.getPort server)]
+        (binding [*port* (.getPort server) *conn* conn]
           (f))
         (finally
           (.stop server)
@@ -591,8 +593,8 @@
   (is (= "42725" (get-in (parse-describe-execute "SELECT 1" [1008] ["{abs}"])
                          [:error \C]))))
 
-(deftest routine-oid-binary-parameters-preserve-unsigned-values
-  (doseq [oid [24 2202]]
+(deftest oid-alias-binary-parameters-preserve-unsigned-values
+  (doseq [oid [24 2202 2205 4089]]
     (with-conn
       (fn [in out]
         (send-msg! out \P (ba (cstr "routine_binary") (cstr "SELECT $1")
@@ -606,6 +608,36 @@
           (is (nil? (:error result)))
           (is (= [["4294967295"]] (:rows result)))
           (is (= 4 (:typlen (first (:columns result))))))))))
+
+(deftest declared-object-oids-and-arrays-read-their-input-types
+  (doseq [[oid value expected] [[2205 "pg_catalog.pg_class" "pg_class"]
+                                [4089 "pg_catalog" "pg_catalog"]
+                                [2210 "{pg_class,-}" "{pg_class,-}"]
+                                [4090 "{public,pg_catalog}" "{public,pg_catalog}"]]]
+    (let [r (parse-describe-execute "SELECT $1" [oid] [value])]
+      (is (nil? (:error r)))
+      (is (= [oid] (:param-oids r)))
+      (is (= [[expected]] (:rows r)))
+      (when (contains? #{2205 4089} oid)
+        (is (= 4 (:typlen (first (:columns r))))))))
+  (is (= "42P01" (get-in (parse-describe-execute "SELECT 1" [2210] ["{missing_object}"])
+                         [:error \C])))
+  (is (= "3F000" (get-in (parse-describe-execute "SELECT 1" [4089] ["missing_schema"])
+                         [:error \C]))))
+
+(deftest declared-object-input-after-autocommit-uses-the-current-catalog
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "CREATE TABLE declared_before (v integer)"))
+      (read-until-ready in)
+      (let [object (objects/object-by-identity @*conn* objects/pg-class-oid 2200 "declared_before")]
+        (d/transact *conn* (objects/rename-object-tx @*conn* objects/pg-class-oid
+                                                     (:datahike.pg.object/oid object) "declared_after" nil)))
+      (send-msg! out \P (ba (cstr "object_input") (cstr "SELECT $1") [:i16 1] [:i32 2205]))
+      (send-bind-execute-sync! out "object_input" ["declared_after"])
+      (let [result (decode (read-until-ready in))]
+        (is (nil? (:error result)))
+        (is (= [["declared_after"]] (:rows result)))))))
 
 (deftest routine-parameter-input-error-aborts-the-transaction
   (with-conn

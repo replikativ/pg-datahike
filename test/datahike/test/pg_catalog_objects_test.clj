@@ -128,6 +128,10 @@
         (let [renamed (objects/object-by-address
                        (d/db conn) objects/pg-type-oid 51000)]
           (is (= "after" (:datahike.pg.object/name renamed)))
+          (is (= 51000 (:datahike.pg.object/oid
+                        (objects/object-by-identity
+                         (d/db conn) objects/pg-type-oid
+                         objects/public-namespace-oid "after"))))
           (is (= 2 (:datahike.pg.object/revision renamed))))))))
 
 (deftest search-path-follows-postgresql-lookup-and-create-rules

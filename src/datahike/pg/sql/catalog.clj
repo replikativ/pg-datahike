@@ -1547,6 +1547,152 @@
                      row)))
           rows)))
 
+(defn relation-rows
+  "pg_class identities, shared with relation OID lookup. No lookup allocates."
+  [user-schema cte-db]
+  (into (mapv (fn [[name oid]]
+                {:pg_class/oid oid :pg_class/relname name
+                 :pg_class/relnamespace 11 :pg_class/relkind "r"
+                 :pg_class/reltype 0 :pg_class/relispartition false
+                 (pgs/row-marker-attr "pg_class") true})
+              catalog-objects/catalog-relation-oids)
+        (into
+     ;; A materialized view's rows live in an ordinary table, so it is
+     ;; in table-names like any other -- but it is relkind 'm', which
+     ;; is how psql's \\dm and every tool that distinguishes the two
+     ;; tell them apart.
+         (let [matviews (into #{}
+                              (map first)
+                              (d/q '{:find [?n]
+                                     :where [[?e :datahike.pg.matview/name ?n]]}
+                                   cte-db))]
+           (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
+             (mapv (fn [t]
+                     (let [tbl-oid (or (pgs/table-oid cte-db t)
+                                       (Math/abs (.hashCode ^String t)))
+                           identity (regoid/registry-relation cte-db {:oid tbl-oid})
+                           row-type (catalog-objects/object-by-identity
+                                     cte-db catalog-objects/pg-type-oid
+                                     catalog-objects/public-namespace-oid t)]
+                       {:pg_class/oid (long tbl-oid)
+                        :pg_class/relname (or (:name identity) t)
+                        :pg_class/relnamespace (or (:namespace-oid identity) 2200)
+                        :pg_class/relispartition false
+                        :pg_class/relkind (if (contains? matviews t) "m" "r")
+                        :pg_class/reltype
+                        (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                                (:datahike.pg.object/oid row-type) 0))
+                        :pg_class/relhastriggers (contains? triggered t)
+                        (pgs/row-marker-attr "pg_class") true}))
+                   (pgs/table-names user-schema))))
+     ;; Composite types get a distinct backing pg_class row (relkind 'c');
+     ;; pg_type.typrelid and pg_class.reltype link the two identities.
+         (into
+          (mapv (fn [{:keys [name oid]}]
+                  (let [relation (catalog-objects/object-by-identity
+                                  cte-db catalog-objects/pg-class-oid
+                                  catalog-objects/public-namespace-oid name)]
+                    {:pg_class/oid (long (or (:datahike.pg.object/oid relation) oid))
+                     :pg_class/relname name
+                     :pg_class/relnamespace 2200
+                     :pg_class/relispartition false
+                     :pg_class/relkind "c"
+                     :pg_class/reltype oid
+                     (pgs/row-marker-attr "pg_class") true}))
+                (pgs/composite-types cte-db))
+      ;; Sequences are relations in PG (relkind 'S'), which is how
+      ;; pg_dump, psql's \ds and ORM introspection find them at all —
+      ;; without a row here a sequence is invisible to anything that
+      ;; walks pg_class (issue #26).
+          (into
+           (mapv (fn [s]
+                   (let [nm (:__seq__/name s)]
+                     {:pg_class/oid
+                      (long (or (:datahike.pg.object/oid
+                                 (catalog-objects/object-by-identity
+                                  cte-db catalog-objects/pg-class-oid
+                                  catalog-objects/public-namespace-oid nm))
+                                (Math/abs (.hashCode ^String nm))))
+                      :pg_class/relname nm
+                      :pg_class/relnamespace 2200
+                      :pg_class/relispartition false
+                      :pg_class/relkind "S"
+                      :pg_class/reltype 0
+                      (pgs/row-marker-attr "pg_class") true}))
+                 (sequence-entities cte-db))
+           (concat
+            (mapv (fn [{:keys [name]}]
+                    (let [relation (catalog-objects/object-by-identity
+                                    cte-db catalog-objects/pg-class-oid
+                                    catalog-objects/public-namespace-oid name)
+                          row-type (catalog-objects/object-by-identity
+                                    cte-db catalog-objects/pg-type-oid
+                                    catalog-objects/public-namespace-oid name)]
+                      {:pg_class/oid
+                       (long (or (:datahike.pg.object/oid relation)
+                                 (Math/abs (.hashCode ^String name))))
+                       :pg_class/relname name
+                       :pg_class/relnamespace 2200
+                       :pg_class/relispartition false
+                       :pg_class/relkind "v"
+                       :pg_class/reltype
+                       (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                               (:datahike.pg.object/oid row-type) 0))
+                       (pgs/row-marker-attr "pg_class") true}))
+                  (view-entities cte-db))
+            (mapv (fn [object]
+                    {:pg_class/oid (:datahike.pg.object/oid object)
+                     :pg_class/relname (:datahike.pg.object/name object)
+                     :pg_class/relnamespace 2200
+                     :pg_class/relispartition false
+                     :pg_class/relkind "i"
+                     :pg_class/reltype 0
+                     (pgs/row-marker-attr "pg_class") true})
+                  (catalog-objects/objects-by-kind cte-db :index))
+        ;; The IMPLICIT indexes -- a PRIMARY KEY's and a UNIQUE column's --
+        ;; are relations in PostgreSQL too, and pgjdbc's getPrimaryKeys
+        ;; joins pg_class a second time to read the index's name out of
+        ;; them. Same descriptors pg_index and pg_indexes use, so the oid
+        ;; it joins on and the name it reports cannot drift apart.
+            (mapv (fn [{:keys [oid name]}]
+                    {:pg_class/oid oid
+                     :pg_class/relname name
+                     :pg_class/relnamespace 2200
+                     :pg_class/relispartition false
+                     :pg_class/relkind "i"
+                     :pg_class/reltype 0
+                     (pgs/row-marker-attr "pg_class") true})
+                  (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db)))))))))
+
+(defn relation-identity
+  "Lookup a relation identity using indexed registered objects first.
+   Native inferred relations and implicit indexes share pg_class's descriptors;
+   their fallback index lives only for the current statement/snapshot."
+  [db request]
+  (or (regoid/registry-relation db request)
+      (when db
+        (let [build (fn []
+                      (let [rows (relation-rows (dbi/-schema db) db)
+                            descriptors (mapv (fn [r]
+                                                {:oid (:pg_class/oid r)
+                                                 :name (:pg_class/relname r)
+                                                 :namespace-oid (:pg_class/relnamespace r)
+                                                 :kind (:pg_class/relkind r)}) rows)]
+                        {:by-oid (into {} (map (juxt :oid identity)) descriptors)
+                         :by-name (into {} (map (juxt (juxt :namespace-oid :name) identity)) descriptors)}))
+              cache regoid/*relation-cache*
+              index (if cache
+                      (let [cached @cache
+                            pending (if (identical? db (:db cached))
+                                      (:index cached) (delay (build)))]
+                        (when-not (identical? db (:db cached))
+                          (reset! cache {:db db :index pending}))
+                        (force pending))
+                      (build))]
+          (if-let [oid (:oid request)]
+            (get-in index [:by-oid oid])
+            (get-in index [:by-name [(:namespace-oid request) (:name request)]]))))))
+
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
    per-table body; library consumers add more via the registry."
@@ -1921,114 +2067,7 @@
              (pgs/row-marker-attr "pg_proc") true})
           (regoid/routines cte-db))
     "pg_class"
-    (complete-pg-class-rows
-     cte-db user-schema
-     (into
-     ;; A materialized view's rows live in an ordinary table, so it is
-     ;; in table-names like any other -- but it is relkind 'm', which
-     ;; is how psql's \\dm and every tool that distinguishes the two
-     ;; tell them apart.
-      (let [matviews (into #{}
-                           (map first)
-                           (d/q '{:find [?n]
-                                  :where [[?e :datahike.pg.matview/name ?n]]}
-                                cte-db))]
-        (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
-          (mapv (fn [t]
-                  (let [tbl-oid (or (pgs/table-oid cte-db t)
-                                    (Math/abs (.hashCode ^String t)))
-                        row-type (catalog-objects/object-by-identity
-                                  cte-db catalog-objects/pg-type-oid
-                                  catalog-objects/public-namespace-oid t)]
-                    {:pg_class/oid (long tbl-oid)
-                     :pg_class/relname t
-                     :pg_class/relnamespace 2200
-                     :pg_class/relispartition false
-                     :pg_class/relkind (if (contains? matviews t) "m" "r")
-                     :pg_class/reltype
-                     (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                             (:datahike.pg.object/oid row-type) 0))
-                     :pg_class/relhastriggers (contains? triggered t)
-                     (pgs/row-marker-attr "pg_class") true}))
-                (pgs/table-names user-schema))))
-     ;; Composite types get a distinct backing pg_class row (relkind 'c');
-     ;; pg_type.typrelid and pg_class.reltype link the two identities.
-      (into
-       (mapv (fn [{:keys [name oid]}]
-               (let [relation (catalog-objects/object-by-identity
-                               cte-db catalog-objects/pg-class-oid
-                               catalog-objects/public-namespace-oid name)]
-                 {:pg_class/oid (long (or (:datahike.pg.object/oid relation) oid))
-                  :pg_class/relname name
-                  :pg_class/relnamespace 2200
-                  :pg_class/relispartition false
-                  :pg_class/relkind "c"
-                  :pg_class/reltype oid
-                  (pgs/row-marker-attr "pg_class") true}))
-             (pgs/composite-types cte-db))
-      ;; Sequences are relations in PG (relkind 'S'), which is how
-      ;; pg_dump, psql's \ds and ORM introspection find them at all —
-      ;; without a row here a sequence is invisible to anything that
-      ;; walks pg_class (issue #26).
-       (into
-        (mapv (fn [s]
-                (let [nm (:__seq__/name s)]
-                  {:pg_class/oid
-                   (long (or (:datahike.pg.object/oid
-                              (catalog-objects/object-by-identity
-                               cte-db catalog-objects/pg-class-oid
-                               catalog-objects/public-namespace-oid nm))
-                             (Math/abs (.hashCode ^String nm))))
-                   :pg_class/relname nm
-                   :pg_class/relnamespace 2200
-                   :pg_class/relispartition false
-                   :pg_class/relkind "S"
-                   :pg_class/reltype 0
-                   (pgs/row-marker-attr "pg_class") true}))
-              (sequence-entities cte-db))
-        (concat
-         (mapv (fn [{:keys [name]}]
-                 (let [relation (catalog-objects/object-by-identity
-                                 cte-db catalog-objects/pg-class-oid
-                                 catalog-objects/public-namespace-oid name)
-                       row-type (catalog-objects/object-by-identity
-                                 cte-db catalog-objects/pg-type-oid
-                                 catalog-objects/public-namespace-oid name)]
-                   {:pg_class/oid
-                    (long (or (:datahike.pg.object/oid relation)
-                              (Math/abs (.hashCode ^String name))))
-                    :pg_class/relname name
-                    :pg_class/relnamespace 2200
-                    :pg_class/relispartition false
-                    :pg_class/relkind "v"
-                    :pg_class/reltype
-                    (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                            (:datahike.pg.object/oid row-type) 0))
-                    (pgs/row-marker-attr "pg_class") true}))
-               (view-entities cte-db))
-         (mapv (fn [object]
-                 {:pg_class/oid (:datahike.pg.object/oid object)
-                  :pg_class/relname (:datahike.pg.object/name object)
-                  :pg_class/relnamespace 2200
-                  :pg_class/relispartition false
-                  :pg_class/relkind "i"
-                  :pg_class/reltype 0
-                  (pgs/row-marker-attr "pg_class") true})
-               (catalog-objects/objects-by-kind cte-db :index))
-        ;; The IMPLICIT indexes -- a PRIMARY KEY's and a UNIQUE column's --
-        ;; are relations in PostgreSQL too, and pgjdbc's getPrimaryKeys
-        ;; joins pg_class a second time to read the index's name out of
-        ;; them. Same descriptors pg_index and pg_indexes use, so the oid
-        ;; it joins on and the name it reports cannot drift apart.
-         (mapv (fn [{:keys [oid name]}]
-                 {:pg_class/oid oid
-                  :pg_class/relname name
-                  :pg_class/relnamespace 2200
-                  :pg_class/relispartition false
-                  :pg_class/relkind "i"
-                  :pg_class/reltype 0
-                  (pgs/row-marker-attr "pg_class") true})
-               (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db))))))))
+    (complete-pg-class-rows cte-db user-schema (relation-rows user-schema cte-db))
     "pg_tables"
     ;; `hastriggers` was hard-coded false, which is what a client reads
     ;; to decide whether to look in pg_trigger at all.

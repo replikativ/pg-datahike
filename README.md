@@ -574,10 +574,20 @@ invalid argument type modifiers can still raise an error. Names resolve
 through `search_path`, and output uses schema qualification when needed.
 Scalar columns, arrays, COPY and typed text parameters preserve these
 identities. Scalar binary parameters use PostgreSQL's unsigned four-byte
-OID format; results use text format, and binary routine-array parameters
+OID format; results use text format, and binary OID-alias array parameters
 are not supported. A function's presence in the generated `pg_proc`
 catalog describes its identity and signature; unsupported execution still
 fails explicitly.
+
+`regclass` resolves permanent relation identities, including tables, views,
+sequences, indexes and supported system catalogs. `regnamespace` resolves
+registered schemas: `'pg_class'::regclass::oid` is `1259`, and
+`'pg_catalog'::regnamespace::oid` is `11`. Missing names raise `42P01` and
+`3F000`, respectively; `to_regclass` and `to_regnamespace` return NULL for
+missing names. Columns, arrays, COPY and typed parameters preserve numeric
+identities, while output uses the current name and visibility. Temporary
+relation aliases raise `0A000`. Regclass constants in column defaults are
+evaluated when the default is used; they do not establish DROP dependencies.
 
 ### Accepted under `:compat :pg-dump` (no semantics, schema loads)
 

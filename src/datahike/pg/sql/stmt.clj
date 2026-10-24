@@ -7692,7 +7692,7 @@
         (let [elem-kw (or (types/cast-array-elem-kw (str col-data-type))
                           (get types/sql-name->elem-kw type-str) :text)]
           (cond
-            (pg-arr/array? inner) (pg-arr/coerce-routine-elements
+            (pg-arr/array? inner) (pg-arr/coerce-oid-elements
                                    (pg-arr/array elem-kw (:elements inner)
                                                  (:dims inner) (:lbounds inner)))
             (sequential? inner)   (pg-arr/array elem-kw (vec inner))
@@ -7705,12 +7705,6 @@
          inner type-str
          {:explicit? true
           :parse-timestamp expr/parse-timestamp-string
-          :resolve-regclass
-          (fn [n]
-            (or (when (and params/*parse-db* (some? inner))
-                  (pgs/table-oid params/*parse-db* n))
-                (when (seq n) (Math/abs (.hashCode ^String n)))
-                0))
           :resolve-regtype #(or (params/registered-type-oid params/*parse-db* %) %)})))))
 
 (defn- widen-integral
@@ -8183,7 +8177,7 @@
           ;; two spellings of one address were two values.
           (mac/mac-type? pg-type) (mac/mac-in pg-type val)
 
-          (= :reg-routine (types/cast-category pg-type))
+          (= :reg-oid (types/cast-category pg-type))
           (sql-cast/cast-scalar val pg-type {:explicit? false})
 
           (= "tsvector" pg-type) (tsearch/canonical-tsvector val)
@@ -8239,7 +8233,7 @@
           (some? elem-kw)
           (cond
             (pg-arr/array? val)
-            (pg-arr/to-storage-text (if (contains? #{:regproc :regprocedure} elem-kw)
+            (pg-arr/to-storage-text (if (contains? #{:regproc :regprocedure :regclass :regnamespace} elem-kw)
                                       (assoc val :elem-type elem-kw) val))
             ;; Array TEXT, which still has to go through the array
             ;; input function. Passing it through unparsed stored

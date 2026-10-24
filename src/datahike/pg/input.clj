@@ -360,6 +360,8 @@
    types/oid-oid parse-oid
    types/oid-regproc #(regoid/input "regproc" %)
    types/oid-regprocedure #(regoid/input "regprocedure" %)
+   types/oid-regclass #(regoid/input "regclass" %)
+   types/oid-regnamespace #(regoid/input "regnamespace" %)
    types/oid-float4 parse-float4
    types/oid-float8 parse-float8
    ;; numeric_in: coerce-numeric already matches it, NaN/Infinity,

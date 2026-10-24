@@ -974,6 +974,11 @@
   [^String sql schema db]
   (binding [params/*parse-db* db
             regoid/*db* db
+            regoid/*relation-provider* catalog/relation-identity
+            regoid/*relation-db* (or regoid/*relation-db* db)
+            regoid/*relation-cache* (or regoid/*relation-cache* (atom nil))
+            regoid/*database-name* (or (some-> params/*session-state* deref :db-name) "datahike")
+            regoid/*temp-tables* params/*temp-table-map*
             regoid/*search-path* (or (some-> params/*session-state* deref :search-path)
                                      ["$user" "public"])
             params/*parse-sql* (params/nested-parse-fn parse-sql)
@@ -1781,7 +1786,7 @@
                                                                    type-str (types/normalize-sql-type-name
                                                                              (str (.getDataType cdt)))
                                                                    full-str (types/normalize-sql-type-name (str cdt))
-                                                                   _ (when (= :reg-routine (types/cast-category full-str))
+                                                                   _ (when (= :reg-oid (types/cast-category full-str))
                                                                        (params/session-dependent!))
                                                                    enum-values (when-not
                                                                                 (or (contains? types/pg-name->oid full-str)
@@ -2477,6 +2482,10 @@
                                           {:op :drop-column
                                            :name (unquote-ident (.getColumnName exp))
                                            :if-exists? (.isUsingIfExists exp)}
+                                          (= op "RENAME_TABLE")
+                                          (throw (errors/pg-error
+                                                  :feature-not-supported
+                                                  {:message "ALTER TABLE RENAME is not supported"}))
                                 ;; RENAME COLUMN
                                           (= op "RENAME")
                                           {:op :rename-column
