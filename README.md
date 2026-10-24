@@ -589,6 +589,18 @@ identities, while output uses the current name and visibility. Temporary
 relation aliases raise `0A000`. Regclass constants in column defaults are
 evaluated when the default is used; they do not establish DROP dependencies.
 
+`regtype` resolves built-in types and registered enums, domains, composites and
+relation row types. It accepts PostgreSQL type spellings, modifiers and array
+decorations; output uses canonical SQL names. `pg_typeof` returns a numeric type
+identity, usable in casts and joins to `pg_type`. `to_regtype` returns NULL for
+missing types; grammar and modifier errors can still raise errors, as in
+PostgreSQL. The catalog includes generated PostgreSQL type metadata even when
+value codecs are unsupported. User-defined array identities and temporary
+row-type aliases are not yet supported. Catalog-triggered reanalysis can rebind
+an OID alias literal in a prepared statement after drop/recreate; PostgreSQL
+retains the originally bound OID. Stored column values keep their numeric
+identity.
+
 ### Accepted under `:compat :pg-dump` (no semantics, schema loads)
 
 `CREATE TRIGGER`, `CREATE FUNCTION` (incl. `$$…$$` body),

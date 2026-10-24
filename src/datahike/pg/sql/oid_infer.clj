@@ -201,6 +201,7 @@
    "least"         :common-type
    ;; Date/time — constants + truncation
    "now"           types/oid-timestamptz
+   "nextval"       types/oid-int8
    "current_timestamp" types/oid-timestamptz
    "transaction_timestamp" types/oid-timestamptz
    "statement_timestamp"  types/oid-timestamptz
@@ -819,6 +820,7 @@
       ;; identical in text mode; encodeBinary narrows the long to the
       ;; declared width for binary clients.
        :integer   (cond
+                    (= "oid" type-str) types/oid-oid
                     (#{"smallint" "int2" "smallserial" "serial2"} type-str) types/oid-int2
                     (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
                     :else                                                    types/oid-int4)

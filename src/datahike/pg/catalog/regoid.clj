@@ -13,6 +13,7 @@
             [datahike.pg.sql.classify :as classify]))
 
 (def ^:dynamic *db* nil)
+(def ^:dynamic *soft-input?* false)
 (def ^:dynamic *search-path* ["$user" "public"])
 (def ^:dynamic *database-name* "datahike")
 (def ^:dynamic *relation-provider* nil)
@@ -22,8 +23,8 @@
 
 (def routine-oids #{24 2202})
 (def routine-types #{"regproc" "regprocedure"})
-(def alias-oids (into routine-oids #{2205 4089}))
-(def alias-types (into routine-types #{"regclass" "regnamespace"}))
+(def alias-oids (into routine-oids #{2205 2206 4089}))
+(def alias-types (into routine-types #{"regclass" "regtype" "regnamespace"}))
 
 (defn- fail! [state message]
   (throw (ex-info message {:sqlstate state})))
@@ -335,7 +336,15 @@
     (vec (remove #(= :comment (:type %)) tokens))))
 
 (defn- parsed-type [spelling]
+  (when (str/blank? spelling)
+    (throw (ex-info "invalid type name" {:sqlstate "42601" :regoid-soft-type-error? true})))
   (let [tokens (type-tokens spelling)
+        _ (when (empty? tokens) (type-syntax!))
+        _ (when (word? (first tokens) "setof")
+            (when (or (= 1 (count tokens)) (word? (second tokens) "setof"))
+              (type-syntax!))
+            (parsed-type (subs spelling (:end (first tokens))))
+            (throw (ex-info "invalid type name" {:sqlstate "42601" :regoid-soft-type-error? true})))
         [tokens array?] (array-decoration tokens)
         [name-tokens mods mod-pos] (modifier-decoration tokens)
         all-words? (every? #(= :ident (:type %)) name-tokens)
@@ -393,42 +402,64 @@
                :else mods)]
     {:names names :mods mods :array? array?}))
 
+(def builtin-types
+  "Catalog type identities, including metadata for types without value codecs."
+  (conj (mapv #(assoc % :namespace-oid 11) catalog/types)
+        {:oid 16383 :typname "vector" :namespace-oid 2200
+         :typlen -1 :typtype "b" :typcategory "U" :typispreferred false
+         :typelem 0 :typarray 0 :typdelim "," :typmodin "vector_typmod_in"}))
+
+(def ^:private builtin-types-by-oid (into {} (map (juxt :oid identity)) builtin-types))
+(def ^:private builtin-types-by-name
+  (into {} (map (fn [t] [[(:namespace-oid t) (:typname t)] t])) builtin-types))
+
+(defn type-identity
+  "Resolve a static or registered type identity by OID or namespace/name.
+   Resolving metadata never allocates a type or implies a supported codec."
+  [db {:keys [oid namespace-oid name]}]
+  (or (if oid (get builtin-types-by-oid oid)
+          (get builtin-types-by-name [namespace-oid name]))
+      (when db
+        (when-let [object (if oid (objects/object-by-address db objects/pg-type-oid oid)
+                              (objects/object-by-identity db objects/pg-type-oid namespace-oid name))]
+          (let [n (:datahike.pg.object/name object)]
+            (when (str/starts-with? n "__dh_pg_temp_")
+              (throw (ex-info "temporary type OID aliases require temporary schema identities"
+                              {:sqlstate "0A000" :regoid-hard-error? true})))
+            {:oid (:datahike.pg.object/oid object) :typname n :user? true
+             :namespace-oid (objects/object-namespace-oid db object)
+             :typelem 0 :typarray 0 :typmodin "-"})))))
+
+(defn- visible-type [db names]
+  (let [n (last names)
+        path (if (= 2 (count names)) [(namespace-oid db (first names))] (search-path db))]
+    (some #(when % (type-identity db {:namespace-oid % :name n})) path)))
+
 (defn- type-oid*
   "parseTypeString for declared routine argument types. Type modifiers are
    validated before being discarded: they do not participate in identity."
   [db spelling]
   (let [{:keys [names mods array?]} (parsed-type spelling)
-        n (last names)
-        ns-name (when (= 2 (count names)) (first names))
-        builtin (when (and (<= (count names) 2)
-                           (or (nil? ns-name) (= "pg_catalog" ns-name)))
-                  (get catalog/type-by-name n))
-        extension (when (and (= n "vector") (<= (count names) 2)
-                             (or (nil? ns-name) (= ns-name "public")))
-                    {:oid 16383 :typname "vector" :typarray 0 :typmodin ::vector})
-        path (if ns-name [(namespace-oid db ns-name)] (search-path db))
-        user-oid (when (and db (<= (count names) 2) (some #{2200} path))
-                   (or (:datahike.pg.object/oid
-                        (objects/object-by-identity db objects/pg-type-oid 2200 n))
-                       (some (fn [[name-attr oid-attr]]
-                               (d/q {:find '[?oid .] :in '[$ ?n]
-                                     :where [['?e name-attr '?n] ['?e oid-attr '?oid]]}
-                                    db n))
-                             [[:datahike.pg.enum/name :datahike.pg.enum/oid]
-                              [:datahike.pg.domain/name :datahike.pg.domain/oid]
-                              [:datahike.pg.composite/name :datahike.pg.composite/oid]])))
-        candidates (cond-> []
-                     builtin (conj [11 builtin])
-                     extension (conj [2200 extension])
-                     user-oid (conj [2200 {:oid user-oid :user? true}]))
-        type (some (fn [ns-oid] (some #(when (= ns-oid (first %)) (second %)) candidates)) path)
-        oid (:oid type)]
-    (when-not oid (fail! "42704" (str "type \"" spelling "\" does not exist")))
+        _ (when (> (count names) 3)
+            (fail! "42601" "improper qualified name (too many dotted names)"))
+        _ (when (and (= 3 (count names)) (not= *database-name* (first names)))
+            (fail! "0A000" "cross-database references are not implemented"))
+        names (if (= 3 (count names)) (subvec names 1) names)
+        temps (if (instance? clojure.lang.IDeref *temp-tables*) @*temp-tables* *temp-tables*)
+        _ (when (and (or (= 1 (count names)) (= "pg_temp" (first names)))
+                     (contains? temps (last names)))
+            (throw (ex-info "temporary type OID aliases require temporary schema identities"
+                            {:sqlstate "0A000" :regoid-hard-error? true})))
+        _ (when (and (= 2 (count names)) (nil? (namespace-oid db (first names)))
+                     (not *soft-input?*))
+            (throw (ex-info (str "schema \"" (first names) "\" does not exist")
+                            {:sqlstate "3F000" :regoid-soft-type-error? true})))
+        type (visible-type db names)
+        oid (if array? (:typarray type) (:oid type))]
+    (when-not (and oid (pos? oid)) (fail! "42704" (str "type \"" spelling "\" does not exist")))
     (when-not (:user? type) (check-modifiers! type mods))
     (when (and (:user? type) mods) (fail! "42601" "type modifier is not allowed"))
-    (let [oid (if array? (:typarray type) oid)]
-      (or (when (and oid (pos? oid)) oid)
-          (fail! "42704" (str "type \"" spelling "\" does not exist"))))))
+    oid))
 
 (defn type-oid
   "Resolve and validate a TypeName. PostgreSQL's type grammar and typmodin
@@ -437,7 +468,7 @@
   (try
     (type-oid* db spelling)
     (catch clojure.lang.ExceptionInfo e
-      (if (= "42704" (:sqlstate (ex-data e)))
+      (if (or (= "42704" (:sqlstate (ex-data e))) (:regoid-soft-type-error? (ex-data e)))
         (throw e)
         (throw (ex-info (.getMessage e) (assoc (ex-data e) :regoid-hard-error? true) e))))))
 
@@ -602,6 +633,7 @@
           (case kind
             "regclass" (relation-input (qualified-name s))
             "regnamespace" (namespace-input (qualified-name s))
+            "regtype" (type-oid *db* s)
             (let [[names args] (if (= kind "regprocedure")
                                  (let [[names types] (signature s)]
                                    [names (mapv #(type-oid *db* %) types)])
@@ -614,7 +646,7 @@
                 (fail! "42725" (str "more than one function named \"" s "\"")))))))))
 
 (defn input-or-nil [kind value]
-  (try (input kind value)
+  (try (binding [*soft-input?* true] (input kind value))
        (catch clojure.lang.ExceptionInfo e
          (if (and (:sqlstate (ex-data e)) (not (:regoid-hard-error? (ex-data e))))
            nil (throw e)))))
@@ -625,6 +657,30 @@
 (defn- quote-ident [s]
   (if (and (re-matches #"[a-z_][a-z0-9_$]*" s) (not (contains? needs-quotes s)))
     s (str "\"" (str/replace s "\"" "\"\"") "\"")))
+
+(def ^:private special-type-names
+  {16 "boolean" 20 "bigint" 21 "smallint" 23 "integer" 700 "real"
+   701 "double precision" 1042 "character" 1043 "character varying"
+   1560 "bit" 1562 "bit varying" 1700 "numeric" 1186 "interval"
+   1083 "time without time zone" 1266 "time with time zone"
+   1114 "timestamp without time zone" 1184 "timestamp with time zone" 114 "json"})
+
+(defn type-name
+  "format_type_be: the SQL type spelling without an explicitly given typmod.
+   Unknown OIDs use decimal text, as regtypeout does."
+  [db oid]
+  (if-let [t (type-identity db {:oid oid})]
+    (if (and (pos? (:typelem t 0)) (not= "p" (:typstorage t))
+             (= oid (:typarray (type-identity db {:oid (:typelem t)}))))
+      (str (type-name db (:typelem t)) "[]")
+      (or (get special-type-names oid)
+          (let [n (:typname t) ns-oid (:namespace-oid t)
+                temps (if (instance? clojure.lang.IDeref *temp-tables*) @*temp-tables* *temp-tables*)
+                visible? (and (not (contains? temps n)) (= oid (:oid (visible-type db [n]))))]
+            (str (when-not visible?
+                   (str (quote-ident (namespace-name db ns-oid)) "."))
+                 (quote-ident n)))))
+    (if (zero? oid) "-" (str oid))))
 
 (defn- argument-type-name [arg-oid format-type]
   (if-let [t (when *db* (objects/object-by-address *db* objects/pg-type-oid arg-oid))]
@@ -662,6 +718,7 @@
   (let [id (long value)]
     (cond
       (zero? id) "-"
+      (= oid 2206) (type-name *db* id)
       (= oid 4089) (if-let [name (namespace-name *db* id)] (quote-ident name) (str id))
       (= oid 2205)
       (if-let [{:keys [name namespace-oid]} (relation {:oid id})]

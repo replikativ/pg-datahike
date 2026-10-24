@@ -516,6 +516,31 @@
             item-oids))
       item-oids)))
 
+(defn- visible-item-oids [parsed]
+  (when-let [{:keys [oids param-idx]} (:visible-select-items parsed)]
+    (effective-item-oids (assoc parsed :select-item-oids oids
+                                :select-item-param-idx param-idx))))
+
+(defn- blend-visible-item-oids
+  "Overlay SQL projection types after hidden inputs and correlated columns
+   have been shaped, identically for Describe and Execute."
+  [parsed fallback]
+  (if-let [{:keys [unknown? resolving-types?]} (:visible-select-items parsed)]
+    (let [splice (fn [values key-fn]
+                   (if-let [cs (:correlated-subqueries parsed)]
+                     (stmt/correlated-splice values
+                                             (into {} (map (juxt :out-pos key-fn)) (:subqueries cs))
+                                             (:n-output cs))
+                     values))
+          oids (splice (visible-item-oids parsed) :oid)
+          unknowns (splice unknown? (constantly false))]
+      (if (= (count fallback) (count oids))
+        (mapv (fn [oid old unknown]
+                (if (and resolving-types? unknown (nil? oid)) nil (or oid old)))
+              oids fallback unknowns)
+        fallback))
+    fallback))
+
 (defn- compute-schema-oids
   "Resolve the PG OID for each :find element of a parsed SELECT.
 
@@ -641,26 +666,31 @@
                 all-oids (into oids (repeat (count ces) nil))
                 vis (stmt/compound-projection-indices all-aliases ces)]
             [(mapv #(nth all-aliases %) vis) (mapv #(nth all-oids %) vis)])
+          [aliases oids])
+        [aliases oids]
+        (if-let [{:keys [subqueries corr-col->idx n-output]} (:correlated-subqueries parsed)]
+          (let [hidden (set (vals corr-col->idx))
+                keep-vis (fn [xs] (vec (keep-indexed (fn [i x] (when-not (hidden i) x)) xs)))]
+            [(stmt/correlated-splice (keep-vis aliases)
+                                     (into {} (map (juxt :out-pos :alias)) subqueries)
+                                     n-output)
+             (stmt/correlated-splice (keep-vis oids)
+                                     (into {} (map (juxt :out-pos :oid)) subqueries)
+                                     n-output)])
           [aliases oids])]
-    (if-let [{:keys [subqueries corr-col->idx n-output]} (:correlated-subqueries parsed)]
-      (let [hidden (set (vals corr-col->idx))
-            keep-vis (fn [xs] (vec (keep-indexed (fn [i x] (when-not (hidden i) x)) xs)))]
-        [(stmt/correlated-splice (keep-vis aliases)
-                                 (into {} (map (juxt :out-pos :alias)) subqueries)
-                                 n-output)
-         (stmt/correlated-splice (keep-vis oids)
-                                 (into {} (map (juxt :out-pos :oid)) subqueries)
-                                 n-output)])
-      [aliases oids])))
+    [aliases (blend-visible-item-oids parsed oids)]))
 
 (defn- select-output-oids
   "Static visible output OIDs for one translated SELECT branch."
   [parsed db]
-  (second (select-output-shape
-           parsed (or (:enriched-db parsed) db)
-           (effective-item-oids
-            (assoc parsed :select-item-oids
-                   (:select-item-resolution-oids parsed))))))
+  (let [analysis (cond-> (assoc parsed :select-item-oids
+                                (:select-item-resolution-oids parsed))
+                   (:visible-select-items parsed)
+                   (-> (assoc-in [:visible-select-items :oids]
+                                 (get-in parsed [:visible-select-items :resolution-oids]))
+                       (assoc-in [:visible-select-items :resolving-types?] true)))]
+    (second (select-output-shape analysis (or (:enriched-db parsed) db)
+                                 (effective-item-oids analysis)))))
 
 (defn- set-operation-output-oids
   "Resolve PostgreSQL's per-column common type across set-op branches."
@@ -9047,7 +9077,7 @@
                                                (or oid PgWireServer/OID_TEXT)))))
                         out)
                       schema-oids)]
-    schema-oids))
+    (int-array (map types/oid->wire-int (blend-visible-item-oids parsed schema-oids)))))
 
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
@@ -10667,7 +10697,7 @@
       (let [current-db (if (:in-tx? @tx-state)
                          (:speculative-db @tx-state)
                          (d/db conn))]
-        (if (pgs/sql-type-exists? current-db type-name)
+        (if (regoid/type-identity current-db {:namespace-oid 2200 :name type-name})
           (classified-error ""
                             (ex-info (str "type " (pr-str type-name)
                                           " already exists")
@@ -10817,7 +10847,7 @@
         (when-not eid
           (throw (ex-info (str "type " (pr-str type-name) " does not exist")
                           {:error :undefined-object :sqlstate "42704"})))
-        (when (pgs/sql-type-exists? db new-name)
+        (when (regoid/type-identity db {:namespace-oid 2200 :name new-name})
           (throw (ex-info (str "type " (pr-str new-name) " already exists")
                           {:error :duplicate-object :sqlstate "42710"})))
         (let [column-eids (map first
@@ -10946,7 +10976,7 @@
       (let [current-db (if (:in-tx? @tx-state)
                          (:speculative-db @tx-state)
                          (d/db conn))]
-        (if (pgs/sql-type-exists? current-db type-name)
+        (if (regoid/type-identity current-db {:namespace-oid 2200 :name type-name})
           (classified-error ""
                             (ex-info (str "type " (pr-str type-name)
                                           " already exists")

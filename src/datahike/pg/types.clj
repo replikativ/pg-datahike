@@ -143,7 +143,7 @@
   (into {}
         (map (fn [e] [e (:typarray (catalog-type e))]))
         [oid-bool oid-bytea oid-name oid-int2 oid-int4 oid-text oid-int8
-         oid-regproc oid-regprocedure oid-regclass oid-regnamespace
+         oid-regproc oid-regprocedure oid-regclass oid-regtype oid-regnamespace
          oid-float4 oid-float8 oid-oid oid-varchar oid-bpchar oid-date
          oid-time oid-timetz oid-timestamp oid-timestamptz oid-numeric
          oid-uuid oid-json oid-money oid-jsonb oid-tsvector oid-tsquery
@@ -177,6 +177,7 @@
    :regproc     oid-regproc
    :regprocedure oid-regprocedure
    :regclass oid-regclass
+   :regtype oid-regtype
    :regnamespace oid-regnamespace
    :varchar     oid-varchar
    :bpchar      oid-bpchar
@@ -362,6 +363,7 @@
    "regproc"           :regproc
    "regprocedure"      :regprocedure
    "regclass"          :regclass
+   "regtype"           :regtype
    "regnamespace"      :regnamespace
    "int"               :int4
    "int4"              :int4
@@ -805,7 +807,7 @@
 
 (defn oid-alias-type-spelling? [sql-type-name]
   (boolean (and sql-type-name
-                (re-find #"(?i)(?:^|\.)\s*\"?(?:regproc(?:edure)?|regclass|regnamespace)\"?\s*(?:\[|$)"
+                (re-find #"(?i)(?:^|\.)\s*\"?(?:regproc(?:edure)?|regclass|regtype|regnamespace)\"?\s*(?:\[|$)"
                          (str/trim (str sql-type-name))))))
 
 (defn normalize-sql-type-name
@@ -817,7 +819,7 @@
   (when sql-type-name
     (let [s (clojure.string/trim (str sql-type-name))
           routine-prefix
-          #"^(?:(?:(?i:pg_catalog)|\"pg_catalog\")\s*\.\s*)?((?i:(?:regproc(?:edure)?|regclass|regnamespace))|\"regproc\"|\"regprocedure\"|\"regclass\"|\"regnamespace\")(?=\s*(?:\[|$))"
+          #"^(?:(?:(?i:pg_catalog)|\"pg_catalog\")\s*\.\s*)?((?i:(?:regproc(?:edure)?|regclass|regtype|regnamespace))|\"regproc\"|\"regprocedure\"|\"regclass\"|\"regtype\"|\"regnamespace\")(?=\s*(?:\[|$))"
           valid-prefix
           #"^(?:(?:(?i:public)|\"public\")\s*\.\s*)?(?:(?i:vector)|\"vector\")(?=\s*(?:\(|\[|$))"]
       (cond
@@ -1199,6 +1201,7 @@
    oid-regproc     :db.type/long
    oid-regprocedure :db.type/long
    oid-regclass :db.type/long
+   oid-regtype :db.type/long
    oid-regnamespace :db.type/long
    oid-float4      :db.type/double
    oid-float8      :db.type/double

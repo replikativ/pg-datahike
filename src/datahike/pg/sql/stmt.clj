@@ -2452,11 +2452,8 @@
   "Given a ParenthesedSelect in FROM/JOIN position, return an enriched db
    that has a virtual table populated with the subquery's results.
 
-   Handles two inner shapes:
-     1. `(SELECT … FROM <table-or-derived> …)` — runs the inner select
-        against `db` and materializes its rows (existing behaviour).
-     2. `(SELECT * FROM table_function(...) [WITH ORDINALITY])` — expands
-        the table function directly without running a query.
+   Runs the inner SELECT, set operation, or VALUES against `db` and
+   materializes its projected rows, including SELECTs over table functions.
 
    Returns {:db spec-db :name sub-name :alias sub-alias :aliases cols}
    or nil if the shape isn't recognised."
@@ -2476,42 +2473,13 @@
                      (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
                                   (unquote-ident (.-name c)))
                                 (or (.getAliasColumns ^Alias a) []))))
-        with-fn d/db-with
         inner (.getSelect ps)
-        inner-ps (when (instance? PlainSelect inner) inner)
-        inner-from (when inner-ps (.getFromItem ^PlainSelect inner-ps))]
+        inner-ps (when (instance? PlainSelect inner) inner)]
     (cond
-      ;; (SELECT * FROM unnest(ARRAY[...]) [WITH ORDINALITY]) AS t
-      (and inner-ps
-           (instance? net.sf.jsqlparser.statement.select.TableFunction inner-from))
-      (when-let [{:keys [aliases rows vtypes]}
-                 (materialize-table-function
-                  ^net.sf.jsqlparser.statement.select.TableFunction inner-from)]
-        (let [schema-tx (mapv (fn [alias vtype]
-                                {:db/ident (keyword sub-name alias)
-                                 :db/valueType vtype
-                                 :db/cardinality :db.cardinality/one})
-                              aliases vtypes)
-              spec-db (with-fn db schema-tx)
-              data-tx (mapv (fn [row]
-                              (into {}
-                                    (keep-indexed
-                                     (fn [i a]
-                                       (let [v (nth row i nil)]
-                                         (when (some? v)
-                                           [(keyword sub-name a) v])))
-                                     aliases)))
-                            rows)
-              spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
-          {:db      spec-db2
-           :schema  (:schema spec-db2)
-           :name    sub-name
-           :alias   (or sub-alias sub-name)
-           :aliases aliases}))
-
-      ;; (SELECT … FROM real-table …) AS t — run the inner select.
-      ;; Inner may also be a SetOperationList (UNION/INTERSECT/EXCEPT) —
-      ;; handle that by translating each branch, executing, and combining.
+      ;; Run the complete SELECT even when its source is a table function:
+      ;; the normal translator evaluates scalar arguments and preserves
+      ;; projections, filters, column aliases, and declared output types.
+      ;; Set operations translate each branch before combining its rows.
       (or inner-ps (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
       (materialize-set-op! inner sub-name db schema sub-alias alias-cols)
 
@@ -5745,7 +5713,7 @@
         ;; the parse cache is keyed by SQL text while the parameter's
         ;; declared type is per-Parse-message. describeResult resolves
         ;; index → OID against :declared-param-oids at Describe time.
-        [select-item-oids* select-item-resolution-oids* select-item-param-idx*]
+        [select-item-oids* select-item-resolution-oids* select-item-param-idx* visible-select-items]
         (let [[oids resolution-oids idxs]
               (reduce
                (fn [[v rv pv] ^SelectItem item]
@@ -5789,7 +5757,10 @@
                 ;; lines up index-for-index with find-aliases.
               n (count @find-aliases)
               pad (fn [acc] (vec (take n (concat acc (repeat nil)))))]
-          [(pad oids) (pad resolution-oids) (pad idxs)])
+          [(pad oids) (pad resolution-oids) (pad idxs)
+           (when (seq @compound-exprs)
+             {:oids oids :resolution-oids resolution-oids :param-idx idxs
+              :unknown? (mapv #(and (some? %1) (nil? %2)) oids resolution-oids)})])
         select-item-oids select-item-oids*
         select-item-resolution-oids select-item-resolution-oids*
         select-item-param-idx select-item-param-idx*
@@ -7558,6 +7529,8 @@
              ;; fall back to value-based inference at Execute time (via
              ;; compute-schema-oids) or TEXT when neither path resolves.
              :select-item-oids select-item-oids
+             ;; SQL projection types before hidden inputs reshape :find.
+             :visible-select-items visible-select-items
              ;; Unlike an ordinary projection, UNION/INTERSECT/EXCEPT keep
              ;; bare strings, NULL and undeclared parameters as UNKNOWN while
              ;; finding a per-column common type. This parallel vector
@@ -7704,8 +7677,7 @@
         (sql-cast/cast-scalar
          inner type-str
          {:explicit? true
-          :parse-timestamp expr/parse-timestamp-string
-          :resolve-regtype #(or (params/registered-type-oid params/*parse-db* %) %)})))))
+          :parse-timestamp expr/parse-timestamp-string})))))
 
 (defn- widen-integral
   "Widen a narrow integral result to Long. `length()` answers an
@@ -8233,7 +8205,7 @@
           (some? elem-kw)
           (cond
             (pg-arr/array? val)
-            (pg-arr/to-storage-text (if (contains? #{:regproc :regprocedure :regclass :regnamespace} elem-kw)
+            (pg-arr/to-storage-text (if (contains? #{:regproc :regprocedure :regclass :regtype :regnamespace} elem-kw)
                                       (assoc val :elem-type elem-kw) val))
             ;; Array TEXT, which still has to go through the array
             ;; input function. Passing it through unparsed stored

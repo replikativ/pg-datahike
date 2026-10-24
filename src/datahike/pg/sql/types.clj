@@ -60,7 +60,8 @@
       (cond
         ;; `schema.name` glued into one token by the tokenizer (both
         ;; sides are bare alphanumeric identifiers). Strip the schema.
-        (and (str/includes? first-text ".")
+        (and (not (:quoted? (meta t1)))
+             (str/includes? first-text ".")
              (re-matches #"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*"
                          first-text))
         [(second (str/split first-text #"\." 2)) rest1]
@@ -68,7 +69,8 @@
         ;; `schema."name"` — the unquoted schema part absorbs the
         ;; trailing dot, the quoted name follows as a separate
         ;; `:ident` token.
-        (and (str/ends-with? first-text ".")
+        (and (not (:quoted? (meta t1)))
+             (str/ends-with? first-text ".")
              (= :ident (first (first rest1))))
         [(second (first rest1)) (rest rest1)]
 

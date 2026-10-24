@@ -89,7 +89,8 @@
     (is (= [oid-bit] (describe-oids "SELECT B'1001000'")))))
 
 (deftest pg-typeof-reports-bit
-  (is (= [["bit"]] (rows "SELECT pg_typeof(B'101')"))))
+  (is (= [["bit"]] (rows "SELECT pg_typeof(B'101')")))
+  (is (= [["bit"]] (rows "SELECT pg_typeof(X'ff')"))))
 
 ;; ---------------------------------------------------------------------------
 ;; Hex bit-string literals

@@ -1871,8 +1871,6 @@
                                                                    (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
                                                                  (or (nil? raw) (= :__null__ raw))
                                                                  :__null__
-                                                                 (= type-str "regtype")
-                                                                 (or (params/registered-type-oid cte-db raw) raw)
                                                                  domain-spec
                                                                  (params/cast-domain-value cte-db domain-spec raw)
                                                                  enum-values

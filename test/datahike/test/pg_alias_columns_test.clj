@@ -67,3 +67,32 @@
     (is (= [["1"] ["2"] ["3"]] (rows "SELECT r FROM generate_series(1, 1 + 2) AS s(r)"))))
   (testing "plain literal arguments keep working"
     (is (= [["2"] ["3"]] (rows "SELECT r FROM generate_series(2,3) AS s(r)")))))
+
+(deftest derived-table-function-projections
+  (testing "a derived SELECT evaluates scalar SRF arguments and exposes its projection"
+    (is (= [["1" "public"]]
+           (rows (str "SELECT r.r, r.nspname FROM ("
+                      "SELECT s.r, (current_schemas(false))[s.r] AS nspname "
+                      "FROM generate_series(1, array_upper(current_schemas(false), 1)) AS s(r)"
+                      ") AS r")))))
+  (testing "literal SRF arguments still apply the inner projection and outer alias list"
+    (is (= [["4"]]
+           (rows (str "SELECT r.v FROM (SELECT n + 1 AS projected "
+                      "FROM generate_series(1,3) AS s(n) "
+                      "WHERE n > 1 ORDER BY n DESC LIMIT 1) AS r(v)")))))
+  (testing "a derived SRF retains WITH ORDINALITY columns"
+    (is (= [["9" "2"]]
+           (rows (str "SELECT r.value, r.position FROM ("
+                      "SELECT n, ord FROM unnest(ARRAY[8,9]) WITH ORDINALITY AS s(n, ord) "
+                      "WHERE ord = 2) AS r(value, position)"))))))
+
+(deftest pgjdbc-type-info-derived-search-path
+  (testing "TypeInfoCache joins the projected search-path name and position"
+    (is (= [["3802" "jsonb"]]
+           (rows (str "SELECT pg_type.oid, typname FROM pg_catalog.pg_type "
+                      "LEFT JOIN (SELECT ns.oid AS nspoid, ns.nspname, r.r "
+                      "FROM pg_namespace AS ns JOIN ("
+                      "SELECT s.r, (current_schemas(false))[s.r] AS nspname "
+                      "FROM generate_series(1, array_upper(current_schemas(false), 1)) AS s(r)"
+                      ") AS r USING (nspname)) AS sp ON sp.nspoid = typnamespace "
+                      "WHERE typname = 'jsonb' ORDER BY sp.r, pg_type.oid DESC LIMIT 1"))))))
