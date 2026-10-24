@@ -445,7 +445,7 @@
      (or (instance? Float v) (instance? Double v))
      ((requiring-resolve 'datahike.pg.types/float->pg-text) v (instance? Float v))
      (and (number? v)
-          (not (contains? #{types/oid-money types/oid-regproc types/oid-regprocedure types/oid-regclass types/oid-regnamespace} elem-oid)))
+          (not (contains? #{types/oid-money types/oid-regproc types/oid-regprocedure types/oid-regclass types/oid-regtype types/oid-regnamespace} elem-oid)))
      (str v)
      (array? v)      (to-pg-text v)
      (sequential? v) (if (empty? v)
@@ -505,7 +505,7 @@
   "Resolve every OID-alias array leaf to its numeric identity. A cast from a
    text ARRAY must run typinput just as an array text literal does."
   [a]
-  (if (contains? #{:regproc :regprocedure :regclass :regnamespace} (:elem-type a))
+  (if (contains? #{:regproc :regprocedure :regclass :regtype :regnamespace} (:elem-type a))
     (let [parse (input/parser (types/elem-kw->oid (:elem-type a)))
           convert (fn convert [v]
                     (cond
@@ -521,7 +521,7 @@
    session's search path or later catalog renames/deletions."
   [a]
   (let [a (coerce-oid-elements a)]
-    (to-pg-text (if (contains? #{:regproc :regprocedure :regclass :regnamespace} (:elem-type a))
+    (to-pg-text (if (contains? #{:regproc :regprocedure :regclass :regtype :regnamespace} (:elem-type a))
                   (assoc a :elem-type :oid) a))))
 
 (defn- coerce-token

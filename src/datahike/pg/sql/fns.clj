@@ -5659,21 +5659,22 @@
    interval, the geometric and network types, bytea, arrays -- answered
    FALSE for valid input before, because the table was all there was."
   [^String s type-name]
-  (let [t (types/normalize-sql-type-name (str/trim (str type-name)))]
-    (cond
+  (binding [regoid/*soft-input?* true]
+    (let [t (types/normalize-sql-type-name (str/trim (str type-name)))]
+      (cond
       ;; array_in, strictly: the cast is lenient, and text that is not
       ;; brace-delimited is no array literal at all.
-      (str/ends-with? t "[]")
-      (let [elem (types/cast-array-elem-kw t)]
-        (when-not (str/starts-with? (str/triml s) "{")
-          (throw (errors/pg-error :invalid-text-representation
-                                  {:message (str "malformed array literal: \"" s "\"")})))
-        (pg-arr/from-pg-text s (or elem :text)))
+        (str/ends-with? t "[]")
+        (let [elem (types/cast-array-elem-kw t)]
+          (when-not (str/starts-with? (str/triml s) "{")
+            (throw (errors/pg-error :invalid-text-representation
+                                    {:message (str "malformed array literal: \"" s "\"")})))
+          (pg-arr/from-pg-text s (or elem :text)))
 
-      (or (types/cast-category t) (contains? types/pg-name->oid t))
-      (sql-cast/cast-scalar s t {})
+        (or (types/cast-category t) (contains? types/pg-name->oid t))
+        (sql-cast/cast-scalar s t {})
 
-      :else nil)))
+        :else nil))))
 
 (defn- known-input-type?
   "Whether pg_input_is_valid's second argument names a type at all. One
@@ -5723,7 +5724,8 @@
            (let [elem (vector-element-type base)]
              (every? #(pg-input-valid? % elem) (vector-elements s)))
            (some? (type-input s type-name))))))
-    (catch Throwable _ false)))
+    (catch Throwable e
+      (if (:regoid-hard-error? (ex-data e)) (throw e) false))))
 
 (defn pg-input-error-info
   "The four-column record returned by pg_input_error_info. This is kept
@@ -5801,6 +5803,7 @@
               [nil nil nil nil]
               [message nil nil sqlstate])
             (catch Throwable e
+              (when (:regoid-hard-error? (ex-data e)) (throw e))
               (let [[code msg fields] (errors/classify-exception e)
                     detail (when fields (.get ^java.util.Map fields "D"))]
                 [msg (when (not= msg detail) detail) nil code]))))))))
@@ -5889,6 +5892,10 @@
                        :arities #{1} :return-oid types/oid-regproc}
    "regprocedure"     {:impl #(regoid/input "regprocedure" %)
                        :arities #{1} :return-oid types/oid-regprocedure}
+   "regtype"          {:impl #(regoid/input "regtype" %)
+                       :arities #{1} :return-oid types/oid-regtype}
+   "to_regtype"       {:impl #(or (regoid/input-or-nil "regtype" %) :__null__)
+                       :arities #{1} :arg-oids [types/oid-text] :return-oid types/oid-regtype}
    "regclass"         {:impl #(regoid/input "regclass" %)
                        :arities #{1} :return-oid types/oid-regclass}
    "regnamespace"     {:impl #(regoid/input "regnamespace" %)

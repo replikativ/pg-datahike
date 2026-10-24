@@ -148,7 +148,7 @@
                         (>= j n) j
                         (= \" (.charAt sql j)) j
                         :else (recur (unchecked-inc j))))]
-            (recur (unchecked-inc end) (conj toks [:ident (subs sql (unchecked-inc i) end)])))
+            (recur (unchecked-inc end) (conj toks (with-meta [:ident (subs sql (unchecked-inc i) end)] {:quoted? true}))))
 
           ;; Single-char operators / wildcards. We don't need a real
           ;; expression parser at this layer — just need to surface

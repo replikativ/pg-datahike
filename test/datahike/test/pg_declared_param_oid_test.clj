@@ -594,7 +594,7 @@
                          [:error \C]))))
 
 (deftest oid-alias-binary-parameters-preserve-unsigned-values
-  (doseq [oid [24 2202 2205 4089]]
+  (doseq [oid [24 2202 2205 2206 4089]]
     (with-conn
       (fn [in out]
         (send-msg! out \P (ba (cstr "routine_binary") (cstr "SELECT $1")
@@ -612,17 +612,25 @@
 (deftest declared-object-oids-and-arrays-read-their-input-types
   (doseq [[oid value expected] [[2205 "pg_catalog.pg_class" "pg_class"]
                                 [4089 "pg_catalog" "pg_catalog"]
+                                [2206 "integer[]" "integer[]"]
+                                [2211 "{int4,text,-}" "{integer,text,-}"]
                                 [2210 "{pg_class,-}" "{pg_class,-}"]
                                 [4090 "{public,pg_catalog}" "{public,pg_catalog}"]]]
     (let [r (parse-describe-execute "SELECT $1" [oid] [value])]
       (is (nil? (:error r)))
       (is (= [oid] (:param-oids r)))
       (is (= [[expected]] (:rows r)))
-      (when (contains? #{2205 4089} oid)
+      (when (contains? #{2205 2206 4089} oid)
         (is (= 4 (:typlen (first (:columns r))))))))
   (is (= "42P01" (get-in (parse-describe-execute "SELECT 1" [2210] ["{missing_object}"])
                          [:error \C])))
   (is (= "3F000" (get-in (parse-describe-execute "SELECT 1" [4089] ["missing_schema"])
+                         [:error \C]))))
+
+(deftest unused-declared-regtype-parameters-validate-input
+  (is (= "42704" (get-in (parse-describe-execute "SELECT 1" [2206] ["missing_type"])
+                         [:error \C])))
+  (is (= "42704" (get-in (parse-describe-execute "SELECT 1" [2211] ["{missing_type}"])
                          [:error \C]))))
 
 (deftest declared-object-input-after-autocommit-uses-the-current-catalog

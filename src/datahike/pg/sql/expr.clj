@@ -1880,11 +1880,6 @@
                                   "pg_get_triggerdef" [:pg_trigger/oid :pg_trigger/tgdef])]
         (catalog-def-lookup! ctx (or (first args) :__null__) key-attr def-attr result-var))
 
-      ;; pg_typeof(value) — PG returns regtype (text-formatted as
-      ;; the type name). We resolve it at translate time using the
-      ;; expression's inferred OID so the result is a constant
-      ;; string the planner can fold; falls back to "text" when the
-      ;; argument is a derived expression we can't statically type.
       ;; abs on a declared integer column is width-checked:
       ;; abs(INT_MIN) is out of range in PostgreSQL, while Java's abs
       ;; WRAPS and returns the negative input unchanged -- an absolute
@@ -1937,15 +1932,26 @@
                    [(apply list fn-param evar args) result-var])
             result-var)))
 
+      ;; regtype carries an OID; the output boundary formats its SQL name.
       (= fname "pg_typeof")
       (let [arg-expr (first params)
             oid-env (oid-env ctx)
             arg-oid (try
-                      (oid-infer/expr-oid arg-expr oid-env)
+                      (if (and (oid-infer/untyped-literal? arg-expr)
+                               (not (pg-bits/bit-string-literal? arg-expr))) 705
+                          (oid-infer/expr-oid arg-expr oid-env))
                       (catch Throwable _ nil))
-            type-name (or (get types/oid->pg-name arg-oid) "text")
+            type-oid (or arg-oid types/oid-text)
             fn-param (symbol (str "?pg-typeof" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [_v] type-name)]
+            impl-fn (fn [v]
+                      ;; pg_typeof is non-strict: NULL still has its static
+                      ;; type. Its argument nevertheless executes, including
+                      ;; a deferred nextval under DISTINCT or ORDER BY where
+                      ;; this function runs inside the Datalog query.
+                      (if (params/call-marker? v)
+                        {:fn :projection :projection-fn (fn [_] type-oid)
+                         :args [v]}
+                        type-oid))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -2601,7 +2607,7 @@
             ;; surfacing as XX000.
             _ (fns/check-arity! fname (count args))
             _ (when (contains? #{"to_regproc" "to_regprocedure" "regproc" "regprocedure"
-                                 "to_regclass" "to_regnamespace" "regclass" "regnamespace"} fname)
+                                 "to_regclass" "to_regnamespace" "to_regtype" "regclass" "regtype" "regnamespace"} fname)
                 (params/session-dependent!))
             clj-fn (get fns/sql-fn->clj-fn fname)
             ;; Strictness is the rule, not a law -- see fns/non-strict-fns.
@@ -4669,8 +4675,6 @@
           is-interval? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
           (= cast-cat :reg-oid) (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
-          (= type-str "regtype")
-          (or (params/registered-type-oid params/*parse-db* inner-raw) inner-raw)
           :else    inner-raw)
       ;; Variable/expression — add runtime cast binding
         (let [inner-val (ctx/materialize-arg! ctx inner-raw)
@@ -4738,17 +4742,6 @@
               (swap! (:in-params ctx) conj uuid-fn-param)
               (swap! (:in-args ctx) conj (null-preserving uuid-fn))
               (swap! (:where-clauses ctx) conj [(list uuid-fn-param inner-val) result-var]))
-
-            (= type-str "regtype")
-            (let [fn-param (symbol (str "?regtype" (swap! (:var-counter ctx) inc)))
-                  db params/*parse-db*
-                  lookup (fn [v]
-                           (when (some? v)
-                             (or (params/registered-type-oid db v) v)))]
-              (swap! (:in-params ctx) conj fn-param)
-              (swap! (:in-args ctx) conj lookup)
-              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
-              result-var)
 
             ;; Numeric / boolean casts on a runtime value. The value may
             ;; arrive as a String — e.g. an extended-protocol parameter
@@ -8843,6 +8836,22 @@
             (conjunct-spine (.getRightExpression a))))
     :else [e]))
 
+(defn- boolean-parameter-predicate? [expr]
+  (or (instance? JdbcParameter expr)
+      (instance? JdbcNamedParameter expr)
+      (and (instance? CastExpression expr)
+           (= :boolean (types/cast-category
+                        (str (.getColDataType ^CastExpression expr)))))))
+
+(defn- boolean-parameter-value [ctx expr]
+  (when (or (instance? JdbcParameter expr) (instance? JdbcNamedParameter expr))
+    (when-let [oid (oid-infer/resolution-oid expr (oid-env ctx))]
+      (when (not= types/oid-bool oid)
+        (throw (ex-info "argument of WHERE must be type boolean"
+                        {:sqlstate "42804"})))))
+  (let [v (translate-expr ctx expr)]
+    (if (seq? v) (ctx/materialize-arg! ctx v) v)))
+
 (defn translate-predicate-false
   "F(φ): the clauses selecting the rows where φ evaluates to **FALSE**.
 
@@ -8870,6 +8879,12 @@
     (and (instance? ParenthesedExpressionList expr)
          (= 1 (count ^ParenthesedExpressionList expr)))
     (translate-predicate-false ctx (first ^ParenthesedExpressionList expr))
+
+    (instance? NullValue expr)
+    [[(list 'not= 1 1)]]
+
+    (boolean-parameter-predicate? expr)
+    [[(list 'false? (boolean-parameter-value ctx expr))]]
 
     (instance? AndExpression expr)
     ;; A conjunction is FALSE exactly when it is not (TRUE or UNKNOWN), so
@@ -10099,6 +10114,9 @@
               col-var (ctx/col-var! ctx resolved)]
           [[(list '= col-var true)]])))
 
+    (instance? NullValue expr)
+    [[(list 'not= 1 1)]]
+
     ;; Boolean literals — `WHERE true` adds no constraint, `WHERE false`
     ;; emits the canonical false-sentinel so the surrounding AND
     ;; short-circuits to no rows. psql's `\dC` (list casts) emits
@@ -10127,6 +10145,9 @@
         (= :__null__ v) [[(list 'not= 1 1)]] ; NULL in bool position → false (PG 3VL)
         :else (let [v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
                 [[(list '= v true)]])))
+
+    (boolean-parameter-predicate? expr)
+    [[(list 'true? (boolean-parameter-value ctx expr))]]
 
     ;; Boolean-valued expressions used directly as predicates:
     ;; `WHERE <bool-fn>(...)`, `WHERE CASE WHEN ... END`, etc. PG

@@ -989,7 +989,8 @@
     (let [queries (vec (mapcat (fn [file]
                                  (map first (:cases (edn/read-string (slurp file)))))
                                ["test/resources/regoid_corpus.edn"
-                                "test/resources/object_oid_corpus.edn"]))
+                                "test/resources/object_oid_corpus.edn"
+                                "test/resources/type_oid_corpus.edn"]))
           run (fn [c sql] [(q c sql) (prep-q c sql [])])]
       {:surface :regoid :seed nil :drawn (set queries)
        :ran {:oid-identity (count queries)}

@@ -40,7 +40,7 @@
              (not= :vector (types/cast-category normalized)))
         invalid-routine-spelling?
         (and (types/oid-alias-type-spelling? type-name)
-             (not (contains? #{"regproc" "regprocedure" "regclass" "regnamespace"}
+             (not (contains? #{"regproc" "regprocedure" "regclass" "regtype" "regnamespace"}
                              (str/replace normalized #"(?:\s*\[\s*\])+$" ""))))
         ;; Unquoted: `path` is a reserved word in JSqlParser's grammar
         ;; and is rewritten to its quoted spelling before parsing, so a
@@ -54,7 +54,7 @@
         base (last (str/split raw #"\."))
         built-in? (or (types/cast-category base)
                       (contains? types/pg-name->oid base)
-                      (contains? #{"regclass" "regnamespace" "regtype"} base))
+                      (contains? #{"regclass" "regtype" "regnamespace"} base))
         registered? (fn [attr]
                       (when db
                         (try

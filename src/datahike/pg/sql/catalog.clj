@@ -1553,7 +1553,8 @@
   (into (mapv (fn [[name oid]]
                 {:pg_class/oid oid :pg_class/relname name
                  :pg_class/relnamespace 11 :pg_class/relkind "r"
-                 :pg_class/reltype 0 :pg_class/relispartition false
+                 :pg_class/reltype (get {1247 71 1249 75 1255 81 1259 83} oid 0)
+                 :pg_class/relispartition false
                  (pgs/row-marker-attr "pg_class") true})
               catalog-objects/catalog-relation-oids)
         (into
@@ -1699,34 +1700,18 @@
   [table-name user-schema cte-db]
   (case table-name
     "pg_type"
-    ;; Full base + array type set from the central registry (types/pg-type-
-    ;; catalog) — including oid 26 (oid), name, numeric, json/jsonb, time/
-    ;; interval and the _T[] array types. The previous hardcoded 10-row list
-    ;; omitted most, so client type-introspection (e.g. asyncpg's
-    ;; set_type_codec → TYPE_BY_OID) failed with "unknown type pg_catalog.X".
-    ;; typelem is the element OID for array types (typname "_int4" → int4's
-    ;; oid), 0 for scalars.
-    (let [name->oid (into {} (map (fn [[o n _ _]] [n o])) types/pg-type-catalog)
-          base (mapv (fn [[oid tname tlen ttype]]
-                       (let [elem (when (str/starts-with? tname "_")
-                                    (name->oid (subs tname 1)))]
-                         (merge
-                          {:pg_type/oid (long oid) :pg_type/typname tname
-                           :pg_type/typlen (long tlen) :pg_type/typtype ttype
-                           :pg_type/typcategory
-                           (name (or (when elem :A) (get types/oid->category oid :U)))
-                           :pg_type/typispreferred (contains? types/preferred-oids oid)
-                           :pg_type/typelem (long (or elem 0))
-                          ;; The array type whose element is this one:
-                          ;; `int4` -> `_int4`. Arrays themselves have none.
-                           :pg_type/typarray (long (or (when-not elem
-                                                         (name->oid (str "_" tname)))
-                                                       0))
-                           :pg_type/typdelim ","
-                           :pg_type/typnamespace (if (= oid 16383) 2200 11)
-                           (pgs/row-marker-attr "pg_type") true}
-                          (type-io-columns oid))))
-                     types/pg-type-catalog)
+    ;; Identities include PostgreSQL's generated metadata, independently of
+    ;; which types have executable codecs. Input lookup consumes these same rows.
+    (let [base (mapv (fn [t]
+                       (merge
+                        (into {} (map (fn [[k v]] [(keyword "pg_type" (name k)) v]))
+                              (select-keys t [:oid :typname :typlen :typtype :typcategory
+                                              :typispreferred :typelem :typarray :typdelim]))
+                        {:pg_type/typnamespace (:namespace-oid t)
+                         :pg_type/typrelid (get {71 1247 75 1249 81 1255 83 1259} (:oid t) 0)
+                         (pgs/row-marker-attr "pg_type") true}
+                        (type-io-columns (:oid t))))
+                     regoid/builtin-types)
           ;; User composite types (CREATE TYPE … AS (..)) — typtype 'c',
           ;; variable length, namespace public.
           composites (mapv (fn [{:keys [name oid]}]

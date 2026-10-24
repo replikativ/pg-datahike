@@ -466,7 +466,6 @@
    Options:
      :explicit?       — an explicit CAST reshapes silently; an assignment
                         raises instead (matters for bit width coercion).
-     :resolve-regtype — fn String → oid, for `::regtype`.
      :prefer-local-datetime? — return a LocalDateTime (microsecond
                         precision) rather than a Date for a timestamp
                         cast. See the :timestamp branch.
@@ -481,7 +480,7 @@
   ;; passes it, and the temporal arms now use the ported parser, so
   ;; destructuring it would only invite someone to wire it back in.
   ;; Dropping it from the ~20 call sites is cleanup, not behaviour.
-  [v type-str {:keys [explicit? resolve-regtype
+  [v type-str {:keys [explicit?
                       prefer-local-datetime? src-oid]
                :or {explicit? true}}]
   (if (or (nil? v) (= :__null__ v))
@@ -705,5 +704,4 @@
 
         ;; Not a width-classified category — the OID-name types.
         (cond
-          (= type-str "regtype") (if resolve-regtype (resolve-regtype (str v)) v)
           :else v)))))

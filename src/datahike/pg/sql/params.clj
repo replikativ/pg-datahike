@@ -362,26 +362,6 @@
                        :hint "New enum values must be committed before they can be used."})))
     label))
 
-(def ^:private regtype-aliases
-  {"boolean" "bool" "smallint" "int2" "integer" "int4" "int" "int4"
-   "bigint" "int8" "real" "float4" "double precision" "float8"
-   "decimal" "numeric" "character varying" "varchar" "character" "bpchar"})
-
-(defn registered-type-oid
-  "Resolve PostgreSQL's regtype input syntax for built-ins and the user type
-   registries. Returns nil for an unknown name; callers decide whether their
-   boundary should raise or retain the input."
-  ([type-name] (registered-type-oid *parse-db* type-name))
-  ([db type-name]
-   (when type-name
-     (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)
-           canonical (get regtype-aliases bare bare)]
-       (or (get types/pg-name->oid canonical)
-           (some (fn [{:keys [name oid]}] (when (= name bare) oid))
-                 (pgs/composite-types db))
-           (some (fn [{:keys [name oid]}] (when (= name bare) oid))
-                 (pgs/enum-types db)))))))
-
 (defn registered-domain-spec
   "Return the persisted definition of a user domain, or nil. Optional fields
    are normalized away from Datahike's null sentinel."
