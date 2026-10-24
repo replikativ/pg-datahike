@@ -102,6 +102,10 @@
            (query c "SELECT p FROM rg_arrays")))
     (is (= {:rows [["1299"]]}
            (query c "SELECT x::oid FROM unnest(ARRAY['now']::regproc[]) AS r(x)")))
+    (is (= {:rows [["{{now}}" "2"]]}
+           (query c "SELECT ARRAY[ARRAY['now']]::regproc[], array_ndims(ARRAY[ARRAY['now']]::regproc[])")))
+    (is (= {:rows [["[0:0][-1:-1]={{now}}"]]}
+           (query c "SELECT '[0:0][-1:-1]={{now}}'::regproc[]")))
     (is (= {:sqlstate "42883"}
            (query c "SELECT ARRAY['rg_unknown']::regproc[]")))
     (execute! c "CREATE FUNCTION rg_array_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1'")

@@ -510,6 +510,7 @@
           convert (fn convert [v]
                     (cond
                       (or (nil? v) (= :__null__ v)) nil
+                      (array? v) (mapv convert (:elements v))
                       (sequential? v) (mapv convert v)
                       :else (parse v)))]
       (update a :elements #(mapv convert %)))
