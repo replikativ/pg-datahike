@@ -65,7 +65,14 @@
            ;; `clojure.main/-main` as an IFn and NPEs, because
            ;; clojure.main is the dispatcher, not a user ns with a
            ;; -main var.
-           :main-opts   ["test/integration/start_pgwire.clj"]}
+           :main-opts   ["test/integration/start_pgwire.clj"]
+           ;; Without a cap the JVM may take a quarter of the machine
+           ;; (7.6 GB on 30) and grows into it rather than collecting. The
+           ;; pg_regress server's live set is ~160 MB once dropped databases
+           ;; are released (#346, #348) -- before those fixes it grew by one
+           ;; fixture per file until the machine ran out. 3 GB leaves room
+           ;; for the in-process test runs this JVM also serves.
+           :jvm-opts    ["-Xmx3g"]}
 
   ;; Override datahike with the local checkout (../datahike) for tracing /
   ;; fixing planner bugs. Compose: `clojure -M:server:local-dh`.
