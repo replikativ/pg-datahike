@@ -4342,6 +4342,66 @@
                      (.getTotalSeconds (.getOffset ^java.time.OffsetTime v)))
           :else (sql-extract* f v zone))))))
 
+(defn interval-trunc
+  "interval_trunc (timestamp.c): the interval's fields from the unit
+   down zeroed -- millennium, century and decade round the YEAR toward
+   zero, quarter the month -- and recombined. `week` is refused because
+   months usually have fractional weeks, any other non-truncatable unit
+   is 0A000 and an unknown one 22023.
+
+   date_trunc over an interval handed its input back unchanged, and a
+   `time` -- which reaches this through its implicit cast to interval
+   -- did the same: `date_trunc('hour', '13:45'::time)` was 13:45."
+  [units v]
+  (let [units (str/lower-case (str/replace (str units) #"^'|'$" ""))
+        unit (get extract-units (subs units 0 (min 10 (count units))))
+        {:keys [year mon mday hour min sec usec]} ((requiring-resolve 'datahike.pg.interval.core/fields) v)
+        tm (case unit
+             (:millennium :century :decade :year :quarter :month :day :hour :minute :second)
+             (let [year (case unit
+                          :millennium (* 1000 (quot year 1000))
+                          :century (* 100 (quot year 100))
+                          :decade (* 10 (quot year 10))
+                          year)
+                   order [:millennium :century :decade :year :quarter :month :day :hour :minute :second]
+                   at (.indexOf ^java.util.List order unit)
+                   from (fn [k] (<= at (.indexOf ^java.util.List order k)))]
+               {:year year
+                :mon (cond (from :year) 0 (from :quarter) (* 3 (quot mon 3)) :else mon)
+                :mday (if (from :month) 0 mday)
+                :hour (if (from :day) 0 hour)
+                :min (if (from :hour) 0 min)
+                :sec (if (from :minute) 0 sec)
+                :usec 0})
+             :millisec {:year year :mon mon :mday mday :hour hour :min min :sec sec
+                        :usec (* 1000 (quot usec 1000))}
+             :microsec {:year year :mon mon :mday mday :hour hour :min min :sec sec :usec usec}
+             nil (throw (errors/pg-error :invalid-parameter-value
+                                         {:message (str "unit \"" units "\" not recognized for type interval")}))
+             (throw (errors/pg-error :feature-not-supported
+                                     (cond-> {:message (str "unit \"" units "\" not supported for type interval")}
+                                       (= unit :week) (assoc :detail "Months usually have fractional weeks.")))))]
+    ((requiring-resolve 'datahike.pg.interval.core/interval)
+     (+ (* 12 (:year tm)) (:mon tm))
+     (:mday tm)
+     (+ (* 1000000 (+ (* 3600 (:hour tm)) (* 60 (:min tm)) (:sec tm))) (:usec tm)))))
+
+(defn sql-extract-date
+  "`EXTRACT(field FROM date)` -- extract_date (date.c), which, unlike
+   date_part, does not go through timestamp: the time-of-day and zone
+   units are 0A000 for a date. date_part('hour', d) still answers 0,
+   because date_part has no date variant and casts to timestamp.
+   Raised per row, as the C does, so an empty input raises nothing."
+  [field v]
+  (if (or (sql-null? field) (sql-null? v))
+    :__null__
+    (let [f (str/lower-case (str/replace (str field) #"^'|'$" ""))
+          unit (get extract-units (subs f 0 (min 10 (count f))))]
+      (if (contains? #{:hour :minute :second :millisec :microsec :tz :tz-hour :tz-minute} unit)
+        (throw (errors/pg-error :feature-not-supported
+                                {:message (str "unit \"" f "\" not supported for type date")}))
+        (sql-extract field v)))))
+
 (defn- sql-extract*
   [f v zone]
   (let [zdt (cond-> (->zdt v)

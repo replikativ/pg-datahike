@@ -321,6 +321,10 @@
 (def ^:private mac-in
   (delay @(requiring-resolve 'datahike.pg.mac/mac-in)))
 
+(def ^:private money-in
+  "cash_in, which cast.clj holds -- and cast.clj requires this namespace."
+  (delay @(requiring-resolve 'datahike.pg.sql.cast/parse-money)))
+
 ;; The five temporal input functions, through the ported parser. The
 ;; same `requiring-resolve` dance as the two above, and for the same
 ;; reason: `cast.clj` requires THIS namespace, so naming it in the ns
@@ -376,6 +380,9 @@
    types/oid-pg-lsn   parse-pg-lsn
    types/oid-macaddr  #(@mac-in "macaddr" %)
    types/oid-macaddr8 #(@mac-in "macaddr8" %)
+   ;; Without it `'{$1.50}'::money[]` kept the token's text and a money
+   ;; text parameter was an unknown literal.
+   types/oid-money    #(@money-in %)
    ;; The temporal family, for the same reason as the two above and
    ;; missed when they were added: without an entry `coerce-token` kept
    ;; the raw token, so `'{2024-02-30}'::date[]` held the TEXT of an

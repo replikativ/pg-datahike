@@ -61,6 +61,7 @@
             [datahike.pg.dump :as dump]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks]
+            [datahike.pg.input :as input]
             [datahike.pg.plpgsql.parse :as pl-parse]
             [datahike.pg.plpgsql.exec :as pl-exec])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler PgWireServer$Notice
@@ -8090,6 +8091,41 @@
                    (.withColumnTypmods (nth sources 2)))
                result)))}))))
 
+;; ---------------------------------------------------------------------------
+;; Temporal parameters sent as text
+
+(def ^:private temporal-param-oids
+  #{types/oid-date types/oid-time types/oid-timetz types/oid-timestamp types/oid-timestamptz})
+
+(defn- decode-temporal-text-params
+  "A text-format Bind value whose declared type is date, time, timetz,
+   timestamp or timestamptz, read by that type's input function -- here,
+   at Execute, because the wire layer decodes Bind outside the session:
+   `'2024-01-15 10:30'` as a timestamptz means 10:30 in the session's
+   TimeZone, and only this scope knows it.
+
+   These were left as strings, so the value reached the statement as an
+   UNKNOWN literal: `SELECT $1` echoed the client's text rather than the
+   value (psycopg's `10:30:00+05:30` came back as written, not as 05:00
+   in UTC), and text that is no timestamp at all was accepted until
+   something happened to cast it. PostgreSQL reads a typed parameter
+   when it is bound.
+
+   The value is whatever the input function returns -- a timestamp's
+   LocalDateTime keeps its microseconds, which a java.util.Date (the
+   binary path's carrier) would round away. `bound` is the 1-indexed
+   vector."
+  [bound declared]
+  (if (empty? declared)
+    bound
+    (reduce-kv (fn [acc idx oid]
+                 (let [v (get acc idx)]
+                   (if (and (string? v) (contains? temporal-param-oids oid))
+                     (assoc acc idx (input/parse oid v))
+                     acc)))
+               bound
+               (into {} (filter (fn [[k _]] (< 0 (long k) (count bound)))) declared))))
+
 (defn- fast-select-prepared
   "Tier-1 Execute path: run a compiled SELECT directly against the live db,
    bypassing the general dispatch. Returns a QueryResult, or nil to fall
@@ -14165,7 +14201,9 @@
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
-        (let [bound (vec bound-params)
+        (let [bound (binding [types/*date-style* (or (:date-style @session-state) [:iso :mdy])
+                              types/*time-zone* (or (:time-zone @session-state) types/utc-zone)]
+                      (decode-temporal-text-params (vec bound-params) (:declared-param-oids parsed)))
               ;; The cardinality of a target-list SRF such as
               ;; generate_series(1,$1) is unknowable at Parse. Its parsed
               ;; map carries RowDescription metadata; now that Bind supplied

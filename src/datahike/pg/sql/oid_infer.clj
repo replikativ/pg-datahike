@@ -757,8 +757,12 @@
         ;; resolution falls to the category's PREFERRED type -- verified
         ;; against the oracle: `date_trunc('month', date_col)` comes back
         ;; with a `+00`.
+        ;; Nor does a `time`: date_trunc(text, time) resolves through
+        ;; time's implicit cast to interval, so it returns an interval.
         (let [o (expr-oid a2 env)]
-          (if (= o types/oid-date) types/oid-timestamptz o)))
+          (cond (= o types/oid-date) types/oid-timestamptz
+                (and (= o types/oid-time) (= fname "date_trunc")) types/oid-interval
+                :else o)))
       ;; COALESCE / NULLIF / GREATEST / LEAST resolve a COMMON type over
       ;; every argument, the same way CASE and UNION do.
       (= rule :common-type)
