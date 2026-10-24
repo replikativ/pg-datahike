@@ -164,10 +164,22 @@ for f in $FILES; do
   # computed in a DOUBLE, so `ln('1.0e400')` overflows to Infinity and
   # the statement dies, and the 800-decimal LN/LOG10/POW checks differ
   # from the eleventh significant digit on. See doc/backlog.md.
+  #
+  # The list below was re-derived on 2026-10-24 from EVIDENCE rather than
+  # from first blockers: every `relation "…" does not exist` in a file's
+  # latest result, kept when an earlier file in parallel_schedule creates
+  # that relation and does not drop it. geometry was paired with `box`
+  # alone, but it also reads circle_tbl (32 errors), path_tbl (19),
+  # lseg_tbl (18), polygon_tbl (17) and line_tbl (6) -- 92 of its 157
+  # errors, and most of why it measured 7.2%. horology reads the five
+  # datetime tables and interval_tbl. Prerequisites run in schedule order.
   case "$f" in
-    geometry)    targets="box $f" ;;
-    numeric_big) targets="numeric $f" ;;
-    *)           targets="$f" ;;
+    geometry)     targets="lseg line box path polygon circle $f" ;;
+    horology)     targets="date time timetz timestamp timestamptz interval $f" ;;
+    join)         targets="create_table create_misc $f" ;;
+    select_views) targets="create_view $f" ;;
+    numeric_big)  targets="numeric $f" ;;
+    *)            targets="$f" ;;
   esac
   # A file killed by this limit still leaves a PARTIAL .out, newer than
   # the stamp, so collecting it would measure how fast this machine is.
