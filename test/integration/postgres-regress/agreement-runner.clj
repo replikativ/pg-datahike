@@ -72,21 +72,26 @@
            (fn [name]
              (let [output (str (io/file directory "runs" name))
                    log (str (io/file directory "runs" (str name ".log")))
+                   setup? (= name "test_setup")
+                   run-directory (if setup? (io/file output) (io/file output "tests"))
+                   script (if setup? "run.sh" "run-with-api-fixtures.sh")
                    args (into ["timeout" (str "--kill-after=" (/ (double grace) 1000) "s") file-limit
                                "bash" (str (io/file (:repo-root cfg)
-                                                    "test/integration/postgres-regress/run-with-api-fixtures.sh"))]
+                                                    (str "test/integration/postgres-regress/" script)))]
                               (concat (get prerequisites name) [name]))
-                   child-env (assoc (into {} env)
-                                    "PG_REGRESS_PROFILE" (:profile cfg)
-                                    "POSTGRES_SOURCE" (:source cfg)
-                                    "PG_REGRESS_SRC" (:regress-root cfg)
-                                    "PG_REGRESS_OUTPUT" output
-                                    "PGCONNECT_TIMEOUT" (or (get env "PGCONNECT_TIMEOUT") "10"))]
+                   child-env (cond-> (assoc (into {} env)
+                                            "PG_REGRESS_PROFILE" (:profile cfg)
+                                            "POSTGRES_SOURCE" (:source cfg)
+                                            "PG_REGRESS_SRC" (:regress-root cfg)
+                                            "PG_REGRESS_OUTPUT" output
+                                            "PGCONNECT_TIMEOUT" (or (get env "PGCONNECT_TIMEOUT") "10"))
+                               setup? (assoc "PG_REGRESS_ISOLATE" "1"
+                                             "PG_REGRESS_STATEMENT_TIMEOUT" "120s"))]
                (println "Measuring" name "->" output)
                (let [status (execute! args child-env log deadline)]
                  (if (zero? status)
                    (try
-                     (reference/collect-result! cfg (io/file output "tests") name directory)
+                     (reference/collect-result! cfg run-directory name directory)
                      {:test name :status :complete}
                      (catch Exception e
                        {:test name :status :incomplete :reason (.getMessage e)}))

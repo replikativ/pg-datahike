@@ -481,5 +481,19 @@
                           (run (fn [& _] receipt) ["foo"] 0)))
     (is (= "old baseline" (slurp baseline)))))
 
+(deftest setup-file-is-measured-directly-without-duplicating-fixture-bootstrap
+  (let [{:keys [env]} (cfg! "17")
+        directory (io/file *temporary* "setup-collection")
+        r (collect-through-wrapper (assoc env "AGREEMENT_FILES" "test_setup"
+                                         "AGREEMENT_KEEP" (str directory)))
+        receipt (edn/read-string (slurp (io/file directory "collection.edn")))
+        run (edn/read-string (slurp (io/file directory "runs/test_setup/reference.edn")))]
+    (is (zero? (:exit r)) (str (:out r) (:err r)))
+    (is (= :complete (:status receipt)))
+    (is (= #{"test_setup"} (set (keys (:outputs receipt)))))
+    (is (= ["test_setup"] (:tests run)))
+    (is (= "120s" (get-in run [:limits :statement-timeout])))
+    (is (not (.exists (io/file directory "runs/test_setup/setup"))))))
+
 (let [r (clojure.test/run-tests 'postgres-reference-test)]
   (System/exit (if (pos? (+ (:fail r) (:error r))) 1 0)))
