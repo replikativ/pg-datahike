@@ -235,6 +235,7 @@ jobs:
             bb beta-exit
             bb pg-regress-wave inventory
             PG_REGRESS_PROFILE=18 bb pg-regress-wave inventory
+            PG_REGRESS_PROFILE=18 bb test/integration/postgres-regress/fixtures.clj validate-descriptor
 
   sqllogictest:
     executor: clj-jdk21

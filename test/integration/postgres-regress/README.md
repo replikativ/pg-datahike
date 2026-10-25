@@ -119,6 +119,56 @@ older `.out` files are not reused. `pg-regress-measure` rewrites the primary
 baseline only after a complete authoritative run. Agreement remains a canonical
 expected-line score, distinct from `pg_regress`'s whole-file/expected-variant result.
 
+PostgreSQL 18 fixture runs use an explicitly dedicated endpoint because upstream
+SQL can create roles, tablespaces, databases and prepared transactions. Set
+`PG_REGRESS_FIXTURE_ENV` to an EDN context file matching the configured endpoint:
+
+```clojure
+{:format 1 :postgres-ref "REL_18_6" :role :target :exclusive? true
+ :endpoint {:host "127.0.0.1" :port "15472"}}
+```
+
+```bash
+PG_REGRESS_PROFILE=18 PG_REGRESS_PORT=15472 \
+PG_REGRESS_FIXTURE_ENV=/path/to/context.edn \
+bb pg-regress-with-fixtures aggregates
+```
+
+The runner loads `test_setup`, then each required prerequisite and requested file
+once, in order, in a fresh database named `regression`, as upstream's SQL and
+psql patterns require. A preexisting database or an administrative connection named
+`regression` is refused. Cleanup verifies the acknowledged creation and observed
+identity before dropping it; target OIDs are synthetic, so exclusive ownership
+remains essential. Each phase retains a separate receipt.
+Single-target output remains under `tests/`; multiple requested targets have separate
+`targets/NAME/` directories. `fixture.edn` records phase hashes, core fixture checks,
+cleanup results and readiness independently of raw SQL completion. Changing a phase,
+context, native library or descriptor invalidates its collected evidence.
+
+For a native PostgreSQL oracle, use `:role :oracle` and a `:native` map containing
+`:directory` and `:manifest`. The build manifest must identify the pinned source
+commit and source-file hash, plus every supplied library's hash. The driver receives
+this directory through `--dlpath`; it replaces a caller's `PG_LIBDIR` environment
+variable. Oracle readiness requires PostgreSQL's actual expected-variant result to
+pass in every phase. Canonical line agreement alone does not establish readiness.
+
+PostgreSQL 18 fixture execution rejects `PG_REGRESS_STRICT=1` and
+`PG_REGRESS_API_STRICT=1`; use named `run.sh` for explicit strict assertions. The
+requested `psql_pipeline` phase uses its upstream statement-timeout default `0`,
+with a finite process timeout of 180 seconds when no caller process limit is set.
+Setup retains its 120-second statement limit and prerequisites retain their usual
+limit. The agreement collector also retains its overall file deadline.
+
+The PostgreSQL 18 probe can compare complete raw output with unverified or
+fixture-limited context, and prints those qualifications. Source context plus a SQL
+difference does not establish an unsupported feature. Cleanup failures leave the
+overall run incomplete even when SQL output is retained. The collector then stops
+and records later files as unattempted. Only a tablespace observed
+absent before this exclusive oracle run may be removed after its database; existing
+tablespaces and arbitrary roles or prepared transactions are never removed.
+PostgreSQL 18 baseline promotion remains disabled until fixture/oracle qualification
+is reviewed. PostgreSQL 17's fixture behavior and baseline contract are unchanged.
+
 Run the filesystem/subprocess harness tests without database servers:
 
 ```bash

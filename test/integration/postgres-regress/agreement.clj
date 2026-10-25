@@ -158,6 +158,7 @@
                      (or (= :unmeasured (:status manifest)) (empty? (:files manifest))))
             (reference/fail! "no measured agreement baseline; run measure before gate"))
         collection (reference/validate-collection! reference-config results-dir)
+        _ (reference/fixture-call reference-config 'assert-qualified! collection mode)
         names (or (subset-names) (application-facing))
         _ (doseq [name names]
             (when-not (contains? (:outputs collection) name)
@@ -183,6 +184,10 @@
                                        " :profile " (pr-str (:profile reference-config)) "\n"
                                        " :source-commit " (pr-str (get-in collection [:reference :commit])) "\n"
                                        " :inputs-sha256 " (pr-str (get-in collection [:reference :inputs-sha256])) "\n"
+                                       (when (:fixtures reference-config)
+                                         (str " :fixture-qualification :ready\n"
+                                              " :fixture-descriptor-sha256 " (pr-str (reference/file-sha256 (:fixtures reference-config))) "\n"
+                                              " :fixture-collection-sha256 " (pr-str (reference/file-sha256 (io/file results-dir "collection.edn"))) "\n"))
                                        " ;; Per-file agreement: the share of PostgreSQL's expected output\n"
                                        " ;; lines that appear, in order, in ours. `bb pg-regress-gate`\n"
                                        " ;; fails when a file drops more than the tolerance below, when an\n"
@@ -208,6 +213,10 @@
       "probe"
       (let [manifest (try (edn/read-string (slurp manifest-file)) (catch Exception _ {}))
             recorded (:files manifest)]
+        (when (:fixtures reference-config)
+          (println "Fixture readiness is separate from raw line agreement; unverified/fixture-limited contexts remain discovery only.")
+          (doseq [[name fixture] (sort (:fixture-evidence collection))]
+            (println "fixture" name (:role fixture) (:readiness fixture) "cleanup" (:cleanup fixture))))
         (println (format "%-26s %7s %7s %s" "file" "now" "was" "delta"))
         (doseq [n (sort names)
                 :let [now (get measured n)

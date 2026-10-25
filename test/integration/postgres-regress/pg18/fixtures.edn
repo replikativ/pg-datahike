@@ -1,0 +1,47 @@
+{:format 1
+ :postgres-ref "REL_18_6"
+ :setup "test_setup"
+ :baseline-qualified? false
+ :core-only-targets #{"boolean" "psql_pipeline"}
+ :target-statement-timeouts {"psql_pipeline" "0"}
+ :prerequisites
+ {"aggregates" ["create_aggregate" "create_index"]
+  "with" ["create_misc" "create_index"]
+  "multirangetypes" ["rangetypes"]
+  "join" ["create_misc" "create_index"]
+  "select_views" ["create_view"]
+  "geometry" ["lseg" "line" "box" "path" "polygon" "circle"]
+  "horology" ["date" "time" "timetz" "timestamp" "timestamptz" "interval"]
+  "numeric_big" ["numeric"]
+  "alter_table" ["create_index"]
+  "psql" ["create_index" "create_am"]
+  "copy2" ["create_type"]
+  "event_trigger" ["create_am"]
+  "create_am" ["create_index"]
+  "explain" ["create_index"]
+  "groupingsets" ["create_index"]
+  "inherit" ["create_index"]
+  "limit" ["create_index"]
+  "misc_functions" ["create_index"]
+  "portals" ["create_index"]
+  "rowtypes" ["create_index"]
+  "select" ["create_index"]
+  "select_distinct" ["create_index"]
+  "select_distinct_on" ["create_index"]
+  "subselect" ["create_index"]
+  "union" ["create_index"]
+  "window" ["create_index"]}
+ :contexts
+ {"alter_generic" :native-helper-boundary
+  "conversion" :native-helper-boundary
+  "create_type" :native-helper-boundary
+  "create_view" :native-helper-boundary
+  "encoding" :native-helper-boundary
+  "lock" :native-helper-boundary
+  "misc" :native-helper-boundary
+  "misc_functions" :native-helper-boundary
+  "opr_sanity" :native-helper-boundary
+  "triggers" :native-helper-boundary
+  "type_sanity" :native-helper-boundary
+  "rangetypes" :unsupported-sql-fixture
+  "multirangetypes" :unsupported-sql-fixture}}

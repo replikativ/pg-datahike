@@ -12,6 +12,9 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
+if [[ "${PG_REGRESS_PROFILE:-17}" == "18" ]]; then
+  exec bash "${script_dir}/run-fixture-phases.sh" "$@"
+fi
 source "${script_dir}/reference.sh"
 pg_major="${PG_REGRESS_MAJOR}"
 pg_bindir="${PG_REGRESS_BINDIR}"

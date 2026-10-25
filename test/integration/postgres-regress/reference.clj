@@ -125,7 +125,7 @@
              :artifact-root (canonical (io/file root ".internal/pg-regress" (:postgres-ref selected)))
              :allow-unpinned? (= "1" (get env "PG_REGRESS_ALLOW_UNPINNED"))
              :target target}
-            (into {} (for [k [:campaign :scope :ledger :agreement :inventory]
+            (into {} (for [k [:campaign :scope :ledger :agreement :inventory :fixtures]
                            :when (get selected k)]
                        [k (canonical (io/file here (get selected k)))])))))
   ([] (config repo-root (System/getenv))))
@@ -233,6 +233,10 @@
                                                    (edn/read-string (slurp (:scope cfg))) ledger))))
 
 (defn validate-baseline! [cfg manifest]
+  (when (and (:fixtures cfg) (= :measured (:status manifest)))
+    (when-not (and (= :ready (:fixture-qualification manifest))
+                   (= (file-sha256 (:fixtures cfg)) (:fixture-descriptor-sha256 manifest)))
+      (fail! "baseline fixture qualification/provenance differs from the selected descriptor")))
   (when-not (and (= (:postgres-ref cfg) (:postgres-ref manifest))
                  (or (nil? (:profile manifest)) (= (:profile cfg) (:profile manifest))))
     (fail! (str "baseline reference " (:postgres-ref manifest)
@@ -297,6 +301,7 @@
                    :runner (runner-state (:repo-root cfg))
                    :limits (limits (System/getenv))
                    :pgoptions (options-evidence (System/getenv))
+                   :driver-options {:dlpath (not-empty (System/getenv "_PG_REGRESS_DLPATH"))}
                    :caller-environment (select-keys (into {} (System/getenv))
                                                     ["LANG" "LC_ALL" "LC_CTYPE" "LC_COLLATE"
                                                      "LC_MESSAGES" "LC_MONETARY" "LC_NUMERIC"
@@ -338,21 +343,34 @@
                                              [name (file-sha256 (io/file output "results" (str name ".out")))])))))
     complete?))
 
-(defn collect-result! [cfg run-directory name collected-directory]
+(defn validate-output! [cfg run-directory]
   (let [receipt (edn/read-string (slurp (io/file run-directory "reference.edn")))]
     (when-not (and (= :complete (:status receipt))
                    (= (:profile cfg) (:profile receipt))
                    (= (validate-source! cfg) (:reference receipt))
                    (= (canonical run-directory) (:output-directory receipt))
-                   (contains? (:outputs receipt) name))
+                   (seq (:outputs receipt)))
       (fail! (str "incomplete or foreign output receipt: " run-directory)))
-    (let [source (io/file run-directory "results" (str name ".out"))]
-      (when-not (= (get-in receipt [:outputs name]) (file-sha256 source))
-        (fail! (str "output changed after the run completed: " source)))
-      (let [destination (io/file collected-directory (str name ".out"))]
-        (when (.exists destination)
-          (fail! (str "refusing to overwrite a collected result: " destination)))
-        (io/copy source destination)))))
+    (doseq [[name hash] (:outputs receipt)]
+      (when-not (and (re-matches #"[a-zA-Z0-9_][a-zA-Z0-9_.-]*" name)
+                     (= hash (file-sha256 (io/file run-directory "results" (str name ".out")))))
+        (fail! (str "output changed after the run completed: " name))))
+    receipt))
+
+(defn collect-result! [cfg run-directory name collected-directory]
+  (let [receipt (validate-output! cfg run-directory)]
+    (when-not (contains? (:outputs receipt) name)
+      (fail! (str "output receipt does not contain " name)))
+    (let [destination (io/file collected-directory (str name ".out"))]
+      (when (.exists destination)
+        (fail! (str "refusing to overwrite a collected result: " destination)))
+      (io/copy (io/file run-directory "results" (str name ".out")) destination))))
+
+(defn fixture-call [cfg function & args]
+  (when (:fixtures cfg)
+    (when-not (find-ns 'postgres-fixtures)
+      (load-file (str (io/file (:repo-root cfg) "test/integration/postgres-regress/fixtures.clj"))))
+    (apply (ns-resolve 'postgres-fixtures function) cfg args)))
 
 (defn finish-collection! [cfg directory names complete?]
   (write-edn! (io/file directory "collection.edn")
@@ -360,6 +378,9 @@
                :output-directory (canonical directory)
                :status (if complete? :complete :incomplete)
                :expected-comparison :canonical-expected-lines
+               :fixture-evidence (when (and (:fixtures cfg) complete?)
+                                   (into {} (for [name names]
+                                              [name (fixture-call cfg 'collection-entry directory name)])))
                :outputs (into {} (for [name names
                                        :let [file (io/file directory (str name ".out"))]
                                        :when (.isFile file)]
@@ -377,6 +398,12 @@
       (when-not (and (re-matches #"[a-zA-Z0-9_][a-zA-Z0-9_.-]*" name)
                      (= hash (file-sha256 (io/file directory (str name ".out")))))
         (fail! (str "collected output changed: " name))))
+    (when (:fixtures cfg)
+      (when-not (= (set (keys (:outputs receipt))) (set (keys (:fixture-evidence receipt))))
+        (fail! "collection is missing required fixture evidence"))
+      (doseq [[name entry] (:fixture-evidence receipt)]
+        (when-not (= entry (fixture-call cfg 'collection-entry directory name))
+          (fail! (str "collected fixture evidence changed: " name)))))
     receipt))
 
 (defn emit-env! [cfg]
