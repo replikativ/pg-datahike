@@ -99,6 +99,29 @@
 (defn- scalar-row [oid] {:rows [[oid]]})
 (defn- array-row [oid] {:rows [[(str "{" oid "}")]]})
 
+(deftest materialization-refresh-preserves-frozen-oid-literals
+  (with-open [c (connect :wire)]
+    (execute! c "SET search_path TO public, pg_catalog")
+    (let [object "poi_materialized_type"
+          renamed "poi_materialized_renamed"
+          table "poi_materialized_rows"]
+      (create-object! c "regtype" object)
+      (execute! c (str "CREATE TABLE " table " (v integer)"))
+      (execute! c (str "INSERT INTO " table " VALUES (1)"))
+      (let [old (object-oid c "regtype" object)
+            statement
+            (prepare c :wire "poi_materialized"
+                     (str "WITH q AS (SELECT v FROM " table ") "
+                          "SELECT " (literal object) "::regtype::oid, v "
+                          "FROM q ORDER BY v"))]
+        (try
+          (warm! statement {:rows [[old "1"]]})
+          (rename-object! c "regtype" object renamed)
+          (execute! c (str "INSERT INTO " table " VALUES (2)"))
+          (is (= {:rows [[old "1"] [old "2"]]}
+                 (run statement)))
+          (finally (close! statement)))))))
+
 (defn- rename-relation-identity! [oid new-name]
   ;; SQL table rename remains explicitly unsupported. Native catalog changes
   ;; still invalidate aliases, independently of the unchanged storage names.

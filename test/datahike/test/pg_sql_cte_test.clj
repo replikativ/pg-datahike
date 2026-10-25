@@ -21,7 +21,8 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager SQLException]))
+  (:import [java.sql Connection DriverManager PreparedStatement SQLException]
+           [org.postgresql PGStatement]))
 
 (def ^:dynamic *conn* nil)
 (def ^:dynamic *port* nil)
@@ -64,6 +65,12 @@
    (str "jdbc:postgresql://127.0.0.1:" *port*
         "/cte?user=x&password=x&sslmode=disable&binaryTransfer=false")))
 
+(defn- ^Connection named-jdbc []
+  (DriverManager/getConnection
+   (str "jdbc:postgresql://127.0.0.1:" *port*
+        "/cte?user=x&password=x&sslmode=disable&binaryTransfer=false"
+        "&preferQueryMode=extended&prepareThreshold=1")))
+
 (defn- rows
   "Run a SELECT and collect each row as a vector of column values
    read positionally as strings (`getString`). String form keeps the
@@ -80,6 +87,178 @@
 (defn- update-count ^long [^Connection c sql]
   (with-open [st (.createStatement c)]
     (.executeUpdate st sql)))
+
+(defn- prepared-rows [^PreparedStatement statement]
+  (with-open [rs (.executeQuery statement)]
+    (let [n (.. rs getMetaData getColumnCount)]
+      (loop [acc []]
+        (if (.next rs)
+          (recur (conj acc (mapv #(.getString rs ^long %) (range 1 (inc n)))))
+          acc)))))
+
+(defn- named-statement ^PreparedStatement [^Connection c sql]
+  (let [statement (.prepareStatement c sql)]
+    (.setPrepareThreshold ^PGStatement statement 1)
+    statement))
+
+(defn- result-rows [result]
+  (mapv vec (seq (.rows result))))
+
+(deftest parse-and-describe-do-not-run-materialized-nextval
+  (let [handler (pg/make-query-handler *conn*)]
+    (.execute handler "CREATE SEQUENCE materialization_effect_seq START 10")
+    (let [parsed (.parse handler
+                         (str "WITH q AS (SELECT nextval('materialization_effect_seq') AS v) "
+                              "SELECT v FROM q")
+                         (int-array 0))
+          description (.describeResult handler parsed)]
+      ;; Describe may derive metadata from the parsed shape, but neither
+      ;; protocol phase owns an execution or a sequence side effect.
+      (is (not= :error (:type parsed)))
+      (is (some? description))
+      (is (= ["v"] (vec (.columnNames description))))
+      (is (= [["10" "f"]]
+             (result-rows
+              (.execute handler
+                        "SELECT last_value, is_called FROM materialization_effect_seq")))))))
+
+(deftest prepared-create-table-as-refreshes-its-derived-source
+  (let [handler (pg/make-query-handler *conn*)]
+    (.execute handler "CREATE TABLE materialization_ctas_source (v integer)")
+    (.execute handler "INSERT INTO materialization_ctas_source VALUES (1)")
+    (let [parsed (.parse handler
+                         (str "CREATE TABLE materialization_ctas_target AS "
+                              "SELECT v FROM "
+                              "(SELECT v FROM materialization_ctas_source) q "
+                              "ORDER BY v")
+                         (int-array 0))]
+      (.execute handler "INSERT INTO materialization_ctas_source VALUES (2)")
+      (.executePrepared handler parsed (object-array [nil]))
+      (is (= [["1"] ["2"]]
+             (result-rows
+              (.execute handler
+                        "SELECT v FROM materialization_ctas_target ORDER BY v")))))))
+
+(deftest named-prepared-materializations-read-each-execution-snapshot
+  (with-open [c (named-jdbc)
+              cte (named-statement
+                   c "WITH q AS (SELECT id FROM emp) SELECT id FROM q ORDER BY id")
+              derived (named-statement
+                       c "SELECT id FROM (SELECT id FROM emp) q ORDER BY id")
+              derived-set (named-statement
+                           c "SELECT id FROM
+                                (SELECT id FROM emp UNION SELECT id FROM emp) q
+                              ORDER BY id")]
+    ;; Execute twice before mutating so this remains a named-server-plan test
+    ;; even if a driver changes exactly when threshold 1 is promoted.
+    (doseq [statement [cte derived derived-set]]
+      (is (= [["1"] ["2"] ["3"] ["4"] ["5"]]
+             (prepared-rows statement)))
+      (is (= [["1"] ["2"] ["3"] ["4"] ["5"]]
+             (prepared-rows statement))))
+    (is (= 1 (update-count c "INSERT INTO emp VALUES (6, 'Fox', 'Eng', 81000)")))
+    (doseq [statement [cte derived derived-set]]
+      (is (= [["1"] ["2"] ["3"] ["4"] ["5"] ["6"]]
+             (prepared-rows statement))))))
+
+(deftest simple-set-operation-does-not-cache-derived-rows
+  (with-open [c (jdbc)]
+    (let [sql "SELECT id FROM (SELECT id FROM emp) q UNION ALL SELECT 0 ORDER BY 1"]
+      (is (= [["0"] ["1"] ["2"] ["3"] ["4"] ["5"]] (rows c sql)))
+      (is (= 1 (update-count c "INSERT INTO emp VALUES (6, 'Fox', 'Eng', 81000)")))
+      (is (= [["0"] ["1"] ["2"] ["3"] ["4"] ["5"] ["6"]]
+             (rows c sql))))))
+
+(deftest sql-prepare-materialization-reads-each-execution-snapshot
+  (with-open [c (jdbc)]
+    (update-count c (str "PREPARE materialized_sql AS "
+                         "WITH q AS (SELECT id FROM emp) "
+                         "SELECT id FROM q ORDER BY id"))
+    (is (= [["1"] ["2"] ["3"] ["4"] ["5"]]
+           (rows c "EXECUTE materialized_sql")))
+    (is (= 1 (update-count c "INSERT INTO emp VALUES (6, 'Fox', 'Eng', 81000)")))
+    (is (= [["1"] ["2"] ["3"] ["4"] ["5"] ["6"]]
+           (rows c "EXECUTE materialized_sql")))
+    (update-count c "DEALLOCATE materialized_sql")))
+
+(deftest prepared-derived-insert-materializes-once-per-execution
+  (with-open [c (named-jdbc)]
+    (update-count c "CREATE TABLE materialized_sink (id serial PRIMARY KEY, label text)")
+    (with-open [statement
+                (named-statement
+                 c "INSERT INTO materialized_sink (label)
+                      SELECT name FROM (SELECT id, name FROM emp WHERE id = ?) q")]
+      (.setInt statement 1 1)
+      (is (= 1 (.executeUpdate statement)))
+      (.setInt statement 1 2)
+      (is (= 1 (.executeUpdate statement)))
+      (is (= [["1" "Alice"] ["2" "Bob"]]
+             (rows c "SELECT id, label FROM materialized_sink ORDER BY id"))))))
+
+(deftest named-prepared-materialization-sees-speculative-and-savepoint-state
+  (with-open [c (named-jdbc)
+              statement (named-statement
+                         c "WITH q AS (SELECT id FROM emp) SELECT id FROM q ORDER BY id")]
+    (.setAutoCommit c false)
+    (is (= [["1"] ["2"] ["3"] ["4"] ["5"]]
+           (prepared-rows statement)))
+    (is (= 1 (update-count c "INSERT INTO emp VALUES (6, 'Fox', 'Eng', 81000)")))
+    (is (= [["1"] ["2"] ["3"] ["4"] ["5"] ["6"]]
+           (prepared-rows statement)))
+    (let [savepoint (.setSavepoint c "before_seven")]
+      (is (= 1 (update-count c "INSERT INTO emp VALUES (7, 'Gus', 'Eng', 80000)")))
+      (is (= [["1"] ["2"] ["3"] ["4"] ["5"] ["6"] ["7"]]
+             (prepared-rows statement)))
+      (.rollback c savepoint)
+      (is (= [["1"] ["2"] ["3"] ["4"] ["5"] ["6"]]
+             (prepared-rows statement))))
+    (.rollback c)))
+
+(deftest parameterized-materialization-refreshes-on-catalog-revalidation
+  (with-open [c (named-jdbc)
+              statement
+              (named-statement
+               c "SELECT id FROM (SELECT id FROM emp WHERE id >= ?) q ORDER BY id")]
+    (.setInt statement 1 3)
+    (is (= [["3"] ["4"] ["5"]] (prepared-rows statement)))
+    (is (= [["3"] ["4"] ["5"]] (prepared-rows statement)))
+    (update-count c "ALTER TABLE emp ADD COLUMN note text")
+    (is (= 1 (update-count c "INSERT INTO emp (id, name, dept, salary)
+                              VALUES (6, 'Fox', 'Eng', 81000)")))
+    ;; Catalog and row refresh share one bound reparse; the `$1` must not
+    ;; fall back to its Parse-time sentinel during DDL revalidation.
+    (is (= [["3"] ["4"] ["5"] ["6"]]
+           (prepared-rows statement)))))
+
+(deftest named-prepared-temp-materialization-is-session-local-and-fresh
+  (with-open [c (named-jdbc)]
+    (update-count c "CREATE TEMP TABLE temp_materialized (v integer)")
+    (is (= 1 (update-count c "INSERT INTO temp_materialized VALUES (1)")))
+    (with-open [statement
+                (named-statement
+                 c "WITH q AS
+                        (SELECT v FROM
+                           (SELECT v FROM temp_materialized WHERE v >= ?) nested_temp)
+                      SELECT v FROM q ORDER BY v")]
+      (.setInt statement 1 1)
+      (is (= [["1"]] (prepared-rows statement)))
+      (is (= [["1"]] (prepared-rows statement)))
+      (is (= 1 (update-count c "INSERT INTO temp_materialized VALUES (2)")))
+      (is (= [["1"] ["2"]] (prepared-rows statement))))))
+
+(deftest cursor-materialization-keeps-the-declare-snapshot
+  (with-open [reader (jdbc) writer (jdbc)]
+    (.setAutoCommit reader false)
+    (update-count reader
+                  "DECLARE materialized_cursor CURSOR FOR
+                     WITH q AS (SELECT id FROM emp)
+                     SELECT id FROM q ORDER BY id")
+    (is (= 1 (update-count writer "INSERT INTO emp VALUES (6, 'Fox', 'Eng', 81000)")))
+    (is (= [["1"] ["2"] ["3"] ["4"] ["5"]]
+           (rows reader "FETCH ALL FROM materialized_cursor")))
+    (.commit reader)
+    (is (= [["1"] ["2"] ["3"] ["4"] ["5"] ["6"]]
+           (rows reader "WITH q AS (SELECT id FROM emp) SELECT id FROM q ORDER BY id")))))
 
 (deftest create-table-as-select-materializes-schema-and-rows
   (with-open [c (jdbc)]

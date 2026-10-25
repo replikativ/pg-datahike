@@ -16,7 +16,8 @@
             [datahike.api :as d]
             [datahike.versioning :as v]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager SQLException]))
+  (:import [java.sql Connection DriverManager SQLException]
+           [org.postgresql PGStatement]))
 
 (def ^:dynamic *conn* nil)
 (def ^:dynamic *port* nil)
@@ -62,6 +63,12 @@
    (DriverManager/getConnection
     (str "jdbc:postgresql://127.0.0.1:" *port* "/" db
          "?user=x&password=x&sslmode=disable&binaryTransfer=false&preferQueryMode=simple"))))
+
+(defn- ^Connection prepared-jdbc []
+  (DriverManager/getConnection
+   (str "jdbc:postgresql://127.0.0.1:" *port* "/demo"
+        "?user=x&password=x&sslmode=disable&binaryTransfer=false"
+        "&preferQueryMode=extended&prepareThreshold=1")))
 
 (defn- rows [^Connection c sql]
   (with-open [st (.createStatement c)
@@ -174,6 +181,26 @@
     (is (= 1 (count (rows c "SELECT id FROM person"))))
     (exec c "RESET datahike.commit_id")
     (is (= 2 (count (rows c "SELECT id FROM person"))))))
+
+(deftest prepared-materialization-uses-the-selected-commit-view
+  (with-open [c (prepared-jdbc)
+              statement
+              (.prepareStatement
+               c "WITH q AS (SELECT id FROM person) SELECT id FROM q ORDER BY id")]
+    (.setPrepareThreshold ^PGStatement statement 1)
+    (letfn [(answers []
+              (with-open [rs (.executeQuery statement)]
+                (loop [acc []]
+                  (if (.next rs)
+                    (recur (conj acc [(.getString rs 1)]))
+                    acc))))]
+      (is (= [["1"]] (answers)))
+      (d/transact *conn* [{:person/id 2 :person/name "Bob"}])
+      (is (= [["1"] ["2"]] (answers)))
+      (exec c (str "SET datahike.commit_id = '" *initial-commit-id* "'"))
+      (is (= [["1"]] (answers)))
+      (exec c "RESET datahike.commit_id")
+      (is (= [["1"] ["2"]] (answers))))))
 
 (deftest set-commit-id-rejects-non-uuid
   (with-open [c (jdbc)]

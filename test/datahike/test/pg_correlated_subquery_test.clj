@@ -11,11 +11,13 @@
    the same uncorrelated answer.
 
    Expectations are a PostgreSQL 17 oracle's."
-  (:require [clojure.test :refer [deftest is use-fixtures testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg]
             [datahike.pg.sql.fns :as fns])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager]
+           [org.postgresql PGStatement]))
 
 (def ^:dynamic *port* nil)
 (def ^:dynamic *conn* nil)
@@ -56,6 +58,100 @@
         (if (.next rs)
           (recur (conj acc (mapv #(.getString rs (int %)) (range 1 (inc n)))))
           acc)))))
+
+(defn- array-members [s]
+  (set (str/split (subs s 1 (dec (count s))) #",")))
+
+(deftest named-prepared-lateral-reads-the-execution-snapshot
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE lateral_parent (id int)")
+    (exec! c "CREATE TABLE lateral_child (pid int)")
+    (exec! c "INSERT INTO lateral_parent VALUES (1),(2)")
+    (exec! c "INSERT INTO lateral_child VALUES (1)")
+    (with-open [statement
+                (.prepareStatement
+                 c (str "SELECT p.id, l.n FROM lateral_parent p "
+                        "CROSS JOIN LATERAL "
+                        "(SELECT count(*) n FROM lateral_child ch "
+                        " WHERE ch.pid = p.id) l ORDER BY p.id"))]
+      (.setPrepareThreshold ^PGStatement statement 1)
+      (letfn [(answers []
+                (with-open [rs (.executeQuery statement)]
+                  (loop [acc []]
+                    (if (.next rs)
+                      (recur (conj acc [(.getString rs 1) (.getString rs 2)]))
+                      acc))))]
+        (is (= [["1" "1"] ["2" "0"]] (answers)))
+        ;; Cross the named-statement threshold before the row change.
+        (is (= [["1" "1"] ["2" "0"]] (answers)))
+        (exec! c "INSERT INTO lateral_child VALUES (2)")
+        (is (= [["1" "1"] ["2" "1"]] (answers)))))))
+
+(deftest named-prepared-expression-subqueries-read-the-execution-snapshot
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE expression_snapshot (v int)")
+    (exec! c "CREATE TABLE expression_filter (v int)")
+    (exec! c "INSERT INTO expression_snapshot VALUES (1),(2)")
+    (with-open [exists-statement
+                (.prepareStatement
+                 c (str "SELECT v FROM expression_snapshot "
+                        "WHERE EXISTS (SELECT 1 FROM expression_filter) ORDER BY v"))
+                not-exists-statement
+                (.prepareStatement
+                 c (str "SELECT v FROM expression_snapshot "
+                        "WHERE NOT EXISTS (SELECT 1 FROM expression_filter) ORDER BY v"))
+                array-statement
+                (.prepareStatement
+                 c "SELECT ARRAY(SELECT v FROM expression_snapshot ORDER BY v)")]
+      (doseq [statement [exists-statement not-exists-statement array-statement]]
+        (.setPrepareThreshold ^PGStatement statement 1))
+      (letfn [(answers [statement]
+                (with-open [rs (.executeQuery statement)]
+                  (loop [acc []]
+                    (if (.next rs)
+                      (recur (conj acc (.getString rs 1)))
+                      acc))))]
+        (is (= [] (answers exists-statement)))
+        (is (= ["1" "2"] (answers not-exists-statement)))
+        (is (= #{"1" "2"}
+               (array-members (first (answers array-statement)))))
+        ;; Ensure the next execution reuses named server statements.
+        (is (= [] (answers exists-statement)))
+        (is (= ["1" "2"] (answers not-exists-statement)))
+        (exec! c "INSERT INTO expression_filter VALUES (1)")
+        (is (= ["1" "2"] (answers exists-statement)))
+        (is (= [] (answers not-exists-statement)))
+        (exec! c "INSERT INTO expression_snapshot VALUES (3)")
+        (is (= #{"1" "2" "3"}
+               (array-members (first (answers array-statement)))))
+        (exec! c "DELETE FROM expression_filter")
+        (is (= [] (answers exists-statement)))
+        (is (= ["1" "2" "3"] (answers not-exists-statement)))))))
+
+(deftest simple-expression-subqueries-do-not-cache-row-results
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE simple_expression_snapshot (v int)")
+    (exec! c "CREATE TABLE simple_expression_filter (v int)")
+    (exec! c "INSERT INTO simple_expression_snapshot VALUES (1),(2)")
+    (let [exists-sql (str "SELECT v FROM simple_expression_snapshot "
+                          "WHERE EXISTS (SELECT 1 FROM simple_expression_filter) ORDER BY v")
+          not-exists-sql (str "SELECT v FROM simple_expression_snapshot "
+                              "WHERE NOT EXISTS (SELECT 1 FROM simple_expression_filter) ORDER BY v")]
+      (is (= [] (rows c exists-sql)))
+      (is (= [["1"] ["2"]] (rows c not-exists-sql)))
+      (exec! c "INSERT INTO simple_expression_filter VALUES (1)")
+      (is (= [["1"] ["2"]] (rows c exists-sql)))
+      (is (= [] (rows c not-exists-sql)))
+      (exec! c "DELETE FROM simple_expression_filter")
+      (is (= [] (rows c exists-sql)))
+      (is (= [["1"] ["2"]] (rows c not-exists-sql))))
+    (is (= #{"1" "2"}
+           (array-members
+            (one c "SELECT ARRAY(SELECT v FROM simple_expression_snapshot ORDER BY v)"))))
+    (exec! c "INSERT INTO simple_expression_snapshot VALUES (3)")
+    (is (= #{"1" "2" "3"}
+           (array-members
+            (one c "SELECT ARRAY(SELECT v FROM simple_expression_snapshot ORDER BY v)"))))))
 
 (defn- sqlstate [^Connection c sql]
   (try

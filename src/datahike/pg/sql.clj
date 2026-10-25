@@ -522,6 +522,7 @@
   (and parsed
        (not (#{:system :error} (:type parsed)))
        (not (:enriched-db parsed))
+       (not (:execution-materialization? parsed))
        (not (:session-dependent? parsed))
        ;; Materialised from a parameterised body: the relation in this
        ;; plan is EMPTY, because the body ran before Bind. Caching it
@@ -621,7 +622,9 @@
         inner (parse-sql (str (.getSelect ct)) schema db)]
     (if (= :error (:type inner))
       inner
-      (assoc base :ctas? true :ctas-select inner))))
+      (cond-> (assoc base :ctas? true :ctas-select inner)
+        (:execution-materialization? inner)
+        (assoc :execution-materialization? true)))))
 
 (defn ctas-finish
   "Complete a CREATE TABLE AS plan from its query's output: `rows` typed,
@@ -1984,6 +1987,13 @@
                                           (not (identical? cte-db orig-db)))
                                    (assoc result :enriched-db cte-db)
                                    result)
+                          ;; CTE and derived-table rows belong to an
+                          ;; execution snapshot.  Keep this distinct from
+                          ;; catalog-only enrichment, whose existing execute
+                          ;; path can cheaply rebuild just catalog relations.
+                          result (if (or cte-materialized? derived-table-edb?)
+                                   (assoc result :execution-materialization? true)
+                                   result)
                         ;; Record the catalog tables so the server can
                         ;; re-resolve the enriched-db at execute (stale-
                         ;; prepared-statement fix) — but only when the
@@ -2064,10 +2074,14 @@
                                                "LIMIT or OFFSET over a FULL JOIN")]
                             (throw (errors/pg-error :feature-not-supported
                                                     {:feature feature})))
-                          {:type :full-join
-                           :left-query left-result
-                           :right-query right-result
-                           :find-aliases (:find-aliases result)})
+                          (cond-> {:type :full-join
+                                   :left-query left-result
+                                   :right-query right-result
+                                   :find-aliases (:find-aliases result)}
+                            (or cte-materialized?
+                                (:execution-materialization? left-result)
+                                (:execution-materialization? right-result))
+                            (assoc :execution-materialization? true)))
               ;; Regular SELECT (possibly with LEFT JOIN from RIGHT rewrite)
                         (assoc result :type :select)))
 
@@ -2260,6 +2274,9 @@
                         (seq set-order-by) (assoc :sql-order-by set-order-by)
                         (some? set-limit) (assoc :sql-limit set-limit)
                         (some? set-offset) (assoc :sql-offset set-offset)
+                        (or cte-materialized?
+                            (some :execution-materialization? sub-results))
+                        (assoc :execution-materialization? true)
                        ;; Top-level catalog materialisation propagates
                        ;; to the server's set-operation executor via
                        ;; :enriched-db — each sub-query runs against it.
@@ -2293,13 +2310,22 @@
 
           ;; INSERT
                     (instance? Insert stmt)
-                    (cond-> (translate-insert ^Insert stmt schema db)
-                      (not (identical? db orig-db)) (assoc :enriched-db db))
+                    (let [result (translate-insert ^Insert stmt schema db)]
+                      (cond-> result
+                        (not (identical? db orig-db)) (assoc :enriched-db db)
+                        (or cte-materialized?
+                            (:execution-materialization? result)
+                            (get-in result [:insert-source :source
+                                            :execution-materialization?]))
+                        (assoc :execution-materialization? true)))
 
           ;; UPDATE
                     (instance? Update stmt)
-                    (cond-> (translate-update ^Update stmt schema db)
-                      (not (identical? db orig-db)) (assoc :enriched-db db)
+                    (let [result (translate-update ^Update stmt schema db)]
+                      (cond-> result
+                        (not (identical? db orig-db)) (assoc :enriched-db db)
+                        (or cte-materialized? (:execution-materialization? result))
+                        (assoc :execution-materialization? true)
                       ;; UPDATE/DELETE re-translate their WHERE at EXECUTE
                       ;; time, outside this binding, so the CTE namespace
                       ;; map has to travel on the parsed map. Without it
@@ -2307,13 +2333,16 @@
                       ;; the base table — which is how
                       ;; `WITH t AS (…) DELETE FROM t WHERE id IN
                       ;; (SELECT id FROM t)` deleted the real rows.
-                      (seq cte-ns-map) (assoc :cte-namespaces cte-ns-map))
+                        (seq cte-ns-map) (assoc :cte-namespaces cte-ns-map)))
 
           ;; DELETE
                     (instance? Delete stmt)
-                    (cond-> (translate-delete ^Delete stmt schema)
-                      (not (identical? db orig-db)) (assoc :enriched-db db)
-                      (seq cte-ns-map) (assoc :cte-namespaces cte-ns-map))
+                    (let [result (translate-delete ^Delete stmt schema)]
+                      (cond-> result
+                        (not (identical? db orig-db)) (assoc :enriched-db db)
+                        (or cte-materialized? (:execution-materialization? result))
+                        (assoc :execution-materialization? true)
+                        (seq cte-ns-map) (assoc :cte-namespaces cte-ns-map)))
 
           ;; CREATE VIEW
                     (instance? CreateView stmt)
