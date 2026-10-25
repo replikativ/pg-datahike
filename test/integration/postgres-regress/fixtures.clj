@@ -92,7 +92,16 @@
        :native library})
     {:role :unverified}))
 
+(def fixture-database "regression")
+
+(defn discovery-flags! [env]
+  (check! (not-any? #(= "1" (get env %)) ["PG_REGRESS_STRICT" "PG_REGRESS_API_STRICT"])
+          "PostgreSQL 18 fixtures are raw discovery; use named run.sh for strict assertions"))
+
 (defn exclusive-context! [cfg env]
+  (discovery-flags! env)
+  (check! (not= fixture-database (get-in cfg [:target :database]))
+          "administrative database must not be the canonical fixture database regression")
   (let [ctx (context cfg env)]
     (check! (and (#{:oracle :target} (:role ctx)) (:exclusive? ctx))
             "PostgreSQL 18 fixture runs require an explicit endpoint-bound exclusive context")
@@ -104,14 +113,24 @@
         targets (vec targets)
         requested (set targets)
         ctx (exclusive-context! cfg env)
+        default-timeout (or (not-empty (get env "PG_REGRESS_STATEMENT_TIMEOUT")) "10s")
+        process-limit (not-empty (get env "PG_REGRESS_TIMEOUT"))
+        statement-limit (fn [name]
+                          (cond (= name (:setup data)) "120s"
+                                (requested name) (get-in data [:target-statement-timeouts name] default-timeout)
+                                :else default-timeout))
         phases (mapv (fn [name]
                        {:name name :target? (contains? requested name)
                         :kind (if (= name (:setup data)) :setup
                                   (if (requested name) :target :prerequisite))
+                        :statement-timeout (statement-limit name)
+                        :process-timeout (or process-limit (when (= "0" (statement-limit name)) "180s"))
                         :directory (cond (requested name) (if (= 1 (count targets)) "tests" (str "targets/" name))
                                          (= name (:setup data)) "setup"
                                          :else (str "prerequisites/" name))}) names)]
     {:format 1 :profile (:profile cfg) :reference (reference/validate-source! cfg)
+     :database fixture-database :statement-timeout-default default-timeout
+     :process-timeout-default process-limit
      :descriptor {:path (reference/canonical (:fixtures cfg))
                   :sha256 (reference/file-sha256 (:fixtures cfg))}
      :context ctx :targets targets :phases phases}))
@@ -138,6 +157,10 @@
     (check! (= [(:name phase)] (:tests receipt)) "phase contains unexpected SQL files")
     (check! (= (assoc (select-keys (:target cfg) [:host :port]) :database database)
                (get-in receipt [:target :endpoint])) "phase used another endpoint or database")
+    (check! (= (:statement-timeout phase) (get-in receipt [:limits :statement-timeout]))
+            "phase statement timeout disagrees with plan")
+    (check! (= (:process-timeout phase) (get-in receipt [:limits :pg-regress-timeout]))
+            "phase process timeout disagrees with plan")
     (merge phase {:receipt-sha256 (reference/file-sha256 (io/file directory "reference.edn"))
                   :run-id (:run-id receipt) :outputs (:outputs receipt)
                   :pg-regress-exit (:pg-regress-exit receipt)
@@ -158,17 +181,83 @@
                     (query! cfg "SELECT oid::text || '|' || subname || '|' || subdbid::text FROM pg_subscription ORDER BY oid")
                     :unobserved-target)})
 
+(defn action-plan! [cfg output]
+  (let [run-plan (read-edn (io/file output "fixture-plan.edn"))]
+    (check! (and (= (:profile cfg) (:profile run-plan))
+                 (= fixture-database (:database run-plan))
+                 (true? (get-in run-plan [:context :exclusive?]))
+                 (= (select-keys (:target cfg) [:host :port]) (get-in run-plan [:context :endpoint])))
+            "fixture action endpoint/profile does not match the owned run")
+    run-plan))
+
+(defn database-oid [cfg name]
+  (let [answer (query! cfg (str "SELECT oid::text FROM pg_catalog.pg_database WHERE datname = '"
+                                (str/replace name "'" "''") "'"))]
+    (when (seq answer)
+      (let [oid (parse-long answer)]
+        (check! (and oid (pos? oid)) "database identity is not a single positive OID")
+        oid))))
+
 (defn preflight! [cfg output]
-  (let [run-plan (read-edn (io/file output "fixture-plan.edn"))
+  (let [run-plan (action-plan! cfg output)
         oracle? (= :oracle (get-in run-plan [:context :role]))
-        state (global-state cfg oracle?)]
+        state (global-state cfg oracle?)
+        admin (get-in cfg [:target :database])
+        admin-oid (database-oid cfg admin)
+        existing (database-oid cfg fixture-database)
+        proof {:format 1 :database fixture-database
+               :endpoint (select-keys (:target cfg) [:host :port]) :admin {:name admin :oid admin-oid}
+               :absent-before? (nil? existing) :create-acknowledged? false
+               :identity-kind (if oracle? :native-oid :synthetic-name-oid)
+               :identity-limitation (when-not oracle?
+                                      "Target OIDs derive from names; ownership relies on exclusive endpoint, absent-before and CREATE acknowledgement, not native generation identity.")}]
     (reference/write-edn! (io/file output "fixture-global-before.edn") state)
+    (reference/write-edn! (io/file output "fixture-database.edn") proof)
+    (check! admin-oid "administrative database identity is unavailable")
+    (check! (nil? existing) "canonical fixture database regression already exists; it is not owned by this run")
     (when oracle?
       (check! (= "0" (:tablespace state))
               "regress_tblspace already exists; it is not owned by this run and will not be removed"))))
 
+(defn database-created! [cfg output]
+  (let [run-plan (action-plan! cfg output)
+        file (io/file output "fixture-database.edn")
+        proof (read-edn file)
+        oid (database-oid cfg fixture-database)]
+    (check! (and (= (:endpoint proof) (get-in run-plan [:context :endpoint]))
+                 (:absent-before? proof) oid
+                 (not= oid (get-in proof [:admin :oid]))
+                 (not= fixture-database (get-in proof [:admin :name])))
+            "created database has no distinct, confirmed owned identity")
+    (reference/write-edn! file (assoc proof :oid oid :create-acknowledged? true))))
+
+(defn database-cleanup! [cfg output]
+  (let [result (try
+                 (let [run-plan (action-plan! cfg output)
+                       proof (read-edn (io/file output "fixture-database.edn"))
+                       oid (:oid proof)]
+                   (check! (and (= (:endpoint proof) (get-in run-plan [:context :endpoint]))
+                                (= fixture-database (:database proof)) (:absent-before? proof)
+                                (:create-acknowledged? proof) (integer? oid) (pos? oid)
+                                (not= fixture-database (get-in cfg [:target :database]))
+                                (= (get-in cfg [:target :database]) (get-in proof [:admin :name]))
+                                (not= oid (get-in proof [:admin :oid])))
+                           "refusing to drop an unproven or administrative database")
+                   (let [current (database-oid cfg fixture-database)
+                         resolved (query! cfg (str "SELECT datname FROM pg_catalog.pg_database WHERE oid = " oid))
+                         admin-oid (database-oid cfg (get-in cfg [:target :database]))]
+                     (check! (and (= oid current) (= fixture-database resolved)
+                                  (= admin-oid (get-in proof [:admin :oid])) (not= oid admin-oid))
+                             "database identity changed, disappeared or was renamed; refusing DROP")
+                     (query! cfg "DROP DATABASE regression")
+                     {:status :complete :database fixture-database :oid oid
+                      :identity-kind (:identity-kind proof)}))
+                 (catch Exception e {:status :failed :database fixture-database :reason (.getMessage e)}))]
+    (reference/write-edn! (io/file output "fixture-database-cleanup.edn") result)
+    (= :complete (:status result))))
+
 (defn cleanup-global! [cfg output database-cleanup]
-  (let [run-plan (read-edn (io/file output "fixture-plan.edn"))
+  (let [run-plan (action-plan! cfg output)
         before-file (io/file output "fixture-global-before.edn")
         before (when (.isFile before-file) (read-edn before-file))
         oracle? (= :oracle (get-in run-plan [:context :role]))
@@ -226,6 +315,9 @@
             (try (doseq [phase @phases] (oracle-version! cfg (:server-observation phase)))
                  (catch Exception e (reset! problem (.getMessage e)))))
         complete? (and complete? (nil? @problem))
+        ownership-file (io/file output "fixture-database.edn")
+        ownership (when (.isFile ownership-file) (read-edn ownership-file))
+        database-cleanup-file (io/file output "fixture-database-cleanup.edn")
         global-file (io/file output "fixture-global-cleanup.edn")
         global (when (.isFile global-file) (read-edn global-file))
         outcome-complete? (and complete? (= :complete cleanup-status) (= :complete (:status global)))
@@ -248,6 +340,10 @@
                                    :sha256 (when (.isFile global-file) (reference/file-sha256 global-file))
                                    :before-sha256 (when (.isFile (io/file output "fixture-global-before.edn"))
                                                     (reference/file-sha256 (io/file output "fixture-global-before.edn")))}
+                  :database-ownership {:sha256 (when (.isFile ownership-file) (reference/file-sha256 ownership-file))
+                                       :identity-kind (:identity-kind ownership) :oid (:oid ownership)
+                                       :cleanup-sha256 (when (.isFile database-cleanup-file)
+                                                         (reference/file-sha256 database-cleanup-file))}
                   :problem @problem :wrapper-exit exit}]
     (reference/write-edn! (io/file output "fixture.edn") evidence)
     outcome-complete?))
@@ -264,8 +360,11 @@
         _ (check! (= (:profile cfg) (:profile evidence) (:profile plan)) "fixture profile changed")
         _ (check! (= (plan-content plan)
                      (plan-content (postgres-fixtures/plan cfg
-                                                           (if-let [path (get-in plan [:context :context-file])]
-                                                             {"PG_REGRESS_FIXTURE_ENV" path} {}) (:targets plan))))
+                                                           (cond-> {"PG_REGRESS_STATEMENT_TIMEOUT" (:statement-timeout-default plan)
+                                                                    "PG_REGRESS_TIMEOUT" (:process-timeout-default plan)}
+                                                             (get-in plan [:context :context-file])
+                                                             (assoc "PG_REGRESS_FIXTURE_ENV" (get-in plan [:context :context-file])))
+                                                           (:targets plan))))
                   "fixture context or plan changed")
         _ (check! (and (= (:descriptor evidence) (:descriptor plan))
                        (= (get-in evidence [:descriptor :sha256])
@@ -283,6 +382,27 @@
         _ (check! (every? #(= (get-in plan [:context :native :directory])
                               (get-in % [:driver-options :dlpath])) (:phases evidence))
                   "phase native library directory disagrees")]
+    (let [proof (read-edn (io/file directory "fixture-database.edn"))
+          cleanup-proof (read-edn (io/file directory "fixture-database-cleanup.edn"))]
+      (check! (and (= (:endpoint proof) (get-in plan [:context :endpoint]))
+                   (= fixture-database (:database evidence) (:database proof))
+                   (:absent-before? proof) (:create-acknowledged? proof) (pos-int? (:oid proof))
+                   (pos-int? (get-in proof [:admin :oid]))
+                   (= (:identity-kind proof) (if (= :oracle (get-in plan [:context :role]))
+                                               :native-oid :synthetic-name-oid))
+                   (or (= :native-oid (:identity-kind proof)) (seq (:identity-limitation proof)))
+                   (not= (:oid proof) (get-in proof [:admin :oid]))
+                   (not= fixture-database (get-in proof [:admin :name]))
+                   (= (:oid proof) (get-in evidence [:database-ownership :oid]))
+                   (= (:identity-kind proof) (get-in evidence [:database-ownership :identity-kind]))
+                   (= (get-in evidence [:database-ownership :sha256])
+                      (reference/file-sha256 (io/file directory "fixture-database.edn")))
+                   (= (get-in evidence [:database-ownership :cleanup-sha256])
+                      (reference/file-sha256 (io/file directory "fixture-database-cleanup.edn"))))
+              "database ownership evidence changed")
+      (when (= :complete (get-in evidence [:cleanup :status]))
+        (check! (and (= :complete (:status cleanup-proof)) (= (:oid proof) (:oid cleanup-proof)))
+                "database cleanup identity disagrees")))
     (check! (= (get-in evidence [:global-cleanup :status])
                (:status (read-edn (io/file directory "fixture-global-cleanup.edn"))))
             "global cleanup status disagrees with evidence")
@@ -341,9 +461,11 @@
                                 (ordered-closure cfg data [(:setup data)])
                                 (println "Fixture descriptor validated:" (:postgres-ref cfg)))
         "plan" (let [data (start! cfg (System/getenv) output args)]
-                 (doseq [{:keys [name directory kind]} (:phases data)]
-                   (print (str name \u0000 directory \u0000 (clojure.core/name kind) \u0000))))
+                 (doseq [{:keys [name directory kind statement-timeout process-timeout]} (:phases data)]
+                   (print (str name \u0000 directory \u0000 (clojure.core/name kind) \u0000 statement-timeout \u0000 process-timeout \u0000))))
         "preflight" (preflight! cfg output)
+        "database-created" (database-created! cfg output)
+        "cleanup-database" (when-not (database-cleanup! cfg output) (System/exit 2))
         "cleanup-global" (cleanup-global! cfg output (first args))
         "pending" (reference/write-edn! (io/file output "fixture.edn")
                                         {:format 1 :profile (:profile cfg) :database (first args)

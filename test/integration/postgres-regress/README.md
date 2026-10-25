@@ -135,7 +135,11 @@ bb pg-regress-with-fixtures aggregates
 ```
 
 The runner loads `test_setup`, then each required prerequisite and requested file
-once, in order, in one disposable database. Each phase retains a separate receipt.
+once, in order, in a fresh database named `regression`, as upstream's SQL and
+psql patterns require. A preexisting database or an administrative connection named
+`regression` is refused. Cleanup verifies the acknowledged creation and observed
+identity before dropping it; target OIDs are synthetic, so exclusive ownership
+remains essential. Each phase retains a separate receipt.
 Single-target output remains under `tests/`; multiple requested targets have separate
 `targets/NAME/` directories. `fixture.edn` records phase hashes, core fixture checks,
 cleanup results and readiness independently of raw SQL completion. Changing a phase,
@@ -147,6 +151,13 @@ commit and source-file hash, plus every supplied library's hash. The driver rece
 this directory through `--dlpath`; it replaces a caller's `PG_LIBDIR` environment
 variable. Oracle readiness requires PostgreSQL's actual expected-variant result to
 pass in every phase. Canonical line agreement alone does not establish readiness.
+
+PostgreSQL 18 fixture execution rejects `PG_REGRESS_STRICT=1` and
+`PG_REGRESS_API_STRICT=1`; use named `run.sh` for explicit strict assertions. The
+requested `psql_pipeline` phase uses its upstream statement-timeout default `0`,
+with a finite process timeout of 180 seconds when no caller process limit is set.
+Setup retains its 120-second statement limit and prerequisites retain their usual
+limit. The agreement collector also retains its overall file deadline.
 
 The PostgreSQL 18 probe can compare complete raw output with unverified or
 fixture-limited context, and prints those qualifications. Source context plus a SQL

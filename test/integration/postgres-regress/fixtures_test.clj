@@ -54,16 +54,37 @@
     (file! (io/file project ".circleci/config.yml") "{}")
     (git! project "init" "-q") (commit! project)
     (file! (io/file tools "psql")
-           (str "#!/usr/bin/env bash\nset -eu\n"
+           (str "#!/usr/bin/env bash\n"
+                "set -eu\n"
                 "if [[ \"${1:-}\" == --version ]]; then echo 'psql (PostgreSQL) 18.6'; exit 0; fi\n"
                 "printf 'psql %s\\n' \"$*\" >> \"$FIXTURE_TEST_LOG\"\n"
-                "case \"$*\" in\n"
+                "args=\"$*\"\n"
+                "oid_file=\"$FIXTURE_TEST_LOG.database.oid\"\n"
+                "name_file=\"$FIXTURE_TEST_LOG.database.name\"\n"
+                "case \"$args\" in\n"
                 " *pg_roles*) if [[ -f \"$FIXTURE_TEST_LOG.role\" ]]; then echo leaked_role; fi ;;\n"
                 " *pg_tablespace*) if [[ -f \"$FIXTURE_TEST_LOG.tablespace\" ]]; then echo 1; else echo 0; fi ;;\n"
                 " *DROP*TABLESPACE*) rm -f \"$FIXTURE_TEST_LOG.tablespace\" ;;\n"
                 " *current_setting*) printf '%s.6\\t%s0006\\tUTC\\tUTF8\\n' \"${FIXTURE_TEST_SERVER_MAJOR:-18}\" \"${FIXTURE_TEST_SERVER_MAJOR:-18}\" ;;\n"
-                " *CREATE*DATABASE*) if [[ \"${FIXTURE_TEST_CREATE_FAIL:-0}\" == 1 ]]; then exit 1; fi ;;\n"
-                " *DROP*DATABASE*) if [[ \"${FIXTURE_TEST_HANG_CLEANUP:-0}\" == 1 ]]; then echo $$ > \"$FIXTURE_TEST_LOG.hung\"; trap '' TERM; while :; do sleep 1; done; fi; if [[ \"${FIXTURE_TEST_CLEANUP_FAIL:-0}\" == 1 ]]; then exit 1; fi ;;\n"
+                " *\"SELECT oid::text FROM pg_catalog.pg_database WHERE datname = 'regression'\"*)\n"
+                "   if [[ -f \"$oid_file\" && \"$(cat \"$name_file\")\" == regression ]]; then cat \"$oid_file\"; fi ;;\n"
+                " *\"SELECT oid::text FROM pg_catalog.pg_database WHERE datname = \"*) echo 11 ;;\n"
+                " *\"SELECT datname FROM pg_catalog.pg_database WHERE oid = \"*)\n"
+                "   requested=\"${args##* = }\"\n"
+                "   if [[ -f \"$oid_file\" && \"$(cat \"$oid_file\")\" == \"$requested\" ]]; then cat \"$name_file\"; fi ;;\n"
+                " *\"SELECT datname FROM pg_database ORDER BY datname\"*)\n"
+                "   echo datahike\n"
+                "   if [[ -f \"$name_file\" ]]; then cat \"$name_file\"; fi ;;\n"
+                " *CREATE*DATABASE*)\n"
+                "   if [[ \"${FIXTURE_TEST_CREATE_FAIL:-0}\" == 1 ]]; then exit 1; fi\n"
+                "   echo \"${FIXTURE_TEST_CREATED_OID:-22}\" > \"$oid_file\"\n"
+                "   echo regression > \"$name_file\" ;;\n"
+                " *DROP*DATABASE*)\n"
+                "   if [[ \"${FIXTURE_TEST_HANG_CLEANUP:-0}\" == 1 ]]; then\n"
+                "     echo $$ > \"$FIXTURE_TEST_LOG.hung\"; trap '' TERM; while :; do sleep 1; done\n"
+                "   fi\n"
+                "   if [[ \"${FIXTURE_TEST_CLEANUP_FAIL:-0}\" == 1 ]]; then exit 1; fi\n"
+                "   rm -f \"$oid_file\" \"$name_file\" ;;\n"
                 " *count*onek*) if [[ \"${FIXTURE_TEST_CORE_FAIL:-0}\" == 1 ]]; then echo broken; else echo '1000|1000|10000|10000|58|6|5|3'; fi ;;\n"
                 "esac\n"))
     (file! (io/file tools "pg_regress")
@@ -74,6 +95,8 @@
                 " --outputdir=*) out=\"${arg#*=}\" ;;\n --inputdir=*) input=\"${arg#*=}\" ;;\n --*) ;;\n *) names+=(\"$arg\") ;;\nesac; done\n"
                 "if [[ \"${FIXTURE_TEST_ORACLE:-0}\" == 1 && \" ${names[*]} \" == *\" test_setup \"* ]]; then touch \"$FIXTURE_TEST_LOG.tablespace\"; fi\n"
                 "if [[ \"${FIXTURE_TEST_LEAK_ROLE:-0}\" == 1 ]]; then touch \"$FIXTURE_TEST_LOG.role\"; fi\n"
+                "if [[ \"${FIXTURE_TEST_REPLACE_DB:-0}\" == 1 ]]; then echo 33 > \"$FIXTURE_TEST_LOG.database.oid\"; fi\n"
+                "if [[ \"${FIXTURE_TEST_RENAME_DB:-0}\" == 1 ]]; then echo renamed_fixture > \"$FIXTURE_TEST_LOG.database.name\"; fi\n"
                 "mkdir -p \"$out/results\"\nfor name in \"${names[@]}\"; do cp \"$input/expected/$name.out\" \"$out/results/$name.out\"; done\n"
                 "if [[ \" ${names[*]} \" == *\" ${FIXTURE_TEST_DIFF:-never} \"* ]]; then exit 1; fi\n"))
     (.setExecutable (io/file tools "psql") true)
@@ -336,6 +359,94 @@
     (is (= :unproven (get-in evidence [:cleanup :status])))
     (is (= :incomplete (:outcome-status evidence)))
     (is (not (str/includes? (slurp log) "DROP DATABASE")))))
+
+(deftest canonical-database-records-native-and-target-ownership-authority
+  (doseq [role [:oracle :target]]
+    (let [{:keys [cfg env project output log]} (fixture!)
+          env (assoc env "PG_REGRESS_FIXTURE_ENV" (context! cfg role))
+          result (run-wrapper env project "foo")
+          proof (fixtures/read-edn (io/file output "fixture-database.edn"))
+          cleanup (fixtures/read-edn (io/file output "fixture-database-cleanup.edn"))]
+      (is (zero? (:exit result)) (str (:out result) (:err result)))
+      (is (= "regression" (:database proof)))
+      (is (= {:name "datahike" :oid 11} (:admin proof)))
+      (is (and (:absent-before? proof) (:create-acknowledged? proof)))
+      (is (= 22 (:oid proof) (:oid cleanup)))
+      (is (= :complete (:status cleanup)))
+      (is (= (if (= role :oracle) :native-oid :synthetic-name-oid) (:identity-kind proof)))
+      (when (= role :target) (is (seq (:identity-limitation proof))))
+      (is (not (.exists (io/file (str log ".database.oid")))))
+      (is (str/includes? (slurp log) "DROP DATABASE regression")))))
+
+(deftest strict-and-administrative-canonical-name-are-refused-before-sql
+  (doseq [[key value message] [["PG_REGRESS_STRICT" "1" "raw discovery"]
+                               ["PG_REGRESS_API_STRICT" "1" "raw discovery"]
+                               ["PG_REGRESS_DB" "regression" "administrative database"]]]
+    (let [{:keys [env project log]} (fixture!)
+          result (run-wrapper (assoc env key value) project "foo")]
+      (is (not (zero? (:exit result))))
+      (is (str/includes? (:err result) message))
+      (is (not (.exists log))))))
+
+(deftest preexisting-canonical-database-is-never-created-or-dropped
+  (let [{:keys [env project output log]} (fixture!)]
+    (file! (str log ".database.oid") "44\n")
+    (file! (str log ".database.name") "regression\n")
+    (let [result (run-wrapper env project "foo")
+          proof (fixtures/read-edn (io/file output "fixture-database.edn"))]
+      (is (not (zero? (:exit result))))
+      (is (false? (:absent-before? proof)))
+      (is (= "44\n" (slurp (str log ".database.oid"))))
+      (is (not (str/includes? (slurp log) "CREATE DATABASE")))
+      (is (not (str/includes? (slurp log) "DROP DATABASE"))))))
+
+(deftest native-replacement-or-rename-and-admin-oid-cannot-authorize-drop
+  (doseq [flag ["FIXTURE_TEST_REPLACE_DB" "FIXTURE_TEST_RENAME_DB" "FIXTURE_TEST_CREATED_OID"]]
+    (let [{:keys [cfg env project output log]} (fixture!)
+          env (assoc env "PG_REGRESS_FIXTURE_ENV" (context! cfg :oracle)
+                     flag (if (= flag "FIXTURE_TEST_CREATED_OID") "11" "1"))
+          result (run-wrapper env project "foo")
+          evidence (fixtures/read-edn (io/file output "fixture.edn"))]
+      (is (not (zero? (:exit result))))
+      (is (= :incomplete (:outcome-status evidence)))
+      (is (= :failed (get-in evidence [:cleanup :status])))
+      (is (.exists (io/file (str log ".database.oid"))))
+      (is (not (str/includes? (slurp log) "DROP DATABASE"))))))
+
+(deftest requested-timeout-override-keeps-setup-and-prerequisite-defaults
+  (let [{:keys [cfg env data here project output]} (fixture!)
+        data (assoc data :target-statement-timeouts {"foo" "0"})
+        _ (file! (io/file here "fixtures.edn") (pr-str data))
+        env (assoc env "PG_REGRESS_STATEMENT_TIMEOUT" "27s")
+        result (run-wrapper env project "foo")
+        evidence (fixtures/validate! cfg output)]
+    (is (zero? (:exit result)) (str (:out result) (:err result)))
+    (is (= ["120s" "27s" "27s" "0"] (mapv :statement-timeout (:phases evidence))))
+    (is (= "0" (get-in (fixtures/read-edn (io/file output "tests/reference.edn")) [:limits :statement-timeout])))
+    (is (= "180s" (get-in (fixtures/read-edn (io/file output "tests/reference.edn")) [:limits :pg-regress-timeout])))
+    (is (= [nil nil nil "180s"] (mapv :process-timeout (:phases evidence))))
+    (is (= ["4m" "4m" "4m" "4m"]
+           (mapv :process-timeout (:phases (fixtures/plan cfg (assoc env "PG_REGRESS_TIMEOUT" "4m") ["foo"])))))
+    (let [path (io/file output "tests/reference.edn")]
+      (spit path (pr-str (assoc-in (fixtures/read-edn path) [:limits :statement-timeout] "wrong")))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"statement timeout"
+                            (fixtures/validate! cfg output))))
+    ;; A timeout override applies only when that file is explicitly requested.
+    (file! (io/file here "fixtures.edn")
+           (pr-str (assoc data :prerequisites {"baz" ["foo"] "foo" ["bar"]})))
+    (let [plan (fixtures/plan cfg env ["baz"])]
+      (is (= ["120s" "27s" "27s" "27s"] (mapv :statement-timeout (:phases plan)))))))
+
+(deftest cleanup-cannot-rebind-owned-proof-to-another-endpoint
+  (let [{:keys [env project output log]} (fixture!)
+        result (run-wrapper env project "foo")
+        before (slurp log)
+        cleanup (sh/sh "bb" "test/integration/postgres-regress/fixtures.clj" "cleanup-database" (str output)
+                       :env (assoc env "PG_REGRESS_PORT" "different") :dir (str project))]
+    (is (zero? (:exit result)) (str (:out result) (:err result)))
+    (is (not (zero? (:exit cleanup))))
+    (is (= before (slurp log)))
+    (is (= :failed (:status (fixtures/read-edn (io/file output "fixture-database-cleanup.edn")))))))
 
 (let [result (clojure.test/run-tests 'postgres-fixtures-test)]
   (System/exit (if (pos? (+ (:fail result) (:error result))) 1 0)))
