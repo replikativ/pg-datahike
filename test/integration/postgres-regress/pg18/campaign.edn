@@ -1,0 +1,164 @@
+{:postgres-major 18,
+ :postgres-ref "REL_18_6",
+ :modes #{:strict :discovery :unmeasured},
+ :waves
+ [{:id 1,
+   :name "expression, type, and error foundations",
+   :tests
+   [{:name "expressions", :boundaries #{:type-inference :nulls :expressions}, :mode :unmeasured}
+    {:name "prepare",
+     :boundaries #{:parameter-inference :type-lookup :prepared-sql},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "errors",
+     :boundaries #{:transaction-errors :name-resolution :sqlstate},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "int2", :boundaries #{:scalar-type :operators}, :requires ["test_setup"], :mode :unmeasured}
+    {:name "int4", :boundaries #{:scalar-type :operators}, :requires ["test_setup"], :mode :unmeasured}
+    {:name "int8", :boundaries #{:scalar-type :operators}, :requires ["test_setup"], :mode :unmeasured}
+    {:name "bit", :boundaries #{:scalar-type :nulls :operators}, :mode :unmeasured}
+    {:name "rowtypes", :boundaries #{:row-comparisons :nulls :structural-type}, :mode :unmeasured}
+    {:name "numeric", :boundaries #{:scalar-type :casts :operators}, :mode :unmeasured}
+    {:name "money", :boundaries #{:scalar-type :text-codec :casts :operators}, :mode :unmeasured}
+    {:name "arrays",
+     :boundaries #{:array-expressions :array-codec :polymorphism},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "uuid",
+     :boundaries
+     #{:scalar-type :type-inference :input-codec :volatile-functions :operators :temporal-extraction},
+     :mode :unmeasured}
+    {:name "enum", :boundaries #{:user-type :ordering :casts :catalog-introspection}, :mode :unmeasured}
+    {:name "domain", :boundaries #{:constraints :user-type :casts}, :mode :unmeasured}
+    {:name "create_type", :boundaries #{:type-ddl :type-lookup}, :mode :unmeasured}
+    {:name "type_sanity", :boundaries #{:type-registry :catalogs}, :mode :unmeasured}
+    {:name "opr_sanity", :boundaries #{:catalogs :operator-registry}, :mode :unmeasured}
+    {:name "misc_sanity", :boundaries #{:catalogs}, :mode :unmeasured}
+    {:name "namespace", :boundaries #{:name-resolution :schemas}, :mode :unmeasured}
+    {:name "rangefuncs",
+     :boundaries #{:parameter-inference :set-returning-functions :lateral},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "explain", :boundaries #{:errors :utility-grammar}, :requires ["test_setup"], :mode :unmeasured}]}
+  {:id 2,
+   :name "application DDL, DML, and relational SQL",
+   :tests
+   [{:name "boolean", :boundaries #{:errors :scalar-type :casts}, :mode :unmeasured}
+    {:name "char", :boundaries #{:scalar-type :casts}, :requires ["test_setup"], :mode :unmeasured}
+    {:name "name", :boundaries #{:scalar-type :catalogs}, :mode :unmeasured}
+    {:name "varchar", :boundaries #{:scalar-type :typmods}, :requires ["test_setup"], :mode :unmeasured}
+    {:name "text",
+     :boundaries #{:scalar-type :functions :expressions},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "float4", :boundaries #{:scalar-type :casts :operators}, :mode :unmeasured}
+    {:name "float8",
+     :boundaries #{:scalar-type :casts :operators},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "date", :boundaries #{:casts :operators :temporal}, :mode :unmeasured}
+    {:name "time", :boundaries #{:typmods :casts :operators :temporal}, :mode :unmeasured}
+    {:name "timestamp", :boundaries #{:functions :casts :operators :temporal}, :mode :unmeasured}
+    {:name "timestamptz",
+     :boundaries #{:time-zones :functions :casts :operators :temporal},
+     :mode :unmeasured}
+    {:name "interval", :boundaries #{:functions :casts :operators :temporal}, :mode :unmeasured}
+    {:name "create_table", :boundaries #{:defaults :ddl :type-metadata}, :mode :unmeasured}
+    {:name "constraints", :boundaries #{:constraints :ddl}, :mode :unmeasured}
+    {:name "insert", :boundaries #{:constraints :defaults :insert-select :dml}, :mode :unmeasured}
+    {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :unmeasured}
+    {:name "update", :boundaries #{:update-from :dml :row-assignment}, :mode :unmeasured}
+    {:name "delete", :boundaries #{:name-resolution :dml}, :mode :unmeasured}
+    {:name "returning",
+     :boundaries #{:defaults :result-metadata :expressions :dml},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "transactions",
+     :boundaries #{:error-recovery :transactions :savepoints},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "case", :boundaries #{:expressions}, :mode :unmeasured}
+    {:name "select_having", :boundaries #{:errors :having :grouping :aggregates}, :mode :unmeasured}
+    {:name "subselect",
+     :boundaries #{:name-resolution :scalar-subqueries :write-expressions :relational},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "union", :boundaries #{:relational :common-types}, :requires ["test_setup"], :mode :unmeasured}
+    {:name "join", :boundaries #{:relational}, :requires ["test_setup" "create_misc"], :mode :unmeasured}
+    {:name "aggregates",
+     :boundaries #{:aggregates},
+     :requires ["test_setup" "create_aggregate"],
+     :mode :unmeasured}
+    {:name "window",
+     :boundaries #{:windows :aggregates :expressions},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "with",
+     :boundaries #{:ctes :recursive-queries},
+     :requires ["test_setup" "create_misc"],
+     :mode :unmeasured}
+    {:name "limit", :boundaries #{:relational}, :requires ["test_setup"], :mode :unmeasured}
+    {:name "tsrf",
+     :boundaries #{:set-returning-projections :expressions :relational},
+     :requires ["test_setup"],
+     :mode :unmeasured}]}
+  {:id 3,
+   :name "specialized application types",
+   :tests
+   [{:name "json", :boundaries #{:json}, :mode :unmeasured}
+    {:name "jsonb", :boundaries #{:jsonb}, :mode :unmeasured}
+    {:name "jsonpath", :boundaries #{:jsonpath}, :mode :unmeasured}
+    {:name "sqljson", :boundaries #{:sql-json}, :mode :unmeasured}
+    {:name "tsearch", :boundaries #{:wire-result-type :full-text :normalization}, :mode :unmeasured}
+    {:name "tsdicts", :boundaries #{:full-text}, :mode :unmeasured}]}
+  {:id 4,
+   :name "core relational and schema backlog",
+   :tests
+   [{:name "select",
+     :boundaries #{:derived-tables :values :relational},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "select_distinct",
+     :boundaries #{:aggregates :distinct :relational},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "select_distinct_on",
+     :boundaries #{:distinct-on :ordering :relational},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "foreign_key", :boundaries #{:constraints :ddl :dml :transactions}, :mode :unmeasured}
+    {:name "create_view", :boundaries #{:ddl :relational :views}, :mode :unmeasured}
+    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :unmeasured}]}
+  {:id 5,
+   :name "bulk I/O, temporary relations, and client tooling",
+   :tests
+   [{:name "copy", :boundaries #{:errors :copy :text-codec}, :mode :unmeasured}
+    {:name "copy2", :boundaries #{:errors :copy :text-codec :csv-codec}, :mode :unmeasured}
+    {:name "copydml", :boundaries #{:copy :returning :dml}, :mode :unmeasured}
+    {:name "copyselect", :boundaries #{:copy :ordering :relational}, :mode :unmeasured}
+    {:name "temp", :boundaries #{:name-resolution :temporary-tables :ddl :transactions}, :mode :unmeasured}
+    {:name "truncate", :boundaries #{:constraints :ddl :dml :transactions}, :mode :unmeasured}
+    {:name "portals",
+     :boundaries #{:prepared-statements :cursors :transactions},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "portals_p2", :boundaries #{:cursors :transactions}, :requires ["portals"], :mode :unmeasured}
+    {:name "psql",
+     :boundaries #{:prepared-statements :copy :catalogs :client-tooling},
+     :requires ["test_setup"],
+     :mode :unmeasured}]}
+  {:id 6,
+   :name "application DDL lifecycle",
+   :tests
+   [{:name "create_index",
+     :boundaries #{:constraints :catalogs :ddl :indexes},
+     :requires ["test_setup"],
+     :mode :unmeasured}
+    {:name "generated_stored", :boundaries #{:copy :ddl :generated-columns :dml}, :mode :unmeasured}
+    {:name "identity", :boundaries #{:identity-columns :sequences :ddl :dml}, :mode :unmeasured}
+    {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :unmeasured}
+    {:name "create_schema", :boundaries #{:name-resolution :schemas :ddl}, :mode :unmeasured}
+    {:name "drop_if_exists", :boundaries #{:conditional-ddl :errors :ddl}, :mode :unmeasured}
+    {:name "create_table_like", :boundaries #{:constraints :ddl :schema-copy}, :mode :unmeasured}
+    {:name "comments", :boundaries #{:comments :string-literals :ddl}, :mode :unmeasured}]}]}

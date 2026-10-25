@@ -70,6 +70,9 @@
                           :task (do (shell "bb test/integration/postgres-regress/reference_test.clj")
                                     (shell "bb test/integration/postgres-regress/comparison_test.clj"))}
 
+  pg-regress-inventory-test {:doc "Test audited release inventory completeness and admission boundaries."
+                            :task (shell "bb test/integration/postgres-regress/inventory_test.clj")}
+
   beta-exit {:doc "Validate and print the beta-exit test/coverage campaign."
              :task (shell "bb test/integration/beta_exit.clj")}
 

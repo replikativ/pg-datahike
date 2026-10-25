@@ -111,8 +111,7 @@
                                             (assoc env "PG_REGRESS_SRC" (str *temporary* "/other/src/test/regress")))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"contradicts"
                           (reference/config reference/repo-root (assoc env "PG_REGRESS_MAJOR" "18"))))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"discovery runs only"
-                          (reference/require-campaign! b)))))
+    (is (.isFile (io/file (:inventory b))))))
 
 (deftest dirty-expected-fixtures-and-wrong-commit-cannot-be-authoritative
   (let [{:keys [config source env]} (cfg! "17")]

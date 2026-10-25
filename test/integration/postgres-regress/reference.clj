@@ -125,7 +125,7 @@
              :artifact-root (canonical (io/file root ".internal/pg-regress" (:postgres-ref selected)))
              :allow-unpinned? (= "1" (get env "PG_REGRESS_ALLOW_UNPINNED"))
              :target target}
-            (into {} (for [k [:campaign :scope :ledger :agreement]
+            (into {} (for [k [:campaign :scope :ledger :agreement :inventory]
                            :when (get selected k)]
                        [k (canonical (io/file here (get selected k)))])))))
   ([] (config repo-root (System/getenv))))
@@ -226,7 +226,11 @@
                    (= (:postgres-ref cfg) (:postgres-ref ledger))
                    (or (nil? (:postgres-major ledger))
                        (= (:major cfg) (:postgres-major ledger))))
-      (fail! "campaign/ledger identity disagrees with selected reference profile"))))
+      (fail! "campaign/ledger identity disagrees with selected reference profile"))
+    (when (:inventory cfg)
+      (load-file (str (io/file (:repo-root cfg) "test/integration/postgres-regress/inventory.clj")))
+      ((ns-resolve 'postgres-inventory 'validate!) cfg campaign
+                                                   (edn/read-string (slurp (:scope cfg))) ledger))))
 
 (defn validate-baseline! [cfg manifest]
   (when-not (and (= (:postgres-ref cfg) (:postgres-ref manifest))
