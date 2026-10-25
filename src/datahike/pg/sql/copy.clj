@@ -71,7 +71,78 @@
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector]
             [datahike.pg.sql.cast :as sql-cast]
-            [datahike.pg.sql.database :as database]))
+            [datahike.pg.sql.database :as database]
+            [datahike.pg.sql.rewrite :as rewrite])
+  (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
+           [net.sf.jsqlparser.statement.select Select PlainSelect]
+           [net.sf.jsqlparser.statement.create.table CreateTable]
+           [net.sf.jsqlparser.statement.insert Insert]
+           [net.sf.jsqlparser.statement.update Update]
+           [net.sf.jsqlparser.statement.delete Delete]))
+
+(defn- select-into?
+  "Inspect SQL AST nodes only; never follow parser backpointers or execution plans."
+  [statement]
+  (let [seen (java.util.IdentityHashMap.)
+        selects (java.util.ArrayList.)]
+    (letfn [(walk [node]
+              (when (and node (not (.containsKey seen node)))
+                (.put seen node true)
+                (cond
+                  (instance? java.lang.Iterable node)
+                  (doseq [child node] (walk child))
+
+                  (.startsWith (.getName (class node)) "net.sf.jsqlparser.")
+                  (do
+                    (when (instance? PlainSelect node) (.add selects node))
+                    (doseq [^java.lang.reflect.Method method (.getMethods (class node))
+                            :let [name (.getName method)]
+                            :when (and (zero? (.getParameterCount method))
+                                       (.startsWith name "get")
+                                       (not (contains? #{"getClass" "getASTNode" "getParent" "getDataType"}
+                                                       name)))]
+                      (let [child (try (.invoke method node (object-array 0))
+                                       (catch java.lang.reflect.InvocationTargetException _ nil)
+                                       (catch IllegalAccessException _ nil))]
+                        (walk child)))))))]
+      (walk statement)
+      ;; A rejection belongs outside reflective getter exception handling.
+      (some (fn [^PlainSelect select]
+              (or (seq (.getIntoTables select)) (.getIntoTempTable select)))
+            selects))))
+
+(defn validate-query!
+  "Check COPY's query before SQL lowering or execution can have effects.
+   PostgreSQL rejects SELECT INTO, utility statements and DML without RETURNING."
+  [query]
+  (let [statements (.getStatements
+                    (CCJSqlParserUtil/parseStatements
+                     (rewrite/rewrite query rewrite/default-rules)))]
+    (when (not= 1 (count statements))
+      (throw (ex-info "COPY query must contain one statement"
+                      {:sqlstate "42601" :error :syntax-error})))
+    (let [statement (first statements)]
+      (when (or (and (instance? CreateTable statement)
+                     (.getSelect ^CreateTable statement))
+                (select-into? statement))
+        (throw (ex-info "COPY (SELECT INTO) is not supported"
+                        {:sqlstate "0A000" :error :feature-not-supported})))
+      (cond
+        (instance? Select statement) nil
+
+        (or (instance? Insert statement)
+            (instance? Update statement)
+            (instance? Delete statement))
+        (when-not (seq (cond
+                         (instance? Insert statement) (.getReturningClause ^Insert statement)
+                         (instance? Update statement) (.getReturningClause ^Update statement)
+                         :else (.getReturningClause ^Delete statement)))
+          (throw (ex-info "COPY query must have a RETURNING clause"
+                          {:sqlstate "0A000" :error :feature-not-supported})))
+
+        :else
+        (throw (ex-info "COPY query must not be a utility command"
+                        {:sqlstate "0A000" :error :feature-not-supported}))))))
 
 ;; ----------------------------------------------------------------------------
 ;; Tokenizer — reuse the one from sql.database
