@@ -13429,7 +13429,24 @@
    is encoded like any other row except that FORCE_QUOTE does not
    apply to it, which is what `copyto.c` does."
   [ctx parsed]
-  (let [{:keys [options columns table query]} parsed
+  (let [{:keys [options columns table query ns]} parsed
+        logical-table (get (clojure.set/map-invert @(:temp-tables ctx)) table table)
+        public-shadow? (and (= "public" ns) (not= table logical-table))
+        db (if (:in-tx? @(:tx-state ctx))
+             (:speculative-db @(:tx-state ctx))
+             (d/db (:conn ctx)))
+        relation (when-not query
+                   (catalog-objects/object-by-identity
+                    db catalog-objects/pg-class-oid
+                    catalog-objects/public-namespace-oid
+                    (if public-shadow? logical-table table)))
+        _ (when (= :view (:datahike.pg.object/kind relation))
+            (throw (ex-info (str "cannot copy from view \"" logical-table "\"")
+                            {:sqlstate "42809" :error :wrong-object-type
+                             :hint "Try the COPY (SELECT ...) TO variant."})))
+        _ (when (and (not query) public-shadow?)
+            (throw (ex-info "COPY of a public relation shadowed by a temporary table is not supported"
+                            {:sqlstate "0A000" :error :feature-not-supported})))
         ;; `physicalize-temp-parse` has already rewritten a temp table's
         ;; name to its physical namespace, and `visible-session-schema`
         ;; deliberately HIDES those -- that is what stops one session
@@ -13500,19 +13517,20 @@
    than resolving it -- writing somewhere surprising is worse than
    failing to read from one."
   [ctx parsed]
-  (let [{:keys [target options]} parsed]
+  (let [{:keys [target options query]} parsed
+        file (when-let [path (:file target)] (java.io.File. ^String path))]
     (when (= :binary (:format options))
       (throw (ex-info "COPY BINARY is not supported by datahike pgwire"
                       {:error :feature-not-supported :feature "COPY BINARY"})))
+    (when (and file (not (.isAbsolute ^java.io.File file)))
+      (throw (ex-info "relative path not allowed for COPY to file"
+                      {:sqlstate "42602" :error :invalid-name})))
+    (when query (copy/validate-query! query))
     (let [[col-names lines n] (copy-to-lines ctx parsed)]
       (if (= :stdout target)
         (doto (PgWireServer$QueryResult/empty (str "COPY " n))
           (.withCopyOutMode (into-array String lines) (count col-names)))
-        (let [^String path (:file target)
-              file (java.io.File. path)]
-          (when-not (.isAbsolute file)
-            (throw (ex-info "relative path not allowed for COPY to file"
-                            {:sqlstate "42602" :error :invalid-name})))
+        (let [^String path (:file target)]
           (try
             (with-open [w (java.io.BufferedWriter.
                            (java.io.OutputStreamWriter.

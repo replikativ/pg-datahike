@@ -3827,15 +3827,20 @@
             (let [^Table table item
                   view-name (unquote-ident (.getName table))
                   [definition columns-str]
-                  (first
-                   (d/q '{:find [?definition ?columns]
-                          :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
-                          :where [[?e ?name-attr ?view-name]
-                                  [?e ?definition-attr ?definition]
-                                  [?e ?columns-attr ?columns]]}
-                        db :datahike.pg/view-name
-                        :datahike.pg/view-definition
-                        :datahike.pg/view-columns view-name))]
+                  ;; Resolve an unqualified owning temp relation before a
+                  ;; persisted view of the same name, as for ordinary tables.
+                  (when-not (and (contains? params/*temp-table-map* view-name)
+                                 (or (nil? (.getSchemaName table))
+                                     (= "pg_temp" (.getSchemaName table))))
+                    (first
+                     (d/q '{:find [?definition ?columns]
+                            :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
+                            :where [[?e ?name-attr ?view-name]
+                                    [?e ?definition-attr ?definition]
+                                    [?e ?columns-attr ?columns]]}
+                          db :datahike.pg/view-name
+                          :datahike.pg/view-definition
+                          :datahike.pg/view-columns view-name)))]
               (if definition
                 (let [columns (try (edn/read-string columns-str)
                                    (catch Exception _ nil))

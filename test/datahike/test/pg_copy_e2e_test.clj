@@ -745,6 +745,69 @@
                                  "WHERE (id + 0) > 0 ORDER BY id DESC) "
                                  "TO STDOUT"))))))
 
+(defn- copy-error-state [^Connection c sql]
+  (try (copy-out-text c sql) nil
+       (catch java.sql.SQLException e (.getSQLState e))))
+
+(deftest copy-query-validates-before-effects
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "INSERT INTO users(id,name) VALUES (1,'original')")
+    (exec! c "CREATE SEQUENCE copy_guard_seq")
+    (doseq [query ["SELECT nextval('copy_guard_seq') INTO TEMP copy_guard_created FROM users"
+                   "(SELECT id INTO copy_guard_created FROM users)"
+                   "WITH src AS (SELECT id FROM users) SELECT id INTO copy_guard_created FROM src"]]
+      (is (= "0A000" (copy-error-state c (str "COPY (" query ") TO STDOUT")))))
+    (is (= [[false]] (query-rows c "SELECT is_called FROM copy_guard_seq")))
+    (is (= "42P01" (try (query-rows c "SELECT * FROM copy_guard_created") nil
+                        (catch java.sql.SQLException e (.getSQLState e)))))
+    (doseq [query ["INSERT INTO users(id,name) VALUES (9,'new')"
+                   "UPDATE users SET name='changed' WHERE id=1"
+                   "DELETE FROM users WHERE id=1"]]
+      (is (= "0A000" (copy-error-state c (str "COPY (" query ") TO STDOUT")))))
+    ;; The wire statement splitter rejects this shape before COPY parsing.
+    (is (= "0A000" (copy-error-state
+                    c "COPY (SELECT id FROM users; DELETE FROM users) TO STDOUT")))
+    (is (= [[1 "original"]] (query-rows c "SELECT id,name FROM users")))
+    (testing "DML RETURNING still executes exactly once"
+      (is (= "2\n" (copy-out-text
+                    c "COPY (INSERT INTO users(id,name) VALUES (2,'second') RETURNING id) TO STDOUT")))
+      (is (= [[1 "original"] [2 "second"]]
+             (query-rows c "SELECT id,name FROM users ORDER BY id"))))))
+
+(deftest copy-query-validation-precedes-file-effects
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [file (java.io.File/createTempFile "pgdh-copy-query-guard-" ".txt")]
+      (try
+        (spit file "unchanged")
+        (is (= "0A000" (try
+                         (exec! c (str "COPY (SELECT 1 INTO copy_file_created) TO '"
+                                       (.getAbsolutePath file) "'"))
+                         nil
+                         (catch java.sql.SQLException e (.getSQLState e)))))
+        (is (= "unchanged" (slurp file)))
+        (finally (.delete file))))
+    (is (= "42602" (try
+                     (exec! c (str "COPY (INSERT INTO users(id,name) VALUES (9,'new') "
+                                   "RETURNING id) TO 'pgdh-relative-guard.txt'"))
+                     nil
+                     (catch java.sql.SQLException e (.getSQLState e)))))
+    (is (= [[0]] (query-rows c "SELECT count(*) FROM users")))))
+
+(deftest copy-relation-form-refuses-views
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "INSERT INTO users(id,name) VALUES (1,'source')")
+    (exec! c "CREATE VIEW copy_guard_view AS SELECT id FROM users")
+    (is (= "42809" (copy-error-state c "COPY copy_guard_view TO STDOUT")))
+    (is (= "1\n" (copy-out-text c "COPY (SELECT * FROM copy_guard_view) TO STDOUT")))
+    (testing "an owning temporary table shadows the view"
+      (exec! c "CREATE TEMP TABLE copy_guard_view(id int)")
+      (exec! c "INSERT INTO copy_guard_view VALUES (7)")
+      (is (= "7\n" (copy-out-text c "COPY copy_guard_view TO STDOUT")))
+      (is (= "42809" (copy-error-state c "COPY public.copy_guard_view TO STDOUT"))))
+    (exec! c "CREATE TEMP TABLE users(id int)")
+    (exec! c "INSERT INTO users VALUES (7)")
+    (is (= "0A000" (copy-error-state c "COPY public.users TO STDOUT")))))
+
 (deftest copy-to-file-and-back
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (is (= 2 (copy-in-text c "COPY users FROM STDIN"

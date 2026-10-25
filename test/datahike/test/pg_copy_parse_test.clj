@@ -12,6 +12,25 @@
 
 (defn- opts [sql] (:options (parse sql)))
 
+(deftest copy-query-preflight-preserves-query-boundaries
+  (doseq [query ["SELECT 1 AS \"into\""
+                 "SELECT 'SELECT x INTO y; DELETE FROM z'"
+                 "WITH gone AS (DELETE FROM t) SELECT 1"
+                 "INSERT INTO t VALUES (1) RETURNING *"
+                 "UPDATE t SET a=1 RETURNING a"
+                 "DELETE FROM t RETURNING a"]]
+    (is (nil? (copy/validate-query! query)) query))
+  (doseq [[query state] [["SELECT 1; DELETE FROM t" "42601"]
+                         ["CREATE TABLE t(a int)" "0A000"]
+                         ["(SELECT 1 INTO t)" "0A000"]
+                         ["SELECT * FROM (SELECT 1 INTO t) q" "0A000"]
+                         ["SELECT (SELECT 1 INTO t)" "0A000"]
+                         ["WITH x AS (SELECT 1) SELECT * INTO t FROM x" "0A000"]
+                         ["INSERT INTO t VALUES(1)" "0A000"]]]
+    (is (= state (try (copy/validate-query! query) nil
+                      (catch clojure.lang.ExceptionInfo e (:sqlstate (ex-data e)))))
+        query)))
+
 ;; ============================================================================
 ;; Table / column-list parsing
 ;; ============================================================================
