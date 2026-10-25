@@ -37,6 +37,8 @@
 
 (load-file "test/integration/postgres-regress/reference.clj")
 (alias 'reference 'postgres-reference)
+(load-file "test/integration/postgres-regress/comparison.clj")
+(alias 'comparison 'postgres-comparison)
 
 (def reference-config (reference/config))
 (reference/require-campaign! reference-config)
@@ -45,38 +47,6 @@
 (def regress-root (:regress-root reference-config))
 (def manifest-file (:agreement reference-config))
 (def scope-file (:scope reference-config))
-
-(defn- presentation-line?
-  "PostgreSQL's parser echoes the offending source and a caret under it.
-   Both sides drop those: they are about the error's POSITION, which is
-   a separate thing to get right and would otherwise dominate the
-   comparison."
-  [^String l]
-  (or (str/starts-with? l "LINE ")
-      (re-matches #"\s*\^\s*" l)))
-
-(defn- lines [f]
-  (with-open [r (io/reader f)]
-    (vec (remove presentation-line? (line-seq r)))))
-
-(defn- matched-lines
-  "How many of `expected` appear, in order, in `actual` -- the total
-   size of the longest common subsequence's matching blocks."
-  [expected actual]
-  (let [a (vec expected), b (vec actual)
-        n (count a), m (count b)]
-    ;; Hirschberg is unnecessary here; the files are thousands of lines,
-    ;; not millions, and only the LENGTH is needed.
-    (loop [i 0, prev (int-array (inc m))]
-      (if (= i n)
-        (aget prev m)
-        (let [cur (int-array (inc m))]
-          (dotimes [j m]
-            (aset cur (inc j)
-                  (if (= (nth a i) (nth b j))
-                    (inc (aget prev j))
-                    (max (aget cur j) (aget prev (inc j))))))
-          (recur (inc i) cur))))))
 
 (defn agreement
   "[percentage matched total] for one file, or nil when it was not run.
@@ -103,9 +73,9 @@
   (let [exp (io/file regress-root "expected" (str test-name ".out"))
         act (io/file results-dir (str test-name ".out"))]
     (when (and (.exists exp) (.exists act))
-      (let [e (lines exp), a (lines act)
-            m (matched-lines e a)]
-        [(if (seq e) (* 100.0 (/ (double m) (count e))) 0.0) m (count e)]))))
+      (comparison/checkpoint-score!
+       exp act (io/file results-dir "comparisons" (str test-name ".edn"))
+       reference/file-sha256))))
 
 (defn application-facing
   "Every regression file except the ones `scope.edn` puts out of scope --
@@ -163,7 +133,9 @@
    on the JVM.
 
    `probe` reports per-file agreement against the recorded manifest and
-   writes NOTHING. It exists so a campaign can iterate on a handful of
+   preserves the baseline. All modes retain hash-checked comparison checkpoints.
+   `stage-measure` is the runner's internal mode: the parent promotes its staged
+   baseline only after the bounded comparison process exits successfully. It exists so a campaign can iterate on a handful of
    files without paying for all 154 -- and it is a separate mode rather
    than a flag on `measure` on purpose: `measure` rewrites `:files` from
    what it measured, so measuring a SUBSET would silently drop every
@@ -181,44 +153,57 @@
   (reference/require-authoritative! reference-config)
   (let [manifest (edn/read-string (slurp manifest-file))]
     (reference/validate-baseline! reference-config manifest))
-  (let [collection (reference/validate-collection! reference-config results-dir)
+  (let [manifest (edn/read-string (slurp manifest-file))
+        _ (when (and (= mode "gate")
+                     (or (= :unmeasured (:status manifest)) (empty? (:files manifest))))
+            (reference/fail! "no measured agreement baseline; run measure before gate"))
+        collection (reference/validate-collection! reference-config results-dir)
         names (or (subset-names) (application-facing))
         _ (doseq [name names]
             (when-not (contains? (:outputs collection) name)
               (reference/fail! (str "no current complete result for " name))))
-        measured (into {} (keep (fn [n]
-                                  (when-let [[pct _ _] (agreement n results-dir)]
-                                    [n (Double/parseDouble (format "%.1f" pct))])))
-                       names)]
+        measured (into {} (map (fn [n]
+                                 (let [[pct _ _] (or (agreement n results-dir)
+                                                     (reference/fail! (str "missing comparison input for " n)))]
+                                   [n (Double/parseDouble (format "%.1f" pct))])))
+                       names)
+        _ (when-not (= collection (reference/validate-collection! reference-config results-dir))
+            (reference/fail! "collection changed during comparison"))
+        _ (when-not (= (set names) (set (or (subset-names) (application-facing))))
+            (reference/fail! "comparison scope changed during comparison"))]
     (case mode
-      "measure"
-      (let [manifest (try (edn/read-string (slurp manifest-file)) (catch Exception _ {}))]
-        (spit manifest-file
-              (str "{:measured \"" (subs (str (java.time.LocalDate/now)) 0 10) "\"\n"
-                   " :postgres-ref \"" campaign-ref "\"\n"
-                   " :profile " (pr-str (:profile reference-config)) "\n"
-                   " :source-commit " (pr-str (get-in collection [:reference :commit])) "\n"
-                   " :inputs-sha256 " (pr-str (get-in collection [:reference :inputs-sha256])) "\n"
-                   " ;; Per-file agreement: the share of PostgreSQL's expected output\n"
-                   " ;; lines that appear, in order, in ours. `bb pg-regress-gate`\n"
-                   " ;; fails when a file drops more than the tolerance below, when an\n"
-                   " ;; exact match is lost, or when a file stops being measurable.\n"
-                   " ;;\n"
-                   " ;; The tolerance is not slack for regressions: a file that is\n"
-                   " ;; mostly cascade realigns by a point or two whenever anything\n"
-                   " ;; ahead of its first divergence changes, in either direction.\n"
-                   " ;;\n"
-                   " ;; And the number is GAMEABLE: it counts expected lines we\n"
-                   " ;; reproduce, so emitting MORE output can only raise it. A\n"
-                   " ;; wrong-but-plausible block of rows scores above a clean\n"
-                   " ;; refusal. Read a file's score to decide what to open next,\n"
-                   " ;; never as a goal. See `agreement`.\n"
-                   " :tolerance " (or (:tolerance manifest) 3.0) "\n"
-                   " :files\n {\n"
-                   (str/join "\n" (for [[n p] (sort measured)]
-                                    (format "  \"%s\" %.1f" n p)))
-                   "\n }}\n"))
-        (println (format "measured %d files, wrote %s" (count measured) manifest-file)))
+      ("measure" "stage-measure")
+      (let [destination (if (= mode "stage-measure")
+                          (io/file results-dir "baseline.edn") manifest-file)
+            manifest (try (edn/read-string (slurp manifest-file)) (catch Exception _ {}))]
+        (comparison/atomic-write! destination
+                                  (str "{:measured \"" (subs (str (java.time.LocalDate/now)) 0 10) "\"\n"
+                                       " :status :measured\n"
+                                       " :postgres-ref \"" campaign-ref "\"\n"
+                                       " :profile " (pr-str (:profile reference-config)) "\n"
+                                       " :source-commit " (pr-str (get-in collection [:reference :commit])) "\n"
+                                       " :inputs-sha256 " (pr-str (get-in collection [:reference :inputs-sha256])) "\n"
+                                       " ;; Per-file agreement: the share of PostgreSQL's expected output\n"
+                                       " ;; lines that appear, in order, in ours. `bb pg-regress-gate`\n"
+                                       " ;; fails when a file drops more than the tolerance below, when an\n"
+                                       " ;; exact match is lost, or when a file stops being measurable.\n"
+                                       " ;;\n"
+                                       " ;; The tolerance is not slack for regressions: a file that is\n"
+                                       " ;; mostly cascade realigns by a point or two whenever anything\n"
+                                       " ;; ahead of its first divergence changes, in either direction.\n"
+                                       " ;;\n"
+                                       " ;; And the number is GAMEABLE: it counts expected lines we\n"
+                                       " ;; reproduce, so emitting MORE output can only raise it. A\n"
+                                       " ;; wrong-but-plausible block of rows scores above a clean\n"
+                                       " ;; refusal. Read a file's score to decide what to open next,\n"
+                                       " ;; never as a goal. See `agreement`.\n"
+                                       " :tolerance " (or (:tolerance manifest) 3.0) "\n"
+                                       " :files\n {\n"
+                                       (str/join "\n" (for [[n p] (sort measured)]
+                                                        (format "  \"%s\" %.1f" n p)))
+                                       "\n }}\n"))
+        (println (format "measured %d files, %s %s" (count measured)
+                         (if (= mode "stage-measure") "staged" "wrote") destination)))
 
       "probe"
       (let [manifest (try (edn/read-string (slurp manifest-file)) (catch Exception _ {}))
@@ -235,7 +220,7 @@
                                  (nil? was) "new"
                                  (>= now 99.95) (if (>= was 99.95) "exact" "EXACT (was not)")
                                  :else (format "%+.1f" (- now was))))))
-        (println "\nprobe only -- nothing written. Run `bb pg-regress-measure` to re-baseline."))
+        (println "\nprobe only -- baseline unchanged. Run `bb pg-regress-measure` to re-baseline."))
 
       "gate"
       (let [manifest (edn/read-string (slurp manifest-file))
