@@ -35,36 +35,16 @@
             [clojure.java.io :as io]
             [clojure.string :as str]))
 
-(def campaign-ref
-  "The PostgreSQL the campaign measures against, from campaign.edn. One
-   source of truth: the oracle, the regression sources, and the
-   manifest's own `:postgres-ref` all have to be this, or the number
-   asserts a reference it was not measured against."
-  (:postgres-ref (edn/read-string
-                  (slurp "test/integration/postgres-regress/campaign.edn"))))
+(load-file "test/integration/postgres-regress/reference.clj")
+(alias 'reference 'postgres-reference)
 
-(def regress-root
-  "The regression sources. The PINNED checkout by default.
-
-   This used to default to `~/Development/postgres`, a maintainer's own
-   checkout, which moves. It had moved to REL_19_BETA1 while
-   campaign.edn pinned REL_17_7 and the oracle was PostgreSQL 17 -- so
-   the manifest recorded a reference nothing had been measured against,
-   and 22 of the 174 measured files did not exist in 17 at all (SQL/PGQ,
-   temporal keys, VIRTUAL generated columns), while `generated.sql` --
-   17's file for a feature that IS in scope -- was not measured, because
-   the file list came from 19 where it had been split in two.
-
-   `PG_REGRESS_SRC` still overrides, for deliberately measuring against
-   another version."
-  (or (System/getenv "PG_REGRESS_SRC")
-      (let [pinned (io/file ".internal" (str "postgres-" campaign-ref)
-                            "src" "test" "regress")]
-        (when (.isDirectory pinned) (str pinned)))
-      (str (System/getProperty "user.home") "/Development/postgres/src/test/regress")))
-
-(def manifest-file "test/integration/postgres-regress/agreement.edn")
-(def scope-file "test/integration/postgres-regress/scope.edn")
+(def reference-config (reference/config))
+(reference/require-campaign! reference-config)
+(reference/validate-source! reference-config)
+(def campaign-ref (:postgres-ref reference-config))
+(def regress-root (:regress-root reference-config))
+(def manifest-file (:agreement reference-config))
+(def scope-file (:scope reference-config))
 
 (defn- presentation-line?
   "PostgreSQL's parser echoes the offending source and a caret under it.
@@ -132,12 +112,8 @@
    server internals, physical access methods, and the rest of what a
    client never sees."
   []
-  (let [s (slurp scope-file)
-        ;; A test name may contain dots -- `collate.icu.utf8` -- so the
-        ;; character class has to allow them, or the entry silently
-        ;; fails to exclude anything.
-        oos (set (re-seq #"(?<=\")[a-z0-9_.]+(?=\")"
-                         (subs s (str/index-of s ":out-of-scope"))))]
+  (let [scope (edn/read-string (slurp scope-file))
+        oos (set (mapcat val (:out-of-scope scope)))]
     (->> (.listFiles (io/file regress-root "sql"))
          (map #(.getName %))
          (filter #(str/ends-with? % ".sql"))
@@ -202,7 +178,14 @@
                   mode "` would rewrite the manifest from a subset and drop"
                   " every other file's baseline."))
     (System/exit 2))
-  (let [names (or (subset-names) (application-facing))
+  (reference/require-authoritative! reference-config)
+  (let [manifest (edn/read-string (slurp manifest-file))]
+    (reference/validate-baseline! reference-config manifest))
+  (let [collection (reference/validate-collection! reference-config results-dir)
+        names (or (subset-names) (application-facing))
+        _ (doseq [name names]
+            (when-not (contains? (:outputs collection) name)
+              (reference/fail! (str "no current complete result for " name))))
         measured (into {} (keep (fn [n]
                                   (when-let [[pct _ _] (agreement n results-dir)]
                                     [n (Double/parseDouble (format "%.1f" pct))])))
@@ -212,7 +195,10 @@
       (let [manifest (try (edn/read-string (slurp manifest-file)) (catch Exception _ {}))]
         (spit manifest-file
               (str "{:measured \"" (subs (str (java.time.LocalDate/now)) 0 10) "\"\n"
-                   " :postgres-ref \"" (or (:postgres-ref manifest) "REL_17_7") "\"\n"
+                   " :postgres-ref \"" campaign-ref "\"\n"
+                   " :profile " (pr-str (:profile reference-config)) "\n"
+                   " :source-commit " (pr-str (get-in collection [:reference :commit])) "\n"
+                   " :inputs-sha256 " (pr-str (get-in collection [:reference :inputs-sha256])) "\n"
                    " ;; Per-file agreement: the share of PostgreSQL's expected output\n"
                    " ;; lines that appear, in order, in ours. `bb pg-regress-gate`\n"
                    " ;; fails when a file drops more than the tolerance below, when an\n"

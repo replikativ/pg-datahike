@@ -9,25 +9,6 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
-# The PINNED checkout by default, matching campaign.edn's :postgres-ref
-# and the oracle. It used to default to a maintainer's own `../postgres`,
-# which moves: it had moved to REL_19_BETA1 while the campaign pinned
-# REL_17_7, so the suite RAN a newer PostgreSQL's regression files and
-# the manifest recorded a reference nothing had been measured against.
-# POSTGRES_SOURCE still overrides.
-campaign_ref="$(sed -n 's/^ *:postgres-ref *"\([^"]*\)".*/\1/p' \
-                "${repo_root}/test/integration/postgres-regress/campaign.edn" | head -1)"
-pinned_source="${repo_root}/.internal/postgres-${campaign_ref}"
-if [[ -n "${POSTGRES_SOURCE:-}" ]]; then
-  postgres_source="${POSTGRES_SOURCE}"
-elif [[ -d "${pinned_source}/src/test/regress" ]]; then
-  postgres_source="${pinned_source}"
-else
-  postgres_source="${repo_root}/../postgres"
-fi
-pg_major="${PG_REGRESS_MAJOR:-17}"
-pg_regress="${PG_REGRESS_BIN:-/usr/lib/postgresql/${pg_major}/lib/pgxs/src/test/regress/pg_regress}"
-pg_bindir="${PG_REGRESS_BINDIR:-/usr/lib/postgresql/${pg_major}/bin}"
 target_host="${PG_REGRESS_HOST:-127.0.0.1}"
 target_port="${PG_REGRESS_PORT:-15432}"
 target_user="${PG_REGRESS_USER:-datahike}"
@@ -50,6 +31,13 @@ if [[ $# -eq 0 ]]; then
   exit 2
 fi
 
+source "${script_dir}/reference.sh"
+postgres_source="${POSTGRES_SOURCE}"
+pg_major="${PG_REGRESS_MAJOR}"
+pg_regress="${PG_REGRESS_BIN}"
+pg_bindir="${PG_REGRESS_BINDIR}"
+bb "${script_dir}/reference.clj" check-tests "$@"
+
 if [[ ! -x "${pg_regress}" ]]; then
   echo "pg_regress not executable: ${pg_regress}" >&2
   echo "set PG_REGRESS_BIN to PostgreSQL's pg_regress binary" >&2
@@ -63,7 +51,7 @@ fi
 
 cleanup_isolated_db() {
   if [[ "${database_created}" == "1" ]]; then
-    "${pg_bindir}/psql" -X \
+    reference_psql -X \
       --host="${target_host}" --port="${target_port}" --username="${target_user}" \
       --dbname="${admin_db}" --set=ON_ERROR_STOP=1 \
       --command="DROP DATABASE IF EXISTS \"${isolated_db}\"" >/dev/null || true
@@ -78,7 +66,7 @@ if [[ "${PG_REGRESS_ISOLATE:-0}" == "1" ]]; then
   trap cleanup_isolated_db EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  "${pg_bindir}/psql" -X \
+  reference_psql -X \
     --host="${target_host}" --port="${target_port}" --username="${target_user}" \
     --dbname="${admin_db}" --set=ON_ERROR_STOP=1 \
     --command="CREATE DATABASE \"${isolated_db}\"" >/dev/null
@@ -93,13 +81,8 @@ if [[ ! -d "${input_dir}/sql" || ! -d "${input_dir}/expected" ]]; then
   exit 2
 fi
 
-if [[ -n "${PG_REGRESS_OUTPUT:-}" ]]; then
-  output_dir="${PG_REGRESS_OUTPUT}"
-else
-  run_stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  output_dir="${repo_root}/.internal/pg-regress/${run_stamp}"
-fi
-mkdir -p "${output_dir}"
+output_dir="$(bb "${script_dir}/reference.clj" output)"
+PG_REGRESS_DB="${target_db}" bb "${script_dir}/reference.clj" begin "${output_dir}" "$@"
 
 echo "PostgreSQL source: ${postgres_source}"
 echo "Target:            ${target_host}:${target_port}/${target_db} as ${target_user}"
@@ -142,13 +125,19 @@ if [[ -n "${statement_timeout}" ]]; then
   fi
 fi
 if [[ -n "${regress_timeout}" ]]; then
-  timeout "${regress_timeout}" "${regress_command[@]}" \
+  timeout --kill-after=2s "${regress_timeout}" "${regress_command[@]}" \
     2>&1 | tee "${output_dir}/pg_regress.log"
 else
   "${regress_command[@]}" 2>&1 | tee "${output_dir}/pg_regress.log"
 fi
 regress_status="${PIPESTATUS[0]}"
+bb "${script_dir}/reference.clj" finish "${output_dir}" "${regress_status}"
+receipt_status=$?
 set -e
+if [[ "${regress_status}" -le 1 && "${receipt_status}" -ne 0 ]]; then
+  echo "Regression output is incomplete or its reference inputs changed; not measurable." >&2
+  exit 2
+fi
 
 diff_file="${output_dir}/regression.diffs"
 if [[ -f "${diff_file}" ]]; then
