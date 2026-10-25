@@ -485,7 +485,7 @@
   (let [{:keys [env]} (cfg! "17")
         directory (io/file *temporary* "setup-collection")
         r (collect-through-wrapper (assoc env "AGREEMENT_FILES" "test_setup"
-                                         "AGREEMENT_KEEP" (str directory)))
+                                          "AGREEMENT_KEEP" (str directory)))
         receipt (edn/read-string (slurp (io/file directory "collection.edn")))
         run (edn/read-string (slurp (io/file directory "runs/test_setup/reference.edn")))]
     (is (zero? (:exit r)) (str (:out r) (:err r)))
