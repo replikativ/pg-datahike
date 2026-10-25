@@ -14,4 +14,5 @@
         :scope "pg18/scope.edn"
         :ledger "pg18/routine-trigger-capabilities.edn"
         :agreement "pg18/agreement.edn"
-        :inventory "pg18/inventory.edn"}}}
+        :inventory "pg18/inventory.edn"
+        :fixtures "pg18/fixtures.edn"}}}

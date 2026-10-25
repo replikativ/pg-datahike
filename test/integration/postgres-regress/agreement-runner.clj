@@ -34,11 +34,25 @@
     (.redirectOutput builder (io/file log))
     (reference/wait-for-owned! (.start builder) timeout-ms)))
 
+(defn collect-in-order [names run-file stop-on-incomplete?]
+  (loop [pending (seq names) outcomes []]
+    (if-let [name (first pending)]
+      (let [outcome (run-file name)
+            outcomes (conj outcomes outcome)]
+        (if (and stop-on-incomplete? (not= :complete (:status outcome)))
+          (into outcomes (for [unattempted (rest pending)]
+                           {:test unattempted :status :unattempted
+                            :reason :prior-fixture-or-resource-outcome-incomplete}))
+          (recur (next pending) outcomes)))
+      outcomes)))
+
 (defn collect! [mode env]
   (when-not (#{"measure" "gate" "probe"} mode)
     (reference/fail! "usage: agreement.sh [measure|gate|probe]"))
   (let [_ (duration-ms "AGREEMENT_COMPARE_TIMEOUT" (get env "AGREEMENT_COMPARE_TIMEOUT" "30m"))
         cfg (reference/config reference/repo-root env)
+        _ (reference/fixture-call cfg 'exclusive-context! env)
+        _ (reference/fixture-call cfg 'baseline-policy! mode)
         _ (reference/require-campaign! cfg)
         _ (reference/require-authoritative! cfg)
         _ (reference/validate-tools! cfg)]
@@ -68,35 +82,40 @@
           _ (println "Externally managed endpoint; server code revision is unverified."
                      "Start the intended build before measuring.")
           outcomes
-          (mapv
-           (fn [name]
-             (let [output (str (io/file directory "runs" name))
-                   log (str (io/file directory "runs" (str name ".log")))
-                   setup? (= name "test_setup")
-                   run-directory (if setup? (io/file output) (io/file output "tests"))
-                   script (if setup? "run.sh" "run-with-api-fixtures.sh")
-                   args (into ["timeout" (str "--kill-after=" (/ (double grace) 1000) "s") file-limit
-                               "bash" (str (io/file (:repo-root cfg)
-                                                    (str "test/integration/postgres-regress/" script)))]
-                              (concat (get prerequisites name) [name]))
-                   child-env (cond-> (assoc (into {} env)
-                                            "PG_REGRESS_PROFILE" (:profile cfg)
-                                            "POSTGRES_SOURCE" (:source cfg)
-                                            "PG_REGRESS_SRC" (:regress-root cfg)
-                                            "PG_REGRESS_OUTPUT" output
-                                            "PGCONNECT_TIMEOUT" (or (get env "PGCONNECT_TIMEOUT") "10"))
-                               setup? (assoc "PG_REGRESS_ISOLATE" "1"
-                                             "PG_REGRESS_STATEMENT_TIMEOUT" "120s"))]
-               (println "Measuring" name "->" output)
-               (let [status (execute! args child-env log deadline)]
-                 (if (zero? status)
-                   (try
-                     (reference/collect-result! cfg run-directory name directory)
-                     {:test name :status :complete}
-                     (catch Exception e
-                       {:test name :status :incomplete :reason (.getMessage e)}))
-                   {:test name :status :incomplete :exit status :log log}))))
-           names)
+          (collect-in-order names
+                            (fn [name]
+                              (let [output (str (io/file directory "runs" name))
+                                    log (str (io/file directory "runs" (str name ".log")))
+                                    setup? (and (not (:fixtures cfg)) (= name "test_setup"))
+                                    run-directory (if setup? (io/file output) (io/file output "tests"))
+                                    script (if setup? "run.sh" "run-with-api-fixtures.sh")
+                                    args (into ["timeout" (str "--kill-after=" (/ (double grace) 1000) "s") file-limit
+                                                "bash" (str (io/file (:repo-root cfg)
+                                                                     (str "test/integration/postgres-regress/" script)))]
+                                               (concat (when-not (:fixtures cfg) (get prerequisites name)) [name]))
+                                    child-env (cond-> (assoc (into {} env)
+                                                             "PG_REGRESS_PROFILE" (:profile cfg)
+                                                             "POSTGRES_SOURCE" (:source cfg)
+                                                             "PG_REGRESS_SRC" (:regress-root cfg)
+                                                             "PG_REGRESS_OUTPUT" output
+                                                             "PGCONNECT_TIMEOUT" (or (get env "PGCONNECT_TIMEOUT") "10"))
+                                                setup? (assoc "PG_REGRESS_ISOLATE" "1"
+                                                              "PG_REGRESS_STATEMENT_TIMEOUT" "120s"))]
+                                (println "Measuring" name "->" output)
+                                (let [status (execute! args child-env log deadline)]
+                                  (if (zero? status)
+                                    (try
+                                      (let [fixture (reference/fixture-call cfg 'validate! output)]
+                                        (when (and fixture (not= :complete (:outcome-status fixture)))
+                                          (reference/fail! "fixture cleanup/environment outcome incomplete"))
+                                        (reference/collect-result! cfg run-directory name directory)
+                                        (cond-> {:test name :status :complete}
+                                          fixture (assoc :fixture-readiness (:readiness fixture)
+                                                         :fixture-role (get-in fixture [:context :role]))))
+                                      (catch Exception e
+                                        {:test name :status :incomplete :reason (.getMessage e)}))
+                                    {:test name :status :incomplete :exit status :log log}))))
+                            (boolean (:fixtures cfg)))
           complete? (every? #(= :complete (:status %)) outcomes)]
       (reference/write-edn! (io/file directory "runs.edn") outcomes)
       (reference/finish-collection! cfg directory names complete?)
@@ -113,6 +132,7 @@
 
 (defn compare! [cfg mode directory env]
   (let [before (reference/validate-collection! cfg directory)
+        _ (reference/fixture-call cfg 'assert-qualified! before mode)
         timeout-ms (duration-ms "AGREEMENT_COMPARE_TIMEOUT"
                                 (get env "AGREEMENT_COMPARE_TIMEOUT" "30m"))
         _ (when (= mode "measure") (.delete (io/file directory "baseline.edn")))

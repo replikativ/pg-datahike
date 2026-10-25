@@ -113,8 +113,11 @@ regress_command=(
   --inputdir="${input_dir}"
   --expecteddir="${input_dir}"
   --outputdir="${output_dir}"
-  "$@"
 )
+if [[ -n "${_PG_REGRESS_DLPATH:-}" ]]; then
+  regress_command+=(--dlpath="${_PG_REGRESS_DLPATH}")
+fi
+regress_command+=("$@")
 
 set +e
 if [[ -n "${statement_timeout}" ]]; then

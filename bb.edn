@@ -68,7 +68,8 @@
 
   pg-regress-harness-test {:doc "Test reference selection, provenance and isolated result collection without database servers."
                           :task (do (shell "bb test/integration/postgres-regress/reference_test.clj")
-                                    (shell "bb test/integration/postgres-regress/comparison_test.clj"))}
+                                    (shell "bb test/integration/postgres-regress/comparison_test.clj")
+                                    (shell "bb test/integration/postgres-regress/fixtures_test.clj"))}
 
   pg-regress-inventory-test {:doc "Test audited release inventory completeness and admission boundaries."
                             :task (shell "bb test/integration/postgres-regress/inventory_test.clj")}
