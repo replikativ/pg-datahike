@@ -306,7 +306,7 @@
         project (io/file *temporary* "project")
         here (io/file project "test/integration/postgres-regress")
         collection (io/file project "results")]
-    (doseq [name ["reference.clj" "profiles.edn" "agreement.clj"]]
+    (doseq [name ["reference.clj" "profiles.edn" "agreement.clj" "comparison.clj"]]
       (file! (io/file here name)
              (slurp (io/file reference/repo-root "test/integration/postgres-regress" name))))
     (file! (io/file here "campaign.edn") "{:postgres-major 17 :postgres-ref \"REL_17_7\"}")
@@ -331,6 +331,17 @@
         (is (= (:commit source) (:source-commit manifest)))
         (is (= (:inputs-sha256 source) (:inputs-sha256 manifest)))
         (is (= 100.0 (get-in manifest [:files "foo"]))))
+      (let [before (slurp baseline-file)
+            staged (invoke "stage-measure")]
+        (is (zero? (:exit staged)) (str (:out staged) (:err staged)))
+        (is (= before (slurp baseline-file)))
+        (is (= :measured (:status (edn/read-string (slurp (io/file collection "baseline.edn")))))))
+      (let [seed "{:postgres-ref \"REL_17_7\" :status :unmeasured :files {}}"]
+        (spit baseline-file seed)
+        (let [r (invoke "gate")]
+          (is (not (zero? (:exit r))))
+          (is (str/includes? (:err r) "no measured agreement baseline"))
+          (is (= seed (slurp baseline-file)))))
       (let [foreign (pr-str {:postgres-ref "REL_18_6" :tolerance 3.0 :files {"foo" 100.0}})]
         (spit baseline-file foreign)
         (let [r (invoke "gate")]
@@ -402,6 +413,87 @@
         (is (not (.exists (io/file collection "foo.out"))))
         (is (= :incomplete (:status (edn/read-string (slurp (io/file collection "collection.edn")))))))
       (finally (.destroyForcibly unrelated) (.waitFor unrelated)))))
+
+(deftest comparison-deadline-keeps-baseline-and-unrelated-process
+  (load-file "test/integration/postgres-regress/agreement-runner.clj")
+  (let [baseline (io/file *temporary* "agreement.edn")
+        collection (io/file *temporary* "comparison")
+        staged (io/file collection "baseline.edn")
+        unrelated (.start (ProcessBuilder. ^java.util.List ["sleep" "30"]))
+        started (System/nanoTime)]
+    (.mkdirs collection)
+    (spit baseline "previous baseline")
+    (try
+      (with-redefs-fn
+        {(ns-resolve 'postgres-reference 'validate-collection!) (fn [& _] {:status :complete})
+         (ns-resolve 'postgres-reference 'termination-grace-ms) 100
+         (ns-resolve 'postgres-agreement-runner 'comparison-command)
+         (fn [& _] ["bash" "-c"
+                    "printf 'uncommitted result' > \"$1\"; trap '' TERM; while :; do sleep 1; done"
+                    "comparison-test" (str staged)])}
+        #(is (= 124 ((ns-resolve 'postgres-agreement-runner 'compare!)
+                     {:agreement (str baseline)} "measure" (str collection)
+                     {"AGREEMENT_COMPARE_TIMEOUT" "0.2s"}))))
+      (is (.exists staged))
+      (is (= "previous baseline" (slurp baseline)))
+      (is (< (/ (- (System/nanoTime) started) 1e9) 5))
+      (is (.isAlive unrelated))
+      (finally (.destroyForcibly unrelated) (.waitFor unrelated)))))
+
+(deftest baseline-promotion-requires-success-and-unchanged-scope-and-collection
+  (load-file "test/integration/postgres-regress/agreement-runner.clj")
+  (load-file "test/integration/postgres-regress/comparison.clj")
+  (let [{:keys [config]} (cfg! "17")
+        source (reference/validate-source! config)
+        baseline (io/file *temporary* "baseline.edn")
+        collection (io/file *temporary* "completed")
+        candidate (io/file *temporary* "candidate.edn")
+        staged (io/file collection "baseline.edn")
+        cfg (assoc config :agreement (str baseline))
+        receipt {:status :complete :outputs {"foo" "hash"}}
+        manifest {:postgres-ref "REL_17_7" :profile "17" :status :measured
+                  :source-commit (:commit source) :inputs-sha256 (:inputs-sha256 source)
+                  :files {"foo" 100.0}}
+        scope-var (intern (create-ns 'agreement) 'application-facing (fn [] ["foo"]))
+        run (fn [collection-fn names status]
+              (with-redefs-fn
+                {scope-var (fn [] names)
+                 (ns-resolve 'postgres-reference 'validate-collection!) collection-fn
+                 (ns-resolve 'postgres-agreement-runner 'comparison-command)
+                 (fn [& _] ["bash" "-c" "cp -- \"$1\" \"$2\"; exit \"$3\""
+                            "comparison-test" (str candidate) (str staged) (str status)])}
+                #((ns-resolve 'postgres-agreement-runner 'compare!) cfg "measure" (str collection) {})))]
+    (.mkdirs collection)
+    (spit candidate (pr-str manifest))
+    (spit baseline "old baseline")
+    (is (zero? (run (fn [& _] receipt) ["foo"] 0)))
+    (is (= manifest (edn/read-string (slurp baseline))))
+    (doseq [[check names status] [[(fn [& _] receipt) ["foo"] 1]
+                                  [(fn [& _] receipt) ["other"] 0]
+                                  [(let [calls (atom 0)]
+                                     (fn [& _] (if (= 1 (swap! calls inc)) receipt
+                                                   (assoc receipt :changed true)))) ["foo"] 0]]]
+      (spit baseline "old baseline")
+      (try (run check names status) (catch clojure.lang.ExceptionInfo _))
+      (is (= "old baseline" (slurp baseline))))
+    (spit candidate (pr-str (assoc manifest :inputs-sha256 "wrong")))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"provenance differs"
+                          (run (fn [& _] receipt) ["foo"] 0)))
+    (is (= "old baseline" (slurp baseline)))))
+
+(deftest setup-file-is-measured-directly-without-duplicating-fixture-bootstrap
+  (let [{:keys [env]} (cfg! "17")
+        directory (io/file *temporary* "setup-collection")
+        r (collect-through-wrapper (assoc env "AGREEMENT_FILES" "test_setup"
+                                          "AGREEMENT_KEEP" (str directory)))
+        receipt (edn/read-string (slurp (io/file directory "collection.edn")))
+        run (edn/read-string (slurp (io/file directory "runs/test_setup/reference.edn")))]
+    (is (zero? (:exit r)) (str (:out r) (:err r)))
+    (is (= :complete (:status receipt)))
+    (is (= #{"test_setup"} (set (keys (:outputs receipt)))))
+    (is (= ["test_setup"] (:tests run)))
+    (is (= "120s" (get-in run [:limits :statement-timeout])))
+    (is (not (.exists (io/file directory "runs/test_setup/setup"))))))
 
 (let [r (clojure.test/run-tests 'postgres-reference-test)]
   (System/exit (if (pos? (+ (:fail r) (:error r))) 1 0)))

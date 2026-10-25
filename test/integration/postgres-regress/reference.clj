@@ -158,6 +158,8 @@
   {:pg-regress-timeout (not-empty (get env "PG_REGRESS_TIMEOUT"))
    :statement-timeout (or (not-empty (get env "PG_REGRESS_STATEMENT_TIMEOUT")) "10s")
    :agreement-file-timeout (get env "AGREEMENT_FILE_TIMEOUT" "900")
+   :agreement-comparison-timeout (get env "AGREEMENT_COMPARE_TIMEOUT" "30m")
+   :agreement-comparison-heap "512m"
    :client-process-timeout-ms client-timeout-ms
    :client-statement-timeout-ms client-statement-timeout-ms
    :termination-grace-ms termination-grace-ms})

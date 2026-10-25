@@ -86,7 +86,19 @@ AGREEMENT_FILES="regproc type_sanity" bb pg-regress-probe
 
 Client observations and database cleanup have finite process and statement
 limits. Agreement file timeouts also force termination after a short grace period.
-Only complete results owned by that run are collected. Timeouts, connection loss,
+The JVM comparison has a 512 MiB heap limit and a 30-minute process deadline;
+set `AGREEMENT_COMPARE_TIMEOUT` (for example, `10m`) to change the deadline.
+Completed per-file comparisons are checkpointed using hashes of both inputs.
+To resume comparison after interruption without rerunning SQL, use the completed
+collection directory and the same profile/source settings:
+
+```bash
+bash test/integration/postgres-regress/agreement.sh compare probe /path/to/collection
+```
+
+The same comparison deadline and heap limit apply when resuming. Checkpoints do not replace a fresh SQL collection for a
+new build. The runner promotes a measured baseline only after its comparison
+process finishes successfully. Only complete results owned by that run are collected. Timeouts, connection loss,
 missing outputs, changed inputs and cross-version baselines fail the measurement;
 older `.out` files are not reused. `pg-regress-measure` rewrites the primary
 baseline only after a complete authoritative run. Agreement remains a canonical
