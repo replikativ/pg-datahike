@@ -147,6 +147,7 @@
          strict-subquery-row
          strict-scalar-subquery
          scalar-subquery-output-oid
+         array-subquery-output-oid
          in-left-asts
          row-expression?
          row-comparison-expression?
@@ -951,6 +952,7 @@
    :default-table (:default-table ctx)
    :from-binding-oids params/*from-binding-oids*
    :scalar-subquery-oid #(scalar-subquery-output-oid ctx %)
+   :array-subquery-oid #(array-subquery-output-oid ctx %)
    :hints         (:hints ctx)})
 
 (defn- source-oid
@@ -3509,9 +3511,8 @@
         params/*row-scope-aliases*))
 
 (defn- local-item-has-column?
-  "Could FROM item `item` supply column `cname`? A stored table answers
-   from the schema; any other relation (derived, function) is assumed to,
-   so a name it might own is never taken for an outer reference."
+  "Whether a FROM item can own a column. Known scalar SRF shapes are
+   resolved from syntax; unshaped relations conservatively claim the name."
   [item cname]
   (cond
     (nil? item) false
@@ -3520,17 +3521,36 @@
           tname (unquote-ident (.getName ^Table item))]
       (or (nil? db)
           (contains? (:schema db) (keyword tname cname))))
+
+    (instance? net.sf.jsqlparser.statement.select.TableFunction item)
+    (let [tf ^net.sf.jsqlparser.statement.select.TableFunction item
+          f (.getFunction tf)
+          fname (resolution-name (.getName f))
+          known-single? (or (= "generate_series" fname)
+                            (and (= "unnest" fname)
+                                 (= 1 (count (.getParameters f)))))
+          alias (.getAlias tf)
+          alias-cols (when alias
+                       (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                               (str/lower-case (unquote-ident (.-name c))))
+                             (.getAliasColumns alias)))]
+      (if known-single?
+        (let [names (cond-> [(or (local-item-alias item) fname)]
+                      (= "ORDINALITY" (some-> (.getWithClause tf) str))
+                      (conj "ordinality"))
+              names (into (vec alias-cols) (drop (count alias-cols) names))]
+          (contains? (set names) cname))
+        true))
     :else true))
 
 (defn ctx-level
   "The query level `ctx` is translating: one item per relation in scope,
    with the columns it exposes -- what an unqualified name in a NESTED
-   SELECT is resolved against (params/level-owners). A derived or function relation, or one whose columns we
-   cannot read, is marked :columns-unknown? so a name it might own is
+   SELECT is resolved against (params/level-owners). A relation whose columns we
+   cannot read is marked :columns-unknown? so a name it might own is
    never taken for an outer reference."
   [ctx]
-  (let [derived (or (:derived-aliases ctx) #{})
-        ;; One item per FROM OCCURRENCE: `table-aliases` registers both
+  (let [;; One item per FROM OCCURRENCE: `table-aliases` registers both
         ;; `{alias -> relation}` and `{relation -> relation}` for a single
         ;; item, so counting its entries calls an aliased relation
         ;; ambiguous with itself.
@@ -3550,7 +3570,7 @@
                      {:alias alias
                       :relation relation
                       :columns (or cols #{})
-                      :columns-unknown? (or (contains? derived alias) (nil? cols))})))}))
+                      :columns-unknown? (nil? cols)})))}))
 
 (defn correlated-subquery-refs
   "Return the outer-column references in `inner`, respecting every
@@ -5589,9 +5609,9 @@
 (defn- apply-subquery-order-limit
   "Apply the server-side SELECT tail used when nullable ORDER BY keys keep
    sorting out of Datalog. Rows still include any hidden sort projections."
-  [rows {:keys [sql-order-by sql-offset sql-limit has-aggregates? limit offset]}]
-  (let [tail-offset (or sql-offset (when has-aggregates? offset))
-        tail-limit (or sql-limit (when has-aggregates? limit))
+  [rows {:keys [sql-order-by sql-offset sql-limit has-aggregates? has-distinct? limit offset]}]
+  (let [tail-offset (or sql-offset (when (or has-aggregates? has-distinct?) offset))
+        tail-limit (or sql-limit (when (or has-aggregates? has-distinct?) limit))
         ordered (if sql-order-by
                   (sort (fn [a b]
                           (loop [parts (partition 3 sql-order-by)]
@@ -5704,8 +5724,9 @@
   (throw-subquery-error! p)
   (reject-unapplied-subquery-stages! p)
   (let [q (cond-> (:query p)
-            (and (:limit p) (not (:has-aggregates? p))) (assoc :limit (:limit p))
-            (and (:offset p) (not (:has-aggregates? p))) (assoc :offset (:offset p))
+            (:has-distinct? p) (dissoc :limit :offset)
+            (and (:limit p) (not (:has-aggregates? p)) (not (:has-distinct? p))) (assoc :limit (:limit p))
+            (and (:offset p) (not (:has-aggregates? p)) (not (:has-distinct? p))) (assoc :offset (:offset p))
             params/*cancel* (assoc :cancel params/*cancel*))
         in-args (:in-args p)
         query-db (or (:enriched-db p) db)
@@ -5728,6 +5749,7 @@
                   (apply-compound-projections raw (:find-aliases p) q in-args
                                               (:compound-exprs p))
                   [raw nil])
+        raw (if (:has-distinct? p) (fns/distinct-by-value raw) raw)
         raw (apply-subquery-order-limit raw p)
         hidden (long (or (:hidden-count p) 0))
         ;; apply-compound-projections already trimmed to the visible
@@ -6412,6 +6434,20 @@
               {:message "subquery must return only one column"})))
     parsed))
 
+(defn- reject-stateful-array-subquery! [inner]
+  (let [selects (cons inner (nested-selects-in inner))]
+    (when (some (fn [node]
+                  (let [expressions (cond
+                                      (instance? PlainSelect node)
+                                      (plain-select-scope-nodes node)
+                                      (instance? Values node) (.getExpressions ^Values node))]
+                    (some #(some (fn [fname] (= "nextval" (resolution-name fname)))
+                                 (params/ast-function-names %))
+                          expressions)))
+                selects)
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "stateful ARRAY subquery projection"})))))
+
 (defn scalar-subquery-output-oid
   "Analyze a scalar subquery and return its sole PostgreSQL output OID.
 
@@ -6440,6 +6476,24 @@
                         (seq (row-subquery-correlation-refs ctx inner)))
             parsed (analyze-scalar-subquery! ctx inner corr-refs)]
         (first (parsed-output-oids parsed))))))
+
+(defn array-subquery-output-oid
+  "Analyze ARRAY's single output column without evaluating its rows."
+  [ctx expr]
+  (let [inner (loop [node expr]
+                (if (instance? ParenthesedSelect node)
+                  (recur (.getSelect ^ParenthesedSelect node))
+                  node))
+        _ (reject-stateful-array-subquery! inner)
+        output-oid (scalar-subquery-output-oid ctx inner)
+        element-oid (get types/array-oid->element-oid output-oid output-oid)
+        array-oid (if (contains? types/array-oid->element-oid output-oid)
+                    output-oid
+                    (get types/element-oid->array-oid output-oid))]
+    (when-not (and array-oid (contains? types/oid->elem-kw element-oid))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "ARRAY subquery element type"})))
+    array-oid))
 
 (defn- statement-clock
   "The SQL value functions over the statement's time, read in the session
@@ -6500,9 +6554,43 @@
                        [(list 'ground :__null__) result-var])))
     result-var))
 
-(defn- uncorrelated-scalar-var!
-  "Bind an uncorrelated scalar subquery at query execution time."
-  [ctx inner]
+(defn- subquery-array
+  "Accumulate one-column rows, retaining nested array dimensions and bounds."
+  [output-oid rows]
+  (let [nested? (contains? types/array-oid->element-oid output-oid)
+        element-oid (get types/array-oid->element-oid output-oid output-oid)
+        element-type (or (get types/oid->elem-kw element-oid)
+                         (throw (errors/pg-error
+                                 :feature-not-supported
+                                 {:feature "ARRAY subquery element type"})))
+        values (mapv (fn [row] (let [v (first row)] (when-not (= :__null__ v) v))) rows)]
+    (when (some params/call-marker? (tree-seq coll? seq values))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "stateful ARRAY subquery projection"})))
+    (if (and nested? (seq values))
+      (let [arrays (mapv (fn [v]
+                           (when (nil? v)
+                             (throw (ex-info "cannot accumulate null arrays"
+                                             {:sqlstate "22004"})))
+                           (let [arr (coerce-pg-array v element-type)]
+                             (when (or (nil? arr) (empty? (:elements arr)))
+                               (throw (ex-info "cannot accumulate empty arrays"
+                                               {:sqlstate "2202E"})))
+                             arr))
+                         values)
+            first-array (first arrays)]
+        (when-not (every? #(= (select-keys first-array [:dims :lbounds])
+                              (select-keys % [:dims :lbounds])) arrays)
+          (throw (ex-info "cannot accumulate arrays of different dimensionality"
+                          {:sqlstate "2202E"})))
+        (pg-arr/array element-type (mapv :elements arrays)
+                      (into [(count arrays)] (:dims first-array))
+                      (into [1] (:lbounds first-array))))
+      (pg-arr/array element-type values))))
+
+(defn- uncorrelated-subquery-var!
+  "Bind an uncorrelated subquery expression once per statement execution."
+  [ctx inner evaluate-subquery]
   (let [parse-fn (:parse-sql ctx)
         schema (:schema ctx)
         fallback-db (:db ctx)
@@ -6514,11 +6602,11 @@
                    (if-let [cache params/*scalar-subquery-cache*]
                      (if (contains? @cache cache-key)
                        (get @cache cache-key)
-                       (let [value (strict-scalar-subquery
+                       (let [value (evaluate-subquery
                                     parse-fn inner schema fallback-db relation-namespaces)]
                          (swap! cache assoc cache-key value)
                          value))
-                     (strict-scalar-subquery
+                     (evaluate-subquery
                       parse-fn inner schema fallback-db relation-namespaces)))
         form (list fn-param)]
     (reset! (:runtime-subqueries? ctx) true)
@@ -6531,24 +6619,10 @@
         (swap! (:nullable-vars ctx) conj result-var)
         result-var))))
 
-(defn- correlated-scalar-var!
-  "Bind a variable to a CORRELATED scalar subquery's value, evaluated once
-   per outer row, and return the variable.
-
-   The subquery becomes an ordinary Datalog function binding --
-   `[(?corr-fn ?outer-col …) ?v]` -- so it is evaluated INSIDE the query,
-   with the outer row's values already bound. That is what makes it work
-   in WHERE: the filter runs before grouping and before LIMIT, exactly
-   where SQL puts it, with no post-pass to reorder.
-
-   Before this, a correlated scalar subquery in an expression was
-   evaluated ONCE at translate time. When the inner happened to translate
-   anyway -- which it does whenever the correlation predicate's outer
-   column resolves to a same-named inner one -- the result was a single
-   CONSTANT folded into the predicate: `WHERE 0 > (SELECT min(i) FROM ft
-   t2 WHERE t2.id <> ft.id)` became `0 > -3`, the GLOBAL minimum, and
-   every row passed."
-  [ctx inner corr-refs]
+(defn- correlated-subquery-var!
+  "Bind a subquery expression per outer row, with typed outer references.
+   The entity token keeps equal values on distinct outer entities separate."
+  [ctx inner corr-refs evaluate-subquery]
   (let [parse-fn (:parse-sql ctx)
         schema   (:schema ctx)
         db       (:db ctx)
@@ -6587,7 +6661,8 @@
                         ;; correlation predicate dissolves and every outer
                         ;; row gets the same uncorrelated answer.
                         params/*lateral-outer-aliases* (set (map first corr-refs))]
-                (eval-correlated-scalar parse-fn inner-sql true schema db))))]
+                (evaluate-subquery parse-fn inner-sql schema db
+                                   ctx/*relation-namespaces*))))]
     (reset! (:runtime-subqueries? ctx) true)
     (swap! (:in-params ctx) conj fn-param)
     (swap! (:in-args ctx) conj f)
@@ -7541,52 +7616,30 @@
           params (when-let [pl (.getParameters f)]
                    (.getExpressions ^ExpressionList pl))]
       (cond
-        ;; ARRAY(SELECT col FROM …) — PG's "construct array from
-        ;; subquery". JSqlParser parses it as Function name="array"
-        ;; with the inner SELECT as the sole argument. Pre-evaluate
-        ;; the inner SELECT (catalog-enriched db is in scope) and
-        ;; wrap all returned rows in a PgArray. Single-column inner
-        ;; → flat 1-D array (matches PG); multi-column inner is rare
-        ;; in PG idiom and would need a row-typed array, so we take
-        ;; the first column only and document it.
-        ;;
-        ;; psql's `\d <table>` uses this:
-        ;;   array_to_string(array(SELECT rolname FROM pg_roles
-        ;;                          WHERE oid = ANY(pol.polroles)), ',')
-        ;; Correlated against the outer pol row. With our virtual
-        ;; pg_policy empty, the outer never iterates and the array()
-        ;; never executes — but we still need a valid translation.
+        ;; ARRAY's one-column subplan shares scalar subquery analysis and
+        ;; execution, but collects every row instead of enforcing cardinality.
         (and (= fname "array")
              (= 1 (count params))
-             (or (instance? PlainSelect (first params))
-                 (instance? ParenthesedSelect (first params))))
-        (let [arg (first params)
-              inner (if (instance? ParenthesedSelect arg)
-                      (.getSelect ^ParenthesedSelect arg)
-                      arg)
-              db (:db ctx)
-              ;; This branch currently folds the inner rows while lowering.
-              ;; Mark the owning SELECT so prepared execution re-lowers it
-              ;; against the effective snapshot and the cross-call parse
-              ;; cache never retains the resulting array value.
-              _ (reset! (:runtime-subqueries? ctx) true)]
-          (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
-            (try
-              (let [parse-fn (:parse-sql ctx)
-                    parsed   (parse-fn (str inner) (:schema ctx) db)
-                    q        (:query parsed)
-                    in-args  (:in-args parsed)
-                    query-db (or (:enriched-db parsed) db)
-                    q-fn     d/q
-                    results  (if (seq in-args)
-                               (apply q-fn q query-db in-args)
-                               (q-fn q query-db))
-                    flat     (vec (map (fn [row]
-                                         (if (sequential? row) (first row) row))
-                                       results))]
-                (pg-arr/array :text flat))
-              (catch Throwable _ (pg-arr/array :text [])))
-            (pg-arr/array :text [])))
+             (instance? net.sf.jsqlparser.statement.select.Select (first params)))
+        (let [inner (loop [node (first params)]
+                      (if (instance? ParenthesedSelect node)
+                        (recur (.getSelect ^ParenthesedSelect node))
+                        node))
+              corr-refs (seq (row-subquery-correlation-refs ctx inner))
+              _ (reject-stateful-array-subquery! inner)
+              parsed (binding [*defer-stateful-projection?* false]
+                       (analyze-scalar-subquery! ctx inner corr-refs))
+              output-oid (first (parsed-output-oids parsed))
+              evaluate (fn [parse-fn sql schema db relation-namespaces]
+                         (binding [*defer-stateful-projection?* false]
+                           (subquery-array
+                            output-oid
+                            (strict-subquery-rows
+                             parse-fn sql schema db nil relation-namespaces
+                             {:expected-width 1 :unknown-from-left? false}))))]
+          (if corr-refs
+            (correlated-subquery-var! ctx inner corr-refs evaluate)
+            (uncorrelated-subquery-var! ctx inner evaluate)))
 
         (and (fns/aggregate-function? fname)
              ;; Resolve it before the enclosing expression types it:
@@ -7895,8 +7948,8 @@
             (do
               (analyze-scalar-subquery! ctx inner corr-refs)
               (if corr-refs
-                (correlated-scalar-var! ctx inner corr-refs)
-                (uncorrelated-scalar-var! ctx inner)))
+                (correlated-subquery-var! ctx inner corr-refs strict-scalar-subquery)
+                (uncorrelated-subquery-var! ctx inner strict-scalar-subquery)))
             :__null__))))
 
     ;; `(expr).field` -- a field of a composite value. PostgreSQL names

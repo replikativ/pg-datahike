@@ -1059,3 +1059,130 @@
                              " (SELECT AVG(id) * 1.2 FROM sg)")))))
     (testing "a FROM-less HAVING is still an explicit capability boundary"
       (is (= "0A000" (sqlstate c "SELECT 1 IN (SELECT count(*) HAVING false)"))))))
+
+(deftest array-subqueries-use-the-complete-runtime-plan
+  ;; These results and SQLSTATEs agree on PostgreSQL 17 and 18.
+  (with-open [c (jdbc)]
+    (is (= ["{2,3,4}" "{3,4,5}" "{4,5,6}"]
+           (col c 1 (str "SELECT ARRAY(SELECT sum(x+y) s FROM generate_series(1,3) y "
+                         "GROUP BY y ORDER BY s) FROM generate_series(1,3) x"))))
+    (is (= "{4,3}" (one c (str "SELECT ARRAY(SELECT x FROM generate_series(1,4) x "
+                               "ORDER BY x DESC LIMIT 2)"))))
+    (is (= [["integer[]" "{1}"]]
+           (rows c "SELECT pg_typeof(ARRAY(SELECT 1)), ARRAY(SELECT 1)")))
+    (is (= [["integer[]" "{}"]]
+           (rows c "SELECT pg_typeof(ARRAY(SELECT 1 WHERE false)), ARRAY(SELECT 1 WHERE false)")))
+    (is (= [["{NULL}" "integer[]"]]
+           (rows c "SELECT ARRAY(SELECT NULL::int), pg_typeof(ARRAY(SELECT NULL::int))")))
+    (is (= "{1,2}" (one c "SELECT ARRAY(SELECT 1 UNION ALL SELECT 2)")))
+    (is (= "{1,1}" (one c "SELECT ARRAY(SELECT 1 UNION ALL SELECT 1)")))
+    (is (= [["boolean[]" "{t,f}"]]
+           (rows c (str "SELECT pg_typeof(ARRAY(SELECT true)), "
+                        "ARRAY(SELECT true UNION ALL SELECT false)"))))
+    (is (= "{{1,2},{2,3}}"
+           (one c "SELECT ARRAY(SELECT ARRAY[x,x+1] FROM generate_series(1,2) x)")))
+    (doseq [[state sql] [["42601" "SELECT ARRAY(SELECT 1,2)"]
+                         ["42703" (str "SELECT ARRAY(SELECT unknown_column "
+                                       "FROM generate_series(1,3) x WHERE false)")]
+                         ["22012" "SELECT ARRAY(SELECT 1/0)"]]]
+      (is (= state (sqlstate c sql)) sql))))
+
+(deftest named-prepared-correlated-array-retains-types-and-reads-current-rows
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE array_outer (id int)")
+    (exec! c "CREATE TABLE array_inner (pid int, value int)")
+    (exec! c "INSERT INTO array_outer VALUES (1),(2)")
+    (exec! c "INSERT INTO array_inner VALUES (1,3),(1,2),(2,8)")
+    (with-open [statement (.prepareStatement c (str "SELECT id, ARRAY(SELECT value FROM array_inner i "
+                                                    "WHERE i.pid=o.id ORDER BY value DESC LIMIT 2) "
+                                                    "FROM array_outer o ORDER BY id"))]
+      (.setPrepareThreshold ^PGStatement statement 1)
+      (let [read-rows (fn []
+                        (with-open [rs (.executeQuery statement)]
+                          (is (= java.sql.Types/ARRAY (.getColumnType (.getMetaData rs) 2)))
+                          (loop [out []]
+                            (if (.next rs)
+                              (recur (conj out [(.getInt rs 1) (.getString rs 2)]))
+                              out))))]
+        (is (= [[1 "{3,2}"] [2 "{8}"]] (read-rows)))
+        (exec! c "INSERT INTO array_inner VALUES (1,9)")
+        (exec! c "DELETE FROM array_inner WHERE pid=2")
+        (is (= [[1 "{9,3}"] [2 "{}"]] (read-rows)))))))
+
+(deftest array-subqueries-retain-nested-shape-and-reject-unhandled-effects
+  (with-open [c (jdbc)]
+    (is (= "[1:1][0:1]={{1,2}}"
+           (one c "SELECT ARRAY(SELECT '[0:1]={1,2}'::int[])")))
+    (doseq [[state sql] [["2202E" "SELECT ARRAY(SELECT ARRAY[]::int[])"]
+                         ["22004" "SELECT ARRAY(SELECT NULL::int[])"]
+                         ["2202E" (str "SELECT ARRAY(SELECT CASE WHEN x=1 THEN ARRAY[1,2] "
+                                       "ELSE ARRAY[3] END FROM generate_series(1,2) x)")]]]
+      (is (= state (sqlstate c sql)) sql))
+    (exec! c "CREATE SEQUENCE array_effect START 1")
+    (doseq [sql ["SELECT ARRAY(SELECT nextval('array_effect'))"
+                 "SELECT ARRAY(SELECT pg_catalog.nextval('array_effect'))"
+                 (str "SELECT ARRAY(SELECT nextval('array_effect') + x.id*0) "
+                      "FROM (VALUES (1)) x(id) WHERE false")]]
+      (is (= "0A000" (sqlstate c sql)) sql))
+    (is (= "1" (one c "SELECT nextval('array_effect')")))))
+
+(deftest array-subquery-unqualified-columns-respect-inner-ownership
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE array_scope (x int)")
+    (exec! c "INSERT INTO array_scope VALUES (7),(8)")
+    (is (= ["{2,3}" "{2,3}"]
+           (col c 1 (str "SELECT ARRAY(SELECT x FROM generate_series(2,3) x ORDER BY x) "
+                         "FROM array_scope x ORDER BY x.x"))))
+    (is (= ["{8,9}" "{9,10}"]
+           (col c 1 (str "SELECT ARRAY(SELECT x+y FROM generate_series(1,2) g(y) ORDER BY y) "
+                         "FROM array_scope o ORDER BY x"))))))
+
+(deftest array-initplans-are-execution-local-and-describe-is-pure
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE array_initplan_rows (id int)")
+    (exec! c "INSERT INTO array_initplan_rows VALUES (1),(2),(3)")
+    (let [calls (atom 0)]
+      (with-redefs [fns/sql-random (fn [] (double (swap! calls inc)))]
+        (with-open [statement (.prepareStatement c (str "SELECT ARRAY(SELECT random()) "
+                                                        "FROM array_initplan_rows ORDER BY id"))]
+          (.setPrepareThreshold ^PGStatement statement 1)
+          (is (= java.sql.Types/ARRAY (.getColumnType (.getMetaData statement) 1)))
+          (is (zero? @calls) "Parse and Describe must not execute the subquery")
+          (let [read-values (fn []
+                              (with-open [rs (.executeQuery statement)]
+                                (loop [out []]
+                                  (if (.next rs)
+                                    (recur (conj out (.getString rs 1)))
+                                    out))))]
+            (is (= ["{1}" "{1}" "{1}"] (read-values)))
+            (is (= 1 @calls))
+            (is (= ["{2}" "{2}" "{2}"] (read-values)))
+            (is (= 2 @calls))))))))
+
+(deftest correlated-array-volatile-calls-follow-physical-outer-rows
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE array_parents (id int)")
+    (exec! c "CREATE TABLE array_children (pid int)")
+    (exec! c "INSERT INTO array_parents VALUES (1),(1),(1)")
+    (exec! c "INSERT INTO array_children VALUES (1),(1)")
+    (let [calls (atom 0)]
+      (with-redefs [fns/sql-random (fn [] (double (swap! calls inc)))]
+        (is (= ["{1}" "{2}" "{3}"]
+               (col c 1 (str "SELECT ARRAY(SELECT random()+p.id*0) "
+                             "FROM array_parents p ORDER BY p.db_id"))))
+        (is (= 3 @calls))
+        (reset! calls 0)
+        (is (= #{"{1}" "{2}" "{3}" "{4}" "{5}" "{6}"}
+               (set (col c 1 (str "SELECT ARRAY(SELECT random()+p.id*0) "
+                                  "FROM array_parents p JOIN array_children ch ON ch.pid=p.id")))))
+        (is (= 6 @calls))))))
+
+(deftest array-subquery-distinct-uses-sql-equality-before-limiting
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE array_floats (v double precision)")
+    (exec! c "INSERT INTO array_floats VALUES ('NaN'),('NaN'),(1),(2)")
+    (is (= "{NaN,2}"
+           (one c "SELECT ARRAY(SELECT DISTINCT v FROM array_floats ORDER BY v DESC LIMIT 2)")))
+    (is (= "{2}"
+           (one c (str "SELECT ARRAY(SELECT DISTINCT v FROM array_floats "
+                       "ORDER BY v DESC LIMIT 1 OFFSET 1)"))))))
