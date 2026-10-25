@@ -2,8 +2,9 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-pg_major="${PG_REGRESS_MAJOR:-17}"
-pg_bindir="${PG_REGRESS_BINDIR:-/usr/lib/postgresql/${pg_major}/bin}"
+source "${script_dir}/reference.sh"
+pg_major="${PG_REGRESS_MAJOR}"
+pg_bindir="${PG_REGRESS_BINDIR}"
 target_host="${PG_REGRESS_HOST:-127.0.0.1}"
 target_port="${PG_REGRESS_PORT:-15432}"
 target_user="${PG_REGRESS_USER:-datahike}"
@@ -30,7 +31,7 @@ echo "Verifying test_setup fixtures in ${target_host}:${target_port}/${target_db
 # the 6 its children loaded, and emp and student each hold stud_emp's 3.
 # These are real PostgreSQL 17's counts for the same four files.
 expected_counts="1000|1000|10000|10000|58|6|5|3"
-actual_counts="$("${psql}" -X -v ON_ERROR_STOP=1 --tuples-only --no-align \
+actual_counts="$(reference_psql -X -v ON_ERROR_STOP=1 --tuples-only --no-align \
   --field-separator='|' \
   --host="${target_host}" --port="${target_port}" --username="${target_user}" \
   --dbname="${target_db}" \

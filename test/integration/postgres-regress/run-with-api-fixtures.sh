@@ -12,8 +12,9 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
-pg_major="${PG_REGRESS_MAJOR:-17}"
-pg_bindir="${PG_REGRESS_BINDIR:-/usr/lib/postgresql/${pg_major}/bin}"
+source "${script_dir}/reference.sh"
+pg_major="${PG_REGRESS_MAJOR}"
+pg_bindir="${PG_REGRESS_BINDIR}"
 target_host="${PG_REGRESS_HOST:-127.0.0.1}"
 target_port="${PG_REGRESS_PORT:-15432}"
 target_user="${PG_REGRESS_USER:-datahike}"
@@ -27,6 +28,8 @@ if [[ $# -eq 0 ]]; then
   exit 2
 fi
 
+bb "${script_dir}/reference.clj" check-tests test_setup "$@"
+
 for test_name in "$@"; do
   if [[ "${test_name}" == "test_setup" ]]; then
     echo "test_setup is implicit in the fixture runner; do not pass it as a target" >&2
@@ -39,17 +42,16 @@ if [[ ! -x "${psql}" ]]; then
   exit 2
 fi
 
-if [[ -n "${PG_REGRESS_OUTPUT:-}" ]]; then
-  output_dir="${PG_REGRESS_OUTPUT}"
-else
-  run_stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  output_dir="${repo_root}/.internal/pg-regress/${run_stamp}"
+output_dir="$(bb "${script_dir}/reference.clj" output)"
+if [[ -d "${output_dir}" ]] && [[ -n "$(ls -A "${output_dir}")" ]]; then
+  echo "Output directory must be empty: ${output_dir}" >&2
+  exit 2
 fi
 mkdir -p "${output_dir}/setup" "${output_dir}/tests"
 
 cleanup_isolated_db() {
   if [[ "${database_created}" == "1" ]]; then
-    "${psql}" -X \
+    reference_psql -X \
       --host="${target_host}" --port="${target_port}" --username="${target_user}" \
       --dbname="${admin_db}" --set=ON_ERROR_STOP=1 \
       --command="DROP DATABASE IF EXISTS \"${isolated_db}\"" >/dev/null || true
@@ -60,7 +62,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "Creating disposable fixture database ${isolated_db} (admin: ${admin_db})"
-"${psql}" -X \
+reference_psql -X \
   --host="${target_host}" --port="${target_port}" --username="${target_user}" \
   --dbname="${admin_db}" --set=ON_ERROR_STOP=1 \
   --command="CREATE DATABASE \"${isolated_db}\"" >/dev/null

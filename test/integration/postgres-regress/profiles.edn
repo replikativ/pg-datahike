@@ -1,0 +1,12 @@
+{:default "17"
+ :profiles
+ {"17" {:major 17
+        :postgres-ref "REL_17_7"
+        :status :primary
+        :campaign "campaign.edn"
+        :scope "scope.edn"
+        :ledger "routine-trigger-capabilities.edn"
+        :agreement "agreement.edn"}
+  "18" {:major 18
+        :postgres-ref "REL_18_6"
+        :status :discovery}}}

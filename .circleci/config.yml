@@ -228,6 +228,7 @@ jobs:
       - run:
           name: Validate beta-exit and PostgreSQL campaign inventories
           command: |
+            bb pg-regress-harness-test
             bb beta-exit
             bb pg-regress-wave inventory
 

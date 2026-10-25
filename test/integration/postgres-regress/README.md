@@ -4,22 +4,49 @@ This harness runs PostgreSQL's own `pg_regress` driver and unmodified
 regression SQL against an existing pg-datahike server. It is a compatibility
 baseline and triage tool, not an all-green gate.
 
-Start pg-datahike on port 15432, then run one or more named tests:
+Start the pg-datahike build you intend to measure on port 15432, materialize
+the pinned source, then run one or more named tests:
 
 ```bash
+bb pg-regress-setup
 bb pg-regress jsonb
 bb pg-regress jsonb expressions
 ```
 
-The default PostgreSQL source checkout is `../postgres`. Override paths and
-the target endpoint when needed:
+`PG_REGRESS_PROFILE` selects the reference source and client-tool major together:
+
+| Profile | Source release | Available operations |
+|---|---|---|
+| `17` (default) | `REL_17_7` | Named tests, fixture runs, audited waves and agreement |
+| `18` | `REL_18_6` | Named discovery tests and fixture runs |
+
+For example, with PostgreSQL 18's tools installed:
 
 ```bash
-POSTGRES_SOURCE=/path/to/postgres \
+PG_REGRESS_PROFILE=18 bb pg-regress-setup
+PG_REGRESS_PROFILE=18 bb pg-regress int4
+```
+
+This selects the test reference; it does not change pg-datahike's advertised
+version or runtime catalog. Profile 18 has no admitted wave or agreement
+inventory yet, so those commands reject it.
+
+Sources default to `.internal/postgres-REL_17_7` or
+`.internal/postgres-REL_18_6`. A missing pinned checkout is an error; the harness
+does not fall back to a moving `../postgres` checkout. Override the source and
+target endpoint when needed:
+
+```bash
+POSTGRES_SOURCE=/path/to/pinned-postgres \
 PG_REGRESS_PORT=15436 \
 PG_REGRESS_DB=datahike \
 bb pg-regress jsonb
 ```
+
+`POSTGRES_SOURCE` names the checkout; the legacy `PG_REGRESS_SRC` names its
+`src/test/regress` directory. If both are supplied they must agree. Connection
+credentials use standard libpq environment variables such as `PGPASSWORD` or
+`PGPASSFILE`; connection URIs/conninfo are not accepted as `PG_REGRESS_DB`.
 
 For independent discovery runs against a server configured with SQL database
 provisioning, create and remove a uniquely named database automatically:
@@ -33,9 +60,43 @@ named by `PG_REGRESS_DB` is used as the administrative connection and is never
 dropped. Isolation fails early when the target has no `CREATE DATABASE` hook,
 instead of silently reusing contaminated state.
 
-The script uses PostgreSQL 17's installed `pg_regress` and `psql` by default.
-Override them with `PG_REGRESS_BIN`, `PG_REGRESS_BINDIR`, or
-`PG_REGRESS_MAJOR`.
+The selected profile defaults to `/usr/lib/postgresql/MAJOR/bin/psql` and the
+matching installed `pg_regress`. `PG_REGRESS_BIN` and `PG_REGRESS_BINDIR` can
+point at another installation of that major. Tool versions and an explicitly
+supplied `PG_REGRESS_MAJOR` must agree with the profile.
+
+Each run retains raw output and a `reference.edn` receipt under
+`.internal/pg-regress/REL_*/RUN/`, or the empty directory explicitly supplied as
+`PG_REGRESS_OUTPUT`. Receipts identify the source commit/input hashes, tool
+versions, preflight-session server version/settings and completion status. The
+preflight settings describe that connection, not every regression session; the
+upstream driver also sets session defaults. Receipts record operator timeout
+settings, hash `PGOPTIONS` without storing its contents, and fingerprint the
+runner harness files. The runner checkout is identified separately: the external server's
+code revision is **unverified**, and its advertised version does not establish
+which build is running. Start/restart the intended server build before measuring.
+
+Agreement commands also require an already-running endpoint and never start,
+stop or recycle a server. Results stay in a versioned run directory; an optional
+`AGREEMENT_KEEP` must name an empty collection directory. A probe can select files:
+
+```bash
+AGREEMENT_FILES="regproc type_sanity" bb pg-regress-probe
+```
+
+Client observations and database cleanup have finite process and statement
+limits. Agreement file timeouts also force termination after a short grace period.
+Only complete results owned by that run are collected. Timeouts, connection loss,
+missing outputs, changed inputs and cross-version baselines fail the measurement;
+older `.out` files are not reused. `pg-regress-measure` rewrites the primary
+baseline only after a complete authoritative run. Agreement remains a canonical
+expected-line score, distinct from `pg_regress`'s whole-file/expected-variant result.
+
+Run the filesystem/subprocess harness tests without database servers:
+
+```bash
+bb pg-regress-harness-test
+```
 
 The compatibility campaign is machine-readable in `campaign.edn`. List its
 waves and current admission modes, or run a whole wave (optionally restricted
@@ -60,11 +121,11 @@ PostgreSQL storage, planner, replication, or server-administration internals
 are pg-datahike release criteria.
 
 The campaign is pinned to the PostgreSQL tag recorded as `:postgres-ref` in
-`campaign.edn`. `POSTGRES_SOURCE` must point at a checkout whose `HEAD` is that
-exact tag, so source-line admissions cannot silently drift when `../postgres`
-moves to another major release. For deliberate exploratory runs against a
-different revision, set `PG_REGRESS_ALLOW_UNPINNED=1`; do not use that override
-when admitting strict slices.
+`campaign.edn` and the selected profile. `POSTGRES_SOURCE` must point at that
+release commit with clean regression SQL, expected outputs, schedules and fixture
+inputs. For deliberate exploratory named runs against changed inputs, set
+`PG_REGRESS_ALLOW_UNPINNED=1`. Such runs are labeled non-authoritative and cannot
+rewrite/compare agreement baselines or run strict slices.
 
 Create and verify the pinned checkout under the ignored `.internal/` directory
 without modifying an existing `../postgres` tree:

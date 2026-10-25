@@ -3,24 +3,19 @@
 (require '[babashka.fs :as fs]
          '[babashka.process :refer [shell]]
          '[clojure.edn :as edn]
-         '[clojure.java.shell :as sh]
          '[clojure.set :as set]
          '[clojure.string :as str])
 
 (def here (fs/parent (fs/file *file*)))
 (def repo-root (-> here fs/parent fs/parent fs/parent))
-(def campaign (edn/read-string (slurp (fs/file here "campaign.edn"))))
-(def scope (edn/read-string (slurp (fs/file here "scope.edn"))))
-(def routine-trigger-ledger
-  (edn/read-string
-   (slurp (fs/file here "routine-trigger-capabilities.edn"))))
-(def pinned-postgres-source
-  (fs/file repo-root ".internal" (str "postgres-" (:postgres-ref campaign))))
-(def postgres-source
-  (fs/file (or (System/getenv "POSTGRES_SOURCE")
-               (when (fs/directory? pinned-postgres-source)
-                 (str pinned-postgres-source))
-               (str (fs/file repo-root ".." "postgres")))))
+(load-file (str (fs/file here "reference.clj")))
+(alias 'reference 'postgres-reference)
+(def reference-config (reference/config (str repo-root) (System/getenv)))
+(reference/require-campaign! reference-config)
+(def campaign (edn/read-string (slurp (:campaign reference-config))))
+(def scope (edn/read-string (slurp (:scope reference-config))))
+(def routine-trigger-ledger (edn/read-string (slurp (:ledger reference-config))))
+(def postgres-source (fs/file (:source reference-config)))
 
 (defn fail! [message]
   (binding [*out* *err*]
@@ -204,35 +199,10 @@
           (fail! (str "only admitted evidence may declare gate/test-var: " id)))))))
 
 (defn validate-postgres-ref! []
-  (let [expected (:postgres-ref campaign)
-        allow-unpinned? (= "1" (System/getenv "PG_REGRESS_ALLOW_UNPINNED"))
-        {:keys [exit out err]}
-        (sh/sh "git" "-C" (str postgres-source)
-               "describe" "--tags" "--exact-match" "HEAD")
-        actual (str/trim out)
-        relevant-diff (sh/sh "git" "-C" (str postgres-source)
-                             "diff" "--quiet" "HEAD" "--"
-                             "src/test/regress/parallel_schedule"
-                             "src/test/regress/sql")
-        clean-source? (zero? (:exit relevant-diff))]
-    (cond
-      (and (zero? exit) (= expected actual) clean-source?) nil
-      allow-unpinned?
+  (let [source (reference/validate-source! reference-config)]
+    (when-not (:authoritative? source)
       (binding [*out* *err*]
-        (println (str "campaign warning: expected PostgreSQL " expected
-                      " with clean regression sources, using "
-                      (if (seq actual) actual (str/trim err))
-                      (when-not clean-source? " (modified regression sources)"))))
-      (and (zero? exit) (= expected actual))
-      (fail! (str "PostgreSQL checkout is at " expected
-                  " but its regression schedule or SQL files are modified. "
-                  "Use a clean pinned checkout for campaign validation, or set "
-                  "PG_REGRESS_ALLOW_UNPINNED=1 for deliberate discovery."))
-      :else
-      (fail! (str "PostgreSQL source must be checked out at " expected
-                  "; got " (if (seq actual) actual (str/trim err))
-                  ". Set POSTGRES_SOURCE to a pinned checkout, or set "
-                  "PG_REGRESS_ALLOW_UNPINNED=1 for deliberate discovery.")))))
+        (println "campaign warning: unpinned discovery inputs; strict operations are disabled")))))
 
 (defn validate! []
   (validate-postgres-ref!)
@@ -463,15 +433,15 @@
         (println (str "running wave " wave-id
                       (when mode (str " mode " (clojure.core/name mode)))
                       ": " (str/join " " names)))
+        (when (= mode :strict)
+          (reference/require-authoritative! reference-config))
         (let [runner ["bash" (str (fs/file here
                                            (if api-fixtures?
                                              "run-with-api-fixtures.sh"
                                              "run.sh")))]
-              ;; Validation and execution must use the same checkout. Without
-              ;; this explicit environment entry, run.sh falls back to the
-              ;; developer's moving ../postgres tree even though the campaign
-              ;; above was validated against .internal/postgres-REL_17_7.
+              ;; Preserve the validated profile and checkout in the child runner.
               command (into ["env"
+                             (str "PG_REGRESS_PROFILE=" (:profile reference-config))
                              (str "POSTGRES_SOURCE=" postgres-source)]
                             (concat (when (= mode :strict)
                                       ["PG_REGRESS_API_STRICT=1"])
