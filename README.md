@@ -394,9 +394,12 @@ AS ENUM`, `CREATE DOMAIN`, partitioned tables (parent + children).
 Data-side coverage includes `INSERT` (single + multi-VALUES) and
 atomic `COPY … FROM stdin` (text and CSV formats), including streaming UTF-8,
 NULL/default markers, constraints, and statement cancellation. Explicit COPY
-`ENCODING` currently accepts UTF-8 spellings only. Run with the `:pg-dump`
-compat preset to silently accept the rest of `pg_dump`'s noise
-(triggers, functions, materialized views, ALTER OWNER):
+`ENCODING` currently accepts UTF-8 spellings only. Use `:compat :pg-dump`
+to load dumps that contain unsupported schema forms. Supported functions,
+triggers and materialized views still execute normally. The preset treats
+selected unsupported forms as successful no-ops; it does not preserve their
+behavior. Review those objects before using a restored database for
+application writes:
 
 ```clojure
 (pg/start-server registry {:port 5432 :compat :pg-dump})
@@ -483,19 +486,19 @@ Bypass the wire layer for tests or in-process applications:
 
 ## Compat with strict vs. permissive clients
 
-By default the handler rejects unsupported DDL (GRANT, REVOKE, POLICY,
-ROW LEVEL SECURITY, CREATE EXTENSION, triggers, functions, …) with
-SQLSTATE `0A000 feature_not_supported`. Real-world clients emit a lot
-of this noise unconditionally — opt in by named preset:
+The default mode rejects many unsupported DDL forms with SQLSTATE
+`0A000 feature_not_supported`. Compatibility presets can accept selected
+rejected forms as successful no-ops. They do not disable supported
+implementations or validate that an imported schema behaves like its
+PostgreSQL source:
 
 ```clojure
 ;; ORM noise: GRANT/REVOKE/POLICY/RLS/EXTENSION (Hibernate, Odoo, Rails)
 (pg/make-query-handler conn {:compat :permissive})
 
-;; pg_dump output: superset of :permissive that also accepts
-;; CREATE TRIGGER / FUNCTION / PROCEDURE / AGGREGATE / RULE,
-;; MATERIALIZED VIEW, ATTACH PARTITION, ALTER TYPE/DOMAIN, etc.
-;; Use this when loading dump files from real PostgreSQL.
+;; pg_dump: also accept selected unsupported routine, trigger,
+;; materialized-view, type and partition forms.
+;; Supported forms retain their normal behavior.
 (pg/make-query-handler conn {:compat :pg-dump})
 
 ;; or accept specific kinds only
@@ -563,10 +566,30 @@ DISTINCT/GROUP BY vector keys are not exposed yet), `bytea`,
 `timestamp with time zone`, `CHARACTER(N)`, `SERIAL`,
 atomic `COPY … FROM stdin` (text + CSV, streaming UTF-8, NULL/default markers),
 `ALTER TABLE … ADD CONSTRAINT
-FOREIGN KEY … ON UPDATE CASCADE ON DELETE RESTRICT`.
+FOREIGN KEY … ON UPDATE NO ACTION ON DELETE CASCADE`.
 
 Generated identity and SERIAL sequence names use `<table>_<column>_seq`.
 Existing names raise `42P07`; automatic suffix selection is not yet supported.
+
+Stored generated columns are computed on INSERT and recomputed on UPDATE;
+explicit assignments are restricted. Enum comparisons, ordering, MIN and MAX
+use declaration order.
+
+SQL functions support expression bodies, selected no-argument scalar table
+queries and set-returning SELECT bodies, including argument-bearing calls in
+FROM. A PL/pgSQL subset supports variables, assignments,
+conditionals, loops, database statements, returns and RAISE, including ordinary
+trigger functions and DO blocks. The routine limitations below still apply.
+
+Ordinary BEFORE/AFTER row and statement triggers support INSERT, UPDATE and
+DELETE, with statement-level TRUNCATE triggers, WHEN/UPDATE OF conditions and
+transition tables for supported AFTER-trigger forms. Constraint/event triggers
+and INSTEAD OF view-trigger execution are unsupported.
+
+Materialized views store query results; REFRESH replaces their contents.
+CONCURRENTLY uses the same refresh path, without PostgreSQL's
+concurrent-refresh checks. Storage options are unsupported. WITH NO DATA
+handling is incomplete and can execute the query.
 
 `regproc` and `regprocedure` refer to functions by their numeric OID.
 Use `'now'::regproc` for an unambiguous name or
@@ -617,47 +640,54 @@ stored routines with arguments, writes to tables with defaults or generated
 columns, and statements beyond the bounded analysis limits. Stored column values
 keep their numeric identity.
 
-### Accepted under `:compat :pg-dump` (no semantics, schema loads)
+### Additional compatibility fallbacks
 
-`CREATE TRIGGER`, `CREATE FUNCTION` (incl. `$$…$$` body),
-`CREATE PROCEDURE`, `CREATE AGGREGATE`, `CREATE RULE`, `CREATE OPERATOR`,
-`CREATE CAST`, `CREATE LANGUAGE`, `CREATE MATERIALIZED VIEW`,
-`ALTER TYPE / DOMAIN`, `ALTER TABLE … ATTACH PARTITION` /
-`DETACH PARTITION`, `ALTER … OWNER TO`, `\restrict`/`\unrestrict`
-psql metacommands, `pg_catalog.set_config(...)`. Partitioned tables
-load: the parent becomes a plain, empty table, partition children load
-as independent tables, and pg_dump's per-child rows land where they
-should. Outside this preset `PARTITION BY` is refused with 0A000
-(accept it on its own with `:silently-accept #{:partitioned-table}`) --
-an unpartitioned parent would accept rows PostgreSQL rejects.
+With `:compat :pg-dump`, selected unsupported procedure, aggregate, rule,
+operator, cast and language forms can be accepted as no-ops, along with
+unsupported variants of routines, triggers, materialized views and types.
+Supported variants retain their normal behavior.
+
+Partitioned tables load under this preset: the parent becomes a plain, empty
+table, children load as independent tables, and pg_dump's per-child rows land
+in those tables. Partition relationships and routing are not implemented.
+Outside this preset `PARTITION BY` is refused with `0A000`; it can be accepted
+separately with `:silently-accept #{:partitioned-table}`. An unpartitioned
+parent can accept rows PostgreSQL would reject.
+
+`ALTER … OWNER TO` and dump metacommand markers such as `\restrict` /
+`\unrestrict` are accepted independently of these presets. `set_config`
+updates modeled session settings; accepting an unmodeled setting does not
+implement its PostgreSQL behavior.
 
 ### Known gaps (by design or deferred)
 
-- No PL/pgSQL execution (CREATE FUNCTION's body is silently accepted
-  but never invoked).
-- No `LISTEN` / `NOTIFY`.
-- FK `ON DELETE CASCADE` / `SET NULL` / `SET DEFAULT` rejected at DDL
-  (RESTRICT is the default and only supported action).
-- Single `public` schema — `CREATE SCHEMA` silently accepted but no-op.
-- Cursor materialization is eager (entire result set held in memory).
-- No deferrable constraints.
-- Generated columns parse but aren't enforced.
-- ENUM ordering is lexicographic (string storage) rather than PG's
-  declaration-order. `ORDER BY` on enum-typed columns may diverge.
-- Partitioned tables: data lives in the children, not the parent (pg-
-  datahike doesn't model the partition relation). Live workloads that
-  need partition-aware routing into the parent table are out of scope.
-- **Constraint enforcement is one-directional in 0.1.** SQL constraints
-  declared via DDL — `NOT NULL`, `CHECK`, `UNIQUE`, foreign-key
-  child-side and parent-side `RESTRICT`, DOMAIN CHECK / NOT NULL,
-  ENUM membership — are enforced by the pgwire handler at write time
-  (via a `:db.fn/call` wrapper that runs against the speculative
-  txdb, mirroring PG IMMEDIATE constraint semantics). Direct
-  `(d/transact)` writes from Clojure bypass these checks because
-  Datahike's schema does not yet carry the corresponding constraint
-  vocabulary. Use the SQL path for constrained inserts, or validate
-  explicitly before transacting. A future release will lift enforcement
-  into Datahike's tx layer so both paths are gated.
+- Routines: dynamic EXECUTE (including FOR IN EXECUTE), exception handlers,
+  cursors and GET DIAGNOSTICS are unsupported. FOUND behavior, signatures,
+  name resolution and definition-time validation are incomplete. Procedures
+  and SQL-standard BEGIN ATOMIC bodies are unsupported.
+- LISTEN, UNLISTEN, NOTIFY and `pg_notify` are accepted, but notifications
+  are not delivered.
+- Immediate foreign keys enforce child references and parent NO ACTION /
+  RESTRICT checks; ON DELETE CASCADE is implemented. NO ACTION is the default.
+  ON DELETE SET NULL / SET DEFAULT and mutating ON UPDATE actions are
+  unsupported, as are deferrable constraints. Foreign-key definition
+  validation is incomplete.
+- Application objects use a single `public` schema. CREATE SCHEMA does not
+  create a schema or embedded objects. Non-public object creation and lookup
+  through search_path are unreliable.
+- Cursors are materialized eagerly. Result-row limits do not bound all
+  intermediate query work or PL/pgSQL loops.
+- Virtual generated columns are unsupported; generated-expression definition
+  validation is incomplete.
+- Some advanced enum overload-resolution and catalog details differ from
+  PostgreSQL.
+- Partitioned tables do not route writes through the parent or combine child
+  rows when reading it.
+- **Constraint enforcement applies to SQL writes.** NOT NULL, CHECK, UNIQUE,
+  foreign-key child references and parent checks/cascades, DOMAIN CHECK /
+  NOT NULL and ENUM membership are enforced by the pgwire handler at write
+  time. Direct `(d/transact)` writes bypass these SQL-level checks. Use the
+  SQL path for constrained writes, or validate explicitly before transacting.
 
 ## Development
 
