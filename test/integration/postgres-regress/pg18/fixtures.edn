@@ -17,6 +17,7 @@
   "psql" ["create_index" "create_am"]
   "copy2" ["create_type"]
   "event_trigger" ["create_am"]
+  "create_am" ["create_index"]
   "explain" ["create_index"]
   "groupingsets" ["create_index"]
   "inherit" ["create_index"]

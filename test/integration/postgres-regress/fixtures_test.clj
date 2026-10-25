@@ -448,5 +448,15 @@
     (is (= before (slurp log)))
     (is (= :failed (:status (fixtures/read-edn (io/file output "fixture-database-cleanup.edn")))))))
 
+(deftest actual-descriptor-orders-access-method-fixtures-transitively-once
+  (let [{:keys [cfg source]} (fixture!)
+        data (fixtures/read-edn (io/file reference/repo-root "test/integration/postgres-regress/pg18/fixtures.edn"))]
+    (doseq [name (distinct (concat (keys (:prerequisites data)) (mapcat val (:prerequisites data))))]
+      (file! (io/file source "src/test/regress/sql" (str name ".sql")) "SELECT 1;\n"))
+    (is (= ["test_setup" "create_index" "create_am" "event_trigger"]
+           (fixtures/ordered-closure cfg data ["event_trigger"])))
+    (is (= ["test_setup" "create_index" "create_am" "psql"]
+           (fixtures/ordered-closure cfg data ["psql"])))))
+
 (let [result (clojure.test/run-tests 'postgres-fixtures-test)]
   (System/exit (if (pos? (+ (:fail result) (:error result))) 1 0)))
