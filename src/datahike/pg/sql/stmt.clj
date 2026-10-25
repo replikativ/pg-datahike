@@ -4614,6 +4614,7 @@
                      :table-aliases table-aliases
                      :default-table default-table
                      :scalar-subquery-oid #(expr/scalar-subquery-output-oid ctx %)
+                     :array-subquery-oid #(expr/array-subquery-output-oid ctx %)
                      :hints (pgs/schema-hints db)}
         reject-vector-distinct-aggregate!
         (fn [distinct? inner-expr]
@@ -5726,6 +5727,7 @@
                  :default-table default-table
                  :from-binding-oids params/*from-binding-oids*
                  :scalar-subquery-oid #(expr/scalar-subquery-output-oid ctx %)
+                 :array-subquery-oid #(expr/array-subquery-output-oid ctx %)
                  :hints (pgs/schema-hints db)}
         ;; OID inference per select-item. The expr-oid walker handles
         ;; AnalyticExpression (windows, WITHIN GROUP) and arithmetic

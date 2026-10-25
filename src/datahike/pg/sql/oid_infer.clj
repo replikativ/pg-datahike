@@ -697,6 +697,11 @@
                  (get sql-fn->return-oid fname)
                  (get-in fns/sql-function-specs [fname :return-oid]))]
     (cond
+      (and (= fname "array") (= 1 (count args))
+           (instance? net.sf.jsqlparser.statement.select.Select first-arg))
+      (when-let [analyze (:array-subquery-oid env)]
+        (analyze first-arg))
+
       ;; ROW(...) — anonymous composite constructor → record OID (2249).
       ;; A ::type cast wrapping it overrides via cast-oid.
       (= fname "row") 2249
