@@ -3550,7 +3550,8 @@
         query-db (or enriched-db db)
         ;; Row-matching query cached per (parsed, schema) — see
         ;; update-row-match-cache / build-update-tx-for-bindings.
-        shape-key (when (nil? enriched-db)
+        shape-key (when (and (nil? enriched-db)
+                             (not (:execution-materialization? parsed)))
                     [(pg-cache/identity-key parsed)
                      (pg-cache/identity-key schema)
                      ;; `ONLY` is stripped from the SQL before the parser
@@ -3731,7 +3732,8 @@
    uncorrelated subqueries run once."
   [parsed schema db]
   (let [k [::set-plan (pg-cache/identity-key parsed) (pg-cache/identity-key schema)]]
-    (or (.get ^java.util.Map update-row-match-cache k)
+    (or (when-not (:execution-materialization? parsed)
+          (.get ^java.util.Map update-row-match-cache k))
         (let [{:keys [table alias assignments where-expr from-sql]} parsed
               quoted #(str \" (str/replace % "\"" "\"\"") \")
               column-constraints (read-column-constraints db table)
@@ -3823,7 +3825,8 @@
           ;; cacheable-parse? says. Keeping it would re-run a later
           ;; execution -- in another session, or after a write -- against
           ;; the snapshot this one was translated on.
-          (when-not (:enriched-db plan)
+          (when-not (or (:enriched-db plan)
+                        (:execution-materialization? plan))
             (.put ^java.util.Map update-row-match-cache k v))
           v))))
 
@@ -5924,6 +5927,22 @@
                             (contains? spec :in-args)
                             (update :in-args params/substitute-params fetch))))
                       specs))))))
+
+(defn- execution-local-plan?
+  "True when a prepared parse contains data that belongs to one execution.
+
+   `:execution-materialization?` is the producer contract.  The remaining
+   predicates are the pre-existing refresh cases kept here while their
+   producers migrate to that contract."
+  [parsed]
+  (or (:execution-materialization? parsed)
+      (:reparse-with-bound-params? parsed)
+      (and (:runtime-subqueries? parsed) (:enriched-db parsed))
+      (:materialisation-params? parsed)
+      (and (= :insert (:type parsed))
+           (:insert-source parsed)
+           (or (:enriched-db parsed)
+               (get-in parsed [:insert-source :source :enriched-db])))))
 
 (defn- coerce-insert-tx-data
   "After ParamRef substitution, an INSERT's `:tx-data` entity maps may
@@ -8118,6 +8137,8 @@
   (when (and (= :select (:type parsed))
              (:query parsed) (seq (:find-aliases parsed))
              (nil? (:enriched-db parsed))
+             (not (:execution-materialization? parsed))
+             (not (:reparse-with-bound-params? parsed))
              (not (:runtime-subqueries? parsed))
              (nil? (:correlated-subqueries parsed))
              (nil? (:compound-exprs parsed))
@@ -14438,23 +14459,7 @@
                         (catch PgWireServer$PgProtocolException e
                           (when (:in-tx? @tx-state)
                             (swap! tx-state assoc :aborted? true))
-                          (throw e))))
-              ;; The cardinality of a target-list SRF such as
-              ;; generate_series(1,$1) is unknowable at Parse. Its parsed
-              ;; map carries RowDescription metadata; now that Bind supplied
-              ;; values, lower the statement to the actual literal rows.
-              parsed (if (:reparse-with-bound-params? parsed)
-                       (let [db (if (:in-tx? @tx-state)
-                                  (or (:speculative-db @tx-state) (d/db conn))
-                                  (d/db conn))]
-                         (binding [params/*bound-params* (vec (rest bound))
-                                   params/*declared-param-oids*
-                                   (:declared-param-oids parsed)]
-                           (assoc (parse-prepared-session-sql (:sql parsed) (dbi/-schema db) db
-                                                              temp-tables session-id session-state prepared-analyses parsed)
-                                  :sql (:sql parsed)
-                                  :declared-param-oids (:declared-param-oids parsed))))
-                       parsed)]
+                          (throw e))))]
           (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
                                                       (java.util.IdentityHashMap.))
                     regoid/*db* (statement-read-db conn tx-state session-state)
@@ -14643,40 +14648,20 @@
                       ;; (Extended-Query Parse already counted at this.parse).
                             {parsed :parsed templated-bound :bound}
                             (if-let [cached *cached-parsed*]
-                              (let [cached (if (= (::catalog-basis (meta cached)) statement-basis)
-                                             cached
-                                             (binding [params/*declared-param-oids*
-                                                       (:declared-param-oids cached)]
-                                               (assoc (parse-prepared-session-sql sql schema db
-                                                                                  temp-tables session-id session-state prepared-analyses cached)
-                                                      :declared-param-oids
-                                                      (:declared-param-oids cached))))]
+                              (let [basis-current?
+                                    (= (::catalog-basis (meta cached)) statement-basis)]
                                 {:parsed
                                  (if-let [bound *cached-bound*]
-                                   (let [;; A runtime subquery over a CTE or
-                                       ;; derived relation needs query-local
-                                       ;; enrichment rebuilt from the SAME
-                                       ;; effective snapshot selected above
-                                       ;; (branch/as-of/cursor/transaction),
-                                       ;; not from head at Bind time.
-                                         cached (if (or (and (:runtime-subqueries? cached)
-                                                             (:enriched-db cached))
-                                                        ;; A derived table or CTE whose body
-                                                        ;; reads a `$n` was materialised
-                                                        ;; EMPTY at Parse -- the body ran
-                                                        ;; before Bind. Re-parse with the
-                                                        ;; values in scope so it runs with
-                                                        ;; them: otherwise the relation is
-                                                        ;; empty and the statement answers
-                                                        ;; no rows, for any binding.
-                                                        (:materialisation-params? cached)
-                                                        (and (= :insert (:type cached))
-                                                             (:insert-source cached)
-                                                             (or (:enriched-db cached)
-                                                                 (get-in cached
-                                                                         [:insert-source
-                                                                          :source
-                                                                          :enriched-db]))))
+                                   (let [;; Query-local rows and bound-value
+                                       ;; materialisation are execution state.
+                                       ;; Rebuild them only after choosing the
+                                       ;; exact transaction/cursor/temporal DB
+                                       ;; above. Catalog and execution refresh
+                                       ;; share this one reparse.
+                                         execution-materialization?
+                                         (execution-local-plan? cached)
+                                         cached (if (or (not basis-current?)
+                                                        execution-materialization?)
                                                   (binding [params/*bound-params* (vec (rest bound))
                                                             params/*declared-param-oids*
                                                             (:declared-param-oids cached)]

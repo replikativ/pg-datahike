@@ -2770,17 +2770,47 @@
         ;; :db/valueType with what describeResult will tell clients.
          sub-oids (:select-item-oids sub-parsed)
          q-fn d/q
-         run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count
-                                 sql-order-by having
-                                 project-set project-order-by project-limit project-offset]
-                          :as p}]
+         run-branch (fn [p]
                       ;; A body that reads a `$n` is run HERE, at parse
                       ;; time, which is before Bind: the placeholders were
                       ;; still sentinels and the relation came out empty,
                       ;; for every binding. Mark the statement so the
                       ;; server re-parses it at Execute, where
                       ;; `params/*bound-params*` supplies the values.
-                      (let [_ (when (some params/param-ref? in-args)
+                      (let [;; Session-visible temp attrs are translated under
+                            ;; their logical SQL names and normally rewritten
+                            ;; by server/physicalize-temp-parse after lowering.
+                            ;; This materializer executes during lowering, so
+                            ;; apply the same namespace mapping before d/q.
+                            p (if (seq params/*temp-table-map*)
+                                (let [mapping params/*temp-table-map*]
+                                  (letfn [(rewrite [x]
+                                            (cond
+                                              ;; DB snapshots, ParamRefs and
+                                              ;; other records are opaque
+                                              ;; execution values. In
+                                              ;; particular, walking an IDB
+                                              ;; can enumerate its indexes.
+                                              (record? x) x
+                                              (and (keyword? x)
+                                                   (contains? mapping (namespace x)))
+                                              (keyword (get mapping (namespace x))
+                                                       (name x))
+                                              (map? x)
+                                              (reduce-kv (fn [m k v]
+                                                           (assoc m (rewrite k) (rewrite v)))
+                                                         (empty x) x)
+                                              (vector? x) (mapv rewrite x)
+                                              (set? x) (into (empty x) (map rewrite) x)
+                                              (list? x) (apply list (map rewrite x))
+                                              (seq? x) (doall (map rewrite x))
+                                              :else x))]
+                                    (rewrite p)))
+                                p)
+                            {:keys [query in-args sql-limit sql-offset hidden-count
+                                    sql-order-by having project-set
+                                    project-order-by project-limit project-offset]} p
+                            _ (when (some params/param-ref? in-args)
                                 (params/materialisation-params!))]
                         (if-let [literal-rows (:literal-rows p)]
                           literal-rows
@@ -7570,6 +7600,30 @@
                                         seq-vt
                                         (seq derived-joins))
                                 db)
+             ;; The speculative relations above contain query rows, not
+             ;; reusable plan state.  A named prepared statement may retain
+             ;; this map across executions, so the server must rebuild those
+             ;; relations against the execution's effective snapshot.
+             :execution-materialization?
+             (boolean (or (instance? ParenthesedSelect from-item)
+                          values-vt
+                          (instance? net.sf.jsqlparser.statement.select.TableFunction
+                                     from-item)
+                          seq-vt
+                          (seq derived-joins)
+                          ;; Scalar/EXISTS/IN/ARRAY subquery evaluators are
+                          ;; closures created while translating the plan.
+                          ;; Some can use *runtime-db* directly; others own
+                          ;; translated row state. Treat their common producer
+                          ;; flag as execution-local so no captured snapshot
+                          ;; can outlive the execution.
+                          @(:runtime-subqueries? ctx)
+                          ;; A correlated LATERAL subquery is evaluated at
+                          ;; query time, but its row-producer closure captures
+                          ;; the DB used to translate this plan. Re-lowering
+                          ;; per prepared execution gives the closure the same
+                          ;; effective snapshot as the outer query.
+                          (some :inner-sql lsrf-specs)))
              ;; Server-side sort for nullable ORDER BY columns
              :sql-order-by    sql-order-by
              :sql-limit       (when (and (empty? project-set-specs) sql-order-by)

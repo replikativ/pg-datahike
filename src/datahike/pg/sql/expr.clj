@@ -7564,7 +7564,12 @@
               inner (if (instance? ParenthesedSelect arg)
                       (.getSelect ^ParenthesedSelect arg)
                       arg)
-              db (:db ctx)]
+              db (:db ctx)
+              ;; This branch currently folds the inner rows while lowering.
+              ;; Mark the owning SELECT so prepared execution re-lowers it
+              ;; against the effective snapshot and the cross-call parse
+              ;; cache never retains the resulting array value.
+              _ (reset! (:runtime-subqueries? ctx) true)]
           (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
             (try
               (let [parse-fn (:parse-sql ctx)
@@ -9638,6 +9643,11 @@
     (let [^ExistsExpression e expr
           not-exists? (.isNot e)
           sub-select (.getRightExpression e)
+          ;; Correlated forms lower to Datalog, while uncorrelated forms
+          ;; below may execute and fold the inner rows immediately. Use the
+          ;; shared producer flag for both so the owning prepared plan never
+          ;; retains a translation-time EXISTS result.
+          _ (reset! (:runtime-subqueries? ctx) true)
           inner (cond
                   (instance? ParenthesedSelect sub-select)
                   (.getSelect ^ParenthesedSelect sub-select)
