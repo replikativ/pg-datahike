@@ -198,6 +198,11 @@ public final class PgWireServer {
          */
         Object parse(String sql, int[] paramOids);
 
+        /** Revalidate an existing analyzed statement. Older handlers may parse afresh. */
+        default Object reparse(String sql, int[] paramOids, Object previousParsed) {
+            return parse(sql, paramOids);
+        }
+
         /**
          * Return the parameter type OIDs this prepared statement
          * expects. Called for {@code Describe('S', stmtName)}.
@@ -2297,7 +2302,7 @@ public final class PgWireServer {
 
         while (true) {
             Object before = handler.planCacheToken();
-            Object reparsed = handler.parse(stmt.sql, stmt.paramOids);
+            Object reparsed = handler.reparse(stmt.sql, stmt.paramOids, stmt.parsed);
             QueryResult newDescription = handler.describeResult(reparsed);
             Object after = handler.planCacheToken();
             if (!java.util.Objects.equals(before, after)) continue;

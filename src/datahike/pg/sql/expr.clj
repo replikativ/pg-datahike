@@ -345,7 +345,7 @@
     (when fname
       (validate-aggregate-call! ctx fname args))))
 
-(defn- known-function-name?
+(defn known-function-name?
   "True for a name that IS a function -- PostgreSQL's catalog decides,
    as it does when it tells 42883 (\"no such function\") from 42809
    (\"there is one, but not of the kind this clause needs\"), plus the

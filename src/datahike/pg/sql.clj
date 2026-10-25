@@ -564,6 +564,11 @@
   [^String sql]
   (rw/rewrite sql rw/default-rules))
 
+(defn prepared-parser-source
+  "Internal normalized source for detached prepared-statement analysis."
+  [sql]
+  (preprocess-sql sql))
+
 (defn- explain-prefix
   "Extract PostgreSQL EXPLAIN options that JSqlParser 5.2 cannot parse.
    Returns the inner statement plus a parser-compatible EXPLAIN spelling."

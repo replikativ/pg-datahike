@@ -565,6 +565,9 @@ atomic `COPY … FROM stdin` (text + CSV, streaming UTF-8, NULL/default markers)
 `ALTER TABLE … ADD CONSTRAINT
 FOREIGN KEY … ON UPDATE CASCADE ON DELETE RESTRICT`.
 
+Generated identity and SERIAL sequence names use `<table>_<column>_seq`.
+Existing names raise `42P07`; automatic suffix selection is not yet supported.
+
 `regproc` and `regprocedure` refer to functions by their numeric OID.
 Use `'now'::regproc` for an unambiguous name or
 `'abs(integer)'::regprocedure` for an exact input signature. Overloaded
@@ -596,10 +599,23 @@ identity, usable in casts and joins to `pg_type`. `to_regtype` returns NULL for
 missing types; grammar and modifier errors can still raise errors, as in
 PostgreSQL. The catalog includes generated PostgreSQL type metadata even when
 value codecs are unsupported. User-defined array identities and temporary
-row-type aliases are not yet supported. Catalog-triggered reanalysis can rebind
-an OID alias literal in a prepared statement after drop/recreate; PostgreSQL
-retains the originally bound OID. Stored column values keep their numeric
-identity.
+row-type aliases are not yet supported.
+
+Supported prepared OID-literal coercions preserve bound identities through
+unrelated catalog changes, including rename or recreation of a type or function
+named by a literal. Changes to referenced relations or
+called functions, `search_path` changes, and `DISCARD PLANS` reanalyze the query.
+A scalar `regclass` literal also depends on its referenced relation; an array
+literal of `regclass[]` does not. Explicit text conversions and `to_reg*` calls
+resolve names when executed.
+
+Queries using unregistered native relations, user-defined datatypes in casts or
+referenced columns, ambiguous coercions, view rewrites, or routine bodies beyond
+simple SQL SELECTs
+can still rebind literals when their plans refresh. Retention also falls back for
+stored routines with arguments, writes to tables with defaults or generated
+columns, and statements beyond the bounded analysis limits. Stored column values
+keep their numeric identity.
 
 ### Accepted under `:compat :pg-dump` (no semantics, schema loads)
 

@@ -53,6 +53,7 @@
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.guc :as guc]
             [datahike.pg.sql.params :as params]
+            [datahike.pg.sql.prepared :as prepared]
             [datahike.pg.sql.set-ops :as set-ops]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
@@ -210,9 +211,12 @@
    FRESH entities (or raises) and writes no existing rows, except
    sequence-counter bumps which follow PostgreSQL nextval semantics
    (non-transactional, never a serialization conflict). tx-buffer-eas
-   attributes such ops as the empty write-set instead of ::opaque."
-  [f]
-  (with-meta f {:datahike.pg/fresh-insert true}))
+   attributes such ops as the empty write-set instead of ::opaque.
+   A table tag identifies row-emitting wrappers that TRUNCATE can cancel."
+  ([f] (fresh-insert-fn f nil))
+  ([f table]
+   (with-meta f (cond-> {:datahike.pg/fresh-insert true}
+                  table (assoc ::insert-table table)))))
 
 (def ^:dynamic *statement-catalog-basis* nil)
 
@@ -1023,7 +1027,11 @@
       (println (str "[PGWIRE] " prefix "sqlstate="
                     (first (errors/classify-exception e))))
       (.printStackTrace e ^java.io.PrintWriter *err*)))
-  (let [[sqlstate msg fields] (errors/classify-exception e)
+  (let [[sqlstate msg fields] (if (instance? PgWireServer$PgProtocolException e)
+                                [(.-sqlstate ^PgWireServer$PgProtocolException e)
+                                 (.getMessage e)
+                                 (.-errorFields ^PgWireServer$PgProtocolException e)]
+                                (errors/classify-exception e))
         ;; Same rule parse-sql* applies to its own "SQL parse error: "
         ;; prefix: an error that already carries a SQLSTATE or a
         ;; registered category was raised deliberately and its message
@@ -2528,7 +2536,8 @@
                       (if (map? entry)
                         (into {} (remove (comp nil? val)) entry)
                         entry))
-                    result))))]])
+                    result)))
+          table-name)]])
      (or *statement-catalog-basis* (catalog-basis/capture db)))))
 
 (defn- single-insert-candidate-tx-data
@@ -5181,14 +5190,18 @@
 
 (defn- table-create-tx-data [db parsed]
   (let [table-name (:table-name parsed)
-        {:keys [oids tx-data]} (catalog-objects/reserve-user-oids-tx db 2)
-        [oid row-type-oid] oids
+        raw-ddl-data (ddl-tx-data parsed)
+        sequence-names (vec (distinct (keep #(when (map? %) (:__seq__/name %))
+                                            raw-ddl-data)))
+        {:keys [oids tx-data]}
+        (catalog-objects/reserve-user-oids-tx db (+ 2 (count sequence-names)))
+        [oid row-type-oid & sequence-oids] oids
         marker (pgs/row-marker-attr table-name)
         ddl-data (mapv (fn [datum]
                          (if (and (map? datum) (= marker (:db/ident datum)))
                            (assoc datum :pg/table-oid oid)
                            datum))
-                       (ddl-tx-data parsed))
+                       raw-ddl-data)
         ddl-by-ident (into {}
                            (keep (fn [datum]
                                    (when (and (map? datum) (:db/ident datum))
@@ -5202,6 +5215,13 @@
                        db {:class-oid catalog-objects/pg-type-oid
                            :oid row-type-oid :kind :row-type :name table-name
                            :namespace-oid catalog-objects/public-namespace-oid})
+        sequence-object-data
+        (mapcat (fn [name sequence-oid]
+                  (catalog-objects/create-object-tx
+                   db {:class-oid catalog-objects/pg-class-oid
+                       :oid sequence-oid :kind :sequence :name name
+                       :namespace-oid catalog-objects/public-namespace-oid}))
+                sequence-names sequence-oids)
         local-names (vec (:column-order parsed))
         local-name-set (set local-names)
         ;; PostgreSQL walks the INHERITS list in order and MERGES columns
@@ -5272,7 +5292,7 @@
         (catalog-objects/create-columns-tx
          oid (map-indexed #(assoc %2 :attnum (inc %1)) effective-columns))]
     (into (vec tx-data)
-          (concat ddl-data object-data row-type-data column-data))))
+          (concat ddl-data object-data row-type-data sequence-object-data column-data))))
 
 (defn- execute-ddl-create [conn parsed tx-state session-id]
   (let [table-name (:table-name parsed)
@@ -5296,7 +5316,10 @@
             (when-not name-conflict?
               (some (fn [column]
                       (let [sequence-name (str table-name "_" column "_seq")]
-                        (when (sequence-exists? current-db sequence-name)
+                        (when (or (sequence-exists? current-db sequence-name)
+                                  (catalog-objects/object-by-identity
+                                   current-db catalog-objects/pg-class-oid
+                                   catalog-objects/public-namespace-oid sequence-name))
                           sequence-name)))
                     (:identity-cols parsed)))]
         (cond
@@ -5734,6 +5757,12 @@
 ;; into the execute dispatch via dynamic bindings.
 ;; ============================================================================
 
+(def ^:private ^:dynamic *previous-prepared*
+  "The analyzed statement explicitly supplied to a revalidation call."
+  nil)
+
+(def ^:private ^:dynamic *prepared-ddl-observer* nil)
+
 (def ^:private ^:dynamic *cached-parsed*
   "When bound by executePrepared, the parsed sql/parse-sql result to
    reuse instead of re-parsing. Nil in the Simple Query path."
@@ -5790,7 +5819,8 @@
   ;; per row, runs the same few statements over and over.
   (let [plans (atom {})]
     (fn [^String sql values oids]
-      (binding [*cached-parsed* nil
+      (binding [*previous-prepared* nil
+                *cached-parsed* nil
                 *cached-bound* nil
                 *snapshot-db* nil
                 *nested-statement?* true
@@ -6130,9 +6160,10 @@
 
 (defn- plan-sql-prepared
   "Parse one SQL-level PREPARE template under a stable schema/session token."
-  [^PgWireServer$QueryHandler handler template]
-  (loop []
-    (let [before (.planCacheToken handler)
+  ([handler template] (plan-sql-prepared handler template nil))
+  ([^PgWireServer$QueryHandler handler template previous]
+   (loop []
+     (let [before (.planCacheToken handler)
           ;; The template's `$1` is a placeholder in a TEMPLATE, bound
           ;; later by EXECUTE -- not a wire parameter of the PREPARE
           ;; itself. In the extended protocol the PREPARE arrives with
@@ -6151,13 +6182,16 @@
           ;; IndexOutOfBoundsException. The caller's bindings have no
           ;; business in a nested parse -- the rule `nested-executor`
           ;; exists for.
-          parsed (binding [params/*bound-params* nil]
-                   (.parse handler template (int-array 0)))
-          description (.describeResult handler parsed)
-          after (.planCacheToken handler)]
-      (if (= before after)
-        {:parsed parsed
-         :result-signature (result-description-signature description)
+           parsed (binding [params/*bound-params* nil]
+                    (if previous
+                      (.reparse handler template (int-array 0) previous)
+                      (.parse handler template (int-array 0))))
+           description (.describeResult handler parsed)
+           after (.planCacheToken handler)]
+       (if (= before after)
+         {:parsed parsed
+          :analyzed-sql (or (get-in parsed [:prepared-analysis :source]) template)
+          :result-signature (result-description-signature description)
          ;; For pg_prepared_statements. The wire layer already asks the
          ;; handler both of these for Describe, so the view reports what
          ;; a client would be told rather than a second opinion.
@@ -6170,10 +6204,10 @@
          ;; describes as nil, and reading a field off it threw inside
          ;; PREPARE. The statement was then never stored and EXECUTE
          ;; answered nil, far from the cause.
-         :param-oids (vec (some-> (.describeParams handler parsed)))
-         :result-oids (vec (some-> description (.-columnOids)))
-         :plan-token after}
-        (recur)))))
+          :param-oids (vec (some-> (.describeParams handler parsed)))
+          :result-oids (vec (some-> description (.-columnOids)))
+          :plan-token after}
+         (recur))))))
 
 (defn- handle-prepare
   "PREPARE name [(types)] AS sql — classify extracts :name and :template."
@@ -6223,7 +6257,7 @@
       (error-result (str "prepared statement \"" pname "\" does not exist") "26000")
       (let [rec (if (= (:plan-token rec) (.planCacheToken ^PgWireServer$QueryHandler handler))
                   rec
-                  (let [replanned (plan-sql-prepared handler (:sql rec))]
+                  (let [replanned (plan-sql-prepared handler (:sql rec) (:parsed rec))]
                     (when (not= (:result-signature rec) (:result-signature replanned))
                       (throw (ex-info "cached plan must not change result type"
                                       {:sqlstate "0A000"})))
@@ -6231,7 +6265,7 @@
                       (swap! sql-prepared assoc pname updated)
                       updated)))
             args (parse-execute-args args-text)
-            template (:sql rec)
+            template (or (:analyzed-sql rec) (:sql rec))
             sql-out (substitute-prepared-params template args)]
         ;; Through `*statement-handler*` -- `nested-executor` -- and not
         ;; the handler directly. The caller's `*cached-parsed*` is still
@@ -6937,6 +6971,7 @@
     (when (nil? (.error ^PgWireServer$QueryResult result))
       (when (:in-tx? @tx-state)
         (swap! tx-state update :ddl-version (fnil inc 0)))
+      (when *prepared-ddl-observer* (*prepared-ddl-observer*))
       (invalidate-schema-cache!))
     result))
 
@@ -7432,7 +7467,11 @@
   [tx-state seq-name]
   (when-let [{:keys [name eid]} (sequence-descriptor (:speculative-db @tx-state)
                                                      seq-name)]
-    (swap! tx-state update-in [:local-sequence-generations [name eid]] (fnil inc 0))))
+    (swap! tx-state
+           (fn [state]
+             (-> state
+                 (update :local-sequence-identities (fnil conj #{}) [name eid])
+                 (update-in [:local-sequence-generations [name eid]] (fnil inc 0)))))))
 
 (defn- register-local-sequence!
   "Mark sequence storage created by the current transaction.  This remains
@@ -7739,10 +7778,10 @@
       :rollback-to-savepoint (handle-rollback-to-savepoint ctx parsed)
       :discard-all           (handle-discard-all ctx parsed)
       :discard-scoped
-      ;; DISCARD PLANS/SEQUENCES/TEMP/LOCKS. No-op in our model;
-      ;; report the actual variant in the command tag. classify
-      ;; exposes the lowercased scope.
-      (empty-result (str "DISCARD " (str/upper-case (:scope parsed))))
+      (do
+        (when (= "plans" (str/lower-case (:scope parsed)))
+          (swap! session-state update :prepared-analysis-generation (fnil inc 0)))
+        (empty-result (str "DISCARD " (str/upper-case (:scope parsed)))))
 
       :reset         (handle-reset ctx parsed)
       ;; LISTEN / UNLISTEN / NOTIFY — no notification delivery, so these
@@ -9586,6 +9625,20 @@
                               db))))
           table-attrs)))
 
+(defn- relation-definition-revision-tx
+  "Record relation-storage rewrites independently of row/sequence values."
+  [db names]
+  (into []
+        (mapcat (fn [name]
+                  (when-let [object
+                             (catalog-objects/object-by-identity
+                              db catalog-objects/pg-class-oid
+                              catalog-objects/public-namespace-oid name)]
+                    (catalog-objects/bump-revision-tx
+                     db catalog-objects/pg-class-oid
+                     (:datahike.pg.object/oid object)))))
+        (distinct names)))
+
 (defn- restart-identity-tx-data
   "TRUNCATE … RESTART IDENTITY: reset every IDENTITY-backing sequence
    of `tables` to its pristine post-CREATE state. Identity sequences
@@ -9597,20 +9650,25 @@
   [db tables]
   (when (get (dbi/-schema db) :__seq__/name)
     (vec
-     (for [table tables
-           {:keys [seq-name]} (compute-identity-cols db table)
-           :let [seq-eid (ffirst (d/q '{:find [?e]
-                                        :where [[?e :__seq__/name ?n]]
-                                        :in [$ ?n]}
-                                      db seq-name))
-                 increment (or (when seq-eid
-                                 (ffirst (d/q '{:find [?i]
-                                                :where [[?e :__seq__/increment ?i]]
-                                                :in [$ ?e]}
-                                              db seq-eid)))
-                               1)]
-           :when seq-eid]
-       [:db/add seq-eid :__seq__/value (- 1 increment)]))))
+     (mapcat
+      (fn [[seq-name increment]]
+        (into [[:db/add [:__seq__/name seq-name] :__seq__/value (- 1 increment)]]
+              (relation-definition-revision-tx db [seq-name])))
+      (distinct
+       (for [table tables
+             {:keys [seq-name]} (compute-identity-cols db table)
+             :let [seq-eid (ffirst (d/q '{:find [?e]
+                                          :where [[?e :__seq__/name ?n]]
+                                          :in [$ ?n]}
+                                        db seq-name))
+                   increment (or (when seq-eid
+                                   (ffirst (d/q '{:find [?i]
+                                                  :where [[?e :__seq__/increment ?i]]
+                                                  :in [$ ?e]}
+                                                db seq-eid)))
+                                 1)]
+             :when seq-eid]
+         [seq-name increment]))))))
 
 (defn- exec-truncate
   "TRUNCATE [TABLE] t1, t2, … — retract every row of every listed
@@ -9621,7 +9679,8 @@
    treated as empty, like DELETE."
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
-        tables (:tables parsed)]
+        tables (:tables parsed)
+        table-set (set tables)]
     (if (:in-tx? @tx-state)
       (try
         (let [spec-db (:speculative-db @tx-state)
@@ -9629,16 +9688,22 @@
               eids (into [] (mapcat #(table-row-eids spec-db %)) tables)
               restart-tx (when (:restart-identity? parsed)
                            (restart-identity-tx-data spec-db tables))
+              definition-tx (relation-definition-revision-tx spec-db tables)
               ;; Speculative db keeps ORIGINAL entity IDs …
               spec-tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
-                                 restart-tx)
+                                 (concat restart-tx definition-tx))
               spec-report (dc/with spec-db spec-tx-data)
-              ;; … the commit buffer remaps to tempids (rows inserted
-              ;; earlier in this tx only exist as tempids at commit).
+              ;; Cancel buffered inserts rather than retracting their tempids.
+              ;; Metadata lookup refs and complete CAS forms survive remapping.
+              inserted-eids (into #{} (filter #(contains? eid->tempid %)) eids)
+              deleted-tempids (into #{} (map eid->tempid) inserted-eids)
               remap (fn [eid] (get eid->tempid eid eid))
-              commit-tx-data (into (mapv (fn [eid] [:db/retractEntity (remap eid)]) eids)
-                                   (map (fn [[op eid attr val]] [op (remap eid) attr val]))
-                                   restart-tx)
+              commit-tx-data (into (into []
+                                         (comp (remove inserted-eids)
+                                               (map (fn [eid] [:db/retractEntity eid])))
+                                         eids)
+                                   (map #(update % 1 remap))
+                                   (concat restart-tx definition-tx))
               ;; BEFORE/AFTER TRUNCATE triggers. They were parsed,
               ;; stored, and reported in pg_trigger with the right
               ;; tgtype -- and never fired, because `matching-triggers`
@@ -9647,9 +9712,24 @@
               _ (doseq [t tables]
                   (fire-statement-triggers! spec-db t :truncate :before))]
           (swap! tx-state (fn [ts]
-                            (-> ts
-                                (update :tx-buffer into (guard-catalog-tx commit-tx-data))
-                                (assoc :speculative-db (:db-after spec-report)))))
+                            (let [buffer (into []
+                                               (remove
+                                                (fn [item]
+                                                  (or (writes-tempid? deleted-tempids item)
+                                                      (and (vector? item)
+                                                           (= :db.fn/call (first item))
+                                                           (contains? table-set
+                                                                      (::insert-table
+                                                                       (meta (second item))))))))
+                                               (:tx-buffer ts))]
+                              (-> ts
+                                  (assoc :tx-buffer (into buffer (guard-catalog-tx commit-tx-data))
+                                         :speculative-db (:db-after spec-report))
+                                  (update :eid->tempid #(apply dissoc % inserted-eids))))))
+          (when (:restart-identity? parsed)
+            (doseq [table tables
+                    {:keys [seq-name]} (compute-identity-cols (:speculative-db @tx-state) table)]
+              (bump-local-sequence-generation! tx-state seq-name)))
           (doseq [t tables]
             (fire-statement-triggers! (:speculative-db @tx-state) t :truncate :after))
           (empty-result "TRUNCATE TABLE"))
@@ -9662,7 +9742,7 @@
               restart-tx (when (:restart-identity? parsed)
                            (restart-identity-tx-data db tables))
               tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
-                            restart-tx)
+                            (concat restart-tx (relation-definition-revision-tx db tables)))
               tx-data ((:tx-wrap ctx identity) tx-data)]
           (doseq [t tables]
             (fire-statement-triggers! db t :truncate :before))
@@ -9759,23 +9839,26 @@
       :else
       (try
         (let [params (ddl/sequence-params seq-opts {:existing existing})
-              eid (:eid existing)
+              sequence-ref [:__seq__/name seq-name]
+              rewrite? (some #(not= :owned-by (first %)) seq-opts)
               ;; The stored counter is the last value handed out, so a
               ;; RESTART to N is stored as N - increment for the next
               ;; advance to land exactly on N.
-              tx-data (cond-> [[:db/add eid :__seq__/increment (:increment params)]
-                               [:db/add eid :__seq__/minvalue (:minvalue params)]
-                               [:db/add eid :__seq__/maxvalue (:maxvalue params)]
-                               [:db/add eid :__seq__/cache (:cache params)]
-                               [:db/add eid :__seq__/cycle (:cycle? params)]
-                               [:db/add eid :__seq__/start (:start params)]
-                               [:db/add eid :__seq__/type (:type params)]]
+              tx-data (cond-> [[:db/add sequence-ref :__seq__/increment (:increment params)]
+                               [:db/add sequence-ref :__seq__/minvalue (:minvalue params)]
+                               [:db/add sequence-ref :__seq__/maxvalue (:maxvalue params)]
+                               [:db/add sequence-ref :__seq__/cache (:cache params)]
+                               [:db/add sequence-ref :__seq__/cycle (:cycle? params)]
+                               [:db/add sequence-ref :__seq__/start (:start params)]
+                               [:db/add sequence-ref :__seq__/type (:type params)]]
                         (:restart params)
-                        (conj [:db/add eid :__seq__/value
-                               (- (:restart params) (:increment params))]))]
+                        (conj [:db/add sequence-ref :__seq__/value
+                               (- (:restart params) (:increment params))])
+                        rewrite?
+                        (into (relation-definition-revision-tx current-db [seq-name])))]
           (if (:in-tx? @tx-state)
             (let [result (execute-ddl-in-tx tx-state tx-data "ALTER SEQUENCE")]
-              (when (nil? (.error ^PgWireServer$QueryResult result))
+              (when (and rewrite? (nil? (.error ^PgWireServer$QueryResult result)))
                 (bump-local-sequence-generation! tx-state seq-name))
               result)
             (do (transact-recorded! conn tx-data)
@@ -12240,8 +12323,21 @@
                       :in [$ ?table]
                       :where [[?sequence :__seq__/owned-by-table ?table]]}
                     db table)))
-        sequence-tx-data (mapv (fn [eid] [:db/retractEntity eid])
+        sequence-tx-data (mapv (fn [eid]
+                                 [:db/retractEntity
+                                  [:__seq__/name (:__seq__/name (d/entity db eid))]])
                                owned-sequence-eids)
+        sequence-object-tx-data
+        (mapcat (fn [eid]
+                  (let [name (:__seq__/name (d/entity db eid))
+                        object (catalog-objects/object-by-identity
+                                db catalog-objects/pg-class-oid
+                                catalog-objects/public-namespace-oid name)]
+                    (when (= :sequence (:datahike.pg.object/kind object))
+                      (catalog-objects/drop-object-tx
+                       db catalog-objects/pg-class-oid
+                       (:datahike.pg.object/oid object)))))
+                owned-sequence-eids)
         ;; The table's own CHECK and FOREIGN KEY constraints go with it.
         ;; Left behind, they were enforced against a later table of the
         ;; same name: `rv_z_a_check` rejected rows of a table that no
@@ -12328,6 +12424,7 @@
                                        inheritance-eids)
                                   (filter some? schema-tx-data)
                                   sequence-tx-data
+                                  sequence-object-tx-data
                                   constraint-tx-data
                                   secondary-tx-data
                                   index-object-tx-data
@@ -13606,6 +13703,58 @@
       (with-meta (retain-select-shape-plan parsed parsed)
         (assoc (meta parsed) ::catalog-basis (catalog-basis/capture db))))))
 
+(defn- prepared-analysis-context [session-state temp-tables]
+  {:search-path (effective-search-path session-state)
+   :temp-tables @temp-tables
+   :database-name (or (:db-name @session-state) "datahike")
+   :selection (select-keys @session-state
+                           [:branch :commit-id :as-of :since :history
+                            :valid-at :valid-from :valid-to :valid-between
+                            :prepared-analysis-generation])})
+
+(defn- parse-prepared-session-sql
+  [sql schema db temp-tables session-id session-state analyses previous]
+  (binding [params/*session-state* session-state]
+    (let [context (prepared-analysis-context session-state temp-tables)
+          old (when (= sql (:sql previous)) (:prepared-analysis previous))
+          token (:prepared-analysis-token previous)
+          valid? (and old token
+                      (locking analyses (.get ^java.util.WeakHashMap analyses token))
+                      (prepared/valid? old db context))
+          source (if valid? (:source old) sql)
+          parsed (parse-session-sql source schema db temp-tables session-id)
+          analysis (when-not (= :error (:type parsed))
+                     (or (when valid? old)
+                         (binding [regoid/*relation-provider* catalog/relation-identity
+                                   regoid/*relation-cache* (atom nil)
+                                   regoid/*temp-tables* temp-tables]
+                           (prepared/analyze (sql/prepared-parser-source sql)
+                                             db parsed context))))
+        ;; Constructors and assignment coercions must execute the detached
+        ;; numeric operands too, rather than retaining their original text.
+          parsed (if (and analysis (not valid?) (not= source (:source analysis)))
+                   (parse-session-sql (:source analysis) schema db temp-tables session-id)
+                   parsed)
+          token (when analysis
+                  (if valid? token
+                      (let [token (Object.)]
+                        (locking analyses
+                          (.put ^java.util.WeakHashMap analyses token analysis))
+                        token)))]
+      (cond-> (assoc parsed :sql sql)
+        analysis (assoc :prepared-analysis analysis :prepared-analysis-token token)))))
+
+(defn- invalidate-changed-prepared-analyses!
+  [^java.util.WeakHashMap analyses db context]
+  ;; Observe speculative definitions before rollback can restore the old DB.
+  ;; Invalidation is sticky, while weak identity keys let closed/deallocated
+  ;; statements disappear without retaining their source or catalog proof.
+  (locking analyses
+    (doseq [token (vec (.keySet analyses))]
+      (when-let [analysis (.get analyses token)]
+        (when-not (prepared/valid? analysis db context)
+          (.put analyses token nil))))))
+
 (defonce ^:private fallback-unique-admissions (atom {}))
 
 (defn- unique-admission-key [conn]
@@ -13700,7 +13849,8 @@
                                        :as opts}]]
   (admit-unique-index-enforcement!
    conn (or (:unique-admissions opts) fallback-unique-admissions))
-  (let [silently-accept (resolve-silently-accept opts)
+  (let [prepared-analyses (java.util.WeakHashMap.)
+        silently-accept (resolve-silently-accept opts)
         max-result-rows (normalize-max-result-rows
                          (get opts :max-result-rows ::default))
         ;; Closure that bumps the caller-supplied stats atom by parse
@@ -13961,6 +14111,7 @@
 
       (planCacheToken [_]
         [@schema-cache-generation
+         @temp-tables
          (catalog-basis/capture
           (if (:in-tx? @tx-state)
             (or (:speculative-db @tx-state) (d/db conn))
@@ -13968,7 +14119,7 @@
          (select-keys @session-state
                       [:branch :commit-id :as-of :since :history
                        :valid-at :valid-from :valid-to :valid-between
-                       :search-path])])
+                       :search-path :prepared-analysis-generation])])
 
       (markTransactionFailed [_]
         (when (:in-tx? @tx-state)
@@ -13977,10 +14128,8 @@
       (parse [this sql param-oids]
         ;; Translate once, return the parsed map as opaque state. The
         ;; wire layer caches it under the Parse stmt name and feeds it
-        ;; back via executePrepared. Note: `db` captured at parse time
-        ;; drives CTE / catalog materialization; intervening DDL on the
-        ;; same connection could make this stale, so named prepared
-        ;; statements held across DDL may see stale schema.
+        ;; back via executePrepared. Revalidation distinguishes refreshing
+        ;; the lowered plan from reanalyzing its original OID literals.
         ;; `*registered-databases*` bound here so any catalog probe on
         ;; `pg_database` that lands during parse materialization sees
         ;; this server's actual registry instead of the legacy fallback.
@@ -14031,8 +14180,9 @@
                   db (if (:in-tx? @tx-state)
                        (or (:speculative-db @tx-state) base-db)
                        base-db)
-                  parsed (parse-session-sql sql (dbi/-schema db) db
-                                            temp-tables session-id)]
+                  parsed (parse-prepared-session-sql sql (dbi/-schema db) db
+                                                     temp-tables session-id session-state
+                                                     prepared-analyses *previous-prepared*)]
             ;; Surface parse-time errors (undefined relation/column,
             ;; syntax errors) as a Parse-message failure, matching
             ;; PostgreSQL: it validates the statement at Parse and raises
@@ -14069,6 +14219,10 @@
                     (assoc parsed :metadata md)
                     parsed)
                   parsed))))))
+
+      (reparse [this sql param-oids previous]
+        (binding [*previous-prepared* previous]
+          (.parse this sql param-oids)))
 
       (describeParams [_ parsed]
         ;; Return a Java int[] of parameter OIDs so Describe('S', …)
@@ -14296,8 +14450,8 @@
                          (binding [params/*bound-params* (vec (rest bound))
                                    params/*declared-param-oids*
                                    (:declared-param-oids parsed)]
-                           (assoc (parse-session-sql (:sql parsed) (dbi/-schema db) db
-                                                     temp-tables session-id)
+                           (assoc (parse-prepared-session-sql (:sql parsed) (dbi/-schema db) db
+                                                              temp-tables session-id session-state prepared-analyses parsed)
                                   :sql (:sql parsed)
                                   :declared-param-oids (:declared-param-oids parsed))))
                        parsed)]
@@ -14347,7 +14501,11 @@
         ;; *registered-databases* bound here too so Simple Query (which
         ;; doesn't go through `parse` first) sees the registry when it
         ;; hits pg_database.
-        (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
+        (binding [*prepared-ddl-observer*
+                  #(invalidate-changed-prepared-analyses!
+                    prepared-analyses (statement-read-db conn tx-state session-state)
+                    (prepared-analysis-context session-state temp-tables))
+                  catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
                                                     (java.util.IdentityHashMap.))
                   catalog/*registered-databases* registered-databases
                   regoid/*db* (statement-read-db conn tx-state session-state)
@@ -14489,8 +14647,8 @@
                                              cached
                                              (binding [params/*declared-param-oids*
                                                        (:declared-param-oids cached)]
-                                               (assoc (parse-session-sql sql schema db
-                                                                         temp-tables session-id)
+                                               (assoc (parse-prepared-session-sql sql schema db
+                                                                                  temp-tables session-id session-state prepared-analyses cached)
                                                       :declared-param-oids
                                                       (:declared-param-oids cached))))]
                                 {:parsed
@@ -14522,8 +14680,8 @@
                                                   (binding [params/*bound-params* (vec (rest bound))
                                                             params/*declared-param-oids*
                                                             (:declared-param-oids cached)]
-                                                    (assoc (parse-session-sql sql schema db
-                                                                              temp-tables session-id)
+                                                    (assoc (parse-prepared-session-sql sql schema db
+                                                                                       temp-tables session-id session-state prepared-analyses cached)
                                                            :sql (:sql cached)
                                                            :declared-param-oids
                                                            (:declared-param-oids cached)))
@@ -14781,7 +14939,8 @@
                               :delete                (binding [*cached-bound*
                                                                (or templated-bound *cached-bound*)]
                                                        (exec-delete ctx parsed))
-                              :truncate              (exec-truncate ctx parsed)
+                              :truncate              (execute-ddl-invalidating
+                                                      tx-state #(exec-truncate ctx parsed))
                             ;; Every DDL exec-* invalidates the per-schema cache.
                             ;; PG metadata (`:pg/not-null` etc.) lives on schema-
                             ;; attribute entities but not in `(dbi/-schema db)`, so
@@ -14892,6 +15051,7 @@
     (execute [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.execute h sql))))
     (executeInGroup [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.executeInGroup h sql))))
     (parse [_ sql oids] (pg-resolve/with-symbol-resolver (.parse h sql oids)))
+    (reparse [_ sql oids previous] (pg-resolve/with-symbol-resolver (.reparse h sql oids previous)))
     (describeParams [_ parsed] (pg-resolve/with-symbol-resolver (.describeParams h parsed)))
     (describeResult [_ parsed] (pg-resolve/with-symbol-resolver (.describeResult h parsed)))
     (executePrepared [_ parsed params] (collecting-notices #(pg-resolve/with-symbol-resolver (.executePrepared h parsed params))))
