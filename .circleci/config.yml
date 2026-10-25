@@ -223,14 +223,18 @@ jobs:
       - install-clj-tools
       - run:
           name: Materialize pinned PostgreSQL regression source
-          command: bb pg-regress-setup
+          command: |
+            bb pg-regress-setup
+            PG_REGRESS_PROFILE=18 bb pg-regress-setup
           no_output_timeout: 10m
       - run:
           name: Validate beta-exit and PostgreSQL campaign inventories
           command: |
             bb pg-regress-harness-test
+            bb pg-regress-inventory-test
             bb beta-exit
             bb pg-regress-wave inventory
+            PG_REGRESS_PROFILE=18 bb pg-regress-wave inventory
 
   sqllogictest:
     executor: clj-jdk21

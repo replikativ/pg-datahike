@@ -1,0 +1,107 @@
+{:postgres-major 18,
+ :postgres-ref "REL_18_6",
+ :candidate-reference "REL_17_7",
+ :capabilities
+ {:constraint-triggers
+  {:status :unverified,
+   :requires #{:table-row-triggers},
+   :summary "Constraint triggers, deferrability, and SET CONSTRAINTS interaction."},
+  :event-triggers
+  {:status :unverified,
+   :requires #{:plpgsql-core},
+   :summary "DDL event triggers and their catalog/event-data surface."},
+  :merge-trigger-integration
+  {:status :unverified,
+   :requires #{:table-statement-triggers :table-row-triggers},
+   :summary
+   "MERGE action selection, trigger firing, nested-row conflict detection, and affected-row rules."},
+  :native-language-handlers
+  {:status :unverified,
+   :requires #{:routine-ddl},
+   :summary "Loading PostgreSQL C/internal language handlers and server shared libraries."},
+  :nested-executor
+  {:status :unverified,
+   :requires #{:object-registry},
+   :summary
+   "A protocol-independent statement executor with one execution context and deterministic effects."},
+  :object-registry
+  {:status :unverified,
+   :requires #{},
+   :summary
+   "Transactional, class-qualified object identity, namespaces, ownership, revision, and dependencies."},
+  :partition-triggers
+  {:status :unverified,
+   :requires #{:table-row-triggers},
+   :summary "Trigger inheritance/cloning and row movement across PostgreSQL partitions."},
+  :plpgsql-advanced
+  {:status :unverified,
+   :requires #{:plpgsql-core},
+   :summary "Dynamic EXECUTE, cursors, exception subtransactions, diagnostics, and advanced polymorphism."},
+  :plpgsql-core
+  {:status :unverified,
+   :requires #{:routine-resolution :nested-executor},
+   :summary
+   "Blocks, declarations, assignment, conditions, loops, return forms, static SQL, PERFORM, SELECT INTO, RAISE, FOUND, and trigger variables."},
+  :replication-trigger-state
+  {:status :unverified,
+   :requires #{:table-trigger-ddl},
+   :summary "ENABLE REPLICA/ALWAYS and session_replication_role firing rules."},
+  :routine-backed-aggregates
+  {:status :unverified,
+   :requires #{:sql-language},
+   :summary "User-defined aggregate transition/final routines over the supported aggregate executor."},
+  :routine-backed-casts
+  {:status :unverified,
+   :requires #{:sql-language},
+   :summary "Function-backed casts with explicit, assignment, and implicit contexts."},
+  :routine-backed-operators
+  {:status :unverified,
+   :requires #{:sql-language},
+   :summary "User-defined operators resolved through the same routine and cast machinery."},
+  :routine-catalogs
+  {:status :unverified,
+   :requires #{:routine-ddl},
+   :summary "Persistent pg_proc/pg_namespace/pg_language and information_schema projections."},
+  :routine-ddl
+  {:status :unverified,
+   :requires #{:object-registry},
+   :summary "CREATE, ALTER, DROP, replace, overload identity, defaults, and ordered arguments."},
+  :routine-resolution
+  {:status :unverified,
+   :requires #{:routine-ddl},
+   :summary
+   "PostgreSQL-compatible name, search_path, overload, polymorphic, default, and coercion resolution."},
+  :routine-security
+  {:status :unverified,
+   :requires #{:sql-language :routine-ddl},
+   :summary
+   "SECURITY DEFINER execution identity, ownership/privilege checks, and leakproof administration."},
+  :sql-language
+  {:status :unverified,
+   :requires #{:routine-resolution :nested-executor},
+   :summary
+   "String and SQL-standard bodies, scalar/set/table/composite results, multi-statement bodies, and writes."},
+  :table-row-triggers
+  {:status :unverified,
+   :requires #{:plpgsql-core :table-trigger-ddl},
+   :summary
+   "BEFORE and AFTER row triggers for INSERT, UPDATE, DELETE, COPY, and ON CONFLICT, including row replacement/suppression."},
+  :table-statement-triggers
+  {:status :unverified,
+   :requires #{:plpgsql-core :table-trigger-ddl},
+   :summary
+   "BEFORE and AFTER statement triggers for INSERT, UPDATE, DELETE, and TRUNCATE, including zero-row statements."},
+  :table-trigger-ddl
+  {:status :unverified,
+   :requires #{:routine-ddl},
+   :summary
+   "Persistent trigger identity, dependencies, catalog projection, rename/drop, WHEN, UPDATE OF, and enable state."},
+  :transition-tables
+  {:status :unverified,
+   :requires #{:table-statement-triggers},
+   :summary "OLD TABLE and NEW TABLE transition relations."},
+  :view-instead-triggers
+  {:status :unverified,
+   :requires #{:table-row-triggers},
+   :summary "INSTEAD OF row triggers and statement triggers on views."}},
+ :evidence []}

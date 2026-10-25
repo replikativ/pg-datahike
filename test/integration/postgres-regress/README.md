@@ -18,7 +18,7 @@ bb pg-regress jsonb expressions
 | Profile | Source release | Available operations |
 |---|---|---|
 | `17` (default) | `REL_17_7` | Named tests, fixture runs, audited waves and agreement |
-| `18` | `REL_18_6` | Named discovery tests and fixture runs |
+| `18` | `REL_18_6` | Named/fixture discovery, audited inventory and unmeasured waves |
 
 For example, with PostgreSQL 18's tools installed:
 
@@ -28,8 +28,23 @@ PG_REGRESS_PROFILE=18 bb pg-regress int4
 ```
 
 This selects the test reference; it does not change pg-datahike's advertised
-version or runtime catalog. Profile 18 has no admitted wave or agreement
-inventory yet, so those commands reject it.
+version or runtime catalog. Profile 18 has a separate source-audited inventory,
+with 231 scheduled tests and 233 SQL files (including two unscheduled files).
+Its 80 campaign files start unmeasured; it has no strict slices, admitted routine
+evidence or agreement scores. The all-SQL scope selects 164 application-facing
+files and excludes 69 files with explicit scope reasons. Inventory counts
+describe source dispositions, not executed or passing tests.
+
+```bash
+PG_REGRESS_PROFILE=18 bb pg-regress-wave inventory
+```
+
+The inventory fingerprints the SQL, schedule and all 265 expected output files,
+including platform variants. The source schedule documents shared setup and
+ordering requirements; those do not establish that every file is ready to run
+in isolation. Native regression helpers and encoding/file fixtures remain
+explicit fixture boundaries. A full agreement measurement requires validation
+of those prerequisites; the empty profile18 baseline is not a release gate.
 
 Sources default to `.internal/postgres-REL_17_7` or
 `.internal/postgres-REL_18_6`. A missing pinned checkout is an error; the harness

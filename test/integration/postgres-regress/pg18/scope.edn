@@ -1,0 +1,136 @@
+{:backlog
+ {:ddl-and-dml
+  #{"generated_virtual"
+    "create_procedure"
+    "updatable_views"
+    "typed_table"
+    "create_aggregate"
+    "largeobject"
+    "event_trigger_login"
+    "create_cast"
+    "drop_operator"
+    "create_misc"
+    "without_overlaps"
+    "create_function_sql"
+    "alter_operator"
+    "rules"
+    "inherit"
+    "event_trigger"
+    "fast_default"
+    "triggers"
+    "plpgsql"
+    "matview"
+    "alter_generic"
+    "create_operator"
+    "merge"},
+  :collation #{"collate"},
+  :relational-queries #{"select_into" "select_views" "groupingsets" "tablesample" "select_implicit"},
+  :json-and-xml
+  #{"xml"
+    "sqljson_jsontable"
+    "jsonpath_encoding"
+    "sqljson_queryfuncs"
+    "jsonb_jsonpath"
+    "xmlmap"
+    "json_encoding"},
+  :encoding-and-copy #{"encoding" "copyencoding" "euc_kr"},
+  :full-text #{"tstypes"},
+  :expressions-and-builtins
+  #{"random"
+    "polymorphism"
+    "strings"
+    "conversion"
+    "horology"
+    "misc"
+    "regex"
+    "unicode"
+    "md5"
+    "misc_functions"
+    "numerology"},
+  :unscheduled-numeric #{"numeric_big"},
+  :transactions-and-concurrency #{"plancache" "mvcc" "async" "prepared_xacts" "advisory_lock" "lock"},
+  :scalar-and-structural-types
+  #{"macaddr"
+    "path"
+    "box"
+    "xid"
+    "pg_lsn"
+    "oid"
+    "inet"
+    "geometry"
+    "line"
+    "polygon"
+    "regproc"
+    "multirangetypes"
+    "macaddr8"
+    "rangetypes"
+    "txid"
+    "circle"
+    "timetz"
+    "point"
+    "lseg"},
+  :catalog-and-client-api
+  #{"object_address" "psql_pipeline" "psql_crosstab" "database" "test_setup" "dbsize" "sysviews"}},
+ :out-of-scope
+ {:server-administration-and-security
+  #{"tablespace"
+    "roleattributes"
+    "create_role"
+    "privileges"
+    "dependency"
+    "rowsecurity"
+    "init_privs"
+    "password"
+    "guc"
+    "security_label"},
+  :physical-access-methods
+  #{"hash_index"
+    "brin_multi"
+    "create_am"
+    "spgist"
+    "gin"
+    "gist"
+    "btree_index"
+    "brin_bloom"
+    "create_index_spgist"
+    "index_including_gist"
+    "hash_func"
+    "indexing"
+    "index_including"
+    "brin"},
+  :platform-collation-matrix
+  #{"collate.utf8" "collate.windows.win1252" "collate.icu.utf8" "collate.linux.utf8"},
+  :unscheduled-catalog-maintenance #{"reindex_catalog"},
+  :planner-and-storage-internals
+  #{"select_parallel"
+    "bitmapops"
+    "tidrangescan"
+    "stats_ext"
+    "compression_pglz"
+    "tuplesort"
+    "cluster"
+    "vacuum"
+    "compression"
+    "functional_deps"
+    "indirect_toast"
+    "equivclass"
+    "combocid"
+    "reloptions"
+    "tidscan"
+    "infinite_recurse"
+    "write_parallel"
+    "stats_import"
+    "vacuum_parallel"
+    "predicate"
+    "memoize"
+    "incremental_sort"
+    "join_hash"
+    "stats"
+    "tid"
+    "maintain_every"},
+  :postgres-internal-sanity #{"oidjoins" "sanity_check"},
+  :server-extension-hooks #{"create_function_c" "amutils" "foreign_data"},
+  :replication #{"publication" "subscription" "replica_identity"},
+  :server-memory-topology #{"numa"},
+  :physical-partitioning
+  #{"partition_join" "partition_prune" "partition_aggregate" "hash_part" "partition_info"}}}

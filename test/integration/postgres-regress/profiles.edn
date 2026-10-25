@@ -9,4 +9,9 @@
         :agreement "agreement.edn"}
   "18" {:major 18
         :postgres-ref "REL_18_6"
-        :status :discovery}}}
+        :status :discovery
+        :campaign "pg18/campaign.edn"
+        :scope "pg18/scope.edn"
+        :ledger "pg18/routine-trigger-capabilities.edn"
+        :agreement "pg18/agreement.edn"
+        :inventory "pg18/inventory.edn"}}}

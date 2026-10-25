@@ -11,7 +11,7 @@
 (load-file (str (fs/file here "reference.clj")))
 (alias 'reference 'postgres-reference)
 (def reference-config (reference/config (str repo-root) (System/getenv)))
-(reference/require-campaign! reference-config)
+(def audited-inventory (reference/require-campaign! reference-config))
 (def campaign (edn/read-string (slurp (:campaign reference-config))))
 (def scope (edn/read-string (slurp (:scope reference-config))))
 (def routine-trigger-ledger (edn/read-string (slurp (:ledger reference-config))))
@@ -97,7 +97,8 @@
   (let [capabilities (:capabilities routine-trigger-ledger)
         evidence (:evidence routine-trigger-ledger)
         capability-ids (set (keys capabilities))
-        capability-statuses #{:target :later :excluded}
+        capability-statuses (cond-> #{:target :later :excluded}
+                              audited-inventory (conj :unverified))
         evidence-statuses #{:target :later :reference-only :admitted}
         evidence-ids (map :id evidence)
         duplicate-evidence (->> evidence-ids frequencies
@@ -256,7 +257,11 @@
         campaign-names (set names)
         inventoried (into campaign-names scoped-names)
         unclassified (sort (set/difference scheduled inventoried))
-        unscheduled (sort (set/difference inventoried scheduled))
+        unscheduled (sort (set/difference inventoried
+                                          (if audited-inventory
+                                            (set (keys ((ns-resolve 'postgres-inventory 'sql-files)
+                                                        (:regress-root reference-config))))
+                                            scheduled)))
         doubly-classified (sort (set/intersection campaign-names
                                                   (set scoped-names)))]
     (when (seq duplicate-wave-ids)
@@ -343,7 +348,8 @@
 (defn print-inventory! []
   (let [campaign-count (count (set (mapcat (comp (partial map :name) :tests)
                                            (:waves campaign))))
-        entries (scope-entries)
+        entries (cond->> (scope-entries)
+                  audited-inventory (filter #(contains? (scheduled-tests) (:name %))))
         backlog-count (count (filter #(= :backlog (:status %)) entries))
         scheduled-count (count (scheduled-tests))
         application-count (+ campaign-count backlog-count)
@@ -355,6 +361,12 @@
         (routine-trigger-metrics)]
     (println (format "PostgreSQL %d schedule: %d tests"
                      (:postgres-major campaign) scheduled-count))
+    (when audited-inventory
+      (println (format "  all SQL      %d (%d canonical/variant expected files); %d application-facing"
+                       (:sql-count audited-inventory) (:expected-count audited-inventory)
+                       (:application-count audited-inventory)))
+      (println (str "  unscheduled  " (str/join ", " (:unscheduled audited-inventory))))
+      (println "  admission    unverified; inventory is source classification, not execution coverage"))
     (println (format "  campaign     %d" campaign-count))
     (println (format (str "    classified %.1f%% of %d application-facing files; "
                           "%.1f%% of the complete schedule")
@@ -377,6 +389,8 @@
                      (get capability-statuses :later 0)
                      (get capability-statuses :excluded 0)
                      evidence-lines))
+    (when-let [unverified (get capability-statuses :unverified)]
+      (println (format "    unverified capability vocabulary %d; no carried execution evidence" unverified)))
     (println (format (str "    evidence target %d (%d lines), later %d (%d lines), "
                           "reference-only %d (%d lines), admitted %d (%d lines); "
                           "%d duplicate claims")
