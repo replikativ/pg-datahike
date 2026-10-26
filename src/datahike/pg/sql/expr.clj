@@ -9454,23 +9454,9 @@
                     [(namespace resolved) (ctx/attr-of ctx resolved)])
                   _ (ctx/validate-column! ctx kw)
                   evar (ctx/entity-var! ctx alias-key)
-                  val-var (ctx/fresh-var! ctx)
-                  ;; Ensure the entity var is bound by an anchor pattern.
-                  ;; Prefer row-marker if available, else first column.
-                  table-name (get (:table-aliases ctx) alias-key alias-key)
-                  _ (when (empty? (filter (fn [c]
-                                            (and (vector? c) (>= (count c) 2)
-                                                 (= evar (first c))
-                                                 (keyword? (second c))))
-                                          @(:where-clauses ctx)))
-                      (let [marker (pgs/row-marker-attr table-name)]
-                        (if (get (:schema ctx) marker)
-                          (ctx/add-clause! ctx [evar marker true])
-                          (let [first-attr (or (when-let [db (:db ctx)]
-                                                 (when-let [co (pgs/column-order-from-db db table-name)]
-                                                   (keyword table-name (first co))))
-                                               kw)]
-                            (ctx/add-clause! ctx [evar first-attr (ctx/fresh-var! ctx)])))))]
+                  ;; Relation membership is established by the enclosing
+                  ;; SELECT or DML row matcher, independently of this column.
+                  val-var (ctx/fresh-var! ctx)]
               ;; Add get-else pattern: [(get-else $ ?e :attr :__null__) ?v]
               (ctx/add-clause! ctx [(list 'get-else '$ evar kw :__null__) val-var])
               (if not-null?

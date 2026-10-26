@@ -908,6 +908,29 @@
     (or (internal-namespace? ns)
         (= (name ident) row-marker-col))))
 
+(defn relation-membership-attrs
+  "Describe the physical attributes that establish membership in `table-name`.
+
+   SQL-created tables have an authoritative row marker; when it exists no
+   other same-namespace datom admits an entity into the SQL relation. Native
+   Datahike tables have no marker, so an entity belongs when it carries ANY
+   non-system attribute in the namespace. The native attributes are sorted to
+   keep translated query forms and their cache keys deterministic.
+
+   Hidden-column hints are intentionally irrelevant here: visibility changes
+   projection, not whether the underlying entity is a row."
+  [schema table-name]
+  (let [table-name (str table-name)
+        marker (row-marker-attr table-name)]
+    (if (contains? schema marker)
+      {:marker marker}
+      {:native (->> (keys schema)
+                    (filter #(and (keyword? %)
+                                  (= table-name (namespace %))
+                                  (not (internal-attr? %))))
+                    (sort-by str)
+                    vec)})))
+
 ;; ============================================================================
 ;; Virtual table derivation
 ;; ============================================================================

@@ -37,6 +37,25 @@
 
 (set! *warn-on-reflection* true)
 
+(defn relation-membership-clause
+  "Return one Datalog clause binding `evar` to every physical row of
+   `table-name`.
+
+   SQL tables use their authoritative row marker. A marker-less native
+   Datahike table is the union of entities carrying any of its namespaced
+   attributes. Only the entity variable escapes the or-join; wildcard values
+   cannot perturb SQL bag or grouping semantics. Shared by SELECT translation
+   and write-path row matching so both agree on what constitutes a row."
+  [schema table-name evar]
+  (let [{:keys [marker native]}
+        (pgs/relation-membership-attrs schema table-name)]
+    (cond
+      marker [evar marker true]
+      (= 1 (count native)) [evar (first native) '_]
+      (seq native) (list* 'or-join [evar]
+                          (mapv (fn [attr] [evar attr '_]) native))
+      :else nil)))
+
 ;; ---------------------------------------------------------------------------
 ;; Table alias resolution
 

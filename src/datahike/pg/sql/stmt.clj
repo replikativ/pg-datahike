@@ -4961,16 +4961,9 @@
                                        (not is-count-star?)
                                        params (pos? (count params)))]
                 (if (and (= fname "count") is-count-star?)
-                        ;; COUNT(*) — count entities using row-marker if available
-                  (let [evar (ctx/entity-var! ctx default-table)
-                        table-name (get (:table-aliases ctx) default-table default-table)
-                        marker-attr (pgs/row-marker-attr table-name)]
-                    (when (empty? @(:where-clauses ctx))
-                      (if (get schema marker-attr)
-                        (ctx/add-clause! ctx [evar marker-attr true])
-                        (let [cols (pgs/column-info schema table-name db)]
-                          (when-let [first-col (second cols)]
-                            (ctx/col-var! ctx (:attr first-col))))))
+                        ;; COUNT(*) counts the relation membership established
+                        ;; by the shared alias-anchor pass below.
+                  (let [evar (ctx/entity-var! ctx default-table)]
                     (if is-distinct?
                       (swap! find-elements conj (list 'count-distinct evar))
                       (swap! find-elements conj (list 'count evar)))
@@ -6075,39 +6068,47 @@
                            (not (contains? (:computed-aliases ctx) alias-key)))
                   (swap! (:with-vars ctx) conj evar)))))
 
-        ;; Anchor for the default-table entity var. If every clause
-        ;; referencing evar is a get-else (e.g. ctx/col-var! output), the
-        ;; var is never actually bound — get-else needs its entity input
-        ;; already grounded. Add a plain data pattern so iteration has
-        ;; a starting point. Applies equally to aggregate queries
-        ;; (GROUP BY col_with_null would drop the NULL-group row
-        ;; otherwise, since no data pattern drives entity enumeration).
-        _ (when default-table
-            (let [table-name (get table-aliases default-table default-table)
-                  evar (ctx/entity-var! ctx default-table)
-                  marker (pgs/row-marker-attr table-name)
-                  has-plain-anchor?
-                  (some (fn [c]
-                          (and (vector? c)
-                               (= 3 (count c))
-                               (= evar (first c))
-                               (keyword? (second c))))
-                        @(:where-clauses ctx))]
-              ;; `ONLY t` reads t without the tables that inherit from
-              ;; it. A child's row carries BOTH markers -- its own and
-              ;; every ancestor's -- which is how the parent sees it, so
-              ;; excluding the children's markers is exactly ONLY.
-              (doseq [[a tname] table-aliases
-                      :when (contains? params/*only-tables* (str/lower-case (str tname)))
-                      child (ctx/inheritance-descendants db tname)]
-                (ctx/add-clause!
-                 ctx (list 'not [(ctx/entity-var! ctx a) (pgs/row-marker-attr child) true])))
-              (when-not has-plain-anchor?
-                (if (get schema marker)
-                  (ctx/add-clause! ctx [evar marker true])
-                  (when-let [cols (pgs/column-info schema table-name db)]
-                    (when-let [first-col (second cols)]
-                      (ctx/add-clause! ctx [evar (:attr first-col) (ctx/fresh-var! ctx)])))))))
+        ;; Establish physical relation membership for every non-nullable
+        ;; alias. SQL-created tables have one authoritative row marker;
+        ;; marker-less native Datahike tables are the union of entities that
+        ;; carry any namespaced attribute. A joined alias needs its own eid
+        ;; anchor just as much as the default FROM alias does. Nullable outer
+        ;; aliases are deliberately excluded here and anchored inside their
+        ;; matched branch below.
+        membership-anchored-evars
+        (let [nullable-aliases (into #{}
+                                     (keep (fn [{:keys [join-type alias]}]
+                                             (when (#{:left :right :full} join-type)
+                                               alias)))
+                                     join-infos)
+              anchored (atom #{})]
+          ;; `ONLY t` reads t without the tables that inherit from it. A
+          ;; child's row carries both its own and every ancestor marker.
+          ;; Iterate actual alias vars rather than the alias map's duplicate
+          ;; base-name entries, which must not manufacture a second eid.
+          (doseq [[alias-key evar] @(:entity-vars ctx)
+                  :let [tname (get (:table-aliases ctx) alias-key alias-key)]
+                  :when (contains? params/*only-tables* (str/lower-case (str tname)))
+                  child (ctx/inheritance-descendants db tname)]
+            (ctx/add-clause!
+             ctx (list 'not [evar (pgs/row-marker-attr child) true])))
+          (doseq [[alias-key evar] @(:entity-vars ctx)
+                  :when (and (not (contains? nullable-aliases alias-key))
+                             (not (contains? (:computed-aliases ctx) alias-key)))
+                  :let [tname (get (:table-aliases ctx) alias-key alias-key)
+                        membership (ctx/relation-membership-clause schema tname evar)
+                        clauses @(:where-clauses ctx)
+                        ;; Keep the structural membership clause even when a
+                        ;; projected native attribute currently binds the eid:
+                        ;; the later NULL-optionalization pass may turn that
+                        ;; attribute pattern into get-else. Only this exact
+                        ;; clause is guaranteed to survive as the row driver.
+                        already? (some #(= membership %) clauses)]
+                  :when membership]
+            (when-not already?
+              (ctx/add-clause! ctx membership))
+            (swap! anchored conj evar))
+          @anchored)
 
         ;; SQL bag semantics for non-aggregate / non-DISTINCT queries.
         ;; Without evar in :with, two entities with identical SELECT-column
@@ -6139,16 +6140,7 @@
                                         (instance? AllColumns (first params))))]
             (cond
               (and (= fname "count") is-count-star? default-table)
-              (let [evar (ctx/entity-var! ctx default-table)
-                    table-name (get (:table-aliases ctx) default-table default-table)
-                    marker-attr (pgs/row-marker-attr table-name)]
-                (when (empty? @(:where-clauses ctx))
-                  (if (get schema marker-attr)
-                    (ctx/add-clause! ctx [evar marker-attr true])
-                    (when-let [cols (pgs/column-info schema table-name db)]
-                      (when-let [first-col (second cols)]
-                        (ctx/col-var! ctx (:attr first-col))))))
-                (list 'count evar))
+              (list 'count (ctx/entity-var! ctx default-table))
               (and params (= 1 (count params)) (not is-count-star?))
               (let [agg-sym (get fns/sql-aggregate->datalog fname)
                     v (expr/translate-expr ctx (first params))
@@ -6588,6 +6580,8 @@
                       all-clauses @(:where-clauses ctx)
                       right-table (get (:table-aliases ctx) right-alias right-alias)
                       right-marker (pgs/row-marker-attr right-table)
+                      right-membership (ctx/relation-membership-clause
+                                        schema right-table right-evar)
                       right-side? (fn [c]
                                     (or (and (vector? c) (= 3 (count c))
                                              (= right-evar (first c))
@@ -6616,7 +6610,9 @@
                       ;; a head variable that appears inside it.
                       anchor-bind (when left-evar
                                     [(list 'identity left-evar) (gensym "?nl-anchor")])
-                      matched-parts (into (cond-> [[right-evar right-marker true]]
+                      matched-parts (into (cond-> (if right-membership
+                                                    [right-membership]
+                                                    [])
                                             anchor-bind (conj anchor-bind))
                                           (concat right-reads matched-only-preds))
                       pred-vars (into #{} (mapcat clause-vars) matched-parts)
@@ -6709,6 +6705,8 @@
                       ;; Also remove any right-side marker/get-else from left clauses
                       right-table (get (:table-aliases ctx) right-alias right-alias)
                       right-marker (pgs/row-marker-attr right-table)
+                      right-membership (ctx/relation-membership-clause
+                                        schema right-table right-evar)
                       left-clauses (vec (remove
                                          (fn [c]
                                            (and (vector? c) (>= (count c) 3)
@@ -6756,7 +6754,8 @@
                       ;; the matched branch only. Without this they'd
                       ;; act as global filters and convert the LEFT JOIN
                       ;; into an INNER JOIN.
-                      matched-parts (into (vec matched-keys)
+                      matched-parts (into (cond-> (vec matched-keys)
+                                            right-membership (conj right-membership))
                                           (concat matched-non-key
                                                   matched-key-binds
                                                   matched-only-preds))
@@ -6862,8 +6861,10 @@
                         right-clauses (vec (filter right-side? all-clauses))
                         left-clauses (vec (remove (fn [c] (or (ref-binding? c) (right-side? c)))
                                                   all-clauses))
-                        right-marker (pgs/row-marker-attr
-                                      (get (:table-aliases ctx) alias alias))
+                        right-table (get (:table-aliases ctx) alias alias)
+                        right-marker (pgs/row-marker-attr right-table)
+                        right-membership (ctx/relation-membership-clause
+                                          schema right-table right-evar)
                         right-clauses (vec (remove #(and (vector? %) (= 3 (count %))
                                                          (= right-marker (second %)))
                                                    right-clauses))
@@ -6884,7 +6885,8 @@
                         ;; made a left row whose ref exists but fails
                         ;; another condition fit NEITHER branch -- it
                         ;; disappeared instead of being null-extended.
-                        matched-parts (into [[owner-evar ref-attr right-evar]]
+                        matched-parts (into (cond-> [[owner-evar ref-attr right-evar]]
+                                              right-membership (conj right-membership))
                                             (concat right-reads matched-only-preds))
                         pred-vars (into #{} (mapcat clause-vars) matched-only-preds)
                         bound-outside (into #{} (mapcat clause-bound-vars) left-clauses)
@@ -6913,6 +6915,9 @@
 
                   (let [{:keys [ref-var ref-attr left-table-evar matched-only-preds]} ref-info
                         owner-evar (ctx/entity-var! ctx alias)
+                        owner-table (get (:table-aliases ctx) alias alias)
+                        owner-membership (ctx/relation-membership-clause
+                                          schema owner-table owner-evar)
                         all-clauses @(:where-clauses ctx)
                       ;; The original ref pattern from the ON clause:
                       ;; `[?p_eid :posting/transaction ?ref-var]`. We
@@ -6923,28 +6928,46 @@
                                        (and (vector? clause) (= 3 (count clause))
                                             (= ref-attr (second clause))
                                             (= ref-var (nth clause 2))))
-                      ;; Right-side data patterns on ref-var (used to
-                      ;; project right-side columns via the ref's
-                      ;; deref'd identity).
+                      ;; Right-side data patterns belong to the entity that
+                      ;; owns this ref. In this branch the owner is the JOINed
+                      ;; (right) row; `ref-var` is the referenced LEFT eid and
+                      ;; cannot own projected right-table attributes.
                         right-clause? (fn [clause]
                                         (and (vector? clause) (= 3 (count clause))
-                                             (= ref-var (first clause))
+                                             (= owner-evar (first clause))
                                              (keyword? (second clause))))
-                        right-clauses (vec (filter right-clause? all-clauses))
+                        right-get-else? (fn [clause]
+                                          (and (vector? clause) (= 2 (count clause))
+                                               (seq? (first clause))
+                                               (= 'get-else (first (first clause)))
+                                               (= owner-evar
+                                                  (nth (vec (first clause)) 2 nil))))
+                        right-side? (fn [clause]
+                                      (or (right-clause? clause)
+                                          (right-get-else? clause)))
+                        right-clauses (vec (filter right-side? all-clauses))
+                        ;; A projected right column is nullable independently
+                        ;; of join null-extension. Keep its read inside the
+                        ;; matched branch and make a missing attribute SQL
+                        ;; NULL rather than turning the row into a non-match.
+                        right-reads (mapv (fn [clause]
+                                            (if (right-clause? clause)
+                                              [(list 'get-else '$ owner-evar
+                                                     (second clause) :__null__)
+                                               (nth clause 2)]
+                                              clause))
+                                          (remove #(= owner-membership %)
+                                                  right-clauses))
                       ;; Outer (LEFT-driving) clauses: drop the ref-binding
                       ;; (moves into matched) and any right-clauses (those
                       ;; only make sense when matched).
                         left-clauses (vec (remove (fn [c]
                                                     (or (ref-binding? c)
-                                                        (right-clause? c)))
+                                                        (right-side? c)))
                                                   all-clauses))
                       ;; Vars introduced by right-side patterns; needed in
                       ;; shared-vars and as :__null__ bindings in unmatched.
-                        right-vars (vec (distinct
-                                         (keep (fn [clause]
-                                                 (when (and (vector? clause) (= 3 (count clause)))
-                                                   (nth clause 2)))
-                                               right-clauses)))
+                        right-vars (vec (distinct (keep second right-reads)))
                       ;; If the LEFT alias was swapped in translate-join
                       ;; (legacy / non-LEFT path that leaked here), we
                       ;; might not have left-table-evar. Fall back to
@@ -7003,7 +7026,10 @@
                                            left-evar
                                            [[(list 'identity left-evar) ref-var]]
                                            :else [])
-                        matched-parts (vec (concat matched-ref-bind right-clauses
+                        matched-parts (vec (concat matched-ref-bind
+                                                   (when owner-membership
+                                                     [owner-membership])
+                                                   right-reads
                                                    matched-only-preds))
                         matched (apply list 'and matched-parts)
                       ;; Unmatched branch: assert no right row points at
@@ -7015,6 +7041,14 @@
                                             (cond-> (vec right-vars)
                                               include-owner? (conj owner-evar)
                                               true           (conj ref-var)))
+                        ;; Carry the already-bound LEFT eid directly through
+                        ;; this branch. The flattened not-join below declares
+                        ;; it to Datahike's rule validator; this binding keeps
+                        ;; the branch shape explicit without imposing physical
+                        ;; membership (important after an earlier LEFT JOIN).
+                        unmatched-anchor (when left-evar
+                                           [[(list 'identity left-evar)
+                                             (gensym "?lj-anchor-")]])
                         not-match-guard
                         (if left-evar
                         ;; "no posting points at this transaction" -- and,
@@ -7029,18 +7063,25 @@
                           (if (seq matched-only-preds)
                             [(list* 'not-join outer-left-vars
                                     (concat matched-ref-bind
+                                            (when owner-membership
+                                              [owner-membership])
                                             (filter (fn [c]
                                                       (some #(contains? pred-vars %)
                                                             (clause-vars c)))
-                                                    right-clauses)
+                                                    right-reads)
                                             matched-only-preds))]
                             (let [inner-eid (gensym "?lj-inner-")]
-                              [(list 'not-join [left-evar]
-                                     [inner-eid ref-attr left-evar])]))
+                              [(list* 'not-join [left-evar]
+                                      (cond-> [[inner-eid ref-attr left-evar]]
+                                        owner-membership
+                                        (conj (ctx/relation-membership-clause
+                                               schema owner-table inner-eid))))]))
                         ;; legacy: ref-var = :__null__
                           [[(list '= ref-var :__null__)]])
                         unmatched (apply list 'and
-                                         (concat not-match-guard null-bindings))
+                                         (concat unmatched-anchor
+                                                 not-match-guard
+                                                 null-bindings))
                         oj-clause (list* 'or-join shared-vars matched unmatched nil)]
                     (reset! (:where-clauses ctx)
                             (if *unmatched-rows-only*
@@ -7098,29 +7139,11 @@
                                   (into pred-vars)
                                   (into entity-var-set)
                                   (into order-vars))
-                ;; Add row-marker anchors for entities that have the marker in schema.
-                ;; This ensures all SQL-inserted entities (including all-NULL rows) are found.
-                ;; Entity vars on the optional side of LEFT JOINs should NOT get
-                ;; marker anchors outside the or-join (they're handled inside it)
-                optional-aliases (set (keep (fn [{:keys [join-type alias]}]
-                                              (when (= :left join-type) alias))
-                                            join-infos))
-                entity-has-anchor (atom #{})
-                _ (doseq [[alias-key evar] @(:entity-vars ctx)]
-                    (when-not (or (contains? optional-aliases alias-key)
-                                  (contains? (:computed-aliases ctx) alias-key))
-                      (let [tname (get (:table-aliases ctx) alias-key alias-key)
-                            marker (pgs/row-marker-attr tname)]
-                        (when (get schema marker)
-                          (let [already? (some (fn [c]
-                                                 (and (vector? c) (>= (count c) 3)
-                                                      (= evar (first c))
-                                                      (= marker (second c))))
-                                               @(:where-clauses ctx))]
-                            (when-not already?
-                              (swap! (:where-clauses ctx) conj [evar marker true]))
-                            (swap! entity-has-anchor conj evar))))))
-                ;; Re-read after possible marker additions
+                ;; Membership anchors above already establish every ordinary
+                ;; physical alias. Seed this pass with those eids so it does
+                ;; not retain an arbitrary projected column as a second anchor
+                ;; and silently filter sparse native rows missing that column.
+                entity-has-anchor (atom membership-anchored-evars)
                 all-clauses @(:where-clauses ctx)
                 ;; Build function-binding dependency: input-var → output-var
                 ;; For [(fn ?input "key") ?output], record ?input → ?output
