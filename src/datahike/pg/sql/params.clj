@@ -201,6 +201,20 @@
    Nil during parsing and non-server use."
   nil)
 
+(def ^:dynamic *analysis-only?*
+  "Internal lowering mode for plain EXPLAIN. Catalog/schema reads are allowed;
+   represented query rows and expression effects must not be produced."
+  false)
+
+(defn require-execution!
+  "Reject a row-producing path without an analysis implementation. Call before
+   invoking the producer; a discarded result would still execute its effects."
+  [producer]
+  (when *analysis-only?*
+    (throw (ex-info (str "EXPLAIN analysis does not support " producer)
+                    {:sqlstate "0A000" :error :feature-not-supported
+                     :feature producer}))))
+
 (def ^:dynamic *assignment-programs*
   "Internal generated-expression programs, keyed by their owned AST placeholder
    names. Only immutable program metadata belongs here; values/markers are built

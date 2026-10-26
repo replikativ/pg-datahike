@@ -5880,6 +5880,7 @@
 
 (defn- run-subquery-leaf
   [p db]
+  (params/require-execution! "subquery row production")
   (params/check-cancel!)
   (throw-subquery-error! p)
   (reject-unapplied-subquery-stages! p)
@@ -10184,6 +10185,8 @@
                           ;; predicate that makes the outer row-set empty.
                           (let [inner-sql (str sub-select)
                                 inner-parsed ((:parse-sql ctx) inner-sql schema db)
+                                _ (throw-subquery-error! inner-parsed)
+                                _ (params/require-execution! "WHERE EXISTS row production")
                                 inner-query (:query inner-parsed)
                                 inner-in-args (:in-args inner-parsed)
                                 query-db (or (:enriched-db inner-parsed) db)
@@ -10222,20 +10225,23 @@
                       ;; EXISTS → use inner patterns as additional where clauses
                       optimized-clauses)))
                 ;; Not a PlainSelect — fall back to uncorrelated execution
-                (let [inner-sql (str sub-select)
-                      inner-parsed ((:parse-sql ctx) inner-sql schema db)
-                      inner-query (:query inner-parsed)
-                      inner-in-args (:in-args inner-parsed)
-                      query-db (or (:enriched-db inner-parsed) db)
-                      inner-results (if (seq inner-in-args)
-                                      (apply d/q
-                                             inner-query query-db inner-in-args)
-                                      (d/q
-                                       inner-query query-db))
-                      has-results? (boolean (seq inner-results))]
-                  (if (if not-exists? (not has-results?) has-results?)
-                    []
-                    [[(list 'not= 1 1)]]))))
+                (do
+                  (let [inner-sql (str sub-select)
+                        inner-parsed ((:parse-sql ctx) inner-sql schema db)
+                        _ (throw-subquery-error! inner-parsed)
+                        _ (params/require-execution! "WHERE EXISTS row production")
+                        inner-query (:query inner-parsed)
+                        inner-in-args (:in-args inner-parsed)
+                        query-db (or (:enriched-db inner-parsed) db)
+                        inner-results (if (seq inner-in-args)
+                                        (apply d/q
+                                               inner-query query-db inner-in-args)
+                                        (d/q
+                                         inner-query query-db))
+                        has-results? (boolean (seq inner-results))]
+                    (if (if not-exists? (not has-results?) has-results?)
+                      []
+                      [[(list 'not= 1 1)]])))))
             (catch Exception _ex
                 ;; Translation is side-effecting. Roll back every partial
                 ;; clause/input before reporting the unsupported shape;

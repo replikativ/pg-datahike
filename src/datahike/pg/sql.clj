@@ -329,6 +329,7 @@
    to miss the cache and looked correct."
   []
   [params/*declared-param-oids* params/*temp-table-map* params/*nested-parse?*
+   params/*analysis-only?*
    (when params/*session-state*
      (select-keys @params/*session-state*
                   ;; TimeZone for the same reason as DateStyle: a
@@ -590,6 +591,15 @@
               (re-matches #"(?is)^\s*EXPLAIN\s+(?:(ANALY[ZS]E)\s+)?(.+?)\s*;?\s*$" sql)]
      {:inner inner :parser-sql sql :analyze? (some? analyze)})))
 
+(defn- explain-artifact
+  "The lowered carrier and post-processing stages, without DB snapshots."
+  [plan]
+  (cond-> (select-keys plan [:type :query :literal-row :literal-rows
+                             :op :set-ops :limit :offset :sql-limit :sql-offset
+                             :sql-order-by :having :compound-exprs :window-specs
+                             :project-set :project-order-by :project-limit :project-offset])
+    (:sub-results plan) (assoc :sub-results (mapv explain-artifact (:sub-results plan)))))
+
 (defn- stmt-with-items
   "Statement-agnostic WITH-list accessor. JSqlParser exposes
    `.getWithItemsList` separately on PlainSelect / SetOperationList /
@@ -841,7 +851,7 @@
                ;; structurally unbounded case before entering Datahike's
                ;; recursive-rule executor. A recursive term with a WHERE
                ;; predicate keeps the existing finite fixed-point path.
-               (when demand-limited-recursion?
+               (when (and demand-limited-recursion? (not params/*analysis-only?*))
                  (throw (errors/pg-error
                          :feature-not-supported
                          {:feature "demand-driven recursive CTE evaluation with LIMIT"})))
@@ -858,7 +868,9 @@
                    ;; for bodies the rule can't represent (LEFT JOIN, etc.).
                      paramy? (boolean (seq (try (params/ast-param-indices wi)
                                                 (catch Throwable _ nil))))
-                     m (if paramy? (or (iter!) (rule!)) (or (rule!) (iter!)))]
+                     m (if params/*analysis-only?*
+                         (stmt/materialize-recursive-analysis! wi cte-name curr-db curr-schema)
+                         (if paramy? (or (iter!) (rule!)) (or (rule!) (iter!))))]
                  (if m
                  ;; A parameterised recursive CTE enriches only the schema
                  ;; now and carries a `:deferred` spec for Execute-time data.
@@ -1525,7 +1537,8 @@
                             (let [e (.getExpression item)]
                               (and (instance? Function e)
                                    (= "generate_series" (str/lower-case (.getName ^Function e))))))
-                          table-free? (and (nil? (.getFromItem ^PlainSelect stmt))
+                          table-free? (and (not params/*analysis-only?*)
+                                           (nil? (.getFromItem ^PlainSelect stmt))
                                            (nil? (.getWhere ^PlainSelect stmt))
                                            (let [items (.getSelectItems ^PlainSelect stmt)]
                                              ;; Target-list SRFs use the general
@@ -1587,8 +1600,10 @@
                                       e (.getExpression it)]
                                   (when (and (instance? Function e)
                                              (= "generate_series" (str/lower-case (.getName ^Function e))))
-                                    (when-let [m (stmt/materialize-table-function
-                                                  (net.sf.jsqlparser.statement.select.TableFunction. ^Function e))]
+                                    (when-let [m (let [tf (net.sf.jsqlparser.statement.select.TableFunction. ^Function e)]
+                                                   (if params/*analysis-only?*
+                                                     (stmt/materialize-table-function tf nil nil {:schema schema :db db})
+                                                     (stmt/materialize-table-function tf)))]
                                       (assoc m :alias (or (select-item-alias it)
                                                           (first (:aliases m))))))))))
                           literal-eval (fn [e]
@@ -2270,12 +2285,14 @@
           ;; EXPLAIN (non-ANALYZE): expose the actual lowered Datahike query.
                     (instance? ExplainStatement stmt)
                     (let [inner-sql (:inner explain)
-                          inner (when inner-sql (parse-sql inner-sql schema db))]
+                          inner (when inner-sql
+                                  (binding [params/*nested-parse?* true]
+                                    (parse-sql inner-sql schema db)))]
                       (cond
                         (nil? inner-sql)
                         {:type :error :message "invalid EXPLAIN statement" :sqlstate "42601"}
                         (= :error (:type inner)) inner
-                        (not= :select (:type inner))
+                        (not (contains? #{:select :set-operation} (:type inner)))
                         {:type :error
                          :message "EXPLAIN currently supports SELECT statements only"
                          :sqlstate "0A000"}
@@ -2290,7 +2307,7 @@
                          :hidden-count 0
                          ;; This is deliberately a truthful engine plan,
                          ;; not a fabricated PostgreSQL Seq Scan tree.
-                         :literal-row [(str "Datahike Query " (pr-str (:query inner)))]}))
+                         :literal-row [(str "Datahike Query " (pr-str (explain-artifact inner)))]}))
 
           ;; INSERT
                     (instance? Insert stmt)
@@ -2812,7 +2829,13 @@
    ;; A row scope (row-eval) belongs to this statement only: a subquery
    ;; parsed from here on sees the row as an outer relation.
    (binding [params/*statement-row-scope-tables* params/*row-scope-tables*
-             params/*row-scope-tables* nil]
+             params/*row-scope-tables* nil
+             ;; Enter before catalog/WITH/derived lowering, and inherit the
+             ;; mode through every nested parse. Cache identity includes it.
+             params/*analysis-only?* (boolean
+                                      (or params/*analysis-only?*
+                                          (when-let [explain (explain-prefix sql)]
+                                            (not (:analyze? explain)))))]
      (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
          ;; per-row eval) resolves outer column refs to ROW-SPECIFIC constants,
          ;; so it must neither be served from nor written to the shared result
