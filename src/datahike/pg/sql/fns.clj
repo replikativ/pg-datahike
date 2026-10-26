@@ -1321,7 +1321,7 @@
 
 (defn- deferred-call-marker? [v]
   (and (map? v)
-       (contains? #{:nextval :now :eval :random-uuid :uuid-v7 :raise :projection}
+       (contains? #{:nextval :now :eval :random-uuid :uuid-v7 :raise :projection :assignment}
                   (some (fn [[k value]] (when (= :fn k) value)) v))))
 
 (defn null-safe

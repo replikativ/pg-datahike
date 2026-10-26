@@ -469,7 +469,7 @@
           (is (= Types/BIGINT (.getParameterType pmd 2))))))))
 
 (deftest test-prepared-statement-sqlstate
-  (testing "PreparedStatement with bad value propagates SQLSTATE"
+  (testing "a declared VARCHAR cannot be assigned directly to a numeric column"
     (with-conn [c {:preferQueryMode "extended"}]
       (with-open [ps (.prepareStatement c "INSERT INTO t (id, name, age) VALUES (?, ?, ?)")]
         (.setInt ps 1 10)
@@ -478,7 +478,7 @@
         (try (.executeUpdate ps)
              (is false "expected SQLException")
              (catch SQLException e
-               (is (= "22P02" (.getSQLState e)))))))))
+               (is (= "42804" (.getSQLState e)))))))))
 
 ;; ============================================================================
 ;; Binary format rejection
@@ -559,11 +559,11 @@
     ;; Sync" state, leaving the connection in an undefined place. Now we
     ;; correctly skip and recover on Sync.
     (with-conn [c {:preferQueryMode "extended"}]
-      ;; Bad parameter (type mismatch)
+      ;; UNKNOWN input takes the numeric column type, then fails its input codec.
       (with-open [ps (.prepareStatement c "INSERT INTO t (id, name, age) VALUES (?, ?, ?)")]
         (.setInt ps 1 400)
         (.setString ps 2 "Zed")
-        (.setString ps 3 "notanumber")
+        (.setObject ps 3 "notanumber" Types/OTHER)
         (try (.executeUpdate ps)
              (is false "expected SQLException")
              (catch SQLException e

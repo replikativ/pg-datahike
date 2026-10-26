@@ -172,13 +172,10 @@
 ;; ---------------------------------------------------------------------------
 
 (defn subscript
-  "PG array subscript: `arr[n]`. 1-indexed (offset by lbound),
-   out-of-range or nil index returns nil (SQL NULL) — never throws.
-
-   For multi-dim arrays, returns the nth sub-array (still a PgArray
-   with rank reduced by 1) so caller can chain `(subscript (subscript
-   m 1) 2)` for `m[1][2]`. Matches PG: `arr[i]` on a 2-D yields a
-   1-D row, `arr[i][j]` yields a scalar."
+  "Take one structural dimension from `a`. This remains useful to array
+   internals, but is not PostgreSQL's complete SQL element-read operation:
+   SQL `a[i]` returns NULL when `a` has more than one dimension. Use
+   `element-at-indices` at the SQL boundary."
   [^PgArray a n]
   (when (and a n (integer? n))
     (let [n (long n)
@@ -193,27 +190,87 @@
               (->PgArray (:elem-type a) child-elements child-dims child-lbounds))
             child))))))
 
+(defn element-at-indices
+  "PostgreSQL array element fetch for one complete subscript chain.
+
+   PostgreSQL does not expose a lower-rank row array through element syntax:
+   the number of supplied indices must equal the stored rank. A NULL index,
+   rank mismatch, empty array, or out-of-range index returns SQL NULL (`nil`)."
+  [^PgArray a indices]
+  (let [indices (vec indices)
+        dims (:dims a)
+        rank (if (and (seq dims) (every? pos? dims)) (count dims) 0)]
+    (when (and a (pos? rank) (= rank (count indices))
+               (every? #(and (some? %) (integer? %)) indices))
+      (loop [value (:elements a), dimension 0]
+        (if (= dimension rank)
+          value
+          (let [children (some-> (inner-seq value) vec)
+                lo (long (or (get (:lbounds a) dimension) 1))
+                offset (- (long (nth indices dimension)) lo)]
+            (when (and children (<= 0 offset) (< offset (count children)))
+              (recur (nth children offset) (inc dimension)))))))))
+
+(defn slice-at
+  "PostgreSQL array slice fetch over a normalized dimension vector.
+
+   Each spec has `:lower`/`:upper` plus `:lower-provided?` and
+   `:upper-provided?`. Missing dimensions select their complete range. Bounds
+   clamp to the stored array, and every nonempty slice resets result lower
+   bounds to 1. A supplied SQL NULL bound returns nil; no overlap, an empty
+   source, or too many dimensions returns PostgreSQL's zero-dimensional `{}`."
+  [^PgArray a specs]
+  (when a
+    (let [specs (vec specs)
+          dims (:dims a)
+          rank (if (and (seq dims) (every? pos? dims)) (count dims) 0)
+          null-bound? (some (fn [{:keys [lower upper lower-provided? upper-provided?]}]
+                              (or (and lower-provided? (nil? lower))
+                                  (and upper-provided? (nil? upper))))
+                            specs)]
+      (cond
+        null-bound? nil
+        (or (zero? rank) (> (count specs) rank))
+        (array (:elem-type a) [])
+        :else
+        (let [ranges
+              (mapv (fn [dimension]
+                      (let [spec (get specs dimension {})
+                            old-lo (long (or (get (:lbounds a) dimension) 1))
+                            old-hi (+ old-lo (long (nth dims dimension)) -1)
+                            lo (if (:lower-provided? spec)
+                                 (long (:lower spec)) old-lo)
+                            hi (if (:upper-provided? spec)
+                                 (long (:upper spec)) old-hi)]
+                        [(max old-lo lo) (min old-hi hi) old-lo]))
+                    (range rank))]
+          (if (some (fn [[lo hi _]] (> lo hi)) ranges)
+            (array (:elem-type a) [])
+            (letfn [(select [value dimension]
+                      (if (= dimension rank)
+                        value
+                        (let [[lo hi old-lo] (nth ranges dimension)
+                              children (vec (inner-seq value))
+                              from (- lo old-lo)
+                              to (inc (- hi old-lo))]
+                          (mapv #(select % (inc dimension))
+                                (subvec children from to)))))]
+              (let [elements (select (:elements a) 0)
+                    out-dims (mapv (fn [[lo hi _]] (inc (- hi lo))) ranges)]
+                (->PgArray (:elem-type a) elements out-dims
+                           (vec (repeat rank 1)))))))))))
+
 (defn slice
   "PG array slice: `arr[lo:hi]`. 1-indexed, inclusive bounds, clamped
    to `[lbound, lbound+length-1]`. Returns a PgArray (possibly empty)
    preserving elem-type. nil bounds → PG default (lbound / lbound+len-1).
 
-   Slicing operates on the outermost dimension only; inner shape and
-   lbounds are preserved. Multi-dim aware."
+   Slicing operates on the outermost dimension; remaining dimensions select
+   their full range. Result lower bounds reset to 1, as PostgreSQL does."
   [^PgArray a lo hi]
-  (let [n        (length a)
-        lb       (lbound a 1)
-        ub       (+ lb n -1)
-        lo'      (max lb (or lo lb))
-        hi'      (min ub (or hi ub))
-        lo-off   (- lo' lb)
-        hi-off   (- hi' lb)
-        slice-len (max 0 (inc (- hi-off lo-off)))]
-    (if (or (> lo' hi') (zero? n))
-      (array (:elem-type a) [] (vec (cons 0 (rest (:dims a)))) (:lbounds a))
-      (let [sliced (subvec (:elements a) lo-off (+ lo-off slice-len))
-            new-dims (vec (cons slice-len (rest (:dims a))))]
-        (->PgArray (:elem-type a) sliced new-dims (:lbounds a))))))
+  (slice-at a [{:lower lo :upper hi
+                :lower-provided? (some? lo)
+                :upper-provided? (some? hi)}]))
 
 (defn flat-elements
   "Walk a (possibly nested) elements vector to a flat seq of leaves —

@@ -47,6 +47,7 @@
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.copy :as copy]
             [datahike.pg.sql.copy.out :as copy-out]
+            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
@@ -76,7 +77,7 @@
            [java.util Arrays]
            [javax.net.ssl KeyManagerFactory SSLContext]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
-           [net.sf.jsqlparser.schema Column]
+           [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.statement.select Select Limit Offset]
            [net.sf.jsqlparser.expression LongValue]))
 
@@ -833,105 +834,28 @@
 
 (defn- parse-execute-args
   "Split the argument list of a SQL-level EXECUTE into top-level
-   literals. Respects single-quoted strings (with '' escape) and
-   parenthesis nesting so commas inside those don't split the list.
-
-   Returns a vector of trimmed raw-text args, preserving quote marks
-   on strings so they're valid SQL literals after interpolation."
+   expressions. Token positions preserve dollar-quoted strings, comments,
+   ARRAY constructors, casts and nested calls; commas split only at depth 0."
   [^String args-str]
   (if (or (nil? args-str) (str/blank? args-str))
     []
-    (let [len (count args-str)]
-      (loop [i 0
-             in-str? false
-             depth 0
-             start 0
-             acc []]
-        (if (>= i len)
-          (let [tail (str/trim (subs args-str start))]
-            (if (pos? (count tail)) (conj acc tail) acc))
-          (let [c (.charAt args-str i)]
+    (let [tokens (vec (cls/tokenize-all args-str))]
+      (loop [remaining tokens, depth 0, start 0, result []]
+        (if-let [token (first remaining)]
+          (let [text (:text token)]
             (cond
-              ;; inside a string: only exit on a non-escaped closing quote
-              in-str?
-              (if (= c \')
-                (if (and (< (inc i) len) (= \' (.charAt args-str (inc i))))
-                  (recur (+ i 2) true depth start acc)            ; '' → escaped
-                  (recur (inc i) false depth start acc))
-                (recur (inc i) true depth start acc))
-              (= c \')  (recur (inc i) true depth start acc)
-              (= c \()  (recur (inc i) false (inc depth) start acc)
-              (= c \))  (recur (inc i) false (dec depth) start acc)
-              (and (= c \,) (zero? depth))
-              (recur (inc i) false 0 (inc i)
-                     (conj acc (str/trim (subs args-str start i))))
-              :else (recur (inc i) false depth start acc))))))))
+              (contains? #{"(" "[" "{"} text)
+              (recur (next remaining) (inc depth) start result)
 
-(defn- substitute-prepared-params
-  "Walk a PREPARE template and replace each placeholder with the
-   corresponding arg literal:
-     ?        → next positional arg
-     $1..$N   → 1-indexed arg
+              (contains? #{")" "]" "}"} text)
+              (recur (next remaining) (dec depth) start result)
 
-   Placeholders inside single-quoted string literals OR double-quoted
-   SQL identifiers are left alone — Metabase's describe-fields query
-   uses `\"pk?\"` as a column alias, and substituting that `?` would
-   silently turn the alias into the first parameter value.
+              (and (= "," text) (zero? depth))
+              (recur (next remaining) depth (:end token)
+                     (conj result (str/trim (subs args-str start (:pos token)))))
 
-   Positional (`?`) and numbered (`$N`) placeholders can be mixed;
-   `?` consumes from a separate cursor so they don't fight over
-   indices with `$N`. When a mix is present, most clients pick one
-   style for the whole template — we allow either."
-  [^String template args]
-  (let [len (count template)
-        sb (StringBuilder.)]
-    (loop [i 0
-           in-str?   false   ; inside '…'
-           in-ident? false   ; inside "…"
-           pos-idx 0]
-      (if (>= i len)
-        (.toString sb)
-        (let [c (.charAt template i)]
-          (cond
-            in-str?
-            (do (.append sb c)
-                (cond
-                  (and (= c \') (< (inc i) len) (= \' (.charAt template (inc i))))
-                  (do (.append sb \')
-                      (recur (+ i 2) true false pos-idx))
-                  (= c \') (recur (inc i) false false pos-idx)
-                  :else    (recur (inc i) true false pos-idx)))
-            in-ident?
-            (do (.append sb c)
-                (cond
-                  ;; "" inside an identifier is the literal " escape.
-                  (and (= c \") (< (inc i) len) (= \" (.charAt template (inc i))))
-                  (do (.append sb \")
-                      (recur (+ i 2) false true pos-idx))
-                  (= c \") (recur (inc i) false false pos-idx)
-                  :else    (recur (inc i) false true pos-idx)))
-            (= c \')
-            (do (.append sb c) (recur (inc i) true false pos-idx))
-            (= c \")
-            (do (.append sb c) (recur (inc i) false true pos-idx))
-            (= c \?)
-            (do (.append sb (if (< pos-idx (count args))
-                              (nth args pos-idx)
-                              "NULL"))
-                (recur (inc i) false false (inc pos-idx)))
-            (= c \$)
-            ;; $N — consume digits
-            (let [j (long (loop [k (inc i)]
-                            (if (and (< k len) (Character/isDigit (.charAt template k)))
-                              (recur (inc k)) k)))]
-              (if (> j (inc i))
-                (let [n (Long/parseLong (subs template (inc i) j))
-                      ;; $1 → args[0]
-                      arg (nth args (dec n) "NULL")]
-                  (.append sb arg)
-                  (recur j false false pos-idx))
-                (do (.append sb c) (recur (inc i) false false pos-idx))))
-            :else (do (.append sb c) (recur (inc i) false false pos-idx))))))))
+              :else (recur (next remaining) depth start result)))
+          (conj result (str/trim (subs args-str start))))))))
 
 (defmacro ^:private with-stmt-timeout
   "Schedule a cancel-flag flip after `timeout-ms` (nil or 0 disables);
@@ -2617,6 +2541,20 @@
                 attrs
                 gens)))))
 
+(defn- evaluate-insert-assignment
+  "Run a precompiled complete-container expression at its physical-column
+   stage, with this execution's parameters and already-projected source cells."
+  [plan db resolve-value source-values]
+  (let [fetch (fn [index]
+                (if (>= (long index) 100000)
+                  (nth source-values (- (long index) 100000) nil)
+                  (nth params/*bound-params* (dec (long index)) nil)))
+        bound-plan (params/substitute-select-plan plan fetch)]
+    (when-not params/*row-execute*
+      (throw (ex-info "INSERT assignment requires the SQL expression executor"
+                      {:sqlstate "XX000"})))
+    (resolve-value (ffirst (params/*row-execute* bound-plan db)))))
+
 (defn- materialize-insert-candidate
   "Evaluate one candidate's target columns in physical column order.
 
@@ -2635,6 +2573,8 @@
   ([candidate constraint-plan db resolve-value]
    (materialize-insert-candidate candidate constraint-plan db resolve-value true))
   ([candidate constraint-plan db resolve-value validate?]
+   (materialize-insert-candidate candidate constraint-plan db resolve-value validate? nil))
+  ([candidate constraint-plan db resolve-value validate? assignment-context]
    (let [schema (dbi/-schema db)
          eval-expr #(row-eval/default-value % schema db)
          attrs
@@ -2659,10 +2599,13 @@
                                               "\" is a generated column.")}))
                 attrs)
               (let [present? (contains? attrs attr)
-                    resolved (if present?
-                               (resolve-value (get attrs attr))
-                               (materialize-column-default default resolve-value
-                                                           default-ast eval-expr))
+                    resolved (if-let [plan (get-in assignment-context [:plans attr])]
+                               (evaluate-insert-assignment
+                                plan db resolve-value (:source-values assignment-context))
+                               (if present?
+                                 (resolve-value (get attrs attr))
+                                 (materialize-column-default default resolve-value
+                                                             default-ast eval-expr)))
                     coerced (when (some? resolved)
                               (#'stmt/coerce-insert-value resolved attr schema db))]
                 (cond-> attrs
@@ -3277,18 +3220,33 @@
         unique-specs (when (= :plain (:insert-mode parsed))
                        (plain-unique-specs base-db table-name constraint-plan))]
     (loop [candidates (:insert-candidates parsed)
+           assignment-plans (:insert-assignment-plans parsed)
            prepared []
            conflict-state nil
            seen-unique #{}]
       (if-let [candidate (first candidates)]
-        (let [candidate (cond-> candidate
+        (let [source-values (when (:insert-source-targets parsed)
+                              (mapv resolve-value (::stmt/insert-source-values candidate)))
+              candidate (if-let [targets (:insert-source-targets parsed)]
+                          (reduce (fn [attrs [target value]]
+                                    (if (seq (:dimensions target))
+                                      attrs
+                                      (assoc attrs (:attr target)
+                                             (when-not (= :__null__ value) value))))
+                                  (dissoc candidate ::stmt/insert-source-values)
+                                  (map vector targets source-values))
+                          candidate)
+              candidate (cond-> candidate
                           (seq (:insert-source-order parsed))
                           (materialize-insert-source-projection
                            (:insert-source-order parsed) base-db resolve-value))
               candidate (materialize-insert-candidate
                          candidate constraint-plan base-db resolve-value
                          (not (before-row-insert-triggers?
-                               base-db (:table constraint-plan) :insert)))
+                               base-db (:table constraint-plan) :insert))
+                         {:plans (or (:insert-shared-assignment-plans parsed)
+                                     (first assignment-plans))
+                          :source-values source-values})
               ;; ON CONFLICT arbitration has statement-wide state: two source
               ;; rows may not update the same target, and an earlier update can
               ;; change the key seen by a later row. Carry that reducer state
@@ -3321,6 +3279,7 @@
               replay-tx-data (when-not on-conflict?
                                (single-insert-candidate-tx-data parsed candidate))]
           (recur (next candidates)
+                 (next assignment-plans)
                  (if on-conflict?
                    prepared
                    (into prepared replay-tx-data))
@@ -3735,6 +3694,16 @@
     (or (when-not (:execution-materialization? parsed)
           (.get ^java.util.Map update-row-match-cache k))
         (let [{:keys [table alias assignments where-expr from-sql]} parsed
+              visible (or alias
+                          (when (str/starts-with? table temp-table-prefix)
+                            (second (re-matches #"[^_]*_(.*)"
+                                                (subs table (count temp-table-prefix))))))
+              projections (stmt/assignment-projections
+                           assignments
+                           (fn [{:keys [column]}]
+                             (Column. (Table. ^String (or visible table)) ^String column))
+                           schema db {:table table})
+              assignments (:assignments projections)
               quoted #(str \" (str/replace % "\"" "\"\"") \")
               column-constraints (read-column-constraints db table)
               assignments
@@ -3760,10 +3729,6 @@
                     assignments)
               ;; A temp table is stored under a per-session name; the
               ;; statement's own text still says the name it was given.
-              visible (or alias
-                          (when (str/starts-with? table temp-table-prefix)
-                            (second (re-matches #"[^_]*_(.*)"
-                                                (subs table (count temp-table-prefix))))))
               ;; A CTE of the target's own name shadows it in the FROM
               ;; list; PostgreSQL resolves an UPDATE's target to the
               ;; table regardless, so name it in a way a CTE cannot be
@@ -3783,7 +3748,8 @@
                         (when from-sql (str ", " from-sql))
                         (when where-expr (str " WHERE " where-expr)))
               plan (binding [params/*bound-params* nil
-                             params/*declared-param-oids* (:declared-param-oids parsed)]
+                             params/*declared-param-oids* (:declared-param-oids parsed)
+                             params/*assignment-programs* (:programs projections)]
                      (sql/parse-sql text schema db))
               _ (when (= :error (:type plan))
                   (throw (ex-info (str (:message plan))
@@ -6179,10 +6145,9 @@
 
 (defn- plan-sql-prepared
   "Parse one SQL-level PREPARE template under a stable schema/session token."
-  ([handler template] (plan-sql-prepared handler template nil))
-  ([^PgWireServer$QueryHandler handler template previous]
-   (loop []
-     (let [before (.planCacheToken handler)
+  [^PgWireServer$QueryHandler handler template declared-param-oids previous]
+  (loop []
+    (let [before (.planCacheToken handler)
           ;; The template's `$1` is a placeholder in a TEMPLATE, bound
           ;; later by EXECUTE -- not a wire parameter of the PREPARE
           ;; itself. In the extended protocol the PREPARE arrives with
@@ -6192,28 +6157,26 @@
           ;; IndexOutOfBoundsException. The caller's bindings have no
           ;; business in a nested parse -- the same rule
           ;; `nested-executor` exists for.
-          ;; The template's `$1` is a placeholder in a TEMPLATE, bound
-          ;; later by EXECUTE -- not a wire parameter of the PREPARE
-          ;; itself. In the extended protocol the PREPARE arrives with
-          ;; its own (empty) bind list, and that binding was still in
-          ;; scope here, so `$1` resolved against it and
-          ;; `PREPARE q(int) AS SELECT $1` died with an
-          ;; IndexOutOfBoundsException. The caller's bindings have no
-          ;; business in a nested parse -- the rule `nested-executor`
-          ;; exists for.
-           parsed (binding [params/*bound-params* nil]
-                    (if previous
-                      (.reparse handler template (int-array 0) previous)
-                      (.parse handler template (int-array 0))))
-           description (.describeResult handler parsed)
-           after (.planCacheToken handler)]
-       (if (= before after)
-         {:parsed parsed
-          :analyzed-sql (or (get-in parsed [:prepared-analysis :source]) template)
-          :result-signature (result-description-signature description)
-         ;; For pg_prepared_statements. The wire layer already asks the
-         ;; handler both of these for Describe, so the view reports what
-         ;; a client would be told rather than a second opinion.
+          param-oids (int-array (map int declared-param-oids))
+          parsed (binding [params/*bound-params* nil]
+                   (if previous
+                     (.reparse handler template param-oids previous)
+                     (.parse handler template param-oids)))
+          description (.describeResult handler parsed)
+          described-oids (vec (some-> (.describeParams handler parsed)))
+          arity (max (count declared-param-oids)
+                     (count described-oids)
+                     (long (or (:param-count parsed) 0)))
+          effective-oids (mapv (fn [i]
+                                 (or (nth declared-param-oids i nil)
+                                     (nth described-oids i nil)
+                                     types/oid-text))
+                               (range arity))
+          after (.planCacheToken handler)]
+      (if (= before after)
+        {:parsed parsed
+         :analyzed-sql (or (get-in parsed [:prepared-analysis :source]) template)
+         :result-signature (result-description-signature description)
          ;; For pg_prepared_statements. Both come from what the wire
          ;; layer would tell the client at Describe, so the view cannot
          ;; disagree with what the client was told.
@@ -6223,16 +6186,17 @@
          ;; describes as nil, and reading a field off it threw inside
          ;; PREPARE. The statement was then never stored and EXECUTE
          ;; answered nil, far from the cause.
-          :param-oids (vec (some-> (.describeParams handler parsed)))
-          :result-oids (vec (some-> description (.-columnOids)))
-          :plan-token after}
-         (recur))))))
+         :param-oids effective-oids
+         :result-oids (vec (some-> description (.-columnOids)))
+         :plan-token after}
+        (recur)))))
 
 (defn- handle-prepare
   "PREPARE name [(types)] AS sql — classify extracts :name and :template."
-  [{:keys [sql-prepared handler sql]} parsed]
+  [{:keys [sql-prepared handler sql db]} parsed]
   (let [pname (:name parsed)
-        tmpl  (:template parsed)]
+        tmpl  (:template parsed)
+        arg-types (:arg-types parsed)]
     ;; A name already prepared is 42P05. This overwrote it silently, so
     ;; a client that re-prepares under a name it already holds -- which
     ;; PostgreSQL refuses, and which the suite tests for -- got the
@@ -6242,9 +6206,17 @@
                       {:error :duplicate-prepared-statement
                        :sqlstate "42P05"})))
     (if (and pname tmpl)
-      (do (swap! sql-prepared assoc pname
-                 (assoc (plan-sql-prepared handler tmpl)
-                        :sql tmpl
+      (let [declared-oids (mapv #(regoid/type-oid db %) (or arg-types []))
+            plan (plan-sql-prepared handler tmpl declared-oids nil)
+            effective-oids (:param-oids plan)
+            arity (count effective-oids)]
+        (swap! sql-prepared assoc pname
+               (assoc plan
+                      :sql tmpl
+                      :declared-arg-types arg-types
+                      :declared-arg-oids declared-oids
+                      :effective-param-oids effective-oids
+                      :arity arity
                         ;; pg_prepared_statements.statement is the
                         ;; whole query string the client SUBMITTED --
                         ;; PostgreSQL's debug_query_string, semicolon
@@ -6257,17 +6229,153 @@
                         ;; and sibling statements included -- not the
                         ;; template that EXECUTE runs, and not this one
                         ;; statement either.
-                        :source-sql (or params/*query-string* sql)
-                        :prepare-time (java.util.Date.)))
-          (empty-result "PREPARE"))
+                      :source-sql (or params/*query-string* sql)
+                      :prepare-time (java.util.Date.)))
+        (empty-result "PREPARE"))
       (error-result "PREPARE: syntax error" "42601"))))
 
+(defn- check-prepared-arg-cast!
+  [source-oid target-oid untyped? index]
+  (when (and (not untyped?)
+             (not (types/assignment-cast-exists? source-oid target-oid)))
+    (throw (ex-info (str "parameter $" index " of type "
+                         (types/format-type source-oid -1)
+                         " cannot be coerced to the expected type "
+                         (types/format-type target-oid -1))
+                    {:sqlstate "42804" :error :datatype-mismatch}))))
+
+(declare coerce-prepared-arg)
+
+(defn- execute-arg-untyped?
+  [sql]
+  (loop [expression (CCJSqlParserUtil/parseExpression sql)]
+    (cond
+      (instance? net.sf.jsqlparser.expression.Parenthesis expression)
+      (recur (.getExpression ^net.sf.jsqlparser.expression.Parenthesis expression))
+
+      (and (instance? net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList
+                      expression)
+           (= 1 (.size ^java.util.List expression)))
+      (recur (.get ^java.util.List expression 0))
+
+      :else (oid/untyped-literal? expression))))
+
+(defn- prepared-arg-shape
+  [parsed arg]
+  (let [source-oid (or (first (visible-item-oids parsed))
+                       (first (effective-item-oids parsed))
+                       (get-in parsed [:metadata :oids 0])
+                       types/oid-text)]
+    {:source-oid source-oid
+     ;; Constant-only SELECT plans currently omit resolution OIDs for both a
+     ;; bare UNKNOWN literal and an explicit `::text` cast. Consult the owned
+     ;; one-expression AST to preserve that phase distinction.
+     :unknown? (execute-arg-untyped? arg)}))
+
+(defn- evaluate-prepared-args
+  "Analyze every SQL-level EXECUTE argument before running any, then evaluate
+   and assignment-coerce them left-to-right. A conversion failure stops before
+   later volatile expressions, and a repeated template parameter still reuses
+   the single value produced for its one argument."
+  [^PgWireServer$QueryHandler handler args target-oids]
+  (when (seq args)
+    (when (some (fn [arg]
+                  (some #(and (= :ident (:type %))
+                              (= "select" (str/lower-case (:text %))))
+                        (cls/tokenize-all arg)))
+                args)
+      ;; Reject before translating the wrapper SELECT: lowering a subquery may
+      ;; materialize it, but PostgreSQL never evaluates EXECUTE subqueries.
+      (throw (ex-info "cannot use subquery in EXECUTE parameter"
+                      {:sqlstate "0A000" :error :feature-not-supported})))
+    (let [plans (mapv (fn [arg]
+                        (binding [*previous-prepared* nil
+                                  *cached-parsed* nil
+                                  *cached-bound* nil
+                                  *nested-statement?* true
+                                  params/*bound-params* nil]
+                          (.parse handler (str "SELECT " arg) (int-array 0))))
+                      args)
+          _ (doseq [plan plans]
+              (when (= :error (:type plan))
+                (throw (ex-info (or (:message plan) "EXECUTE parameter could not be parsed")
+                                {:sqlstate (or (:sqlstate plan) "42601")
+                                 :error :execute-parameter})))
+              (when (seq (:project-set plan))
+                (throw (ex-info "set-returning functions are not allowed in EXECUTE parameters"
+                                {:sqlstate "0A000" :error :feature-not-supported})))
+              (when (or (:runtime-subqueries? plan)
+                        (:correlated-subqueries plan)
+                        (:execution-materialization? plan))
+                (throw (ex-info "cannot use subquery in EXECUTE parameter"
+                                {:sqlstate "0A000" :error :feature-not-supported}))))
+          shapes (mapv prepared-arg-shape plans args)
+          _ (doseq [i (range (count args))]
+              (let [{:keys [source-oid unknown?]} (nth shapes i)]
+                (check-prepared-arg-cast! source-oid
+                                          (nth target-oids i types/oid-text)
+                                          unknown? (inc i))))]
+      (loop [i 0, values []]
+        (if (= i (count plans))
+          {:values values}
+          (let [plan (nth plans i)
+                result (binding [*previous-prepared* nil
+                                 *cached-parsed* nil
+                                 *cached-bound* nil
+                                 *nested-statement?* true
+                                 params/*bound-params* nil]
+                         (.executePrepared handler plan (object-array [nil])))]
+            (if (.error ^PgWireServer$QueryResult result)
+              {:result result}
+              (let [rows (.rows ^PgWireServer$QueryResult result)]
+                (when-not (= 1 (alength rows))
+                  (throw (ex-info "EXECUTE parameter expression returned a set"
+                                  {:sqlstate "0A000" :error :feature-not-supported})))
+                (let [{:keys [source-oid unknown?]} (nth shapes i)
+                      value (aget ^objects (aget rows 0) 0)
+                      coerced (coerce-prepared-arg
+                               value source-oid
+                               (nth target-oids i types/oid-text)
+                               unknown? (inc i))]
+                  (recur (inc i) (conj values coerced)))))))))))
+
+(defn- coerce-prepared-arg
+  "Read one evaluated EXECUTE argument through its prepared parameter type's
+   text input function after checking PostgreSQL assignment compatibility."
+  [value source-oid target-oid untyped? index]
+  (when (some? value)
+    (check-prepared-arg-cast! source-oid target-oid untyped? index))
+  (letfn [(input-value [text oid]
+            (if-let [element-oid (types/array-oid->element-oid oid)]
+              (pg-arr/from-pg-text text (types/oid->elem-kw element-oid))
+              (if (input/parser oid) (input/parse oid text) text)))
+          (cast-leaves [tree source-element-oid target-element-oid]
+            (mapv (fn [item]
+                    (if (sequential? item)
+                      (cast-leaves item source-element-oid target-element-oid)
+                      (sql-cast/cast-scalar
+                       item (types/oid->pg-name target-element-oid)
+                       {:explicit? false :src-oid source-element-oid})))
+                  tree))]
+    (cond
+      (nil? value) nil
+      untyped? (input-value value target-oid)
+      (types/array-oid->element-oid target-oid)
+      (let [source-element-oid (types/array-oid->element-oid source-oid)
+            target-element-oid (types/array-oid->element-oid target-oid)
+            source-array (input-value value source-oid)]
+        (pg-arr/array (types/oid->elem-kw target-element-oid)
+                      (cast-leaves (:elements source-array)
+                                   source-element-oid target-element-oid)
+                      (:dims source-array) (:lbounds source-array)))
+      :else
+      (let [source-value (input-value value source-oid)]
+        (sql-cast/cast-scalar source-value (types/oid->pg-name target-oid)
+                              {:explicit? false :src-oid source-oid})))))
+
 (defn- handle-execute-prepared
-  "EXECUTE name[(args)] — substitute args into the stored template, then
-   recurse through the handler's .execute so the substituted SQL flows
-   through the full dispatch. Args are literal SQL expressions per PG
-   SQL-level EXECUTE semantics (pgjdbc/psycopg2 use extended-query Bind,
-   which goes through a type-aware path)."
+  "EXECUTE name[(args)] — evaluate each argument once, coerce it to the
+   stored parameter OID, and bind the original analyzed plan."
   [{:keys [sql-prepared handler]} parsed]
   (let [pname (:name parsed)
         args-text (:args-text parsed)
@@ -6276,7 +6384,9 @@
       (error-result (str "prepared statement \"" pname "\" does not exist") "26000")
       (let [rec (if (= (:plan-token rec) (.planCacheToken ^PgWireServer$QueryHandler handler))
                   rec
-                  (let [replanned (plan-sql-prepared handler (:sql rec) (:parsed rec))]
+                  (let [replanned (plan-sql-prepared handler (:sql rec)
+                                                     (:declared-arg-oids rec)
+                                                     (:parsed rec))]
                     (when (not= (:result-signature rec) (:result-signature replanned))
                       (throw (ex-info "cached plan must not change result type"
                                       {:sqlstate "0A000"})))
@@ -6284,18 +6394,19 @@
                       (swap! sql-prepared assoc pname updated)
                       updated)))
             args (parse-execute-args args-text)
-            template (or (:analyzed-sql rec) (:sql rec))
-            sql-out (substitute-prepared-params template args)]
-        ;; Through `*statement-handler*` -- `nested-executor` -- and not
-        ;; the handler directly. The caller's `*cached-parsed*` is still
-        ;; in scope here, and it is the parse of THIS EXECUTE, so a bare
-        ;; `.execute` re-ran the EXECUTE instead of the SQL just
-        ;; substituted: an infinite recursion that killed the connection
-        ;; with a StackOverflowError. The simple path never showed it,
-        ;; because nothing there caches a parse to reuse.
-        (if-let [run params/*statement-handler*]
-          (run sql-out [] [])
-          (.execute ^PgWireServer$QueryHandler handler sql-out))))))
+            arity (:arity rec)]
+        (if (not= arity (count args))
+          (error-result (str "wrong number of parameters for prepared statement \""
+                             pname "\"")
+                        "42601")
+          (let [{^PgWireServer$QueryResult evaluated :result
+                 values :values}
+                (evaluate-prepared-args handler args (:effective-param-oids rec))]
+            (if (and evaluated (.error evaluated))
+              evaluated
+              (let [bound (into-array Object (cons nil (or values [])))]
+                (.executePrepared ^PgWireServer$QueryHandler handler
+                                  (:parsed rec) bound)))))))))
 
 (defn- handle-deallocate
   "DEALLOCATE [PREPARE] name | DEALLOCATE ALL"

@@ -44,6 +44,7 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.sql.oid-infer :as oid-infer]
+            [datahike.pg.sql.assignment-target :as assignment-target]
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
@@ -1166,7 +1167,10 @@
      (pg-arr/array? v)
      v
 
-     (and (string? v) (clojure.string/starts-with? (clojure.string/triml v) "{"))
+     (and (string? v)
+          (let [text (clojure.string/triml v)]
+            (or (clojure.string/starts-with? text "{")
+                (clojure.string/starts-with? text "["))))
      (let [trial (fn [t] (try (pg-arr/from-pg-text v t) (catch Throwable _ nil)))]
        (or (when elem-type (trial elem-type))
            (trial :int8)
@@ -3043,6 +3047,162 @@
         [retained form] (split-aggregate-projection value emitted #{})]
     (reset! (:where-clauses ctx) (into before retained))
     form))
+
+(defn- normalize-array-read-dimensions [dimensions]
+  (let [slice? (some #(= :slice (:kind %)) dimensions)]
+    {:slice? slice?
+     :dimensions
+     (mapv (fn [dimension]
+             (if slice?
+               (if (= :element (:kind dimension))
+                 {:kind :slice
+                  :lower 1 :lower-provided? true
+                  :upper (:index dimension) :upper-provided? true}
+                 (cond-> {:kind :slice
+                          :lower-provided? (contains? dimension :lower)
+                          :upper-provided? (contains? dimension :upper)}
+                   (contains? dimension :lower) (assoc :lower (:lower dimension))
+                   (contains? dimension :upper) (assoc :upper (:upper dimension))))
+               dimension))
+           dimensions)}))
+
+(defn- translate-array-read!
+  "Compile a complete PostgreSQL array read without exposing lower-rank rows.
+
+   The inert projection stages the strict container before its subscripts, then
+   evaluates all upper/index expressions followed by all lower expressions. A
+   NULL container therefore skips stateful indices, while a NULL index is
+   observed only after every supplied index has run."
+  [ctx expression]
+  (let [{:keys [base dimensions]} (oid-infer/array-read-chain expression)
+        {:keys [slice? dimensions]} (normalize-array-read-dimensions dimensions)
+        base-oid (source-oid ctx base)
+        base-elem-type (some-> base-oid
+                               types/array-oid->element-oid
+                               types/oid->elem-kw)
+        _ (when (and base-oid
+                     (not (contains? types/array-oid->element-oid base-oid)))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:feature (str "subscripted reads of "
+                                   (types/format-type base-oid -1))})))
+        base-form (translate-deferred-form ctx #(translate-expr ctx base))
+        bounds (into (into []
+                           (keep-indexed
+                            (fn [i dimension]
+                              (let [key (if slice? :upper :index)]
+                                (when (contains? dimension key)
+                                  {:path [i key] :expression (get dimension key)}))))
+                           dimensions)
+                     (when slice?
+                       (keep-indexed
+                        (fn [i dimension]
+                          (when (contains? dimension :lower)
+                            {:path [i :lower] :expression (:lower dimension)}))
+                        dimensions)))
+        bounds-typechecked
+        (doseq [{:keys [expression]} bounds
+                :when (instance? net.sf.jsqlparser.expression.Expression expression)]
+          (when (and (not (oid-infer/untyped-literal? expression))
+                     (not (types/assignment-cast-exists?
+                           (source-oid ctx expression) types/oid-int4)))
+            (throw (ex-info "array subscript must have type integer"
+                            {:error :datatype-mismatch :sqlstate "42804"}))))
+        compiled-bounds
+        (do
+          bounds-typechecked
+          (mapv (fn [{:keys [expression] :as bound}]
+                  (assoc bound :form
+                         (if (instance? net.sf.jsqlparser.expression.Expression expression)
+                           (translate-deferred-form ctx #(translate-expr ctx expression))
+                           expression)))
+                bounds))
+        forms (into [base-form] (map :form) compiled-bounds)
+        variables (vec (ctx/collect-vars forms))
+        fn-param (symbol (str "?array-read-" (swap! (:var-counter ctx) inc)))
+        out-var (ctx/fresh-var! ctx)
+        build-marker
+        (fn [& values]
+          (let [bindings (zipmap variables values)
+                interpret #(interpret-form % bindings)
+                null? #(or (nil? %) (= :__null__ %))
+                cast-bound (fn [value]
+                             (if (null? value)
+                               :__null__
+                               (sql-cast/cast-scalar value "int4" {:explicit? false})))
+                decode (fn [container]
+                         (or (coerce-pg-array container base-elem-type)
+                             (throw (errors/pg-error
+                                     :feature-not-supported
+                                     {:feature "subscripted reads of this value"}))))
+                finish
+                (fn [array resolved]
+                  (if (some null? resolved)
+                    :__null__
+                    (let [runtime-dimensions
+                          (reduce (fn [ds [{:keys [path]} value]]
+                                    (assoc-in ds path value))
+                                  dimensions
+                                  (map vector compiled-bounds resolved))
+                          value
+                          (if slice?
+                            (pg-arr/slice-at
+                             array
+                             (mapv #(select-keys % [:lower :upper
+                                                    :lower-provided?
+                                                    :upper-provided?])
+                                   runtime-dimensions))
+                            (pg-arr/element-at-indices
+                             array (mapv :index runtime-dimensions)))]
+                      (if (nil? value) :__null__ value))))
+                resume-staged
+                (fn [base-value resolved-prefix current-value remaining]
+                  {:fn :assignment
+                   :assignment-fn
+                   (fn [resolve-value]
+                     (let [container (resolve-value base-value)]
+                       (if (null? container)
+                         :__null__
+                         (let [array (decode container)
+                               initial (cond-> resolved-prefix
+                                         (some? current-value)
+                                         (conj (cast-bound
+                                                (resolve-value current-value))))
+                               resolved
+                               (reduce (fn [out {:keys [form]}]
+                                         (conj out
+                                               (cast-bound
+                                                (resolve-value (interpret form)))))
+                                       initial remaining)]
+                           (finish array resolved)))))})
+                base-value (interpret base-form)]
+            (cond
+              ;; No bound has run yet, so resolving a deferred container can
+              ;; still preserve strict-fetch semantics and skip every index.
+              (params/call-marker? base-value)
+              (resume-staged base-value [] nil compiled-bounds)
+
+              (null? base-value) :__null__
+
+              :else
+              (let [array (decode base-value)]
+                (loop [remaining compiled-bounds, resolved []]
+                  (if-let [bound (first remaining)]
+                    (let [value (interpret (:form bound))]
+                      (if (params/call-marker? value)
+                        ;; Preserve the already evaluated prefix and the exact
+                        ;; marker object. The resolver continues with later
+                        ;; forms only after this value resolves and casts.
+                        (resume-staged base-value resolved value (next remaining))
+                        (recur (next remaining) (conj resolved (cast-bound value)))))
+                    (finish array resolved)))))))
+        form (apply list fn-param variables)]
+    (ctx/make-columns-optional! ctx variables)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj build-marker)
+    (if ctx/*defer-expression-materialization*
+      form
+      (do (ctx/add-clause! ctx [form out-var]) out-var))))
 
 (defn translate-case-expr
   "Translate a CASE WHEN expression by compiling a Clojure function
@@ -6554,6 +6714,80 @@
                        [(list 'ground :__null__) result-var])))
     result-var))
 
+(defn- assignment-source-type!
+  [ctx expression target-oid description]
+  (when (and (not (oid-infer/untyped-literal? expression))
+             (not (types/assignment-cast-exists? (source-oid ctx expression) target-oid)))
+    (throw (ex-info (str description " has an incompatible expression type")
+                    {:error :datatype-mismatch :sqlstate "42804"}))))
+
+(defn- translate-assignment-program!
+  "Compile an owned assignment expression using the existing lazy SQL forms.
+   The cached function owns metadata only; each invocation captures that row's
+   actual bindings in a fresh marker resolved after row selection."
+  [ctx {:keys [base-expr operations column-oid decode-base
+               check-subscripts! assign] :as program}]
+  (let [base-form (translate-deferred-form ctx #(translate-expr ctx base-expr))
+        compiled
+        (mapv (fn [operation]
+                (let [expected (assignment-target/value-oid operation column-oid)
+                      _ (when-not expected
+                          (throw (errors/pg-error :feature-not-supported
+                                                  {:feature "assignment to this subscripted type"})))
+                      bounds (assignment-target/bound-expressions operation)]
+                  (doseq [{:keys [expression]} bounds]
+                    (assignment-source-type! ctx expression types/oid-int4 "array subscript"))
+                  (assignment-source-type! ctx (:value-expr operation) expected "array assignment")
+                  (assoc operation
+                         :bound-forms
+                         (mapv (fn [{:keys [path expression]}]
+                                 {:path path :form (translate-deferred-form
+                                                    ctx #(translate-expr ctx expression))})
+                               bounds)
+                         :value-form (translate-deferred-form
+                                      ctx #(translate-expr ctx (:value-expr operation))))))
+              operations)
+        forms (cons base-form (mapcat (fn [operation]
+                                        (cons (:value-form operation)
+                                              (map :form (:bound-forms operation))))
+                                      compiled))
+        variables (vec (ctx/collect-vars forms))
+        fn-param (symbol (str "?assignment-program-" (swap! (:var-counter ctx) inc)))
+        out-var (ctx/fresh-var! ctx)
+        build-marker
+        (fn [& values]
+          (let [bindings (zipmap variables values)]
+            {:fn :assignment
+             :assignment-fn
+             (fn [resolve-value]
+               (let [evaluate #(resolve-value (interpret-form % bindings))
+                     initial (decode-base (evaluate base-form))]
+                 (reduce
+                  (fn [container {:keys [bound-forms value-form coerce-value] :as operation}]
+                    (params/check-cancel!)
+                    (let [evaluated
+                          (reduce (fn [operation {:keys [path form]}]
+                                    (params/check-cancel!)
+                                    (let [value (evaluate form)
+                                          value (when-not (or (nil? value) (= :__null__ value))
+                                                  (sql-cast/cast-scalar value "int4" {:explicit? false}))]
+                                      (assoc-in operation path value)))
+                                  operation bound-forms)
+                          path (:dimensions evaluated)]
+                      (check-subscripts! path)
+                      (let [rhs (evaluate value-form)
+                            rhs (when-not (= :__null__ rhs) rhs)
+                            coerced (coerce-value rhs)]
+                        (assign container (:elem-type program) path coerced))))
+                  initial compiled)))}))
+        form (apply list fn-param variables)]
+    (ctx/make-columns-optional! ctx variables)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj build-marker)
+    (if ctx/*defer-expression-materialization*
+      form
+      (do (ctx/add-clause! ctx [form out-var]) out-var))))
+
 (defn- subquery-array
   "Accumulate one-column rows, retaining nested array dimensions and bounds."
   [output-oid rows]
@@ -6991,34 +7225,7 @@
           (if (params/param-ref? v) (param-value ctx (:idx v)) v))
 
         (some? ac)
-        ;; Walk the bracket-expressions left-to-right, applying
-        ;; pg-arr/subscript once per `[expr]`. Each step routes the
-        ;; input through coerce-pg-array so a stored canonical-text
-        ;; array column is reconstructed transparently.
-        (let [bare-col (let [c (Column.)]
-                         (.setColumnName c (.getColumnName col-expr))
-                         (when tbl (.setTable c ^Table tbl))
-                         c)
-              base-var (translate-expr ctx bare-col)
-              base-var (if (seq? base-var) (ctx/materialize-arg! ctx base-var) base-var)
-              idx-exprs (.getExpressions ^ArrayConstructor ac)]
-          (reduce (fn [container idx-expr]
-                    (let [idx-val   (translate-expr ctx idx-expr)
-                          idx-val   (if (seq? idx-val) (ctx/materialize-arg! ctx idx-val) idx-val)
-                          fn-param  (symbol (str "?col-sub" (swap! (:var-counter ctx) inc)))
-                          sub-fn    (fn [arr i]
-                                      (if-let [a (coerce-pg-array arr)]
-                                        (let [v (pg-arr/subscript a i)]
-                                          (if (nil? v) :__null__ v))
-                                        :__null__))
-                          result-var (ctx/fresh-var! ctx)]
-                      (swap! (:in-params ctx) conj fn-param)
-                      (swap! (:in-args ctx) conj sub-fn)
-                      (swap! (:where-clauses ctx) conj
-                             [(list fn-param container idx-val) result-var])
-                      result-var))
-                  base-var
-                  idx-exprs))
+        (translate-array-read! ctx col-expr)
 
         ;; No FROM at all: nothing for a column to belong to. An outer
         ;; row's column was resolved above (`bound`); anything else is
@@ -7169,71 +7376,7 @@
     ;; that exactly. For slices we emit pg-arr/slice which returns a
     ;; new PgArray.
     (instance? ArrayExpression expr)
-    (let [^ArrayExpression ae expr
-          container (translate-expr ctx (.getObjExpression ae))
-          container (if (seq? container) (ctx/materialize-arg! ctx container) container)
-          slice? (nil? (.getIndexExpression ae))
-          result-var (ctx/fresh-var! ctx)]
-      (if (or slice?
-              ;; JSqlParser 5 surfaces `arr[lo:hi]` as a single
-              ;; IndexExpression of class JsonExpression with a
-              ;; toString like "2:4" instead of separate start/stop
-              ;; index expressions. Detect + split.
-              (let [idx-expr (.getIndexExpression ae)]
-                (and (some? idx-expr)
-                     (instance? JsonExpression idx-expr)
-                     (str/includes? (str idx-expr) ":"))))
-        ;; Slice: arr[lo:hi] (either bound may be absent → use nil and
-        ;; let pg-arr/slice fall back to defaults).
-        (let [idx-expr (.getIndexExpression ae)
-              json-slice? (and (some? idx-expr)
-                               (instance? JsonExpression idx-expr)
-                               (str/includes? (str idx-expr) ":"))
-              [lo-exp hi-exp]
-              (if json-slice?
-                (let [[l h] (str/split (str idx-expr) #":" 2)]
-                  [(when-not (str/blank? l) (Long/parseLong l))
-                   (when-not (str/blank? h) (Long/parseLong h))])
-                [(.getStartIndexExpression ae)
-                 (.getStopIndexExpression ae)])
-              lo (cond
-                   json-slice?           lo-exp
-                   (nil? lo-exp)         nil
-                   :else                 (translate-expr ctx lo-exp))
-              hi (cond
-                   json-slice?           hi-exp
-                   (nil? hi-exp)         nil
-                   :else                 (translate-expr ctx hi-exp))
-              lo (if (seq? lo) (ctx/materialize-arg! ctx lo) lo)
-              hi (if (seq? hi) (ctx/materialize-arg! ctx hi) hi)
-              fn-param (symbol (str "?pg-arr-slice" (swap! (:var-counter ctx) inc)))
-              slice-fn (fn [arr lo hi]
-                         (if-let [a (coerce-pg-array arr)]
-                           (pg-arr/slice a lo hi)
-                           :__null__))]
-          (swap! (:in-params ctx) conj fn-param)
-          (swap! (:in-args ctx) conj slice-fn)
-          (swap! (:where-clauses ctx) conj
-                 [(list fn-param container lo hi) result-var])
-          result-var)
-        ;; Single element: arr[idx]. Wrap pg-arr/subscript so SQL-NULL
-        ;; (out-of-range) rides as :__null__ — Datalog's var-binding
-        ;; semantics drops rows whose find-var resolves to plain nil,
-        ;; but preserves rows bound to our sentinel. value->string
-        ;; converts back to SQL NULL on the wire.
-        (let [idx (translate-expr ctx (.getIndexExpression ae))
-              idx (if (seq? idx) (ctx/materialize-arg! ctx idx) idx)
-              fn-param (symbol (str "?pg-arr-sub" (swap! (:var-counter ctx) inc)))
-              sub-fn (fn [arr i]
-                       (if-let [a (coerce-pg-array arr)]
-                         (let [v (pg-arr/subscript a i)]
-                           (if (nil? v) :__null__ v))
-                         :__null__))]
-          (swap! (:in-params ctx) conj fn-param)
-          (swap! (:in-args ctx) conj sub-fn)
-          (swap! (:where-clauses ctx) conj
-                 [(list fn-param container idx) result-var])
-          result-var)))
+    (translate-array-read! ctx expr)
 
     ;; Prepared-statement parameter placeholder: `?` (index auto-assigned
     ;; by JSqlParser) or `$N` (explicit 1-based index).
@@ -7616,6 +7759,9 @@
           params (when-let [pl (.getParameters f)]
                    (.getExpressions ^ExpressionList pl))]
       (cond
+        (contains? params/*assignment-programs* fname)
+        (translate-assignment-program! ctx (get params/*assignment-programs* fname))
+
         ;; ARRAY's one-column subplan shares scalar subquery analysis and
         ;; execution, but collects every row instead of enforcing cardinality.
         (and (= fname "array")

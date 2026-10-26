@@ -365,9 +365,14 @@
          (c/classify "PREPARE foo AS SELECT $1 + 1")))
   (testing "trailing semicolon is stripped"
     (is (= "SELECT $1 + 1" (:template (c/classify "PREPARE foo AS SELECT $1 + 1;")))))
-  (testing "(arg-types) list is skipped"
-    (is (= "SELECT $1 + length($2)"
-           (:template (c/classify "PREPARE foo (int, text) AS SELECT $1 + length($2)")))))
+  (testing "(arg-types) are retained without splitting type modifiers"
+    (let [parsed (c/classify
+                  "PREPARE foo (int, numeric(10, 2), public.\"Odd Type\"[]) AS SELECT $1")]
+      (is (= ["int" "numeric(10, 2)" "public.\"Odd Type\"[]"]
+             (:arg-types parsed)))
+      (is (= "SELECT $1" (:template parsed)))))
+  (testing "an explicit empty declaration list remains distinguishable"
+    (is (= [] (:arg-types (c/classify "PREPARE foo () AS SELECT 1")))))
   (testing "quoted prepared-statement name is lowercased on capture"
     (is (= "s_1" (:name (c/classify "PREPARE \"S_1\" AS SELECT 1")))))
   (testing "template is nil when AS is missing"

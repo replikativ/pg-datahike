@@ -29,6 +29,8 @@
             [datahike.pg.sql.database :as database]
             [datahike.pg.sql.types :as user-types]
             [datahike.pg.sql.rewrite :as rw]
+            [datahike.pg.sql.assignment-rewrite :as assignment-rewrite]
+            [datahike.pg.sql.assignment-target :as assignment-target]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.ctx :as ctx]
@@ -1260,7 +1262,9 @@
         ;; Fall through to JSqlParser.
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
-          (let [^String parser-sql (preprocess-sql (or (:parser-sql explain) sql))
+          (let [target-rewrite (assignment-rewrite/normalize
+                                (preprocess-sql (or (:parser-sql explain) sql)))
+                ^String parser-sql (:sql target-rewrite)
                 ;; Translation mutates some JSqlParser relation nodes while
                 ;; materialising derived schemas. Validate this rare invalid
                 ;; shape on an independent pristine AST, so neither the
@@ -1282,6 +1286,7 @@
                 stmt (if full-join-sql?
                        (CCJSqlParserUtil/parse parser-sql)
                        (ast-parse parser-sql))
+                target-annotations (assignment-rewrite/annotate stmt (:targets target-rewrite))
             ;; Catalog materialisation: find every catalog table ref
             ;; anywhere in the AST (top-level, derived tables, UNION
             ;; branches, WHERE subqueries, CTE bodies) and inject a
@@ -1358,32 +1363,11 @@
                 inferred-oids
                 (when (pos? param-count)
                   (cond (instance? Insert stmt)
-                        (let [values-oids (params/insert-param-oids stmt schema db)
-                          ;; ON CONFLICT DO UPDATE SET col = ?: walk the
-                          ;; conflict action's UpdateSet list the same
-                          ;; way params/update-param-oids does.
-                              on-conflict-oids
-                              (try
-                                (when-let [action (.getConflictAction ^Insert stmt)]
-                                  (let [table-ns (when-let [^Table t (.getTable ^Insert stmt)]
-                                                   (unquote-ident (.getName t)))
-                                        col-oid (fn [col] (params/infer-param-oid-for-column
-                                                           schema table-ns col))
-                                        sets (.getUpdateSets action)
-                                        r (java.util.HashMap.)]
-                                    (doseq [^UpdateSet us (or sets [])]
-                                      (let [cols (.getColumns us) vals (.getValues us)]
-                                        (when (and cols vals)
-                                          (doseq [[^Column c v] (map vector cols vals)]
-                                            (when (instance? JdbcParameter v)
-                                              (when-let [oid (col-oid (unquote-ident
-                                                                       (.getColumnName c)))]
-                                                (.put r (.getIndex ^JdbcParameter v) oid)))))))
-                                    (when (pos? (.size r)) (into {} r))))
-                                (catch Throwable _ nil))]
-                          (merge values-oids on-conflict-oids))
+                        (binding [assignment-target/*omitted-bounds* target-annotations]
+                          (params/insert-param-oids stmt schema db))
                         (instance? Update stmt)
-                        (let [from-set (params/update-param-oids stmt schema)
+                        (let [from-set (binding [assignment-target/*omitted-bounds* target-annotations]
+                                         (params/update-param-oids stmt schema))
                               ^Table t (.getTable ^Update stmt)
                               tns (when t (unquote-ident (.getName t)))
                               joins (.getJoins ^Update stmt)
@@ -2310,7 +2294,8 @@
 
           ;; INSERT
                     (instance? Insert stmt)
-                    (let [result (translate-insert ^Insert stmt schema db)]
+                    (let [result (binding [assignment-target/*omitted-bounds* target-annotations]
+                                   (translate-insert ^Insert stmt schema db))]
                       (cond-> result
                         (not (identical? db orig-db)) (assoc :enriched-db db)
                         (or cte-materialized?
@@ -2321,7 +2306,8 @@
 
           ;; UPDATE
                     (instance? Update stmt)
-                    (let [result (translate-update ^Update stmt schema db)]
+                    (let [result (binding [assignment-target/*omitted-bounds* target-annotations]
+                                   (translate-update ^Update stmt schema db))]
                       (cond-> result
                         (not (identical? db orig-db)) (assoc :enriched-db db)
                         (or cte-materialized? (:execution-materialization? result))
@@ -2645,6 +2631,7 @@
                             p))]
                   (when (and placeholder-parsed
                              (= :insert (:type placeholder-parsed))
+                             (not (contains? placeholder-parsed :insert-assignment-plans))
                              (vector? (:tx-data placeholder-parsed)))
                     ;; Enrich the schema with pg metadata (NUMERIC(p,s)
                     ;; scale, array-elem) so the fast-path literal coercion

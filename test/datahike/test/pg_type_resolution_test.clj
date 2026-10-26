@@ -231,7 +231,7 @@
                               ["$123.456" "$123.46"]
                               ["$123.459" "$123.46"]]]
       (exec! c "DELETE FROM money_input")
-      (with-open [ps (.prepareStatement c "INSERT INTO money_input VALUES (?)")]
+      (with-open [ps (.prepareStatement c "INSERT INTO money_input VALUES (?::money)")]
         (.setString ps 1 input)
         (.executeUpdate ps))
       (is (= [expected] (col c 1 "SELECT m FROM money_input")) input))))

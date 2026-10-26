@@ -32,7 +32,8 @@
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.fns :as fns]
-            [datahike.pg.types :as types])
+            [datahike.pg.types :as types]
+            [datahike.pg.sql.assignment-target :as assignment-target])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
             AnalyticExpression CastExpression Function JdbcParameter Parenthesis NotExpression
@@ -199,6 +200,12 @@
    their local variants) derive from this value so sibling calls agree.
    Nil during parsing and non-server use."
   nil)
+
+(def ^:dynamic *assignment-programs*
+  "Internal generated-expression programs, keyed by their owned AST placeholder
+   names. Only immutable program metadata belongs here; values/markers are built
+   separately for each executing row. Not a SQL function registry."
+  {})
 
 (def ^:dynamic *scalar-subquery-cache*
   "Execution-local memo table for uncorrelated scalar subqueries.
@@ -721,7 +728,7 @@
   "Function markers translate-* may emit for SQL constructs that must
    be re-evaluated per execute (i.e. NOT cacheable as a parse-time
    value). Resolved by `resolve-nextvals!` against a per-fn resolver."
-  #{:nextval :now :eval :random-uuid :uuid-v7 :raise :projection})
+  #{:nextval :now :eval :random-uuid :uuid-v7 :raise :projection :assignment})
 
 (defn call-marker?
   "True if v is a deferred function-call marker emitted by translate-*
@@ -785,6 +792,13 @@
                            ;; A composed projection resolves its effectful
                            ;; leaves first, then applies the already-compiled
                            ;; scalar operation exactly once.
+                       :assignment
+                       (let [assignment-fn (:assignment-fn v)]
+                         (when-not (ifn? assignment-fn)
+                           (throw (ex-info "invalid deferred assignment" {})))
+                         ;; The program stages children itself. In particular,
+                         ;; no RHS is walked before subscript NULL validation.
+                         (assignment-fn walk))
                        :projection (let [projection-fn (:projection-fn v)]
                                      (when-not (ifn? projection-fn)
                                        (throw (ex-info
@@ -1151,88 +1165,130 @@
            ;; :pg/type is either attached by translate-create-table in
            ;; the current tx (still a :db/add-form vector) or already
            ;; committed on the ident entity (needs a Datalog lookup).
-           pg-type (or (when (coll? schema)
+           pg-type (or (when (map? schema) (get-in schema [attr :pg/type]))
+                       (when (coll? schema)
                          (some (fn [a] (when (= (:db/ident a) attr) (:pg/type a)))
                                schema))
                        (pg-type-of-attr db attr))]
        (or (get types/pg-name->oid pg-type)
            (get types/dh-type->oid vt))))))
 
+(declare where-param-oids)
+
+(defn- merge-assignment-param! [result index expected]
+  (when expected
+    (let [declared (get *declared-param-oids* index)
+          declared (when (and declared (pos? declared)) declared)
+          actual (or declared expected)]
+      (when (and declared (not (types/assignment-cast-exists? declared expected)))
+        (throw (ex-info "parameter type cannot be assigned to this target"
+                        {:error :datatype-mismatch :sqlstate "42804"})))
+      (when-let [previous (.get ^java.util.Map result index)]
+        (when (not= previous actual)
+          (throw (ex-info (str "inconsistent types deduced for parameter $" index)
+                          {:error :ambiguous-parameter :sqlstate "42P08"}))))
+      (.put ^java.util.Map result index actual))))
+
+(defn- assignment-expression-params! [result expression expected schema table]
+  (cond
+    (instance? Parenthesis expression)
+    (assignment-expression-params! result (.getExpression ^Parenthesis expression)
+                                   expected schema table)
+
+    (and (instance? ExpressionList expression) (= 1 (count expression)))
+    (assignment-expression-params! result (first expression) expected schema table)
+
+    (instance? JdbcParameter expression)
+    (merge-assignment-param! result (.getIndex ^JdbcParameter expression) expected)
+
+    (and (instance? net.sf.jsqlparser.expression.ArrayConstructor expression)
+         (get types/array-oid->element-oid expected))
+    (let [element-oid (get types/array-oid->element-oid expected)]
+      (doseq [child (.getExpressions ^net.sf.jsqlparser.expression.ArrayConstructor expression)]
+        (assignment-expression-params!
+         result child
+         (if (instance? net.sf.jsqlparser.expression.ArrayConstructor child) expected element-oid)
+         schema table)))
+
+    :else
+    (doseq [[index oid] (where-param-oids expression schema table)]
+      ;; These are expression-internal contexts, including explicit casts.
+      ;; A declared parameter remains the cast's source type; only a direct
+      ;; assignment above imposes assignment-cast compatibility.
+      (merge-assignment-param! result index
+                               (let [declared (get *declared-param-oids* index)]
+                                 (if (and declared (pos? declared)) declared oid))))))
+
+(defn- assignment-target-params! [result target expression schema table db]
+  (doseq [{:keys [expression]} (assignment-target/bound-expressions target)]
+    (assignment-expression-params! result expression types/oid-int4 schema table))
+  (let [column-oid (infer-param-oid-for-column schema table (:column target) db)]
+    (assignment-expression-params! result expression
+                                   (assignment-target/value-oid target column-oid)
+                                   schema table)))
+
 (defn insert-param-oids
-  "Walk an INSERT AST: for each `VALUES (..., ?, ...)` row, positional
-   column i → attribute type → PG OID. Returns a map {param-index → oid}.
-
-   Only covers the flat single-row / multi-row VALUES case — which is
-   what JDBC setObject/setString produces for the common ORM path.
-
-   When the INSERT omits the explicit column list (`INSERT INTO t
-   VALUES (?, ?, ?)`), falls back to the table's declared column order
-   from `pgs/column-info` (which honours both schema entity-ID order and
-   the `:datahike.pg/column-order` hint). This is what pgjdbc's
-   `executeBatch` needs: setLong(1, …) wants param 1's OID at Describe
-   time, and without inferred OIDs pgjdbc's resolved-type tracker
-   raises `Can't change resolved type for param: N from <oid> to 0`."
+  "Infer VALUES and subscript parameter types from structural target descriptors."
   ([^Insert insert schema] (insert-param-oids insert schema nil))
   ([^Insert insert schema db]
    (try
-     (let [table-ns (when-let [^Table t (.getTable insert)]
-                      (unquote-ident (.getName t)))
-           explicit-cols (some-> (.getColumns insert)
-                                 (->> (mapv #(unquote-ident (.getColumnName ^Column %)))))
-           cols (if (seq explicit-cols)
-                  explicit-cols
-                 ;; No column list: derive from schema. Drop the
-                 ;; synthetic db_id prepended by column-info — INSERT
-                 ;; VALUES is positional against user-declared columns.
-                  (when table-ns
-                    (let [info (pgs/column-info schema table-ns db)]
-                      (when (seq info)
-                        (vec (keep (fn [c]
-                                     (when (not= :db/id (:attr c))
-                                       (name (:attr c))))
-                                   info))))))
+     (let [table (some-> (.getTable insert) .getName unquote-ident)
+           targets (if (seq (.getColumns insert))
+                     (mapv #(update (assignment-target/describe %) :column unquote-ident)
+                           (.getColumns insert))
+                     (mapv (fn [column]
+                             {:column (:name column) :target-kind :whole :dimensions []})
+                           (remove #(= :db/id (:attr %)) (pgs/column-info schema table db))))
            select (.getSelect insert)
-           col-oid (fn [col] (infer-param-oid-for-column schema table-ns col))]
-       (when (and table-ns (seq cols)
-                  (instance? net.sf.jsqlparser.statement.select.Values select))
-         (let [rows (.getExpressions ^net.sf.jsqlparser.statement.select.Values select)
-               result (java.util.HashMap.)]
-           (doseq [row (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList rows)
-                              [rows] rows))]
-             (let [exprs (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList row)
-                                row [row]))]
-               (doseq [[i e] (map vector (range) exprs)]
-                 (when (and (instance? JdbcParameter e) (< i (count cols)))
-                   (when-let [oid (col-oid (nth cols i))]
-                     (.put result (.getIndex ^JdbcParameter e) oid))))))
-           (when (pos? (.size result)) (into {} result)))))
+           result (java.util.HashMap.)]
+       ;; Target indices belong to each candidate, including INSERT SELECT.
+       (doseq [target targets
+               {:keys [expression]} (assignment-target/bound-expressions target)]
+         (assignment-expression-params! result expression types/oid-int4 schema table))
+       (when (instance? net.sf.jsqlparser.statement.select.Values select)
+         (let [expressions (vec (.getExpressions ^net.sf.jsqlparser.statement.select.Values select))
+               rows (if (and (seq expressions) (every? #(instance? ExpressionList %) expressions))
+                      (mapv vec expressions)
+                      [expressions])]
+           (doseq [row rows
+                   [target expression] (map vector targets row)]
+             (assignment-target-params! result target expression schema table db))))
+       ;; With a plain, unexpanded SELECT list, source and target positions
+       ;; agree. Stars require the SELECT translator's expanded metadata.
+       (when (instance? net.sf.jsqlparser.statement.select.PlainSelect select)
+         (let [items (vec (.getSelectItems ^net.sf.jsqlparser.statement.select.PlainSelect select))
+               expressions (mapv #(.getExpression ^net.sf.jsqlparser.statement.select.SelectItem %) items)]
+           (when (and (= (count targets) (count expressions))
+                      (not-any? #(or (instance? net.sf.jsqlparser.statement.select.AllColumns %)
+                                     (instance? net.sf.jsqlparser.statement.select.AllTableColumns %))
+                                expressions))
+             (doseq [[target expression] (map vector targets expressions)]
+               (assignment-target-params! result target expression schema table db)))))
+       (when-let [action (.getConflictAction insert)]
+         (doseq [^UpdateSet update-set (.getUpdateSets action)
+                 [^Column column expression] (map vector (.getColumns update-set)
+                                                  (.getValues update-set))]
+           (assignment-target-params!
+            result (update (assignment-target/describe column) :column unquote-ident)
+            expression schema table db)))
+       (when (pos? (.size result)) (into {} result)))
+     (catch clojure.lang.ExceptionInfo e (throw e))
      (catch Throwable _ nil))))
 
-(declare where-param-oids)
-
 (defn update-param-oids
-  "Walk an UPDATE AST: for each SET col = ?, map param index to the
-   column attribute's PG OID."
+  "Infer SET value and index/bound parameter types without losing indirection."
   [^Update update schema]
   (try
-    (let [^Table t (.getTable update)
-          table-ns (when t (unquote-ident (.getName t)))
-          col-oid (fn [col] (infer-param-oid-for-column schema table-ns col))
-          sets (.getUpdateSets update)
+    (let [table (some-> (.getTable update) .getName unquote-ident)
           result (java.util.HashMap.)]
-      (doseq [^UpdateSet us (or sets [])]
-        (let [cols (.getColumns us)
-              vals (.getValues us)]
-          (when (and cols vals)
-            (doseq [[^Column c v] (map vector cols vals)]
-              (if (instance? JdbcParameter v)
-                (when-let [oid (col-oid (unquote-ident (.getColumnName c)))]
-                  (.put result (.getIndex ^JdbcParameter v) oid))
-                ;; An expression (`SET bal = bal + $1`) types its
-                ;; parameters as a WHERE operand would.
-                (doseq [[idx oid] (where-param-oids v schema table-ns)]
-                  (.putIfAbsent result idx oid)))))))
+      (doseq [^UpdateSet update-set (.getUpdateSets update)
+              [^Column column expression] (map vector (.getColumns update-set)
+                                               (.getValues update-set))]
+        (assignment-target-params!
+         result (clojure.core/update (assignment-target/describe column) :column unquote-ident)
+         expression schema table *parse-db*))
       (when (pos? (.size result)) (into {} result)))
+    (catch clojure.lang.ExceptionInfo e (throw e))
     (catch Throwable _ nil)))
 
 (defn collect-table-aliases

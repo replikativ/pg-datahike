@@ -360,18 +360,22 @@
 ;; Value coercion of the tx-fn payload
 
 (deftest param-on-conflict-untyped-text-param
-  (testing "a text-typed parameter bound to a BIGINT column narrows after substitution"
-    ;; node-postgres (and pgjdbc's setString) describe `$1` as varchar even
-    ;; for an integer column; the value only becomes a Long once the
-    ;; placeholder is resolved, so the re-coercion pass has to reach the
-    ;; rows the ON CONFLICT tx-fn receives.
+  (testing "an UNKNOWN parameter takes its BIGINT target type through ON CONFLICT"
+    ;; node-postgres sends unspecified parameter OIDs. pgjdbc's Types/OTHER
+    ;; requests the same behavior; setString instead declares VARCHAR, which
+    ;; PostgreSQL rejects for a direct BIGINT assignment. The re-coercion pass
+    ;; must reach the rows the ON CONFLICT tx-fn receives.
     (with-open [c (open)]
       (ddl! c "CREATE TABLE ctr (id BIGINT PRIMARY KEY, n BIGINT)")
       (with-open [ps (.prepareStatement
                       c (str "INSERT INTO ctr (id, n) VALUES (?, ?) "
                              "ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n"))]
-        (.setString ps 1 "7") (.setString ps 2 "1")  (.executeUpdate ps)
-        (.setString ps 1 "7") (.setString ps 2 "42") (.executeUpdate ps))
+        (.setObject ps 1 "7" java.sql.Types/OTHER)
+        (.setObject ps 2 "1" java.sql.Types/OTHER)
+        (.executeUpdate ps)
+        (.setObject ps 1 "7" java.sql.Types/OTHER)
+        (.setObject ps 2 "42" java.sql.Types/OTHER)
+        (.executeUpdate ps))
       (is (= [[7 42]] (rows c "SELECT id, n FROM ctr"))
           "second bind conflicts on the coerced key and updates in place"))))
 

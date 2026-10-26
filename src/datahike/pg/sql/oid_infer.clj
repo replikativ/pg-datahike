@@ -30,7 +30,7 @@
             CaseExpression CastExpression DoubleValue Expression ExtractExpression
             Function JdbcNamedParameter JdbcParameter JsonExpression LongValue NotExpression
             NullValue Parenthesis SignedExpression StringValue TimeKeyExpression
-            TimestampValue TimeValue DateValue WhenClause]
+            TimestampValue TimeValue DateValue WhenClause RangeExpression]
            [net.sf.jsqlparser.expression.operators.arithmetic
             Addition BitwiseAnd BitwiseLeftShift BitwiseOr BitwiseRightShift
             BitwiseXor Concat Division Modulo Multiplication Subtraction]
@@ -409,6 +409,98 @@
 
 (declare expr-oid)
 
+(defn- json-subexpression [base entries]
+  (if (seq entries) (JsonExpression. base (vec entries)) base))
+
+(defn- array-read-dimension
+  "One JSqlParser array-read bracket as an element or slice descriptor."
+  [expression]
+  (cond
+    ;; JSqlParser attaches a leading minus to the complete `lo:hi`
+    ;; JsonExpression (`-1:0` becomes Signed(Json(1:0))). Move that sign to
+    ;; the lower child without mutating the cached parser objects.
+    (and (instance? SignedExpression expression)
+         (instance? JsonExpression (.getExpression ^SignedExpression expression)))
+    (let [signed ^SignedExpression expression
+          dimension (array-read-dimension (.getExpression signed))]
+      (if (and (= :slice (:kind dimension)) (contains? dimension :lower))
+        (update dimension :lower #(SignedExpression. (.getSign signed) %))
+        {:kind :element :index expression}))
+
+    (instance? RangeExpression expression)
+    (cond-> {:kind :slice}
+      (.getStartExpression ^RangeExpression expression)
+      (assoc :lower (.getStartExpression ^RangeExpression expression))
+      (.getEndExpression ^RangeExpression expression)
+      (assoc :upper (.getEndExpression ^RangeExpression expression)))
+
+    (instance? JsonExpression expression)
+    (let [j ^JsonExpression expression
+          entries (vec (.getIdentList j))
+          colons (keep-indexed #(when (= ":" (.getValue ^java.util.Map$Entry %2)) %1)
+                               entries)]
+      (if-let [i (first colons)]
+        (cond-> {:kind :slice}
+          (or (.getExpression j) (pos? i))
+          (assoc :lower (json-subexpression (.getExpression j) (subvec entries 0 i)))
+          (or (.getKey ^java.util.Map$Entry (nth entries i))
+              (< (inc i) (count entries)))
+          (assoc :upper (json-subexpression
+                         (.getKey ^java.util.Map$Entry (nth entries i))
+                         (subvec entries (inc i)))))
+        {:kind :element :index expression}))
+
+    :else {:kind :element :index expression}))
+
+(defn- array-expression-dimension [^ArrayExpression expression]
+  (let [index (.getIndexExpression expression)]
+    (if (nil? index)
+      (cond-> {:kind :slice}
+        (.getStartIndexExpression expression)
+        (assoc :lower (.getStartIndexExpression expression))
+        (.getStopIndexExpression expression)
+        (assoc :upper (.getStopIndexExpression expression)))
+      (array-read-dimension index))))
+
+(defn array-read-chain
+  "Flatten JSqlParser's two array-read encodings into base + dimensions.
+
+   The first bracket may be attached to a Column's ArrayConstructor while
+   later brackets are nested ArrayExpressions. Returned ASTs are not mutated;
+   the base Column is a fresh unsubscripted node."
+  [expression]
+  (let [chain
+        (loop [current expression, dimensions ()]
+          (cond
+            (instance? ArrayExpression current)
+            (recur (.getObjExpression ^ArrayExpression current)
+                   (conj dimensions (array-expression-dimension current)))
+
+            (and (instance? Column current)
+                 (.getArrayConstructor ^Column current))
+            (let [column ^Column current
+                  constructor ^ArrayConstructor (.getArrayConstructor column)
+                  base (doto (Column.)
+                         (.setColumnName (.getColumnName column))
+                         (.setTable (.getTable column)))]
+              {:base base
+               :dimensions (into (mapv array-read-dimension
+                                       (.getExpressions constructor))
+                                 dimensions)})
+
+            :else {:base current :dimensions (vec dimensions)}))]
+    (when (> (count (:dimensions chain)) 6)
+      (throw (ex-info "number of array dimensions exceeds the maximum allowed (6)"
+                      {:error :program-limit-exceeded :sqlstate "54000"})))
+    chain))
+
+(defn- array-read-oid [expression env]
+  (let [{:keys [base dimensions]} (array-read-chain expression)
+        base-oid (expr-oid base env)]
+    (if (some #(= :slice (:kind %)) dimensions)
+      base-oid
+      (get types/array-oid->element-oid base-oid))))
+
 (defn- column-oid
   "Resolve a Column reference to an OID via the live schema. Returns nil
    if we can't find the attribute (derived tables, catalog views, etc.);
@@ -697,6 +789,9 @@
                  (get sql-fn->return-oid fname)
                  (get-in fns/sql-function-specs [fname :return-oid]))]
     (cond
+      (contains? params/*assignment-programs* fname)
+      (:column-oid (get params/*assignment-programs* fname))
+
       (and (= fname "array") (= 1 (count args))
            (instance? net.sf.jsqlparser.statement.select.Select first-arg))
       (when-let [analyze (:array-subquery-oid env)]
@@ -969,7 +1064,9 @@
         "current_user" types/oid-name
         "session_user" types/oid-name
         "user" types/oid-name
-        (column-oid expr env))
+        (if (.getArrayConstructor ^Column expr)
+          (array-read-oid expr env)
+          (column-oid expr env)))
 
       ;; --- Parenthesis / sign wrappers ----------------------------------
       (instance? Parenthesis expr)
@@ -1124,15 +1221,11 @@
       ;; arr[N] / arr[lo:hi] → element OID (for single subscript)
       ;; or the container's array OID (for slice).
       (instance? ArrayExpression expr)
-      (let [^ArrayExpression ae expr
-            container-oid (expr-oid (.getObjExpression ae) env)
-            slice? (nil? (.getIndexExpression ae))]
-        (cond
-          ;; Slice preserves the array type (returns a PgArray).
-          slice? container-oid
-          ;; Single subscript returns the element type.
-          (nil? container-oid) nil
-          :else (get types/array-oid->element-oid container-oid types/oid-text)))
+      ;; PostgreSQL arrays are rectangular values, not arrays of independently
+      ;; typed row arrays. Any element-only chain returns the base element OID
+      ;; once; a slice anywhere makes the complete chain return the base array
+      ;; OID. Repeatedly stripping an OID made `a[1][2]` fall through to text.
+      (array-read-oid expr env)
 
       ;; --- CAST ---------------------------------------------------------
       (instance? CastExpression expr) (cast-oid expr env)
