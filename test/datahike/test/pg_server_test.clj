@@ -275,6 +275,106 @@
       (is (nil? (err r)))
       (is (= [["hello, world"]] (mapv vec (.rows r)))))))
 
+(deftest test-sql-prepare-declared-types-and-single-evaluation
+  (is (nil? (err (.execute *handler* "PREPARE typed_once (int) AS SELECT $1,$1"))))
+  (is (nil? (err (.execute *handler* "CREATE SEQUENCE prepare_once_seq"))))
+  (let [r (.execute *handler* "EXECUTE typed_once(nextval('prepare_once_seq'))")]
+    (is (nil? (err r)))
+    (is (= [["1" "1"]] (mapv vec (.rows r)))))
+  (is (= [["1" "t"]]
+         (mapv vec (.rows (.execute *handler*
+                                    "SELECT last_value,is_called FROM prepare_once_seq")))))
+  (testing "declared types coerce unknown literals and reject incompatible expressions"
+    (is (= [["2" "2"]]
+           (mapv vec (.rows (.execute *handler* "EXECUTE typed_once('2')")))))
+    (is (= "42804" (sqlstate (.execute *handler* "EXECUTE typed_once(true)"))))
+    (is (nil? (err (.execute *handler* "PREPARE rounded_int(int) AS SELECT $1"))))
+    (is (= [["2"]]
+           (mapv vec (.rows (.execute *handler* "EXECUTE rounded_int(1.5)")))))
+    (is (nil? (err (.execute *handler*
+                             "PREPARE rounded_array(int[]) AS SELECT $1::text"))))
+    (is (= [["{2,-3}"]]
+           (mapv vec (.rows (.execute
+                             *handler*
+                             "EXECUTE rounded_array(ARRAY[1.5,-2.5]::numeric[])"))))))
+  (testing "known incompatible types fail before any argument runs"
+    (is (nil? (err (.execute *handler* "CREATE SEQUENCE prepare_guard_seq"))))
+    (is (nil? (err (.execute *handler*
+                             "PREPARE typed_pair(int,int) AS SELECT $1,$2"))))
+    (is (= "42804"
+           (sqlstate (.execute
+                      *handler*
+                      "EXECUTE typed_pair('x'::text,nextval('prepare_guard_seq'))"))))
+    (is (= [["1" "f"]]
+           (mapv vec (.rows (.execute
+                             *handler*
+                             "SELECT last_value,is_called FROM prepare_guard_seq")))))
+    (is (= "42804"
+           (sqlstate (.execute
+                      *handler*
+                      "EXECUTE typed_pair(NULL::text,nextval('prepare_guard_seq'))"))))
+    (is (= [["1" "f"]]
+           (mapv vec (.rows (.execute
+                             *handler*
+                             "SELECT last_value,is_called FROM prepare_guard_seq"))))))
+  (testing "runtime coercion of one argument precedes evaluation of the next"
+    (is (nil? (err (.execute *handler* "CREATE SEQUENCE prepare_first_seq"))))
+    (is (nil? (err (.execute *handler* "CREATE SEQUENCE prepare_second_seq"))))
+    (is (nil? (err (.execute
+                    *handler*
+                    "PREPARE ordered_cast(smallint,bigint) AS SELECT $1,$2"))))
+    (is (= "22003"
+           (sqlstate
+            (.execute
+             *handler*
+             (str "EXECUTE ordered_cast("
+                  "nextval('prepare_first_seq')+32767,"
+                  "nextval('prepare_second_seq'))")))))
+    (is (= [["1" "t"]]
+           (mapv vec (.rows (.execute
+                             *handler*
+                             "SELECT last_value,is_called FROM prepare_first_seq")))))
+    (is (= [["1" "f"]]
+           (mapv vec (.rows (.execute
+                             *handler*
+                             "SELECT last_value,is_called FROM prepare_second_seq"))))))
+  (testing "row-producing argument expressions are rejected"
+    (is (= "0A000"
+           (sqlstate (.execute *handler*
+                               "EXECUTE typed_once(generate_series(1,3))"))))
+    (is (= "0A000"
+           (sqlstate (.execute *handler* "EXECUTE typed_once((SELECT 1))"))))
+    (is (= "42883"
+           (sqlstate (.execute *handler* "EXECUTE typed_once(no_such_execute_arg())")))))
+  (testing "arity is checked before evaluating arguments"
+    (is (= "42601" (sqlstate (.execute *handler* "EXECUTE typed_once()")))))
+  (testing "declared but unused positions remain part of the prepared signature"
+    (is (nil? (err (.execute *handler*
+                             "PREPARE unused_decl(int,text) AS SELECT $1"))))
+    (is (= [["{integer,text}"]]
+           (mapv vec (.rows (.execute
+                             *handler*
+                             (str "SELECT parameter_types::text "
+                                  "FROM pg_prepared_statements "
+                                  "WHERE name='unused_decl'"))))))
+    (is (= "42601" (sqlstate (.execute *handler* "EXECUTE unused_decl(1)"))))
+    (is (nil? (err (.execute *handler* "SET search_path TO public"))))
+    (is (= [["1"]]
+           (mapv vec (.rows (.execute *handler*
+                                      "EXECUTE unused_decl(1,'unused')"))))))
+  (testing "argument splitting retains array and dollar-quoted commas"
+    (is (nil? (err (.execute *handler* "PREPARE typed_array (int[]) AS SELECT $1::text"))))
+    (is (= [["{1,2}"]]
+           (mapv vec (.rows (.execute *handler* "EXECUTE typed_array(ARRAY[1,2])")))))
+    (is (nil? (err (.execute *handler* "PREPARE typed_text (text) AS SELECT $1"))))
+    (is (= [["a,b"]]
+           (mapv vec (.rows (.execute *handler* "EXECUTE typed_text($tag$a,b$tag$)")))))))
+
+(deftest test-sql-prepare-rejects-an-unknown-declared-type
+  (is (= "42704"
+         (sqlstate (.execute *handler*
+                             "PREPARE missing_type(no_such_type) AS SELECT $1")))))
+
 (deftest test-sql-prepare-rejects-result-type-change-after-ddl
   (is (nil? (err (.execute *handler* "PREPARE p_shape AS SELECT * FROM person"))))
   (is (nil? (err (.execute *handler* "ALTER TABLE person ADD COLUMN note TEXT"))))

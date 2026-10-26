@@ -66,6 +66,8 @@
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
+            [datahike.pg.sql.assignment-target :as assignment-target]
+            [datahike.pg.arrays.assign :as array-assign]
             [datahike.pg.types :as types]
             [datahike.pg.tsearch :as tsearch]
             [datahike.pg.vector :as pg-vector]
@@ -5598,12 +5600,14 @@
                     ;; Regular non-aggregate expression
                     (let [all-clauses (vec @(:where-clauses ctx))
                           emitted (subvec all-clauses before)
-                          effectful? (some #(and (symbol? %)
-                                                 (str/starts-with?
-                                                  (clojure.core/name %)
-                                                  "?nextval-marker-"))
-                                           (tree-seq coll? seq
-                                                     (cons v (map first emitted))))
+                          effectful? (or (some #(contains? params/*assignment-programs* %)
+                                               (params/ast-function-names expr))
+                                         (some #(and (symbol? %)
+                                                     (str/starts-with?
+                                                      (clojure.core/name %)
+                                                      "?nextval-marker-"))
+                                               (tree-seq coll? seq
+                                                         (cons v (map first emitted)))))
                           scalar-binding? (some #(and (vector? %)
                                                       (= 2 (count %))
                                                       (seq? (first %))
@@ -8113,6 +8117,123 @@
       :else         v)
     v))
 
+(defn array-column-spec
+  "The declared ordinary-array element codec and typmod, without enforcing
+   dimension declarations (PostgreSQL array rank belongs to each value)."
+  [attr schema db]
+  (let [pg-type (or (get-in schema [attr :pg/type]) (params/pg-type-of-attr db attr))
+        elem-type (or (get-in schema [attr :pg/array-elem])
+                      (when (and pg-type (str/starts-with? pg-type "_"))
+                        (keyword (subs pg-type 1))))
+        element-oid (get types/elem-kw->oid elem-type)]
+    (when (and elem-type element-oid)
+      {:elem-type elem-type
+       :element-oid element-oid
+       :column-oid (get types/element-oid->array-oid element-oid)
+       :typmod (or (get-in schema [attr :pg/typmod])
+                   (params/pg-typmod-of-attr db attr))})))
+
+(defn coerce-array-element
+  "Apply a scalar assignment cast while retaining the SQL/query carrier.
+   Array text must never contain scalar Datahike storage sentinels."
+  [value {:keys [element-oid typmod]}]
+  (when-not (or (nil? value) (= :__null__ value))
+    (let [target (types/format-type element-oid (or typmod -1))]
+      (when-not (types/cast-category target)
+        (throw (errors/pg-error :feature-not-supported
+                                {:feature "assignment to this array element type"})))
+      (sql-cast/cast-scalar value target {:explicit? false}))))
+
+(defn coerce-array-value
+  "Canonicalize every array leaf through its assignment codec, retaining
+   actual dimensions and lower bounds. Scalar whole-array input is an error."
+  [value {:keys [elem-type] :as spec}]
+  (when-not (or (nil? value) (= :__null__ value))
+    (let [array (cond
+                  (pg-arr/array? value) value
+                  (string? value) (pg-arr/from-pg-text value elem-type)
+                  (sequential? value) (pg-arr/array elem-type value)
+                  :else (throw (ex-info "array assignment requires an array expression"
+                                        {:error :datatype-mismatch :sqlstate "42804"})))
+          _ (when (> (count (:dims array)) 6)
+              (throw (ex-info "number of array dimensions exceeds the maximum allowed (6)"
+                              {:error :program-limit-exceeded :sqlstate "54000"})))]
+      (assoc (pg-arr/replace-leaves array #(coerce-array-element % spec))
+             :elem-type elem-type))))
+
+(defn partial-assignment-expression
+  "Build one complete-container projection for a column's ordered partial
+   targets. Cached programs contain codecs/ASTs, never row values or a DB."
+  [operations base-expression schema db]
+  (let [attr (:attr (first operations))
+        spec (array-column-spec attr schema db)]
+    (when-not (and spec (:column-oid spec))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "assignment to this subscripted type"})))
+    (assignment-target/program-expression
+     (assoc spec
+            :base-expr base-expression
+            :operations
+            (mapv (fn [operation]
+                    (assignment-target/reject-partial-default! operation (:value-expr operation))
+                    (assoc operation :coerce-value
+                           (if (= :array-element (:target-kind operation))
+                             #(coerce-array-element % spec)
+                             #(coerce-array-value % spec))))
+                  operations)
+            :decode-base (fn [value]
+                           (cond
+                             (or (nil? value) (= :__null__ value)) nil
+                             (pg-arr/array? value) value
+                             (string? value) (pg-arr/from-pg-text value (:elem-type spec))
+                             :else (throw (ex-info "array assignment requires an array value"
+                                                   {:sqlstate "42804"}))))
+            :check-subscripts! array-assign/check-subscripts!
+            :assign array-assign/assign))))
+
+(defn assignment-projections
+  "Group partial targets into one final value per base attribute. The caller
+   chooses the base expression (old row for UPDATE, typed NULL for INSERT)."
+  [assignments base-expression schema db & [{:keys [table]}]]
+  (let [table (or table (some-> assignments first :attr namespace))
+        assignments (mapv #(cond-> %
+                             (nil? (:attr %)) (assoc :attr (keyword table (:column %))))
+                          assignments)
+        order (zipmap (map :name (pgs/column-info schema table db)) (range))
+        groups (sort-by #(get order (:column (first %)) Long/MAX_VALUE)
+                        (vals (group-by :attr assignments)))]
+    (reduce (fn [{:keys [programs] :as result} group]
+              (let [first-target (first group)]
+                (if (assignment-target/partial-target? first-target)
+                  (let [binding (partial-assignment-expression group
+                                                               (base-expression first-target)
+                                                               schema db)]
+                    (-> result
+                        (update :assignments conj
+                                (assoc first-target :value-expr (:expression binding)
+                                       :assignment-program? true))
+                        (assoc :programs (assoc programs (:name binding) (:program binding)))))
+                  (update result :assignments conj first-target))))
+            {:assignments [] :programs {}} groups)))
+
+(defn- validate-partial-assignment-types!
+  "Analyze the target-row scope without evaluating any assignment children."
+  [assignments table alias schema db & [{:keys [excluded?]}]]
+  (when (some assignment-target/partial-target? assignments)
+    (let [{projections :assignments programs :programs}
+          (assignment-projections assignments
+                                  #(Column. (Table. (or alias table)) (:column %))
+                                  schema db {:table table})]
+      (binding [params/*assignment-programs* (merge params/*assignment-programs* programs)]
+        (let [physical-table (get params/*temp-table-map* table table)
+              ;; The supplied schema exposes temporary columns under their
+              ;; SQL name; row-eval reads durable column metadata from the
+              ;; physical namespace and binds it under the visible alias.
+              analysis-schema (if (= physical-table table) schema (:schema db))]
+          ((requiring-resolve 'datahike.pg.sql.row-eval/row-oids)
+           (mapv :value-expr projections) physical-table analysis-schema db
+           {:alias (or alias table) :excluded? excluded?}))))))
+
 (defn coerce-insert-value
   "Coerce a value to match the schema type for an attribute.
 
@@ -8264,30 +8385,11 @@
         ;; sequential value into one) to canonical PG text. Strings
         ;; that already look like array text pass through unchanged.
           (some? elem-kw)
-          (cond
-            (pg-arr/array? val)
-            (pg-arr/to-storage-text (if (contains? #{:regproc :regprocedure :regclass :regtype :regnamespace} elem-kw)
-                                      (assoc val :elem-type elem-kw) val))
-            ;; Array TEXT, which still has to go through the array
-            ;; input function. Passing it through unparsed stored
-            ;; `{1,abc}` in an `int[]`, and `{{1,2},{3}}` and `{1,2`
-            ;; too -- while `'{1,abc}'::int[]` rejected all three. The
-            ;; element type is known right here (`elem-kw`) and was
-            ;; simply not used on this branch; `from-pg-text` raises on
-            ;; malformed input and coerces each element, which is what
-            ;; the cast path has always done.
-            (and (string? val)
-                 (clojure.string/starts-with? (clojure.string/triml val) "{"))
-            (pg-arr/to-storage-text (pg-arr/from-pg-text val elem-kw))
-            (sequential? val)
-            (pg-arr/to-storage-text (pg-arr/array elem-kw (vec val)))
-            :else
-          ;; Last-ditch: string-coerce. Lets clients send a single
-          ;; element to an array column and have it stored as a
-          ;; 1-element array (PG would reject this; we tolerate to
-          ;; mirror the permissive behaviour of `:db.type/string`
-          ;; coercion above).
-            (pg-arr/to-storage-text (pg-arr/array elem-kw [val])))
+          (let [spec (array-column-spec attr schema db)]
+            (when-not spec
+              (throw (errors/pg-error :feature-not-supported
+                                      {:feature "assignment to this array element type"})))
+            (pg-arr/to-storage-text (coerce-array-value val spec)))
         ;; :db.type/ref column with a numeric/string PK value →
         ;; lookup-ref. Already-vector values (explicit `[:k v]`) pass
         ;; through unchanged. Convention-based target resolution
@@ -8893,17 +8995,18 @@
                                          {:error :undefined-column
                                           :sqlstate "42703"
                                           :column ref-name})))
-                       {:attr attr :col-name col-name :value-expr value-expr}))
+                       (let [target (assoc (assignment-target/describe col)
+                                           :attr attr :column col-name :col-name col-name
+                                           :value-expr value-expr)]
+                         (assignment-target/reject-partial-default! target value-expr)
+                         (when (and (assignment-target/partial-target? target)
+                                    (nil? (array-column-spec attr schema db)))
+                           (throw (errors/pg-error :feature-not-supported
+                                                   {:feature "assignment to this subscripted type"})))
+                         target)))
                    cols values)))
-          (.getUpdateSets conflict-action)))
-        duplicate (some (fn [[attr n]] (when (> n 1) attr))
-                        (frequencies (map :attr assignments)))]
-    (when duplicate
-      (throw (ex-info (str "multiple assignments to same column \""
-                           (name duplicate) "\"")
-                      {:error :syntax-error
-                       :sqlstate "42601"
-                       :column (name duplicate)})))
+          (.getUpdateSets conflict-action)))]
+    (assignment-target/validate-duplicates! assignments "42601")
     assignments))
 
 (defn- canonical-relation
@@ -8944,7 +9047,10 @@
    ON CONFLICT's SET/WHERE AST through Execute-time substitution."
   [update-assignments update-where]
   (let [idxs (into (sorted-set)
-                   (concat (mapcat #(params/ast-param-indices (:value-expr %))
+                   (concat (mapcat (fn [target]
+                                     (concat (params/ast-param-indices (:value-expr target))
+                                             (mapcat #(params/ast-param-indices (:expression %))
+                                                     (assignment-target/bound-expressions target))))
                                    update-assignments)
                            (when update-where
                              (params/ast-param-indices update-where))))]
@@ -8963,17 +9069,34 @@
         update-where (.getWhereExpression conflict-action)
         update-assignments (when-not do-nothing?
                              (conflict-update-assignments
-                              conflict-action table-name ns schema db))]
-    {:table-name table-name
-     :ns ns
-     :schema schema
-     :target-alias target-alias
-     :parse-fn params/*parse-sql*
-     :do-nothing? do-nothing?
-     :conflict-cols conflict-cols
-     :update-where update-where
-     :update-assignments update-assignments
-     :set-params (conflict-set-params update-assignments update-where)}))
+                              conflict-action table-name ns schema db))
+        _ (validate-partial-assignment-types! update-assignments table-name target-alias
+                                              schema db {:excluded? true})]
+    (let [plan {:table-name table-name
+                :ns ns
+                :schema schema
+                :target-alias target-alias
+                :parse-fn params/*parse-sql*
+                :do-nothing? do-nothing?
+                :conflict-cols conflict-cols
+                :update-where update-where
+                :update-assignments update-assignments
+                :set-params (conflict-set-params update-assignments update-where)}
+          physical-table (get params/*temp-table-map* table-name table-name)]
+      (if (= physical-table table-name)
+        plan
+        ;; Runtime functions close over this plan before the server rewrites
+        ;; structural parse fields. Bind their storage identities now, while
+        ;; keeping SQL column ASTs and their visible relation alias intact.
+        (let [physical-attr #(if (= table-name (namespace %))
+                               (keyword physical-table (name %)) %)]
+          (assoc plan :runtime-plan
+                 (assoc plan :table-name physical-table :ns physical-table
+                        :schema (:schema db)
+                        :target-alias (or target-alias table-name)
+                        :conflict-cols (when conflict-cols (mapv physical-attr conflict-cols))
+                        :update-assignments
+                        (mapv #(update % :attr physical-attr) update-assignments))))))))
 
 (defn- conflict-unique-specs [txdb table-name]
   (let [schema (:schema txdb)
@@ -9079,30 +9202,37 @@
     (when (or (nil? update-where)
               (true? (let [v (first (:values (row-scope [update-where])))]
                        (when (some? v) (boolean v)))))
-      (reduce
-       (fn [{:keys [row-after] :as result}
-            [{:keys [attr]} new-val]]
+      (let [{assignments :assignments programs :programs}
+            (assignment-projections
+             update-assignments
+             (fn [target]
+               (Column. (Table. (or target-alias table-name)) (:column target)))
+             schema txdb {:table table-name})
+            values (binding [params/*assignment-programs* (merge params/*assignment-programs* programs)]
+                     (:values (row-scope (mapv :value-expr assignments))))]
+        (reduce
+         (fn [{:keys [row-after] :as result}
+              [{:keys [attr]} new-val]]
          ;; PostgreSQL evaluates every SET RHS against the pre-update target
          ;; row, not against assignments earlier in the same SET list.
-         (let [attr (or (when (contains? old-map attr) attr)
-                        (some #(when (and (keyword? %)
-                                          (= (name attr) (name %))) %)
-                              (keys old-map))
-                        attr)
-               old-val (get old-map attr)
-               coerced (when (some? new-val)
-                         (coerce-insert-value new-val attr schema))]
-           (cond-> (if (nil? new-val)
-                     (assoc result :row-after (dissoc row-after attr))
-                     (assoc-in result [:row-after attr] coerced))
-             (and (nil? new-val) (some? old-val))
-             (update :ops conj [:db/retract (:db/id result) attr old-val])
+           (let [attr (or (when (contains? old-map attr) attr)
+                          (some #(when (and (keyword? %)
+                                            (= (name attr) (name %))) %)
+                                (keys old-map))
+                          attr)
+                 old-val (get old-map attr)
+                 coerced (when (some? new-val)
+                           (coerce-insert-value new-val attr schema txdb))]
+             (cond-> (if (nil? new-val)
+                       (assoc result :row-after (dissoc row-after attr))
+                       (assoc-in result [:row-after attr] coerced))
+               (and (nil? new-val) (some? old-val))
+               (update :ops conj [:db/retract (:db/id result) attr old-val])
 
-             (some? new-val)
-             (update :ops conj [:db/add (:db/id result) attr coerced]))))
-       {:db/id (:db/id old-map) :ops [] :row-after old-map}
-       (map vector update-assignments
-            (:values (row-scope (mapv :value-expr update-assignments))))))))
+               (some? new-val)
+               (update :ops conj [:db/add (:db/id result) attr coerced]))))
+         {:db/id (:db/id old-map) :ops [] :row-after old-map}
+         (map vector assignments values))))))
 
 (defn- materialize-conflict-defaults
   [txdb attrs constraint-plan schema]
@@ -9240,18 +9370,19 @@
   (let [row-refs (atom [])
         affected (atom 0)
         set-params (:set-params plan)
+        runtime-plan (or (:runtime-plan plan) plan)
         candidate-step (fn [txdb state candidate runtime-set-params]
                          (reduce-on-conflict
                           txdb [candidate] runtime-set-params
-                          (assoc plan :preserve-nulls? true) state))
+                          (assoc runtime-plan :preserve-nulls? true) state))
         tx-fn (fn [txdb row-attrs set-params]
                 (reset! row-refs [])
                 (reset! affected 0)
-                (let [result (reduce-on-conflict txdb row-attrs set-params plan)]
+                (let [result (reduce-on-conflict txdb row-attrs set-params runtime-plan)]
                   (doseq [row (:mutated-rows result)]
                     (validate-conflict-row-constraints!
-                     txdb (:table-name plan) row
-                     (row-constraints/constraint-plan txdb (:table-name plan))
+                     txdb (:table-name runtime-plan) row
+                     (row-constraints/constraint-plan txdb (:table-name runtime-plan))
                      (:effective-rows result) true))
                   (reset! row-refs (:row-refs result))
                   (reset! affected (:affected result))
@@ -9382,6 +9513,75 @@
                        :value-count value-count}))))
   rows)
 
+(defn- insert-default-expression? [expression]
+  (let [expression (unwrap-parens expression)]
+    (and (instance? Column expression)
+         (nil? (some-> ^Column expression .getTable .getName))
+         (.equalsIgnoreCase "default" (.getColumnName ^Column expression)))))
+
+(defn- compile-insert-assignment-plans
+  "Compile column expressions for an INSERT containing partial targets.
+   Each physical column has one complete value, evaluated in column order."
+  [targets schema db]
+  (into {}
+        (keep
+         (fn [[attr operations]]
+           (let [target (first operations)
+                 partial? (assignment-target/partial-target? target)
+                 original-expression (:value-expr target)]
+             (when-not (and (not partial?) (insert-default-expression? original-expression))
+               (let [{:keys [expression name program]}
+                     (if partial?
+                       (partial-assignment-expression operations (NullValue.) schema db)
+                       {:expression original-expression})
+                     plan (binding [params/*assignment-programs* (cond-> params/*assignment-programs*
+                                                                   name (assoc name program))
+                                    params/*bound-params* nil]
+                            (params/*parse-sql* (str "SELECT " expression) schema db))]
+                 (when (= :error (:type plan))
+                   (throw (ex-info (:message plan)
+                                   {:sqlstate (:sqlstate plan)
+                                    :error-fields (:error-fields plan)})))
+                 (when (and (not partial?)
+                            (not (oid/untyped-literal? (unwrap-parens original-expression)))
+                            (not (types/assignment-cast-exists?
+                                  (first (:select-item-oids plan))
+                                  (params/infer-param-oid-for-column
+                                   schema (namespace attr) (:column target) db))))
+                   (throw (ex-info (str "column \"" (:column target)
+                                        "\" has an incompatible expression type")
+                                   {:sqlstate "42804" :error :datatype-mismatch})))
+                 [attr plan])))))
+        (group-by :attr targets)))
+
+(defn- insert-source-types
+  "Visible type metadata is already expanded for stars and precedes hidden
+   inputs used by deferred projections. Raw SelectItems have neither property."
+  [source]
+  (let [oids (or (get-in source [:visible-select-items :oids])
+                 (:select-item-oids source))
+        resolution (or (get-in source [:visible-select-items :resolution-oids])
+                       (:select-item-resolution-oids source))]
+    {:oids oids
+     :unknown? (mapv (fn [i oid] (and (some? oid) (nil? (nth resolution i nil))))
+                     (range) oids)}))
+
+(defn- validate-insert-source-types!
+  [targets {:keys [oids unknown?]} schema db]
+  (doseq [[target source unknown?] (map vector targets oids unknown?)
+          :let [column-oid (params/infer-param-oid-for-column
+                            schema (namespace (:attr target)) (:column target) db)
+                expected (assignment-target/value-oid target column-oid)]
+          :when (and (not unknown?)
+                     (not (types/assignment-cast-exists? source expected)))]
+    (throw (ex-info (str "column \"" (:column target)
+                         "\" has an incompatible expression type")
+                    {:sqlstate "42804" :error :datatype-mismatch}))))
+
+(defn- materialized-insert-plans? [plans]
+  (boolean (some #(or (:enriched-db %) (:execution-materialization? %)
+                      (:materialisation-params? %)) plans)))
+
 (defn materialize-insert-select
   "Execute a translated INSERT ... SELECT source against `db` and build the
    ordinary ordered INSERT candidate plan.
@@ -9391,7 +9591,7 @@
    the current statement snapshot. Stateful projection calls remain inert
    markers here and are resolved candidate-by-candidate by the server."
   [{:keys [source col-names source-attrs table-name ns ancestor-tables
-           sequence-defaults conflict-plan returning]}
+           sequence-defaults conflict-plan returning assignment-targets assignment-plans]}
    db resolve-value]
   (let [source-db db
         query (:query source)
@@ -9428,14 +9628,21 @@
                     results))
         row-attrs
         (mapv (fn [row]
-                (into {}
-                      (keep (fn [[attr val]]
-                              (let [value (when-not (= :__null__ val) val)]
-                                (when (or (some? value)
-                                          (nil? val)
-                                          (= :__null__ val))
-                                  [attr value]))))
-                      (map vector source-attrs row)))
+                (if assignment-targets
+                  ;; Preserve positional occurrences until the source tuple
+                  ;; has been evaluated. Duplicate partial columns cannot be
+                  ;; represented by a map keyed on the destination attribute.
+                  (assoc (into {} (map (fn [target] [(:attr target) nil]))
+                               assignment-targets)
+                         ::insert-source-values row)
+                  (into {}
+                        (keep (fn [[attr val]]
+                                (let [value (when-not (= :__null__ val) val)]
+                                  (when (or (some? value)
+                                            (nil? val)
+                                            (= :__null__ val))
+                                    [attr value]))))
+                        (map vector source-attrs row))))
               rows)
         marker-attrs (into [(pgs/row-marker-attr table-name)]
                            (map pgs/row-marker-attr ancestor-tables))
@@ -9463,7 +9670,10 @@
                             :count (count entities)
                             :table table-name :ns ns}
                      returning (assoc :returning returning))))]
-    (assoc result :insert-source-order source-attrs)))
+    (if assignment-targets
+      (assoc result :insert-source-targets assignment-targets
+             :insert-shared-assignment-plans assignment-plans)
+      (assoc result :insert-source-order source-attrs))))
 
 (defn- expand-insert-values-srfs
   "Expand top-level SRFs in one INSERT ... VALUES row.
@@ -9644,20 +9854,18 @@
               (if db
                 (ctx/resolve-inherited-attr raw-attr schema db)
                 raw-attr))))
-        ;; PostgreSQL rejects a target column named twice. We built a
-        ;; map from the column list, so the last value silently won and
-        ;; `INSERT INTO t (id, id) VALUES (91, 92)` reported INSERT 0 1
-        ;; having stored 92 — a row the client never asked for. Checked
-        ;; only for an EXPLICIT column list; the implicit one is derived
-        ;; from the schema and cannot repeat.
-        _ (when (seq columns)
-            (when-let [dup (first (for [[c n] (frequencies col-names)
-                                        :when (> n 1)]
-                                    c))]
-              (throw (ex-info (str "column \"" dup "\" specified more than once")
-                              {:error :duplicate-column
-                               :sqlstate "42701"
-                               :column dup}))))
+        targets (mapv (fn [column col-name]
+                        (assoc (if column (assignment-target/describe column)
+                                   {:target-kind :whole :dimensions []})
+                               :column col-name :attr (resolve-target-attr col-name)))
+                      (if (seq columns) columns (repeat nil)) col-names)
+        _ (assignment-target/validate-duplicates! targets "42701")
+        partial? (boolean (some assignment-target/partial-target? targets))
+        _ (doseq [target targets
+                  :when (and (assignment-target/partial-target? target)
+                             (nil? (array-column-spec (:attr target) schema db)))]
+            (throw (errors/pg-error :feature-not-supported
+                                    {:feature "assignment to this subscripted type"})))
         select (.getSelect insert)
         ;; ON CONFLICT handling
         ^net.sf.jsqlparser.statement.insert.InsertConflictAction
@@ -9738,6 +9946,31 @@
             _ (when (= :error (:type inner-parsed))
                 (throw (ex-info (str (:message inner-parsed))
                                 {:sqlstate (or (:sqlstate inner-parsed) "XX000")})))
+            source-types (insert-source-types inner-parsed)
+            _ (validate-insert-source-types! targets source-types schema db)
+            assignment-plans
+            (when partial?
+              (let [source-types
+                    (into {}
+                          (map-indexed
+                           (fn [i [target source unknown?]]
+                             [(+ 100000 i)
+                              (if unknown?
+                                (assignment-target/value-oid
+                                 target (params/infer-param-oid-for-column
+                                         schema (namespace (:attr target)) (:column target) db))
+                                source)])
+                           (map vector targets (:oids source-types) (:unknown? source-types))))
+                    operations (mapv (fn [i target]
+                                       (assoc target :value-expr
+                                              (doto (JdbcParameter.)
+                                                (.setIndex (int (+ 100000 i)))
+                                                (.setUseFixedIndex true)
+                                                (.setParameterCharacter "$"))))
+                                     (range) targets)]
+                (binding [params/*declared-param-oids* (merge params/*declared-param-oids* source-types)]
+                  (compile-insert-assignment-plans
+                   (filterv assignment-target/partial-target? operations) schema db))))
             source-plan
             {:source inner-parsed
              :col-names col-names
@@ -9749,22 +9982,29 @@
              :conflict-plan (when conflict-action
                               (conflict-plan conflict-action conflict-target
                                              table-name ns schema db target-alias))
-             :returning (extract-returning (.getReturningClause insert))}]
+             :returning (extract-returning (.getReturningClause insert))}
+            source-plan (cond-> source-plan
+                          partial? (assoc :assignment-targets targets
+                                          :assignment-plans assignment-plans))]
         ;; Source rows belong to execution, not parsing. Besides prepared
         ;; statements observing the current snapshot, this keeps volatile
         ;; source projections out of Parse and lets the server interleave one
         ;; projected candidate with target defaults and validation.
-        {:type :insert
-         :insert-mode :deferred-select
-         :insert-candidates []
-         :tx-data []
-         :count 0
-         :table table-name
-         :ns ns
-         :insert-source source-plan
+        (cond-> {:type :insert
+                 :insert-mode :deferred-select
+                 :insert-candidates []
+                 :tx-data []
+                 :count 0
+                 :table table-name
+                 :ns ns
+                 :insert-source source-plan
          ;; Describe runs before deferred source materialization, but must
          ;; advertise the same RETURNING row shape Execute will produce.
-         :returning (:returning source-plan)})
+                 :returning (:returning source-plan)}
+          (materialized-insert-plans? (cons inner-parsed (vals assignment-plans)))
+          (assoc :execution-materialization? true)
+          (some :session-dependent? (cons inner-parsed (vals assignment-plans)))
+          (assoc :session-dependent? true)))
 
       ;; Normal INSERT with VALUES
       (and (instance? Values select) (seq col-names))
@@ -9806,7 +10046,11 @@
                         ;; Direct list of values (single row without parens)
                         :else
                         [(vec expr-list)])
-            rows (vec (mapcat #(expand-insert-values-srfs % ev) row-exprs))
+            _ (when (and partial? (some target-list-srf? (mapcat identity row-exprs)))
+                (throw (errors/pg-error :feature-not-supported
+                                        {:feature "set-returning expressions with subscripted INSERT targets"})))
+            rows (if partial? row-exprs
+                     (vec (mapcat #(expand-insert-values-srfs % ev) row-exprs)))
             _ (if (seq columns)
                 (validate-insert-row-widths! col-names rows)
                 ;; Without an explicit target list PostgreSQL permits a
@@ -9821,10 +10065,23 @@
                                    :value-count (count row)}))))
             ;; Build row attribute maps
             ;; For INHERITS: resolve inherited columns to parent namespace
+            assignment-plans
+            (when partial?
+              (mapv (fn [row]
+                      (compile-insert-assignment-plans
+                       (mapv (fn [target value-expr]
+                               (assignment-target/reject-partial-default! target value-expr)
+                               (assoc target :value-expr value-expr))
+                             targets row)
+                       schema db)) rows))
             row-attrs (mapv (fn [row]
                               (into {}
-                                    (keep (fn [[col-name val]]
-                                            (let [attr (resolve-target-attr col-name)
+                                    (keep (fn [[target value]]
+                                            (let [attr (:attr target)
+                                                  val (if partial?
+                                                        (if (insert-default-expression? value)
+                                                          ::insert-default nil)
+                                                        value)
                                                   coerced (coerce-insert-value val attr schema)]
                                           ;; DEFAULT means omitted; explicit
                                           ;; NULL remains a present nil so a
@@ -9837,7 +10094,7 @@
                                                 (= ::insert-default val) nil
                                                 (some? coerced) [attr coerced]
                                                 :else [attr nil])))
-                                          (map vector col-names row))))
+                                          (map vector targets row))))
                             rows)
         ;; Add row-existence marker for this table
             marker (pgs/row-marker-attr table-name)
@@ -9987,10 +10244,15 @@
         ;; Add RETURNING clause if present
             returning (extract-returning (.getReturningClause insert))]
         (cond-> (assoc result :alias target-alias)
+          partial? (assoc :insert-assignment-plans assignment-plans)
+          (materialized-insert-plans? (mapcat vals assignment-plans))
+          (assoc :execution-materialization? true)
+          (some :session-dependent? (mapcat vals assignment-plans))
+          (assoc :session-dependent? true)
           (not conflict-action)
           (assoc :insert-mode :plain
                  :insert-candidates (filterv map? (:tx-data result)))
-          (and (not conflict-action) (not returning)
+          (and (not partial?) (not conflict-action) (not returning)
                (empty? ancestor-tables) (empty? sequence-defaults)
                (empty? (.getWithItemsList insert))
                (every? literal-catalog-expression? (mapcat identity row-exprs)))
@@ -10178,22 +10440,32 @@
                                :sqlstate "42703"
                                :column qualifier
                                :hint "SET target columns cannot be qualified with the relation name."}))))
-        ;; Same hazard as the INSERT column list, different SQLSTATE:
-        ;; `UPDATE t SET sal = 1, sal = 2` built one assignment map and
-        ;; the last write won, reporting UPDATE 1 for a statement
-        ;; PostgreSQL refuses.
-        _ (when-let [dup (first (for [[c n] (frequencies
-                                             (mapcat (fn [^UpdateSet us]
-                                                       (map #(unquote-ident
-                                                              (.getColumnName ^Column %))
-                                                            (.getColumns us)))
-                                                     update-sets))
-                                      :when (> n 1)]
-                                  c))]
-            (throw (ex-info (str "multiple assignments to same column \"" dup "\"")
-                            {:error :syntax-error
-                             :sqlstate "42601"
-                             :column dup})))
+        assignments
+        (vec
+         (mapcat
+          (fn [^UpdateSet us]
+            (let [cols (vec (.getColumns us))
+                  values (or (row-subquery-columns cols (vec (.getValues us)))
+                             (vec (.getValues us)))]
+              (when-not (= (count cols) (count values))
+                (throw (ex-info "multi-column UPDATE from a row expression is not supported"
+                                {:error :feature-not-supported :sqlstate "0A000"})))
+              (map (fn [^Column column value]
+                     (let [target (assignment-target/describe column)
+                           name (canonical-target-column (:column target))
+                           target (assoc target :column name
+                                         :attr (ctx/resolve-inherited-attr
+                                                (keyword ns name) schema db)
+                                         :value-expr value)]
+                       (assignment-target/reject-partial-default! target value)
+                       (when (and (assignment-target/partial-target? target)
+                                  (nil? (array-column-spec (:attr target) schema db)))
+                         (throw (errors/pg-error :feature-not-supported
+                                                 {:feature "assignment to this subscripted type"})))
+                       target))
+                   cols values)))
+          update-sets))
+        _ (assignment-target/validate-duplicates! assignments "42601")
         withs (.getWithItemsList update)
         ;; The WITH clause rides along into the SET query, which is
         ;; parsed as ordinary SQL: the CTE is then materialised by the
@@ -10212,6 +10484,11 @@
                    (str fi (apply str (map (fn [^Join j]
                                              (str (if (.isSimple j) ", " " ") j))
                                            (or (.getJoins update) [])))))]
+    ;; Target-row analysis is metadata-only. FROM/WITH retain their full
+    ;; query scope in update-set-plan rather than pretending those sources
+    ;; belong to this narrower row scope.
+    (when-not (or from-sql with-sql)
+      (validate-partial-assignment-types! assignments table-name alias-name schema db))
     (cond-> {:type :update
              :table table-name
              :alias alias-name
@@ -10227,28 +10504,7 @@
                ;; (server/update-set-plan) and must see the same ones.
              :declared-param-oids params/*declared-param-oids*
              :where-expr where-expr
-             :assignments
-             (vec
-              (mapcat
-               (fn [^UpdateSet us]
-                 (let [cols (vec (.getColumns us))
-                       exprs (or (row-subquery-columns (vec (.getColumns us))
-                                                       (vec (.getValues us)))
-                                 (vec (.getValues us)))]
-                   (when-not (= (count cols) (count exprs))
-                       ;; A multi-column assignment from anything else --
-                       ;; ROW(...), a set-operation subquery -- still needs
-                       ;; one evaluation yielding a record. Applying only
-                       ;; the first pair is silent partial corruption.
-                     (throw (ex-info
-                             "multi-column UPDATE from a row expression is not supported"
-                             {:error :feature-not-supported :sqlstate "0A000"})))
-                   (map (fn [^Column col value-expr]
-                          {:column (canonical-target-column
-                                    (unquote-ident (.getColumnName col)))
-                           :value-expr value-expr})
-                        cols exprs)))
-               update-sets))}
+             :assignments assignments}
       (.getReturningClause update)
       (assoc :returning (extract-returning (.getReturningClause update))))))
 

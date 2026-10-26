@@ -1032,12 +1032,12 @@
                                ;; PG keeps these in pg_attribute; we
                                ;; tag the schema attr's ident entity
                                ;; with `:pg/typmod` and surface it in
-                               ;; the catalog + describeResult. Skipped
-                               ;; for array columns — we don't currently
-                               ;; preserve element typmod through the
-                               ;; serialized array codec.
+                               ;; the catalog + describeResult. An array's
+                               ;; typmod constrains each element; it does
+                               ;; not constrain its dimensions or bounds.
                                numeric-typmod
-                               (when (and (= dh-type :db.type/bigdec) (not array-spec))
+                               (when (or (= dh-type :db.type/bigdec)
+                                         (= :numeric (:elem array-spec)))
                                  (let [[p s] (types/parse-numeric-args raw-type)]
                                    (when (or p s)
                                      (types/encode-numeric-typmod p s))))
@@ -1048,17 +1048,23 @@
                                ;; enforced it on write. PostgreSQL's
                                ;; typmod for these is n + VARHDRSZ.
                                char-typmod
-                               (when (and (= dh-type :db.type/string) (not array-spec))
-                                 (when-let [n (types/parse-char-length raw-type)]
+                               (when (= dh-type :db.type/string)
+                                 (when-let [n (or (types/parse-char-length raw-type)
+                                                  (when (and array-spec
+                                                             (contains? #{"char" "character"} base-type))
+                                                    1))]
                                    (+ n 4)))
                                bit-typmod
-                               (when (and (= dh-type :db.type/string) (not array-spec))
+                               (when (= dh-type :db.type/string)
                                  ;; JSqlParser inconsistently includes the
                                  ;; modifier in getDataType for `bit(4)`, but
                                  ;; exposes `varbit(4)` as dataType="varbit"
                                  ;; plus a separate argument list. `str` on
                                  ;; ColDataType faithfully includes both.
-                                 (some-> (types/parse-bit-length (str cdt)) long))
+                                 (some-> (or (types/parse-bit-length
+                                              (str/replace (str cdt) #"(?:\s*\[[^\]]*\])+$" ""))
+                                             (when (and array-spec (= "bit" base-type)) 1))
+                                         long))
                                vector-typmod
                                (when (= dh-type :db.type/float-array)
                                  (pg-vector/parse-typmod

@@ -165,22 +165,33 @@
     (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-str)) second Integer/parseInt)))
 
 (defn- apply-text-length
-  "Truncate to the declared length. `cast-scalar`'s explicit? flag is the
-   same distinction PostgreSQL draws: an explicit cast truncates
-   silently, an assignment refuses."
+  "Apply a character typmod. `cast-scalar`'s explicit? flag is the same
+   distinction PostgreSQL draws: an explicit cast truncates silently, while
+   an assignment refuses non-space excess characters. Fixed-width character
+   values are blank-padded after truncation/validation."
   [^String v type-str explicit?]
   (if-let [n (text-length-limit type-str)]
-    (if (<= (count v) n)
-      v
-      (if explicit?
-        (subs v 0 n)
-        (throw (errors/pg-error
-                :string-data-right-truncation
-                {:message (str "value too long for type "
-                               (if (contains? #{"char" "character" "bpchar"}
-                                              (base-type-name type-str))
-                                 "character(" "character varying(")
-                               n ")")}))))
+    (let [base (base-type-name type-str)
+          fixed? (contains? #{"char" "character" "bpchar"} base)
+          ;; PostgreSQL typmods count characters, not UTF-8 bytes; Java's
+          ;; String length counts UTF-16 code units, so use code points here.
+          length (.codePointCount v 0 (.length v))
+          prefix-end (when (> length n) (.offsetByCodePoints v 0 n))
+          value (cond
+                  (<= length n) v
+                  (or explicit?
+                      (every? #(= \space %) (subs v prefix-end)))
+                  (subs v 0 prefix-end)
+                  :else
+                  (throw (errors/pg-error
+                          :string-data-right-truncation
+                          {:message (str "value too long for type "
+                                         (if fixed?
+                                           "character(" "character varying(")
+                                         n ")")})))]
+      (if (and fixed? (< length n))
+        (str value (apply str (repeat (- n length) \space)))
+        value))
     v))
 
 (declare cast-number-to-integer integer-to-oid)
@@ -280,9 +291,11 @@
                  ;; a float infinity perfectly well.
                  (if float4?
                    (let [f (.floatValue (Double/valueOf d))]
-                     (if (and (Double/isFinite d) (Float/isInfinite f))
-                       (out-of-range! "real")
-                       f))
+                     (when (and (Double/isFinite d)
+                                (or (Float/isInfinite f)
+                                    (and (zero? f) (not (zero? d)))))
+                       (out-of-range! "real"))
+                     f)
                    d))]
     (cond
       ;; Text is read by float4in / float8in.

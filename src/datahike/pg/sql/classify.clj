@@ -1789,16 +1789,40 @@
   "PREPARE name [(arg-types)] AS <sql-template>"
   [^String sql toks]
   (let [name (ident-text (first toks))
-        ;; Skip optional (arg-types)
         after-name-idx 1
-        after-types-idx (if (= "(" (:text (nth toks after-name-idx nil)))
-                          (inc (paren-group-end toks after-name-idx))
-                          after-name-idx)
+        types-open? (= "(" (:text (nth toks after-name-idx nil)))
+        types-end-idx (when types-open? (paren-group-end toks after-name-idx))
+        arg-types
+        (when types-open?
+          (let [opening (nth toks after-name-idx)
+                closing (nth toks types-end-idx nil)]
+            (when closing
+              (loop [i (inc after-name-idx)
+                     depth 0
+                     start (:end opening)
+                     result []]
+                (if (= i types-end-idx)
+                  (let [tail (str/trim (subs sql start (:pos closing)))]
+                    (cond
+                      (and (empty? result) (str/blank? tail)) []
+                      (str/blank? tail) (conj result "")
+                      :else (conj result tail)))
+                  (let [token (nth toks i)
+                        text (:text token)]
+                    (cond
+                      (= "(" text) (recur (inc i) (inc depth) start result)
+                      (= ")" text) (recur (inc i) (dec depth) start result)
+                      (and (= "," text) (zero? depth))
+                      (recur (inc i) depth (:end token)
+                             (conj result (str/trim (subs sql start (:pos token)))))
+                      :else (recur (inc i) depth start result))))))))
+        after-types-idx (if types-open? (inc types-end-idx) after-name-idx)
         as-tok (when (kw=? (nth toks after-types-idx nil) "as")
                  (nth toks after-types-idx))]
-    {:kind :prepare
-     :name (when name (str/lower-case name))
-     :template (when as-tok (text-tail sql (:end as-tok)))}))
+    (cond-> {:kind :prepare
+             :name (when name (str/lower-case name))
+             :template (when as-tok (text-tail sql (:end as-tok)))}
+      types-open? (assoc :arg-types arg-types))))
 
 (defn- classify-execute
   "EXECUTE name [(args)]"

@@ -111,6 +111,8 @@
 (def oid-oid-array         1028)
 (def oid-varchar-array     1015)
 (def oid-bpchar-array      1014)
+(def oid-bit-array         1561)
+(def oid-varbit-array      1563)
 (def oid-date-array        1182)
 (def oid-time-array        1183)
 (def oid-timetz-array      1270)
@@ -144,7 +146,7 @@
         (map (fn [e] [e (:typarray (catalog-type e))]))
         [oid-bool oid-bytea oid-name oid-int2 oid-int4 oid-text oid-int8
          oid-regproc oid-regprocedure oid-regclass oid-regtype oid-regnamespace
-         oid-float4 oid-float8 oid-oid oid-varchar oid-bpchar oid-date
+         oid-float4 oid-float8 oid-oid oid-varchar oid-bpchar oid-bit oid-varbit oid-date
          oid-time oid-timetz oid-timestamp oid-timestamptz oid-numeric
          oid-uuid oid-json oid-money oid-jsonb oid-tsvector oid-tsquery
          ;; The geometric and MAC families. Their `_T` rows were already
@@ -181,6 +183,8 @@
    :regnamespace oid-regnamespace
    :varchar     oid-varchar
    :bpchar      oid-bpchar
+   :bit         oid-bit
+   :varbit      oid-varbit
    :date        oid-date
    :time        oid-time
    :timetz      oid-timetz
@@ -357,6 +361,9 @@
    "char"              :bpchar
    "character"         :bpchar
    "bpchar"            :bpchar
+   "bit"               :bit
+   "varbit"            :varbit
+   "bit varying"       :varbit
    "name"              :name
    "citext"            :text
    "integer"           :int4
@@ -992,6 +999,13 @@
       (= :S (cat target)) true
       (and (array-oid->element-oid source) (array-oid->element-oid target))
       (assignment-cast-exists? (array-oid->element-oid source) (array-oid->element-oid target))
+      ;; Supported arrays are known containers even though resolution-oids
+      ;; deliberately enumerates scalar categories. Do not let that omission
+      ;; invent a scalar-to-array cast. Unknown user/domain OIDs retain their
+      ;; existing deferred resolution; vector's extension casts are separate.
+      (and (array-oid->element-oid target) (catalog-type source)) false
+      (and (array-oid->element-oid source)
+           (not= target oid-vector) (catalog-type target)) false
       (or (nil? (cat source)) (nil? (cat target))) true
       :else false)))
 

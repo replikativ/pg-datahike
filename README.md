@@ -571,6 +571,15 @@ FOREIGN KEY … ON UPDATE NO ACTION ON DELETE CASCADE`.
 Generated identity and SERIAL sequence names use `<table>_<column>_seq`.
 Existing names raise `42P07`; automatic suffix selection is not yet supported.
 
+Arrays with supported built-in element types support element and slice
+assignments in `UPDATE`, `INSERT` and `ON CONFLICT DO UPDATE`: for example, `UPDATE samples SET readings[2]=42`
+or `INSERT INTO samples(readings[2:3]) VALUES (ARRAY[42,43])`. Partial writes
+preserve unaffected elements; one-dimensional writes can extend the bounds.
+Multidimensional writes use the stored value's shape, regardless of dimensions
+written in the column declaration. A partial INSERT starts with a NULL array and skips that column's
+default. Partial writes to other subscriptable types, such as `point`, raise
+`0A000`. User-defined array types remain unsupported.
+
 Stored generated columns are computed on INSERT and recomputed on UPDATE;
 explicit assignments are restricted. Enum comparisons, ordering, MIN and MAX
 use declaration order.
