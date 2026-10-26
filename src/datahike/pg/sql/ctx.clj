@@ -569,10 +569,9 @@
    with numeric attribute refs, hence `namespace` is safe on that dynamic
    attribute variable.
 
-   Ignored values are fresh vars rather than `_`: Datahike's limited-query
-   planner can project a wildcard membership scan away when another pattern
-   reads the same attribute. Only `evar` escapes an or-join, preserving SQL
-   row/cardinality semantics for cardinality-many attributes."
+   Ignored values use fresh variables. Only `evar` escapes an or-join,
+   keeping membership values out of SQL row/grouping identity, including
+   cardinality-many attributes."
   [ctx table-name evar]
   (let [schema (:schema ctx)
         db (:db ctx)
