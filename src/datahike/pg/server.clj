@@ -14837,6 +14837,13 @@
                                                  ;; original literal SQL for
                                                  ;; these plans instead.
                                                  (not (:runtime-subqueries? p))
+                                                 ;; Rows produced while parsing a
+                                                 ;; parameterized child cannot
+                                                 ;; be repaired by substituting
+                                                 ;; its outer ParamRefs. Parse
+                                                 ;; the original literal SQL so
+                                                 ;; the child receives values.
+                                                 (not (:materialisation-params? p))
                                                  (contains? #{:select :update :delete}
                                                             (:type p)))
                                         (when bump-dispatch! (bump-dispatch! p))
