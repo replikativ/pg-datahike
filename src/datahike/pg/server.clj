@@ -3439,40 +3439,13 @@
              (list 'not [evar (pgs/row-marker-attr child) true])))))
 
 (defn- ensure-evar-anchor!
-  "The UPDATE/DELETE row-matching query needs at least one data pattern
-   binding the table's entity var — a WHERE consisting only of get-else /
-   function-binding clauses (e.g. `WHERE col = $1` via the predicate
-   path) leaves it unbound, which the datahike planner rejects. Prepend
-   the row-marker anchor when no clause binds it."
+  "Restrict DML row matching to physical members of the target relation.
+   Column predicates alone neither enumerate sparse native rows nor prove
+   marker membership for SQL-created tables."
   [ctx evar table]
-  (let [clauses @(:where-clauses ctx)
-        marker (pgs/row-marker-attr table)
-        binds-evar? (some (fn [c]
-                            (and (vector? c) (>= (count c) 2)
-                                 (= evar (first c)) (keyword? (second c))))
-                          clauses)]
-    (when-not binds-evar?
-      (cond
-        ;; Tables created through SQL DDL carry the row marker — the
-        ;; cheapest anchor (one indexed boolean per row).
-        (contains? (:schema ctx) marker)
-        (reset! (:where-clauses ctx)
-                (vec (cons [evar marker true] clauses)))
-        ;; Markerless tables (databases seeded directly through datahike —
-        ;; a first-class use case: SQL over an existing datahike db):
-        ;; anchor on the presence of ANY table column. A row is exactly an
-        ;; entity holding at least one of the table's attributes, so the
-        ;; or-union binds the entity var without changing semantics. The
-        ;; engine (post-#923) correctly rejects get-else-only queries with
-        ;; an unbound entity var, so SOME anchor is required.
-        :else
-        (when-let [col-attrs (seq (keep (fn [c]
-                                          (let [a (:attr c)]
-                                            (when (and a (not= :db/id a)) a)))
-                                        (pgs/column-info (:schema ctx) table)))]
-          (reset! (:where-clauses ctx)
-                  (vec (cons (cons 'or (mapv (fn [a] [evar a]) col-attrs))
-                             clauses))))))))
+  (when-let [membership (sql-ctx/relation-membership-clause ctx table evar)]
+    (when-not (some #{membership} @(:where-clauses ctx))
+      (swap! (:where-clauses ctx) #(into [membership] %)))))
 
 (def ^:private update-row-match-cache
   "Row-matching query cache for UPDATE/DELETE: [(identity parsed)

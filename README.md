@@ -311,6 +311,12 @@ full control bypassing the template, set the hooks directly:
 
 ### 2. Schema hints (native DBs)
 
+A native table contains one row per entity with any attribute in that
+namespace. Missing columns read as SQL NULL, and hiding a column does not
+remove rows that exist only through that attribute. Tables created through
+SQL retain their SQL row membership, including all-NULL rows; unrelated native
+datoms in the same namespace do not add SQL rows.
+
 `:datahike.pg/*` meta-attributes let you customize the SQL-side view of
 an existing Datahike schema without touching its structure:
 
