@@ -61,6 +61,7 @@
             [datahike.pg.keywords :as pg-kw]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.analysis :as analysis]
+            [datahike.pg.sql.grouping-validation :as grouping-validation]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
@@ -3972,7 +3973,8 @@
   "Translate a PlainSelect into a Datalog query map + metadata.
   Returns {:query map :find-aliases [...] :has-aggregates? bool}"
   [^PlainSelect select schema & [db]]
-  (let [_ (validate-srf-row-count! select)
+  (let [_ (grouping-validation/validate! select)
+        _ (validate-srf-row-count! select)
         ;; A parenthesized join group is a relation tree, not a single
         ;; right-hand relation. The current outer-join lowering expects a
         ;; concrete right alias and otherwise constructs a malformed or-join
