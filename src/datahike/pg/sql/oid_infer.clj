@@ -973,7 +973,10 @@
         scalar-oid (sql-type-name->oid type-str (:db env))]
     (cond
       (nil? scalar-oid) nil
-      array? (get types/element-oid->array-oid scalar-oid types/oid-text-array)
+      array? (or (get types/element-oid->array-oid scalar-oid)
+                 (do
+                   (params/require-execution! "metadata for this unsupported array type")
+                   types/oid-text-array))
       :else scalar-oid)))
 
 (defn- case-oid

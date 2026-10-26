@@ -568,6 +568,12 @@ atomic `COPY … FROM stdin` (text + CSV, streaming UTF-8, NULL/default markers)
 `ALTER TABLE … ADD CONSTRAINT
 FOREIGN KEY … ON UPDATE NO ACTION ON DELETE CASCADE`.
 
+Plain `EXPLAIN` analyzes supported SELECT queries without running their rows or
+side effects. `QUERY PLAN` contains the lowered Datahike query and its execution
+stages. `EXPLAIN ANALYZE` raises `0A000`, as do shapes whose output metadata
+cannot be established without execution, including correlated LATERAL queries
+and some routine or user-defined-type outputs.
+
 Generated identity and SERIAL sequence names use `<table>_<column>_seq`.
 Existing names raise `42P07`; automatic suffix selection is not yet supported.
 
