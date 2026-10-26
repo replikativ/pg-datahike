@@ -6096,7 +6096,7 @@
                   :when (and (not (contains? nullable-aliases alias-key))
                              (not (contains? (:computed-aliases ctx) alias-key)))
                   :let [tname (get (:table-aliases ctx) alias-key alias-key)
-                        membership (ctx/relation-membership-clause schema tname evar)
+                        membership (ctx/relation-membership-clause ctx tname evar)
                         clauses @(:where-clauses ctx)
                         ;; Keep the structural membership clause even when a
                         ;; projected native attribute currently binds the eid:
@@ -6581,7 +6581,7 @@
                       right-table (get (:table-aliases ctx) right-alias right-alias)
                       right-marker (pgs/row-marker-attr right-table)
                       right-membership (ctx/relation-membership-clause
-                                        schema right-table right-evar)
+                                        ctx right-table right-evar)
                       right-side? (fn [c]
                                     (or (and (vector? c) (= 3 (count c))
                                              (= right-evar (first c))
@@ -6706,7 +6706,7 @@
                       right-table (get (:table-aliases ctx) right-alias right-alias)
                       right-marker (pgs/row-marker-attr right-table)
                       right-membership (ctx/relation-membership-clause
-                                        schema right-table right-evar)
+                                        ctx right-table right-evar)
                       left-clauses (vec (remove
                                          (fn [c]
                                            (and (vector? c) (>= (count c) 3)
@@ -6864,7 +6864,7 @@
                         right-table (get (:table-aliases ctx) alias alias)
                         right-marker (pgs/row-marker-attr right-table)
                         right-membership (ctx/relation-membership-clause
-                                          schema right-table right-evar)
+                                          ctx right-table right-evar)
                         right-clauses (vec (remove #(and (vector? %) (= 3 (count %))
                                                          (= right-marker (second %)))
                                                    right-clauses))
@@ -6917,7 +6917,7 @@
                         owner-evar (ctx/entity-var! ctx alias)
                         owner-table (get (:table-aliases ctx) alias alias)
                         owner-membership (ctx/relation-membership-clause
-                                          schema owner-table owner-evar)
+                                          ctx owner-table owner-evar)
                         all-clauses @(:where-clauses ctx)
                       ;; The original ref pattern from the ON clause:
                       ;; `[?p_eid :posting/transaction ?ref-var]`. We
@@ -7075,7 +7075,7 @@
                                       (cond-> [[inner-eid ref-attr left-evar]]
                                         owner-membership
                                         (conj (ctx/relation-membership-clause
-                                               schema owner-table inner-eid))))]))
+                                               ctx owner-table inner-eid))))]))
                         ;; legacy: ref-var = :__null__
                           [[(list '= ref-var :__null__)]])
                         unmatched (apply list 'and

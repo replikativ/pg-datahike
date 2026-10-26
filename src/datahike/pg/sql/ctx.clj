@@ -28,6 +28,7 @@
    them without re-exporting through the top-level sql ns."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
@@ -36,25 +37,6 @@
            [net.sf.jsqlparser.schema Column Table]))
 
 (set! *warn-on-reflection* true)
-
-(defn relation-membership-clause
-  "Return one Datalog clause binding `evar` to every physical row of
-   `table-name`.
-
-   SQL tables use their authoritative row marker. A marker-less native
-   Datahike table is the union of entities carrying any of its namespaced
-   attributes. Only the entity variable escapes the or-join; wildcard values
-   cannot perturb SQL bag or grouping semantics. Shared by SELECT translation
-   and write-path row matching so both agree on what constitutes a row."
-  [schema table-name evar]
-  (let [{:keys [marker native]}
-        (pgs/relation-membership-attrs schema table-name)]
-    (cond
-      marker [evar marker true]
-      (= 1 (count native)) [evar (first native) '_]
-      (seq native) (list* 'or-join [evar]
-                          (mapv (fn [attr] [evar attr '_]) native))
-      :else nil)))
 
 ;; ---------------------------------------------------------------------------
 ;; Table alias resolution
@@ -574,6 +556,56 @@
   "Generate a fresh logic variable ?v1, ?v2, etc."
   [ctx]
   (symbol (str "?v" (swap! (:var-counter ctx) inc))))
+
+(defn relation-membership-clause
+  "Return one Datalog clause binding `evar` to every physical row of
+   `table-name`.
+
+   SQL tables use their authoritative row marker. A marker-less native table
+   under schema-flexibility :write is the union of its declared namespaced
+   attributes. Under :read, attributes need not have schema entries, so the
+   clause discovers namespaced datoms from the execution DB instead of
+   capturing entity ids while translating. Datahike forbids combining :read
+   with numeric attribute refs, hence `namespace` is safe on that dynamic
+   attribute variable.
+
+   Ignored values are fresh vars rather than `_`: Datahike's limited-query
+   planner can project a wildcard membership scan away when another pattern
+   reads the same attribute. Only `evar` escapes an or-join, preserving SQL
+   row/cardinality semantics for cardinality-many attributes."
+  [ctx table-name evar]
+  (let [schema (:schema ctx)
+        db (:db ctx)
+        table-name (str table-name)
+        {:keys [marker native]}
+        (pgs/relation-membership-attrs schema table-name)
+        read-flexible?
+        (= :read (try (:schema-flexibility (dbi/-config db))
+                      (catch Throwable _ nil)))]
+    (cond
+      marker [evar marker true]
+
+      read-flexible?
+      (let [attr-var (fresh-var! ctx)
+            value-var (fresh-var! ctx)
+            ns-var (fresh-var! ctx)]
+        ;; `and` is a branch form rather than a standalone top-level Datalog
+        ;; clause. A one-branch or-join gives these three clauses their local
+        ;; attribute/value vars while exposing only the row eid.
+        (list 'or-join [evar]
+              (list 'and
+                    [evar attr-var value-var]
+                    [(list 'namespace attr-var) ns-var]
+                    [(list '= ns-var table-name)])))
+
+      (= 1 (count native))
+      [evar (first native) (fresh-var! ctx)]
+
+      (seq native)
+      (list* 'or-join [evar]
+             (mapv (fn [attr] [evar attr (fresh-var! ctx)]) native))
+
+      :else nil)))
 
 (defn entity-var!
   "Get or create the entity variable for a table alias."

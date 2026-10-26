@@ -3443,7 +3443,7 @@
    Column predicates alone neither enumerate sparse native rows nor prove
    marker membership for SQL-created tables."
   [ctx evar table]
-  (when-let [membership (sql-ctx/relation-membership-clause (:schema ctx) table evar)]
+  (when-let [membership (sql-ctx/relation-membership-clause ctx table evar)]
     (when-not (some #{membership} @(:where-clauses ctx))
       (swap! (:where-clauses ctx) #(into [membership] %)))))
 

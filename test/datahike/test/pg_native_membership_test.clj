@@ -201,3 +201,30 @@
     (is (= 0 (.executeUpdate s "DELETE FROM marker_control WHERE a=99")))
     (is (= 1 (count (d/q '{:find [?e] :where [[?e :marker_control/a 99]]}
                          (d/db *conn*)))))))
+
+(deftest read-flexibility-discovers-live-undeclared-membership
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :read :attribute-refs? false :keep-history? false}]
+    (d/create-database cfg)
+    (let [conn (d/connect cfg)
+          {:keys [server]} (pg/start-server {"read_membership" conn} {:port 0})]
+      (try
+        ;; The handler/server predates the declared key and the untyped data.
+        (d/transact conn [{:db/ident :flex/id :db/valueType :db.type/long
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}])
+        (d/transact conn [{:flex/id 1 :flex/name "A"} {:flex/name "B"}
+                          {:unrelated/name "outside"}])
+        (with-open [c (DriverManager/getConnection
+                       (str "jdbc:postgresql://127.0.0.1:" (.getPort server)
+                            "/read_membership?user=x&password=x&sslmode=disable&binaryTransfer=false"))]
+          (is (nil? (get (:schema (d/db conn)) :flex/name)))
+          (is (= [["A"] ["B"]] (rows c "SELECT name FROM flex ORDER BY name")))
+          (is (= [["4"]] (rows c "SELECT count(*) FROM flex l,flex r")))
+          (with-open [ps (.prepareStatement c "SELECT count(*) FROM flex")]
+            (.setPrepareThreshold ^PGStatement ps 1)
+            (with-open [r (.executeQuery ps)] (is (.next r)) (is (= 2 (.getLong r 1))))
+            (d/transact conn [{:flex/note "new undeclared attribute"}])
+            (with-open [r (.executeQuery ps)] (is (.next r)) (is (= 3 (.getLong r 1)))))
+          (is (= [[nil] ["A"] ["B"]]
+                 (rows c "SELECT name FROM flex ORDER BY name NULLS FIRST"))))
+        (finally (.stop server) (d/release conn) (d/delete-database cfg))))))
