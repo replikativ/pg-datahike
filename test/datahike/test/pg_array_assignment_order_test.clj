@@ -200,3 +200,17 @@
            (rows c "SELECT a FROM assignment_order_defaults")))
     (is (= [["1" "f"]]
            (rows c "SELECT last_value,is_called FROM assignment_order_seq")))))
+
+(deftest quoted-update-targets-resolve-the-base-column
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE quoted_update_targets (\"d\" date,\"a\" int[])")
+    (exec! c "INSERT INTO quoted_update_targets VALUES (DATE '2010-11-03',ARRAY[1,2])")
+    ;; pgjdbc's updatable ResultSet quotes every generated UPDATE target.
+    (exec! c "UPDATE quoted_update_targets SET \"d\"=DATE '2014-12-23'")
+    (is (= [["2014-12-23"]]
+           (rows c "SELECT \"d\" FROM quoted_update_targets")))
+    ;; Decoding the partial target must retain its dimensions while the same
+    ;; base-name normalization strips the identifier quotes.
+    (exec! c "UPDATE quoted_update_targets SET \"a\"[2]=22")
+    (is (= [["{1,22}"]]
+           (rows c "SELECT \"a\" FROM quoted_update_targets")))))

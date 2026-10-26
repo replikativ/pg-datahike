@@ -17,8 +17,8 @@
        re-coerced at Execute against the raw schema),
      - any UPDATE.
 
-   Which is to say: it fired for `psql`, and not for JDBC `setString`,
-   asyncpg, psycopg, node-postgres or any ORM. The existing
+   It fired for literal queries while prepared driver queries could bypass
+   canonicalization, including JDBC parameters with an explicit jsonb cast. The existing
    canonicalization test used a `Statement`, which is why this went
    unnoticed.
 
@@ -134,7 +134,7 @@
             (.execute st "CREATE TABLE jw (id int PRIMARY KEY, p jsonb)"))
           (testing "parameterised INSERT — the value arrives as a ParamRef and
                     is re-coerced at Execute, which used to see no :pg/type"
-            (with-open [ps (.prepareStatement c "INSERT INTO jw VALUES (?, ?)")]
+            (with-open [ps (.prepareStatement c "INSERT INTO jw VALUES (?, ?::jsonb)")]
               (.setInt ps 1 1)
               (.setString ps 2 "{\"b\":2,\"a\":1}")
               (.execute ps)))
@@ -146,7 +146,7 @@
             (.next rs)
             (is (= "{\"c\": 3, \"d\": 4}" (.getString rs 1))))
           (testing "and a parameterised INSERT that is never updated"
-            (with-open [ps (.prepareStatement c "INSERT INTO jw VALUES (?, ?)")]
+            (with-open [ps (.prepareStatement c "INSERT INTO jw VALUES (?, ?::jsonb)")]
               (.setInt ps 1 2)
               (.setString ps 2 "{\"z\":1,\"y\":2}")
               (.execute ps))

@@ -10452,7 +10452,7 @@
                                 {:error :feature-not-supported :sqlstate "0A000"})))
               (map (fn [^Column column value]
                      (let [target (assignment-target/describe column)
-                           name (canonical-target-column (:column target))
+                           name (canonical-target-column (unquote-ident (:column target)))
                            target (assoc target :column name
                                          :attr (ctx/resolve-inherited-attr
                                                 (keyword ns name) schema db)
