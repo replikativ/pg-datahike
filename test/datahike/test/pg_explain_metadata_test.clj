@@ -54,7 +54,7 @@
     (exec! c "INSERT INTO explain_source VALUES(1),(2)")
     (let [q d/q db-with d/db-with reads (atom 0) produced (atom 0)
           text (str "SELECT x,y FROM (SELECT a.id x,b.id y FROM explain_source a,"
-                    "explain_source b) t WHERE x=1 GROUP BY GROUPING SETS(x,y)")]
+                    "explain_source b) t WHERE x=1 GROUP BY x,y")]
       (with-redefs [d/q (fn [query & args]
                           (when (source-read? query)
                             (swap! reads inc)

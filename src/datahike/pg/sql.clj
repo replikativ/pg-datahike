@@ -37,6 +37,7 @@
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.grouping-validation :as grouping-validation]
             [datahike.pg.jsonb]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
@@ -1304,6 +1305,9 @@
                 stmt (if full-join-sql?
                        (CCJSqlParserUtil/parse parser-sql)
                        (ast-parse parser-sql))
+                ;; Unsupported grouping syntax must not disappear into ordinary
+                ;; grouping, or run CTE/derived producers before it is rejected.
+                _ (grouping-validation/validate! stmt)
                 target-annotations (assignment-rewrite/annotate stmt (:targets target-rewrite))
             ;; Catalog materialisation: find every catalog table ref
             ;; anywhere in the AST (top-level, derived tables, UNION

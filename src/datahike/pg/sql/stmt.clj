@@ -61,6 +61,8 @@
             [datahike.pg.keywords :as pg-kw]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.analysis :as analysis]
+            [datahike.pg.sql.derived :as derived]
+            [datahike.pg.sql.grouping-validation :as grouping-validation]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
@@ -2508,7 +2510,7 @@
 
    Returns {:db spec-db :name sub-name :alias sub-alias :aliases cols}
    or nil if the shape isn't recognised."
-  [^ParenthesedSelect ps db schema]
+  [^ParenthesedSelect ps db schema & [options]]
   (let [sub-alias (when-let [a (.getAlias ps)]
                     (unquote-ident (str/trim (.getName ^Alias a))))
         ;; Storage namespace, deliberately NOT the user's alias: a
@@ -2532,7 +2534,7 @@
       ;; projections, filters, column aliases, and declared output types.
       ;; Set operations translate each branch before combining its rows.
       (or inner-ps (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
-      (materialize-set-op! inner sub-name db schema sub-alias alias-cols)
+      (materialize-set-op! inner sub-name db schema sub-alias alias-cols options)
 
       ;; FROM (VALUES (...), (...)) AS v(a,b). materialize-set-op! already
       ;; knows how to evaluate and type literal VALUES rows; this shape was
@@ -2873,6 +2875,8 @@
   ([inner target-name db schema alias]
    (materialize-set-op! inner target-name db schema alias nil))
   ([inner target-name db schema alias explicit-aliases]
+   (materialize-set-op! inner target-name db schema alias explicit-aliases nil))
+  ([inner target-name db schema alias explicit-aliases options]
    (params/check-cancel!)
    (if params/*analysis-only?*
      (materialize-output-schema!
@@ -2931,7 +2935,7 @@
                {:op op-kind :branches parsed})
 
              :else
-             {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
+             {:op nil :branches [(translate-select ^PlainSelect inner schema db options)]})
            _ (when (and (some? (:op branch-parsed))
                         (not= :union-all (:op branch-parsed))
                         (some #{types/oid-vector}
@@ -3963,16 +3967,17 @@
 (defn translate-select
   "Translate a SELECT while sharing anonymous relation identities across its
    complete nested query tree."
-  [^PlainSelect select schema & [db]]
+  [^PlainSelect select schema & [db options]]
   (binding [*anonymous-derived-counter*
             (or *anonymous-derived-counter* (atom -1))]
-    (translate-select* select schema db)))
+    (translate-select* select schema db options)))
 
 (defn translate-select*
   "Translate a PlainSelect into a Datalog query map + metadata.
   Returns {:query map :find-aliases [...] :has-aggregates? bool}"
-  [^PlainSelect select schema & [db]]
-  (let [_ (validate-srf-row-count! select)
+  [^PlainSelect select schema & [db options]]
+  (let [_ (grouping-validation/validate! select)
+        _ (validate-srf-row-count! select)
         ;; A parenthesized join group is a relation tree, not a single
         ;; right-hand relation. The current outer-join lowering expects a
         ;; concrete right alias and otherwise constructs a malformed or-join
@@ -4039,10 +4044,13 @@
                 item))
             item))
         ;; FROM clause — may be a Table, view, or derived table (subquery)
-        from-item (-> (.getFromItem select)
-                      unwrap-derived-parentheses
-                      expand-view
-                      name-anonymous-derived)
+        explicit-from (unwrap-derived-parentheses (.getFromItem select))
+        from-item (-> explicit-from expand-view name-anonymous-derived)
+        ;; A child's restriction must reach its translator before the child
+        ;; materializes. Views and join-position children keep their own scope.
+        derived-where (when (instance? ParenthesedSelect explicit-from)
+                        (derived/additional-where select from-item schema db
+                                                  {:cte-names (set (keys *cte-namespaces*))}))
         ;; `FROM <sequence>` reads the sequence's position — nil for
         ;; every ordinary table, so this only costs a lookup when the
         ;; FROM item is a bare relation name (issue #26).
@@ -4073,7 +4081,8 @@
           (if-let [{sub-db :db sub-schema :schema
                     sub-name :name sub-alias :alias}
                    (materialize-derived-select!
-                    ^ParenthesedSelect from-item db schema)]
+                    ^ParenthesedSelect from-item db schema
+                    (when derived-where {:additional-where derived-where}))]
             [sub-db sub-schema sub-name sub-alias]
             [db schema nil nil])
 
@@ -4635,7 +4644,11 @@
               select-items)
         ctx (assoc ctx :agg-aliases-warning-set agg-aliases-warning-set)
 
-        where-expr (.getWhere select)
+        where-expr (if-let [additional (:additional-where options)]
+                     (if-let [original (.getWhere select)]
+                       (AndExpression. original additional)
+                       additional)
+                     (.getWhere select))
         ;; *conjunctive-where* enables the indexable data-pattern fast
         ;; paths (value-bound `[?e :attr v]`, shared-var equi-join
         ;; unification) — sound only for top-level AND-ed conjuncts;

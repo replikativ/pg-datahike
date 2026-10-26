@@ -63,7 +63,7 @@
      c
      (str "SELECT x,y FROM ("
           "SELECT t1.id x,t2.id y FROM explain_rows t1,explain_rows t2"
-          ") t WHERE x=1 GROUP BY GROUPING SETS(x,y) ORDER BY 1,2"))))
+          ") t WHERE x=1 GROUP BY x,y ORDER BY 1,2"))))
 
 (deftest explain-values-and-srfs-do-not-evaluate-arguments
   (with-open [c (jdbc)]
