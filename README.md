@@ -128,8 +128,8 @@ are not generally lazy.
 Client cancellation and `SET statement_timeout = '5s'` stop cooperative query
 execution, including nested queries and row processing. Cancellation does not
 reserve memory or bound intermediate allocations. Extended-protocol Parse
-honors client cancellation, but statement timeout does not yet share one
-deadline across Parse, Bind, Execute and Sync as PostgreSQL does.
+honors client cancellation. Statement timeout currently applies during execution;
+it does not yet track PostgreSQL's extended-protocol message lifecycle.
 
 Clients use ordinary PostgreSQL TLS settings:
 
