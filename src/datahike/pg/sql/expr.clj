@@ -5770,10 +5770,12 @@
   "Apply the server-side SELECT tail used when nullable ORDER BY keys keep
    sorting out of Datalog. Rows still include any hidden sort projections."
   [rows {:keys [sql-order-by sql-offset sql-limit has-aggregates? has-distinct? limit offset]}]
-  (let [tail-offset (or sql-offset (when (or has-aggregates? has-distinct?) offset))
+  (let [tick! (params/cancellation-ticker)
+        tail-offset (or sql-offset (when (or has-aggregates? has-distinct?) offset))
         tail-limit (or sql-limit (when (or has-aggregates? has-distinct?) limit))
         ordered (if sql-order-by
                   (sort (fn [a b]
+                          (tick!)
                           (loop [parts (partition 3 sql-order-by)]
                             (if-let [[idx dir nulls] (first parts)]
                               (let [c (fns/order-key-cmp (nth a idx nil)
@@ -5784,7 +5786,8 @@
                         rows)
                   rows)
         offset-rows (cond->> ordered tail-offset (drop tail-offset))]
-    (vec (cond->> offset-rows tail-limit (take tail-limit)))))
+    (into [] (map (fn [row] (tick!) row))
+          (cond->> offset-rows tail-limit (take tail-limit)))))
 
 (defn row-bindings
   "Variable bindings for a projection or predicate FORM evaluated against
@@ -5809,13 +5812,15 @@
    (a NULL operand) drops it, which is what `true?` says here."
   [results having query in-args]
   (if-let [{:keys [form slots]} having]
-    (filterv (fn [row]
-               (let [rv (if (sequential? row) (vec row) [row])
-                     binds (reduce (fn [m [sym idx]] (assoc m sym (nth rv idx nil)))
-                                   (row-bindings query in-args row)
-                                   slots)]
-                 (true? (interpret-form form binds))))
-             results)
+    (let [tick! (params/cancellation-ticker)]
+      (filterv (fn [row]
+                 (tick!)
+                 (let [rv (if (sequential? row) (vec row) [row])
+                       binds (reduce (fn [m [sym idx]] (assoc m sym (nth rv idx nil)))
+                                     (row-bindings query in-args row)
+                                     slots)]
+                   (true? (interpret-form form binds))))
+               results))
     results))
 
 (defn compound-projection-indices
@@ -5859,9 +5864,11 @@
   [results aliases query in-args compound-exprs]
   (if (seq compound-exprs)
     ;; The shared `row-bindings`, not a fourth private copy of it.
-    (let [row-bindings #(row-bindings query in-args %)
+    (let [tick! (params/cancellation-ticker)
+          row-bindings #(row-bindings query in-args %)
           new-results
           (mapv (fn [row]
+                  (tick!)
                   (let [rv (if (sequential? row) (vec row) [row])
                         binds (row-bindings row)]
                     (reduce (fn [r {:keys [form slots]}]
@@ -5874,7 +5881,7 @@
                 results)
           new-aliases (into (vec aliases) (map :alias compound-exprs))
           visible-indices (compound-projection-indices new-aliases compound-exprs)]
-      [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
+      [(mapv (fn [row] (tick!) (mapv #(nth row %) visible-indices)) new-results)
        (mapv #(nth new-aliases %) visible-indices)])
     [results aliases]))
 
@@ -5884,7 +5891,8 @@
   (params/check-cancel!)
   (throw-subquery-error! p)
   (reject-unapplied-subquery-stages! p)
-  (let [q (cond-> (:query p)
+  (let [tick! (params/cancellation-ticker)
+        q (cond-> (:query p)
             (:has-distinct? p) (dissoc :limit :offset)
             (and (:limit p) (not (:has-aggregates? p)) (not (:has-distinct? p))) (assoc :limit (:limit p))
             (and (:offset p) (not (:has-aggregates? p)) (not (:has-distinct? p))) (assoc :offset (:offset p))
@@ -5910,7 +5918,8 @@
                   (apply-compound-projections raw (:find-aliases p) q in-args
                                               (:compound-exprs p))
                   [raw nil])
-        raw (if (:has-distinct? p) (fns/distinct-by-value raw) raw)
+        raw (if (:has-distinct? p)
+              (fns/distinct-by-value (map (fn [row] (tick!) row) raw)) raw)
         raw (apply-subquery-order-limit raw p)
         hidden (long (or (:hidden-count p) 0))
         ;; apply-compound-projections already trimmed to the visible
@@ -5918,10 +5927,11 @@
         hidden (if (seq (:compound-exprs p)) 0 hidden)]
     (if (pos? hidden)
       (mapv (fn [row]
+              (tick!)
               (let [v (if (sequential? row) (vec row) [row])]
                 (subvec v 0 (- (count v) hidden))))
             raw)
-      (mapv #(if (sequential? %) (vec %) [%]) raw))))
+      (mapv (fn [row] (tick!) (if (sequential? row) (vec row) [row])) raw))))
 
 (defn- validate-parsed-in-plan! [p]
   (if (= :set-operation (:type p))
@@ -5941,27 +5951,30 @@
   [p db]
   (validate-parsed-in-plan! p)
   (if (= :set-operation (:type p))
-    (let [output-oids (parsed-output-oids p)
+    (let [tick! (params/cancellation-ticker)
+          checked-row (fn [row] (tick!) row)
+          output-oids (parsed-output-oids p)
           rows (mapv (fn [branch]
-                       (mapv #(set-ops/coerce-row % output-oids)
+                       (mapv #(set-ops/coerce-row (checked-row %) output-oids)
                              (run-subquery-leaf branch (or (:enriched-db p) db))))
                      (:sub-results p))]
       ;; Combined under SQL equality, as the server's own set-operation
       ;; executor combines them -- this was `distinct` and `clojure.set`,
       ;; so `'1 mon'::interval IN (SELECT '30 days' INTERSECT SELECT
       ;; '1 mon')` was false. The surviving row is the first-seen one.
-      (let [key-of fns/row-value-key
+      (let [key-of #(fns/row-value-key (checked-row %))
             key-sets #(map (fn [r] (into #{} (map key-of) r)) %)
+            all-rows #(map checked-row (mapcat identity rows))
             combined (case (:op p)
-                       :union-all (vec (mapcat identity rows))
-                       :union (fns/distinct-by-value (mapcat identity rows))
+                       :union-all (vec (all-rows))
+                       :union (fns/distinct-by-value (all-rows))
                        :intersect (let [ks (key-sets (rest rows))]
-                                    (filterv (fn [r] (every? #(contains? % (key-of r)) ks))
-                                             (fns/distinct-by-value (first rows))))
+                                    (filterv (fn [r] (tick!) (every? #(contains? % (key-of r)) ks))
+                                             (fns/distinct-by-value (map checked-row (first rows)))))
                        :except (let [ks (key-sets (rest rows))]
-                                 (filterv (fn [r] (not-any? #(contains? % (key-of r)) ks))
-                                          (fns/distinct-by-value (first rows))))
-                       (vec (mapcat identity rows)))
+                                 (filterv (fn [r] (tick!) (not-any? #(contains? % (key-of r)) ks))
+                                          (fns/distinct-by-value (map checked-row (first rows)))))
+                       (vec (all-rows)))
             result (apply-subquery-order-limit combined p)]
         result))
     (run-subquery-leaf p db)))
@@ -10187,7 +10200,7 @@
                                 inner-parsed ((:parse-sql ctx) inner-sql schema db)
                                 _ (throw-subquery-error! inner-parsed)
                                 _ (params/require-execution! "WHERE EXISTS row production")
-                                inner-query (:query inner-parsed)
+                                inner-query (params/cancellable-query (:query inner-parsed))
                                 inner-in-args (:in-args inner-parsed)
                                 query-db (or (:enriched-db inner-parsed) db)
                                 inner-results (if (seq inner-in-args)
@@ -10230,7 +10243,7 @@
                         inner-parsed ((:parse-sql ctx) inner-sql schema db)
                         _ (throw-subquery-error! inner-parsed)
                         _ (params/require-execution! "WHERE EXISTS row production")
-                        inner-query (:query inner-parsed)
+                        inner-query (params/cancellable-query (:query inner-parsed))
                         inner-in-args (:in-args inner-parsed)
                         query-db (or (:enriched-db inner-parsed) db)
                         inner-results (if (seq inner-in-args)
@@ -10247,7 +10260,8 @@
                 ;; clause/input before reporting the unsupported shape;
                 ;; otherwise leaked inner vars corrupt later translation.
               (ctx/restore! ctx snapshot)
-              (if (seq corr-refs)
+              (if (and (seq corr-refs)
+                       (not= "57014" (first (errors/classify-exception _ex))))
                 (throw (errors/pg-error
                         :feature-not-supported
                         {:message "this correlated EXISTS shape is not implemented"}))

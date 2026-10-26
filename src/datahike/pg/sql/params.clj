@@ -335,6 +335,23 @@
     (when (.deref cancel)
       (throw (ex-info "query canceled" {:datahike/canceled true})))))
 
+(defn cancellable-query
+  "Attach the current statement token to a normalized query map at execution.
+   Read the binding here so cached plans never capture a session's token."
+  [query]
+  (check-cancel!)
+  (cond-> query *cancel* (assoc :cancel *cancel*)))
+
+(defn cancellation-ticker
+  "Make an execution-local check for row loops; poll on entry and every 512
+   operations. The checker reads the current binding rather than capturing it."
+  []
+  (let [operations (volatile! 0)]
+    (fn []
+      (when (zero? (bit-and (long @operations) 511))
+        (check-cancel!))
+      (vswap! operations unchecked-inc))))
+
 (defn registered-enum-values
   "Return the declared label set for a CREATE TYPE ... AS ENUM registry
    entry, or nil when `type-name` is not a registered enum."

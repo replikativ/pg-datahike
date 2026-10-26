@@ -3561,6 +3561,7 @@
                   (params/substitute-params in-args-raw
                                             (fn [idx] (nth bound idx)))
                   in-args-raw)
+        q (params/cancellable-query q)
         eids (mapv first
                    (if (seq in-args)
                      (run-param-query q #(apply d/q q query-db in-args))
@@ -8294,9 +8295,10 @@
                                         (params/resolve-param-ref a #(nth bound %))
                                         a))
                               in-args)
-                   q-input (cond-> query
-                             (and *max-result-rows* (empty? (:with query)))
-                             (assoc :limit (inc *max-result-rows*)))
+                   q-input (params/cancellable-query
+                            (cond-> query
+                              (and *max-result-rows* (empty? (:with query)))
+                              (assoc :limit (inc *max-result-rows*))))
                    res (run-param-query q-input #(apply d/q q-input db args))
                    rows (if (pos? hidden)
                           (mapv #(subvec (vec %) 0 keep-n) res)
@@ -8399,8 +8401,14 @@
           ;; side effects, and it cost 2^depth body executions in a
           ;; recursive call (measured exactly).
           (catch clojure.lang.ExceptionInfo e
-            (if (params/routine-error-key (ex-data e)) (throw e) nil))
-          (catch Exception _ nil))))))
+            (if (or (params/routine-error-key (ex-data e))
+                    (= "57014" (first (errors/classify-exception e))))
+              (throw e)
+              nil))
+          (catch Exception e
+            (if (= "57014" (first (errors/classify-exception e)))
+              (throw e)
+              nil)))))))
 
 (def ^:private select-shape-cache
   "Result-shape cache for exec-select: [(identity parsed) (identity schema)
@@ -14305,6 +14313,7 @@
                     types/*time-zone* (or (:time-zone @session-state) types/utc-zone)
                     fns/*compensated-float-sum?*
                     (= :compensated (:float-sum @session-state))
+                    params/*cancel* (current-cancel)
                     ;; Parameter types declared by the Parse message affect
                     ;; expression resolution and lowering, not merely the
                     ;; later ParameterDescription. For example, PostgreSQL
@@ -14608,6 +14617,7 @@
                     types/*time-zone* (or (:time-zone @session-state) types/utc-zone)
                     fns/*compensated-float-sum?*
                     (= :compensated (:float-sum @session-state))
+                    params/*cancel* (current-cancel)
                     params/*statement-handler* (or params/*statement-handler* (nested-executor this))
                     *max-result-rows* max-result-rows]
             (or

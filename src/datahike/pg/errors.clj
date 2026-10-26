@@ -725,7 +725,7 @@
         SQLSTATE; runs the category's `:format` fn over ex-data; if
         the formatter returns a string, that's the user-facing
         message, otherwise the throw site's message stands.
-     3. `:datahike/canceled` flag → 57014.
+     3. `:datahike/canceled` flag or query-timeout marker → 57014.
      4. `:error` key matched against `dh-error->sqlstate` (Datahike
         internal). Tries `rewrite-datahike-message` to upgrade the
         message + extract extra fields.
@@ -752,7 +752,8 @@
         ;; UNIQUE violation named `mu_pkey` (the table-only fallback)
         ;; while the ErrorResponse's `n` field, built from merged-data,
         ;; said `mu_u_key`. The message and the field disagreed.
-        canceled? (:datahike/canceled data)
+        canceled? (or (:datahike/canceled data)
+                      (= :datahike/query-timeout (:type data)))
         ;; Datahike's own error keys (`:transact/schema`, `:transact/upsert`,
         ;; …) live in dh-error->sqlstate. Try this whenever the key
         ;; isn't a registered pgwire category.

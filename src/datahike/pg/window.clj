@@ -45,9 +45,15 @@
   (:require [datahike.pg.errors :as errors]
             [datahike.pg.resolve :as pg-resolve]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.params :as params]
             [datahike.query :as dq]))
 
 (set! *warn-on-reflection* true)
+
+(def ^:dynamic ^:private *cancel-tick* (fn [] nil))
+
+(defn- checked-window-rows [rows]
+  (map (fn [row] (*cancel-tick*) row) rows))
 
 ;; ============================================================================
 ;; Partition and sort
@@ -60,6 +66,7 @@
    server's ORDER BY uses -- rather than a private copy."
   [order-by]
   (fn [row-a row-b]
+    (*cancel-tick*)
     (loop [specs order-by]
       (if-let [[idx dir nulls] (first specs)]
         (let [c (fns/order-key-cmp (nth row-a idx nil) (nth row-b idx nil) dir nulls)]
@@ -70,7 +77,7 @@
   "Partition rows by partition-by columns, sort within each partition.
    Returns a vector of sorted partitions, each a vector of [orig-idx row]."
   [rows partition-by-idxs order-by]
-  (let [indexed (map-indexed vector rows)
+  (let [indexed (map-indexed vector (checked-window-rows rows))
         groups (if (empty? partition-by-idxs)
                  [indexed]
                  ;; PARTITION BY groups under SQL equality, which
@@ -109,8 +116,8 @@
       (do (java.util.Arrays/fill starts (int 0))
           (java.util.Arrays/fill ends (int n))
           [starts ends])
-      (let [key-of (fn [i] (let [[_ row] (nth partition i)]
-                             (mapv (fn [[idx _]] (nth row idx nil)) order-by)))
+      (let [key-of (fn [i] (*cancel-tick*) (let [[_ row] (nth partition i)]
+                                             (mapv (fn [[idx _]] (nth row idx nil)) order-by)))
             peers? (fn [a b] (every? (fn [[va vb]]
                                        (zero? (fns/order-key-cmp va vb :asc nil)))
                                      (map vector a b)))]
@@ -120,6 +127,7 @@
                   j (loop [j (inc i)]
                       (if (and (< j n) (peers? k (key-of j))) (recur (inc j)) j))]
               (dotimes [p (- j i)]
+                (*cancel-tick*)
                 (aset starts (+ i p) (int i))
                 (aset ends (+ i p) (int j)))
               (recur (long j)))))
@@ -141,7 +149,7 @@
                            "exactly one ORDER BY column")})))
   (let [[idx odir] (first order-by)
         n (count partition)
-        val-at (fn [j] (let [[_ row] (nth partition j)] (nth row idx nil)))
+        val-at (fn [j] (*cancel-tick*) (let [[_ row] (nth partition j)] (nth row idx nil)))
         cur (val-at i)]
     (if (or (nil? cur) (= :__null__ cur))
       (if start? peer-lo peer-hi)
@@ -217,9 +225,9 @@
   [partition start end col-idx arg2-idx arg2-const]
   (let [slice (subvec partition start end)]
     (cond
-      arg2-idx (mapv (fn [[_ row]] [(nth row col-idx nil) (nth row arg2-idx nil)]) slice)
-      (some? arg2-const) (mapv (fn [[_ row]] [(nth row col-idx nil) arg2-const]) slice)
-      :else (mapv (fn [[_ row]] (nth row col-idx nil)) slice))))
+      arg2-idx (mapv (fn [[_ row]] [(nth row col-idx nil) (nth row arg2-idx nil)]) (checked-window-rows slice))
+      (some? arg2-const) (mapv (fn [[_ row]] [(nth row col-idx nil) arg2-const]) (checked-window-rows slice))
+      :else (mapv (fn [[_ row]] (nth row col-idx nil)) (checked-window-rows slice)))))
 
 (defn- expanding-frame?
   "True when every row's frame starts at the partition's first row and ends
@@ -239,7 +247,7 @@
    Returns nil when `op` has no such step, and the caller recomputes."
   [op agg-sym partition ends col-idx]
   (let [n (count partition)
-        v-at (fn [i] (let [[_ row] (nth partition i)] (nth row col-idx nil)))
+        v-at (fn [i] (*cancel-tick*) (let [[_ row] (nth partition i)] (nth row col-idx nil)))
         f (when agg-sym (resolve-agg agg-sym))
         numeric-avg? (= 'datahike.pg.query-fns/filter-avg-numeric agg-sym)
         out (object-array n)]
@@ -317,6 +325,7 @@
   (let [{:keys [op frame col-idx arg2-idx arg2-const agg-sym count-star? order-by]} spec
         result (volatile! (transient {}))]
     (doseq [partition partitions]
+      (*cancel-tick*)
       (let [n (count partition)
             _ (when (and (contains? #{:sum :avg} op)
                          (some? col-idx)
@@ -335,8 +344,9 @@
                         {:feature (str (name op)
                                        " over non-numeric window input (including interval)")})))
             [peer-lo peer-hi] (peer-bounds partition order-by)
-            bounds (mapv #(frame-bounds partition order-by frame %
-                                        (aget ^ints peer-lo %) (aget ^ints peer-hi %))
+            bounds (mapv #(do (*cancel-tick*)
+                              (frame-bounds partition order-by frame %
+                                            (aget ^ints peer-lo %) (aget ^ints peer-hi %)))
                          (range n))
             ;; A whole-partition frame is one aggregate broadcast to every
             ;; row; an expanding frame accumulates in one pass; anything
@@ -360,9 +370,11 @@
             (doseq [[orig-idx _] partition] (vswap! result assoc! orig-idx v)))
           running
           (dotimes [i n]
+            (*cancel-tick*)
             (vswap! result assoc! (first (nth partition i)) (aget ^objects running i)))
           :else
           (dotimes [i n]
+            (*cancel-tick*)
             (vswap! result assoc! (first (nth partition i)) (agg-1 (nth bounds i)))))))
     (persistent! @result)))
 
@@ -377,6 +389,7 @@
   [partitions op]
   (let [result (volatile! (transient {}))]
     (doseq [partition partitions]
+      (*cancel-tick*)
       (let [n (count partition)
             [peer-lo peer-hi] (peer-bounds partition (:order-by (meta partition)))
             dense (int-array n)]
@@ -388,6 +401,7 @@
               (aset dense i (int d))
               (recur (inc i) d lo))))
         (dotimes [i n]
+          (*cancel-tick*)
           (let [orig-idx (first (nth partition i))
                 lo (aget ^ints peer-lo i)
                 hi (aget ^ints peer-hi i)]
@@ -413,12 +427,14 @@
       (throw (errors/pg-error :invalid-argument
                               {:message "argument of ntile must be greater than zero"})))
     (doseq [partition partitions]
+      (*cancel-tick*)
       (let [size (count partition)
             b (long b)
             base (quot size b)                  ;; rows in a small bucket
             extra (rem size b)                  ;; buckets that get one more
             big-rows (* extra (inc base))]
         (dotimes [pos size]
+          (*cancel-tick*)
           (let [orig-idx (first (nth partition pos))]
             (vswap! result assoc! orig-idx
                     (if (< pos big-rows)
@@ -442,8 +458,10 @@
         lead? (= :lead (:op spec))
         result (volatile! (transient {}))]
     (doseq [partition partitions]
+      (*cancel-tick*)
       (let [size (count partition)]
         (dotimes [pos size]
+          (*cancel-tick*)
           (let [orig-idx (first (nth partition pos))
                 source-pos (if lead? (+ pos offset) (- pos offset))
                 v (if (and (>= source-pos 0) (< source-pos size))
@@ -463,9 +481,11 @@
         nth-n (long (or (:offset-n spec) 1))
         result (volatile! (transient {}))]
     (doseq [partition partitions]
+      (*cancel-tick*)
       (let [n (count partition)
             [peer-lo peer-hi] (peer-bounds partition order-by)]
         (dotimes [i n]
+          (*cancel-tick*)
           (let [orig-idx (first (nth partition i))
                 [s e] (frame-bounds partition order-by frame i
                                     (aget ^ints peer-lo i) (aget ^ints peer-hi i))
@@ -564,14 +584,17 @@
    rows: seq of result tuples (vectors)
    Returns rows with one window value appended per spec."
   [rows window-specs]
-  (if (or (empty? rows) (empty? window-specs))
-    rows
-    (let [n (count rows)
-          cols (mapv #(compute-spec rows %) window-specs)]
-      (mapv (fn [i]
-              (into (vec (nth rows i))
+  (params/check-cancel!)
+  (binding [*cancel-tick* (params/cancellation-ticker)]
+    (if (or (empty? rows) (empty? window-specs))
+      rows
+      (let [n (count rows)
+            cols (mapv #(do (*cancel-tick*) (compute-spec rows %)) window-specs)]
+        (mapv (fn [i]
+                (*cancel-tick*)
+                (into (vec (nth rows i))
                     ;; `:__null__` is how the rest of the pipeline carries SQL
                     ;; NULL, but the window columns have always handed nil to
                     ;; the row formatter -- keep that.
-                    (mapv #(let [v (get % i)] (if (= :__null__ v) nil v)) cols)))
-            (range n)))))
+                      (mapv #(let [v (get % i)] (if (= :__null__ v) nil v)) cols)))
+              (range n))))))

@@ -118,11 +118,18 @@ they are not yet mapped to per-database Datahike principals.
 Every `start-server` listener limits a single SELECT result to 100,000 rows by
 default. Results over the limit fail with SQLSTATE `54000` before pg-datahike
 allocates the pgwire row array; set-shaped queries also push `limit + 1`
-into Datahike so their result relation stays bounded. Tune the ceiling for the
+into Datahike. This ceiling limits final results, not intermediate joins or
+materialized relations. Tune the ceiling for the
 deployment with `:max-result-rows 250000`, or set it to `false` only when the
 host process provides its own memory controls. PostgreSQL cursor paging and
 driver fetch sizes remain useful for network backpressure, but Datahike queries
 are not generally lazy.
+
+Client cancellation and `SET statement_timeout = '5s'` stop cooperative query
+execution, including nested queries and row processing. Cancellation does not
+reserve memory or bound intermediate allocations. Extended-protocol Parse
+honors client cancellation, but statement timeout does not yet share one
+deadline across Parse, Bind, Execute and Sync as PostgreSQL does.
 
 Clients use ordinary PostgreSQL TLS settings:
 
