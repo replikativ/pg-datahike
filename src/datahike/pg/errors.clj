@@ -765,7 +765,7 @@
         dh-rewrite (rewrite-datahike-message msg)
         regex-code (when (and (nil? explicit-sqlstate)
                               (nil? category)
-                              (nil? canceled?)
+                              (not canceled?)
                               (nil? dh-code)
                               (nil? dh-rewrite))
                      (classify-message msg))
