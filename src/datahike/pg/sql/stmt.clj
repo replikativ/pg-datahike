@@ -1338,6 +1338,25 @@
   (when n
     (expr/resolution-name (str/lower-case n))))
 
+(defn- preserve-cancellation! [exception]
+  (when (= "57014" (first (errors/classify-exception exception)))
+    (throw exception)))
+
+(defn- checked-rows [rows]
+  (let [tick! (params/cancellation-ticker)]
+    (map (fn [row] (tick!) row) rows)))
+
+(defn- checked-sort [comparator rows]
+  (let [tick! (params/cancellation-ticker)]
+    (sort (fn [left right] (tick!) (comparator left right))
+          (checked-rows rows))))
+
+(defn- checked-db-with [db tx]
+  (params/check-cancel!)
+  (let [result (d/db-with db tx)]
+    (params/check-cancel!)
+    result))
+
 (defn- table-function-has-column-reference?
   "Whether a table function argument contains a column reference.
 
@@ -1812,6 +1831,7 @@
    parallel to the longest result and shorter results are padded with SQL
    NULL. A base row disappears only when every SRF is empty."
   [rows specs]
+  (params/check-cancel!)
   (let [apply-level
         (fn [rows level-specs]
           (mapcat
@@ -1835,7 +1855,7 @@
                              (assoc out out-pos v)))
                          row
                          (map vector level-specs tuple)))))
-           rows))]
+           (checked-rows rows)))]
     (reduce apply-level rows
             (map second (sort-by first (group-by :level specs))))))
 
@@ -2113,6 +2133,7 @@
   ;; than failing.
   (let [parse-fn params/*parse-sql*]
     (fn [& outer-vals]
+      (params/check-cancel!)
       (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
                        {} (map vector corr-refs outer-vals))]
         (binding [params/*from-bindings* fb
@@ -2135,7 +2156,8 @@
                       first-q (some :query plans)
                       run-plan (fn [plan]
                                  (when-let [q (:query plan)]
-                                   (let [ia (:in-args plan)
+                                   (let [q (params/cancellable-query q)
+                                         ia (:in-args plan)
                                          qdb (or (:enriched-db plan)
                                                  (:enriched-db p)
                                                  query-db)]
@@ -2165,8 +2187,8 @@
                       ;; each tuple one element wider than the binding
                       ;; form it feeds.
                       (mapv (fn [r] (vec (take n-cols (if (sequential? r) r [r]))))
-                            res))))
-                (catch Throwable _ nil))
+                            (checked-rows res)))))
+                (catch Throwable e (preserve-cancellation! e) nil))
               []))))))
 
 (defn- trivially-true-on?
@@ -2678,6 +2700,7 @@
           visible-idxs  (vec (remove corr-idx-set (range (count find-aliases))))
           out-pos->subq (into {} (map (juxt :out-pos identity)) subqueries)
           run-1 (fn [subq rv]
+                  (params/check-cancel!)
                   (let [fb (reduce (fn [m [a c]]
                                      (assoc-in m [a c] (nth rv (get corr-col->idx [a c]) nil)))
                                    {} (:corr-refs subq))]
@@ -2687,7 +2710,7 @@
                                  vis (mapv #(nth rv % nil) visible-idxs)
                                  sv  (into {} (map (fn [[op sq]] [op (run-1 sq rv)])) out-pos->subq)]
                              (correlated-splice vis sv n-output)))
-                         rows)
+                         (checked-rows rows))
           vis-aliases (mapv #(nth find-aliases %) visible-idxs)
           new-aliases (correlated-splice vis-aliases
                                          (into {} (map (fn [[op sq]] [op (:alias sq)])) out-pos->subq)
@@ -2850,12 +2873,14 @@
   ([inner target-name db schema alias]
    (materialize-set-op! inner target-name db schema alias nil))
   ([inner target-name db schema alias explicit-aliases]
+   (params/check-cancel!)
    (if params/*analysis-only?*
      (materialize-output-schema!
       db target-name alias
       (name-output-columns (analyze-select-body-columns inner schema db)
                            explicit-aliases (or alias target-name)))
-     (let [with-fn d/db-with
+     (let [tick! (params/cancellation-ticker)
+           with-fn checked-db-with
            is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
            values? (instance? Values inner)
            branch-parsed
@@ -2967,9 +2992,9 @@
                                   (params/materialisation-params!))]
                           (if-let [literal-rows (:literal-rows p)]
                             literal-rows
-                            (let [q (cond-> query
-                                      (:limit p)  (assoc :limit (:limit p))
-                                      (:offset p) (assoc :offset (:offset p)))
+                            (let [q (params/cancellable-query (cond-> query
+                                                                (:limit p)  (assoc :limit (:limit p))
+                                                                (:offset p) (assoc :offset (:offset p))))
                            ;; If translate-select materialized derived
                            ;; tables (FROM (…) AS sub) or catalog refs
                            ;; under it, the resulting query references
@@ -3006,7 +3031,7 @@
                                 ;; the top level uses -- a second one would
                                 ;; be free to disagree about NULLs.
                                   raw (if (seq sql-order-by)
-                                        (sort (fns/null-safe-order-cmp sql-order-by) raw)
+                                        (checked-sort (fns/null-safe-order-cmp sql-order-by) raw)
                                         raw)
                                   raw (cond->> raw
                                         sql-offset (drop sql-offset)
@@ -3016,7 +3041,7 @@
                                   hc (or hidden-count 0)
                                   visible (- (count (:find query)) hc)
                                   raw (if (pos? hc)
-                                        (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
+                                        (mapv #(if (sequential? %) (vec (take visible %)) %) (checked-rows raw))
                                         raw)
                               ;; A derived SELECT has the same logical
                               ;; projection as a top-level SELECT. In
@@ -3030,7 +3055,7 @@
                                                               query in-args
                                                               (:compound-exprs p))]
                               rows))))
-           branch-rows (mapv run-branch (:branches branch-parsed))
+           branch-rows (mapv #(checked-rows (run-branch %)) (:branches branch-parsed))
          ;; Apply the same logical projection to the first branch's aliases.
          ;; Set-operation branches must agree in width; SQL takes the exposed
          ;; column names from this branch.
@@ -3047,11 +3072,11 @@
          ;; caches cannot conflate `1 mon` with `30 days`. Two copies of
          ;; this logic is why the top-level fix alone left
          ;; `SELECT … FROM (SELECT a INTERSECT SELECT b) s` wrong.
-           key-of fns/row-value-key
+           key-of (fn [row] (tick!) (fns/row-value-key row))
            sub-results (case (:op branch-parsed)
-                         :union-all (mapcat identity branch-rows)
+                         :union-all (mapcat checked-rows branch-rows)
                          :union     (fns/distinct-by-value
-                                     (mapcat identity branch-rows))
+                                     (mapcat checked-rows branch-rows))
                          :intersect (let [key-sets (map #(into #{} (map key-of) %)
                                                         (rest branch-rows))]
                                       (filterv (fn [r] (every? #(contains? % (key-of r))
@@ -3080,7 +3105,7 @@
            win-resolved
            (when (seq win-specs)
              (let [rows (window/execute-window-functions
-                         (mapv (fn [r] (if (sequential? r) (vec r) [r])) sub-results)
+                         (mapv (fn [r] (if (sequential? r) (vec r) [r])) (checked-rows sub-results))
                          win-specs)
                    aliases (into (vec sub-aliases) (map :alias) win-specs)
                  ;; The window executor APPENDS its values, and reading
@@ -3164,6 +3189,7 @@
                              (<= (.longValue n) Long/MAX_VALUE)))
            sample-rows (fn [col-idx]
                          (keep (fn [row]
+                                 (tick!)
                                  (let [vs (if (sequential? row) (vec row) [row])
                                        v  (nth vs col-idx nil)]
                                    (when (and (some? v) (not= :__null__ v)) v)))
@@ -3384,6 +3410,7 @@
                           (let [vals (if (sequential? row) (vec row) [row])
                                 cols (into {} (keep-indexed
                                                (fn [i a]
+                                                 (tick!)
                                                  (let [v (nth vals i nil)]
                                                    (when (and (some? v) (not= :__null__ v))
                                                      [(keyword target-name a)
@@ -7960,9 +7987,11 @@
   (when (= :error (:type p))
     (throw (ex-info (str (:message p))
                     {:sqlstate (:sqlstate p) :error-fields (:error-fields p)})))
+  (params/check-cancel!)
   (params/require-execution! "constant SELECT row production")
   (let [row (if-let [q (:query p)]
-              (let [ia (:in-args p)
+              (let [q (params/cancellable-query q)
+                    ia (:in-args p)
                     qdb (or (:enriched-db p) db)]
                 (first (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))))
               (:literal-row p))
@@ -8020,10 +8049,13 @@
                                  (set in-syms) clauses)]
                      (and bound-at-end (every? bound-at-end find))))
           (fn [in-args]
+            (params/check-cancel!)
             (params/require-execution! "constant SELECT expression evaluation")
-            (let [env (zipmap in-syms in-args)
+            (let [tick! (params/cancellation-ticker)
+                  env (zipmap in-syms in-args)
                   arg (fn [env a] (if (var-sym? a) (get env a) a))
                   env (reduce (fn [env {:keys [f fixed args out]}]
+                                (tick!)
                                 (let [v (apply (or fixed (get env f)) (map #(arg env %) args))]
                                   (cond
                                     (nil? out) (if v env (reduced nil))
@@ -9614,7 +9646,7 @@
         ;; resolve those key cells here; non-key volatile projections remain
         ;; deferred until their candidate survives shaping.
         results (resolve-order-keys results (:sql-order-by parsed) resolve-value)
-        results (if sql-cmp (sort sql-cmp results) results)
+        results (if sql-cmp (checked-sort sql-cmp results) results)
         results (if sql-cmp
                   (cond->> results
                     (:sql-offset parsed) (drop (:sql-offset parsed))
@@ -9626,7 +9658,7 @@
         results (resolve-order-keys results (:project-order-by parsed) resolve-value)
         project-cmp (when (seq (:project-order-by parsed))
                       (fns/null-safe-order-cmp (:project-order-by parsed)))
-        results (if project-cmp (sort project-cmp results) results)]
+        results (if project-cmp (checked-sort project-cmp results) results)]
     (if (seq (:project-set parsed))
       (cond->> results
         (:project-offset parsed) (drop (:project-offset parsed))
@@ -9787,15 +9819,16 @@
   [{:keys [source col-names source-attrs table-name ns ancestor-tables
            sequence-defaults conflict-plan returning assignment-targets assignment-plans]}
    db resolve-value]
+  (params/check-cancel!)
   (let [source-db db
         query (:query source)
         in-args (:in-args source)
         raw-results (cond
                       (:literal-rows source) (:literal-rows source)
                       (:literal-row source) [(:literal-row source)]
-                      (seq in-args) (apply d/q query source-db in-args)
-                      :else (d/q query source-db))
-        results (shape-insert-select-results raw-results source resolve-value)
+                      (seq in-args) (apply d/q (params/cancellable-query query) source-db in-args)
+                      :else (d/q (params/cancellable-query query) source-db))
+        results (shape-insert-select-results (checked-rows raw-results) source resolve-value)
         hidden-count (long (or (:hidden-count source) 0))
         results (if (pos? hidden-count)
                   (map (fn [row]
@@ -11206,8 +11239,9 @@
   "Entity maps for the rows a recursive CTE produced, coercing each value
    to its column's datahike type and tagging every row with `row-marker`."
   [rows col-names col-types target-name row-marker]
+  (params/check-cancel!)
   (let [coercions (mapv recursive-coercion col-types)]
-    (vec (for [row rows]
+    (vec (for [row (checked-rows rows)]
            (let [vs (vec row)
                  cols (into {} (keep-indexed
                                 (fn [i c]
@@ -11233,7 +11267,7 @@
            :in    (into '[$ %] in-params)
            :where [rule-call]}]
     (binding [dq/*disable-planner* false]
-      (apply d/q q db rule in-args))))
+      (apply d/q (params/cancellable-query q) db rule in-args))))
 
 (defn- anchor-col-vtypes
   "Best-effort per-column datahike value-types for a recursive CTE,
@@ -11329,6 +11363,7 @@
    so the outer query degrades to an empty CTE rather than crashing."
   [{:keys [rule rule-name rule-vars col-names col-types in-params in-args
            target-name row-marker]} db]
+  (params/check-cancel!)
   (try
     (let [grounded   (ground-rule-params rule in-params in-args)
           ;; Keep only params still referenced after grounding.
@@ -11338,8 +11373,8 @@
           rem-args   (mapv pmap rem-params)
           rows (run-recursive-rule db grounded rule-name rule-vars rem-params rem-args)
           data-tx (recursive-data-tx rows col-names col-types target-name row-marker)]
-      (if (seq data-tx) (d/db-with db data-tx) db))
-    (catch Throwable _ db)))
+      (if (seq data-tx) (checked-db-with db data-tx) db))
+    (catch Throwable e (preserve-cancellation! e) db)))
 
 (defn materialize-recursive-cte!
   "Run a WITH RECURSIVE CTE rule to a fixed point and materialize the
@@ -11357,6 +11392,7 @@
 
    Reuses `translate-recursive-cte` for the rule construction."
   [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
+  (params/check-cancel!)
   (let [{:keys [rule rule-name col-names rule-vars in-params in-args anchor]}
         (translate-recursive-cte wi schema db)
         row-marker (pgs/row-marker-attr target-name)
@@ -11366,7 +11402,7 @@
     (if deferred?
       (let [col-types (anchor-col-vtypes anchor col-names schema db)
             schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
-            spec-db   (d/db-with db schema-tx)]
+            spec-db   (checked-db-with db schema-tx)]
         {:db      spec-db
          :schema  (:schema spec-db)
          :name    target-name
@@ -11390,9 +11426,9 @@
                                   :else :db.type/string)))
                             (range (count col-names)))
             schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
-            spec-db (d/db-with db schema-tx)
+            spec-db (checked-db-with db schema-tx)
             data-tx (recursive-data-tx rows col-names col-types target-name row-marker)
-            spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
+            spec-db2 (if (seq data-tx) (checked-db-with spec-db data-tx) spec-db)]
         {:db      spec-db2
          :schema  (:schema spec-db2)
          :name    target-name
@@ -11403,12 +11439,14 @@
   "Run a translate-select result's :query against `exec-db`, dropping any
    hidden trailing columns (entity/order-by vars), and return row vectors."
   [{:keys [query in-args hidden-count]} exec-db]
-  (let [vis (- (count (:find query)) (or hidden-count 0))
+  (params/check-cancel!)
+  (let [query (params/cancellable-query query)
+        vis (- (count (:find query)) (or hidden-count 0))
         raw (if (seq in-args)
               (apply d/q query exec-db in-args)
               (d/q query exec-db))]
     (mapv (fn [r] (let [v (if (sequential? r) (vec r) [r])] (vec (take vis v))))
-          raw)))
+          (checked-rows raw))))
 
 (defn materialize-recursive-iterative!
   "FALLBACK recursive-CTE evaluator (B1): semi-naive iteration instead of a
@@ -11432,6 +11470,7 @@
    anchor (`SELECT $1::int` — the param constant-folds in translation, so the
    rule path / B2 must own it), or any translation/eval failure."
   [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
+  (params/check-cancel!)
   (try
     (when-let [[anchor recursive] (recursive-cte-branches wi)]
       (let [col-list  (.getWithItemList wi)
@@ -11453,7 +11492,7 @@
                        (boolean (seq (params/ast-param-indices recursive))))
             anchor-from (.getFromItem ^PlainSelect anchor)
             mk-data-tx (fn [coercions rows]
-                         (vec (for [row rows]
+                         (vec (for [row (checked-rows rows)]
                                 (assoc (into {} (keep-indexed
                                                  (fn [i c]
                                                    (let [v (nth row i nil)]
@@ -11493,7 +11532,7 @@
                                        (get types/oid-preserving-pg-name (nth anchor-oids i nil))))
                                    (range (count col-names)))
                 schema-tx (recursive-schema-tx target-name col-names col-types row-marker col-array-elems col-pg-types)
-                spec0 (d/db-with db schema-tx)
+                spec0 (checked-db-with db schema-tx)
                 rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
                              (translate-select recursive (:schema spec0) spec0))]
             {:db spec0 :schema (:schema spec0) :name target-name
@@ -11524,21 +11563,22 @@
                                 (range (count col-names)))
                 coercions (mapv recursive-coercion col-types)
                 schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
-                spec0 (d/db-with (d/db-with db schema-tx) (mk-data-tx coercions anchor-rows))
+                spec0 (checked-db-with (checked-db-with db schema-tx) (mk-data-tx coercions anchor-rows))
                 rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
                              (translate-select recursive (:schema spec0) spec0))]
             (loop [cur spec0, seen (set anchor-rows), i 0]
+              (params/check-cancel!)
               (if (> i 100000)
                 {:db cur :schema (:schema cur) :name target-name
                  :alias target-name :aliases col-names}
                 (let [rows  (visible-query-rows rec-parsed cur)
-                      novel (vec (remove seen rows))]
+                      novel (vec (remove seen (checked-rows rows)))]
                   (if (empty? novel)
                     {:db cur :schema (:schema cur) :name target-name
                      :alias target-name :aliases col-names}
-                    (recur (d/db-with cur (mk-data-tx coercions novel))
-                           (into seen novel) (inc i))))))))))
-    (catch Throwable _ nil)))
+                    (recur (checked-db-with cur (mk-data-tx coercions novel))
+                           (into seen (checked-rows novel)) (inc i))))))))))
+    (catch Throwable e (preserve-cancellation! e) nil)))
 
 (defn materialize-recursive-iterative-rows!
   "Execute-time materialisation for a DEFERRED iterative recursive CTE (see
@@ -11553,10 +11593,11 @@
    (the caller's query-db, whose schema already has the CTE attrs); on anchor
    failure returns `db` unchanged."
   [{:keys [anchor recursive col-names col-types target-name row-marker]} db]
+  (params/check-cancel!)
   (try
     (let [coercions (mapv recursive-coercion col-types)
           mk-data-tx (fn [rows]
-                       (vec (for [row rows]
+                       (vec (for [row (checked-rows rows)]
                               (assoc (into {} (keep-indexed
                                                (fn [i c]
                                                  (let [v (nth row i nil)]
@@ -11570,7 +11611,7 @@
           ;; whose :enriched-db carries the CTE attrs + any derived tables it
           ;; referenced; seed it with the (param-bound) anchor rows.
           rec-base    (or (:enriched-db recursive) db)
-          base        (d/db-with rec-base (mk-data-tx anchor-rows))]
+          base        (checked-db-with rec-base (mk-data-tx anchor-rows))]
       ;; Bounded recursion: a type-dependency chain is shallow, and a result
       ;; column like typeinfo_tree.depth makes a type re-derived via a longer
       ;; path a DISTINCT row, so a deep/correlated body can keep producing
@@ -11579,11 +11620,12 @@
       ;; core-type rows are resolved from its builtin codecs), so a partial
       ;; recursion is still correct for the cases that matter.
       (loop [cur base, seen (set anchor-rows), i 0]
+        (params/check-cancel!)
         (if (>= i 64)
           cur
-          (let [rows  (try (visible-query-rows recursive cur) (catch Throwable _ :stop))
-                novel (when (not= rows :stop) (vec (remove seen rows)))]
+          (let [rows  (try (visible-query-rows recursive cur) (catch Throwable e (preserve-cancellation! e) :stop))
+                novel (when (not= rows :stop) (vec (remove seen (checked-rows rows))))]
             (if (or (= rows :stop) (empty? novel))
               cur
-              (recur (d/db-with cur (mk-data-tx novel)) (into seen novel) (inc i)))))))
-    (catch Throwable _ db)))
+              (recur (checked-db-with cur (mk-data-tx novel)) (into seen (checked-rows novel)) (inc i)))))))
+    (catch Throwable e (preserve-cancellation! e) db)))

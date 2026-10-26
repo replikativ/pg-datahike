@@ -856,9 +856,15 @@
                          :feature-not-supported
                          {:feature "demand-driven recursive CTE evaluation with LIMIT"})))
                (let [rule! #(try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
-                                 (catch Throwable _ nil))
+                                 (catch Throwable e
+                                   (when (= "57014" (first (errors/classify-exception e)))
+                                     (throw e))
+                                   nil))
                      iter! #(try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
-                                 (catch Throwable _ nil))
+                                 (catch Throwable e
+                                   (when (= "57014" (first (errors/classify-exception e)))
+                                     (throw e))
+                                   nil))
                    ;; Parameterised CTEs: prefer the iterative evaluator (it
                    ;; defers a table-full param anchor to Execute and handles
                    ;; complex bodies — asyncpg's typeinfo_tree); it bails (nil)

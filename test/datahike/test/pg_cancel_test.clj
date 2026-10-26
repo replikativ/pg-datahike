@@ -16,15 +16,17 @@
    been set — the first check-cancel! on the scan path raises 57014
    regardless of scan duration. No Thread/sleep coordination.
 
-   Requires the query planner: legacy engine has no cancel points. Set
+   Exercises the query-planner execution mode. Set
    DATAHIKE_QUERY_PLANNER=true when running the test suite."
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg]
             [datahike.query :as q])
-  (:import [datahike.pg PgWireServer PgWireServer$QueryHandlerFactory]
+  (:import [datahike.pg PgWireServer PgWireServer$PgProtocolException
+            PgWireServer$QueryHandler PgWireServer$QueryHandlerFactory]
            [java.sql Connection DriverManager SQLException Statement]
            [java.util.concurrent CountDownLatch TimeUnit]
+           [java.util.concurrent.atomic AtomicBoolean]
            [java.util.concurrent.locks LockSupport]))
 
 (def ^:private cancel-schema
@@ -39,7 +41,7 @@
   (d/transact conn (into [] (for [i (range n)] {:x/id i :x/val (mod i 100)}))))
 
 ;; One server, one DB, one CountDownLatch template — shared across the
-;; three read-only tests in this ns. Per-test fresh coordination state
+;; read-only tests in this ns. Per-test fresh coordination state
 ;; lives in `reset-latches!`. Saves ~50s of fixture transacting that
 ;; the per-test :each setup would repeat.
 (def ^:dynamic ^:private *server-state* nil)
@@ -49,7 +51,8 @@
   ([state pause-dispatch?]
    (reset! (:dispatch-started state) (CountDownLatch. 1))
    (reset! (:cancel-landed state) (promise))
-   (reset! (:pause-dispatch? state) pause-dispatch?)))
+   (reset! (:pause-dispatch? state) pause-dispatch?)
+   (reset! (:query-count state) 0)))
 
 (defn- cancel-fixture [f]
   (pg/reset-lock-registry!)
@@ -68,7 +71,9 @@
           ;; without rebuilding the fixture.
           state {:dispatch-started (atom (CountDownLatch. 1))
                  :cancel-landed    (atom (promise))
-                 :pause-dispatch?  (atom true)}]
+                 :pause-dispatch?  (atom true)
+                 :query-count      (atom 0)
+                 :conn             conn}]
       (load-db conn 1000)
       (let [factory (reify PgWireServer$QueryHandlerFactory
                       (create [_]
@@ -84,6 +89,7 @@
                               ;; parkNanos doesn't throw on interrupt
                               ;; — it just returns — so we fall
                               ;; straight into d/q with the flag set.
+                              (swap! (:query-count state) inc)
                               (.countDown ^CountDownLatch @(:dispatch-started state))
                               (when @(:pause-dispatch? state)
                                 (LockSupport/parkNanos (* 10 1000 1000 1000)) ;; 10s ceiling
@@ -111,6 +117,85 @@
   (str "SELECT avg((SELECT avg(a1.col1 ORDER BY "
        "(SELECT avg(a2.col2) FROM x a3)) "
        "FROM x a1(col1))) FROM x a2(col2)"))
+
+(def ^:private nested-derived-cancel-sql
+  "SELECT d.id FROM (SELECT id FROM x) d ORDER BY d.id")
+
+(def ^:private fast-prepared-cancel-sql
+  "SELECT id,val FROM x WHERE id >= ? ORDER BY val DESC,id DESC")
+
+(defn- cancel-running-statement
+  [^Statement statement execute-query]
+  (let [outcome (promise)
+        runner (future
+                 (try
+                   (with-open [_ (execute-query)]
+                     (deliver outcome :completed))
+                   (catch SQLException e
+                     (deliver outcome (.getSQLState e)))
+                   (catch Throwable t
+                     (deliver outcome [:threw (class t) (.getMessage t)]))))]
+    (is (.await ^CountDownLatch @(:dispatch-started *server-state*)
+                10 TimeUnit/SECONDS)
+        "server did not reach the deterministic cancellation boundary")
+    (.cancel statement)
+    (is (= true (deref @(:cancel-landed *server-state*) 10000 :timeout))
+        "cancel's safety-net interrupt did not release dispatch")
+    (let [result (deref outcome 10000 :timeout)]
+      @runner
+      result)))
+
+(deftest cancel-request-reaches-a-nested-derived-query
+  (reset-latches! *server-state*)
+  (with-open [c (open)
+              st (.createStatement c)]
+    (is (= "57014"
+           (cancel-running-statement st #(.executeQuery st nested-derived-cancel-sql))))
+    (is (= 1 @(:query-count *server-state*))
+        "the cancelled statement was dispatched only once")
+    (with-open [rs (.executeQuery st "SELECT 1")]
+      (is (.next rs))
+      (is (= 1 (.getInt rs 1))))))
+
+(deftest cancel-request-reaches-the-compiled-prepared-lane
+  (reset-latches! *server-state*)
+  (with-open [c (open)
+              ps (.prepareStatement c fast-prepared-cancel-sql)]
+    (.setInt ps 1 0)
+    (is (= "57014" (cancel-running-statement ps #(.executeQuery ps))))
+    ;; The fast lane used to swallow ExceptionInfo and rerun the statement on
+    ;; the general lane. Cancellation is an answer, not a planning decline.
+    (is (= 1 @(:query-count *server-state*))
+        "cancellation must not fall through and execute the prepared query twice")
+    (with-open [st (.createStatement c)
+                rs (.executeQuery st "SELECT 1")]
+      (is (.next rs))
+      (is (= 1 (.getInt rs 1))))))
+
+(deftest extended-parse-binds-the-session-cancel-token
+  ;; A direct handler call makes this deterministic without a large query or a
+  ;; race against pgjdbc's Parse message. The protocol loop installs this same
+  ;; ThreadLocal while dispatching Parse.
+  (let [handler ^PgWireServer$QueryHandler
+        (pg/make-query-handler (:conn *server-state*))
+        flag (AtomicBoolean. true)
+        thrown (try
+                 (.set ^ThreadLocal PgWireServer/CANCEL_FLAG flag)
+                 (try
+                   (.parse handler
+                           "SELECT d.id FROM (SELECT id FROM x) d"
+                           (int-array 0))
+                   nil
+                   (catch PgWireServer$PgProtocolException e e)
+                   (catch clojure.lang.ExceptionInfo e e))
+                 (finally
+                   (.remove ^ThreadLocal PgWireServer/CANCEL_FLAG)
+                   (.close handler)))]
+    (is (some? thrown))
+    (is (= "57014"
+           (if (instance? PgWireServer$PgProtocolException thrown)
+             (.-sqlstate ^PgWireServer$PgProtocolException thrown)
+             (when (:datahike/canceled (ex-data thrown)) "57014"))))))
 
 (deftest cancel-request-interrupts-long-scan
   (reset-latches! *server-state*)
