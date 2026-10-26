@@ -199,6 +199,9 @@
       (is (= [["1"] ["2"]] (answers)))
       (exec c (str "SET datahike.commit_id = '" *initial-commit-id* "'"))
       (is (= [["1"]] (answers)))
+      (is (re-find #"^Datahike Query"
+                   (ffirst (rows c (str "EXPLAIN WITH q AS (SELECT id FROM person) "
+                                        "SELECT id FROM q")))))
       (exec c "RESET datahike.commit_id")
       (is (= [["1"] ["2"]] (answers))))))
 

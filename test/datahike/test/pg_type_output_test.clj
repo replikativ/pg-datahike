@@ -141,17 +141,8 @@
     (testing "through a derived relation"
       (is (= [["\\x0001ff"]] (rows c "SELECT b::text FROM (SELECT b FROM tb) s")))
       (is (= [["\\x0001ff"]] (rows c "SELECT s.b::text FROM (SELECT b FROM tb) s")))
-      ;; KNOWN DIVERGENCE, not a consequence of the value fix above.
-      ;; `dh-type->oid` maps :db.type/bytes to oid-text while
-      ;; `dh-type->pg-name` maps it to "bytea" (types.clj:539 vs :562),
-      ;; so the reported column OID is 25 where PostgreSQL says 17. The
-      ;; VALUE is correct either way -- that is what the assertions above
-      ;; pin. Flipping the OID changes every bytea column's wire framing,
-      ;; so it wants the pgjdbc/psycopg suites and a pg_dump round-trip:
-      ;; consolidation-plan Phase 3. When that lands, this flips to
-      ;; "bytea" and the `::text` expectations stay as they are.
-      (is (= [["text"]] (rows c "SELECT pg_typeof(b) FROM (SELECT b FROM tb) s"))
-          "reported OID is still text; see Phase 3"))))
+      (is (= [["bytea"]] (rows c "SELECT pg_typeof(b) FROM (SELECT b FROM tb) s"))
+          "derived metadata preserves the bytea type as well as its value"))))
 
 (deftest text-order-matches-the-collation-we-report
   ;; Text comparison here is `fns/order-cmp`'s `compare`, i.e.

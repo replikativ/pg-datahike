@@ -46,6 +46,7 @@
             [datahike.datom]
             [datahike.query :as dq]
             [datahike.pg.cache :as pg-cache]
+            [datahike.db.interface :as dbi]
             [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.errors :as errors]
             [datahike.pg.input :as input]
@@ -2743,24 +2744,41 @@
 
 (defn output-schema-tx
   "Build virtual column metadata shared by analysis and execution."
-  [target-name columns]
-  (conj
-   (mapv (fn [{:keys [name oid typmod vtype pg-type array-elem record-fields]}]
-           (let [element (or array-elem (some-> oid types/array-oid->element-oid types/oid->elem-kw))
-                 pg-type (or pg-type (get types/oid->pg-type-marker oid))
-                 vtype (or vtype (when element :db.type/string) (types/dh-type-for-oid oid))]
-             (when-not (and vtype pg-type)
-               (throw (errors/pg-error :feature-not-supported
-                                       {:feature "analysis of this output type"})))
-             (cond-> {:db/ident (keyword target-name name)
-                      :db/valueType vtype :db/cardinality :db.cardinality/one
-                      :pg/type pg-type}
-               element (assoc :pg/array-elem element)
-               (and typmod (not= -1 typmod)) (assoc :pg/typmod typmod)
-               record-fields (assoc :pg/record-fields record-fields))))
-         columns)
-   {:db/ident (pgs/row-marker-attr target-name)
-    :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}))
+  [target-name columns db]
+  (let [column-tx
+        (conj
+         (mapv (fn [{:keys [name oid typmod vtype pg-type array-elem record-fields]}]
+                 (let [element (or array-elem (some-> oid types/array-oid->element-oid types/oid->elem-kw))
+                       pg-type (or pg-type (get types/oid->pg-type-marker oid))
+                       vtype (or vtype (when element :db.type/string) (types/dh-type-for-oid oid))]
+                   (when-not (and vtype pg-type)
+                     (throw (errors/pg-error :feature-not-supported
+                                             {:feature "analysis of this output type"})))
+                   (cond-> {:db/ident (keyword target-name name)
+                            :db/valueType vtype :db/cardinality :db.cardinality/one
+                            :pg/type pg-type}
+                     element (assoc :pg/array-elem element)
+                     (and typmod (not= -1 typmod)) (assoc :pg/typmod typmod)
+                     record-fields (assoc :pg/record-fields record-fields))))
+               columns)
+         {:db/ident (pgs/row-marker-attr target-name)
+          :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one})
+        ;; A historical commit can predate pgwire's metadata bootstrap.
+        ;; Add only the attributes used by this private virtual schema;
+        ;; the selected commit and the live connection remain unchanged.
+        used (into #{} (mapcat keys) column-tx)
+        missing (when db
+                  (into []
+                        (keep (fn [[ident value-type]]
+                                (when (and (contains? used ident)
+                                           (not (contains? (dbi/-schema db) ident)))
+                                  {:db/ident ident :db/valueType value-type
+                                   :db/cardinality :db.cardinality/one})))
+                        [[:pg/type :db.type/string]
+                         [:pg/typmod :db.type/long]
+                         [:pg/array-elem :db.type/keyword]
+                         [:pg/record-fields :db.type/string]]))]
+    (into (vec missing) column-tx)))
 
 (defn materialize-output-schema!
   "Expose a virtual relation's declared columns; never produce user rows."
@@ -2769,7 +2787,7 @@
         _ (when (and params/*analysis-only?* (not-every? #(pos-int? (:oid %)) columns))
             (throw (errors/pg-error :feature-not-supported
                                     {:feature "analysis of unresolved virtual column types"})))
-        tx (output-schema-tx target-name columns)
+        tx (output-schema-tx target-name columns db)
         spec-db (d/db-with db tx)]
     {:db spec-db :schema (:schema spec-db) :name target-name
      :alias (or alias target-name) :aliases (mapv :name columns)
@@ -3359,7 +3377,8 @@
                      :array-elem (nth col-array-elem i)
                      :record-fields (when-let [record (nth col-record i)]
                                       (pg-rec/layout->text (pg-rec/layout record)))})
-                  (range) sub-aliases))
+                  (range) sub-aliases)
+            db)
            spec-db (with-fn db schema-tx)
            data-tx (vec (for [row sub-results]
                           (let [vals (if (sequential? row) (vec row) [row])
