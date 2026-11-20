@@ -335,12 +335,55 @@
     (when (.deref cancel)
       (throw (ex-info "query canceled" {:datahike/canceled true})))))
 
+(defn declare-scoped-inputs
+  "Add every scalar :in var an `or-join` / `not-join` body uses to that clause's
+   declared var list.
+
+   Those two forms unify ONLY the vars they declare with the rest of the query; any
+   other var in the body is a fresh one. The translator computes the lists from the
+   columns a body shares with its surroundings and does not know about wire
+   parameters (?pN) or generated inputs, which reach the body as plain vars. Left
+   undeclared such a parameter is not the input inside the body — Datomic matches
+   it against everything, and datahike refuses the query. Declaring it is what the
+   SQL means: a parameter is one value for the whole statement."
+  [query]
+  (let [ins (into #{} (filter #(and (symbol? %) (= \? (first (name %))))) (:in query))]
+    (if (empty? ins)
+      query
+      (letfn [(used [form]
+                (into [] (comp (filter ins) (distinct)) (tree-seq coll? seq form)))
+              (fix [form]
+                (cond
+                  (and (seq? form) ('#{or-join not-join} (first form)))
+                  (let [[op vars & body] form
+                        body' (map fix body)
+                        declared (set (flatten vars))
+                        missing (remove declared (used body'))]
+                    (if (or (seq missing) (not= body body'))
+                      (apply list op (into (vec vars) missing) body')
+                      form))
+
+                  (and (seq? form) ('#{or not and} (first form)))
+                  (let [body' (map fix (rest form))]
+                    (if (= body' (rest form)) form (apply list (first form) body')))
+
+                  ;; a branch written as a vector of clauses
+                  (and (vector? form) (every? coll? form) (some seq? form))
+                  (let [form' (mapv fix form)] (if (= form' form) form form'))
+
+                  :else form))]
+        (let [where (:where query)
+              where' (mapv fix where)]
+          (if (= where where') query (assoc query :where where')))))))
+
 (defn cancellable-query
-  "Attach the current statement token to a normalized query map at execution.
-   Read the binding here so cached plans never capture a session's token."
+  "Ready a normalized query map for execution: declare its scalar inputs in the
+   join clauses that use them (see `declare-scoped-inputs`) and attach the
+   current statement token. Read the binding here so cached plans never capture
+   a session's token."
   [query]
   (check-cancel!)
-  (cond-> query *cancel* (assoc :cancel *cancel*)))
+  (cond-> (declare-scoped-inputs query) *cancel* (assoc :cancel *cancel*)))
 
 (defn cancellation-ticker
   "Make an execution-local check for row loops; poll on entry and every 512

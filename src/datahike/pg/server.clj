@@ -8792,10 +8792,11 @@
                                   (min (long limit) cap-limit)
                                   (and limit pushable?) limit
                                   :else cap-limit)
-                    q-input (cond-> datalog
-                              (some? query-limit) (assoc :limit query-limit)
-                              (and offset pushable?) (assoc :offset offset)
-                              :always (assoc :cancel (current-cancel)))]
+                    q-input (params/declare-scoped-inputs
+                             (cond-> datalog
+                               (some? query-limit) (assoc :limit query-limit)
+                               (and offset pushable?) (assoc :offset offset)
+                               :always (assoc :cancel (current-cancel))))]
                 ;; Runtime subquery closures execute inside d/q. Bind the
                 ;; statement's effective query DB, not merely the connection's
                 ;; raw snapshot: CTEs and derived relations live in `query-db`.
