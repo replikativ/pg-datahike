@@ -117,16 +117,21 @@
       ;; write, so the zone is applied instead of guessed at.
       (is (= 0 (run c "CREATE TABLE dz (id int PRIMARY KEY, a timestamp DEFAULT (now() AT TIME ZONE 'UTC'))")))
       (is (= 0 (run c (str "CREATE TABLE dz2 (id int PRIMARY KEY,"
-                           " a timestamp DEFAULT (now() AT TIME ZONE 'America/New_York'),"
+                           " a timestamp DEFAULT (now() AT TIME ZONE 'Asia/Kolkata'),"
                            " b timestamp DEFAULT (now() AT TIME ZONE 'UTC'))"))))
       (run c "INSERT INTO dz2 (id) VALUES (1)")
-      ;; The zone is really applied: the two differ by New York's offset
+      ;; The zone is really applied: the two differ by the zone's offset
       ;; from UTC, and the column agrees with the same expression run as
       ;; a query rather than as a default.
-      (is (= ["04:00:00"] (run c "SELECT (b - a)::text FROM dz2"))
+      ;;
+      ;; The zone has NO daylight saving, so the offset is the same on
+      ;; every day of the year: with America/New_York this asserted
+      ;; 04:00:00 and failed from November to March. A half-hour offset
+      ;; also tells an applied zone from one rounded to whole hours.
+      (is (= ["-05:30:00"] (run c "SELECT (b - a)::text FROM dz2"))
           "a folded default would make the two columns equal")
       (is (= ["true"]
-             (run c (str "SELECT ((((now() AT TIME ZONE 'America/New_York')"
+             (run c (str "SELECT ((((now() AT TIME ZONE 'Asia/Kolkata')"
                          " - a) < interval '1 minute'))::text FROM dz2")))
           "the stored default is the same wall clock the expression gives now"))))
 
