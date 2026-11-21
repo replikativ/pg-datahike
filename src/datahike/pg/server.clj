@@ -2050,8 +2050,8 @@
   "The constraint entity an `ALTER TABLE ... ADD` writes -- the same shape
    CREATE TABLE writes, so the two spellings cannot drift apart -- after
    validating the rows already in the table."
-  [db table taken {:keys [op name expr cols parent-table parent-cols
-                          on-delete on-update]}]
+  [db table taken added-columns {:keys [op name expr cols parent-table parent-cols
+                                        on-delete on-update]}]
   (case op
     :add-check
     (let [;; `ChooseConstraintName` uses `<table>_<col>_check` when the
@@ -2074,35 +2074,12 @@
     :add-foreign-key
     (let [cname (or name (ddl/generated-constraint-name
                           taken table (str/join "_" cols) "fkey"))
-          parent-cols (if (seq parent-cols)
-                        parent-cols
-                        (ddl/primary-key-cols db parent-table))
+          parent-cols (ddl/resolve-foreign-key!
+                       db table {:name cname :cols cols :parent-table parent-table
+                                 :parent-cols parent-cols :added-columns added-columns} nil)
           ->action {"cascade" :cascade "set null" :set-null
                     "set default" :set-default "restrict" :restrict
                     "no action" :no-action}]
-      (when (empty? parent-cols)
-        (throw (ex-info (str "there is no primary key for referenced table \""
-                             parent-table "\"")
-                        {:error :invalid-foreign-key :sqlstate "42830"
-                         :table table :constraint cname})))
-      ;; The referenced columns must carry a UNIQUE or PRIMARY KEY
-      ;; constraint. This checked only that the parent had SOME primary
-      ;; key, so `REFERENCES p (non_unique_col)` was accepted -- and
-      ;; without a unique constraint a child row can match several
-      ;; parents, which is why PostgreSQL refuses it at DDL.
-      ;;
-      ;; Single-column references only. A COMPOSITE primary key or
-      ;; UNIQUE leaves no trace in the schema at all here -- it is not
-      ;; enforced either, which is a larger bug recorded in
-      ;; doc/review-backlog.md -- so a composite reference cannot be
-      ;; judged and stays lenient rather than being refused wrongly.
-      (when (and (= 1 (count parent-cols))
-                 (not (contains? (ddl/unique-key-sets db parent-table)
-                                 (set parent-cols))))
-        (throw (ex-info (str "there is no unique constraint matching given keys"
-                             " for referenced table \"" parent-table "\"")
-                        {:error :invalid-foreign-key :sqlstate "42830"
-                         :table table :constraint cname})))
       (validate-added-fk! db table cname cols parent-table parent-cols)
       [(cond-> {:pg/constraint-key (ddl/constraint-key table cname)
                 :pg/fk-conname cname
@@ -5234,9 +5211,31 @@
               (remove inherited-names local-names))
         column-data
         (catalog-objects/create-columns-tx
-         oid (map-indexed #(assoc %2 :attnum (inc %1)) effective-columns))]
-    (into (vec tx-data)
-          (concat ddl-data object-data row-type-data sequence-object-data column-data))))
+         oid (map-indexed #(assoc %2 :attnum (inc %1)) effective-columns))
+        foreign-key? #(and (map? %) (contains? % :pg/fk-parent-table))
+        has-foreign-keys? (some foreign-key? ddl-data)
+        ddl-data
+        (if has-foreign-keys?
+          (let [local {:columns (into {} (map (juxt :name :storage-ident)) effective-columns)
+                       :primary-key (:pk-cols parsed)
+                       :schema ddl-by-ident}]
+            (mapv (fn [datum]
+                    (if (foreign-key? datum)
+                      (let [resolved (ddl/resolve-foreign-key!
+                                      db table-name
+                                      {:name (:pg/fk-conname datum)
+                                       :cols (jb/parse-jsonb (:pg/fk-child-cols datum))
+                                       :parent-table (:pg/fk-parent-table datum)
+                                       :parent-cols (jb/parse-jsonb (:pg/fk-parent-cols datum))}
+                                      local)]
+                        (assoc datum :pg/fk-parent-cols (jb/serialize-jsonb resolved)))
+                      datum))
+                  ddl-data))
+          ddl-data)
+        tx-data (into (vec tx-data)
+                      (concat ddl-data object-data row-type-data sequence-object-data column-data))]
+    (cond-> tx-data
+      has-foreign-keys? (guard-catalog-tx (catalog-basis/capture db)))))
 
 (defn- execute-ddl-create [conn parsed tx-state session-id]
   (let [table-name (:table-name parsed)
@@ -7236,6 +7235,9 @@
    asyncpg's pool reset sends `RESET ALL` on every release."
   [{:keys [session-state]} parsed]
   (let [setting (some-> (:var parsed) str/lower-case)]
+    (when (contains? #{"transaction_isolation" "transaction_read_only" "transaction_deferrable"} setting)
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "parameter \"" setting "\" cannot be reset")})))
     ;; RESET is a SET to the default, and as transactional.
     (guc/scoped!
      session-state false
@@ -12331,12 +12333,13 @@
                   ;; unnamed FK generate the name the first already had,
                   ;; and the two entities shared a :pg/constraint-key --
                   ;; the second silently replaced the first.
+                  added-columns (into {} (map (juxt :name :storage-ident)) added-column-specs)
                   taken (atom (into #{} (map :constraint)
                                     (concat (:checks existing) (:fks existing))))]
               (vec (mapcat (fn [{:keys [op] :as operation}]
                              (cond
                                (contains? #{:add-check :add-foreign-key} op)
-                               (let [tx (added-constraint-tx db table @taken operation)]
+                               (let [tx (added-constraint-tx db table @taken added-columns operation)]
                                  (swap! taken into (keep (some-fn :pg/check-conname
                                                                   :pg/fk-conname))
                                         tx)
@@ -12390,7 +12393,10 @@
                       (into tx-data
                             (catalog-objects/bump-revision-tx
                              db catalog-objects/pg-class-oid relation-oid))
-                      tx-data)]
+                      tx-data)
+            tx-data (cond-> tx-data
+                      (some #(= :add-foreign-key (:op %)) operations)
+                      (guard-catalog-tx (catalog-basis/capture db)))]
         (if (seq tx-data)
           (try
             (if (:in-tx? @tx-state)
@@ -12411,6 +12417,8 @@
                 (throw e))))
           (empty-result "ALTER TABLE")))
       (catch Exception e
+        (when (:in-tx? @tx-state)
+          (swap! tx-state assoc :aborted? true))
         (classified-error "ALTER TABLE error: " e)))))
 
 (defn- drop-table-tx-data

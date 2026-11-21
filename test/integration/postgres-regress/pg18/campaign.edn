@@ -115,7 +115,13 @@
     {:name "transactions",
      :boundaries #{:error-recovery :transactions :savepoints},
      :requires ["test_setup"],
-     :mode :unmeasured}
+     :mode :discovery
+     :blockers #{:transaction-characteristic-transitions}
+     :strict-slices
+     [{:id :reset-transaction-isolation
+       :source-lines [39 42]
+       :gate "test/datahike/test/pg_server_test.clj"
+       :test-var "postgres-transaction-characteristics-cannot-be-reset"}]}
     {:name "case", :boundaries #{:expressions}, :mode :unmeasured}
     {:name "select_having", :boundaries #{:errors :having :grouping :aggregates}, :mode :strict}
     {:name "select_implicit", :boundaries #{:name-resolution :relational}, :mode :strict}
@@ -169,7 +175,13 @@
      :boundaries #{:distinct-on :ordering :relational},
      :requires ["test_setup"],
      :mode :unmeasured}
-    {:name "foreign_key", :boundaries #{:constraints :ddl :dml :transactions}, :mode :unmeasured}
+    {:name "foreign_key", :boundaries #{:constraints :ddl :dml :transactions}, :mode :discovery
+     :blockers #{:foreign-key-actions :foreign-key-match-and-enforcement}
+     :strict-slices
+     [{:id :foreign-key-definition-validation
+       :source-lines [538 543]
+       :gate "test/datahike/test/pg_constraints_test.clj"
+       :test-var "postgres-rejects-invalid-foreign-key-definitions"}]}
     {:name "create_view", :boundaries #{:ddl :relational :views}, :mode :unmeasured}
     {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :unmeasured}]}
   {:id 5,

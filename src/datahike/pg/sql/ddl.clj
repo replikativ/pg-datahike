@@ -21,6 +21,7 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.constraints.unique :as unique]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.pg-catalog :as pg-catalog]
@@ -72,31 +73,17 @@
                          schema)]
           [(name attr)])))))
 
-(defn unique-key-sets
-  "Every set of columns of `table-name` that a UNIQUE or PRIMARY KEY
-   constraint covers, as sets.
-
-   `primary-key-cols` finds only the PK, so an FK could reference a
-   column with no unique constraint at all -- which PostgreSQL refuses
-   with 42830, because without one a child row can match several
-   parents. Composite keys are the `pg$pk_tuple` / `pg$unique_tuple_N`
-   derived attributes; single-column ones are `:db.unique/identity`
-   (PK) or `:db.unique/value` (UNIQUE) on the column itself."
-  [db table-name]
-  (when db
-    (let [schema (:schema db)]
-      (into #{}
-            (keep (fn [[a props]]
-                    (when (and (keyword? a) (= table-name (namespace a)))
-                      (cond
-                        (seq (:db/tupleAttrs props))
-                        (when (:db/unique props)
-                          (into #{} (map name) (:db/tupleAttrs props)))
-
-                        (and (:db/unique props)
-                             (not (str/starts-with? (name a) "pg$")))
-                        #{(name a)}))))
-            schema))))
+(defn- schema-unique-keys [schema table columns]
+  (let [column-names (set/map-invert columns)]
+    (into #{}
+          (keep (fn [[attr props]]
+                  (when (and (keyword? attr) (= table (namespace attr)) (:db/unique props))
+                    (if-let [members (seq (:db/tupleAttrs props))]
+                      (when (every? column-names members)
+                        (into #{} (map column-names) members))
+                      (when-let [column (get column-names attr)]
+                        #{column})))))
+          schema)))
 
 (defn- attr-enum-name
   "Return the enum type attached to a persisted column attribute."
@@ -108,6 +95,72 @@
             :where [[?e :db/ident ?ident]
                     [?e :datahike.pg/enum-of ?name]]}
           db attr))))
+
+(defn- fk-column-attrs [db table]
+  (into {} (keep (fn [{:keys [name attr]}]
+                   (when-not (= :db/id attr) [name attr])))
+        (pgs/column-info (:schema db) table db)))
+
+(defn- validate-fk-columns! [columns names]
+  (doseq [column names]
+    (when-not (contains? columns column)
+      (if (contains? #{"tableoid" "ctid" "xmin" "xmax" "cmin" "cmax"} column)
+        (throw (errors/pg-error :feature-not-supported
+                                {:message "system columns cannot be used in foreign keys"}))
+        (throw (ex-info (str "column \"" column "\" referenced in foreign key constraint does not exist")
+                        {:sqlstate "42703" :column column}))))))
+
+(defn resolve-foreign-key!
+  "Validate and resolve a foreign key against the catalog snapshot used by DDL.
+   The optional local table describes columns and schema still being created."
+  [db child {:keys [name cols parent-table parent-cols added-columns]} local]
+  (let [child-columns (if local (:columns local) (into (fk-column-attrs db child) added-columns))
+        local-parent? (and local (= child parent-table))
+        parent-columns (if local-parent? (:columns local) (fk-column-attrs db parent-table))
+        _ (when-not (or local-parent? (seq parent-columns)
+                        (get (:schema db) (pgs/row-marker-attr parent-table)))
+            (throw (errors/pg-error :undefined-table {:table parent-table})))
+        _ (validate-fk-columns! child-columns cols)
+        explicit? (seq parent-cols)
+        parent-cols (if explicit? parent-cols
+                        (if local-parent? (:primary-key local) (primary-key-cols db parent-table)))]
+    (when-not (seq parent-cols)
+      (throw (ex-info (str "there is no primary key for referenced table \"" parent-table "\"")
+                      {:sqlstate "42830" :constraint name})))
+    (validate-fk-columns! parent-columns parent-cols)
+    (when (not= (count parent-cols) (count (set parent-cols)))
+      (throw (ex-info "foreign key referenced-columns list must not contain duplicates"
+                      {:sqlstate "42830" :constraint name})))
+    (when (and explicit?
+               (not (or (contains? (schema-unique-keys (if local-parent? (:schema local) (:schema db))
+                                                       parent-table
+                                                       parent-columns)
+                                   (set parent-cols))
+                        (and (not local-parent?)
+                             (some (fn [index]
+                                     (and (= parent-table (:table index))
+                                          (= (set parent-cols) (into #{} (map :name) (:keys index)))))
+                                   (unique/index-descriptors db))))))
+      (throw (ex-info (str "there is no unique constraint matching given keys for referenced table \""
+                           parent-table "\"")
+                      {:sqlstate "42830" :constraint name})))
+    (when-not (= (count cols) (count parent-cols))
+      (throw (ex-info "number of referencing and referenced columns for foreign key disagree"
+                      {:sqlstate "42830" :constraint name})))
+    ;; Equal storage types do not make two distinct enum types compatible.
+    (let [enum-name (fn [attr]
+                      (or (get-in local [:schema attr :datahike.pg/enum-of])
+                          (attr-enum-name db attr)))]
+      (doseq [[child-col parent-col] (map vector cols parent-cols)
+              :let [child-enum (enum-name (get child-columns child-col))
+                    parent-enum (enum-name (get parent-columns parent-col))]
+              :when (and (or child-enum parent-enum) (not= child-enum parent-enum))]
+        (throw (ex-info (str "foreign key constraint \"" name "\" cannot be implemented")
+                        {:sqlstate "42804" :constraint name :table child
+                         :detail (str "Key columns \"" child-col "\" of the referencing table and \""
+                                      parent-col "\" of the referenced table are of incompatible types: "
+                                      (or child-enum "non-enum") " and " (or parent-enum "non-enum") ".")}))))
+    parent-cols))
 
 (defn identity-column?
   "Check if a JSqlParser ColumnDefinition has GENERATED BY DEFAULT AS IDENTITY
@@ -525,20 +578,20 @@
                   {:kind :expr :value (str expr)})
               {:kind :unsupported :raw raw})))))))
 
+(defn- referenced-columns [columns]
+  (let [names (mapv (comp params/unquote-ident str) columns)]
+    (if (= ["__pg_default_pk__"] names) [] names)))
+
 (defn- foreign-key-index->spec
   "The FK shape `extract-ddl-constraints` produces, from a
    `ForeignKeyIndex` -- the node CREATE TABLE and ALTER TABLE both carry."
   [^ForeignKeyIndex fk]
-  (let [parsed-ref-cols (mapv (comp params/unquote-ident str)
-                              (or (.getReferencedColumnNames fk) []))]
-    {:name (some-> (.getName fk) params/unquote-ident)
-     :cols (mapv (comp params/unquote-ident str) (.getColumnsNames fk))
-     :parent-table (some-> (.getTable fk) .getName params/unquote-ident)
-     ;; The sentinel `inline-references-rule` injects when the SQL named
-     ;; no referenced columns; DDL lowering fills in the parent's PK.
-     :parent-cols (if (= ["__pg_default_pk__"] parsed-ref-cols) [] parsed-ref-cols)
-     :on-delete (some-> (.getOnDeleteReferenceOption fk) str/lower-case)
-     :on-update (some-> (.getOnUpdateReferenceOption fk) str/lower-case)}))
+  {:name (some-> (.getName fk) params/unquote-ident)
+   :cols (mapv (comp params/unquote-ident str) (.getColumnsNames fk))
+   :parent-table (some-> (.getTable fk) .getName params/unquote-ident)
+   :parent-cols (referenced-columns (.getReferencedColumnNames fk))
+   :on-delete (some-> (.getOnDeleteReferenceOption fk) str/lower-case)
+   :on-update (some-> (.getOnUpdateReferenceOption fk) str/lower-case)})
 
 (defn alter-added-constraint
   "The constraint an `ALTER TABLE ... ADD ...` expression adds, as
@@ -576,7 +629,7 @@
          :name nil
          :cols (mapv params/unquote-ident (.getFkColumns exp))
          :parent-table (some-> (.getFkSourceTable exp) params/unquote-ident)
-         :parent-cols (mapv params/unquote-ident (or (.getFkSourceColumns exp) []))
+         :parent-cols (referenced-columns (.getFkSourceColumns exp))
          :on-delete (action net.sf.jsqlparser.statement.ReferentialAction$Type/DELETE)
          :on-update (action net.sf.jsqlparser.statement.ReferentialAction$Type/UPDATE)})
 
@@ -1262,69 +1315,11 @@
                 :pg/check-conname  cname
                 :pg/check-table    table-name
                 :pg/check-expr     expr}))
-        child-schema-by-col
-        (into {}
-              (keep (fn [datum]
-                      (when-let [ident (and (map? datum) (:db/ident datum))]
-                        (when (= table-name (namespace ident))
-                          [(name ident) datum]))))
-              schema-tx)
-        ;; FK-constraint entities. Column lists stored as
-        ;; JSON-serialized strings for order-preserving round-trip.
+        ;; Store the referenced column list as written. Omitted columns
+        ;; resolve against the current catalog when CREATE commits.
         fk-entities
-        (vec (for [[i {:keys [name cols parent-table parent-cols on-delete on-update]}]
-                   (map-indexed vector (:fks constraints))
+        (vec (for [{:keys [name cols parent-table parent-cols on-delete on-update]} (:fks constraints)
                    :let [cname (choose! name (str/join "_" cols) "fkey")
-                         ;; SQL's omitted referenced-column list means the
-                         ;; parent's PRIMARY KEY, not an empty tuple.  Keeping
-                         ;; it empty made every inline `REFERENCES parent`
-                         ;; check vacuous and was particularly visible in the
-                         ;; upstream enum regression test.
-                         parent-cols (if (seq parent-cols)
-                                       parent-cols
-                                       (or (primary-key-cols db parent-table)
-                                           (throw
-                                            (ex-info
-                                             (str "there is no primary key for referenced table \""
-                                                  parent-table "\"")
-                                             {:sqlstate "42830"
-                                              :constraint cname
-                                              :table parent-table}))))
-                         _ (when-not (= (count cols) (count parent-cols))
-                             (throw
-                              (ex-info "number of referencing and referenced columns disagree"
-                                       {:sqlstate "42830"
-                                        :constraint cname
-                                        :table table-name})))
-                         ;; Enum equality is nominal: two enums with the same
-                         ;; string carrier (or even identical labels) remain
-                         ;; incompatible PostgreSQL types.  Validate their
-                         ;; identity at DDL time before the storage lowering
-                         ;; to :db.type/string erases that distinction.
-                         _ (doseq [[child-col parent-col]
-                                   (map vector cols parent-cols)
-                                   :let [child-enum
-                                         (:datahike.pg/enum-of
-                                          (get child-schema-by-col child-col))
-                                         parent-enum
-                                         (attr-enum-name
-                                          db (keyword parent-table parent-col))]
-                                   :when (and (or child-enum parent-enum)
-                                              (not= child-enum parent-enum))]
-                             (throw
-                              (ex-info
-                               (str "foreign key constraint \"" cname
-                                    "\" cannot be implemented")
-                               {:sqlstate "42804"
-                                :constraint cname
-                                :table table-name
-                                :detail
-                                (str "Key columns \"" child-col
-                                     "\" of the referencing table and \""
-                                     parent-col
-                                     "\" of the referenced table are of incompatible types: "
-                                     (or child-enum "non-enum") " and "
-                                     (or parent-enum "non-enum") ".")})))
                          ->action (fn [s]
                                     (when s
                                       (case (str/lower-case s)
