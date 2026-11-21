@@ -27,7 +27,24 @@
      :boundaries #{:array-expressions :array-codec :polymorphism},
      :requires ["test_setup"],
      :mode :discovery
-     :blockers #{:array-functions :array-input-and-bounds :array-type-resolution}}
+     :blockers #{:array-functions :array-input-and-bounds :array-type-resolution}
+     :strict-slices
+     [{:id :array-sort
+       :source-lines [865 868]
+       :gate "test/datahike/test/pg_array_sql_test.clj"
+       :test-var "postgres-array-sort-numeric-slices"}
+      {:id :array-sort-direction-and-nulls
+       :source-lines [874 881]
+       :gate "test/datahike/test/pg_array_sql_test.clj"
+       :test-var "postgres-array-sort-numeric-slices"}
+      {:id :array-sort-numeric-dimensions
+       :source-lines [884 885]
+       :gate "test/datahike/test/pg_array_sql_test.clj"
+       :test-var "postgres-array-sort-numeric-slices"}
+      {:id :array-sort-preserves-bounds
+       :source-lines [894 895]
+       :gate "test/datahike/test/pg_array_sql_test.clj"
+       :test-var "postgres-array-sort-numeric-slices"}]}
     {:name "uuid",
      :boundaries
      #{:scalar-type :type-inference :input-codec :volatile-functions :operators :temporal-extraction},

@@ -2198,6 +2198,32 @@
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      (= fname "array_sort")
+      (let [[array-oid & flag-oids :as oids] (call-arg-oids ctx arg-exprs)
+            elem-oid (types/array-oid->element-oid array-oid)
+            _ (when (or (not (<= 1 (count oids) 3))
+                        (and array-oid (nil? elem-oid))
+                        (some #(and % (not= % types/oid-bool)) flag-oids))
+                (throw (no-such-function fname oids)))
+            _ (when-not elem-oid
+                (throw (ex-info "could not determine polymorphic type because input has type unknown"
+                                {:sqlstate "42804"})))
+            elem-type (types/oid->elem-kw elem-oid)
+            fn-param (symbol (str "?array-sort" (swap! (:var-counter ctx) inc)))
+            read-bool (fn [v] (if (string? v) (input/parse-bool v) v))
+            impl-fn (fn [v & flags]
+                      (if (or (fns/sql-null? v) (some fns/sql-null? flags))
+                        :__null__
+                        (let [descending? (read-bool (first flags))
+                              nulls-first? (if (= 2 (count flags))
+                                             (read-bool (second flags))
+                                             descending?)]
+                          (fns/array-sort (coerce-pg-array v elem-type) descending? nulls-first?))))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (ctx/add-clause! ctx [(apply list fn-param args) result-var])
+        result-var)
+
       ;; array_position(arr, v [, start]) — PG rejects multi-dim
       ;; (`array_userfuncs.c:1345`). Returns position relative to
       ;; lbound. NULL arr → NULL; not-found → NULL; matches IS NOT

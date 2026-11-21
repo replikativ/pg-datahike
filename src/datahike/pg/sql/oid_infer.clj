@@ -281,6 +281,7 @@
    "array_position" types/oid-int4
    "array_remove"  :compatible-array-first
    "array_replace" :compatible-array-first
+   "array_sort"    :first-arg
    "array_fill"    :arg-array})
 
 (def sql-aggregate->return-oid
@@ -1209,10 +1210,11 @@
             base-oid)))
 
       ;; --- Array constructor / subscript --------------------------------
-      ;; ARRAY[…] → T[] where T is the LUB of element OIDs; fall back
-      ;; to text[] for empty or mixed.
+      ;; A bare NULL does not participate in the array element's common
+      ;; type. A typed NULL, such as NULL::text, still contributes.
       (instance? ArrayConstructor expr)
       (let [elem-oids (->> (.getExpressions ^ArrayConstructor expr)
+                           (remove #(instance? NullValue %))
                            (keep #(expr-oid % env))
                            vec)
             common-oid (types/select-common-type elem-oids "ARRAY" true)]
