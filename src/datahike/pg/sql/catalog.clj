@@ -290,6 +290,12 @@
                 (assoc r :pg_attribute/attcollation
                        (long (types/typcollation (:pg_attribute/atttypid r)))))
               rows)
+        "pg_constraint"
+        ;; All supported constraints are enforced, local and non-temporal.
+        (mapv #(assoc % :pg_constraint/conenforced true
+                      :pg_constraint/conparentid 0
+                      :pg_constraint/conperiod false)
+              rows)
         rows))))
 
 (defn catalog-schema-for*
@@ -996,12 +1002,15 @@
      ;; The index a PRIMARY KEY / UNIQUE constraint is enforced by; 0 for
      ;; a CHECK. psql's \d joins pg_index to pg_constraint on it.
      {:db/ident :pg_constraint/conindid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_constraint/conparentid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/conrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/connamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/confrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condeferrable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condeferred :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conenforced :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/convalidated :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conperiod :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/conkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/confkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condef :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -1016,6 +1025,9 @@
      {:db/ident :pg_extension/extnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_extension/extrelocatable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_extension/extversion :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; The built-in vector extension has no dumpable configuration tables.
+     {:db/ident :pg_extension/extconfig :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_oid"}
+     {:db/ident :pg_extension/extcondition :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
      {:db/ident (pgs/row-marker-attr "pg_extension") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_tables"
     [{:db/ident :pg_tables/schemaname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
