@@ -8,6 +8,7 @@
   "PG_LIBDIR/PG_DLSUFFIX require the release's regression library. Missing native helpers are fixture boundaries, not blanket exclusions of client-visible behavior.",
   :measurement :partial},
  :admission :partial,
+ :residual-map "residuals.edn",
  :ordering-prerequisites
  {"select_parallel" ["create_misc"],
   "horology" ["date" "time" "timetz" "timestamp" "timestamptz" "interval"],

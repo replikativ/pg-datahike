@@ -1,0 +1,88 @@
+{:postgres-ref "REL_18_6"
+ :source-commit "724edf9bde9d356724ad384a2e196edc3c9f80f7"
+ :target-revision "adc0f41922891b542076ada3e7a73967f4b96944"
+ :target-jar-sha256 "a19296101d30a076fde9f8be55ef9bc47a364bd710d3c355c8acffb91d72dce9"
+ :outcomes {
+  :matches #{"advisory_lock" "boolean" "comments" "delete" "lseg" "macaddr" "md5"
+    "numeric_big" "portals_p2" "select_having" "select_implicit"}
+  :differs #{"aggregates" "alter_generic" "alter_operator" "alter_table" "arrays" "async" "bit"
+    "box" "case" "char" "circle" "collate" "constraints" "conversion"
+    "copy" "copy2" "copydml" "copyencoding" "copyselect" "create_aggregate" "create_cast"
+    "create_function_sql" "create_index" "create_misc" "create_operator" "create_procedure" "create_schema" "create_table"
+    "create_table_like" "create_type" "create_view" "date" "dbsize" "domain" "drop_if_exists"
+    "drop_operator" "encoding" "enum" "errors" "euc_kr" "event_trigger" "event_trigger_login"
+    "explain" "expressions" "fast_default" "float4" "float8" "foreign_key" "generated_stored"
+    "generated_virtual" "geometry" "groupingsets" "horology" "identity" "inet" "inherit"
+    "insert" "insert_conflict" "int2" "int4" "int8" "interval" "json"
+    "json_encoding" "jsonb" "jsonb_jsonpath" "jsonpath" "jsonpath_encoding" "largeobject" "limit"
+    "line" "lock" "macaddr8" "matview" "merge" "misc" "misc_functions"
+    "misc_sanity" "money" "multirangetypes" "mvcc" "name" "namespace" "numeric"
+    "numerology" "object_address" "oid" "opr_sanity" "path" "pg_lsn" "plancache"
+    "plpgsql" "point" "polygon" "polymorphism" "portals" "prepare" "prepared_xacts"
+    "psql" "psql_crosstab" "psql_pipeline" "random" "rangefuncs" "rangetypes" "regex"
+    "regproc" "returning" "rowtypes" "rules" "select" "select_distinct" "select_distinct_on"
+    "select_into" "select_views" "sequence" "sqljson" "sqljson_jsontable" "sqljson_queryfuncs" "strings"
+    "subselect" "sysviews" "tablesample" "temp" "test_setup" "text" "time"
+    "timestamp" "timestamptz" "timetz" "transactions" "triggers" "truncate" "tsdicts"
+    "tsearch" "tsrf" "tstypes" "txid" "type_sanity" "typed_table" "unicode"
+    "union" "updatable_views" "update" "uuid" "varchar" "window" "with"
+    "without_overlaps" "xid" "xml" "xmlmap"}
+  :incomplete #{"database" "join"}}
+ :fixture-readiness {
+  :ready #{"boolean" "psql_pipeline"}
+  :fixture-limited #{"alter_generic" "conversion" "copy2" "create_type" "create_view" "encoding" "lock"
+    "misc" "misc_functions" "multirangetypes" "opr_sanity" "rangetypes" "select_views" "triggers"
+    "type_sanity"}
+  :unverified #{"advisory_lock" "aggregates" "alter_operator" "alter_table" "arrays" "async" "bit"
+    "box" "case" "char" "circle" "collate" "comments" "constraints"
+    "copy" "copydml" "copyencoding" "copyselect" "create_aggregate" "create_cast" "create_function_sql"
+    "create_index" "create_misc" "create_operator" "create_procedure" "create_schema" "create_table" "create_table_like"
+    "database" "date" "dbsize" "delete" "domain" "drop_if_exists" "drop_operator"
+    "enum" "errors" "euc_kr" "event_trigger" "event_trigger_login" "explain" "expressions"
+    "fast_default" "float4" "float8" "foreign_key" "generated_stored" "generated_virtual" "geometry"
+    "groupingsets" "horology" "identity" "inet" "inherit" "insert" "insert_conflict"
+    "int2" "int4" "int8" "interval" "join" "json" "json_encoding"
+    "jsonb" "jsonb_jsonpath" "jsonpath" "jsonpath_encoding" "largeobject" "limit" "line"
+    "lseg" "macaddr" "macaddr8" "matview" "md5" "merge" "misc_sanity"
+    "money" "mvcc" "name" "namespace" "numeric" "numeric_big" "numerology"
+    "object_address" "oid" "path" "pg_lsn" "plancache" "plpgsql" "point"
+    "polygon" "polymorphism" "portals" "portals_p2" "prepare" "prepared_xacts" "psql"
+    "psql_crosstab" "random" "rangefuncs" "regex" "regproc" "returning" "rowtypes"
+    "rules" "select" "select_distinct" "select_distinct_on" "select_having" "select_implicit" "select_into"
+    "sequence" "sqljson" "sqljson_jsontable" "sqljson_queryfuncs" "strings" "subselect" "sysviews"
+    "tablesample" "temp" "test_setup" "text" "time" "timestamp" "timestamptz"
+    "timetz" "transactions" "truncate" "tsdicts" "tsearch" "tsrf" "tstypes"
+    "txid" "typed_table" "unicode" "union" "updatable_views" "update" "uuid"
+    "varchar" "window" "with" "without_overlaps" "xid" "xml" "xmlmap"}}
+ ;; These findings describe named statement ranges. A file can have further causes.
+ :findings
+ [{:id :simple-query-copy-continuation
+   :file "copyselect" :lines [90 96] :state :covered :impact :wrong-result
+   :detail "COPY-IN used to drop subsequent commands and retain only the first batch."}
+  {:id :materialized-view-with-no-data
+   :file "matview" :lines [17 19] :state :open :impact :wrong-result
+   :detail "The catalog reports relispopulated true for an unpopulated view even though a direct scan rejects it."}
+  {:id :or-join-heap-exhaustion
+   :file "join" :lines [3835 3836] :state :open :impact :internal-error
+   :detail "The OR join over two 10,000-row inputs terminated its connection with a Java heap error."}
+  {:id :infinite-interval-date-bin
+   :file "interval" :lines [772 773] :state :open :impact :internal-error
+   :detail "An infinite interval stride reaches a Java date-to-interval cast instead of a PostgreSQL error."}
+  {:id :database-rename-fixture
+   :file "database" :lines [1 5] :state :boundary :impact :fixture
+   :detail "Unsupported rename leaves a run-created database under the original name."}
+  {:id :legacy-copy-force-quote
+   :file "copyselect" :lines [65 65] :state :open :impact :unsupported
+   :detail "The legacy FORCE QUOTE option is rejected."}
+  {:id :array-sort
+   :file "arrays" :lines [865 868] :state :open :impact :unsupported
+   :detail "PostgreSQL array_sort overloads are missing."}
+  {:id :create-table-as-execute
+   :file "prepare" :lines [62 65] :state :open :impact :unsupported
+   :detail "CREATE TABLE AS EXECUTE is rejected by the parser."}
+  {:id :virtual-generated-columns
+   :file "generated_virtual" :lines [8 9] :state :boundary :impact :unsupported
+   :detail "VIRTUAL generated columns are explicitly rejected."}
+  {:id :grouping-family
+   :file "groupingsets" :lines [87 106] :state :boundary :impact :unsupported
+   :detail "GROUPING SETS, ROLLUP, and CUBE are rejected before materialization."}]}

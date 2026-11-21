@@ -133,6 +133,28 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"independently of fixtures"
                           (inventory/validate! cfg strict scope ledger)))))
 
+(deftest residuals-account-for-the-scope-and-require-evidence-for-coverage
+  (let [{:keys [cfg campaign scope ledger manifest manifest-file]} (fixture!)
+        residual-file (io/file *temporary* "residuals.edn")
+        residuals {:postgres-ref "REL_18_6"
+                   :source-commit (get-in manifest [:reference :commit])
+                   :target-revision (apply str (repeat 40 "a"))
+                   :target-jar-sha256 (apply str (repeat 64 "b"))
+                   :outcomes {:matches #{"test_setup"} :differs #{"foo"} :incomplete #{"numeric_big"}}
+                   :fixture-readiness {:ready #{"test_setup"} :fixture-limited #{} :unverified #{"foo" "numeric_big"}}
+                   :findings [{:id :foo-result :file "foo" :lines [1 1] :state :open
+                               :impact :wrong-result :detail "A documented result difference."}]}]
+    (spit manifest-file (pr-str (assoc manifest :residual-map "residuals.edn")))
+    (spit residual-file (pr-str residuals))
+    (is (= residuals (:residuals (inventory/validate! cfg campaign scope ledger))))
+    (doseq [bad [(update-in residuals [:outcomes :matches] conj "foo")
+                 (update-in residuals [:outcomes :differs] disj "foo")
+                 (assoc-in residuals [:findings 0 :lines] [1 2])
+                 (assoc-in residuals [:findings 0 :state] :covered)]]
+      (spit residual-file (pr-str bad))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"audited inventory"
+                            (inventory/validate! cfg campaign scope ledger))))))
+
 (deftest shared-campaign-entrypoint-validates-audit-before-agreement-or-waves
   (let [{:keys [cfg campaign scope ledger manifest manifest-file]} (fixture!)
         paths (into {} (for [[kind data] [[:campaign (assoc campaign :postgres-major 18 :postgres-ref "REL_18_6")]

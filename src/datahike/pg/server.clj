@@ -5792,18 +5792,11 @@
               (reset! plans {}))
             result))))))
 
-(def ^:private ^:dynamic *implicit-tx-allowed*
-  "When true (bound by executePrepared for the extended-query path), a
-   write executed outside an explicit BEGIN block opens an *implicit*
-   transaction in tx-state instead of auto-committing. PostgreSQL runs
-   every extended-query message group (the messages up to the next Sync)
-   as one implicit transaction; we mirror that by accumulating the
-   group's writes speculatively and committing them at Sync
-   (commitImplicit), so the whole group is atomic and a trailing
-   ROLLBACK / mid-group error rolls it back. The simple-query path leaves
-   this false until that path is unified too (see
-   doc/design-alignment.md)."
-  false)
+(def ^:private ^:dynamic *implicit-tx-group*
+  "Wire group owning the implicit transaction. Simple Query groups end
+   at the end of the message, extended groups end at Sync, and direct
+   execution has no group."
+  nil)
 
 (defn- substitute-insert-source-params [source-plan fetch]
   (cond-> (update source-plan :source params/substitute-select-plan fetch)
@@ -6737,7 +6730,13 @@
 (defn- handle-begin
   [{:keys [conn tx-state session-state temp-tables]} parsed]
   (if (:in-tx? @tx-state)
-    (tag-tx-status (empty-result "BEGIN") tx-state)
+    (do
+      ;; BEGIN later in a Simple Query promotes its implicit block. Keep
+      ;; the staged work and hand ownership of the commit to the client.
+      (when (:implicit? @tx-state)
+        (swap! tx-state assoc :implicit? false)
+        (guc/begin! session-state))
+      (tag-tx-status (empty-result "BEGIN") tx-state))
     (let [real-db (d/db conn)]
       (swap! tx-state assoc
              :in-tx? true :aborted? false :tx-buffer []
@@ -7028,9 +7027,8 @@
 (def ^:private write-parse-types
   "Parsed :type values that mutate the database. A write executed in an
    extended-query group outside an explicit BEGIN opens an implicit
-   transaction (see open-implicit-tx! / *implicit-tx-allowed*) so the
-   whole group is atomic. COPY is excluded — it runs its own sub-protocol
-   and commits separately."
+   transaction (see open-implicit-tx! / *implicit-tx-group*) so the whole
+   group is atomic. COPY is classified separately by direction."
   #{:insert :update :delete :truncate
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
     :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
@@ -7043,16 +7041,12 @@
     ;; buffered/explicit transaction at their narrower execution boundary.
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
+(defn- copy-from? [parsed]
+  (and (= :copy-from-stdin (:kind parsed)) (= :from (:direction parsed))))
+
 (defn- reject-read-only-write!
   [tx-state session-state parsed]
-  (let [write-type (if (and (= :copy-from-stdin (:kind parsed))
-                            ;; COPY owns its transaction/sub-protocol and
-                            ;; therefore is a :system parse, deliberately
-                            ;; absent from write-parse-types. Only the FROM
-                            ;; direction writes -- COPY TO is a read, and
-                            ;; PostgreSQL allows it in a read-only
-                            ;; transaction.
-                            (not= :to (:direction parsed)))
+  (let [write-type (if (copy-from? parsed)
                      :copy-from-stdin
                      (:type parsed))]
     (when (and (or (contains? write-parse-types write-type)
@@ -14556,7 +14550,7 @@
       (executePrepared [this parsed bound-params]        ;; bound-params is a 1-indexed Object[] (element 0 unused). We
         ;; thread it through via dynamic bindings so the existing
         ;; `execute` dispatch body handles everything else unchanged.
-        ;; *implicit-tx-allowed* true: this is the extended-query path,
+        ;; This is the extended-query path,
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
@@ -14607,14 +14601,17 @@
                        ;; *cached-bound* retains the wire protocol's unused
                        ;; slot 0 for ParamRef substitution.
                        params/*bound-params* (vec (rest bound))
-                       *implicit-tx-allowed* true]
+                       *implicit-tx-group* :extended]
                (.execute this (or (:sql parsed) "")))))))
 
       (executeInGroup [this sql]
+        (.executeInGroup this sql false))
+
+      (executeInGroup [this sql multi-statement?]
         ;; Simple-query group member: a write opens/joins the 'Q''s
         ;; implicit transaction (committed at end-of-'Q' via
         ;; commitImplicit) so a multi-statement Simple Query is atomic.
-        (binding [*implicit-tx-allowed* true]
+        (binding [*implicit-tx-group* (if multi-statement? :simple-multi :simple)]
           (.execute this sql)))
 
       (execute [this sql]
@@ -14987,10 +14984,12 @@
                           ;; See open-implicit-tx! / commitImplicit and
                           ;; doc/design-alignment.md.
                           (reject-read-only-write! tx-state session-state parsed)
-                          (when (and *implicit-tx-allowed*
+                          (when (and *implicit-tx-group*
                                      (not *snapshot-db*)
                                      (not (:in-tx? @tx-state))
-                                     (contains? write-parse-types (:type parsed)))
+                                     (or (contains? write-parse-types (:type parsed))
+                                         (and (= :simple-multi *implicit-tx-group*)
+                                              (copy-from? parsed))))
                             (open-implicit-tx! ctx))
                           (binding [params/*runtime-db* db
                                     regoid/*db* db
@@ -15158,6 +15157,8 @@
   (reify PgWireServer$QueryHandler
     (execute [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.execute h sql))))
     (executeInGroup [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.executeInGroup h sql))))
+    (executeInGroup [_ sql multi-statement?]
+      (collecting-notices #(pg-resolve/with-symbol-resolver (.executeInGroup h sql multi-statement?))))
     (parse [_ sql oids] (pg-resolve/with-symbol-resolver (.parse h sql oids)))
     (reparse [_ sql oids previous] (pg-resolve/with-symbol-resolver (.reparse h sql oids previous)))
     (describeParams [_ parsed] (pg-resolve/with-symbol-resolver (.describeParams h parsed)))

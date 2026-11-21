@@ -424,6 +424,25 @@
       (println (format "  admitted   %s/%s lines %d-%d"
                        name (clojure.core/name id) (first source-lines) (second source-lines))))))
 
+(defn- print-residuals! []
+  (let [{:keys [target-revision outcomes fixture-readiness findings]} (:residuals audited-inventory)]
+    (when-not outcomes (fail! "no residual map for this profile"))
+    (println (str "Paired discovery against " (:postgres-ref campaign)
+                  " (target " (subs target-revision 0 7) ")"))
+    (println "  Output outcomes:" (into (sorted-map) (map (fn [[k xs]] [k (count xs)])) outcomes))
+    (println "  Target fixture readiness:" (into (sorted-map) (map (fn [[k xs]] [k (count xs)])) fixture-readiness))
+    (let [untriaged (set/difference (set/union (:differs outcomes) (:incomplete outcomes))
+                                    (set (map :file findings)))
+          wave-names (into {} (map (juxt :id :name)) (:waves campaign))
+          outstanding (filter #(untriaged (:name %)) (get-in audited-inventory [:manifest :dispositions]))
+          area #(or (wave-names (:wave %)) (name (:reason %)))]
+      (println "  Differing or incomplete files with no recorded finding:" (count untriaged))
+      (doseq [[label entries] (sort-by key (group-by area outstanding))]
+        (println (format "    %3d %s" (count entries) label))))
+    (doseq [{:keys [file lines state impact detail]} findings]
+      (println (format "  %s:%d-%d [%s/%s] %s" file (first lines) (second lines)
+                       (name state) (name impact) detail)))))
+
 (defn- run-tests! [runner env names]
   (apply shell {:dir (str repo-root)}
          (concat ["env"
@@ -472,6 +491,7 @@
 
 (cond
   (= ["inventory"] *command-line-args*) (print-inventory!)
+  (= ["residuals"] *command-line-args*) (print-residuals!)
   (empty? *command-line-args*) (print-campaign!)
   (= ["strict"] *command-line-args*)
   (let [tests (filter #(= :strict (:mode %)) (campaign-tests))]
