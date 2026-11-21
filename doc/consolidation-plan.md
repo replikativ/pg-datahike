@@ -491,14 +491,13 @@ N+1 and is the thing 7.2 and 7.3 must avoid wherever the shape allows.
 
 ## After the PostgreSQL 18.6 compatibility batch — live PostgreSQL mirroring
 
-Finish the 18.6 cutover and the current application-facing batch covering
-schema changes, writes, transactions, and COPY. Then prototype a read-only
-pg-datahike mirror of a PostgreSQL publication. Start with an exported
-snapshot loaded via COPY, follow native `pgoutput` with pgJDBC, and replay
-each committed transaction as parameterized SQL. The transport probe
-passed against PostgreSQL 18.6. The prototype milestone is a two-table
-mirror that resumes after a crash with the same current rows and no
-duplicate history. Track the remaining SQL work in the
+The 18.6 cutover shipped in v0.1.414. The two-table prototype followed
+native `pgoutput` with pgJDBC after loading an exported COPY snapshot.
+It applied committed transactions as parameterized SQL and resumed
+after a crash with matching current rows and one destination history
+transaction per source commit. The next subscriber milestone is a
+database-enforced read-only mirror with an internal writer. Track the
+remaining SQL work in the
 [regression baseline](postgres-regress-baseline.md) and the subscriber
 milestones in [the mirroring proposal](postgres-mirroring.md).
 

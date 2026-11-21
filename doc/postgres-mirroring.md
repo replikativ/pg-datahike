@@ -1,8 +1,9 @@
 # Mirroring a live PostgreSQL, with our semantics
 
-**Transport verified locally.** The subscriber prototype is queued after
-the PostgreSQL 18.6 cutover and the current application-facing
-compatibility batch. See the [roadmap](consolidation-plan.md).
+**Two-table subscriber verified locally against PostgreSQL 18.6.**
+The [prototype](../test/datahike/pg/mirror_prototype.clj) uses native
+`pgoutput`, COPY and pg-datahike's existing SQL transaction path.
+See the [roadmap](consolidation-plan.md) for productizing the subscriber.
 
 ## The goal
 
@@ -38,7 +39,9 @@ update, insert, and delete across two tables in one commit and omitted
 a rolled-back insert. Receiving the commit and sending status feedback
 left `confirmed_flush_lsn` at the slot's start position. Setting the
 applied and flushed LSNs explicitly advanced it to the transaction's end
-position. Destination apply and crash recovery still need a prototype.
+position. The prototype applies decoded rows and updates its checkpoint
+in one local SQL transaction. The ordinary SQL commit uses
+`transact-recorded!`.
 
 Generate parameterized SQL from decoded row changes for the first apply
 implementation. Keep one write path and one commit boundary. Use the
@@ -118,7 +121,7 @@ excluded.
 ## Subscriber milestones
 
 - [x] Verify the native transport, slot snapshot, and explicit feedback.
-- [ ] After the 18.6 compatibility batch, use a local REPL prototype to mirror
+- [x] Use a local REPL prototype to mirror
   two ordinary keyed tables. Keep writes going during COPY. Apply a
   multi-table transaction with a key change, a delete, and an update that
   leaves a large value unchanged. Kill the worker after the destination
@@ -131,6 +134,34 @@ excluded.
   and the full integration suites before opening the PR.
 - [ ] Extend table synchronization and schema evolution, recovery after
   slot loss, failover handling, and support for large transactions.
+
+### Running the prototype probe
+
+Set `PG_MIRROR_SOURCE_URL` to a JDBC URL for an empty native PostgreSQL
+18 database on a server with `wal_level=logical`. The connection needs
+to create the test publication and replication slot. Run the probe from
+the repository root after compiling the Java sources with `bb prep`.
+
+```bash
+clojure -M:dev -m datahike.pg.mirror-probe
+```
+
+The probe opens a file-backed pg-datahike store with history enabled.
+While COPY reads the exported snapshot, the publisher commits an update
+with an unchanged TOAST field, a primary-key change, an insert and a
+delete. A separate process applies the commit and is halted before
+acknowledgement. The probe reopens the store, verifies the duplicate
+arrives without adding history, then follows another commit with an
+explicit NULL. It compares current rows, the checkpoint, and historical
+rows from before the first apply.
+
+The prototype accepts whole-table publications with default primary-key
+replica identity and supported primitive column types. Keep the
+destination private to the worker while exercising the probe. A
+database-enforced read-only endpoint, schema drift handling beyond
+rejection, and transactional streaming for large commits are separate
+subscriber milestones. The probe prints the local store and worker log
+directory and uses a slot in the disposable source database.
 
 ## Known performance trap in Option 2, today
 
