@@ -104,7 +104,12 @@
        :source-lines [161 163]
        :gate "test/datahike/test/pg_check_constraint_test.clj"
        :test-var "postgres-create-table-rejects-invalid-options"}]}
-    {:name "constraints", :boundaries #{:constraints :ddl}, :mode :unmeasured}
+    {:name "constraints", :boundaries #{:constraints :defaults :ddl}, :mode :unmeasured
+     :strict-slices
+     [{:id :unparenthesized-arithmetic-default
+       :source-lines [32 40]
+       :gate "test/datahike/test/pg_expression_default_test.clj"
+       :test-var "compound-arithmetic-defaults"}]}
     {:name "insert", :boundaries #{:constraints :defaults :insert-select :dml}, :mode :unmeasured}
     {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :unmeasured}
     {:name "update", :boundaries #{:update-from :dml :row-assignment}, :mode :unmeasured}

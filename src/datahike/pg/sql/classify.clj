@@ -728,17 +728,18 @@
 (defn- read-relation-name
   "Consume one `[ONLY] [schema.]name [*]` from the token stream.
    Returns [last-name-segment remaining-toks], or nil when the head is
-   not a relation name. The schema qualifier is dropped (single-
-   namespace store — mirrors the JSqlParser Drop branch's
-   `(-> .getName .getName)` in parse-sql)."
-  [toks]
-  (let [toks (if (kw=? (first toks) "only") (rest toks) toks)]
-    (when (ident-tok? (first toks))
-      (loop [nm (ident-text (first toks))
-             ts (rest toks)]
-        (if (and (= "." (:text (first ts))) (ident-tok? (second ts)))
-          (recur (ident-text (second ts)) (drop 2 ts))
-          [nm (if (= "*" (:text (first ts))) (rest ts) ts)])))))
+   not a relation name. The schema qualifier is dropped for the
+   single-namespace store. The optional token reader can preserve the raw SQL
+   spelling for callers that normalize identifiers after classification."
+  ([toks] (read-relation-name toks ident-text))
+  ([toks token-name]
+   (let [toks (if (kw=? (first toks) "only") (rest toks) toks)]
+     (when (ident-tok? (first toks))
+       (loop [nm (token-name (first toks))
+              ts (rest toks)]
+         (if (and (= "." (:text (first ts))) (ident-tok? (second ts)))
+           (recur (token-name (second ts)) (drop 2 ts))
+           [nm (if (= "*" (:text (first ts))) (rest ts) ts)]))))))
 
 (defn- read-relation-list
   "Comma-separated relation names (each per read-relation-name).
@@ -1497,7 +1498,7 @@
                   (kw=? (second toks) "not")
                   (kw=? (nth toks 2 nil) "exists"))
         ts (if ine? (drop 3 toks) toks)]
-    (or (when-let [[nm ts1] (read-relation-name ts)]
+    (or (when-let [[nm ts1] (read-relation-name ts :text)]
           (let [[opts ts2] (read-sequence-options ts1)
                 ts3 (drop-while #(= ";" (:text %)) ts2)]
             (when (empty? ts3)
@@ -1517,7 +1518,7 @@
   [toks]
   (let [ie? (and (kw=? (first toks) "if") (kw=? (second toks) "exists"))
         ts (if ie? (drop 2 toks) toks)]
-    (or (when-let [[nm ts1] (read-relation-name ts)]
+    (or (when-let [[nm ts1] (read-relation-name ts :text)]
           (let [[opts ts2] (read-sequence-options ts1)
                 ts3 (drop-while #(= ";" (:text %)) ts2)]
             (when (and (seq opts) (empty? ts3))

@@ -923,8 +923,8 @@
 ;; made at execute.
 ;; ============================================================================
 
-(defn- create-table-options-start
-  "First token after a CREATE TABLE column list."
+(defn- create-table-column-list-start
+  "Opening parenthesis of a CREATE TABLE column list."
   [code]
   (when (= "create" (kw-text (first code)))
     (let [table (skip-non-comment code 1
@@ -937,9 +937,15 @@
               after-name (loop [i (inc name-start)]
                            (if (punct? (nth code i nil) ".") (recur (+ i 2)) i))]
           (when (punct? (nth code after-name nil) "(")
-            (let [after-cols (match-paren-group code after-name)]
-              (when (punct? (nth code (dec after-cols) nil) ")")
-                after-cols))))))))
+            after-name))))))
+
+(defn- create-table-options-start
+  "First token after a CREATE TABLE column list."
+  [code]
+  (when-let [open (create-table-column-list-start code)]
+    (let [after-cols (match-paren-group code open)]
+      (when (punct? (nth code (dec after-cols) nil) ")")
+        after-cols))))
 
 (defn- table-oids-rule
   "Accept the legacy opt-out and reject OID storage before parsing DDL."
@@ -1098,6 +1104,65 @@
                                  (conj [close-end close-end ")"]))))))
 
                 :else (recur (inc i) acc)))))))))
+
+(defn- arithmetic-default-token? [tok]
+  (or (= :number (:type tok))
+      (and (= :op (:type tok)) (contains? #{"+" "-" "*" "/" "%"} (:text tok)))
+      (punct? tok "(")
+      (punct? tok ")")))
+
+(defn- default-constraint-start? [tok next-tok]
+  (let [word (kw-text tok)]
+    (or (contains? #{"check" "unique" "primary" "references" "generated" "collate"} word)
+        (and (= "not" word) (= "null" (kw-text next-tok))))))
+
+(defn- arithmetic-default-parens [code start column-list-end]
+  (loop [idx start, depth 0, operands 0]
+    (let [token (nth code idx)]
+      (if (and (< idx column-list-end) (arithmetic-default-token? token))
+        (cond
+          (punct? token "(") (recur (inc idx) (inc depth) operands)
+          (punct? token ")") (when (pos? depth) (recur (inc idx) (dec depth) operands))
+          (= :number (:type token)) (recur (inc idx) depth (inc operands))
+          :else (recur (inc idx) depth operands))
+        (when (and (zero? depth)
+                   (<= 2 operands)
+                   (or (= idx column-list-end)
+                       (punct? token ",")
+                       (default-constraint-start? token (nth code (inc idx) nil)))
+                   (not= idx (match-paren-group code start)))
+          (let [open (:pos (nth code start))
+                last-token (nth code (dec idx))]
+            (when (or (= :number (:type last-token)) (punct? last-token ")"))
+              (let [close (:end last-token)]
+                [[open open "("] [close close ")"]]))))))))
+
+(defn- arithmetic-default-spans [code open close]
+  (loop [idx (inc open), spans []]
+    (if (>= idx close)
+      spans
+      (let [token (nth code idx)]
+        (cond
+          (punct? token "(")
+          (recur (match-paren-group code idx) spans)
+
+          (= "default" (kw-text token))
+          (recur (inc idx) (into spans (arithmetic-default-parens code (inc idx) close)))
+
+          :else (recur (inc idx) spans))))))
+
+(defn arithmetic-default-paren-rule
+  "Wrap a numeric arithmetic column DEFAULT that JSqlParser's column grammar
+   cannot parse bare. Only numeric operands, arithmetic operators and grouped
+   terms qualify, preserving PostgreSQL's restrictions on unwrapped defaults."
+  [toks]
+  (let [toks (drop-while #(= :comment (:type %)) toks)]
+    (when (= "create" (kw-text (first toks)))
+      (let [code (vec (remove #(= :comment (:type %)) toks))]
+        (when-let [open (create-table-column-list-start code)]
+          (let [close (dec (match-paren-group code open))]
+            (when (punct? (nth code close nil) ")")
+              (arithmetic-default-spans code open close))))))))
 
 (defn json-path-operator-spacing-rule
   "Put a lexical boundary around PostgreSQL's `#>` and `#>>` operators.
@@ -1408,6 +1473,7 @@
    reserved-column-name-rule
    boolean-is-rule
    default-fn-call-paren-rule
+   arithmetic-default-paren-rule
    negative-numeric-scale-rule
    wide-integer-literal-rule
    dollar-quoted-string-rule

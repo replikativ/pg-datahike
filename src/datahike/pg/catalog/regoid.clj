@@ -76,7 +76,9 @@
         (when (= start end) (fail! "42602" "invalid name syntax"))
         [(truncate-ident (fold-ident (subs s start end))) end]))))
 
-(defn- qualified-name [s]
+(defn parse-qualified-name
+  "Parse a catalog name string, folding unquoted components and preserving quoted ones."
+  [s]
   (loop [i 0 names []]
     (let [[part end] (identifier s i)
           end (skip-space s end)
@@ -616,7 +618,7 @@
                          [] (conj args last-arg))]
               (when (> (count args) 100)
                 (fail! "54023" "functions cannot have more than 100 arguments"))
-              [(qualified-name (subs s 0 open)) args]))
+              [(parse-qualified-name (subs s 0 open)) args]))
           :else (recur (inc i) start depth false args))))))
 
 (defn input
@@ -631,13 +633,13 @@
               (fail! "22003" "OID out of range")))
           (numeric-oid s)
           (case kind
-            "regclass" (relation-input (qualified-name s))
-            "regnamespace" (namespace-input (qualified-name s))
+            "regclass" (relation-input (parse-qualified-name s))
+            "regnamespace" (namespace-input (parse-qualified-name s))
             "regtype" (type-oid *db* s)
             (let [[names args] (if (= kind "regprocedure")
                                  (let [[names types] (signature s)]
                                    [names (mapv #(type-oid *db* %) types)])
-                                 [(qualified-name s) nil])
+                                 [(parse-qualified-name s) nil])
                   matches (cond->> (candidates *db* names)
                             (some? args) (filter #(= args (:args %))))]
               (case (count matches)

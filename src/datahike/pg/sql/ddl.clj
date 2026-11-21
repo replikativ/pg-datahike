@@ -1631,7 +1631,8 @@
    (`increment\\s+by\\s+(\\d+)`), which could not see a negative increment
    and silently dropped MINVALUE/MAXVALUE/CACHE/CYCLE. See issue #21."
   [{:keys [seq-name seq-opts if-not-exists?]}]
-  (let [params (sequence-params seq-opts {})]
+  (let [seq-name (params/unquote-ident seq-name)
+        params (sequence-params seq-opts {})]
     {:type :ddl-create-sequence
      :seq-name seq-name
      :if-not-exists? if-not-exists?

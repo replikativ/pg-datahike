@@ -7394,6 +7394,19 @@
     (last (str/split seq-name #"\." 2))
     seq-name))
 
+(defn- sequence-reference-name
+  "Resolve a sequence argument to the stored name. Databases created before
+   sequence DDL folded unquoted names may still have a mixed-case spelling."
+  [db spelling]
+  (when spelling
+    (let [canonical (peek (regoid/parse-qualified-name spelling))
+          legacy (bare-sequence-name spelling)]
+      (if (and (not= canonical legacy)
+               (not (sequence-exists? db canonical))
+               (sequence-exists? db legacy))
+        legacy
+        canonical))))
+
 (defn- sequence-descriptor [db seq-name]
   (let [bare-name (bare-sequence-name seq-name)
         eid (when (get (dbi/-schema db) :__seq__/name)
@@ -7665,7 +7678,9 @@
   "SELECT nextval('seq_name') — wire wrapper around `nextval!`."
   [{:keys [conn tx-state session-state]} parsed]
   (try
-    (let [v (nextval-for-tx! conn tx-state (:seq-name parsed))]
+    (let [lookup-db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+          seq-name (sequence-reference-name lookup-db (:seq-name parsed))
+          v (nextval-for-tx! conn tx-state seq-name)]
       ;; Remember which sequence this session last advanced so lastval()
       ;; can answer. PG scopes lastval to the session for exactly this
       ;; reason — it is the "what id did my INSERT just get" idiom, and
@@ -7674,10 +7689,10 @@
         (swap! session-state
                (fn [st]
                  (-> st
-                     (assoc :last-sequence (:seq-name parsed))
+                     (assoc :last-sequence seq-name)
                      ;; currval is only defined for sequences THIS
                      ;; session has advanced.
-                     (update :seq-called (fnil conj #{}) (:seq-name parsed))))))
+                     (update :seq-called (fnil conj #{}) seq-name)))))
       (single-row-result "nextval" PgWireServer/OID_INT8 (str v)))
     (catch Exception e
       ;; No prefix: every error reachable here is already PG-shaped
@@ -7698,9 +7713,8 @@
    caller reads it as \"the id my insert just got\"."
   [{:keys [conn tx-state session-state]} parsed]
   (try
-    (let [seq-name (some-> (:seq-name parsed)
-                           (#(if (clojure.string/includes? % ".")
-                               (last (clojure.string/split % #"\." 2)) %)))]
+    (let [lookup-db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+          seq-name (sequence-reference-name lookup-db (:seq-name parsed))]
       (when-not (contains? (:seq-called @session-state #{}) seq-name)
         ;; ex-info with an explicit :sqlstate rather than errors/pg-error:
         ;; the latter's :detail also lands in the ErrorResponse's D field,
@@ -7708,10 +7722,7 @@
         (throw (ex-info (str "currval of sequence \"" seq-name
                              "\" is not yet defined in this session")
                         {:sqlstate "55000"})))
-      (let [lookup-db (if (:in-tx? @tx-state)
-                        (:speculative-db @tx-state)
-                        (d/db conn))
-            curr-val (ffirst (d/q '{:find [?v]
+      (let [curr-val (ffirst (d/q '{:find [?v]
                                     :where [[?e :__seq__/name ?n]
                                             [?e :__seq__/value ?v]]
                                     :in [$ ?n]}
@@ -7761,14 +7772,10 @@
    22003) instead of silently storing an out-of-range position."
   [{:keys [conn tx-state session-state]} parsed]
   (try
-    (let [seq-name (some-> (:seq-name parsed)
-                           (#(if (clojure.string/includes? % ".")
-                               (last (clojure.string/split % #"\." 2)) %)))
-          new-val (:new-value parsed)
+    (let [new-val (:new-value parsed)
           is-called? (get parsed :is-called true)
-          lookup-db (if (:in-tx? @tx-state)
-                      (:speculative-db @tx-state)
-                      (d/db conn))
+          lookup-db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+          seq-name (sequence-reference-name lookup-db (:seq-name parsed))
           seq-eid (ffirst (d/q '{:find [?e]
                                  :where [[?e :__seq__/name ?n]]
                                  :in [$ ?n]}

@@ -1244,7 +1244,8 @@
               ;; which live in the db — so it only carries the options here
               ;; and the executor resolves them.
               :alter-sequence
-              (assoc base :type :ddl-alter-sequence)
+              (assoc base :type :ddl-alter-sequence
+                     :seq-name (unquote-ident (:seq-name cls-info)))
 
               :create-domain
               (try
