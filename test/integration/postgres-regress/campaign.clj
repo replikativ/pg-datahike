@@ -352,7 +352,8 @@
                   audited-inventory (filter #(contains? (scheduled-tests) (:name %))))
         backlog-count (count (filter #(= :backlog (:status %)) entries))
         scheduled-count (count (scheduled-tests))
-        application-count (+ campaign-count backlog-count)
+        scheduled-campaign-count (count (filter (scheduled-tests) (map :name (campaign-tests))))
+        application-count (or (:application-count audited-inventory) (+ campaign-count backlog-count))
         {:keys [mode-counts slice-count slice-file-count gate-file-count
                 claimed-line-count unique-line-count duplicate-line-claims]}
         (campaign-metrics)
@@ -373,7 +374,7 @@
                           "%.1f%% of the complete schedule")
                      (* 100.0 (/ campaign-count application-count))
                      application-count
-                     (* 100.0 (/ campaign-count scheduled-count))))
+                     (* 100.0 (/ scheduled-campaign-count scheduled-count))))
     (println (format "    strict %d, discovery %d, unmeasured %d"
                      (get mode-counts :strict 0)
                      (get mode-counts :discovery 0)
@@ -462,7 +463,9 @@
                     (concat (when output-root
                               [(str "PG_REGRESS_OUTPUT=" (fs/file output-root test-name))])
                             (when strict?
-                              ["PG_REGRESS_API_STRICT=1" "PG_REGRESS_ISOLATE=1"]))
+                              (cond-> ["PG_REGRESS_API_STRICT=1" "PG_REGRESS_ISOLATE=1"]
+                                (contains? (:strict-fixtures audited-inventory) test-name)
+                                (conj "PG_REGRESS_MINIMAL_FIXTURE=1"))))
                     [test-name])))))
 
 (defn- run-wave! [wave-arg mode-arg]

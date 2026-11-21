@@ -21,6 +21,7 @@
     {:name "bit", :boundaries #{:scalar-type :nulls :operators}, :mode :unmeasured}
     {:name "rowtypes", :boundaries #{:row-comparisons :nulls :structural-type}, :mode :unmeasured}
     {:name "numeric", :boundaries #{:scalar-type :casts :operators}, :mode :unmeasured}
+    {:name "numeric_big", :boundaries #{:scalar-type :casts :operators}, :requires ["numeric"], :mode :strict}
     {:name "money", :boundaries #{:scalar-type :text-codec :casts :operators}, :mode :unmeasured}
     {:name "arrays",
      :boundaries #{:array-expressions :array-codec :polymorphism},
@@ -192,7 +193,7 @@
      :boundaries #{:prepared-statements :cursors :transactions},
      :requires ["test_setup"],
      :mode :unmeasured}
-    {:name "portals_p2", :boundaries #{:cursors :transactions}, :requires ["portals"], :mode :unmeasured}
+    {:name "portals_p2", :boundaries #{:cursors :transactions}, :requires ["portals"], :mode :strict}
     {:name "advisory_lock", :boundaries #{:advisory-locks :transactions}, :mode :strict}
     {:name "psql",
      :boundaries #{:prepared-statements :copy :catalogs :client-tooling},

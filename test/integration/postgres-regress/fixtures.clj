@@ -18,6 +18,32 @@
             "descriptor identity disagrees with reference")
     data))
 
+(defn strict-setup-sql [cfg data target]
+  (let [steps (get-in data [:strict-fixtures target])
+        root (:regress-root cfg)]
+    (check! (and (vector? steps) (seq steps)) (str "no strict fixture for " target))
+    (apply str
+           (for [{:keys [sql lines copy sha256] :as step} steps]
+             (if sql
+               (let [file (io/file root "sql" (str sql ".sql"))
+                     [start end] lines]
+                 (check! (and (= #{:sql :lines} (set (keys step)))
+                              (re-matches #"[a-z0-9_]+" sql) (.isFile file))
+                         (str "invalid strict SQL fixture for " target))
+                 (let [source (vec (str/split-lines (slurp file)))]
+                   (check! (and (vector? lines) (= 2 (count lines))
+                                (integer? start) (integer? end) (<= 1 start end (count source)))
+                           (str "invalid strict fixture source range for " target))
+                   (str (str/join "\n" (subvec source (dec start) end)) "\n")))
+               (let [filename (:data step)
+                     file (io/file root "data" (str filename))]
+                 (check! (and (= #{:copy :data :sha256} (set (keys step)))
+                              (string? copy) (re-matches #"[a-z_][a-z0-9_]*" copy)
+                              (string? filename) (re-matches #"[a-z0-9_]+\.data" filename)
+                              (.isFile file) (= sha256 (reference/file-sha256 file)))
+                         (str "strict COPY fixture identity changed for " target))
+                 (str "COPY " copy " FROM STDIN;\n" (slurp file) "\\.\n")))))))
+
 (defn ordered-closure [cfg data targets]
   (reference/validate-tests! cfg targets)
   (check! (= (count targets) (count (distinct targets))) "duplicate requested target")
@@ -459,7 +485,11 @@
         "validate-descriptor" (let [data (descriptor cfg)]
                                 (reference/validate-source! cfg)
                                 (ordered-closure cfg data [(:setup data)])
+                                (doseq [target (keys (:strict-fixtures data))]
+                                  (reference/validate-tests! cfg [target])
+                                  (strict-setup-sql cfg data target))
                                 (println "Fixture descriptor validated:" (:postgres-ref cfg)))
+        "strict-setup" (print (strict-setup-sql cfg (descriptor cfg) output))
         "plan" (let [data (start! cfg (System/getenv) output args)]
                  (doseq [{:keys [name directory kind statement-timeout process-timeout]} (:phases data)]
                    (print (str name \u0000 directory \u0000 (clojure.core/name kind) \u0000 statement-timeout \u0000 process-timeout \u0000))))

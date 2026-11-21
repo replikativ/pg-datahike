@@ -124,7 +124,6 @@ if [[ -n "${_PG_REGRESS_DLPATH:-}" ]]; then
 fi
 regress_command+=("$@")
 
-set +e
 if [[ -n "${statement_timeout}" ]]; then
   if [[ -n "${PGOPTIONS:-}" ]]; then
     export PGOPTIONS="${PGOPTIONS} -c statement_timeout=${statement_timeout}"
@@ -132,6 +131,21 @@ if [[ -n "${statement_timeout}" ]]; then
     export PGOPTIONS="-c statement_timeout=${statement_timeout}"
   fi
 fi
+if [[ "${PG_REGRESS_MINIMAL_FIXTURE:-0}" == "1" ]]; then
+  if [[ -z "${isolated_db}" || $# -ne 1 ]]; then
+    echo "A strict fixture needs one test in an isolated database." >&2
+    exit 2
+  fi
+  bb "${script_dir}/fixtures.clj" strict-setup "$1" >"${output_dir}/strict-setup.sql"
+  reference_psql -X --host="${target_host}" --port="${target_port}" \
+    --username="${target_user}" --dbname="${target_db}" --set=ON_ERROR_STOP=1 \
+    --single-transaction --file="${output_dir}/strict-setup.sql" \
+    >"${output_dir}/strict-setup.log" 2>&1 || {
+    cat "${output_dir}/strict-setup.log" >&2
+    exit 2
+  }
+fi
+set +e
 if [[ -n "${regress_timeout}" ]]; then
   timeout --kill-after=2s "${regress_timeout}" "${regress_command[@]}" \
     2>&1 | tee "${output_dir}/pg_regress.log"

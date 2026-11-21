@@ -26,6 +26,21 @@
       (try (binding [*temporary* dir] (f))
            (finally (doseq [file (reverse (file-seq dir))] (.delete file)))))))
 
+(deftest strict-fixtures-use-the-declared-slices-and-pinned-copy-data
+  (let [root *temporary*
+        _ (file! (io/file root "sql/setup.sql") "-- omitted\nCREATE TABLE fixture (x int);\n-- omitted\n")
+        copy-file (file! (io/file root "data/fixture.data") "42\n")
+        cfg {:regress-root root}
+        descriptor {:strict-fixtures
+                    {"target" [{:sql "setup" :lines [2 2]}
+                               {:copy "fixture" :data "fixture.data"
+                                :sha256 (reference/file-sha256 copy-file)}]}}]
+    (is (= "CREATE TABLE fixture (x int);\nCOPY fixture FROM STDIN;\n42\n\\.\n"
+           (fixtures/strict-setup-sql cfg descriptor "target")))
+    (spit copy-file "99\n")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"strict COPY fixture identity changed"
+                          (fixtures/strict-setup-sql cfg descriptor "target")))))
+
 (defn fixture! []
   (let [root (.toFile (Files/createTempDirectory (.toPath *temporary*) "case-" (make-array FileAttribute 0)))
         source (io/file root "source")
