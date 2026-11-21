@@ -9191,6 +9191,52 @@
                         ctx (into #{} (filter symbol?) (flatten (seq inner)))))]
           (conj (vec guards) (concat ['not] inner)))))))
 
+(defn- keyed-disjunction-column [ctx aliases expr]
+  (when (instance? Column expr)
+    (let [^Column column expr
+          alias (some-> (.getTable column) .getName unquote-ident)]
+      (when (and (contains? aliases alias)
+                 (nil? (.getArrayConstructor column))
+                 (#{types/oid-int2 types/oid-int4 types/oid-int8} (source-oid ctx column)))
+        (let [resolved (ctx/resolve-column column (:table-aliases ctx) (:default-table ctx)
+                                           (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+              attr (ctx/attr-of ctx resolved)
+              spec (get (:schema ctx) attr)]
+          (when (and (= :db.type/long (:db/valueType spec))
+                     (= :db.cardinality/one (:db/cardinality spec)))
+            [alias attr]))))))
+
+(defn translate-keyed-disjunction
+  "Compile a WHERE disjunction between two base relations to keyed joins on
+   their entity pairs. All terms must be equality between stored integer
+   columns from opposite sides. Missing datoms exclude SQL NULLs. The
+   shared entity pair keeps bag multiplicity and prevents a match in more
+   than one term from producing the pair twice."
+  [ctx aliases expr]
+  (when (instance? OrExpression expr)
+    (let [or? #(instance? OrExpression %)
+          terms (remove or?
+                        (tree-seq or?
+                                  (fn [^OrExpression node]
+                                    [(.getLeftExpression node) (.getRightExpression node)])
+                                  expr))
+          pairs (mapv (fn [term]
+                        (when (instance? EqualsTo term)
+                          (let [^EqualsTo equality term
+                                [la :as left] (keyed-disjunction-column ctx aliases (.getLeftExpression equality))
+                                [ra :as right] (keyed-disjunction-column ctx aliases (.getRightExpression equality))]
+                            (when (and left right (not= la ra))
+                              [left right]))))
+                      terms)]
+      (when (every? some? pairs)
+        (let [entity (fn [alias] (ctx/entity-var! ctx alias))
+              shared (mapv entity (sort aliases))]
+          [(apply list 'or-join shared
+                  (map (fn [[[left la] [right ra]]]
+                         (let [key (ctx/fresh-var! ctx)]
+                           (list 'and [(entity left) la key] [(entity right) ra key])))
+                       pairs))])))))
+
 (defn translate-predicate
   "Translate a JSqlParser WHERE expression to Datalog :where clauses.
    Returns a vector of clause forms."

@@ -4656,8 +4656,18 @@
         ;; expr.clj re-binds it false inside OR / NOT branches.
         _ (when where-expr
             (binding [expr/*conjunctive-where* true]
-              (let [preds (expr/translate-predicate ctx where-expr)]
-                (swap! (:where-clauses ctx) into preds))))
+              (let [^Join join (first joins)
+                    keyed-preds (when (and (= 1 (count joins))
+                                           (or (.isSimple join) (.isCross join))
+                                           (instance? Table from-item)
+                                           (instance? Table (.getRightItem join))
+                                           (empty? derived-alias-set)
+                                           (empty? params/*from-bindings*)
+                                           (empty? params/*statement-row-scope-tables*))
+                                  (expr/translate-keyed-disjunction
+                                   ctx (set (map first star-relations)) where-expr))]
+                (swap! (:where-clauses ctx) into
+                       (or keyed-preds (expr/translate-predicate ctx where-expr))))))
 
         has-distinct? (some? (.getDistinct select))
         ;; `DISTINCT ON (exprs)` keeps the FIRST row of each group of rows
