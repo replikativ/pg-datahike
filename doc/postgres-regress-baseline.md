@@ -199,10 +199,14 @@ namespace ACL column. The schema-only dump now reaches `pg_class.relpages`.
 Basic `\d` on the 18.6 candidate shows both tables, the view, the primary
 and secondary indexes, the check, and both directions of the foreign-key
 relationship. That path exercises a set-returning function and `UNION ALL
-VALUES` for foreign-key discovery. Detailed `\d+` still fails when it
-reads a correlated catalog array with `unnest`.
-Native PostgreSQL 18 separately reports `NOT NULL` constraints in
-`pg_constraint` (`contype = 'n'`).
+VALUES` for foreign-key discovery. Detailed `\d+` also succeeds on the
+ordinary-table fixture after correlated `unnest` and array-element joins
+were fixed. The 18.6 candidate reports `NOT NULL` constraints in
+`pg_constraint` (`contype = 'n'`) and links them to the correct physical
+column positions. The current metadata derives the PostgreSQL names for
+unnamed constraints. Explicit `NOT NULL` constraint names need durable
+metadata. `ALTER COLUMN SET NOT NULL` and `DROP NOT NULL` still leave that
+metadata unchanged.
 
 A discovery run captured the native dump SQL with
 `PGOPTIONS='-c log_statement=all' pg_dump --schema-only` against the fixture.

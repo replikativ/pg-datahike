@@ -1127,6 +1127,25 @@
       (is (= "0A000" (sqlstate c sql)) sql))
     (is (= "1" (one c "SELECT nextval('array_effect')")))))
 
+(deftest array-subquery-expands-a-bound-from-function-per-row
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE opts (id int, options text[])")
+    (exec! c "INSERT INTO opts VALUES (1, ARRAY['a','b']), (2, NULL), (3, ARRAY['c'])")
+    (is (= ["{toast.a,toast.b}" "{}" "{toast.c}"]
+           (col c 1 "SELECT ARRAY(SELECT 'toast.' || x FROM unnest(o.options) x)
+                       FROM opts o ORDER BY o.id")))
+    (is (= "0" (one c "SELECT count(*) FROM unnest(NULL::text[])")))))
+
+(deftest inner-join-uses-the-array-element-as-the-key
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE key_ids (id int PRIMARY KEY)")
+    (exec! c "CREATE TABLE key_arrays (owner int, keys int[])")
+    (exec! c "INSERT INTO key_ids VALUES (1), (2), (3)")
+    (exec! c "INSERT INTO key_arrays VALUES (1, ARRAY[1,2]), (1, ARRAY[2]), (1, NULL)")
+    (is (= ["2"]
+           (col c 1 "SELECT i.id FROM key_ids i JOIN key_arrays a
+                       ON (a.owner = 1 AND i.id = a.keys[2]) ORDER BY i.id")))))
+
 (deftest array-subquery-unqualified-columns-respect-inner-ownership
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE array_scope (x int)")
