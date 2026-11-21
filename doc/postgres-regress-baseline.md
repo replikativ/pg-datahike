@@ -215,7 +215,9 @@ Adding a column with a literal default fills existing rows. Changing or
 dropping the default affects later writes, including COPY with an omitted
 column. The `fast_default.sql` slice also checks that short rows in a
 multi-row VALUES insert retain their original boundaries. Backfilling
-expression defaults on populated tables remains open.
+expression defaults on populated tables remains open. Combining ADD COLUMN
+and ADD CHECK on that column in one ALTER currently returns 42703. Native
+18.6 validates the check against the backfilled rows.
 
 The first stock dump query over relations also exposed a Datahike planner
 problem. It exhausted a 1.2 GiB heap on this fixture. The planner projected
