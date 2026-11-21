@@ -50,6 +50,14 @@
     (is (= [["public" "10"]]
            (rows "SELECT nspname, nspowner FROM pg_namespace WHERE nspname='public'")))))
 
+(deftest extension-configuration-columns
+  (is (= [["3079" "16382" "vector" "public" "t" "0.8.6" nil nil]]
+         (rows "SELECT x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable,
+                       x.extversion, x.extconfig, x.extcondition
+                  FROM pg_extension x JOIN pg_namespace n ON n.oid = x.extnamespace")))
+  (is (= [["oid[]" "text[]"]]
+         (rows "SELECT pg_typeof(extconfig), pg_typeof(extcondition) FROM pg_extension"))))
+
 (deftest insert-values-evaluates-function-calls
   ;; `INSERT INTO t VALUES (1, repeat('x',5))` stored the SQL TEXT
   ;; `repeat('x', 5)` — the 14-character string — because extract-value

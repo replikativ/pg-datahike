@@ -51,3 +51,18 @@
         (is (nil? (.error (.execute h ^String sql))) sql))
       (doseq [[sql expected] (:corpus fixture)]
         (is (= expected (run h sql)) sql)))))
+
+(deftest ordinary-constraint-flags-match-postgresql-18
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (doseq [sql ["CREATE TABLE parent (id integer PRIMARY KEY)"
+                   "CREATE TABLE child (id integer PRIMARY KEY, pid integer UNIQUE REFERENCES parent(id), amount integer CHECK (amount > 0))"]]
+        (is (nil? (.error (.execute h ^String sql))) sql))
+      (is (= "c|t|0|f\nf|t|0|f\np|t|0|f\nu|t|0|f"
+             (run h "SELECT contype, conenforced, conparentid, conperiod
+                       FROM pg_catalog.pg_constraint
+                       WHERE conrelid = 'child'::regclass AND contype <> 'n'
+                       ORDER BY contype")))
+      (is (= "boolean|oid|boolean"
+             (run h "SELECT pg_typeof(conenforced), pg_typeof(conparentid), pg_typeof(conperiod)
+                       FROM pg_catalog.pg_constraint WHERE contype = 'c'"))))))
