@@ -10,7 +10,12 @@
      :boundaries #{:parameter-inference :type-lookup :prepared-sql},
      :requires ["test_setup"],
      :mode :discovery
-     :blockers #{:create-table-as-execute :path-parameter-inference :prepared-catalog-rendering}}
+     :blockers #{:path-parameter-inference :prepared-catalog-rendering}
+     :strict-slices
+     [{:id :create-table-as-execute
+       :source-lines [62 66]
+       :gate "test/datahike/test/pg_select_into_test.clj"
+       :test-var "postgres-create-table-as-execute"}]}
     {:name "errors",
      :boundaries #{:transaction-errors :name-resolution :sqlstate},
      :requires ["test_setup"],

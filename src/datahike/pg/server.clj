@@ -6341,10 +6341,10 @@
         (sql-cast/cast-scalar source-value (types/oid->pg-name target-oid)
                               {:explicit? false :src-oid source-oid})))))
 
-(defn- handle-execute-prepared
-  "EXECUTE name[(args)] — evaluate each argument once, coerce it to the
-   stored parameter OID, and bind the original analyzed plan."
-  [{:keys [sql-prepared handler]} parsed]
+(defn- invoke-sql-prepared
+  "Find and revalidate a session plan, then evaluate each SQL EXECUTE argument
+   once before passing the plan and coerced values to the caller."
+  [{:keys [sql-prepared handler]} parsed execute]
   (let [pname (:name parsed)
         args-text (:args-text parsed)
         rec (when pname (get @sql-prepared pname))]
@@ -6372,9 +6372,14 @@
                 (evaluate-prepared-args handler args (:effective-param-oids rec))]
             (if (and evaluated (.error evaluated))
               evaluated
-              (let [bound (into-array Object (cons nil (or values [])))]
-                (.executePrepared ^PgWireServer$QueryHandler handler
-                                  (:parsed rec) bound)))))))))
+              (execute rec (or values [])))))))))
+
+(defn- handle-execute-prepared
+  [{:keys [handler] :as ctx} parsed]
+  (invoke-sql-prepared ctx parsed
+                       (fn [rec values]
+                         (.executePrepared ^PgWireServer$QueryHandler handler
+                                           (:parsed rec) (into-array Object (cons nil values))))))
 
 (defn- handle-deallocate
   "DEALLOCATE [PREPARE] name | DEALLOCATE ALL"
@@ -10575,6 +10580,28 @@
 
 (declare parse-session-sql)
 
+(defn- ctas-output-names [columns names]
+  (when (> (count columns) (count names))
+    (throw (ex-info "too many column names were specified" {:sqlstate "42601"})))
+  (let [names (into (mapv params/unquote-ident columns) (drop (count columns)) names)
+        duplicate-name (some (fn [[n occurrences]] (when (> occurrences 1) n))
+                             (frequencies names))]
+    (when duplicate-name
+      (throw (ex-info (str "column \"" duplicate-name "\" specified more than once")
+                      {:sqlstate "42701" :column duplicate-name})))
+    names))
+
+(defn- describe-ctas [^PgWireServer$QueryHandler handler source columns feature]
+  (let [description (.describeResult handler source)]
+    (when-not description
+      (throw (errors/pg-error :feature-not-supported {:feature feature})))
+    (let [names (ctas-output-names columns (vec (.columnNames description)))
+          output-columns (:output-columns source)]
+      {:names names
+       :oids (.columnOids description)
+       :typmods (when (= (count names) (count output-columns))
+                  (mapv :typmod output-columns))})))
+
 (defn- create-as-without-data
   "Describe the source without evaluating it and create the relation in one DDL transaction."
   [{:keys [handler db schema temp-tables session-id] :as ctx} parsed matview-query]
@@ -10586,31 +10613,59 @@
                (parse-session-sql ddl-sql schema db temp-tables session-id))]
     (when (= :error (:type plan))
       (throw (ex-info (:message plan) (select-keys plan [:sqlstate]))))
-    (let [source (:ctas-select plan)
-          description (.describeResult ^PgWireServer$QueryHandler handler source)
-          names (vec (some-> ^PgWireServer$QueryResult description .columnNames))
-          oids (some-> ^PgWireServer$QueryResult description .columnOids)
-          output-columns (:output-columns source)
-          plan (cond-> plan
-                 (= (count names) (count output-columns))
-                 (assoc :ctas-column-typmods (mapv :typmod output-columns)))]
-      (when-not description
-        (throw (errors/pg-error :feature-not-supported
-                                {:feature (str tag " WITH NO DATA for this query")})))
-      (when (> (count columns) (count names))
-        (throw (ex-info "too many column names were specified" {:sqlstate "42601"})))
-      (let [names (into (mapv params/unquote-ident columns) (drop (count columns)) names)
-            duplicate-name (some (fn [[n occurrences]] (when (> occurrences 1) n))
-                                 (frequencies names))]
-        (when duplicate-name
-          (throw (ex-info (str "column \"" duplicate-name "\" specified more than once")
-                          {:sqlstate "42701" :column duplicate-name})))
-        (let [result-plan (-> (sql/ctas-finish (dissoc plan :ctas-select) []
-                                               (mapv dump/quote-ident names) oids db)
-                              (assoc :create-tag tag)
-                              (cond-> matview-query
-                                (update :tx-data into (matview-tx-data (:table-name plan) matview-query false))))]
-          (exec-ddl-create ctx result-plan))))))
+    (let [{:keys [names oids typmods]}
+          (describe-ctas handler (:ctas-select plan) columns
+                         (str tag " WITH NO DATA for this query"))
+          base (cond-> (dissoc plan :ctas-select)
+                 typmods (assoc :ctas-column-typmods typmods))
+          result-plan (-> (sql/ctas-finish base [] (mapv dump/quote-ident names) oids db)
+                          (assoc :create-tag tag)
+                          (cond-> matview-query
+                            (update :tx-data into (matview-tx-data (:table-name plan) matview-query false))))]
+      (exec-ddl-create ctx result-plan))))
+
+(defn- prepared-ctas-output
+  [{:keys [schema db temp-tables session-id conn tx-state] :as ctx} source values]
+  (let [bound (into [nil] values)]
+    (binding [*cached-bound* bound
+              params/*bound-params* values
+              params/*declared-param-oids* (:declared-param-oids source)]
+      (let [source (if (execution-local-plan? source)
+                     (parse-session-sql (:sql source) schema db temp-tables session-id)
+                     source)
+            source (-> source
+                       (resolve-param-refs bound)
+                       (resolve-nextval-markers conn tx-state))]
+        (query-output ctx source)))))
+
+(defn- create-as-execute
+  [{:keys [handler schema db temp-tables session-id] :as ctx}
+   {:keys [relation-sql columns temp-target? if-not-exists? with-data? execute-invocation]}]
+  (let [ddl-sql (str "CREATE " (when temp-target? "TEMP ") "TABLE "
+                     (when if-not-exists? "IF NOT EXISTS ") relation-sql " AS SELECT 1")
+        plan (parse-session-sql ddl-sql schema db temp-tables session-id)
+        base (dissoc plan :ctas-select)]
+    (when (= :error (:type base))
+      (throw (ex-info (:message base) (select-keys base [:sqlstate]))))
+    (if (table-exists? db (:table-name base))
+      ;; Resolve duplicate handling before looking up or invoking EXECUTE.
+      (exec-ddl-create ctx base)
+      (invoke-sql-prepared
+       ctx execute-invocation
+       (fn [rec values]
+         (let [source (:parsed rec)]
+           (when-not (#{:select :set-operation} (:type source))
+             (if (#{:insert :update :delete} (:type source))
+               (throw (ex-info "prepared statement is not a SELECT" {:sqlstate "42809"}))
+               (throw (errors/pg-error :feature-not-supported
+                                       {:feature "CREATE TABLE AS with this prepared query"}))))
+           (let [{:keys [names oids typmods]}
+                 (describe-ctas handler source columns "CREATE TABLE AS with this prepared query")
+                 base (cond-> base typmods (assoc :ctas-column-typmods typmods))
+                 output (when with-data? (prepared-ctas-output ctx source values))]
+             (exec-ddl-create ctx (sql/ctas-finish base (:rows output)
+                                                   (mapv dump/quote-ident names)
+                                                   (or (:oids output) oids) db)))))))))
 
 (defn- exec-ddl-create-table-as
   "CREATE TABLE … [(cols)] AS <query> [WITH [NO] DATA].
@@ -10628,14 +10683,16 @@
                 (:query parsed))
         db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))]
     (try
-      (if with-data?
+      (cond
+        (:execute-invocation parsed) (create-as-execute ctx parsed)
+        with-data?
         (if (and (not temp-target?) (table-exists? db table-name) if-not-exists?)
           (do (params/notice! "NOTICE" (str "relation \"" table-name
                                             "\" already exists, skipping"))
               (empty-result "CREATE TABLE AS"))
           (run-nested! (str "CREATE " (when temp-target? "TEMP ") "TABLE "
                             (when if-not-exists? "IF NOT EXISTS ") relation-sql " AS " query)))
-        (create-as-without-data ctx parsed nil))
+        :else (create-as-without-data ctx parsed nil))
       (catch Exception e
         (classified-error "" e)))))
 
@@ -13732,7 +13789,8 @@
 
              :else
              (assoc visible ident props)))))
-     (empty schema)
+     (with-meta (empty schema)
+       (assoc (meta schema) ::pgs/physical-table-names logical->physical))
      schema)))
 
 (defn- table-reference-key? [k]

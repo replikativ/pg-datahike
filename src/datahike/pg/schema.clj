@@ -1325,6 +1325,9 @@
          tables (derive-virtual-tables schema hints)]
      (when-let [table (get tables table-name)]
        (let [columns (:columns table)
+             ;; Temporary tables project logical attributes, while their
+             ;; catalog and persisted attnums use the physical name.
+             storage-table (get (::physical-table-names (meta schema)) table-name table-name)
              ;; Order by entity ID if db is available. Keyed by the
              ;; attr's local name (always the original, independent of
              ;; any :datahike.pg/column rename) so column-order-from-db's
@@ -1349,7 +1352,7 @@
              by-ident (delay (into {}
                                    (for [[_ t] tables, c (:columns t)]
                                      [(:attr c) c])))
-             ordered (if-let [regs (when db (registered-columns db table-name))]
+             ordered (if-let [regs (when db (registered-columns db storage-table))]
                        (let [col-map (into {} (map (juxt :name identity)) columns)]
                          (vec (keep (fn [reg]
                                       (let [nm (:datahike.pg.column/name reg)]
@@ -1358,7 +1361,7 @@
                                                          (:datahike.pg.column/storage-ident reg))
                                                     (assoc :name nm)))))
                                     regs)))
-                       (if-let [col-order (when db (seq (column-order-from-db db table-name)))]
+                       (if-let [col-order (when db (seq (column-order-from-db db storage-table)))]
                          (let [col-map (into {} (map (juxt :name identity)) columns)]
                            (vec (keep col-map col-order)))
                          columns))]
