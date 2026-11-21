@@ -13,7 +13,8 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.server :as pg]
-            [datahike.pg.sql.stmt :as stmt])
+            [datahike.pg.sql.stmt :as stmt]
+            [datahike.query.resource :as resource])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]))
 
 (defn- with-n-rows [n f]
@@ -77,3 +78,37 @@
         (is (= [["4000"]] (mapv vec (.rows r))))
         (is (< ms 1500)
             (format "4k self-join took %.0f ms — quadratic regression?" ms))))))
+
+(deftest disjunctive-self-join-uses-integer-keys
+  (with-n-rows 220
+    (fn [conn h]
+      (let [sql (str "SELECT count(*) FROM sj a, sj b WHERE "
+                     "b.grp = a.grp OR b.grp = a.id OR b.id = a.grp")
+            db (d/db conn)
+            {:keys [query]} (stmt/translate-select (CCJSqlParserUtil/parse sql)
+                                                   (dbi/-schema db) db)
+            rows (mapv (fn [id] [id (mod id 100)]) (range 220))
+            expected (count (for [[a x] rows, [b y] rows
+                                  :when (or (= y x) (= y a) (= b x))]
+                              [a b]))]
+        (is (some #(and (seq? %) (= 'or-join (first %))
+                        (every? (fn [arm] (every? data-pattern? (rest arm))) (drop 2 %)))
+                  (:where query))
+            (pr-str (:where query)))
+        (binding [resource/*max-intermediate-slots* 10000]
+          (let [r (.execute h sql)]
+            (is (nil? (.error r)) (.error r))
+            (is (= [[(str expected)]] (mapv vec (.rows r)))))
+          (is (= "54000" (.sqlstate (.execute h "SELECT a.id, b.id FROM sj a CROSS JOIN sj b"))))
+          (is (= [["42"]] (mapv vec (.rows (.execute h "SELECT 42"))))))))))
+
+(deftest disjunctive-equality-keeps-row-pairs-and-excludes-null-matches
+  (with-n-rows 4
+    (fn [_ h]
+      (is (nil? (.error (.execute h "INSERT INTO sj VALUES (1,NULL), (1,NULL), (99,NULL), (20,2)"))))
+      (let [r (.execute h (str "SELECT a.id,b.id FROM sj a CROSS JOIN sj b WHERE "
+                               "a.id=b.id OR a.id=b.grp OR a.grp=b.id"))]
+        (is (nil? (.error r)) (.error r))
+        (is (= {["0" "0"] 1 ["1" "1"] 9 ["2" "2"] 1 ["3" "3"] 1
+                ["99" "99"] 1 ["20" "20"] 1 ["2" "20"] 1 ["20" "2"] 1}
+               (frequencies (map vec (.rows r)))))))))

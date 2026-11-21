@@ -136,7 +136,12 @@
      :requires ["test_setup"],
      :mode :unmeasured}
     {:name "union", :boundaries #{:relational :common-types}, :requires ["test_setup"], :mode :unmeasured}
-    {:name "join", :boundaries #{:relational}, :requires ["test_setup" "create_misc"], :mode :unmeasured}
+    {:name "join", :boundaries #{:relational}, :requires ["test_setup" "create_misc"], :mode :unmeasured
+     :strict-slices
+     [{:id :or-join-heap-exhaustion
+       :source-lines [3835 3836]
+       :gate "test/datahike/test/pg_join_scaling_test.clj"
+       :test-var "disjunctive-self-join-uses-integer-keys"}]}
     {:name "aggregates",
      :boundaries #{:aggregates},
      :requires ["test_setup" "create_aggregate"],
