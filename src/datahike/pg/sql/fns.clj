@@ -556,6 +556,34 @@
     (and (mixed-temporal? a b)) (compare (temporal-instant a) (temporal-instant b))
     :else (compare a b)))
 
+(defn array-sort
+  "Sort numeric and boolean arrays along the first dimension, keeping bounds.
+   Multidimensional slices compare lexicographically in storage order."
+  [a descending? nulls-first?]
+  (let [elements (:elements a)]
+    (if (< (count elements) 2)
+      a
+      (let [elem-type (:elem-type a)
+            null-order (if nulls-first? -1 1)
+            cmp (fn [x y]
+                  (cond
+                    (sql-null? x) (if (sql-null? y) 0 null-order)
+                    (sql-null? y) (- null-order)
+                    descending? (order-cmp y x)
+                    :else (order-cmp x y)))]
+        (when-not (#{:int2 :int4 :int8 :numeric :float4 :float8 :bool} elem-type)
+          (throw (ex-info (str "array_sort cannot order " (name elem-type) " elements")
+                          {:error :feature-not-supported :sqlstate "0A000"})))
+        (assoc a :elements
+               (if (pg-arr/multidim? a)
+                 (let [slabs (mapv (fn [slab]
+                                     [slab (pg-arr/array
+                                            elem-type
+                                            (vec (pg-arr/flat-elements (assoc a :elements slab))))])
+                                   elements)]
+                   (mapv first (sort (fn [[_ x] [_ y]] (cmp x y)) slabs)))
+                 (vec (sort cmp elements))))))))
+
 (defn order-key-cmp
   "Compare two ORDER BY key values. `dir` is :asc or :desc; `nulls` is
    :first, :last, or nil for PostgreSQL's default -- NULLS LAST for ASC

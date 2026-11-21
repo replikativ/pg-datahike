@@ -148,6 +148,32 @@
 ;; Array-returning functions — the pgjdbc/Metabase blocker
 ;; ---------------------------------------------------------------------------
 
+(deftest postgres-array-sort-numeric-slices
+  (doseq [[sql expected]
+          [["SELECT array_sort('{}'::int[])" "{}"]
+           ["SELECT array_sort('{1}'::int[])" "{1}"]
+           ["SELECT array_sort('{1,3,5,2,4,6}'::int[])" "{1,2,3,4,5,6}"]
+           ["SELECT array_sort('{1.1,3.3,5.5,2.2,4.4,6.6}'::numeric[])" "{1.1,2.2,3.3,4.4,5.5,6.6}"]
+           ["SELECT array_sort('{1,NULL,3}'::float8[], true)" "{NULL,3,1}"]
+           ["SELECT array_sort('{1,NULL,3}'::float8[], true, false)" "{3,1,NULL}"]
+           ["SELECT array_sort('{1,NULL,3}'::int[], false, true)" "{NULL,1,3}"]
+           ["SELECT array_sort('{1,NULL,3}'::int[], false)" "{1,3,NULL}"]
+           ["SELECT array_sort('{1,NULL,3}'::int[], true, true)" "{NULL,3,1}"]
+           ["SELECT array_sort('{1,NULL,3}'::int[], false, false)" "{1,3,NULL}"]
+           ["SELECT array_sort('{{1}}'::int[])" "{{1}}"]
+           ["SELECT array_sort(ARRAY[[2,4],[2,1],[6,5]])" "{{2,1},{2,4},{6,5}}"]
+           ["SELECT array_sort('[10:12][20:21]={{1,2},{10,20},{3,4}}'::int[])"
+            "[10:12][20:21]={{1,2},{3,4},{10,20}}"]
+           ["SELECT array_sort('[-1:0]={7,1}'::int[])" "[-1:0]={1,7}"]
+           ["SELECT array_sort(ARRAY[true,false,NULL])" "{f,t,NULL}"]
+           ["SELECT array_sort(ARRAY[1,2], NULL)" nil]
+           ["SELECT array_sort(NULL::int[])" nil]]]
+    (is (= [[expected]] (rows sql)) sql))
+  (is (= [oid-int4-array] (describe-oids "SELECT array_sort(ARRAY[2,1])")))
+  (is (= "42804" (first (error-info "SELECT ARRAY[true,NULL::text]"))))
+  (is (= "42883" (first (error-info "SELECT array_sort(ARRAY[2,1], 1)"))))
+  (is (= "42804" (first (error-info "SELECT array_sort(NULL)")))))
+
 (deftest postgres-array-fill-validation-slice
   (testing "empty dimensions produce an empty array"
     (is (= [["{}"]] (rows "SELECT array_fill(42, '{}')")))
