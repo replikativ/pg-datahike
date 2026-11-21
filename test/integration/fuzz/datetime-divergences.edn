@@ -43,19 +43,11 @@
   :reason
   "DEFERRED: a clock-reading token. The parser handles these -- pass a `:now` and they work -- but `cast.clj/datetime-ctx` supplies none on purpose, because a cast is constant-folded into a cached plan and folding `today` once would freeze it for that plan's life. Needs the deferred treatment `now()` gets."}
  {:surface :datetime,
-  :key "SELECT 'now'::time::text",
-  :reason
-  "DEFERRED: a clock-reading token. The parser handles these -- pass a `:now` and they work -- but `cast.clj/datetime-ctx` supplies none on purpose, because a cast is constant-folded into a cached plan and folding `today` once would freeze it for that plan's life. Needs the deferred treatment `now()` gets."}
- {:surface :datetime,
   :key "SELECT 'now'::timestamp::text",
   :reason
   "DEFERRED: a clock-reading token. The parser handles these -- pass a `:now` and they work -- but `cast.clj/datetime-ctx` supplies none on purpose, because a cast is constant-folded into a cached plan and folding `today` once would freeze it for that plan's life. Needs the deferred treatment `now()` gets."}
  {:surface :datetime,
   :key "SELECT 'now'::timestamptz::text",
-  :reason
-  "DEFERRED: a clock-reading token. The parser handles these -- pass a `:now` and they work -- but `cast.clj/datetime-ctx` supplies none on purpose, because a cast is constant-folded into a cached plan and folding `today` once would freeze it for that plan's life. Needs the deferred treatment `now()` gets."}
- {:surface :datetime,
-  :key "SELECT 'now'::timetz::text",
   :reason
   "DEFERRED: a clock-reading token. The parser handles these -- pass a `:now` and they work -- but `cast.clj/datetime-ctx` supplies none on purpose, because a cast is constant-folded into a cached plan and folding `today` once would freeze it for that plan's life. Needs the deferred treatment `now()` gets."}
  {:surface :datetime,

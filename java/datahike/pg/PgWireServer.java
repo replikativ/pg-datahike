@@ -735,10 +735,16 @@ public final class PgWireServer {
             this.txStatus = '\0';  // no opinion — see field doc
         }
 
-        /** SELECT can return a relation with zero columns. */
+        private boolean rowSet;
+
+        /** Mark an actual result set, which may have zero columns. */
+        public QueryResult asRowSet() {
+            rowSet = true;
+            return this;
+        }
+
         private boolean returnsRows() {
-            return columnNames != null && (columnNames.length > 0
-                    || (commandTag != null && commandTag.startsWith("SELECT ")));
+            return columnNames != null && (columnNames.length > 0 || rowSet);
         }
 
         /** Error result with default XX000 SQLSTATE. */

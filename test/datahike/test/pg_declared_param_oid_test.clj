@@ -283,7 +283,11 @@
     (is (= [] (:columns result)))
     (is (= [[]] (:rows result)))
     (is (= "SELECT 1" (:command-complete result))))
-  (is (= [[";"]] (:rows (simple "SELECT ';';")))))
+  (is (= [[";"]] (:rows (simple "SELECT ';';"))))
+  (let [result (simple "CREATE TABLE from_select AS SELECT 1 AS id")]
+    (is (= "SELECT 1" (:command-complete result)))
+    (is (nil? (:columns result)))
+    (is (nil? (:rows result)))))
 
 (deftest reported-literal-and-range-regressions
   ;; #374, #286 and #287, checked against a PostgreSQL 18.6 UTF-8 database.
