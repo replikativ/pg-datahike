@@ -27,6 +27,56 @@
 (defn check! [condition message]
   (when-not condition (reference/fail! (str "audited inventory: " message))))
 
+(defn- validate-partition! [application-files groups categories label]
+  (check! (and (map? groups) (= categories (set (keys groups)))
+               (every? set? (vals groups)))
+          (str "invalid " label " groups"))
+  (let [names (mapcat val groups)]
+    (check! (and (= application-files (set names))
+                 (= (count names) (count application-files)))
+            (str label " must account for every application SQL file exactly once"))))
+
+(defn- validate-residuals! [cfg manifest files tests]
+  (when-let [filename (:residual-map manifest)]
+    (let [directory (.getParentFile (io/file (:inventory cfg)))
+          {:keys [postgres-ref source-commit target-revision target-jar-sha256
+                  outcomes fixture-readiness findings] :as residuals}
+          (edn/read-string (slurp (io/file directory filename)))
+          application-files (into #{} (comp (remove #(= :out-of-scope (:status %)))
+                                            (map :name))
+                                  (:dispositions manifest))
+          remaining (set/union (:differs outcomes) (:incomplete outcomes))
+          gates (into {} (for [{:keys [name strict-slices]} tests
+                               {:keys [id source-lines]} strict-slices]
+                           [[name id] source-lines]))]
+      (check! (= [postgres-ref source-commit]
+                 [(:postgres-ref cfg) (get-in manifest [:reference :commit])])
+              "residual map reference disagrees with profile")
+      (check! (and (string? target-revision) (re-matches #"[0-9a-f]{40}" target-revision)
+                   (string? target-jar-sha256) (re-matches #"[0-9a-f]{64}" target-jar-sha256))
+              "residual map needs a target revision and build checksum")
+      (validate-partition! application-files outcomes #{:matches :differs :incomplete} "residual outcomes")
+      (validate-partition! application-files fixture-readiness #{:ready :fixture-limited :unverified} "fixture readiness")
+      (check! (set/subset? (:incomplete outcomes) (:unverified fixture-readiness))
+              "an incomplete run cannot qualify its fixture")
+      (check! (and (vector? findings) (= (count findings) (count (set (map :id findings)))))
+              "residual findings must have unique identifiers")
+      (doseq [{:keys [id file lines state impact detail]} findings]
+        (check! (and (keyword? id) (contains? remaining file)
+                     (#{:open :boundary :covered} state)
+                     (#{:wrong-result :internal-error :fixture :unsupported} impact)
+                     (string? detail) (not (str/blank? detail)))
+                (str "invalid residual finding " id))
+        (let [[start end] lines
+              line-count (count (str/split-lines (slurp (get files file))))]
+          (check! (and (vector? lines) (= 2 (count lines))
+                       (integer? start) (integer? end) (pos? start) (<= start end line-count))
+                  (str "invalid source range for residual " id)))
+        (when (= :covered state)
+          (check! (= lines (get gates [file id]))
+                  (str "covered residual must name a matching strict slice: " id))))
+      residuals)))
+
 (defn validate! [cfg campaign scope ledger]
   (let [manifest (edn/read-string (slurp (:inventory cfg)))
         root (:regress-root cfg)
@@ -109,4 +159,5 @@
      :application-count (count (remove #(= :out-of-scope (:status %)) entries))
      :scheduled-count (count scheduled-names)
      :unscheduled (vec (sort (set/difference sql-names scheduled-names)))
+     :residuals (validate-residuals! cfg manifest files tests)
      :manifest manifest}))

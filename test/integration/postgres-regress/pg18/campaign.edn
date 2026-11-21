@@ -168,8 +168,13 @@
     {:name "copy2", :boundaries #{:errors :copy :text-codec :csv-codec}, :mode :unmeasured}
     {:name "copydml", :boundaries #{:copy :returning :dml}, :mode :unmeasured}
     {:name "copyselect", :boundaries #{:copy :ordering :relational}, :mode :discovery
-     :blockers #{:copy-force-quote :multi-command-copy-from}
-     :accepted-differences #{:copy-error-diagnostics}}
+     :blockers #{:copy-force-quote}
+     :accepted-differences #{:copy-error-diagnostics}
+     :strict-slices
+     [{:id :simple-query-copy-continuation
+       :source-lines [90 96]
+       :gate "test/datahike/test/pg_declared_param_oid_test.clj"
+       :test-var "postgres-simple-query-resumes-after-each-copy"}]}
     {:name "temp", :boundaries #{:name-resolution :temporary-tables :ddl :transactions}, :mode :unmeasured}
     {:name "truncate", :boundaries #{:constraints :ddl :dml :transactions}, :mode :unmeasured}
     {:name "portals",

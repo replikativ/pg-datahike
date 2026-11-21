@@ -127,7 +127,7 @@ state after rejected statements.
 |---|---|
 | `aggregates` | Custom aggregate fixtures cause cascades. Built-in aggregate coverage and resolution remain open. |
 | `arrays` | Array input and bounds, type resolution, and functions such as `array_sort`, `array_sample` and `array_reverse`. |
-| `copyselect` | Legacy `FORCE QUOTE` syntax and a second `COPY FROM STDIN` in one simple-query message. The latter leaves the second row unwritten. |
+| `copyselect` | Legacy `FORCE QUOTE` syntax and COPY diagnostics. A strict wire slice checks successive `COPY FROM STDIN` commands and the statements around them. |
 | `create_table` and `create_table_like` | Partitioning, some persistence metadata and optional LIKE properties such as `INCLUDING GENERATED`. A subquery in a default is rejected with a different SQLSTATE. |
 | `groupingsets` | Grouping sets, rollup and cube are unsupported. The v0.1.390 replay completed with early rejections; the initial October run exhausted the heap. |
 | `prepare` | Arity, declared type coercion and unknown-type errors now agree in focused probes. `CREATE TABLE AS EXECUTE`, path inference and catalog output still differ. |
@@ -140,6 +140,17 @@ requires an exclusive disposable endpoint. The full agreement manifest
 remains unqualified. Use [the campaign manifest](../test/integration/postgres-regress/pg18/campaign.edn)
 for admissions and per-file blockers, and [the fixture descriptor](../test/integration/postgres-regress/pg18/fixtures.edn)
 for prerequisite and native-helper boundaries.
+
+The [residual map](../test/integration/postgres-regress/pg18/residuals.edn)
+records the later paired discovery across all 164 application-facing files.
+It tracks output outcomes and fixture readiness independently. Findings link
+to upstream SQL ranges and distinguish wrong results, internal errors,
+unsupported SQL and fixture boundaries. A covered finding must name a live
+strict slice. Files without a recorded cause remain visible in the census.
+
+```bash
+PG_REGRESS_PROFILE=18 bb pg-regress-wave residuals
+```
 
 Run the current gate with PostgreSQL 18 clients and a pg-datahike server with
 database provisioning enabled:
