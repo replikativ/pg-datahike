@@ -820,6 +820,8 @@
       (when-let [array-oid (some-> first-arg (expr-oid env))]
         (get types/array-oid->element-oid array-oid))
 
+      (= fname "pg_partition_ancestors") types/oid-regclass
+
       ;; Aggregate rule (registered in sql-aggregate->return-oid) —
       ;; delegate to the shared resolver so runtime variant selection
       ;; (in stmt.clj) doesn't have to recompute the same logic.
@@ -911,7 +913,7 @@
    its declared return type all resolve through; it is the seam the
    single name/OID resolver of Phase 4 replaces."
   [type-str db]
-  (let [type-str (some-> type-str str/lower-case types/base-type-name-of)]
+  (let [type-str (some-> type-str types/normalize-sql-type-name types/base-type-name-of)]
     (or
      (composite-name->oid type-str db)
      (case (types/cast-category type-str)

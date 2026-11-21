@@ -58,6 +58,15 @@
   (is (= [["oid[]" "text[]"]]
          (rows "SELECT pg_typeof(extconfig), pg_typeof(extcondition) FROM pg_extension"))))
 
+(deftest namespace-acl-column
+  (is (= [["2615" "2200" "public" "10" nil nil]]
+         (rows "SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl,
+                       acldefault('n', n.nspowner) AS acldefault
+                  FROM pg_namespace n WHERE n.nspname = 'public'")))
+  (let [^PgWireServer$QueryResult result (run "SELECT nspacl FROM pg_namespace")]
+    (is (nil? (.-error result)))
+    (is (= [1034] (vec (.-columnOids result))))))
+
 (deftest insert-values-evaluates-function-calls
   ;; `INSERT INTO t VALUES (1, repeat('x',5))` stored the SQL TEXT
   ;; `repeat('x', 5)` — the 14-character string — because extract-value

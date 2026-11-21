@@ -2158,8 +2158,12 @@
                                             (if (instance? ParenthesedSelect s)
                                               (recur (.getSelect ^ParenthesedSelect s))
                                               s))]
-                                    (if (instance? PlainSelect s)
+                                    (cond
+                                      (instance? PlainSelect s)
                                       (translate-select ^PlainSelect s schema db)
+                                      (instance? Values s)
+                                      (stmt/translate-literal-values s schema db)
+                                      :else
                                       {:type :error
                                        :sqlstate "0A000"
                                        :message (str "Unsupported set operation member: "

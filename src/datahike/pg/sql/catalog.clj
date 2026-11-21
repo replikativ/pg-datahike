@@ -399,6 +399,8 @@
     [{:db/ident :pg_namespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_namespace/nspname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_namespace/nspowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; This catalog models ownership; the server has no schema ACLs.
+     {:db/ident :pg_namespace/nspacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
      {:db/ident (pgs/row-marker-attr "pg_namespace") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     ;; A single role, the one every connection authenticates as. We have
     ;; no privilege system; this exists so ownership resolves.

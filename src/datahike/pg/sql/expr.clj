@@ -5742,8 +5742,9 @@
   ;; This evaluator sits below the wire SELECT executor. Until these stages
   ;; share one execution pipeline, an explicit 0A000 is safer than consuming
   ;; plausible-looking raw Datalog rows with SQL semantics omitted.
-  (when (or (seq (:project-set p))
-            (seq (:window-specs p))
+  (when (or (seq (:window-specs p))
+            (and (seq (:project-set p))
+                 (or (seq (:compound-exprs p)) (seq (:sql-order-by p))))
             ;; `:compound-exprs` was here. They are reconstructed below
             ;; now -- `(SELECT AVG(id) * 1.2 …)` is an aggregate with an
             ;; expression over it, which PostgreSQL simply evaluates.
@@ -5952,9 +5953,16 @@
                   (apply-compound-projections raw (:find-aliases p) q in-args
                                               (:compound-exprs p))
                   [raw nil])
+        raw (if-let [specs (seq (:project-set p))]
+              ((requiring-resolve 'datahike.pg.sql.stmt/apply-project-set) raw specs)
+              raw)
         raw (if (:has-distinct? p)
               (fns/distinct-by-value (map (fn [row] (tick!) row) raw)) raw)
-        raw (apply-subquery-order-limit raw p)
+        raw (apply-subquery-order-limit
+             raw (cond-> p
+                   (:project-order-by p) (assoc :sql-order-by (:project-order-by p))
+                   (:project-limit p) (assoc :sql-limit (:project-limit p))
+                   (:project-offset p) (assoc :sql-offset (:project-offset p))))
         hidden (long (or (:hidden-count p) 0))
         ;; apply-compound-projections already trimmed to the visible
         ;; columns, so the hidden-count trim below must not run twice.

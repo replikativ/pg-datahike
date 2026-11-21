@@ -358,9 +358,10 @@
       (is (= "t" (one c (str "SELECT timestamp '2020-01-01' IN "
                              "(SELECT date '2020-01-01' UNION "
                              "SELECT timestamp '2020-01-02')")))))
+    (testing "set-returning projections contribute their expanded rows"
+      (is (= "t" (one c "SELECT 2 IN (SELECT generate_series(1,3))")))
+      (is (= "f" (one c "SELECT 4 IN (SELECT generate_series(1,3))"))))
     (testing "unsupported post-query stages fail explicitly, never with a plausible wrong value"
-      (is (= "0A000"
-             (sqlstate c "SELECT 2 IN (SELECT generate_series(1,3))")))
       (is (= "0A000"
              (sqlstate c "SELECT 1 IN (SELECT count(*) HAVING false)")))
       (is (= "0A000"

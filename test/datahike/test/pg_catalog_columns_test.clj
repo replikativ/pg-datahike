@@ -66,3 +66,25 @@
       (is (= "boolean|oid|boolean"
              (run h "SELECT pg_typeof(conenforced), pg_typeof(conparentid), pg_typeof(conperiod)
                        FROM pg_catalog.pg_constraint WHERE contype = 'c'"))))))
+
+(deftest partition-ancestors-of-ordinary-relations
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (nil? (.error (.execute h "CREATE TABLE ordinary (id integer)"))))
+      (doseq [sql ["SELECT * FROM pg_catalog.pg_partition_ancestors('ordinary')"
+                   "SELECT * FROM pg_partition_ancestors('ordinary') WITH ORDINALITY AS a(relid, depth)"
+                   "SELECT pg_partition_ancestors('ordinary')"
+                   "SELECT pg_partition_ancestors(NULL)"]]
+        (is (= "" (run h sql)) sql))
+      (is (= "t" (run h "SELECT 'ordinary'::pg_catalog.regclass IN
+                                 (SELECT pg_catalog.pg_partition_ancestors('ordinary')
+                                  UNION ALL VALUES ('ordinary'::pg_catalog.regclass))")))
+      (is (= "42P01" (.sqlstate (.execute h "SELECT * FROM pg_partition_ancestors('missing_table')"))))
+      (is (= "42883" (.sqlstate (.execute h "SELECT * FROM pg_partition_ancestors()"))))
+      (is (= "42883" (.sqlstate (.execute h "SELECT pg_partition_ancestors(true)"))))
+      (let [^PgWireServer$QueryResult result
+            (.execute h "SELECT * FROM pg_partition_ancestors('ordinary') WITH ORDINALITY AS a(relid, depth)")]
+        (is (= ["relid" "depth"] (vec (.-columnNames result))))
+        (is (= [2205 20] (vec (.-columnOids result)))))
+      (is (= "f|t" (run h "SELECT 1 IN (SELECT generate_series(1, 3) LIMIT 1 OFFSET 1),
+                                 2 IN (SELECT generate_series(1, 3) LIMIT 1 OFFSET 1)"))))))
