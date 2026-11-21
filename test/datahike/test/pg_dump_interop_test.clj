@@ -51,7 +51,7 @@
            (rows "SELECT nspname, nspowner FROM pg_namespace WHERE nspname='public'")))))
 
 (deftest extension-configuration-columns
-  (is (= [["3079" "16382" "vector" "public" "t" "0.8.6" nil nil]]
+  (is (= [["3079" "16384" "vector" "public" "t" "0.8.6" nil nil]]
          (rows "SELECT x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable,
                        x.extversion, x.extconfig, x.extcondition
                   FROM pg_extension x JOIN pg_namespace n ON n.oid = x.extnamespace")))
@@ -105,3 +105,33 @@
     (is (= [["1"] ["2"]] (rows "SELECT n FROM vol ORDER BY id"))))
   (testing "now() is not frozen by the parse cache"
     (is (= "2" (v "SELECT count(DISTINCT t) FROM vol")))))
+
+(deftest vector-objects-belong-to-the-extension
+  (is (= [["vector" "vector"]]
+         (rows "SELECT e.extname, t.typname
+                  FROM pg_extension e JOIN pg_depend d ON d.refobjid = e.oid
+                  JOIN pg_type t ON t.oid = d.objid
+                 WHERE d.refclassid = 'pg_extension'::regclass
+                   AND d.classid = 'pg_type'::regclass AND d.deptype = 'e'")))
+  (is (= [["vector_in"]]
+         (rows "SELECT p.proname
+                  FROM pg_extension e JOIN pg_depend d ON d.refobjid = e.oid
+                  JOIN pg_proc p ON p.oid = d.objid
+                 WHERE d.classid = 'pg_proc'::regclass AND d.deptype = 'e'
+                   AND p.proname = 'vector_in'"))))
+
+(deftest schema-definitions-respect-the-dump-search-path
+  (doseq [sql ["CREATE TABLE restore_parent (id int PRIMARY KEY)"
+               "CREATE TABLE restore_child (pid int REFERENCES restore_parent)"
+               "CREATE VIEW restore_view AS SELECT id FROM restore_parent"
+               "CREATE VIEW restore_nested AS SELECT q.pid FROM (SELECT pid FROM restore_child) q"]]
+    (is (nil? (err sql)) sql))
+  (is (= "SELECT id FROM restore_parent;"
+         (v "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'restore_view'")))
+  (is (nil? (err "SELECT pg_catalog.set_config('search_path', '', false)")))
+  (is (= "SELECT id FROM public.restore_parent;"
+         (v "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'restore_view'")))
+  (is (= "SELECT q.pid FROM (SELECT pid FROM public.restore_child) q;"
+         (v "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'restore_nested'")))
+  (is (= "FOREIGN KEY (pid) REFERENCES public.restore_parent (id)"
+         (v "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f'"))))

@@ -47,3 +47,20 @@ Needs pg-datahike on `localhost:15432` and a source PostgreSQL. Outputs
 `last-restore.log` (the restore's own errors) and
 `pagila-default-format.sql` (the generated dump); both are kept as CI
 artifacts because the console prints only counts.
+
+## Schema export into native PostgreSQL
+
+`schema-export.sh` checks the reverse direction with stock PostgreSQL 18
+client binaries on `PATH`. It creates the same ordinary schema fixture in
+pg-datahike and in native PostgreSQL, dumps the former, and restores it into
+a second native database. It compares the restored schema, reads the view,
+and checks rejection of duplicate keys, NULLs, missing parent rows, and
+failed checks.
+
+Set `PG_EXPORT_SOURCE`, `PG_EXPORT_ORACLE`, and `PG_EXPORT_RESTORE` to three
+empty disposable database URLs. Use an 18.6 candidate as the source and make
+the pgvector extension available to the restore server. Set
+`PG_EXPORT_RESTORE_OPTIONS` if the extension lives in a test directory on
+that server. Run `bash test/integration/pgdump/schema-export.sh` from the
+repository root. The script prints the path of the dump and comparison
+artifacts.

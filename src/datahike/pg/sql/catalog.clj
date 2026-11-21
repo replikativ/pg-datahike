@@ -62,6 +62,11 @@
    callers reference it."
   types/pg-role-oid)
 
+(def ^:private vector-extension-oid
+  ;; Extension OIDs are unique within pg_extension. Use a normal object
+  ;; OID so tools can distinguish vector from initdb's built-in extensions.
+  catalog-objects/first-user-oid)
+
 (def pg-role-name
   "See `datahike.pg.types/pg-role-name`."
   types/pg-role-name)
@@ -1017,8 +1022,7 @@
      {:db/ident :pg_stat_user_tables/n_dead_tup :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_stat_user_tables") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_depend"
-    ;; Always empty — no dependency tracking. Some pgjdbc / pg_dump
-    ;; queries reference it; an empty table is the right shape.
+    ;; pg_dump uses the extension member edges to emit CREATE EXTENSION.
     [{:db/ident :pg_depend/classid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_depend/objid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_depend/objsubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -2941,7 +2945,7 @@
     ;; installed extension because migration tools discover pgvector through
     ;; pg_extension before using its type and functions.
     "pg_extension"
-    [{:pg_extension/oid 16382
+    [{:pg_extension/oid vector-extension-oid
       :pg_extension/extname "vector"
       :pg_extension/extowner pg-role-oid
       :pg_extension/extnamespace 2200
@@ -2959,7 +2963,14 @@
     "pg_foreign_table"
     []
     "pg_depend"
-    []
+    (mapv (fn [[class-id object-id]]
+            {:pg_depend/classid class-id :pg_depend/objid object-id :pg_depend/objsubid 0
+             :pg_depend/refclassid catalog-objects/pg-extension-oid
+             :pg_depend/refobjid vector-extension-oid :pg_depend/refobjsubid 0
+             :pg_depend/deptype "e" (pgs/row-marker-attr "pg_depend") true})
+          (into [[catalog-objects/pg-type-oid types/oid-vector]]
+                (map (fn [routine] [catalog-objects/pg-proc-oid (:oid routine)]))
+                regoid/vector-extension-routines))
     "pg_inherits"
     []
     "pg_enum"
@@ -3194,9 +3205,18 @@
            :pg_constraint/convalidated  true
            :pg_constraint/conkey        (->conkey child-attnums)
            :pg_constraint/confkey       (->conkey parent-attnums)
-           :pg_constraint/condef        (str "FOREIGN KEY (" (str/join ", " cs)
-                                             ") REFERENCES " parent
-                                             " (" (str/join ", " ps) ")")
+           :pg_constraint/condef
+           (let [path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+                 reference (binding [regoid/*db* cte-db
+                                     regoid/*relation-db* cte-db
+                                     regoid/*relation-provider* relation-identity
+                                     regoid/*search-path* path]
+                             (regoid/output types/oid-regclass parent-oid types/format-type))]
+             (str "FOREIGN KEY (" (str/join ", " (map fns/quote-identifier cs))
+                  ") REFERENCES " (if (= reference (str parent-oid))
+                                    (fns/quote-identifier parent)
+                                    reference)
+                  " (" (str/join ", " (map fns/quote-identifier ps)) ")"))
            (pgs/row-marker-attr "pg_constraint") true}))))
     "information_schema_table_constraints"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))]

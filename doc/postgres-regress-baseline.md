@@ -231,18 +231,19 @@ candidate's fixture OIDs in place of the native OIDs. The exact column
 scan now returns all six fixture columns, including the three derived
 `NOT NULL` constraint names.
 
-Stock `pg_dump` completes against the candidate with the Datahike planner
-fix loaded locally. Its first output exposed three restore failures.
-`pg_get_viewdef` needs a trailing semicolon for the dump client and a
-qualified relation name under an empty search path. The foreign key
-definition also needs the qualified referenced table. The vector type
-and its routines must be recorded as extension members so the dump can
-declare the installed extension.
+Stock `pg_dump` completes against a fresh 18.6 candidate with the local
+Datahike planner fix. The generated view and foreign key definitions
+qualify their references when the search path is empty, and the dump
+declares vector as an extension. Restoring into an empty native 18.6
+database with pgvector 0.8.1 available matched the fixture's columns,
+constraints, indexes, and view definition. The restored view and
+primary-key, NOT NULL, foreign-key, and check-constraint behavior passed.
+The fixture contains no vector columns.
 
-The cutover needs successful stock-client describe and schema export on
-this fixture, an export restored into an empty native database with the
-same tables, view, index and constraints, and a passing PostgreSQL 18
-regression gate on the candidate build.
+Use `test/integration/pgdump/schema-export.sh` for the same check. The
+candidate still depends on a released Datahike build containing the
+planner fix. The version cutover also needs the strict PostgreSQL 18
+gate to pass against the release candidate.
 
 ## Running the comparison
 

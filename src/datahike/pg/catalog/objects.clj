@@ -39,6 +39,7 @@
 (def ^:const pg-proc-oid 1255)
 (def ^:const pg-namespace-oid 2615)
 (def ^:const pg-trigger-oid 2620)
+(def ^:const pg-extension-oid 3079)
 
 (def catalog-relation-oids
   "pg_class OIDs of the system catalogs we materialise, from each header's
@@ -47,7 +48,7 @@
    (tableoid, oid). Views have no tableoid and are deliberately absent."
   {"pg_am" 2601 "pg_amop" 2602 "pg_amproc" 2603 "pg_attrdef" 2604 "pg_attribute" 1249 "pg_cast" 2605 "pg_class" 1259 "pg_collation" 3456
    "pg_constraint" 2606 "pg_conversion" 2607 "pg_database" 1262 "pg_depend" 2608
-   "pg_default_acl" 826 "pg_description" 2609 "pg_enum" 3501 "pg_event_trigger" 3466 "pg_extension" 3079 "pg_foreign_data_wrapper" 2328 "pg_foreign_server" 1417
+   "pg_default_acl" 826 "pg_description" 2609 "pg_enum" 3501 "pg_event_trigger" 3466 "pg_extension" pg-extension-oid "pg_foreign_data_wrapper" 2328 "pg_foreign_server" 1417
    "pg_foreign_table" 3118 "pg_index" 2610
    "pg_inherits" 2611 "pg_init_privs" 3394 "pg_language" 2612 "pg_namespace" 2615 "pg_opclass" 2616
    "pg_operator" 2617 "pg_opfamily" 2753 "pg_policy" 3256 "pg_proc" 1255
