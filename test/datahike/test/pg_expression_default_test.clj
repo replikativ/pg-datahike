@@ -93,6 +93,17 @@
     (exec! c "INSERT INTO nested_defaults DEFAULT VALUES")
     (is (= [[9 7 9]] (rows c "SELECT a,b,c FROM nested_defaults")))))
 
+(deftest mixed-case-sequence-arguments-in-defaults-and-projections
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE SEQUENCE Default_Arg START WITH 5")
+    (exec! c "CREATE TABLE seq_arg (n int DEFAULT nextval('DEFAULT_ARG'))")
+    (exec! c "INSERT INTO seq_arg DEFAULT VALUES")
+    (is (= [[5 6]] (rows c "SELECT n, nextval('DEFAULT_ARG') FROM seq_arg")))
+    (exec! c "CREATE SEQUENCE dot START WITH 99")
+    (exec! c "CREATE SEQUENCE \"Seq.Dot\" START WITH 40")
+    (is (= [[40]] (rows c "SELECT nextval('\"Seq.Dot\"')")))
+    (is (= [[99]] (rows c "SELECT nextval('dot')")))))
+
 (deftest a-volatile-default-is-evaluated-per-row
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TABLE t (a int, u uuid DEFAULT gen_random_uuid())")
