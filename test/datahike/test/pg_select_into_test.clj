@@ -124,14 +124,33 @@
           (is (= "SELECT 1" (.commandTag r))))
         (is (= [["1" "2"]] (rows (exec h "SELECT p, q FROM c2")))))
       (testing "WITH NO DATA creates the table empty, and keeps the DDL tag"
-        (let [r (exec h "CREATE TABLE c3 AS SELECT 1 AS x WITH NO DATA")]
+        (let [r (exec h "CREATE TABLE c3 AS SELECT 1 / 0 AS x WITH NO DATA")]
           (is (nil? (.error r)))
           (is (= "CREATE TABLE AS" (.commandTag r))))
-        (is (= [["0"]] (rows (exec h "SELECT count(*) FROM c3")))))
+        (is (= [["0"]] (rows (exec h "SELECT count(*) FROM c3"))))
+        (is (= [["x" "integer"]]
+               (rows (exec h (str "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute "
+                                  "WHERE attrelid = 'c3'::regclass AND attnum > 0"))))))
       (testing "a plain CTAS is untouched by any of this"
         (let [r (exec h "CREATE TABLE c4 AS SELECT 5 AS z")]
           (is (= "SELECT 1" (.commandTag r))))
         (is (= [["5"]] (rows (exec h "SELECT * FROM c4")))))
+      (finally (release! h)))))
+
+(deftest ctas-with-no-data-preserves-column-metadata
+  (let [h (fresh-handler)]
+    (try
+      (is (nil? (.error (exec h "CREATE TABLE src (sized varchar(15))"))))
+      (let [r (exec h (str "CREATE TABLE dst (\"Copy\") AS "
+                           "SELECT sized, 'a'::varchar(11) AS casted FROM src WITH NO DATA"))]
+        (is (nil? (.error r)))
+        (is (= "CREATE TABLE AS" (.commandTag r))))
+      (is (= [["Copy" "character varying(15)"] ["casted" "character varying(11)"]]
+             (rows (exec h (str "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute "
+                                "WHERE attrelid = 'dst'::regclass AND attnum > 0 ORDER BY attnum")))))
+      (let [r (exec h "CREATE TABLE repeated AS SELECT 1 AS a, 2 AS a WITH NO DATA")]
+        (is (= "42701" (.sqlstate r))))
+      (is (= [["0"]] (rows (exec h "SELECT count(*) FROM pg_class WHERE relname = 'repeated'"))))
       (finally (release! h)))))
 
 (deftest ctas-stores-the-rows-in-the-selects-order

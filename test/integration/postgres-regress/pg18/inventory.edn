@@ -855,8 +855,8 @@
    :sql-sha256 "79f4fd8136a3c6203ec6164dc86828165d102d9b0c2238f21dfe119a2882145e",
    :expected-sha256 "5da406c6688c48b5b5544d01fc8af85822ee65949c4d5acf544ffe229d6be56b",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :ddl-and-dml}
+   :status :campaign,
+   :wave 6}
   {:name "md5",
    :scheduled? true,
    :sql-sha256 "1ac70abdb09d828aa6d11120b1a14dd31a672d5c2b80545b5f1aeee245cba147",

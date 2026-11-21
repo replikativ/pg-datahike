@@ -5127,9 +5127,10 @@
    that produced them would have (`SELECT 3`); a plain CREATE TABLE is
    `CREATE TABLE`."
   [parsed]
-  (if (:ctas? parsed)
-    (str "SELECT " (long (or (:ctas-rows parsed) 0)))
-    "CREATE TABLE"))
+  (or (:create-tag parsed)
+      (if (:ctas? parsed)
+        (str "SELECT " (long (or (:ctas-rows parsed) 0)))
+        "CREATE TABLE")))
 
 (defn- table-create-tx-data [db parsed]
   (let [table-name (:table-name parsed)
@@ -5288,7 +5289,8 @@
       ;; which doesn't surface custom :pg/* attrs.
           (and table-name name-conflict? if-not-exists?)
           (do (params/notice! "NOTICE" (str "relation \"" table-name "\" already exists, skipping"))
-              [(empty-result (if (:ctas? parsed) "CREATE TABLE AS" "CREATE TABLE")) false])
+              [(empty-result (or (:create-tag parsed)
+                                 (if (:ctas? parsed) "CREATE TABLE AS" "CREATE TABLE"))) false])
 
           ;; The current identity lowering uses PostgreSQL's conventional
           ;; table_column_seq name directly.  Until it allocates a numbered
@@ -10562,51 +10564,77 @@
   (classified-error "" (ex-info (str "\"" name "\" is not a materialized view")
                                 {:error :wrong-object-type :sqlstate "42809"})))
 
+(declare parse-session-sql)
+
+(defn- create-as-without-data
+  "Describe the source without evaluating it and create the relation in one DDL transaction."
+  [{:keys [handler db schema temp-tables session-id] :as ctx} parsed matview-query]
+  (let [{:keys [relation-sql columns temp-target? if-not-exists?]} parsed
+        tag (if matview-query "CREATE MATERIALIZED VIEW" "CREATE TABLE AS")
+        ddl-sql (str "CREATE " (when temp-target? "TEMP ") "TABLE "
+                     (when if-not-exists? "IF NOT EXISTS ") relation-sql " AS " (:query parsed))
+        plan (binding [params/*analysis-only?* true]
+               (parse-session-sql ddl-sql schema db temp-tables session-id))]
+    (when (= :error (:type plan))
+      (throw (ex-info (:message plan) (select-keys plan [:sqlstate]))))
+    (let [source (:ctas-select plan)
+          description (.describeResult ^PgWireServer$QueryHandler handler source)
+          names (vec (some-> ^PgWireServer$QueryResult description .columnNames))
+          oids (some-> ^PgWireServer$QueryResult description .columnOids)
+          output-columns (:output-columns source)
+          plan (cond-> plan
+                 (= (count names) (count output-columns))
+                 (assoc :ctas-column-typmods (mapv :typmod output-columns)))]
+      (when-not description
+        (throw (errors/pg-error :feature-not-supported
+                                {:feature (str tag " WITH NO DATA for this query")})))
+      (when (> (count columns) (count names))
+        (throw (ex-info "too many column names were specified" {:sqlstate "42601"})))
+      (let [names (into (mapv params/unquote-ident columns) (drop (count columns)) names)
+            duplicate-name (some (fn [[n occurrences]] (when (> occurrences 1) n))
+                                 (frequencies names))]
+        (when duplicate-name
+          (throw (ex-info (str "column \"" duplicate-name "\" specified more than once")
+                          {:sqlstate "42701" :column duplicate-name})))
+        (let [result-plan (-> (sql/ctas-finish (dissoc plan :ctas-select) []
+                                               (mapv dump/quote-ident names) oids db)
+                              (assoc :create-tag tag)
+                              (cond-> matview-query
+                                (update :tx-data into (matview-tx-data (:table-name plan) matview-query false))))]
+          (exec-ddl-create ctx result-plan))))))
+
 (defn- exec-ddl-create-table-as
   "CREATE TABLE … [(cols)] AS <query> [WITH [NO] DATA].
 
    The two things JSqlParser cannot parse -- the column list and the
    WithData tail -- are handled the way the materialized view handles
    them: the column list becomes a derived table's alias list, which
-   already renames output columns, and WITH NO DATA runs the query for
-   its column types and then empties the table. Everything else is the
-   ordinary CTAS path, so the rows and types are whatever that path
-   produces."
+   already renames output columns. WITH NO DATA only describes the query."
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
-        {:keys [table-name columns with-data? if-not-exists?]} parsed
+        {:keys [table-name relation-sql columns with-data? if-not-exists? temp-target?]} parsed
         query (if (seq columns)
                 (str "SELECT * FROM (" (:query parsed) ") AS \"__ctas_src\" ("
                      (str/join ", " columns) ")")
                 (:query parsed))
         db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))]
-    (cond
-      (and (table-exists? db table-name) if-not-exists?)
-      (do (params/notice! "NOTICE" (str "relation \"" table-name
-                                        "\" already exists, skipping"))
-          (empty-result "CREATE TABLE AS"))
-      :else
-      (try
-        (let [^PgWireServer$QueryResult built
-              (run-nested! (str "CREATE TABLE " table-name " AS " query))]
-          (if with-data?
-            built
-            (do (run-nested! (str "DELETE FROM " table-name))
-                ;; PostgreSQL tags a populated CTAS with the query's row
-                ;; count and an unpopulated one with the DDL tag.
-                (empty-result "CREATE TABLE AS"))))
-        (catch Exception e
-          (classified-error "" e))))))
+    (try
+      (if with-data?
+        (if (and (not temp-target?) (table-exists? db table-name) if-not-exists?)
+          (do (params/notice! "NOTICE" (str "relation \"" table-name
+                                            "\" already exists, skipping"))
+              (empty-result "CREATE TABLE AS"))
+          (run-nested! (str "CREATE " (when temp-target? "TEMP ") "TABLE "
+                            (when if-not-exists? "IF NOT EXISTS ") relation-sql " AS " query)))
+        (create-as-without-data ctx parsed nil))
+      (catch Exception e
+        (classified-error "" e)))))
 
 (defn- exec-ddl-create-matview
   "CREATE MATERIALIZED VIEW name [(cols)] AS query [WITH [NO] DATA].
 
-   The view is built by running CREATE TABLE AS on the stored query, so
-   its column names, types and contents are exactly those of the query
-   -- there is no second code path that could disagree with a plain
-   CTAS. WITH NO DATA still runs the query, to learn the column types
-   PostgreSQL also records for an unpopulated view, and then empties
-   it."
+   Populated views use CTAS. WITH NO DATA derives the columns without
+   evaluating the stored query."
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
         {:keys [matview-name columns with-data? if-not-exists?]} parsed
@@ -10632,19 +10660,12 @@
 
       :else
       (try
-        (let [^PgWireServer$QueryResult built
-              (run-nested! (str "CREATE TABLE " matview-name " AS " query))]
-          (when-not with-data?
-            (run-nested! (str "DELETE FROM " matview-name)))
-          (commit-ddl ctx (matview-tx-data matview-name query with-data?)
-                      ;; PostgreSQL tags a POPULATED materialized view
-                      ;; with the query's row count, exactly as it tags
-                      ;; CREATE TABLE AS -- `SELECT 3`, not `CREATE
-                      ;; MATERIALIZED VIEW`. WITH NO DATA ran no query
-                      ;; to count, so it keeps the DDL tag.
-                      (if with-data?
-                        (or (.commandTag built) "CREATE MATERIALIZED VIEW")
-                        "CREATE MATERIALIZED VIEW")))
+        (if with-data?
+          (let [^PgWireServer$QueryResult built
+                (run-nested! (str "CREATE TABLE " matview-name " AS " query))]
+            (commit-ddl ctx (matview-tx-data matview-name query true)
+                        (or (.commandTag built) "CREATE MATERIALIZED VIEW")))
+          (create-as-without-data ctx parsed query))
         (catch Exception e
           (classified-error "" e))))))
 

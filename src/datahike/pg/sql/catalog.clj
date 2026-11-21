@@ -1562,10 +1562,11 @@
      ;; in table-names like any other -- but it is relkind 'm', which
      ;; is how psql's \\dm and every tool that distinguishes the two
      ;; tell them apart.
-         (let [matviews (into #{}
-                              (map first)
-                              (d/q '{:find [?n]
-                                     :where [[?e :datahike.pg.matview/name ?n]]}
+         (let [matviews (into {}
+                              (d/q '{:find [?n ?populated]
+                                     :where [[?e :datahike.pg.matview/name ?n]
+                                             [(get-else $ ?e :datahike.pg.matview/populated? true)
+                                              ?populated]]}
                                    cte-db))]
            (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
              (mapv (fn [t]
@@ -1580,6 +1581,7 @@
                         :pg_class/relnamespace (or (:namespace-oid identity) 2200)
                         :pg_class/relispartition false
                         :pg_class/relkind (if (contains? matviews t) "m" "r")
+                        :pg_class/relispopulated (get matviews t true)
                         :pg_class/reltype
                         (long (if (= :row-type (:datahike.pg.object/kind row-type))
                                 (:datahike.pg.object/oid row-type) 0))

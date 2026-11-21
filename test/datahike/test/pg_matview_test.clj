@@ -98,6 +98,38 @@
       (ok! h "REFRESH MATERIALIZED VIEW mv WITH NO DATA")
       (is (= "55000" (.sqlstate (exec h "SELECT * FROM mv")))))))
 
+(deftest postgres-materialized-view-with-no-data
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE mvtest_t (id int NOT NULL PRIMARY KEY, type text NOT NULL, amt numeric NOT NULL)")
+    (ok! h "INSERT INTO mvtest_t VALUES (1,'x',2),(2,'x',3),(3,'y',5),(4,'y',7),(5,'z',11)")
+    (ok! h (str "CREATE MATERIALIZED VIEW mvtest_tm AS "
+                "SELECT type, sum(amt) AS totamt FROM mvtest_t GROUP BY type WITH NO DATA"))
+    (let [populated-sql "SELECT relispopulated FROM pg_class WHERE oid = 'mvtest_tm'::regclass"
+          scan-sql "SELECT * FROM mvtest_tm ORDER BY type"]
+      (is (= [["f"]] (rows (ok! h populated-sql))))
+      (is (= "55000" (.sqlstate (exec h scan-sql))))
+      (ok! h "REFRESH MATERIALIZED VIEW mvtest_tm")
+      (is (= [["t"]] (rows (ok! h populated-sql))))
+      (is (= [["x" "5"] ["y" "12"] ["z" "11"]] (rows (ok! h scan-sql))))
+      (ok! h "REFRESH MATERIALIZED VIEW mvtest_tm WITH NO DATA")
+      (is (= [["f"]] (rows (ok! h populated-sql))))
+      (is (= "55000" (.sqlstate (exec h scan-sql)))))))
+
+(deftest with-no-data-only-analyzes-the-source
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE SEQUENCE mv_seq")
+    (ok! h "CREATE MATERIALIZED VIEW mv AS SELECT nextval('mv_seq') AS n WITH NO DATA")
+    (is (= [["n" "bigint"]]
+           (rows (ok! h (str "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute "
+                             "WHERE attrelid = 'mv'::regclass AND attnum > 0")))))
+    (is (= [["1"]] (rows (ok! h "SELECT nextval('mv_seq')"))))
+    (ok! h "CREATE MATERIALIZED VIEW bad_when_run AS SELECT 1 / 0 AS n WITH NO DATA")
+    (is (= "22012" (.sqlstate (exec h "REFRESH MATERIALIZED VIEW bad_when_run"))))
+    (is (= "55000" (.sqlstate (exec h "SELECT * FROM bad_when_run"))))
+    (ok! h "EXPLAIN SELECT * FROM bad_when_run")
+    (ok! h "CREATE MATERIALIZED VIEW nested AS SELECT * FROM bad_when_run WITH NO DATA")
+    (is (= "55000" (.sqlstate (exec h "SELECT * FROM nested"))))))
+
 (deftest an-explicit-column-list-renames-the-output
   (with-h [h (fresh-handler)]
     (base! h)
