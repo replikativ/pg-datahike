@@ -185,8 +185,8 @@ CREATE INDEX client_child_amount_idx ON client_child (amount);
 CREATE VIEW client_view AS SELECT id FROM client_child;
 ```
 
-Point `PGHOST`, `PGPORT`, `PGUSER`, and `PGDATABASE` at each endpoint and
-use the PostgreSQL 18 binaries to run:
+Point `PGHOST`, `PGPORT`, `PGUSER`, and `PGDATABASE` at each endpoint.
+Run both commands with PostgreSQL 18 client binaries.
 
 ```bash
 psql -X -E -v ON_ERROR_STOP=1 -c '\d client_child' -c '\d+ client_child'
