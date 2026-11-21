@@ -73,6 +73,7 @@
     "pg_namespace" "pg_database" "pg_proc" "pg_roles" "pg_settings"
     "pg_authid" "pg_auth_members" "pg_am" "pg_language" "pg_tablespace"
     "pg_operator" "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
+    "pg_foreign_table"
     "pg_shdepend"
     ;; Session views. These are the only catalogs here that are NOT
     ;; derived from the database: a PREPAREd statement and a DECLAREd
@@ -752,6 +753,12 @@
      ;; psql's \df filters on it; every row here is an ordinary function.
      {:db/ident :pg_proc/prokind :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      {:db/ident (pgs/row-marker-attr "pg_proc") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_foreign_table"
+    [{:db/ident :pg_foreign_table/ftrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_table/ftserver :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_table/ftoptions :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
+     {:db/ident (pgs/row-marker-attr "pg_foreign_table") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
     "pg_class"
     [;; Stable per-table OID — the primary key of pg_class. Populated
      ;; from the table's :pg/table-oid. Lets pgjdbc's metadata joins
@@ -759,7 +766,13 @@
      {:db/ident :pg_class/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_class/relname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_class/relnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_class/relkind :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_class/relkind :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_class/relpages :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_class/reltuples :db/valueType :db.type/float :db/cardinality :db.cardinality/one :pg/type "float4"}
+     {:db/ident :pg_class/relallvisible :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_class/relallfrozen :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_class/relfrozenxid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "xid"}
+     {:db/ident :pg_class/relminmxid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "xid"}
      ;; reltype: the pg_type OID of this relation's composite row-type.
      ;; asyncpg joins composite pg_type → pg_class on `c.reltype = t.oid`.
      {:db/ident :pg_class/reltype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -1598,6 +1611,15 @@
                       :pg_class/relam (case kind ("r" "m") 2 "i" 403 0)
                       :pg_class/relfilenode (if stored? (long oid) 0)
                       :pg_class/reltablespace 0
+                      ;; The backing store has no PostgreSQL heap pages or
+                      ;; freeze horizon. PostgreSQL uses -1 for an unknown
+                      ;; tuple estimate and 0 for an invalid transaction ID.
+                      :pg_class/relpages 0
+                      :pg_class/reltuples (float -1)
+                      :pg_class/relallvisible 0
+                      :pg_class/relallfrozen 0
+                      :pg_class/relfrozenxid 0
+                      :pg_class/relminmxid 0
                       :pg_class/reltoastrelid 0
                       :pg_class/reloftype 0
                       :pg_class/relchecks (long (if (= "r" kind) (get checks name 0) 0))
@@ -2660,6 +2682,8 @@
     "pg_description"
     []
     "pg_stat_user_tables"
+    []
+    "pg_foreign_table"
     []
     "pg_depend"
     []

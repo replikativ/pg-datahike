@@ -106,3 +106,41 @@
                (run h sql)))
         (is (nil? (.error (.execute h "ALTER TABLE described DROP COLUMN label"))))
         (is (= (if pg18? "described_id_not_null|id|f|t|f|t|smallint" "") (run h sql)))))))
+
+(deftest relation-metadata-for-schema-export
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (nil? (.error (.execute h "CREATE TABLE exported (id integer)"))))
+      (is (= "\"char\"|integer|real|integer|integer|xid|xid"
+             (run h "SELECT pg_typeof(relkind), pg_typeof(relpages), pg_typeof(reltuples),
+                            pg_typeof(relallvisible), pg_typeof(relallfrozen),
+                            pg_typeof(relfrozenxid), pg_typeof(relminmxid)
+                       FROM pg_class WHERE relname = 'exported'")))
+      (is (= "0|-1|0|0|0|0"
+             (run h "SELECT relpages, reltuples, relallvisible, relallfrozen,
+                            relfrozenxid, relminmxid
+                       FROM pg_class WHERE relname = 'exported'")))
+      (is (= "0"
+             (run h "SELECT CASE WHEN c.relkind = 'f'
+                            THEN (SELECT ftserver FROM pg_catalog.pg_foreign_table
+                                   WHERE ftrelid = c.oid)
+                            ELSE 0 END
+                       FROM pg_class c WHERE c.relname = 'exported'")))
+      (doseq [[source expected] [["pg_am WHERE amname = 'btree'" "2601"]
+                                 ["pg_language WHERE lanname = 'sql'" "2612"]
+                                 ["pg_operator WHERE oid = 96" "2617"]
+                                 ["pg_cast WHERE castsource = 23 AND casttarget = 20" "2605"]
+                                 ["pg_tablespace WHERE spcname = 'pg_default'" "1213"]]]
+        (is (= expected (run h (str "SELECT tableoid FROM " source))) source)))))
+
+(deftest schema-qualified-built-in-casts
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (= "smallint|\"char\"|oid[]"
+             (run h "SELECT pg_typeof(0::pg_catalog.int2),
+                            pg_typeof('x'::pg_catalog.char),
+                            pg_typeof('{42}'::pg_catalog.oid[])")))
+      (is (= "42|oid\n43|oid"
+             (run h "SELECT n, pg_typeof(n)
+                       FROM unnest('{42,43}'::\"pg_catalog\".\"oid\"[]) AS a(n)
+                       ORDER BY n"))))))
