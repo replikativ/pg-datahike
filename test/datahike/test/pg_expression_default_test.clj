@@ -77,15 +77,16 @@
     (exec! c "CREATE TABLE task (id int PRIMARY KEY)")
     (exec! c "INSERT INTO task VALUES (1)")
     (exec! c "ALTER TABLE task ADD COLUMN priority int DEFAULT 7 NOT NULL")
-    (exec! c "ALTER TABLE task ADD COLUMN tag text DEFAULT 'old'")
+    (exec! c "ALTER TABLE task ADD COLUMN tag text DEFAULT 'old identity'")
     (exec! c "ALTER TABLE task ALTER COLUMN priority SET DEFAULT (40 + 2)")
+    (exec! c "ALTER TABLE task ALTER COLUMN tag SET DEFAULT 'identity'")
     (exec! c "INSERT INTO task (id) VALUES (2)")
     (with-open [payload (StringReader. "3\n")]
       (is (= 1 (.copyIn (.getCopyAPI (.unwrap c PGConnection))
                         "COPY task (id) FROM STDIN" payload))))
     (exec! c "ALTER TABLE task ALTER COLUMN tag DROP DEFAULT")
     (exec! c "INSERT INTO task (id) VALUES (4)")
-    (is (= [[1 7 "old"] [2 42 "old"] [3 42 "old"] [4 42 nil]]
+    (is (= [[1 7 "old identity"] [2 42 "identity"] [3 42 "identity"] [4 42 nil]]
            (rows c "SELECT id, priority, tag FROM task ORDER BY id")))
     (exec! c "BEGIN")
     (exec! c "ALTER TABLE task ALTER COLUMN priority SET DEFAULT 5")
