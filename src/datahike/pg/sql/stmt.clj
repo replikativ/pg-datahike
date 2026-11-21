@@ -48,6 +48,7 @@
             [datahike.pg.cache :as pg-cache]
             [datahike.db.interface :as dbi]
             [datahike.pg.catalog.basis :as catalog-basis]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.errors :as errors]
             [datahike.pg.input :as input]
             [datahike.pg.constraints.row :as row-constraints]
@@ -1146,6 +1147,7 @@
     (instance? LongValue expr)   (.getValue ^LongValue expr)
     (instance? DoubleValue expr) (types/decimal-literal expr (.getValue ^DoubleValue expr))
     (instance? StringValue expr) (expr/string-value-text ^StringValue expr)
+    (instance? NullValue expr) nil
     (instance? JdbcParameter expr)
     (if-let [bound params/*bound-params*]
       (nth bound (dec (long (.getIndex ^JdbcParameter expr))) ::corr)
@@ -1319,7 +1321,7 @@
    known one whose arguments we could not evaluate (a correlated LATERAL
    argument): the first is 42883, the second is not."
   #{"unnest" "generate_series" "pg_get_keywords"
-    "pg_input_error_info" expandarray-name
+    "pg_input_error_info" "pg_partition_ancestors" expandarray-name
     "jsonb_array_elements" "json_array_elements"
     "jsonb_array_elements_text" "json_array_elements_text"
     "jsonb_each" "json_each" "jsonb_each_text" "json_each_text"
@@ -1413,6 +1415,9 @@
                            "argument types. You might need to add "
                            "explicit type casts.")}))))))
 
+(def ^:private target-list-srf-names
+  #{"generate_series" "unnest" "pg_partition_ancestors" expandarray-name})
+
 (defn- target-list-srf?
   "Whether expr is a set-returning function supported by ProjectSet.
 
@@ -1423,7 +1428,7 @@
    `(information_schema._pg_expandarray(i.indkey)).n`."
   [expr]
   (and (instance? Function expr)
-       (contains? #{"generate_series" "unnest" expandarray-name}
+       (contains? target-list-srf-names
                   (srf-base-name (.getName ^Function expr)))))
 
 (defn- srf-row-get
@@ -1451,7 +1456,7 @@
    that SELECT's placement context."
   [expr]
   (boolean
-   (some #(contains? #{"generate_series" "unnest" expandarray-name} (srf-base-name %))
+   (some #(contains? target-list-srf-names (srf-base-name %))
          (params/ast-function-names expr))))
 
 (defn- reject-prohibited-target-srf!
@@ -1563,6 +1568,20 @@
                                {:aliases aliases :rows rows :vtypes vtypes
                                 :pg-types (vec pg-types)}))]
        (cond
+         (= fname "pg_partition_ancestors")
+         (let [db (or (:db scope) params/*parse-db*)
+               arg-oid (some-> (first params) (oid/resolution-oid {:schema (:schema db) :db db}))
+               _ (when (or (not= 1 (count params))
+                           (and arg-oid
+                                (not (types/implicit-coercible? arg-oid types/oid-regclass))))
+                   (throw (errors/pg-error :undefined-function {:function (str f)})))
+               value (eval-fn (first params))]
+           (when-not (= ::corr value)
+             (regoid/input "regclass" value)
+             ;; Ordinary relations have no partition tree. The server
+             ;; rejects declarative partitioning (exec-ddl-create).
+             (with-ordinality ["relid"] [] [:db.type/long] ["regclass"])))
+
          (= fname "pg_input_error_info")
          (let [[value type-name] (mapv eval-fn params)]
            (when (= 2 (count params))
@@ -2218,6 +2237,21 @@
   "VALUES output columns inferred from ASTs, without evaluating any cell."
   [values schema db]
   (analysis/values-output values schema db))
+
+(defn translate-literal-values
+  "Make a SELECT leaf for literal VALUES rows used in a set operation."
+  [values schema db]
+  (let [expressions (values-expression-rows values)
+        columns (analyze-values-output values schema db)
+        rows (when-not params/*analysis-only?*
+               (mapv #(mapv eval-values-literal %) expressions))
+        oids (mapv :oid columns)]
+    (when (some #{:unhandled} (mapcat identity rows))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "non-literal expressions in set-operation VALUES"})))
+    {:type :select :literal-rows (or rows [])
+     :find-aliases (mapv :name columns)
+     :select-item-oids oids :select-item-resolution-oids oids}))
 
 (defn- column-vtype
   "Best-effort storage type for a column expression in a virtual relation."
@@ -4763,7 +4797,11 @@
           ([^Function f alias-str visible?]
            (lower-project-srf! f alias-str visible? nil))
           ([^Function f alias-str visible? field]
-           (let [children (atom [])
+           (let [_ (when (= "pg_partition_ancestors" (srf-base-name (.getName f)))
+                     (analysis/table-function-shape
+                      (net.sf.jsqlparser.statement.select.TableFunction. f)
+                      "pg_partition_ancestors" nil schema db))
+                 children (atom [])
                  arg-vars
                  (mapv (fn [arg]
                          (if (target-list-srf? arg)

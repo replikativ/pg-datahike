@@ -113,6 +113,7 @@
 
 (def ^:private fixed-table-functions
   {"pg_input_error_info" {:names ["message" "detail" "hint" "sql_error_code"] :oids [25 25 25 25] :arity #{2}}
+   "pg_partition_ancestors" {:names ["relid"] :oids [types/oid-regclass] :arity #{1}}
    "pg_get_keywords" {:names ["word" "catcode" "barelabel" "catdesc" "baredesc"] :oids [25 18 16 25 25] :arity #{0}}
    "jsonb_array_elements" {:names ["value"] :oids [3802] :arity #{1}}
    "json_array_elements" {:names ["value"] :oids [114] :arity #{1}}
@@ -171,6 +172,7 @@
             (let [expected (cond
                              (str/starts-with? function-name "jsonb_") [3802]
                              (str/starts-with? function-name "json_") [114]
+                             (= function-name "pg_partition_ancestors") [types/oid-regclass]
                              (contains? #{"regexp_split_to_table" "string_to_table"
                                           "pg_input_error_info"} function-name)
                              (repeat (count arguments) 25)
