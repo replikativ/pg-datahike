@@ -1,80 +1,78 @@
 # Mirroring a live PostgreSQL, with our semantics
 
-Status: **proposal, nothing implemented.** This file holds the decisions
-and the constraints. The evidence behind them -- XTDB 2.2 line
-references, a captured `postgres_fdw` session against a scratch server,
-and a per-step verdict on what we answer today -- is in the research
-note `.internal/xtdb-external-sources.md` (local, not committed, and its
-file:line references drift like the other `.internal/` reports).
+**Transport verified locally.** The subscriber prototype is queued after
+the PostgreSQL 18.6 cutover and the current application-facing
+compatibility batch. See the [roadmap](consolidation-plan.md).
 
 ## The goal
 
-A pg-datahike database configured as a mirror of
-`{host, db, publication, slot}`: it snapshots a publication, follows
-pgoutput, and applies each upstream commit as one `d/transact`. Clients
-then query it with our PostgreSQL semantics **plus** `FOR SYSTEM_TIME AS
-OF` -- time travel over a database that never had it. XTDB 2.2 shipped
-the same shape and has shown the demand.
+A read-only pg-datahike database mirrors a publication from an existing
+PostgreSQL database. PostgreSQL remains the write endpoint. The mirror
+loads a consistent snapshot, follows native logical replication, and
+applies each upstream commit as one local transaction. Clients can query
+it with SQL or Datalog and inspect history from the initial snapshot
+onward with `FOR SYSTEM_TIME AS OF`.
 
 ## The three shapes, and which ones we want
 
 | | What | Verdict |
 |---|---|---|
-| **Option 1** | upstream PostgreSQL → pg-datahike live mirror (CDC in) | **The strategic feature.** ~4-6 wk MVP |
-| **Option 2** | a running PostgreSQL querying us through `postgres_fdw` / `dblink` | **Cheapest win, do first.** ~1.5-2.5 wk, and most of it is catalog work this plan already owns |
+| **Option 1** | upstream PostgreSQL → pg-datahike live mirror (CDC in) | **Next prototype after the compatibility batch.** |
+| **Option 2** | a running PostgreSQL querying us through `postgres_fdw` / `dblink` | Independent interoperability work that shares catalog and test infrastructure. |
 | **Option 3** | pg-datahike as a logical-replication publisher (CDC out) | **Defer.** Needs a durable commit cursor and consumer-pinned GC roots in datahike, after the 1.0 id layout |
 
-Option 2 first, then Option 1. Option 2 is independently useful, and it
-builds the PG-17-in-tests infrastructure and catalog fidelity that
-Option 1 also needs.
+## Native subscriber and apply path
 
-## Where we beat XTDB, and what not to copy
+Use pgJDBC to connect in replication mode to a stock PostgreSQL publisher.
+Start with `pgoutput` protocol version 1 in text mode. Create a logical
+slot with an exported snapshot, import it on a regular connection, and
+COPY the published tables into a staging mirror. Catch up from the slot's
+consistent position before making the mirror available to readers.
+Configure the upstream connection, publication, and slot explicitly.
+`CREATE SUBSCRIPTION` can come later as a SQL management interface.
+[PostgreSQL replication protocol](https://www.postgresql.org/docs/18/protocol-logical-replication.html) · [Exported snapshots](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html#LOGICALDECODING-SNAPSHOTS)
 
-**Copy:** the resume token written in the same transaction as the rows;
-resume from what is *indexed* but confirm only what is *durable*; one
-sole confirmer; pgjdbc's automatic flush turned **off** (it confirms the
-slot from keepalives behind your back -- the single most important
-non-obvious detail); skip re-delivered LSNs.
+**Verified against PostgreSQL 18.6 with pgJDBC 42.7.3.** The slot snapshot
+showed the original rows while writes committed. The stream delivered an
+update, insert, and delete across two tables in one commit and omitted
+a rolled-back insert. Receiving the commit and sending status feedback
+left `confirmed_flush_lsn` at the slot's start position. Setting the
+applied and flushed LSNs explicitly advanced it to the transaction's end
+position. Destination apply and crash recovery still need a prototype.
 
-**Do better, because a datom per attribute lets us:**
+Generate parameterized SQL from decoded row changes for the first apply
+implementation. Keep one write path and one commit boundary. Use the
+existing transaction machinery through `transact-recorded!`. Consider
+direct datom generation if the prototype shows a measurable SQL cost or
+uncovers apply semantics that the shared path cannot express.
 
-- **Unchanged TOAST.** pgoutput sends `'u'` for an unchanged out-of-line
-  value. XTDB writes whole documents, so it must halt and demand
-  `REPLICA IDENTITY FULL`. We emit *no datom for that attribute* and the
-  previous value stays current. **We do not need REPLICA IDENTITY FULL
-  for TOASTable columns.**
-- **TRUNCATE.** XTDB halts on the `T` message. We retract the marked
-  rows in the same transaction, and with `:keep-history? true` an `AS OF`
-  before the truncate still sees the data.
-- **Real keys.** No synthetic `_id` column: we have the PK via
-  `:db.unique/identity`, and a composite PK via `:t/pg$pk_tuple`.
+- Resolve updates and deletes by the source key. Use the old key for a
+  key-changing update. The destination already represents single and
+  composite primary keys.
+- Leave an unchanged TOAST column out of the update. Set a column to
+  SQL NULL when the stream provides an explicit NULL. This allows tables
+  with large values to use ordinary primary-key replica identity.
+- Apply `TRUNCATE` to the published relations as part of the source
+  transaction. With history enabled, reads before the truncate still see
+  the original rows.
 
-**Do not copy:** halting on TRUNCATE or on an unchanged TOAST value;
-tables added to the publication later that are never snapshotted; the
-"inoperable, re-ATTACH everything" answer to an interrupted snapshot
-(a staging branch gives us an atomic area instead).
+[PostgreSQL row change formats](https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html)
 
-## Constraints, to settle before any code
+## Apply and recovery guarantees
 
-These exist because a mirror is a second writer, and this repository's
-whole consolidation effort is about not having two implementations of
-one concept.
-
-1. **One write path.** Replica mode -- skipping FK/CHECK/UNIQUE during
-   apply, PostgreSQL's `session_replication_role = replica` -- is a
-   **flag on the existing path**, never a parallel one, and it must be
-   visible in status so nobody later has to guess which rows were
-   checked. Upstream already enforced those constraints, possibly
-   `DEFERRABLE INITIALLY DEFERRED`, so a per-row immediate check in
-   commit order can fail spuriously. That is the reason for the flag; it
-   is not a reason for a second path.
-2. **Everything goes through `transact-recorded!`.** Its docstring says
-   every server-side transact must, because of the conflict ring. The
-   mirror needs tx-meta, so `transact-recorded!` grows an optional
-   tx-meta argument -- it does not grow a bypass.
-3. **Confirm only what is durable, and confirm from one place.**
-4. **The LSN lives in the data,** as tx-meta plus a single cursor entity
-   upserted in the same transaction. Never derive it from tx ids.
+1. **Apply the upstream effects once.** Use an internal apply mode on the
+   existing write path for source-computed values and effects. Keep
+   destination storage invariants in force and define how apply handles
+   transactions whose source constraints were deferred.
+2. **Commit through `transact-recorded!`.** This keeps the conflict ring
+   consistent. Pass transaction metadata through the same path when
+   needed.
+3. **Acknowledge only after a durable commit.** One worker owns feedback
+   for the slot.
+4. **Commit rows and the checkpoint together.** Persist the source
+   transaction's end LSN in a cursor entity in the same transaction.
+   Skip redeliveries at or below the recorded position. Record the
+   upstream commit timestamp separately from Datahike's transaction time.
 5. **No code may assume dense tx ids.** See the `ring-write-eas` note
    below.
 6. **Refuse a mirror on a volatile store** (`:memory`, a non-fsyncing
@@ -99,21 +97,14 @@ reason to go around the one required write path.
   -- about 1 s at 3M datoms. 1-2 days, no prerequisites, and required
   before the 1.0 ids regardless of whether we ever build a mirror.
 
-## Prerequisites this plan already owns
+## Shared compatibility work
 
 - **Catalog fidelity** (consolidation-plan Phase 4 and the `sysviews`
-  cluster). A mirror synthesizes `CREATE TABLE` / `ALTER TABLE` SQL and
-  runs it through our own DDL path -- deliberately, so the translator,
-  catalog and `\d` all keep working -- and it reads upstream
-  `pg_attribute` / `pg_constraint`. It inherits whatever the catalog
-  gets wrong. Today `pg_class` serves 6 of PostgreSQL 17's 33 columns
-  and **an unknown catalog column reads as NULL instead of raising**,
-  which is why `IMPORT FOREIGN SCHEMA` silently imports nothing
-  (`NOT c.relispartition` is NULL for every row).
-- **One settings store** (Phase 1.5). Startup-packet `options` is read
-  today only by two ad-hoc regexes (statement_timeout and
-  `-c datestyle=`), so there is no general `-c name=value`. The store
-  gives `postgres_fdw` sessions an `AS OF` through
+  cluster). Discover source columns and keys through PostgreSQL's
+  catalogs. Load the mirror's schema through the existing DDL path so its
+  SQL translator, catalogs, and `\d` agree.
+- **FDW session settings** (Phase 1.5). A shared settings store lets
+  `postgres_fdw` sessions select an `AS OF` through
   `OPTIONS (options '-c ...')`.
 
 ## Scope: two regression files are excluded by inertia
@@ -124,15 +115,22 @@ reason to go around the one required write path.
 to plpgsql. Move each in when its feature lands rather than leaving it
 excluded.
 
-## Staging
+## Subscriber milestones
 
-| Stage | What | Effort |
-|---|---|---|
-| **0** | Option 2: catalog columns, `regclass` OID consistency, streaming cursors + `MOVE BACKWARD ALL`, parenthesized joins with inner aliases, an EXPLAIN cost line, SQL `DEALLOCATE` of protocol-level statements. Gated by a local PG 17 + `postgres_fdw`, and by `foreign_data` | 1.5-2.5 wk |
-| **0.5** | the three seams above | ~1 wk |
-| **1** | Option 1 MVP: pgjdbc stream behind a `ChangeStream` protocol, snapshot via COPY into a staging branch, DDL through the SQL path, direct tx-data apply with tx-meta and the cursor entity, confirm-after-resolve, monotonic `txInstant`, read-only mirror, TOAST `'u'`, TRUNCATE, metrics, kill/restart harness | 4-6 wk |
-| **2** | hardening: tablesync for tables added later, schema evolution from `Relation` diffs, auto re-snapshot on slot loss, PG 14-16, large-tx spill, optional native replication client | 3-5 wk |
-| **3** | Option 3(b) a Debezium-shaped change stream, then maybe (a) a walsender | 2-3 wk / 6-10 wk |
+- [x] Verify the native transport, slot snapshot, and explicit feedback.
+- [ ] After the 18.6 compatibility batch, use a local REPL prototype to mirror
+  two ordinary keyed tables. Keep writes going during COPY. Apply a
+  multi-table transaction with a key change, a delete, and an update that
+  leaves a large value unchanged. Kill the worker after the destination
+  commit and before acknowledgement, then restart and compare current
+  rows and historical reads. Verify one local transaction per applied
+  source commit and confirm that a rolled-back source change stays absent.
+- [ ] Turn the prototype into a read-only mirror with durable storage,
+  staging and cutover, schema drift detection, `TRUNCATE`, and lag and
+  checkpoint status. Run the focused PostgreSQL oracle during development
+  and the full integration suites before opening the PR.
+- [ ] Extend table synchronization and schema evolution, recovery after
+  slot loss, failover handling, and support for large transactions.
 
 ## Known performance trap in Option 2, today
 

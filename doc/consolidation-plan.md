@@ -489,18 +489,21 @@ to protect, and to check on the pgbench path before and after (see
 `doc/benchmarks.md` and the baseline in memory). A per-row callout would be an
 N+1 and is the thing 7.2 and 7.3 must avoid wherever the shape allows.
 
-## Beyond the phases — mirroring a live PostgreSQL
+## After the PostgreSQL 18.6 compatibility batch — live PostgreSQL mirroring
 
-A separate direction, not a phase: a pg-datahike database that follows a
-live PostgreSQL over logical replication and answers with our semantics
-plus `FOR SYSTEM_TIME AS OF`, and the reverse path of a running
-PostgreSQL querying us through `postgres_fdw`. See
-[postgres-mirroring.md](postgres-mirroring.md) for the decisions, the
-constraints that have to hold before any code, and the seams worth
-landing early. Two of its prerequisites are phases here already --
-catalog fidelity (Phase 4, and the `sysviews` cluster) and the single
-settings store (Phase 1.5) -- so the order does not change; the document
-records what must not be built the wrong way in the meantime.
+Finish the 18.6 cutover and the current application-facing batch covering
+schema changes, writes, transactions, and COPY. Then prototype a read-only
+pg-datahike mirror of a PostgreSQL publication. Start with an exported
+snapshot loaded via COPY, follow native `pgoutput` with pgJDBC, and replay
+each committed transaction as parameterized SQL. The transport probe
+passed against PostgreSQL 18.6. The prototype milestone is a two-table
+mirror that resumes after a crash with the same current rows and no
+duplicate history. Track the remaining SQL work in the
+[regression baseline](postgres-regress-baseline.md) and the subscriber
+milestones in [the mirroring proposal](postgres-mirroring.md).
+
+The mirror reuses catalog, schema, and type handling from the compatibility
+work. `postgres_fdw` and `dblink` are independent interoperability work.
 
 ## Process per phase
 
