@@ -133,13 +133,15 @@
        :gate "test/datahike/test/pg_expression_default_test.clj"
        :test-var "compound-arithmetic-defaults"}]}
     {:name "insert", :boundaries #{:constraints :defaults :insert-select :dml}, :mode :unmeasured}
-    {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :unmeasured}
+    {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :discovery
+     :blockers #{:conflict-operator-class-index :explain-insert}}
     {:name "update", :boundaries #{:update-from :dml :row-assignment}, :mode :unmeasured}
     {:name "delete", :boundaries #{:name-resolution :dml}, :mode :strict}
     {:name "returning",
      :boundaries #{:defaults :result-metadata :expressions :dml},
      :requires ["test_setup"],
-     :mode :unmeasured}
+     :mode :discovery
+     :blockers #{:returning-update-source-binding}}
     {:name "transactions",
      :boundaries #{:error-recovery :transactions :savepoints},
      :requires ["test_setup"],
@@ -216,7 +218,8 @@
        :gate "test/datahike/test/pg_constraints_test.clj"
        :test-var "postgres-rejects-invalid-foreign-key-definitions"}]}
     {:name "create_view", :boundaries #{:ddl :relational :views}, :mode :unmeasured}
-    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :unmeasured
+    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :discovery
+     :blockers #{:alter-reserved-system-column :alter-comment-missing-relation}
      :strict-slices
      [{:id :alter-column-nullability
        :source-lines [876 908]
@@ -273,8 +276,11 @@
        :gate "test/datahike/test/pg_expression_default_test.clj"
        :test-var "fast-default-keeps-old-row-values"}]}
     {:name "generated_stored", :boundaries #{:copy :ddl :generated-columns :dml}, :mode :unmeasured}
-    {:name "identity", :boundaries #{:identity-columns :sequences :ddl :dml}, :mode :unmeasured}
-    {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :unmeasured}
+    {:name "identity", :boundaries #{:identity-columns :sequences :ddl :dml}, :mode :discovery
+     :blockers #{:identity-sequence-options :alter-identity}}
+    {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :discovery
+     :requires ["test_setup"]
+     :blockers #{:sequence-ownership-validation :cached-sequence-position :sequence-privileges}}
     {:name "create_schema", :boundaries #{:name-resolution :schemas :ddl}, :mode :unmeasured}
     {:name "drop_if_exists", :boundaries #{:conditional-ddl :errors :ddl}, :mode :unmeasured}
     {:name "create_table_like", :boundaries #{:constraints :ddl :schema-copy}, :mode :discovery

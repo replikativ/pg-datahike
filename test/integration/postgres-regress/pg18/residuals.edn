@@ -86,9 +86,30 @@
   {:id :expression-default-backfill
    :file "fast_default" :lines [67 67] :state :open :impact :unsupported
    :detail "Adding a column with an expression default to a populated table requires backfill evaluation. The volatile default case needs a separate value per existing row."}
+  {:id :fast-default-rewrite-event
+   :file "fast_default" :lines [59 61] :state :boundary :impact :unsupported
+   :detail "The first difference is CREATE EVENT TRIGGER on table_rewrite. The volatile backfill fails separately because it needs per-row default evaluation."}
   {:id :sequence-data-discovery
-   :file "sequence" :lines [416 417] :state :open :impact :unsupported
-   :detail "PostgreSQL 18 pg_dump uses pg_get_sequence_data to read last_value and is_called in data-bearing dumps. Schema-only pg_dump and direct COPY pass the ordinary fixture."}
+   :file "sequence" :lines [416 417] :state :open :impact :wrong-result
+   :detail "pg_get_sequence_data now gives stock pg_dump both position fields. With CACHE 10 and three calls, native 18.6 reports the reserved upper value 10 and pg-datahike reports the handed-out value 3."}
+  {:id :sequence-ownership-validation
+   :file "sequence" :lines [14 20] :state :open :impact :wrong-result
+   :detail "The invalid OWNED BY clause creates the sequence. Subsequent ownership checks with that name fail as duplicate relations. Replay each ownership case with fresh names before comparing its SQLSTATE."}
+  {:id :identity-sequence-options
+   :file "identity" :lines [7 8] :state :open :impact :unsupported
+   :detail "CREATE TABLE rejects identity START and INCREMENT options, so later probes on itest3 are cascades. ALTER COLUMN ADD GENERATED has a separate parser gap."}
+  {:id :alter-comment-missing-relation
+   :file "alter_table" :lines [18 18] :state :open :impact :wrong-result
+   :detail "COMMENT ON a missing relation succeeds on the target. Native 18.6 rejects it before the ordinary-table migration statements."}
+  {:id :alter-reserved-system-column
+   :file "alter_table" :lines [22 22] :state :open :impact :wrong-result
+   :detail "ADD COLUMN xmin succeeds and adds a visible column. Native 18.6 rejects the reserved system attribute name."}
+  {:id :conflict-operator-class-index
+   :file "insert_conflict" :lines [13 16] :state :open :impact :unsupported
+   :detail "The first independent failure is CREATE UNIQUE INDEX with text_pattern_ops. Later ON CONFLICT arbiter differences depend on those indexes. EXPLAIN INSERT has a separate parser gap."}
+  {:id :returning-update-source-binding
+   :file "returning" :lines [41 44] :state :open :impact :unsupported
+   :detail "UPDATE FROM reaches RETURNING without the joined source alias in scope. The statement fails before the write and later SELECT output reflects the unchanged row."}
   {:id :reset-transaction-isolation
    :file "transactions" :lines [39 42] :state :covered :impact :wrong-result
    :detail "RESET of a current transaction characteristic now returns 0A000. The gate checks that the transaction then returns 25P02 until rollback."}

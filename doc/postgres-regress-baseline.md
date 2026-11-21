@@ -254,8 +254,38 @@ normalization.
 
 The expanded fixture compares ALTER-generated defaults as part of the
 schema restore. It exports table data through COPY and restores it into
-native 18.6, then compares the actual values. Data-bearing `pg_dump`
-still needs `pg_get_sequence_data` and correct sequence state.
+native 18.6, then compares the actual values.
+
+The [data export check](../test/integration/pgdump/data-export.sh) uses
+stock 18.6 `pg_dump` for a complete dump and restores it into a fresh
+native database. It compares COPY rows, sequence parameters, both fields of
+`pg_get_sequence_data`, ownership of SERIAL and identity sequences, and
+the next generated values. It exercises untouched, advanced, and reset
+sequences. The legacy offset representation is read on upgrade and converted
+when the sequence position changes. Legacy offsets cannot reconstruct a
+previous `setval(false)` flag away from the initial value.
+
+### Migration and write replay
+
+The paired replay used the pinned 18.6 fixtures with setup and prerequisites
+collected separately. Native output matched the upstream expectation in
+all six target phases. The first independent differences are tracked by
+upstream SQL range in the [residual map](../test/integration/postgres-regress/pg18/residuals.edn).
+The whole-corpus census above still describes the earlier frozen replay.
+
+| File | First independent difference | Triage |
+|---|---|---|
+| `sequence` | Invalid `OWNED BY` creates a sequence | Validate ownership before changing the catalog. The duplicate-relation errors that follow use the same name. Metadata for the `CACHE 10` example also differs after three calls. |
+| `identity` | `CREATE TABLE` rejects identity `START` and `INCREMENT` options | Compare modifiers and ordinary identity inserts independently. Later statements referencing the rejected table have no fixture. |
+| `fast_default` | The `table_rewrite` event trigger is unsupported | Test stable and volatile default backfill on populated tables independently of rewrite notices. |
+| `alter_table` | `COMMENT ON` accepts a missing target, then `ADD COLUMN xmin` succeeds | Reproduce both with a fresh ordinary table. The initial 180-second run stopped at `\d tt7`. A separate 480-second run completed. |
+| `insert_conflict` | A unique index with `text_pattern_ops` is rejected | Test the index definition before testing conflict arbiter inference. `EXPLAIN INSERT` is a separate parser gap. |
+| `returning` | `UPDATE FROM ... RETURNING` cannot resolve the source alias | Bind the joined row for projection and check error atomicity. The following result diff includes the unchanged destination row. |
+
+Prioritize accepting invalid DDL that durably changes the schema, then
+ordinary migration defaults and joined write projections. Unique-index
+arbiters and rewrite-event behavior have separate fixture and feature
+coverage.
 
 ## Running the comparison
 
