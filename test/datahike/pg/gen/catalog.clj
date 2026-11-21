@@ -14,6 +14,7 @@
    Only the columns resolution needs are kept, and type references are
    resolved to OIDs the way genbki's BKI_LOOKUP does."
   (:require [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
             [clojure.string :as str]))
 
 (def default-source ".internal/postgres-REL_17_7")
@@ -212,6 +213,65 @@
   (let [configure (slurp (io/file src "configure.ac"))]
     (second (re-find #"AC_INIT\(\[PostgreSQL\], \[([^\]]+)\]" configure))))
 
+(def ^:private operator-catalogs
+  {:opclasses [:oid :opcmethod :opcname :opcnamespace :opcowner :opcfamily
+               :opcintype :opcdefault :opckeytype]
+   :opfamilies [:oid :opfmethod :opfname :opfnamespace :opfowner]
+   :amops [:oid :amopfamily :amoplefttype :amoprighttype :amopstrategy
+           :amoppurpose :amopopr :amopmethod :amopsortfamily]
+   :amprocs [:oid :amprocfamily :amproclefttype :amprocrighttype :amprocnum :amproc]})
+
+(defn- bki-value [column value]
+  (case column
+    (:opcname :opfname :amoppurpose) value
+    :opcdefault (->bool value)
+    (or (parse-long value)
+        (throw (ex-info "Invalid numeric catalog value" {:column column :value value})))))
+
+(defn- operator-catalog-rows [bki table columns]
+  (let [begin (str "open " table)
+        end (str "close " table)
+        rows (->> (str/split-lines bki)
+                  (drop-while #(not= begin %))
+                  rest
+                  (take-while #(not= end %)))]
+    (when (empty? rows)
+      (throw (ex-info "Missing bootstrap catalog rows" {:table table})))
+    (mapv (fn [line]
+            (let [[_ row] (re-matches #"insert \( (.*) \)" line)
+                  values (when row (str/split row #" "))]
+              (when-not (= (count columns) (count values))
+                (throw (ex-info "Invalid bootstrap catalog row" {:table table :line line})))
+              (zipmap columns (map bki-value columns values))))
+          rows)))
+
+(defn- bootstrap-operator-catalogs
+  "Use PostgreSQL's own BKI generation for catalog-assigned object OIDs."
+  [src version]
+  (let [include (.getCanonicalFile (io/file src "src/include"))
+        catalog-dir (io/file include "catalog")
+        makefile (slurp (io/file catalog-dir "Makefile"))
+        [_ header-list] (re-find #"(?s)CATALOG_HEADERS :=(.*?)\nGENERATED_HEADERS" makefile)
+        headers (mapv #(str (io/file catalog-dir %)) (re-seq #"\w+\.h" header-list))
+        tmp (.toFile (java.nio.file.Files/createTempDirectory
+                      "pgdh-bki-" (make-array java.nio.file.attribute.FileAttribute 0)))]
+    (try
+      (let [cmd (into ["perl" (.getCanonicalPath (io/file src "src/backend/catalog/genbki.pl"))
+                       (str "--include-path=" include "/")
+                       (str "--set-version=" (first (str/split version #"\.")))]
+                      headers)
+            {:keys [exit out err]} (apply shell/sh (into cmd [:dir tmp]))]
+        (when-not (zero? exit)
+          (throw (ex-info "PostgreSQL catalog generation failed" {:exit exit :out out :err err})))
+        (let [bki (slurp (io/file tmp "postgres.bki"))]
+          (into {}
+                (map (fn [[key table]] [key (operator-catalog-rows bki table (operator-catalogs key))]))
+                [[:opclasses "pg_opclass"] [:opfamilies "pg_opfamily"]
+                 [:amops "pg_amop"] [:amprocs "pg_amproc"]])))
+      (finally
+        (doseq [file (reverse (file-seq tmp))]
+          (io/delete-file file))))))
+
 (defn generate
   "The catalog map for the PostgreSQL checkout at `src`."
   [src]
@@ -219,33 +279,37 @@
         type-oid (type-lookup ts)
         procedures (procs src type-oid)
         language-oids (into {} (map (fn [row] [(:lanname row) (parse-long (:oid row))]))
-                            (read-dat src "pg_language"))]
-    {:pg-version (source-version src)
-     :types ts
-     :casts (casts src type-oid)
-     :procs procedures
+                            (read-dat src "pg_language"))
+        version (source-version src)]
+    (merge (bootstrap-operator-catalogs src version)
+           {:pg-version version
+            :types ts
+            :casts (casts src type-oid)
+            :procs procedures
      ;; pg_proc.h defaults prolang to internal. Keep explicit overrides
      ;; separate so the main routine registry stays compact.
-     :proc-languages (into []
-                           (keep (fn [{:keys [oid language]}]
-                                   (when language
-                                     {:oid oid
-                                      :language (or (get language-oids language)
-                                                    (throw (ex-info "Unknown routine language"
-                                                                    {:language language :oid oid})))})))
-                           procedures)
-     :operators (operators src type-oid)}))
+            :proc-languages (into []
+                                  (keep (fn [{:keys [oid language]}]
+                                          (when language
+                                            {:oid oid
+                                             :language (or (get language-oids language)
+                                                           (throw (ex-info "Unknown routine language"
+                                                                           {:language language :oid oid})))})))
+                                  procedures)
+            :operators (operators src type-oid)})))
 
 (def columns
   "Column order of each table's rows in the generated file."
-  {:types [:oid :typname :typlen :typtype :typcategory :typispreferred
-           :typdelim :typelem :typarray :typcollation
-           :typinput :typoutput :typreceive :typsend :typmodin :typmodout
-           :typanalyze :typsubscript :typalign :typbyval :typstorage]
-   :casts [:source :target :context :method :func]
-   :procs [:oid :proname :args :ret :kind :strict :volatile :retset :variadic]
-   :proc-languages [:oid :language]
-   :operators [:oid :oprname :kind :left :right :result :code :com :negate :rest :join]})
+  (concat
+   {:types [:oid :typname :typlen :typtype :typcategory :typispreferred
+            :typdelim :typelem :typarray :typcollation
+            :typinput :typoutput :typreceive :typsend :typmodin :typmodout
+            :typanalyze :typsubscript :typalign :typbyval :typstorage]
+    :casts [:source :target :context :method :func]
+    :procs [:oid :proname :args :ret :kind :strict :volatile :retset :variadic]
+    :proc-languages [:oid :language]
+    :operators [:oid :oprname :kind :left :right :result :code :com :negate :rest :join]}
+   operator-catalogs))
 
 (defn sha256 [^String s]
   (let [md (java.security.MessageDigest/getInstance "SHA-256")]

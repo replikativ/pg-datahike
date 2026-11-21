@@ -43,6 +43,11 @@
    :rest and :join (regproc names, \"-\" for none)."
   (rows :operators))
 
+(def opclasses (rows :opclasses))
+(def opfamilies (rows :opfamilies))
+(def amops (rows :amops))
+(def amprocs (rows :amprocs))
+
 (def type-by-oid (into {} (map (juxt :oid identity)) types))
 
 (def type-by-name (into {} (map (juxt :typname identity)) types))
