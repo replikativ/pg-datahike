@@ -326,6 +326,7 @@
                      types/oid-numeric types/oid-numeric
                      types/oid-float4  types/oid-float8
                      types/oid-float8  types/oid-float8
+                     types/oid-interval types/oid-interval
                      :default          types/oid-float8}
    "min"            :arg-type
    "max"            :arg-type

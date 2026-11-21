@@ -2434,6 +2434,31 @@
 (def sql-interval-div
   (null-safe (fn [a b] ((:divide @iv-arith) (@interval-coerce a) (double b)))))
 
+(defn- average-intervals [values]
+  (let [{:keys [add divide]} @iv-arith
+        [n total infinity]
+        (reduce (fn [[n total infinity] v]
+                  (if (types/infinite-datetime v)
+                    [n total (if infinity (add infinity v) v)]
+                    [(inc n)
+                     (try (if total (add total v) v)
+                          (catch ArithmeticException _
+                            (throw (errors/pg-error :datetime-field-overflow
+                                                    {:message "interval out of range"}))))
+                     infinity]))
+                [0 nil nil]
+                values)]
+    (cond
+      infinity infinity
+      total (divide total (double n))
+      :else :__null__)))
+
+(defn avg-interval [coll]
+  (average-intervals (map @interval-coerce (remove sql-null? coll))))
+
+(defn avg-interval-distinct [coll]
+  (average-intervals (distinct-input (map @interval-coerce (remove sql-null? coll)))))
+
 (def sql-time+interval
   (null-safe
    (fn [a b]
@@ -3209,6 +3234,11 @@
    one."
   [v]
   (nil? (types/infinite-datetime v)))
+
+(defn sql-isfinite-interval [v]
+  (if (sql-null? v)
+    :__null__
+    (sql-isfinite (@interval-coerce v))))
 
 (defn sql-chr
   "Character with the given code point. PostgreSQL rejects 0 outright
@@ -4038,18 +4068,18 @@
                              {:prefer-local-datetime? true})
                        v))
           source (as-other source origin)
-          origin (as-other origin source)]
+          origin (as-other origin source)
+          stride (@interval-coerce stride)]
       (cond
         (types/infinite-datetime source) source
         (types/infinite-datetime origin) (datetime-error "22008" "origin out of range")
         (types/infinite-datetime stride)
         (datetime-error "22008" "timestamps cannot be binned into infinite intervals")
         :else
-        (let [iv (@interval-coerce stride)
-              [months days micros] @interval-fields]
-          (when-not (zero? (long (months iv)))
+        (let [[months days micros] @interval-fields]
+          (when-not (zero? (long (months stride)))
             (datetime-error "0A000" "timestamps cannot be binned into intervals containing months or years"))
-          (let [stride-us (+ (* (long (days iv)) usecs-per-day) (long (micros iv)))]
+          (let [stride-us (+ (* (long (days stride)) usecs-per-day) (long (micros stride)))]
             (when (<= stride-us 0) (datetime-error "22008" "stride must be greater than zero"))
             (let [o (epoch-usecs origin)
                   diff (- (epoch-usecs source) o)

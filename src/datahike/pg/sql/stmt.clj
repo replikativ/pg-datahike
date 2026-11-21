@@ -4850,6 +4850,9 @@
         (fn [agg-name input-oid]
           (let [result-oid (oid/resolve-aggregate-result-oid agg-name input-oid)]
             (cond
+              (and (= agg-name "avg") (= result-oid types/oid-interval))
+              'datahike.pg.query-fns/avg-interval
+
               (= result-oid types/oid-numeric)
               (case agg-name
                 "sum" 'datahike.pg.query-fns/filter-sum-numeric
@@ -4941,7 +4944,9 @@
                 (when-not agg-sym
                   (expr/undefined-function!
                    ctx fname (second (expr/call-node-name+args ae))))
-                (swap! find-elements conj (list agg-sym v))
+                (let [variant (when inner-expr
+                                (pick-precision-variant fname (oid/expr-oid inner-expr agg-oid-env)))]
+                  (swap! find-elements conj (list (or variant agg-sym) v)))
                 (swap! find-aliases conj (or alias0 fname))))
             idx))
 

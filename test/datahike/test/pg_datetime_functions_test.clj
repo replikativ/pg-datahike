@@ -21,7 +21,8 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.types :as types])
   (:import [datahike.pg PgWireServer$QueryHandler PgWireServer$QueryResult]))
 
 (def ^:private corpus
@@ -65,3 +66,52 @@
           (println " " expr "\n    want:" want "\n    got :" got))
         (is (empty? @bad)
             (str (count @bad) " of " (count corpus) " corpus entries disagree"))))))
+
+(deftest postgres-date-bin-rejects-infinite-interval-strides
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (let [args ", timestamp '2001-02-16 20:38:40', timestamp '2001-02-16 20:05:00')"]
+        (doseq [stride ["'infinity'" "'-infinity'" "interval 'infinity'" "interval '-infinity'"]]
+          (let [result (.execute h (str "SELECT date_bin(" stride args))]
+            (is (= "22008" (.sqlstate result)) stride)
+            (is (= "timestamps cannot be binned into infinite intervals" (.error result)) stride)))
+        (let [result (.execute h (str "SELECT date_bin('15 minutes'" args))]
+          (is (nil? (.error result)))
+          (is (= [types/oid-timestamp] (vec (.columnOids result))))
+          (is (= [["2001-02-16 20:35:00"]] (mapv vec (.rows result)))))))))
+
+(deftest averages-of-intervals-use-the-interval-overload
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (nil? (.error (.execute h "CREATE TABLE spans (id int, v interval)"))))
+      (is (nil? (.error (.execute h (str "INSERT INTO spans VALUES (1,'1 day'), (2,'3 days'),"
+                                         " (3,'3 days'), (4,NULL), (5,'infinity'), (6,'-infinity')")))))
+      (doseq [[sql want] [["SELECT avg(v) FROM spans WHERE id <= 4" "2 days 08:00:00"]
+                          ["SELECT avg(DISTINCT v) FROM spans WHERE id <= 4" "2 days"]
+                          ["SELECT avg(v) FROM spans WHERE isfinite(v)" "2 days 08:00:00"]
+                          ["SELECT avg(v) FILTER (WHERE id = 1) FROM spans" "1 day"]
+                          ["SELECT avg(v) FROM spans WHERE id IN (1,5)" "infinity"]
+                          ["SELECT avg(v) FROM spans WHERE id = 6" "-infinity"]
+                          ["SELECT avg(v) FROM spans WHERE id = 4" nil]
+                          ["SELECT avg(v) FROM spans WHERE id = 0" nil]]]
+        (let [result (.execute h sql)]
+          (is (nil? (.error result)) sql)
+          (is (= [types/oid-interval] (vec (.columnOids result))) sql)
+          (is (= [[want]] (mapv vec (.rows result))) sql)))
+      (is (= "22008" (.sqlstate (.execute h "SELECT avg(v) FROM spans"))))
+      (is (nil? (.error (.execute h "INSERT INTO spans VALUES (7,'2 usecs'), (8,'3 usecs')"))))
+      (is (= [["00:00:00.000002"]]
+             (mapv vec (.rows (.execute h "SELECT avg(v) FROM spans WHERE id > 6"))))))))
+
+(deftest postgres-average-of-finite-intervals
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (nil? (.error (.execute h "CREATE TABLE interval_tbl (f1 interval)"))))
+      (is (nil? (.error (.execute h (str "INSERT INTO interval_tbl VALUES "
+                                         "('@ 1 minute'),('@ 5 hour'),('@ 10 day'),('@ 34 year'),"
+                                         "('@ 3 months'),('@ 14 seconds ago'),('1 day 2 hours 3 minutes 4 seconds'),"
+                                         "('6 years'),('5 months'),('5 months 12 hours'),('infinity'),('-infinity')")))))
+      (let [result (.execute h "SELECT avg(f1) FROM interval_tbl WHERE isfinite(f1)")]
+        (is (nil? (.error result)))
+        (is (= [types/oid-interval] (vec (.columnOids result))))
+        (is (= [["4 years 1 mon 10 days 04:18:23"]] (mapv vec (.rows result))))))))

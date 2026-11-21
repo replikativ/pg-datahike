@@ -128,11 +128,38 @@
       (ic/interval (check-i32 m) dd micros))))
 
 (defn divide
-  "`interval_div`. Division by zero is 22012, not an interval error."
+  "`interval_div`. Cascade fractional fields, then round the combined microseconds once."
   [iv ^double factor]
-  (when (zero? factor)
-    (throw (errors/pg-error :division-by-zero {:message "division by zero"})))
-  (multiply iv (/ 1.0 factor)))
+  (cond
+    (zero? factor) (throw (errors/pg-error :division-by-zero {:message "division by zero"}))
+    (Double/isNaN factor) (out-of-range! "interval out of range")
+    (types/infinite-datetime iv)
+    (cond
+      (Double/isInfinite factor) (out-of-range! "interval out of range")
+      (neg? factor) (negate iv)
+      :else iv)
+    :else
+    (let [scaled-months (/ (double (ic/months iv)) factor)
+          scaled-days (/ (double (ic/days iv)) factor)
+          int32-ceiling (- (double int32-min))]
+      (when-not (and (<= int32-min scaled-months) (< scaled-months int32-ceiling)
+                     (<= int32-min scaled-days) (< scaled-days int32-ceiling))
+        (out-of-range! "interval out of range"))
+      (let [months (long scaled-months)
+            days (long scaled-days)
+            remaining-days (tsround (* (- scaled-months months) 30.0))
+            month-days (long remaining-days)
+            seconds (tsround (* (+ (- scaled-days days) (- remaining-days month-days)) 86400.0))
+            whole-days (long (/ seconds 86400.0))
+            seconds (- seconds (* whole-days 86400.0))
+            days (check-i32 (+ days whole-days month-days))
+            micros (Math/rint (+ (/ (double (ic/micros iv)) factor) (* seconds usecs-per-sec)))
+            int64-floor (double Long/MIN_VALUE)]
+        (when-not (and (<= int64-floor micros)
+                       (< micros (- int64-floor))
+                       (not (and (= micros int64-floor) (= int32-min days months))))
+          (out-of-range! "interval out of range"))
+        (ic/interval months days (long micros))))))
 
 ;; ---------------------------------------------------------------------------
 ;; timestamp ± interval
