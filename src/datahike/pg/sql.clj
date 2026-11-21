@@ -632,7 +632,8 @@
    SELECT would not have answered."
   [^CreateTable ct schema db]
   (let [base (ddl/translate-create-table ct db)
-        inner (parse-sql (str (.getSelect ct)) schema db)]
+        inner (binding [params/*nested-parse?* (or params/*nested-parse?* params/*analysis-only?*)]
+                (parse-sql (str (.getSelect ct)) schema db))]
     (if (= :error (:type inner))
       inner
       (cond-> (assoc base :ctas? true :ctas-select inner)
@@ -644,7 +645,7 @@
    `aliases` the output column names, `oids` their result OIDs (wire
    ints; -1 or nil where only the values can tell). Returns the plan
    with the columns' schema and the rows appended to its :tx-data."
-  [base rows find-aliases oids db]
+  [{:keys [ctas-column-typmods] :as base} rows find-aliases oids db]
   (let [visible-rows (mapv (fn [row] (if (sequential? row) (vec row) [row])) rows)
         oids (vec (map #(when (and % (pos? (long %))) (long %)) (or oids [])))
         aliases (mapv (fn [idx alias]
@@ -664,12 +665,15 @@
                                 vtype (or (types/dh-type-for-oid oid)
                                           :db.type/string)
                                 attr (keyword table-name alias)
-                                pg-type (get types/oid->pg-type-marker oid)]
+                                pg-type (get types/oid->pg-type-marker oid)
+                                typmod (nth ctas-column-typmods idx nil)]
                             {:alias alias :attr attr :oid oid :vtype vtype
                              :schema (cond-> {:db/ident attr
                                               :db/valueType vtype
                                               :db/cardinality :db.cardinality/one}
-                                       pg-type (assoc :pg/type pg-type))}))
+                                       pg-type (assoc :pg/type pg-type)
+                                       (and typmod (not= typmod -1)) (assoc :pg/typmod typmod)
+                                       (:temp? base) (assoc :db/noHistory true))}))
                         (range) aliases)
         ctas-schema (into {} (map (fn [{:keys [attr schema]}] [attr schema])) col-specs)
         data-tx (mapv (fn [row]

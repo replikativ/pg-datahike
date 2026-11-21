@@ -4146,7 +4146,8 @@
                             {:error :undefined-table
                              :sqlstate "42P01"
                              :table name})))
-        _ (when (instance? Table from-item) (reject-unpopulated-matview! db name))
+        _ (when (and (instance? Table from-item) (not params/*analysis-only?*))
+            (reject-unpopulated-matview! db name))
 
         ;; Build table aliases: {alias → real-table-name}
         ;; For self-joins, the alias is the key; for regular usage, table name is the key too.

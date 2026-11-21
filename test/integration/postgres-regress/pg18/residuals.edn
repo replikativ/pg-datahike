@@ -60,8 +60,8 @@
    :file "copyselect" :lines [90 96] :state :covered :impact :wrong-result
    :detail "COPY-IN used to drop subsequent commands and retain only the first batch."}
   {:id :materialized-view-with-no-data
-   :file "matview" :lines [17 19] :state :open :impact :wrong-result
-   :detail "The catalog reports relispopulated true for an unpopulated view even though a direct scan rejects it."}
+   :file "matview" :lines [17 21] :state :covered :impact :wrong-result
+   :detail "The catalog used to report relispopulated true for an unpopulated view. The gate checks the flag, the scan SQLSTATE and refresh."}
   {:id :or-join-heap-exhaustion
    :file "join" :lines [3835 3836] :state :open :impact :internal-error
    :detail "The OR join over two 10,000-row inputs terminated its connection with a Java heap error."}

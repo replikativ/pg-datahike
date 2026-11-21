@@ -19,7 +19,6 @@
     "fast_default"
     "triggers"
     "plpgsql"
-    "matview"
     "alter_generic"
     "create_operator"
     "merge"},

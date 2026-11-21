@@ -194,6 +194,13 @@
      :boundaries #{:constraints :catalogs :ddl :indexes},
      :requires ["test_setup"],
      :mode :unmeasured}
+    {:name "matview", :boundaries #{:catalogs :ddl :materialized-views}, :mode :discovery
+     :accepted-differences #{:explain-plan-text}
+     :strict-slices
+     [{:id :materialized-view-with-no-data
+       :source-lines [17 21]
+       :gate "test/datahike/test/pg_matview_test.clj"
+       :test-var "postgres-materialized-view-with-no-data"}]}
     {:name "generated_stored", :boundaries #{:copy :ddl :generated-columns :dml}, :mode :unmeasured}
     {:name "identity", :boundaries #{:identity-columns :sequences :ddl :dml}, :mode :unmeasured}
     {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :unmeasured}

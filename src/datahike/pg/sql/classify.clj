@@ -637,6 +637,8 @@
   (let [skip? #{"or" "replace" "unique" "temporary" "temp"
                 "global" "local" "unlogged"}
         or-replace? (and (kw=? (first toks) "or") (kw=? (second toks) "replace"))
+        temp? (some #(kw-in? % #{"temporary" "temp"})
+                    (take-while #(kw-in? % skip?) toks))
         toks (loop [ts toks]
                (if (kw-in? (first ts) skip?)
                  (recur (rest ts))
@@ -657,7 +659,8 @@
       ;; Ordinary indexes remain compatibility no-ops; extension-backed types
       ;; such as vector must reject until their index semantics are real.
       (kw=? t1 "index")     {:kind :generic-sql}
-      (kw=? t1 "table")     (classify-create-table (rest toks))
+      (kw=? t1 "table")     (cond-> (classify-create-table (rest toks))
+                              temp? (assoc :temp-target? true))
       (kw=? t1 "sequence")  (classify-create-sequence (rest toks))
 
       ;; CREATE TYPE — only AS ENUM is supported as a first-class
@@ -1148,7 +1151,7 @@
   [after-name]
   (let [[cols after-cols] (if (= "(" (:text (first after-name)))
                             (let [[inner rest-ts] (read-balanced after-name)]
-                              [(mapv ident-text
+                              [(mapv :text
                                      (remove #(= "," (:text %)) inner))
                                rest-ts])
                             [nil after-name])
@@ -1273,6 +1276,7 @@
                      (re-find #"(?is)\Wwith\s+data\s*;?\s*$" *source*))
              (assoc t :kind :create-table-as
                     :table-name nm
+                    :relation-sql (slice-between (take (- (count ts) (count after-name)) ts))
                     :if-not-exists? (boolean ine?)))))))
    (if-not (re-find #"(?i)\blike\b" *source*)
      {:kind :generic-sql}
@@ -1308,6 +1312,7 @@
     (or (when-let [[nm after-name] (read-relation-name ts)]
           (when-let [t (read-as-query-tail after-name)]
             (assoc t :kind :create-matview
+                   :relation-sql (slice-between (take (- (count ts) (count after-name)) ts))
                    :matview-name nm
                    :if-not-exists? (boolean ine?))))
         reject)))
