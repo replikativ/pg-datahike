@@ -23,18 +23,21 @@
             [datahike.api :as d]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.pg-catalog :as pg-catalog]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector])
   (:import [net.sf.jsqlparser.schema Column Table]
-           [net.sf.jsqlparser.expression StringValue]
+           [net.sf.jsqlparser.expression Expression Function StringValue]
            [net.sf.jsqlparser.statement.create.table
             CreateTable ColumnDefinition ColDataType Index
             CheckConstraint ForeignKeyIndex]
            [net.sf.jsqlparser.statement.create.sequence CreateSequence]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
-           [datahike.pg ColumnSubstitutingDeParser ColumnSubstitutingDeParser$Unsupported]))
+           [java.util.function Consumer]
+           [datahike.pg ColumnSubstitutingDeParser ColumnSubstitutingDeParser$Unsupported
+            DefaultExpressionVisitor]))
 
 (set! *warn-on-reflection* true)
 
@@ -345,19 +348,39 @@
                   (str/trim matched))))))))))
 
 (defn parse-default-expression
-  "Parse a DEFAULT expression's text, or nil if JSqlParser cannot read it.
-
-   Only a parse check. Whether the expression can be EVALUATED -- that
-   its functions exist and that it references no column -- is settled by
-   the evaluator at write time, where the same scope rules a CHECK
-   constraint gets apply. PostgreSQL rejects a column reference at CREATE
-   TABLE (\"cannot use column reference in DEFAULT expression\"); we
-   reject it at the first write instead. Loudly, either way."
+  "Parse a DEFAULT expression's text, or nil if JSqlParser cannot read it."
   [raw]
   (when-not (str/blank? raw)
     (try
       (CCJSqlParserUtil/parseExpression raw)
       (catch Exception _ nil))))
+
+(defn- reject-default-expression! [kind]
+  (let [[error message]
+        (case kind
+          "column" [:feature-not-supported "cannot use column reference in DEFAULT expression"]
+          "subquery" [:feature-not-supported "cannot use subquery in DEFAULT expression"]
+          "aggregate" [:grouping-error "aggregate functions are not allowed in DEFAULT expressions"]
+          "window" [:windowing-error "window functions are not allowed in DEFAULT expressions"]
+          "set" [:feature-not-supported "set-returning functions are not allowed in DEFAULT expressions"])]
+    (throw (errors/pg-error error {:message message}))))
+
+(defn- check-default-function! [^Function call]
+  (let [fname (-> (.getName call) str/lower-case (str/replace #"^pg_catalog\." ""))
+        procs (get pg-catalog/procs-by-name fname)]
+    ;; Avoid inferring the nature of a call by name when it also has
+    ;; scalar overloads. This check never evaluates the DEFAULT.
+    (when (seq procs)
+      (cond
+        (every? #(= "a" (:kind %)) procs) (reject-default-expression! "aggregate")
+        (every? :retset procs) (reject-default-expression! "set")))))
+
+(defn- validate-default-expression! [^Expression expr]
+  (.accept expr
+           (DefaultExpressionVisitor.
+            (reify Consumer (accept [_ kind] (reject-default-expression! kind)))
+            (reify Consumer (accept [_ call] (check-default-function! call))))
+           nil))
 
 (defn column-default-spec
   "If the column spec list carries `DEFAULT <expr>`, return a map
@@ -496,8 +519,10 @@
             ;; the specs arrive tokenized, so `raw` reads `100 +1` and
             ;; `upper ('ab')`, and that text is what `pg_get_expr` shows
             ;; and what pg_dump writes back out.
-            (if-let [expr (parse-default-expression peeled)]
-              {:kind :expr :value (str expr)}
+            (if-let [expr (or (parse-default-expression peeled)
+                              (when (not= peeled raw) (parse-default-expression raw)))]
+              (do (validate-default-expression! expr)
+                  {:kind :expr :value (str expr)})
               {:kind :unsupported :raw raw})))))))
 
 (defn- foreign-key-index->spec

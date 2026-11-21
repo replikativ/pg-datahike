@@ -10473,7 +10473,7 @@
   (let [^PgWireServer$QueryResult r
         (run-nested!
          (str "SELECT a.attname, format_type(a.atttypid, a.atttypmod),"
-              " a.attnotnull, d.adbin"
+              " a.attnotnull, a.attgenerated, d.adbin"
               " FROM pg_attribute a"
               " JOIN pg_class c ON c.oid = a.attrelid"
               " LEFT JOIN pg_attrdef d"
@@ -10487,10 +10487,13 @@
                       {:error :undefined-table :sqlstate "42P01"})))
     (str/join ", "
               (for [^"[Ljava.lang.String;" row rows
-                    :let [[nm typ notnull dflt] (vec row)]]
-                (str "\"" nm "\" " typ
+                    :let [[nm typ notnull generated dflt] (vec row)]]
+                (str (dump/quote-ident nm) " " typ
                      (when (= "t" notnull) " NOT NULL")
-                     (when (and defaults? dflt) (str " DEFAULT " dflt)))))))
+                     ;; pg_attrdef also stores generation expressions. LIKE
+                     ;; INCLUDING DEFAULTS copies only ordinary defaults.
+                     (when (and defaults? (str/blank? generated) dflt)
+                       (str " DEFAULT (" dflt ")")))))))
 
 (defn- exec-ddl-create-table-like
   "CREATE TABLE … (LIKE source …): substitute each LIKE element with the
