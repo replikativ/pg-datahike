@@ -214,27 +214,33 @@ metadata unchanged.
 The first stock dump query over relations also exposed a Datahike planner
 problem. It exhausted a 1.2 GiB heap on this fixture. The planner projected
 the outer relation's join keys, kept repeated bindings, and joined those
-copies back to the same outer rows. With the upstream fix applied locally,
-that query completed and stock `pg_dump` next stopped at `pg_transform`
-during routine discovery.
+copies back to the same outer rows. With the fix applied locally, that
+query completed in under a second.
+
+Routine discovery now has typed routine ACLs and language OIDs. The type
+scan reads the first byte of a PostgreSQL `name` using a zero-based
+subscript. The operator scan can cast an implementation routine's
+`regproc` to its numeric OID. The local candidate gets through all three
+scans and stops at `pg_opclass`.
 
 The native SQL was captured with
 `PGOPTIONS='-c log_statement=all' pg_dump --schema-only`. The first replay
 produced errors in 32 of 48 read queries. With the planner fix, relation
-metadata and qualified casts applied, 23 errored. The second replay
-substituted the candidate's fixture OIDs for the native OIDs. A query that
-runs still needs its rows and the resulting dump checked.
+metadata and qualified casts applied, 23 errored. With routine, type,
+and operator metadata added, 17 errored. The latter two replays
+substituted the candidate's fixture OIDs for the native OIDs. A query
+that runs still needs its rows and the resulting dump checked.
 
 | SQLSTATE | Queries | Remaining work |
 |---|---:|---|
-| `42P01` | 17 | Routine discovery needs `pg_transform` and `pg_init_privs`. Operator classes, conversions and text search need built-in catalog data. The other scans need the catalog shape for facilities such as foreign data, logical replication and event triggers. |
-| `42703` | 4 | Routine ACL, index readiness, publication owner and the constraint `tableoid` used in the column scan |
-| `0A000` | 1 | Zero-based subscripting of PostgreSQL's `name` type in the type scan |
-| `22P02` | 1 | Converting a catalog operator implementation from `regproc` to `oid` |
+| `42P01` | 14 | Operator classes, families, access-method operators, conversions and text search need built-in catalog data. Foreign data, default ACL, event trigger, subscription and security-label scans need the catalog shapes for those facilities. |
+| `42703` | 3 | Constraint `tableoid` in the column scan, index readiness and publication owner |
 
-Prioritize routine and type discovery first, then fixture columns, indexes,
-and the view and dependency scans. Keep the built-in catalog work tied to
-the native metadata it represents.
+The next stock dump blocker is the built-in operator class scan. After
+catalog discovery, compare the fixture's columns, indexes, constraints,
+and view definition in the restored database. The candidate advertises
+the vector extension, so verify the dump's extension membership and test
+restoring into native PostgreSQL with the required extension available.
 
 The cutover needs successful stock-client describe and schema export on
 this fixture, an export restored into an empty native database with the

@@ -3100,6 +3100,16 @@
                dimension))
            dimensions)}))
 
+(defn- name-byte
+  "Fetch a byte from PostgreSQL's zero-based, NUL-padded NameData."
+  [^String value index]
+  (when (<= 0 index 63)
+    (let [bytes (.getBytes value java.nio.charset.StandardCharsets/UTF_8)
+          b (if (< index (min 63 (alength bytes)))
+              (bit-and 0xff (aget bytes (int index)))
+              0)]
+      (sql-cast/internal-char-output b))))
+
 (defn- translate-array-read!
   "Compile a complete PostgreSQL array read without exposing lower-rank rows.
 
@@ -3111,10 +3121,16 @@
   (let [{:keys [base dimensions]} (oid-infer/array-read-chain expression)
         {:keys [slice? dimensions]} (normalize-array-read-dimensions dimensions)
         base-oid (source-oid ctx base)
+        name? (= types/oid-name base-oid)
+        _ (when (and name? slice?)
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "slices of fixed-length arrays not implemented"})))
         base-elem-type (some-> base-oid
                                types/array-oid->element-oid
                                types/oid->elem-kw)
         _ (when (and base-oid
+                     (not name?)
                      (not (contains? types/array-oid->element-oid base-oid)))
             (throw (errors/pg-error
                     :feature-not-supported
@@ -3164,11 +3180,13 @@
                              (if (null? value)
                                :__null__
                                (sql-cast/cast-scalar value "int4" {:explicit? false})))
-                decode (fn [container]
-                         (or (coerce-pg-array container base-elem-type)
-                             (throw (errors/pg-error
-                                     :feature-not-supported
-                                     {:feature "subscripted reads of this value"}))))
+                decode (if name?
+                         identity
+                         (fn [container]
+                           (or (coerce-pg-array container base-elem-type)
+                               (throw (errors/pg-error
+                                       :feature-not-supported
+                                       {:feature "subscripted reads of this value"})))))
                 finish
                 (fn [array resolved]
                   (if (some null? resolved)
@@ -3179,15 +3197,17 @@
                                   dimensions
                                   (map vector compiled-bounds resolved))
                           value
-                          (if slice?
-                            (pg-arr/slice-at
-                             array
-                             (mapv #(select-keys % [:lower :upper
-                                                    :lower-provided?
-                                                    :upper-provided?])
-                                   runtime-dimensions))
-                            (pg-arr/element-at-indices
-                             array (mapv :index runtime-dimensions)))]
+                          (cond
+                            name? (when (= 1 (count resolved))
+                                    (name-byte array (first resolved)))
+                            slice? (pg-arr/slice-at
+                                    array
+                                    (mapv #(select-keys % [:lower :upper
+                                                           :lower-provided?
+                                                           :upper-provided?])
+                                          runtime-dimensions))
+                            :else (pg-arr/element-at-indices
+                                   array (mapv :index runtime-dimensions)))]
                       (if (nil? value) :__null__ value))))
                 resume-staged
                 (fn [base-value resolved-prefix current-value remaining]

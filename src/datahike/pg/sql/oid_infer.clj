@@ -499,9 +499,10 @@
 (defn- array-read-oid [expression env]
   (let [{:keys [base dimensions]} (array-read-chain expression)
         base-oid (expr-oid base env)]
-    (if (some #(= :slice (:kind %)) dimensions)
-      base-oid
-      (get types/array-oid->element-oid base-oid))))
+    (cond
+      (some #(= :slice (:kind %)) dimensions) base-oid
+      (= types/oid-name base-oid) types/oid-char
+      :else (get types/array-oid->element-oid base-oid))))
 
 (defn- column-oid
   "Resolve a Column reference to an OID via the live schema. Returns nil

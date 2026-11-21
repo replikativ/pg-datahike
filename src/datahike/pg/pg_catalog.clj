@@ -32,8 +32,10 @@
 
 (def procs
   "pg_proc rows: :oid :proname :args (OIDs) :ret :kind (f/a/w/p)
-   :strict :volatile (i/s/v) :retset :variadic (0 when not variadic)."
-  (rows :procs))
+   :strict :volatile (i/s/v) :retset :variadic (0 when not variadic)
+   :language (the pg_language OID)."
+  (let [languages (into {} (map (juxt :oid :language)) (rows :proc-languages))]
+    (mapv #(assoc % :language (get languages (:oid %) 12)) (rows :procs))))
 
 (def operators
   "pg_operator rows: :oid :oprname :kind (b/l) :left (0 for prefix)

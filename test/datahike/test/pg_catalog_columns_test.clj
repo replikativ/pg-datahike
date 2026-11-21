@@ -144,3 +144,32 @@
              (run h "SELECT n, pg_typeof(n)
                        FROM unnest('{42,43}'::\"pg_catalog\".\"oid\"[]) AS a(n)
                        ORDER BY n"))))))
+
+(deftest routine-and-type-discovery-metadata
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (= "10|internal|t"
+             (run h "SELECT proowner, l.lanname, proacl IS NULL
+                       FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+                       WHERE p.proname = 'int4eq'")))
+      (is (= "10|sql"
+             (run h "SELECT proowner, l.lanname
+                       FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+                       WHERE p.oid = 1215")))
+      (is (= "10|t"
+             (run h "SELECT typowner, typacl IS NULL FROM pg_type WHERE typname = 'int4'")))
+      (is (= "96|65|int4eq"
+             (run h "SELECT oid, oprcode::oid, oprcode FROM pg_operator WHERE oid = 96")))
+      (is (= "0" (run h "SELECT count(*) FROM pg_init_privs")))
+      (is (= "0" (run h "SELECT count(*) FROM pg_transform"))))))
+
+(deftest subscripted-name-is-a-zero-based-byte
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (= "\"char\"|_|t|t"
+             (run h "SELECT pg_typeof(typname[0]), typname[0], typname[63] = '',
+                            typname[64] IS NULL FROM pg_type WHERE typname = '_int4'")))
+      (is (= "\\303|\\251|_|t"
+             (run h "SELECT ('é_'::name)[0], ('é_'::name)[1], ('é_'::name)[2],
+                            ('é_'::name)[-1] IS NULL")))
+      (is (= "0A000" (.sqlstate (.execute h "SELECT ('abc'::name)[0:2]")))))))

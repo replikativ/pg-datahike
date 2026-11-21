@@ -73,7 +73,7 @@
     "pg_namespace" "pg_database" "pg_proc" "pg_roles" "pg_settings"
     "pg_authid" "pg_auth_members" "pg_am" "pg_language" "pg_tablespace"
     "pg_operator" "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
-    "pg_foreign_table"
+    "pg_foreign_table" "pg_init_privs" "pg_transform"
     "pg_shdepend"
     ;; Session views. These are the only catalogs here that are NOT
     ;; derived from the database: a PREPAREd statement and a DECLAREd
@@ -322,7 +322,8 @@
         ;; not modelled), and a domain its base type's.
         "pg_type"
         (mapv (fn [r]
-                (assoc r :pg_type/typcollation
+                (assoc r :pg_type/typowner pg-role-oid
+                       :pg_type/typcollation
                        (long (types/typcollation
                               (or (let [b (:pg_type/typbasetype r)]
                                     (when (and b (pos? (long b))) b))
@@ -357,6 +358,8 @@
     "pg_type"
     [{:db/ident :pg_type/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_type/typowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_type/typacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
      {:db/ident :pg_type/typlen :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      ;; typtype is PG's "char" (OID 18): clients (asyncpg's is_scalar_type)
      ;; binary-decode it to a single byte, so advertise OID 18 not text.
@@ -646,13 +649,13 @@
      {:db/ident :pg_operator/oprleft :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_operator/oprright :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_operator/oprresult :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
-     {:db/ident :pg_operator/oprcode :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_operator/oprcode :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
      ;; From pg_operator.dat too, checked operator by operator against
      ;; PostgreSQL 17; drop_operator and opr_sanity join on them.
      {:db/ident :pg_operator/oprcom :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_operator/oprnegate :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
-     {:db/ident :pg_operator/oprrest :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
-     {:db/ident :pg_operator/oprjoin :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_operator/oprrest :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_operator/oprjoin :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
      {:db/ident (pgs/row-marker-attr "pg_operator") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_cast"
@@ -738,12 +741,31 @@
     [{:db/ident :pg_settings/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_settings/setting :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_settings") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_init_privs"
+    [{:db/ident :pg_init_privs/objoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_init_privs/classoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_init_privs/objsubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_init_privs/privtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_init_privs/initprivs :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
+     {:db/ident (pgs/row-marker-attr "pg_init_privs") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_transform"
+    [{:db/ident :pg_transform/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_transform/trftype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_transform/trflang :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_transform/trffromsql :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_transform/trftosql :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident (pgs/row-marker-attr "pg_transform") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
     "pg_proc"
     [;; psql's `\df` selects `p.oid` and passes it to
      ;; pg_get_function_result / pg_get_function_arguments. Without this
      ;; the reference resolved to NULL instead of raising, so `\df`
      ;; "worked" while calling those functions with NULL.
      {:db/ident :pg_proc/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_proc/proowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_proc/prolang :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_proc/proacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
      {:db/ident :pg_proc/proname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_proc/provolatile :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_proc/pronamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -1316,6 +1338,22 @@
      (or (when-let [nm (some-> func (str/split #"\(") first str/trim not-empty)]
            (:oid (first (get pg-cat/procs-by-name nm))))
          0))))
+
+(def ^:private operator-routine-oid
+  "Resolve a PostgreSQL bootstrap operator's procedure reference."
+  (memoize
+   (fn [reference]
+     (if (= "-" reference)
+       0
+       (let [[_ name signature] (re-matches #"([^()]+)(?:\(([^()]*)\))?" reference)
+             args (when signature
+                    (mapv #(get-in pg-cat/type-by-name [% :oid])
+                          (str/split signature #",")))
+             matches (cond->> (get pg-cat/procs-by-name name)
+                       args (filter #(= args (:args %))))]
+         (when-not (= 1 (count matches))
+           (throw (ex-info "Invalid catalog operator procedure" {:reference reference})))
+         (:oid (first matches)))))))
 
 (defn- trigger-entities
   "Every registered trigger, with its spec decoded. Read from the datoms
@@ -2128,9 +2166,15 @@
     [{:pg_settings/name "max_index_keys"
       :pg_settings/setting "32"
       (pgs/row-marker-attr "pg_settings") true}]
+    "pg_init_privs"
+    []
+    "pg_transform"
+    []
     "pg_proc"
-    (mapv (fn [{:keys [oid proname volatile namespace-oid args ret kind]}]
+    (mapv (fn [{:keys [oid proname volatile namespace-oid args ret kind language]}]
             {:pg_proc/oid (long oid)
+             :pg_proc/proowner pg-role-oid
+             :pg_proc/prolang language
              :pg_proc/proname proname
              :pg_proc/provolatile volatile
              :pg_proc/pronamespace (long namespace-oid)
@@ -2327,9 +2371,9 @@
              :pg_operator/oprcanmerge false :pg_operator/oprcanhash false
              :pg_operator/oprleft (or left 0) :pg_operator/oprright (or right 0)
              :pg_operator/oprresult (or result 0)
-             :pg_operator/oprcode (str code)
+             :pg_operator/oprcode (operator-routine-oid code)
              :pg_operator/oprcom (long com) :pg_operator/oprnegate (long negate)
-             :pg_operator/oprrest (str rest) :pg_operator/oprjoin (str join)
+             :pg_operator/oprrest (operator-routine-oid rest) :pg_operator/oprjoin (operator-routine-oid join)
              (pgs/row-marker-attr "pg_operator") true})
           pg-cat/operators)
 

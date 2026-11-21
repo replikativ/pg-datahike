@@ -169,6 +169,7 @@
                            (mapv type-oid (str/split (str/trim (:proargtypes r)) #"\s+")))]
                 {:oid (parse-long (:oid r))
                  :proname (:proname r)
+                 :language (:prolang r)
                  :args args
                  :ret (type-oid (:prorettype r))
                  :kind (:prokind r "f")
@@ -215,11 +216,24 @@
   "The catalog map for the PostgreSQL checkout at `src`."
   [src]
   (let [ts (types src)
-        type-oid (type-lookup ts)]
+        type-oid (type-lookup ts)
+        procedures (procs src type-oid)
+        language-oids (into {} (map (fn [row] [(:lanname row) (parse-long (:oid row))]))
+                            (read-dat src "pg_language"))]
     {:pg-version (source-version src)
      :types ts
      :casts (casts src type-oid)
-     :procs (procs src type-oid)
+     :procs procedures
+     ;; pg_proc.h defaults prolang to internal. Keep explicit overrides
+     ;; separate so the main routine registry stays compact.
+     :proc-languages (into []
+                           (keep (fn [{:keys [oid language]}]
+                                   (when language
+                                     {:oid oid
+                                      :language (or (get language-oids language)
+                                                    (throw (ex-info "Unknown routine language"
+                                                                    {:language language :oid oid})))})))
+                           procedures)
      :operators (operators src type-oid)}))
 
 (def columns
@@ -230,6 +244,7 @@
            :typanalyze :typsubscript :typalign :typbyval :typstorage]
    :casts [:source :target :context :method :func]
    :procs [:oid :proname :args :ret :kind :strict :volatile :retset :variadic]
+   :proc-languages [:oid :language]
    :operators [:oid :oprname :kind :left :right :result :code :com :negate :rest :join]})
 
 (defn sha256 [^String s]
