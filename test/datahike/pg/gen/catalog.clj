@@ -227,13 +227,13 @@
      ;; pg_proc.h defaults prolang to internal. Keep explicit overrides
      ;; separate so the main routine registry stays compact.
      :proc-languages (into []
-                          (keep (fn [{:keys [oid language]}]
-                                  (when language
-                                    {:oid oid
-                                     :language (or (get language-oids language)
-                                                   (throw (ex-info "Unknown routine language"
-                                                                   {:language language :oid oid})))})))
-                          procedures)
+                           (keep (fn [{:keys [oid language]}]
+                                   (when language
+                                     {:oid oid
+                                      :language (or (get language-oids language)
+                                                    (throw (ex-info "Unknown routine language"
+                                                                    {:language language :oid oid})))})))
+                           procedures)
      :operators (operators src type-oid)}))
 
 (def columns

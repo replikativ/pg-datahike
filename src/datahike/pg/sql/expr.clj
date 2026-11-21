@@ -3201,11 +3201,11 @@
                             name? (when (= 1 (count resolved))
                                     (name-byte array (first resolved)))
                             slice? (pg-arr/slice-at
-                             array
-                             (mapv #(select-keys % [:lower :upper
-                                                    :lower-provided?
-                                                    :upper-provided?])
-                                   runtime-dimensions))
+                                    array
+                                    (mapv #(select-keys % [:lower :upper
+                                                           :lower-provided?
+                                                           :upper-provided?])
+                                          runtime-dimensions))
                             :else (pg-arr/element-at-indices
                                    array (mapv :index runtime-dimensions)))]
                       (if (nil? value) :__null__ value))))
