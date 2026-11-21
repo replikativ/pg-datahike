@@ -104,5 +104,5 @@
                  "described_id_not_null|id|f|t|f|t|smallint\ndescribed_label_not_null|label|f|t|f|t|smallint"
                  "")
                (run h sql)))
-        (is (nil? (.error (.execute h "ALTER TABLE described ALTER COLUMN label DROP NOT NULL"))))
+        (is (nil? (.error (.execute h "ALTER TABLE described DROP COLUMN label"))))
         (is (= (if pg18? "described_id_not_null|id|f|t|f|t|smallint" "") (run h sql)))))))

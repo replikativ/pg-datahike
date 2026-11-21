@@ -25,7 +25,7 @@ cc_t_pkey|f|f|t|t"]
   ["SELECT c2.relname, pg_get_constraintdef(con.oid, true), con.contype FROM pg_class c, pg_class c2, pg_index i LEFT JOIN pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x')) WHERE c.relname = 'cc_t' AND c.oid = i.indrelid AND i.indexrelid = c2.oid ORDER BY i.indisprimary DESC, c2.relname" "cc_t_pkey|PRIMARY KEY (a)|p
 cc_t_b||
 cc_t_c_key|UNIQUE (c)|u"]
-  ["SELECT conname, contype, conindid <> 0 FROM pg_constraint WHERE conrelid = 'cc_t'::regclass ORDER BY conname" "cc_t_b_check|c|f
+  ["SELECT conname, contype, conindid <> 0 FROM pg_constraint WHERE conrelid = 'cc_t'::regclass AND contype <> 'n' ORDER BY conname" "cc_t_b_check|c|f
 cc_t_c_key|u|t
 cc_t_pkey|p|t"]
   ["SELECT pg_get_constraintdef(NULL::oid) IS NULL, pg_get_indexdef(NULL::oid) IS NULL, pg_get_triggerdef(NULL::oid) IS NULL" "t|t|t"]

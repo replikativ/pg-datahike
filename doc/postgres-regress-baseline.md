@@ -205,7 +205,8 @@ were fixed. The 18.6 candidate reports `NOT NULL` constraints in
 `pg_constraint` (`contype = 'n'`) and links them to the correct physical
 column positions. The current metadata derives the PostgreSQL names for
 unnamed constraints. Explicit `NOT NULL` constraint names need durable
-metadata before they can be reported faithfully.
+metadata. `ALTER COLUMN SET NOT NULL` and `DROP NOT NULL` still leave that
+metadata unchanged.
 
 A discovery run captured the native dump SQL with
 `PGOPTIONS='-c log_statement=all' pg_dump --schema-only` against the fixture.
