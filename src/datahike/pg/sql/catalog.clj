@@ -75,6 +75,8 @@
     "pg_operator" "pg_opclass" "pg_opfamily" "pg_amop" "pg_amproc"
     "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
     "pg_foreign_table" "pg_init_privs" "pg_transform"
+    "pg_foreign_data_wrapper" "pg_foreign_server" "pg_default_acl"
+    "pg_event_trigger" "pg_subscription" "pg_seclabels"
     "pg_shdepend"
     ;; Session views. These are the only catalogs here that are NOT
     ;; derived from the database: a PREPAREd statement and a DECLAREd
@@ -905,15 +907,14 @@
      {:db/ident :pg_index/indnkeyatts :db/valueType :db.type/long :db/cardinality :db.cardinality/one
       :pg/type "int2"}
      {:db/ident :pg_index/indisvalid :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_index/indisready :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_index/indnullsnotdistinct :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      ;; psql's \d reads both; nothing is clustered or a replica identity here.
      {:db/ident :pg_index/indisclustered :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_index/indisreplident :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
-     ;; indpred / indexprs are bytea in real PG but tested only for IS
-     ;; NULL — a string column with "" (treated as non-null) works.
-     ;; pgjdbc's query requires these to be NULL for a valid PK match,
-     ;; so we emit actual NULL via empty value + get-else pathway.
-     {:db/ident :pg_index/indpred :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_index/indexprs :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; The supported indexes have neither predicates nor expression keys.
+     {:db/ident :pg_index/indpred :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_node_tree"}
+     {:db/ident :pg_index/indexprs :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_node_tree"}
      ;; Pre-baked CREATE INDEX text — `pg_get_indexdef(oid)` lowers to
      ;; a join that reads this column directly. PG generates the
      ;; string at runtime from indkey + indrelid; we synthesize once
@@ -1095,10 +1096,87 @@
      {:db/ident :pg_statistic_ext/stxkind :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_statistic_ext/stxstattarget :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_statistic_ext") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_foreign_data_wrapper"
+    [{:db/ident :pg_foreign_data_wrapper/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_data_wrapper/fdwname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_foreign_data_wrapper/fdwowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_data_wrapper/fdwhandler :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_data_wrapper/fdwvalidator :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_data_wrapper/fdwacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
+     {:db/ident :pg_foreign_data_wrapper/fdwoptions :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
+     {:db/ident (pgs/row-marker-attr "pg_foreign_data_wrapper") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_foreign_server"
+    [{:db/ident :pg_foreign_server/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_server/srvname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_foreign_server/srvowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_server/srvfdw :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_foreign_server/srvtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident :pg_foreign_server/srvversion :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident :pg_foreign_server/srvacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
+     {:db/ident :pg_foreign_server/srvoptions :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
+     {:db/ident (pgs/row-marker-attr "pg_foreign_server") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_default_acl"
+    [{:db/ident :pg_default_acl/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_default_acl/defaclrole :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_default_acl/defaclnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_default_acl/defaclobjtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_default_acl/defaclacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
+     {:db/ident (pgs/row-marker-attr "pg_default_acl") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_event_trigger"
+    [{:db/ident :pg_event_trigger/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_event_trigger/evtname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_event_trigger/evtevent :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_event_trigger/evtowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_event_trigger/evtfoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_event_trigger/evtenabled :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_event_trigger/evttags :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
+     {:db/ident (pgs/row-marker-attr "pg_event_trigger") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_subscription"
+    [{:db/ident :pg_subscription/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_subscription/subdbid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_subscription/subname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_subscription/subowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_subscription/subenabled :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_subscription/subbinary :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_subscription/substream :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_subscription/subtwophasestate :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_subscription/subdisableonerr :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_subscription/subpasswordrequired :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_subscription/subrunasowner :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_subscription/subfailover :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_subscription/subconninfo :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident :pg_subscription/subslotname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_subscription/subsynccommit :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident :pg_subscription/subpublications :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
+     {:db/ident :pg_subscription/suborigin :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident (pgs/row-marker-attr "pg_subscription") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_seclabels"
+    [{:db/ident :pg_seclabels/objoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_seclabels/classoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_seclabels/objsubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_seclabels/objtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident :pg_seclabels/objnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_seclabels/objname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident :pg_seclabels/provider :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident :pg_seclabels/label :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident (pgs/row-marker-attr "pg_seclabels") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
     "pg_publication"
     [{:db/ident :pg_publication/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_publication/pubname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_publication/puballtables :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_publication/pubowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_publication/pubinsert :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_publication/pubupdate :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_publication/pubdelete :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_publication/pubtruncate :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_publication/pubviaroot :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_publication/pubgencols :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      {:db/ident (pgs/row-marker-attr "pg_publication") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_publication_namespace"
     [{:db/ident :pg_publication_namespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -1486,6 +1564,7 @@
          {:oid (long oid) :name name :table table :method method
           :relation-oid (long relation-oid) :keys keys
           :unique? (boolean unique?)
+          :ready? (not= :building status)
           :valid? (and (not legacy-incomplete?) (not= :building status))
           :indexdef indexdef}))
      (d/q '{:find [?index ?oid ?name ?table ?method ?keys ?unique ?relation-oid]
@@ -2680,14 +2759,14 @@
              :pg_index/indisprimary primary?
              :pg_index/indisunique unique?
              :pg_index/indisvalid true
+             :pg_index/indisready true
              :pg_index/indisclustered false
              :pg_index/indisreplident false
-             :pg_index/indpred ""
-             :pg_index/indexprs ""
+             :pg_index/indnullsnotdistinct false
              :pg_index/indexdef indexdef
              (pgs/row-marker-attr "pg_index") true})
           explicit
-          (for [{:keys [oid relation-oid keys unique? valid? indexdef]}
+          (for [{:keys [oid relation-oid keys unique? valid? ready? indexdef]}
                 (explicit-index-descriptors cte-db)]
             {:pg_index/indrelid relation-oid
              :pg_index/indexrelid oid
@@ -2697,10 +2776,10 @@
              :pg_index/indisprimary false
              :pg_index/indisunique unique?
              :pg_index/indisvalid valid?
+             :pg_index/indisready ready?
              :pg_index/indisclustered false
              :pg_index/indisreplident false
-             :pg_index/indpred ""
-             :pg_index/indexprs ""
+             :pg_index/indnullsnotdistinct false
              :pg_index/indexdef indexdef
              (pgs/row-marker-attr "pg_index") true})]
       (vec (concat native explicit)))
@@ -2849,6 +2928,11 @@
           (pgs/row-marker-attr "pg_locks") true})))
     "pg_stat_activity" []
     "pg_statistic_ext"
+    []
+    ;; The server has no foreign-data objects, default grants, event
+    ;; triggers, subscriptions, or security label providers.
+    ("pg_foreign_data_wrapper" "pg_foreign_server" "pg_default_acl"
+                               "pg_event_trigger" "pg_subscription" "pg_seclabels")
     []
     "pg_publication"
     []

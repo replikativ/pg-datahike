@@ -229,13 +229,15 @@ The native SQL was captured with
 produced errors in 32 of 48 read queries. With the planner fix, relation
 metadata and qualified casts applied, 23 errored. With routine, type,
 and operator metadata added, 17 errored. With the generated operator class,
-family and access-method catalogs added, 14 errored. These replays substituted the candidate's fixture OIDs for the native OIDs. A query
+family and access-method catalogs added, 14 errored. The optional catalog
+shapes, correlated option scans, and index readiness brought that to six.
+These replays substituted the candidate's fixture OIDs for the native OIDs. A query
 that runs still needs its rows and the resulting dump checked.
 
 | SQLSTATE | Queries | Remaining work |
 |---|---:|---|
-| `42P01` | 11 | Conversions and text search need built-in catalog data. Foreign data, default ACL, event trigger, subscription and security-label scans need the catalog shapes for those facilities. |
-| `42703` | 3 | Constraint `tableoid` in the column scan, index readiness and publication owner |
+| `42P01` | 5 | The conversion catalog and four text search catalogs need built-in metadata. |
+| `42703` | 1 | The column scan joins a description through the constraint relation's `tableoid`. |
 
 The next stock dump blocker is the built-in text search parser scan. After
 catalog discovery, compare the fixture's columns, indexes, constraints,

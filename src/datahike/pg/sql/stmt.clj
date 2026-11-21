@@ -1325,7 +1325,7 @@
    known one whose arguments we could not evaluate (a correlated LATERAL
    argument): the first is 42883, the second is not."
   #{"unnest" "generate_series" "pg_get_keywords"
-    "pg_input_error_info" "pg_partition_ancestors" expandarray-name
+    "pg_input_error_info" "pg_partition_ancestors" "pg_options_to_table" expandarray-name
     "jsonb_array_elements" "json_array_elements"
     "jsonb_array_elements_text" "json_array_elements_text"
     "jsonb_each" "json_each" "jsonb_each_text" "json_each_text"
@@ -1377,7 +1377,10 @@
    (some (fn [^Column col]
            (let [alias (some-> col .getTable .getName unquote-ident str/lower-case)
                  name (-> col .getColumnName unquote-ident str/lower-case)]
-             (not (contains? (get params/*from-bindings* alias) name))))
+             (if alias
+               (not (contains? (get params/*from-bindings* alias) name))
+               (empty? (params/binding-column-owners params/*from-bindings* name
+                                                     params/*outer-scope-aliases*)))))
          (mapcat params/ast-columns (.getParameters (.getFunction tf))))))
 
 (defn- reject-unmaterialized-table-function!
@@ -1574,6 +1577,30 @@
                                {:aliases aliases :rows rows :vtypes vtypes
                                 :pg-types (vec pg-types)}))]
        (cond
+         (= fname "pg_options_to_table")
+         (let [db (or (:db scope) params/*parse-db*)
+               arg (first params)
+               arg-oid (some-> arg (oid/resolution-oid {:schema (:schema db) :db db
+                                                        :from-binding-oids params/*from-binding-oids*}))]
+           (when (or (not= 1 (count params))
+                     (and arg-oid (not (types/implicit-coercible? arg-oid types/oid-text-array))))
+             (throw (errors/pg-error :undefined-function {:function (str f)})))
+           (let [value (eval-fn arg)]
+             (when-not (= ::corr value)
+               (let [options (cond
+                               (fns/sql-null? value) []
+                               (pg-arr/array? value) (pg-arr/flat-elements value)
+                               :else (pg-arr/flat-elements (pg-arr/from-pg-text value :text)))
+                     rows (mapv (fn [option]
+                                  (when (fns/sql-null? option)
+                                    (throw (ex-info "array must not contain nulls"
+                                                    {:sqlstate "22004" :error :null-value-not-allowed})))
+                                  (let [[k v] (str/split option #"=" 2)]
+                                    [k v]))
+                                (checked-rows options))]
+                 (with-ordinality ["option_name" "option_value"] rows
+                   [:db.type/string :db.type/string] ["text" "text"])))))
+
          (= fname "pg_partition_ancestors")
          (let [db (or (:db scope) params/*parse-db*)
                arg-oid (some-> (first params) (oid/resolution-oid {:schema (:schema db) :db db}))
