@@ -17,6 +17,7 @@
    uuid -> java.util.UUID."
   (:refer-clojure :exclude [parse-uuid])
   (:require [clojure.string :as str]
+            [datahike.pg.bits :as bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.sql.coerce :as coerce]
@@ -354,6 +355,8 @@
 
 (def ^:private parsers
   {types/oid-bool parse-bool
+   types/oid-bit bits/parse-bit-literal
+   types/oid-varbit #(bits/parse-bit-literal % true)
    types/oid-int2 parse-int2
    types/oid-int4 parse-int4
    types/oid-int8 parse-int8

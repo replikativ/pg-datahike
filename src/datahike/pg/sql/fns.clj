@@ -3077,12 +3077,12 @@
         (str v))))
 
 (defn sql-length
-  "SQL LENGTH / CHAR_LENGTH. Bit strings measure in bits, not in the
-   record's map entries."
+  "SQL LENGTH / CHAR_LENGTH. Text measures Unicode code points and bit
+   strings measure bits."
   [v]
   (cond
     (pg-bits/pg-bit? v) (pg-bits/width v)
-    (string? v) (count v)
+    (string? v) (.codePointCount ^String v 0 (.length ^String v))
     (bytes? v) (alength ^bytes v)
     :else
     (throw (errors/pg-error

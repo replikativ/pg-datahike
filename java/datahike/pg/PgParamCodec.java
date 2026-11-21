@@ -671,6 +671,8 @@ public final class PgParamCodec {
                  PgWireServer.OID_FLOAT4,
                  PgWireServer.OID_FLOAT8,
                  PgWireServer.OID_NUMERIC,
+                 PgWireServer.OID_BIT,
+                 PgWireServer.OID_VARBIT,
                  PgWireServer.OID_UUID ->
                 readText(oid, s);
             // Date/time come in as ISO-8601 or PG's text forms; the downstream
@@ -752,6 +754,8 @@ public final class PgParamCodec {
             || oid == PgWireServer.OID_FLOAT4
             || oid == PgWireServer.OID_FLOAT8
             || oid == PgWireServer.OID_NUMERIC
+            || oid == PgWireServer.OID_BIT
+            || oid == PgWireServer.OID_VARBIT
             || oid == PgWireServer.OID_UUID
             || oid == PgWireServer.OID_DATE
             || oid == PgWireServer.OID_TIMESTAMP
@@ -954,6 +958,9 @@ public final class PgParamCodec {
                 case PgWireServer.OID_INT8 ->
                     ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
                         .putLong(parseLong(value)).array();
+
+                case PgWireServer.OID_BIT, PgWireServer.OID_VARBIT ->
+                    encodeBits(value.toString());
 
                 case PgWireServer.OID_FLOAT4 ->
                     ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
@@ -1158,6 +1165,34 @@ public final class PgParamCodec {
     // *_recv functions in src/backend/utils/adt/*.c for the canonical spec.
     // ========================================================================
 
+    private static byte[] encodeBits(String digits) {
+        int width = digits.length();
+        byte[] bytes = new byte[Integer.BYTES + (int) ((width + 7L) / 8)];
+        ByteBuffer.wrap(bytes).putInt(width);
+        for (int i = 0; i < width; i++) {
+            switch (digits.charAt(i)) {
+                case '1' -> bytes[Integer.BYTES + i / 8] |= (byte) (0x80 >>> (i % 8));
+                case '0' -> { }
+                default -> throw new IllegalArgumentException("bit result must contain only 0 and 1");
+            }
+        }
+        return bytes;
+    }
+
+    private static Object decodeBits(int oid, ByteBuffer buf) {
+        int width = buf.remaining() >= Integer.BYTES ? buf.getInt() : -1;
+        if (width < 0 || (width + 7L) / 8 != buf.remaining()) {
+            throw new PgWireServer.PgProtocolException("22P03", "invalid binary representation for bit string");
+        }
+        StringBuilder digits = new StringBuilder(width);
+        int packed = 0;
+        for (int i = 0; i < width; i++) {
+            if (i % 8 == 0) packed = Byte.toUnsignedInt(buf.get());
+            digits.append((packed & (0x80 >>> (i % 8))) == 0 ? '0' : '1');
+        }
+        return readText(oid, digits.toString());
+    }
+
     public static Object decodeBinary(int oid, byte[] bytes) {
         ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
         return switch (oid) {
@@ -1173,6 +1208,9 @@ public final class PgParamCodec {
                 (long) buf.getInt();
             case PgWireServer.OID_INT8 ->
                 buf.getLong();
+
+            case PgWireServer.OID_BIT, PgWireServer.OID_VARBIT ->
+                decodeBits(oid, buf);
 
             // regprocrecv/regprocedurerecv share PostgreSQL's oidrecv.
             // Preserve the unsigned half of the OID space.

@@ -1911,12 +1911,19 @@
                                        [(unquote-ident (.-name c)) (str t)]))
                                    (or (.getAliasColumns ^Alias a) []))))
         fname  (or (srf-base-name (.getName (.getFunction tf))) "tf")
+        ;; At Parse, only the declared output shape exists. Reparse with
+        ;; Bind's actual values before producing any rows.
+        unbound-params? (and (nil? params/*bound-params*)
+                             (seq (params/ast-param-indices (.getFunction tf))))
+        shape-only? (or params/*analysis-only?* unbound-params?)
+        _ (when unbound-params? (params/materialisation-params!))
         ;; Storage namespace, not the user's alias — see
         ;; materialize-derived-select! for why they must differ.
         sub-name (str "__srf__" (or talias fname))]
     (when-let [{:keys [aliases rows vtypes pg-types oids]}
-               (materialize-table-function
-                tf
+               (binding [params/*analysis-only?* shape-only?]
+                 (materialize-table-function
+                  tf
                 ;; Literals first; then fall back to evaluating a CONSTANT
                 ;; scalar expression. `srf-const-eval` alone only knew
                 ;; literals, so `generate_series(1, array_upper(
@@ -1931,17 +1938,17 @@
                 ;; ::corr exactly as before. That keeps this a widening of
                 ;; the constant case rather than a change to the
                 ;; correlated one.
-                (fn [e]
-                  (let [v (srf-const-eval e)]
-                    (if (not= ::corr v)
-                      v
-                      (let [pf params/*parse-sql*]
-                        (if-let [r (and pf db
-                                        (eval-corr-scalar pf (str e) false
-                                                          (:schema db) db))]
-                          r
-                          ::corr)))))
-                alias-coldefs {:db db :schema (:schema db)})]
+                  (fn [e]
+                    (let [v (srf-const-eval e)]
+                      (if (not= ::corr v)
+                        v
+                        (let [pf params/*parse-sql*]
+                          (if-let [r (and pf db
+                                          (eval-corr-scalar pf (str e) false
+                                                            (:schema db) db))]
+                            r
+                            ::corr)))))
+                  alias-coldefs {:db db :schema (:schema db)}))]
       (let [_ (when (and alias-cols (> (count alias-cols) (count aliases)))
                 (throw (ex-info (str "table \"" (or talias "") "\" has " (count aliases)
                                      " columns available but " (count alias-cols)
@@ -1954,7 +1961,7 @@
                                                    aliases))
                       (and talias (= 1 (count aliases))) [talias]
                       :else aliases)]
-        (if params/*analysis-only?*
+        (if shape-only?
           (materialize-output-schema!
            db sub-name (or talias sub-name)
            (mapv (fn [name oid] {:name name :oid oid}) aliases oids))

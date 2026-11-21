@@ -1065,6 +1065,9 @@
                                    params/*nested-parse?*)
                        (catalog/system-query?* sql cls-info))]
         (cond
+          (= :select-empty-projection (:kind cls-info))
+          {:type :select :literal-row [] :find-aliases [] :select-item-oids []}
+
           sys-type
           (let [base (merge
                       (when (contains? catalog/classify-system-kinds sys-type) cls-info)
@@ -1744,8 +1747,10 @@
                                         ;; the literal-row fast path would
                                         ;; freeze their result (or the result
                                         ;; variable's printed name).
-                                        (not-any? #(expr/contains-subquery?
-                                                    (.getExpression ^SelectItem %))
+                                        (not-any? (fn [^SelectItem item]
+                                                    (let [expression (.getExpression item)]
+                                                      (or (expr/contains-subquery? expression)
+                                                          (expr/time-now-cast? expression))))
                                                   (.getSelectItems ^PlainSelect stmt))
                                         (identical? db pre-cte-db))
                          ;; Evaluate each SELECT expression as a Clojure expression

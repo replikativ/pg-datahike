@@ -207,19 +207,23 @@
             (recur))))
       (f in out))))
 
-(defn- bind-body-formats [portal-name statement-name params result-formats]
-  (apply ba (cstr portal-name) (cstr statement-name)
-         [:i16 0]                    ; all params text
-         [:i16 (count params)]
-         (concat
-          (mapcat (fn [^String p]
-                    (if (nil? p)
-                      [[:i32 -1]]
-                      (let [b (.getBytes p StandardCharsets/UTF_8)]
-                        [[:i32 (alength b)] b])))
-                  params)
-          [[:i16 (count result-formats)]]
-          (map (fn [format] [:i16 format]) result-formats))))
+(defn- bind-body-formats
+  ([portal-name statement-name params result-formats]
+   (bind-body-formats portal-name statement-name params result-formats false))
+  ([portal-name statement-name params result-formats binary-params?]
+   (apply ba (cstr portal-name) (cstr statement-name)
+          (concat (if binary-params? [[:i16 1] [:i16 1]] [[:i16 0]])
+                  [[:i16 (count params)]]
+                  (mapcat (fn [p]
+                            (if (nil? p)
+                              [[:i32 -1]]
+                              (let [^bytes b (if binary-params?
+                                               p
+                                               (.getBytes ^String p StandardCharsets/UTF_8))]
+                                [[:i32 (alength b)] b])))
+                          params)
+                  [[:i16 (count result-formats)]]
+                  (map (fn [format] [:i16 format]) result-formats)))))
 
 (defn- bind-body [statement-name params]
   (bind-body-formats "" statement-name params []))
@@ -270,6 +274,78 @@
     (fn [in out]
       (send-msg! out \Q (cstr sql))
       (decode (read-until-ready in)))))
+
+(deftest select-without-projection-returns-one-row
+  ;; #281. A zero-column row still has RowDescription and DataRow messages.
+  (doseq [result [(simple "SELECT /* no projection */;")
+                  (parse-describe-execute "SELECT" [] [])]]
+    (is (nil? (:error result)) (:error result))
+    (is (= [] (:columns result)))
+    (is (= [[]] (:rows result)))
+    (is (= "SELECT 1" (:command-complete result))))
+  (is (= [[";"]] (:rows (simple "SELECT ';';")))))
+
+(deftest reported-literal-and-range-regressions
+  ;; #374, #286 and #287, checked against a PostgreSQL 18.6 UTF-8 database.
+  (is (= [["1" "2"]] (:rows (simple "SELECT length('🥝'), char_length('é')"))))
+  (let [result (simple "SELECT ARRAY[1,NULL,55]")]
+    (is (= [oid-int4-array] (mapv :oid (:columns result))))
+    (is (= [["{1,NULL,55}"]] (:rows result))))
+  (is (= "22003" (get-in (simple "SELECT exp(20000.0)") [:error \C]))))
+
+(deftest now-as-time-reads-the-current-clock
+  ;; #282. The literal and CURRENT_TIME agree when parsed and run together.
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "BEGIN; SELECT 'now'::time = CURRENT_TIME::time;"))
+      (is (= [["t"]] (:rows (decode (read-until-ready in)))))))
+  (let [result (parse-describe-execute "SELECT 'now'::time" [] [])]
+    (is (= [1083] (mapv :oid (:columns result))))
+    (is (re-matches #"\d{2}:\d{2}:\d{2}(?:\.\d+)?" (or (ffirst (:rows result)) ""))))
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "PREPARE capture_time AS SELECT 'now'::time = CURRENT_TIME::time"))
+      (is (nil? (:error (decode (read-until-ready in)))))
+      (Thread/sleep 20)
+      (send-msg! out \Q (cstr "EXECUTE capture_time"))
+      (is (= [["f"]] (:rows (decode (read-until-ready in))))))))
+
+(deftest varbit-parameters-use-the-bit-operator
+  ;; #283. Both operands are declared varbit. PostgreSQL describes the result as bit.
+  (is (= [["1000"]] (:rows (parse-describe-execute "SELECT $1 & $2" [1562 1562] ["1010" "1100"]))))
+  (with-conn
+    (fn [in out]
+      (send-msg! out \P (ba (cstr "bits") (cstr "SELECT $1 & $2") [:i16 2] [:i32 1562] [:i32 1562]))
+      (send-msg! out \B (bind-body-formats "" "bits"
+                                           [(ba [:i32 4] (byte-array [(unchecked-byte 0xa0)]))
+                                            (ba [:i32 4] (byte-array [(unchecked-byte 0xc0)]))]
+                                           [1] true))
+      (send-msg! out \D (ba (byte-array [(int \P)]) (cstr "")))
+      (send-msg! out \E (ba (cstr "") [:i32 0]))
+      (send-msg! out \S (byte-array 0))
+      (let [result (decode (read-until-ready in))]
+        (is (= [1560] (mapv :oid (:columns result))))
+        (is (= [[[0 0 0 4 128]]] (:raw-rows result)))))))
+
+(deftest insert-from-unnest-of-a-binary-array
+  ;; #285. Parse has the type but the array contents arrive only at Bind.
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "CREATE TABLE sarray(id serial PRIMARY KEY, val int2)"))
+      (is (nil? (:error (decode (read-until-ready in)))))
+      (send-msg! out \P (ba (cstr "load") (cstr "INSERT INTO sarray(val) SELECT * FROM unnest($1::int2[])")
+                            [:i16 1] [:i32 1005]))
+      (send-msg! out \B (bind-body-formats "" "load"
+                                           [(ba [:i32 1] [:i32 0] [:i32 21] [:i32 2] [:i32 1]
+                                                [:i32 2] [:i16 2] [:i32 2] [:i16 -3])]
+                                           [] true))
+      (send-msg! out \E (ba (cstr "") [:i32 0]))
+      (send-msg! out \S (byte-array 0))
+      (is (= "INSERT 0 2" (:command-complete (decode (read-until-ready in)))))
+      (send-msg! out \Q (cstr "SELECT val FROM sarray ORDER BY id"))
+      (let [result (decode (read-until-ready in))]
+        (is (= [oid-int2] (mapv :oid (:columns result))))
+        (is (= [["2"] ["-3"]] (:rows result)))))))
 
 (deftest execute-max-rows-suspends-and-resumes-one-portal
   (with-conn
