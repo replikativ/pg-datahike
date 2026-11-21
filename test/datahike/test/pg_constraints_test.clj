@@ -183,6 +183,12 @@
     (is (= "42830" (.sqlstate ^PgWireServer$QueryResult result))))
   (is (= [["1"]] (rows (run "SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conrelid = 'fk_index_child'::regclass")))))
 
+(deftest fk-referenced-keys-belong-to-the-referenced-table
+  (is (ok? (run "CREATE TABLE fk_ancestor (code int UNIQUE)")))
+  (is (ok? (run "CREATE TABLE fk_inherited (extra int) INHERITS (fk_ancestor)")))
+  (let [result (run "CREATE TABLE fk_orphan (code int REFERENCES fk_inherited(code))")]
+    (is (= "42830" (.sqlstate ^PgWireServer$QueryResult result)) (err result))))
+
 (deftest ordinary-insert-compiles-and-caches-one-row-plan
   (is (ok? (run "CREATE TABLE plan_plain (id INT, note TEXT)")))
   (let [calls (atom 0)

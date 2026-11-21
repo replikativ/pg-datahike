@@ -73,11 +73,11 @@
                          schema)]
           [(name attr)])))))
 
-(defn- schema-unique-keys [schema columns]
+(defn- schema-unique-keys [schema table columns]
   (let [column-names (set/map-invert columns)]
     (into #{}
           (keep (fn [[attr props]]
-                  (when (:db/unique props)
+                  (when (and (keyword? attr) (= table (namespace attr)) (:db/unique props))
                     (if-let [members (seq (:db/tupleAttrs props))]
                       (when (every? column-names members)
                         (into #{} (map column-names) members))
@@ -133,6 +133,7 @@
                       {:sqlstate "42830" :constraint name})))
     (when (and explicit?
                (not (or (contains? (schema-unique-keys (if local-parent? (:schema local) (:schema db))
+                                                       parent-table
                                                        parent-columns)
                                    (set parent-cols))
                         (and (not local-parent?)
