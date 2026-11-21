@@ -1104,10 +1104,8 @@
       (is (= "42703" (:sqlstate r)))
       (is (re-find #"this_column_never_existed" (or (:err r) "")))))
   (testing "a real PostgreSQL column we do not serve"
-    ;; relfilenode and typinput were here until psql and type_sanity
-    ;; demanded them; these four still are not served.
-    (doseq [[rel col] [["pg_class" "relpages"]
-                       ["pg_class" "reltuples"]
+    (doseq [[rel col] [["pg_class" "relnatts"]
+                       ["pg_class" "relrewrite"]
                        ["pg_attribute" "attlen"]
                        ["pg_type" "typdefault"]]]
       (is (= "42703" (:sqlstate (ex (str "SELECT r." col " FROM " rel " r"))))
@@ -1119,7 +1117,7 @@
            (rows "SELECT c.relname FROM pg_class c WHERE c.relname = 'strictcat'")))
     (is (= "42703" (:sqlstate (ex (str "SELECT c.relname FROM pg_class c"
                                        " WHERE c.relname = 'strictcat'"
-                                       "   AND c.relpages = 0"))))))
+                                       "   AND c.relnatts = 1"))))))
   (testing "relispartition IS served now, and false, because a client demanded it"
     ;; postgres_fdw's IMPORT FOREIGN SCHEMA probe ends
     ;; `AND NOT c.relispartition`. Declaring it was not enough -- an
