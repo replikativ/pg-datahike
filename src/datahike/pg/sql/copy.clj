@@ -36,7 +36,7 @@
      ESCAPE          'X'                — CSV escape char (defaults to QUOTE)
      FORCE_NOT_NULL  ( col, ... ) | *
      FORCE_NULL      ( col, ... ) | *
-     FORCE_QUOTE     ( col, ... ) | *   — TO-only; we accept for COPY FROM as a no-op
+     FORCE_QUOTE     ( col, ... ) | *   — TO-only
      ENCODING        'UTF8'             — UTF-8 aliases accepted; others rejected
      FREEZE          [ BOOL ]           — accepted, ignored
      DEFAULT         'X'                — defaults-marker (PG 16+)
@@ -310,6 +310,21 @@
                              (pr-str head))
                         {:error :syntax-error :got head}))))))
 
+(defn- consume-legacy-force-columns
+  "Parse an unparenthesized COPY FORCE column list or a bare *."
+  [toks]
+  (if (ident-eq? (first toks) "*")
+    [:all (rest toks)]
+    (loop [t toks, cols []]
+      (let [[head & tail] t]
+        (when-not (and (ident-token? head) (not (ident-eq? head "*")))
+          (throw (ex-info "expected column name in COPY FORCE column list"
+                          {:error :syntax-error :got head})))
+        (let [cols (conj cols (str/lower-case (second head)))]
+          (if (= :comma (ffirst tail))
+            (recur (rest tail) cols)
+            [cols tail]))))))
+
 (defn- consume-legacy-option-list
   "Parse the pre-9.0 keyword option list (no parens, no commas):
 
@@ -353,6 +368,19 @@
                                      ", got: " (pr-str (first t1)))
                                 {:error :syntax-error :option k :got (first t1)})))
               (recur (rest t1) (conj out [k vv])))
+
+            "force"
+            (let [[_ modifier following & after] t
+                  [key columns]
+                  (cond
+                    (ident-eq? modifier "quote") ["force_quote" (drop 2 t)]
+                    (ident-eq? modifier "null") ["force_null" (drop 2 t)]
+                    (and (ident-eq? modifier "not") (ident-eq? following "null"))
+                    ["force_not_null" after]
+                    :else (throw (ex-info "expected QUOTE, NOT NULL, or NULL after COPY FORCE"
+                                          {:error :syntax-error :got modifier})))
+                  [cols remaining] (consume-legacy-force-columns columns)]
+              (recur remaining (conj out [key cols])))
 
             ;; FORCE_NOT_NULL / FORCE_NULL / FORCE_QUOTE — column lists
             ("force_not_null" "force_null" "force_quote")

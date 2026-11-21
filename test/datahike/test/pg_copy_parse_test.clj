@@ -190,6 +190,20 @@
     (is (= :csv (:format o)))
     (is (= #{"a" "b"} (:force-not-null o)))))
 
+(deftest legacy-force-options-use-postgresql-spellings
+  (is (= #{"a" "b"}
+         (get-in (parse "COPY t TO STDOUT CSV FORCE QUOTE a, b HEADER")
+                 [:options :force-quote])))
+  (is (= :all (get-in (parse "COPY t TO STDOUT CSV FORCE QUOTE *")
+                      [:options :force-quote])))
+  (let [o (opts "COPY t FROM STDIN CSV FORCE NOT NULL a, b FORCE NULL *")]
+    (is (= #{"a" "b"} (:force-not-null o)))
+    (is (= :all (:force-null o))))
+  (doseq [sql ["COPY t TO STDOUT CSV FORCE QUOTE"
+               "COPY t TO STDOUT CSV FORCE QUOTE (a)"
+               "COPY t TO STDOUT CSV FORCE QUOTE a,"]]
+    (is (thrown? clojure.lang.ExceptionInfo (parse sql)) sql)))
+
 ;; ============================================================================
 ;; Validation / error paths
 ;; ============================================================================

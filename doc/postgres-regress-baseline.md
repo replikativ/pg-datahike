@@ -129,7 +129,7 @@ state after rejected statements.
 |---|---|
 | `aggregates` | Custom aggregate fixtures cause cascades. Built-in aggregate coverage and resolution remain open. |
 | `arrays` | Array input and bounds, type resolution, and functions such as `array_sort`, `array_sample` and `array_reverse`. |
-| `copyselect` | Legacy `FORCE QUOTE` syntax and COPY diagnostics. A strict wire slice checks successive `COPY FROM STDIN` commands and the statements around them. |
+| `copyselect` | COPY diagnostics. Strict wire slices check legacy `FORCE QUOTE` CSV output and successive `COPY FROM STDIN` commands. |
 | `create_table` and `create_table_like` | Partitioning, some persistence metadata and optional LIKE properties such as `INCLUDING GENERATED`. A subquery in a default is rejected with a different SQLSTATE. |
 | `groupingsets` | Grouping sets, rollup and cube are unsupported. The v0.1.390 replay completed with early rejections; the initial October run exhausted the heap. |
 | `prepare` | Arity, declared type coercion and unknown-type errors now agree in focused probes. `CREATE TABLE AS EXECUTE`, path inference and catalog output still differ. |
