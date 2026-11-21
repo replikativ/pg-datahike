@@ -45,7 +45,6 @@
     "unicode"
     "misc_functions"
     "numerology"},
-  :unscheduled-numeric #{"numeric_big"},
   :transactions-and-concurrency #{"plancache" "mvcc" "async" "prepared_xacts" "lock"},
   :scalar-and-structural-types
   #{"path"

@@ -958,8 +958,8 @@
    :sql-sha256 "235b533f827a9155dc70896b88bd653e68297a8c40ac8098a5e59b92485cf032",
    :expected-sha256 "35e02d49faad7b11cc27d5c53f1fe76feeb573237cfce51398e58e0b39da4e65",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :unscheduled-numeric}
+   :status :campaign,
+   :wave 1}
   {:name "numerology",
    :scheduled? true,
    :sql-sha256 "c7e4c9cb9dd5670c077cc25f011839aa010bbe271c50103e68687dbdb3be925f",
@@ -1705,9 +1705,9 @@
    :source-lines [1 10],
    :basis "pg_numa_available and pg_shmem_allocations_numa inspect server shared-memory topology."},
   "numeric_big"
-  {:scope :backlog,
+  {:scope :campaign,
    :basis
-   "Unscheduled numeric regression remains an explicit application-facing input; it is not an additional scheduled file."},
+   "Unscheduled numeric regression gates against the pinned expected output after creating the tables its opening DROP statements require."},
   "object_address"
   {:scope :backlog,
    :source-lines [1 55],

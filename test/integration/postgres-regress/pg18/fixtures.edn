@@ -3,6 +3,12 @@
  :setup "test_setup"
  :baseline-qualified? false
  :core-only-targets #{"boolean" "psql_pipeline"}
+ :strict-fixtures
+ {"numeric_big" [{:sql "numeric" :lines [5 15]}]
+  "portals_p2" [{:sql "test_setup" :lines [118 135]}
+                {:copy "onek" :data "onek.data"
+                 :sha256 "1f59332622392237c33d997e605177db5d77dc09b370599005223b0adf901b5c"}
+                {:sql "test_setup" :lines [141 141]}]}
  :target-statement-timeouts {"psql_pipeline" "0"}
  :prerequisites
  {"aggregates" ["create_aggregate" "create_index"]

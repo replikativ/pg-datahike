@@ -115,11 +115,13 @@ an aggregate's ORDER BY is part of its contract.
 
 ## PostgreSQL 18.6
 
-The live whole-file gate starts with `advisory_lock`, `boolean`, `comments`,
+The live whole-file gate includes `advisory_lock`, `boolean`, `comments`,
 `delete`, `lseg`, `macaddr`, `md5`, `select_having` and `select_implicit`.
 Each matched a fresh native 18.6 oracle and pg-datahike v0.1.390 after removing
 source excerpts and their caret markers. The gate uses the pinned upstream
-output and gives each file a separate database. Focused tests also cover
+output and gives each file a separate database. `numeric_big` and `portals_p2`
+also run in separate databases with the minimal setup declared in `fixtures.edn`.
+Focused tests also cover
 upstream `CREATE TABLE` and `CREATE TABLE LIKE` slices, including catalog
 state after rejected statements.
 

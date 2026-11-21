@@ -27,6 +27,7 @@
   (let [source (io/file *temporary* "source")
         regress (io/file source "src/test/regress")
         manifest-file (io/file *temporary* "inventory.edn")
+        fixture-file (file! (io/file *temporary* "fixtures.edn") "{}")
         campaign {:waves [{:id 1 :tests [{:name "foo" :mode :unmeasured}]}]}
         scope {:backlog {:client #{"test_setup" "numeric_big"}}
                :out-of-scope {:physical #{"reindex_catalog"}}}
@@ -43,7 +44,7 @@
     (git! source "tag" "REL_18_6")
     (let [cfg (assoc (reference/config reference/repo-root
                                        {"PG_REGRESS_PROFILE" "18" "POSTGRES_SOURCE" (str source)})
-                     :inventory (str manifest-file))
+                     :inventory (str manifest-file) :fixtures (str fixture-file))
           declared (into {} (inventory/dispositions campaign scope))
           expected (into (sorted-map) (for [file (.listFiles (io/file regress "expected"))]
                                         [(.getName file) (reference/file-sha256 file)]))
@@ -117,7 +118,7 @@
         (is (thrown? clojure.lang.ExceptionInfo (inventory/validate! cfg campaign scope ledger)))
         (if before (spit file before) (.delete file))))))
 
-(deftest partial-admission-requires-an-independent-whole-file-gate
+(deftest partial-admission-requires-independence-or-an-admitted-fixture
   (let [{:keys [cfg campaign scope ledger manifest manifest-file]} (fixture!)
         strict (assoc-in campaign [:waves 0 :tests 0 :mode] :strict)
         independent (assoc manifest :admission :partial :ordering-prerequisites {})]
@@ -125,13 +126,17 @@
     (is (= 4 (:sql-count (inventory/validate! cfg strict scope ledger))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs a strict"
                           (inventory/validate! cfg campaign scope ledger)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"independently of fixtures"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"independence or an admitted fixture"
                           (inventory/validate! cfg
                                                (assoc-in strict [:waves 0 :tests 0 :requires] ["test_setup"])
                                                scope ledger)))
     (spit manifest-file (pr-str (assoc manifest :admission :partial)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"independently of fixtures"
-                          (inventory/validate! cfg strict scope ledger)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"independence or an admitted fixture"
+                          (inventory/validate! cfg strict scope ledger)))
+    (spit (:fixtures cfg) (pr-str {:strict-fixtures {"foo" [{:sql "test_setup" :lines [1 1]}]}}))
+    (is (= #{"foo"} (:strict-fixtures (inventory/validate! cfg strict scope ledger))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must name strict whole-file gates"
+                          (inventory/validate! cfg campaign scope ledger)))))
 
 (deftest residuals-account-for-the-scope-and-require-evidence-for-coverage
   (let [{:keys [cfg campaign scope ledger manifest manifest-file]} (fixture!)
