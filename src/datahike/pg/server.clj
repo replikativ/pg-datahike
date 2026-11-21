@@ -7413,27 +7413,39 @@
         canonical))))
 
 (defn- sequence-descriptor [db seq-name]
-  (let [bare-name (bare-sequence-name seq-name)
-        eid (when (get (dbi/-schema db) :__seq__/name)
-              (ffirst (d/q '{:find [?e]
-                             :where [[?e :__seq__/name ?n]]
-                             :in [$ ?n]}
-                           db bare-name)))]
-    (when eid
-      (let [attr (fn [a default]
-                   (let [v (ffirst (d/q {:find '[?v]
-                                         :where [['?e a '?v]]
-                                         :in '[$ ?e]}
-                                        db eid))]
-                     (if (some? v) v default)))
-            increment (attr :__seq__/increment 1)]
-        {:eid eid
-         :name bare-name
-         :increment increment
-         :current (attr :__seq__/value 0)
-         :maximum (attr :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
-         :minimum (attr :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
-         :cycle? (boolean (attr :__seq__/cycle false))}))))
+  (when (and (string? seq-name) (get (dbi/-schema db) :__seq__/name))
+    (let [lookup (fn [name]
+                   (when-let [eid (ffirst (d/q '{:find [?e]
+                                                 :where [[?e :__seq__/name ?n]]
+                                                 :in [$ ?n]}
+                                               db name))]
+                     [name eid]))
+          bare-name (bare-sequence-name seq-name)
+          [name eid] (or (lookup seq-name)
+                         (when (not= bare-name seq-name)
+                           (lookup bare-name))
+                         ;; Defaults and deferred projections may still
+                         ;; carry the spelling from a SQL regclass literal.
+                         ;; Preserve physical names and legacy stored names
+                         ;; before resolving the literal's canonical form.
+                         (let [canonical (peek (regoid/parse-qualified-name seq-name))]
+                           (when (and (not= canonical seq-name) (not= canonical bare-name))
+                             (lookup canonical))))]
+      (when eid
+        (let [attr (fn [a default]
+                     (let [v (ffirst (d/q {:find '[?v]
+                                           :where [['?e a '?v]]
+                                           :in '[$ ?e]}
+                                          db eid))]
+                       (if (some? v) v default)))
+              increment (attr :__seq__/increment 1)]
+          {:eid eid
+           :name name
+           :increment increment
+           :current (attr :__seq__/value 0)
+           :maximum (attr :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
+           :minimum (attr :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
+           :cycle? (boolean (attr :__seq__/cycle false))})))))
 
 (defn- advance-sequence-value
   [{:keys [increment maximum minimum cycle?]} seq-name ^long current]
