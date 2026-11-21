@@ -63,7 +63,7 @@
            [net.sf.jsqlparser.statement.update Update UpdateSet]
            [net.sf.jsqlparser.statement.delete Delete]
            [net.sf.jsqlparser.statement.drop Drop]
-           [net.sf.jsqlparser.statement.alter Alter AlterExpression]
+           [net.sf.jsqlparser.statement.alter Alter AlterExpression AlterExpression$ColumnDataType]
            [net.sf.jsqlparser.statement ExplainStatement SavepointStatement RollbackStatement Commit]
            [net.sf.jsqlparser.statement.create.index CreateIndex]))
 
@@ -75,6 +75,16 @@
 (def ^:private view-name-attr :datahike.pg/view-name)
 (def ^:private view-definition-attr :datahike.pg/view-definition)
 (def ^:private view-columns-attr :datahike.pg/view-columns)
+
+(defn- alter-column-nullability [^AlterExpression expression]
+  (when-let [^AlterExpression$ColumnDataType column (first (.getColDataTypeList expression))]
+    (let [data-type (.getColDataType column)
+          specs (mapv (comp str/upper-case str) (.getColumnSpecs column))
+          tokens (if data-type (into [(str/upper-case (str data-type))] specs) specs)
+          operation ({["SET" "NOT" "NULL"] :set-not-null
+                      ["DROP" "NOT" "NULL"] :drop-not-null} tokens)]
+      (when operation
+        {:op operation :name (unquote-ident (.getColumnName column))}))))
 
 (defn- create-index-options
   "Normalize JSqlParser's `WITH (...)` tail into a keyword map.  PostgreSQL's
@@ -2581,7 +2591,9 @@
                                                   (second (re-matches
                                                            #"(?i)\s*VALIDATE\s+CONSTRAINT\s+(\S+)\s*"
                                                            (str exp))))}
-                                ;; ALTER (SET NOT NULL, TYPE change, etc.) — no-op
+                                          (= op "ALTER")
+                                          (or (alter-column-nullability exp)
+                                              {:op :other :raw (str exp)})
                                           :else {:op :other :raw (str exp)})))
                                     expressions)]
                       {:type :ddl-alter :table table-name :operations ops})

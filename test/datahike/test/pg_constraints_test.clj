@@ -63,6 +63,56 @@
   (testing "UPDATE SET col = NULL rejected"
     (is (err-contains? (run "UPDATE nn SET name = NULL WHERE id = 1") "not-null"))))
 
+(deftest alter-column-nullability
+  (let [attnotnull (str "SELECT attnotnull FROM pg_attribute "
+                        "WHERE attrelid = 'nn'::regclass AND attname = 'Mixed Case'")
+        constraint (str "SELECT conname FROM pg_constraint "
+                        "WHERE conrelid = 'nn'::regclass AND contype = 'n' "
+                        "AND conname <> 'nn_id_not_null'")
+        set-not-null "ALTER TABLE nn ALTER COLUMN \"Mixed Case\" SET NOT NULL"
+        drop-not-null "ALTER TABLE nn ALTER \"Mixed Case\" DROP NOT NULL"]
+    (is (ok? (run "CREATE TABLE nn (id INT PRIMARY KEY, \"Mixed Case\" TEXT, b TEXT)")))
+    (is (ok? (run "INSERT INTO nn (id) VALUES (1)")))
+    (is (= "23502" (.sqlstate ^PgWireServer$QueryResult (run set-not-null))))
+    (is (= [["f"]] (rows (run attnotnull))))
+    (is (= [] (rows (run constraint))))
+    (is (ok? (run "UPDATE nn SET \"Mixed Case\" = 'filled' WHERE id = 1")))
+    (is (ok? (run "BEGIN")))
+    (is (ok? (run set-not-null)))
+    (is (= [["t"]] (rows (run attnotnull))))
+    (is (ok? (run "ROLLBACK")))
+    (is (= [["f"]] (rows (run attnotnull))))
+    (is (= "23502" (.sqlstate ^PgWireServer$QueryResult
+                    (run (str set-not-null ", ALTER COLUMN b SET NOT NULL")))))
+    (is (= [["f"]] (rows (run attnotnull))))
+    (is (ok? (run set-not-null)))
+    (is (ok? (run set-not-null)))
+    (is (= [["t"]] (rows (run attnotnull))))
+    (is (= 1 (count (rows (run constraint)))))
+    (is (= "23502" (.sqlstate ^PgWireServer$QueryResult (run "INSERT INTO nn (id) VALUES (2)"))))
+    (is (= "23502" (.sqlstate ^PgWireServer$QueryResult
+                    (run "UPDATE nn SET \"Mixed Case\" = NULL WHERE id = 1"))))
+    (is (= "23502" (.sqlstate ^PgWireServer$QueryResult
+                    (run (str drop-not-null ", ALTER COLUMN b SET NOT NULL")))))
+    (is (= [["t"]] (rows (run attnotnull))))
+    (is (ok? (run drop-not-null)))
+    (is (ok? (run drop-not-null)))
+    (is (= [["f"]] (rows (run attnotnull))))
+    (is (= [] (rows (run constraint))))
+    (is (ok? (run "INSERT INTO nn (id) VALUES (2)")))
+    (is (= "42703" (.sqlstate ^PgWireServer$QueryResult
+                    (run "ALTER TABLE nn ALTER missing SET NOT NULL"))))
+    (is (= "42P16" (.sqlstate ^PgWireServer$QueryResult
+                    (run "ALTER TABLE nn ALTER id DROP NOT NULL"))))
+    (is (ok? (run "CREATE VIEW nn_view AS SELECT id FROM nn")))
+    (is (= "42809" (.sqlstate ^PgWireServer$QueryResult
+                    (run "ALTER TABLE nn_view ALTER id SET NOT NULL"))))
+    (is (ok? (run "CREATE TABLE nn_key (a INT, b INT GENERATED ALWAYS AS IDENTITY, c INT, PRIMARY KEY (a,c))")))
+    (is (= "42P16" (.sqlstate ^PgWireServer$QueryResult
+                    (run "ALTER TABLE nn_key ALTER a DROP NOT NULL"))))
+    (is (= "42601" (.sqlstate ^PgWireServer$QueryResult
+                    (run "ALTER TABLE nn_key ALTER b DROP NOT NULL"))))))
+
 (deftest primary-key-is-implicitly-not-null
   (is (ok? (run "CREATE TABLE pkn (id INT PRIMARY KEY, name TEXT)")))
   (let [r (run "INSERT INTO pkn (name) VALUES ('missing')")]

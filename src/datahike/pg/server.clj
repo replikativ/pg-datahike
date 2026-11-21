@@ -7019,7 +7019,8 @@
                       :tx-options {}
                       :ddl-version 0
                       :owned-locks #{})
-               (dissoc :temp-tables-before
+               (dissoc :speculative-db
+                       :temp-tables-before
                        :local-sequence-reservations
                        :local-sequence-generations
                        :local-sequence-identities)))))
@@ -12112,6 +12113,56 @@
                                    keys))])
                   (column-index-dependents db table column)))))))
 
+(defn- alter-column-nullability-tx
+  [db table relation-oid {:keys [op name]}]
+  (let [relation (catalog-objects/object-by-address db catalog-objects/pg-class-oid relation-oid)
+        column (catalog-objects/column-by-name db relation-oid name)
+        attr (:datahike.pg.column/storage-ident column)
+        schema (dbi/-schema db)]
+    (when (and relation (not= :table (:datahike.pg.object/kind relation)))
+      (throw (ex-info (str "ALTER action ALTER COLUMN ... "
+                           (if (= :set-not-null op) "SET" "DROP")
+                           " NOT NULL cannot be performed on relation \"" table "\"")
+                      {:sqlstate "42809"})))
+    (when-not attr
+      (throw (errors/pg-error :undefined-column {:table table :column name})))
+    (when (or (not (:datahike.pg.column/local? column))
+              (pos? (or (:datahike.pg.column/inherit-count column) 0))
+              (seq (inherited-column-dependents
+                    db (:datahike.pg.column/address-key column))))
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "changing nullability of inherited columns is not supported"})))
+    (let [entity (d/entity db attr)
+          eid (:db/id entity)]
+      (case op
+        :set-not-null
+        (when-not (:pg/not-null entity)
+          (when (some #(nil? (get (d/entity db %) attr)) (table-row-eids db table))
+            (throw (ex-info (str "column \"" name "\" of relation \"" table
+                                 "\" contains null values")
+                            {:sqlstate "23502" :table table :column name})))
+          [[:db/add eid :pg/not-null true]])
+
+        :drop-not-null
+        (do
+          (when (and (contains? schema :__seq__/identity-generation)
+                     (:__seq__/identity-generation
+                      (d/entity db [:__seq__/name (str table "_" name "_seq")])))
+            (throw (ex-info (str "column \"" name "\" of relation \"" table
+                                 "\" is an identity column")
+                            {:sqlstate "42601"})))
+          (when (or (= :db.unique/identity (get-in schema [attr :db/unique]))
+                    (some (fn [[ident {:db/keys [unique tupleAttrs]}]]
+                            (and (keyword? ident) (= table (namespace ident))
+                                 (= :db.unique/identity unique)
+                                 (some #{attr} tupleAttrs)))
+                          schema))
+            (throw (ex-info (str "column \"" name "\" is in a primary key")
+                            {:sqlstate "42P16"})))
+          (when (:pg/not-null entity)
+            [[:db/retract eid :pg/not-null true]]))))))
+
 (defn- inherited-add-column-tx-data
   "Propagate newly added parent columns through the inheritance tree.
 
@@ -12462,10 +12513,19 @@
                         (rename-column-tx-data db table relation-oid operation)
                         nil))
                     operations)
-            tx-data (into schema-and-constraint-data
-                          (concat added-constraint-data attnum-data
-                                  inherited-column-data
-                                  hint-data lifecycle-data))
+            nullability-ops (group-by :op (filter #(#{:set-not-null :drop-not-null} (:op %))
+                                                  operations))
+            nullability-tx (fn [op]
+                             (mapv (fn [change]
+                                     [:db.fn/call alter-column-nullability-tx table relation-oid change])
+                                   (get nullability-ops op)))
+            ;; PostgreSQL drops nullability before adding columns, then
+            ;; validates SET NOT NULL against the resulting table. Run the
+            ;; scan in the writer as well as on a speculative transaction.
+            tx-data (into (nullability-tx :drop-not-null)
+                          (concat schema-and-constraint-data added-constraint-data
+                                  attnum-data inherited-column-data hint-data lifecycle-data
+                                  (nullability-tx :set-not-null)))
             tx-data (if (and relation-oid (seq tx-data))
                       (into tx-data
                             (catalog-objects/bump-revision-tx
@@ -12487,7 +12547,8 @@
               ;; historical accept-as-no-op behavior (uniqueness is
               ;; still enforced by the SQL layer's identity checks)
               ;; instead of failing statements that used to succeed.
-              (if (and (not-any? #(= :add-column (:op %)) operations)
+              (if (and (empty? nullability-ops)
+                       (not-any? #(= :add-column (:op %)) operations)
                        (re-find #"Update not supported"
                                 (str (.getMessage e))))
                 (empty-result "ALTER TABLE")

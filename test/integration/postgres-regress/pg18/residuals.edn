@@ -77,6 +77,9 @@
   {:id :foreign-key-definition-validation
    :file "foreign_key" :lines [538 543] :state :covered :impact :wrong-result
    :detail "Invalid foreign keys previously left relations and dependencies behind. The gate checks missing and system columns, non-unique target keys, and a clean catalog after rejection."}
+  {:id :alter-column-nullability
+   :file "alter_table" :lines [876 908] :state :covered :impact :wrong-result
+   :detail "SET and DROP NOT NULL on ordinary tables update enforcement and the catalog together. The gate checks rejecting existing NULL rows, atomic failure with multiple ALTER actions, and visibility before and after rollback."}
   {:id :reset-transaction-isolation
    :file "transactions" :lines [39 42] :state :covered :impact :wrong-result
    :detail "RESET of a current transaction characteristic now returns 0A000. The gate checks that the transaction then returns 25P02 until rollback."}

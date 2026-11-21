@@ -216,7 +216,12 @@
        :gate "test/datahike/test/pg_constraints_test.clj"
        :test-var "postgres-rejects-invalid-foreign-key-definitions"}]}
     {:name "create_view", :boundaries #{:ddl :relational :views}, :mode :unmeasured}
-    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :unmeasured}]}
+    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :unmeasured
+     :strict-slices
+     [{:id :alter-column-nullability
+       :source-lines [876 908]
+       :gate "test/datahike/test/pg_constraints_test.clj"
+       :test-var "alter-column-nullability"}]}]}
   {:id 5,
    :name "bulk I/O, temporary relations, and client tooling",
    :tests

@@ -164,15 +164,13 @@ PG_REGRESS_PROFILE=18 bb pg-regress-wave strict
 
 ### PostgreSQL 18 client cutover
 
-The advertised server version remains 17.7. PostgreSQL 18 client behavior
-is checked separately from the strict SQL regression profile. The existing
-`pgdump-roundtrip` CI job uses native PostgreSQL as the dump source and
-pg-datahike as the restore target.
+The candidate reports 18.6 and uses the catalog generated from `REL_18_6`.
+The stock client checks use that catalog and the published Datahike
+`0.8.1937` artifact. The `pgdump-roundtrip` CI job uses native PostgreSQL
+as the dump source and pg-datahike as the restore target.
 
 Load the following into disposable native and pg-datahike databases to
-reproduce the client probes. For the candidate only, build a throwaway copy
-with `SERVER_VERSION` set to `18.6` and `SERVER_VERSION_NUM` to `180006` in
-`PgWireServer.java` before compiling Java.
+reproduce the client probes.
 
 ```sql
 CREATE TABLE client_parent (id int PRIMARY KEY, name text NOT NULL);
@@ -207,15 +205,17 @@ ordinary-table fixture after correlated `unnest` and array-element joins
 were fixed. The 18.6 candidate reports `NOT NULL` constraints in
 `pg_constraint` (`contype = 'n'`) and links them to the correct physical
 column positions. The current metadata derives the PostgreSQL names for
-unnamed constraints. Explicit `NOT NULL` constraint names need durable
-metadata. `ALTER COLUMN SET NOT NULL` and `DROP NOT NULL` still leave that
-metadata unchanged.
+unnamed constraints. `ALTER COLUMN SET NOT NULL` validates existing rows
+before updating enforcement and metadata on ordinary tables. `DROP NOT
+NULL` removes that state. The regression checks rollback and atomicity
+when an ALTER contains several actions. Explicit constraint names and
+changing nullability on inherited columns remain open.
 
 The first stock dump query over relations also exposed a Datahike planner
 problem. It exhausted a 1.2 GiB heap on this fixture. The planner projected
 the outer relation's join keys, kept repeated bindings, and joined those
-copies back to the same outer rows. With the fix applied locally, that
-query completed in under a second.
+copies back to the same outer rows. The local probe completed in under
+a second with the change now released in Datahike `0.8.1937`.
 
 Routine discovery now has typed routine ACLs and language OIDs. The type
 scan can read the first byte of a PostgreSQL `name`. The operator scan can
@@ -231,8 +231,8 @@ candidate's fixture OIDs in place of the native OIDs. The exact column
 scan now returns all six fixture columns, including the three derived
 `NOT NULL` constraint names.
 
-Stock `pg_dump` completes against a fresh 18.6 candidate with the local
-Datahike planner fix. The generated view and foreign key definitions
+Stock `pg_dump` completes against a fresh 18.6 candidate with Datahike
+`0.8.1937`. The generated view and foreign key definitions
 qualify their references when the search path is empty, and the dump
 declares vector as an extension. Restoring into an empty native 18.6
 database with pgvector 0.8.1 available matched the fixture's columns,
@@ -240,10 +240,9 @@ constraints, indexes, and view definition. The restored view and
 primary-key, NOT NULL, foreign-key, and check-constraint behavior passed.
 The fixture contains no vector columns.
 
-Use `test/integration/pgdump/schema-export.sh` for the same check. The
-candidate still depends on a released Datahike build containing the
-planner fix. The version cutover also needs the strict PostgreSQL 18
-gate to pass against the release candidate.
+Use `test/integration/pgdump/schema-export.sh` for the same check. All
+eleven strict files also match on the candidate after source-position
+normalization.
 
 ## Running the comparison
 
