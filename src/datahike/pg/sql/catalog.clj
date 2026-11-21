@@ -30,6 +30,7 @@
             [datahike.pg.locks :as locks]
             [datahike.pg.pg-catalog :as pg-cat]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.fns :as fns]
@@ -1499,16 +1500,28 @@
              db)))
 
 (defn sequence-last-value
-  "PG's `last_value`: the value most recently handed out, or nil when
-   the sequence has never been advanced.
+  "The value shown by pg_sequences when the sequence has been called."
+  [entity]
+  (let [[value called?] (sequence/position entity)]
+    (when called? value)))
 
-   We store the last value handed out, so a never-called sequence holds
-   `start - increment` (see ddl/sequence-entity). PG models the same
-   state as last_value + is_called=false and reports last_value as NULL
-   in pg_sequences until the first nextval."
-  [{:__seq__/keys [value start increment]}]
-  (when-not (= value (- start increment))
-    value))
+(defn- sequence-oid [db name]
+  (or (pgs/table-oid db name) (Math/abs (long (.hashCode ^String name)))))
+
+(defn sequence-position-by-oid
+  "The two fields exposed by pg_get_sequence_data. Missing relations and
+   relations of other kinds have a row with two NULLs."
+  [db oid]
+  (let [object (when oid
+                 (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid))
+        entity (cond
+                 (= :sequence (:datahike.pg.object/kind object))
+                 (sequence/entity-by-name db (:datahike.pg.object/name object))
+
+                 (and oid (nil? object))
+                 (some #(when (= oid (sequence-oid db (:__seq__/name %))) %)
+                       (sequence-entities db)))]
+    (if entity (sequence/position entity) [nil nil])))
 
 (defn- view-entities [db]
   (if db
@@ -1763,6 +1776,42 @@
             columns)]))
      (sort-by key tables))))
 
+(defn- default-oid [db column]
+  (or (:column-eid column) (:db/id (d/entity db (:attr column)))))
+
+(defn- sequence-name [sequences spelling]
+  (when (string? spelling)
+    (if (contains? sequences spelling)
+      spelling
+      (let [canonical (peek (regoid/parse-qualified-name spelling))]
+        (when (contains? sequences canonical) canonical)))))
+
+(defn- sequence-dependencies [db schema]
+  (when-let [seqs (seq (sequence-entities db))]
+    (let [sequences (into {} (map (juxt :__seq__/name identity)) seqs)
+          tables (into {} (catalog-table-columns db (pgs/derive-virtual-tables schema (pgs/schema-hints db))))
+          class-id catalog-objects/pg-class-oid
+          attribute-default-id (catalog-objects/catalog-relation-oids "pg_attrdef")
+          dependency (fn [from-class from to to-column kind]
+                       {:pg_depend/classid from-class :pg_depend/objid from :pg_depend/objsubid 0
+                        :pg_depend/refclassid class-id :pg_depend/refobjid to :pg_depend/refobjsubid to-column
+                        :pg_depend/deptype kind (pgs/row-marker-attr "pg_depend") true})]
+      (concat
+       (for [{:__seq__/keys [name owned-by-table identity-generation]} seqs
+             [idx column] (map-indexed vector (get tables owned-by-table))
+             :when (= name (str owned-by-table "_" (clojure.core/name (:attr column)) "_seq"))
+             :let [relation-oid (pgs/table-oid db owned-by-table)]
+             :when relation-oid]
+         (dependency class-id (sequence-oid db name) relation-oid
+                     (or (:attnum column) (inc idx)) (if identity-generation "i" "a")))
+       (for [[_ columns] tables
+             column columns
+             :let [entity (d/entity db (:attr column))]
+             :when (= :nextval (:pg/default-kind entity))
+             :let [name (sequence-name sequences (or (:pg/default-arg entity) (:pg/default-value entity)))]
+             :when name]
+         (dependency attribute-default-id (default-oid db column) (sequence-oid db name) 0 "n"))))))
+
 (def ^:private type-io-keys
   [:typinput :typoutput :typreceive :typsend :typmodin :typmodout
    :typanalyze :typsubscript :typalign :typbyval :typstorage])
@@ -1953,11 +2002,7 @@
            (mapv (fn [s]
                    (let [nm (:__seq__/name s)]
                      {:pg_class/oid
-                      (long (or (:datahike.pg.object/oid
-                                 (catalog-objects/object-by-identity
-                                  cte-db catalog-objects/pg-class-oid
-                                  catalog-objects/public-namespace-oid nm))
-                                (Math/abs (.hashCode ^String nm))))
+                      (sequence-oid cte-db nm)
                       :pg_class/relname nm
                       :pg_class/relnamespace 2200
                       :pg_class/relispartition false
@@ -2485,8 +2530,8 @@
 
     "pg_sequence"
     (mapv (fn [s]
-            {:pg_sequence/seqrelid (or (pgs/table-oid cte-db (:__seq__/name s)) 0)
-             :pg_sequence/seqtypid (or (types/pg-name->oid (:__seq__/type s))
+            {:pg_sequence/seqrelid (sequence-oid cte-db (:__seq__/name s))
+             :pg_sequence/seqtypid (or (pgs/resolve-type-oid cte-db (:__seq__/type s))
                                        types/oid-int8)
              :pg_sequence/seqstart (:__seq__/start s)
              :pg_sequence/seqincrement (:__seq__/increment s)
@@ -2902,6 +2947,7 @@
     "pg_attrdef"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           table-columns (catalog-table-columns cte-db tables)
+          sequences (delay (into #{} (map :__seq__/name) (sequence-entities cte-db)))
           defaults
           (when cte-db
             (into {}
@@ -2944,7 +2990,19 @@
                           (if (= (:oid col) types/oid-varbit)
                             "bit varying"
                             "\"bit\""))
-                     :nextval (str "nextval('" (or arg value) "'::regclass)")
+                     :nextval
+                     (let [spelling (or arg value)
+                           name (sequence-name @sequences spelling)
+                           path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+                           reference (if name
+                                       (binding [regoid/*db* cte-db
+                                                 regoid/*relation-db* cte-db
+                                                 regoid/*relation-provider* relation-identity
+                                                 regoid/*search-path* path]
+                                         (regoid/output types/oid-regclass (sequence-oid cte-db name)
+                                                        types/format-type))
+                                       spelling)]
+                       (str "nextval('" (str/replace reference "'" "''") "'::regclass)"))
                      :fn (str value "()")
                      :literal
                      (cond
@@ -2963,8 +3021,7 @@
                    attnum (or (:attnum col) (inc idx))
                    ;; Use the durable column subobject rather than a name
                    ;; or the shared storage attribute on inherited columns.
-                   oid (or (:column-eid col)
-                           (:db/id (d/entity cte-db (:attr col))))]]
+                   oid (default-oid cte-db col)]]
          {:pg_attrdef/oid (long oid)
           :pg_attrdef/adrelid (long tbl-oid)
           :pg_attrdef/adnum (long attnum)
@@ -2992,14 +3049,15 @@
     "pg_foreign_table"
     []
     "pg_depend"
-    (mapv (fn [[class-id object-id]]
-            {:pg_depend/classid class-id :pg_depend/objid object-id :pg_depend/objsubid 0
-             :pg_depend/refclassid catalog-objects/pg-extension-oid
-             :pg_depend/refobjid vector-extension-oid :pg_depend/refobjsubid 0
-             :pg_depend/deptype "e" (pgs/row-marker-attr "pg_depend") true})
-          (into [[catalog-objects/pg-type-oid types/oid-vector]]
-                (map (fn [routine] [catalog-objects/pg-proc-oid (:oid routine)]))
-                regoid/vector-extension-routines))
+    (into (mapv (fn [[class-id object-id]]
+                  {:pg_depend/classid class-id :pg_depend/objid object-id :pg_depend/objsubid 0
+                   :pg_depend/refclassid catalog-objects/pg-extension-oid
+                   :pg_depend/refobjid vector-extension-oid :pg_depend/refobjsubid 0
+                   :pg_depend/deptype "e" (pgs/row-marker-attr "pg_depend") true})
+                (into [[catalog-objects/pg-type-oid types/oid-vector]]
+                      (map (fn [routine] [catalog-objects/pg-proc-oid (:oid routine)]))
+                      regoid/vector-extension-routines))
+          (sequence-dependencies cte-db user-schema))
     "pg_inherits"
     []
     "pg_enum"

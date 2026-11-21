@@ -59,8 +59,10 @@
             [datahike.pg.jsonb :as jb]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.keywords :as pg-kw]
             [datahike.pg.sql.cast :as sql-cast]
+            [datahike.pg.sql.catalog :as pcat]
             [datahike.pg.sql.analysis :as analysis]
             [datahike.pg.sql.derived :as derived]
             [datahike.pg.sql.grouping-validation :as grouping-validation]
@@ -1328,7 +1330,7 @@
    known one whose arguments we could not evaluate (a correlated LATERAL
    argument): the first is 42883, the second is not."
   #{"unnest" "generate_series" "pg_get_keywords"
-    "pg_input_error_info" "pg_partition_ancestors" "pg_options_to_table" expandarray-name
+    "pg_input_error_info" "pg_partition_ancestors" "pg_get_sequence_data" "pg_options_to_table" expandarray-name
     "jsonb_array_elements" "json_array_elements"
     "jsonb_array_elements_text" "json_array_elements_text"
     "jsonb_each" "json_each" "jsonb_each_text" "json_each_text"
@@ -1518,6 +1520,10 @@
               :feature-not-supported
               {:message "set-returning functions are not allowed in OFFSET"})))))
 
+(defn- sequence-data-row [db value]
+  (binding [regoid/*db* db]
+    (pcat/sequence-position-by-oid db (regoid/input "regclass" value))))
+
 (defn materialize-table-function
   "Produce rows for a `TableFunction` FROM item. Supports the common
    constant-arg set-returning functions:
@@ -1603,6 +1609,20 @@
                                 (checked-rows options))]
                  (with-ordinality ["option_name" "option_value"] rows
                    [:db.type/string :db.type/string] ["text" "text"])))))
+
+         (= fname "pg_get_sequence_data")
+         (let [db (or (:db scope) params/*parse-db*)
+               arg (first params)
+               arg-oid (some-> arg (oid/resolution-oid {:schema (:schema db) :db db
+                                                        :from-binding-oids params/*from-binding-oids*}))]
+           (when (or (not= 1 (count params))
+                     (not (analysis/implicit-regclass-argument? arg-oid)))
+             (throw (errors/pg-error :undefined-function {:function (str f)})))
+           (let [value (eval-fn arg)]
+             (when-not (= ::corr value)
+               (with-ordinality ["last_value" "is_called"]
+                 [(sequence-data-row db value)]
+                 [:db.type/long :db.type/boolean] [nil nil]))))
 
          (= fname "pg_partition_ancestors")
          (let [db (or (:db scope) params/*parse-db*)
@@ -2057,6 +2077,8 @@
    materialise-once path and a correlated use of it still raises."
   {"generate_series" {:cols ["generate_series"] :vtypes [:db.type/long]
                       :pg-types ["int4"]}
+   "pg_get_sequence_data" {:cols ["last_value" "is_called"]
+                           :vtypes [:db.type/long :db.type/boolean]}
    "regexp_split_to_table" {:cols ["regexp_split_to_table"] :vtypes [:db.type/string]
                             :pg-types ["text"]}
    "string_to_table" {:cols ["string_to_table"] :vtypes [:db.type/string]
@@ -2071,8 +2093,12 @@
    indistinguishable from an empty result for an inner LATERAL but would
    be wrong for an outer one — and a nil here would silently swallow
    rows rather than raise."
-  [fname]
+  [fname db]
   (case fname
+    "pg_get_sequence_data"
+    (fn [value]
+      [(mapv #(if (nil? %) :__null__ %) (sequence-data-row db value))])
+
     "generate_series"
     (fn [& args]
       (let [[start stop step] (map #(when (number? %) (long %)) args)
@@ -2129,7 +2155,9 @@
         ;; than materialised as constants.
         corr? (some #(instance? Column %) params)]
     (when (and shape corr? (seq params))
-      (let [talias (when-let [a (.getAlias tf)]
+      (let [_ (when (and (= fname "pg_get_sequence_data") (not= 1 (count params)))
+                (throw (errors/pg-error :undefined-function {:function (str f)})))
+            talias (when-let [a (.getAlias tf)]
                      (unquote-ident (.getName ^Alias a)))
             alias-cols (when-let [a (.getAlias tf)]
                          (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
@@ -2518,66 +2546,34 @@
          :n-cols (count cols)}))))
 
 (defn- sequence->virtual-table
-  "Materialise `FROM <sequence-name>` into a one-row virtual table.
-
-   PostgreSQL exposes every sequence as a relation with three columns —
-   last_value, log_cnt, is_called — and `SELECT * FROM myseq` is the
-   classic way to read a sequence's position. We store the last value
-   HANDED OUT, so a never-advanced sequence holds `start - increment`;
-   PG's equivalent encoding is last_value=start with is_called=false,
-   which is what this reconstructs.
-
-   log_cnt is PG's count of WAL-preallocated values — an internal
-   recovery detail with no analogue here, reported as 0.
-
-   Returns {:db :schema :name :alias} or nil when `tbl` is not a
-   sequence, in which case the caller treats it as an ordinary table."
+  "Expose a sequence's current position as a one-row relation. log_cnt
+   describes PostgreSQL WAL preallocation and is zero in this store."
   [^Table tbl db]
   (let [tname (unquote-ident (.getName tbl))
         talias (when-let [a (.getAlias tbl)]
                  (unquote-ident (str/trim (.getName ^Alias a))))]
-    (if params/*analysis-only?*
-      (when (d/q '{:find [?e .] :in [$ ?name]
-                   :where [[?e :__seq__/name ?name]]} db tname)
+    (when-let [entity (sequence/entity-by-name db tname)]
+      (if params/*analysis-only?*
         (materialize-output-schema!
          db tname talias [{:name "last_value" :oid types/oid-int8}
                           {:name "log_cnt" :oid types/oid-int8}
-                          {:name "is_called" :oid types/oid-bool}]))
-      (let [row (first (d/q '{:find [?v ?s ?i]
-                              :in [$ ?n]
-                              :where [[?e :__seq__/name ?n]
-                                      [?e :__seq__/value ?v]
-                                      [?e :__seq__/start ?s]
-                                      [?e :__seq__/increment ?i]]}
-                            db tname))]
-        (when row
-          (let [[value start increment] row
-                called? (not= value (- start increment))
-            ;; The row-marker attr is what anchors entity enumeration for
-            ;; a table whose columns are all read through get-else (the
-            ;; same idiom the pg_* catalog tables use). Without it the
-            ;; projection has nothing to iterate and the scan returns
-            ;; zero rows even though the row is there.
-                schema-tx [{:db/ident (keyword tname "last_value")
-                            :db/valueType :db.type/long
-                            :db/cardinality :db.cardinality/one}
-                           {:db/ident (keyword tname "log_cnt")
-                            :db/valueType :db.type/long
-                            :db/cardinality :db.cardinality/one}
-                           {:db/ident (keyword tname "is_called")
-                            :db/valueType :db.type/boolean
-                            :db/cardinality :db.cardinality/one}
-                           {:db/ident (pgs/row-marker-attr tname)
-                            :db/valueType :db.type/boolean
-                            :db/cardinality :db.cardinality/one}]
-                spec-db (d/db-with db schema-tx)
-                spec-db2 (d/db-with spec-db
-                                    [{(keyword tname "last_value") (if called? value start)
-                                      (keyword tname "log_cnt") 0
-                                      (keyword tname "is_called") called?
-                                      (pgs/row-marker-attr tname) true}])]
-            {:db spec-db2 :schema (:schema spec-db2)
-             :name tname :alias (or talias tname)}))))))
+                          {:name "is_called" :oid types/oid-bool}])
+        (let [[value called?] (sequence/position entity)
+              value-attr (keyword tname "last_value")
+              log-attr (keyword tname "log_cnt")
+              called-attr (keyword tname "is_called")
+              marker (pgs/row-marker-attr tname)
+              spec-db (d/db-with db
+                                 [{:db/ident value-attr :db/valueType :db.type/long
+                                   :db/cardinality :db.cardinality/one}
+                                  {:db/ident log-attr :db/valueType :db.type/long
+                                   :db/cardinality :db.cardinality/one}
+                                  {:db/ident called-attr :db/valueType :db.type/boolean
+                                   :db/cardinality :db.cardinality/one}
+                                  {:db/ident marker :db/valueType :db.type/boolean
+                                   :db/cardinality :db.cardinality/one}])
+              result (d/db-with spec-db [{value-attr value log-attr 0 called-attr called? marker true}])]
+          {:db result :schema (:schema result) :name tname :alias (or talias tname)})))))
 
 (defn materialize-derived-select!
   "Given a ParenthesedSelect in FROM/JOIN position, return an enriched db
@@ -4604,11 +4600,15 @@
         _ (doseq [lsrf-spec (cond-> (vec lsrf-specs) lsrf-spec (conj lsrf-spec))]
             (let [{:keys [cols vars ord-var fname params name marker
                           inner-sql corr-refs]} lsrf-spec
+                  _ (when (= fname "pg_get_sequence_data")
+                      (let [arg-oid (oid/resolution-oid (first params) ctx)]
+                        (when-not (analysis/implicit-regclass-argument? arg-oid)
+                          (throw (errors/pg-error :undefined-function {:function fname})))))
                   subquery? (some? inner-sql)
                   rows-fn (if subquery?
                             (lateral-rows-fn inner-sql corr-refs schema db
                                              (:n-cols lsrf-spec))
-                            (srf-rows-fn fname))
+                            (srf-rows-fn fname db))
                   arg-vals (if subquery?
                              ;; The outer columns the inner correlates
                              ;; with, in the order lateral-rows-fn
@@ -7982,7 +7982,9 @@
                           ;; the DB used to translate this plan. Re-lowering
                           ;; per prepared execution gives the closure the same
                           ;; effective snapshot as the outer query.
-                          (some :inner-sql lsrf-specs)))
+                          (some #(or (:inner-sql %)
+                                     (= "pg_get_sequence_data" (:fname %)))
+                                lsrf-specs)))
              ;; Server-side sort for nullable ORDER BY columns
              :sql-order-by    sql-order-by
              :sql-limit       (when (and (empty? project-set-specs) sql-order-by)

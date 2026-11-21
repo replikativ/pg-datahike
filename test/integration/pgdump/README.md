@@ -59,8 +59,11 @@ constraint behavior. It then exports rows via `COPY TO STDOUT` and checks
 that native `COPY FROM STDIN` restores the same values, including escaped
 text and a NULL foreign key.
 
-PostgreSQL 18 `pg_dump` queries `pg_get_sequence_data` for dumps that
-include data. That function and sequence-state round-tripping remain open.
+For a full stock dump with sequence-backed rows, run
+`bash test/integration/pgdump/data-export.sh` with fresh databases.
+It compares COPY output, sequence parameters and positions, and new IDs
+generated after restore. The fixture covers standalone, SERIAL, and
+GENERATED ALWAYS sequences.
 
 Set `PG_EXPORT_SOURCE`, `PG_EXPORT_ORACLE`, and `PG_EXPORT_RESTORE` to three
 empty disposable database URLs. Use an 18.6 candidate as the source and make

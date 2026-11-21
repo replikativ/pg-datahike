@@ -36,6 +36,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.resolve :as pg-resolve]
             [datahike.pg.secondary :as pg-secondary]
             [datahike.pg.sql :as sql]
@@ -6912,10 +6913,10 @@
 (defn- direct-sequence-value-write?
   "True when a buffered operation itself mutates sequence storage."
   [op]
-  (or (and (map? op) (contains? op :__seq__/value))
+  (or (and (map? op) (some #(contains? op %) sequence/position-attributes))
       (and (vector? op)
            (contains? #{:db/add :db/retract :db/cas :db.fn/cas} (first op))
-           (= :__seq__/value (nth op 2 nil)))))
+           (contains? sequence/position-attributes (nth op 2 nil)))))
 
 (defn- durable-replay-buffer [buffer]
   ;; Only preceding marker adds owned by this buffer may be absent on replay.
@@ -7416,111 +7417,55 @@
 
 (defn- sequence-descriptor [db seq-name]
   (when (and (string? seq-name) (get (dbi/-schema db) :__seq__/name))
-    (let [lookup (fn [name]
-                   (when-let [eid (ffirst (d/q '{:find [?e]
-                                                 :where [[?e :__seq__/name ?n]]
-                                                 :in [$ ?n]}
-                                               db name))]
-                     [name eid]))
+    (let [lookup #(sequence/entity-by-name db %)
           bare-name (bare-sequence-name seq-name)
-          [name eid] (or (lookup seq-name)
-                         (when (not= bare-name seq-name)
-                           (lookup bare-name))
+          entity (or (lookup seq-name)
+                     (when (not= bare-name seq-name)
+                       (lookup bare-name))
                          ;; Defaults and deferred projections may still
                          ;; carry the spelling from a SQL regclass literal.
                          ;; Preserve physical names and legacy stored names
                          ;; before resolving the literal's canonical form.
-                         (let [canonical (peek (regoid/parse-qualified-name seq-name))]
-                           (when (and (not= canonical seq-name) (not= canonical bare-name))
-                             (lookup canonical))))]
-      (when eid
-        (let [attr (fn [a default]
-                     (let [v (ffirst (d/q {:find '[?v]
-                                           :where [['?e a '?v]]
-                                           :in '[$ ?e]}
-                                          db eid))]
-                       (if (some? v) v default)))
-              increment (attr :__seq__/increment 1)]
-          {:eid eid
-           :name name
+                     (let [canonical (peek (regoid/parse-qualified-name seq-name))]
+                       (when (and (not= canonical seq-name) (not= canonical bare-name))
+                         (lookup canonical))))]
+      (when entity
+        (let [increment (get entity :__seq__/increment 1)]
+          {:eid (:db/id entity)
+           :name (:__seq__/name entity)
            :increment increment
-           :current (attr :__seq__/value 0)
-           :maximum (attr :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
-           :minimum (attr :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
-           :cycle? (boolean (attr :__seq__/cycle false))})))))
+           :stored-value (:__seq__/value entity)
+           :stored-called? (:__seq__/is-called entity)
+           :position (sequence/position entity)
+           :maximum (get entity :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
+           :minimum (get entity :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
+           :cycle? (get entity :__seq__/cycle false)})))))
 
 (defn- advance-sequence-value
-  [{:keys [increment maximum minimum cycle?]} seq-name ^long current]
-  (if (pos? increment)
-    (if (if (>= maximum 0)
-          (> current (- maximum increment))
-          (> (+ current increment) maximum))
-      (if cycle?
-        minimum
-        (throw (errors/pg-error
-                :sequence-generator-limit-exceeded
-                {:detail (str "nextval: reached maximum value of sequence \""
-                              seq-name "\" (" maximum ")")})))
-      (+ current increment))
-    (if (if (< minimum 0)
-          (< current (- minimum increment))
-          (< (+ current increment) minimum))
-      (if cycle?
-        maximum
-        (throw (errors/pg-error
-                :sequence-generator-limit-exceeded
-                {:detail (str "nextval: reached minimum value of sequence \""
-                              seq-name "\" (" minimum ")")})))
-      (+ current increment))))
+  [{:keys [position increment maximum minimum cycle?]} seq-name]
+  (let [[value called?] position]
+    (if-not called?
+      value
+      (let [next (+' value increment)
+            ascending? (pos? increment)
+            exceeds? (if ascending? (> next maximum) (< next minimum))]
+        (cond
+          (not exceeds?) next
+          cycle? (if ascending? minimum maximum)
+          :else
+          (throw (errors/pg-error
+                  :sequence-generator-limit-exceeded
+                  {:detail (str "nextval: reached " (if ascending? "maximum" "minimum")
+                                " value of sequence \"" seq-name "\" ("
+                                (if ascending? maximum minimum) ")")})))))))
 
 (defn nextval!
-  "Atomically advance the named sequence on `conn` and return the new
-   long. Shared core of `SELECT nextval(...)` and INSERT-VALUES nextval
-   resolution.
-
-   PG semantics: a `nextval` advance is never rolled back, even by
-   ROLLBACK on the surrounding transaction. We match that by always
-   committing to the live conn, regardless of any session's `:in-tx?`
-   state.
-
-   Atomicity: optimistic CAS-retry. Each iteration reads the current
-   :__seq__/value, computes the new value, and submits
-
-       [[:db/cas seq-eid :__seq__/value curr new]]
-
-   to `d/transact`. Datahike's transactor serialises tx applications
-   per conn, so two concurrent CAS submissions see each other: the
-   first wins, the second's old-val no longer matches the
-   transactor's current value and the CAS raises `:transact/cas`. We
-   re-read and retry. The loser thread will see the winner's new
-   value, compute the next slot, and commit cleanly.
-
-   Why CAS instead of the simpler `:db.fn/call` pattern: Datahike's
-   writer batches multiple in-flight transactions for a single
-   commit, then writes the SAME `:db-after` (the batch's final db)
-   into every tx-report in the batch. So reading `(:db-after report)`
-   to recover the value this call assigned doesn't work — it returns
-   the LAST tx in the batch. CAS sidesteps that: the value we
-   intended is the literal `new` slot of the op-vec, available
-   without reading `:db-after`.
-
-   Throws ex-info `:undefined-sequence` if the named sequence does
-   not exist, and `:serialization-failure` if the contention retry
-   budget is exhausted."
+  "Reserve a committed sequence value outside the surrounding SQL transaction.
+   CAS both fields because SETVAL can change is_called at the same value.
+   Return the reserved value directly since batched writer reports can
+   share the batch's final database."
   [conn ^String seq-name]
-  (let [q-fn d/q
-        descriptor (sequence-descriptor (d/db conn) seq-name)
-        _ (when-not descriptor
-            (throw (ex-info "sequence does not exist"
-                            {:error :undefined-sequence
-                             :sequence seq-name})))
-        eid (:eid descriptor)
-        read-curr (fn []
-                    (ffirst (q-fn '{:find [?v]
-                                    :where [[?e :__seq__/value ?v]]
-                                    :in [$ ?e]}
-                                  (d/db conn) eid)))
-        ;; CAS failure detection: Datahike's transactor raises an
+  (let [;; CAS failure detection: Datahike's transactor raises an
         ;; ex-info with `{:error :transact/cas}`, but the writer's
         ;; throwable-promise + CompletableFuture wrapping strips
         ;; the structured ex-data by the time we see the throw on
@@ -7534,10 +7479,18 @@
     ;; capped at 100ms. Datahike's commit-loop waits up to 50ms
     ;; (commit-wait-time) between batches before flushing.
     (loop [attempt 0]
-      (let [curr (or (read-curr) 0)
-            next (advance-sequence-value descriptor seq-name curr)
+      (let [db (d/db conn)
+            {:keys [eid stored-value stored-called?] :as descriptor}
+            (sequence-descriptor db seq-name)
+            _ (when-not descriptor
+                (throw (ex-info "sequence does not exist"
+                                {:error :undefined-sequence :sequence seq-name})))
+            next (advance-sequence-value descriptor seq-name)
+            tx-data (conj (sequence/install-called-attribute db)
+                          [:db/cas eid :__seq__/value stored-value next]
+                          [:db/cas eid :__seq__/is-called stored-called? true])
             cas-ok?
-            (try (transact-recorded! conn [[:db/cas eid :__seq__/value curr next]])
+            (try (transact-recorded! conn tx-data)
                  true
                  (catch Throwable e
                    (if (cas-failure? e) false (throw e))))]
@@ -7574,18 +7527,18 @@
                               snapshots)))
           [db buffer retained]
           (reduce-kv
-           (fn [[db buffer retained] [name eid storage-generation :as generation] value]
+           (fn [[db buffer retained] [name eid storage-generation :as generation] position]
              (let [descriptor (sequence-descriptor db name)
                    current-generation (get local-sequence-generations [name eid] 0)
                    current? (and (= eid (:eid descriptor))
                                  (= storage-generation current-generation))
                    retained (if (reachable? generation)
-                              (assoc retained generation value)
+                              (assoc retained generation position)
                               retained)]
-               (if (and current? (not= value (:current descriptor)))
-                 (let [op [:db/add [:__seq__/name name] :__seq__/value value]
-                       report (dc/with db [op])]
-                   [(:db-after report) (conj buffer op) retained])
+               (if (and current? (not= position (:position descriptor)))
+                 (let [ops (sequence/position-tx db [:__seq__/name name] position)
+                       report (dc/with db ops)]
+                   [(:db-after report) (into buffer ops) retained])
                  [db buffer retained])))
            [speculative-db tx-buffer {}]
            (or local-sequence-reservations {}))]
@@ -7683,14 +7636,15 @@
               ;; are overlaid into it when a savepoint is restored; consulting
               ;; the side journal directly here would ignore a later SETVAL or
               ;; transactional ALTER SEQUENCE RESTART.
-                next (advance-sequence-value descriptor seq-name (:current descriptor))
-                op [:db/add [:__seq__/name (:name descriptor)] :__seq__/value next]
-                report (dc/with db [op])]
+                next (advance-sequence-value descriptor seq-name)
+                position [next true]
+                ops (sequence/position-tx db [:__seq__/name (:name descriptor)] position)
+                report (dc/with db ops)]
             (swap! tx-state (fn [current]
                               (-> current
                                   (assoc :speculative-db (:db-after report))
-                                  (update :tx-buffer conj op)
-                                  (assoc-in [:local-sequence-reservations generation] next))))
+                                  (update :tx-buffer into ops)
+                                  (assoc-in [:local-sequence-reservations generation] position))))
             next))))))
 
 (defn- handle-nextval
@@ -7778,17 +7732,7 @@
       (classified-error "" e))))
 
 (defn- handle-setval
-  "SELECT setval('seq_name', N[, is_called]) — force the sequence to N.
-
-   Returns N. The 3-arg form's `is_called` decides what the NEXT
-   nextval produces: with true (and for the 2-arg form) it is
-   N + increment, with false it is N itself. We store the last value
-   HANDED OUT, so `is_called false` persists `N - increment` — ignoring
-   the flag, as this used to, made `setval(s,10,false)` followed by
-   `nextval(s)` answer 11 where PG answers 10.
-
-   Also range-checks N against the sequence's MINVALUE/MAXVALUE (PG:
-   22003) instead of silently storing an out-of-range position."
+  "Store both fields of the SQL sequence position and return the given value."
   [{:keys [conn tx-state session-state]} parsed]
   (try
     (let [new-val (:new-value parsed)
@@ -7805,7 +7749,6 @@
           committed-generation? (and (= seq-eid (:eid committed-descriptor))
                                      (not (contains? (:local-sequence-identities @tx-state #{})
                                                      sequence-identity)))
-          increment (get seq-ent :__seq__/increment 1)
           minv (get seq-ent :__seq__/minvalue Long/MIN_VALUE)
           maxv (get seq-ent :__seq__/maxvalue Long/MAX_VALUE)]
       (when (and seq-eid (or (< new-val minv) (> new-val maxv)))
@@ -7814,8 +7757,8 @@
                              "\" (" minv ".." maxv ")")
                         {:sqlstate "22003"})))
       (if seq-eid
-        (let [stored (if is-called? new-val (- new-val increment))
-              setval-tx [[:db/add seq-eid :__seq__/value stored]]]
+        (let [position [new-val is-called?]
+              setval-tx (sequence/position-tx lookup-db seq-eid position)]
           ;; setval(…, true) defines currval for this session, exactly
           ;; as a nextval would; setval(…, false) does not.
           (when (and session-state is-called?)
@@ -7838,7 +7781,7 @@
                                   (not committed-generation?)
                                   (assoc-in [:local-sequence-reservations
                                              (conj generation-id storage-generation)]
-                                            stored)))))
+                                            position)))))
             (transact-recorded! conn setval-tx))
           (single-row-result "setval" PgWireServer/OID_INT8 (str new-val)))
         (error-result (str "Sequence not found: " seq-name))))
@@ -9778,35 +9721,19 @@
         (distinct names)))
 
 (defn- restart-identity-tx-data
-  "TRUNCATE … RESTART IDENTITY: reset every IDENTITY-backing sequence
-   of `tables` to its pristine post-CREATE state. Identity sequences
-   (translate-create-table) initialise :__seq__/value to 0 = start(1) -
-   increment(1); handle-nextval is advance-then-return, so resetting to
-   `- 1 increment` makes the next nextval return 1 again. Sequences
-   with a non-default START WITH aren't reachable here — IDENTITY
-   columns always start at 1."
+  "TRUNCATE … RESTART IDENTITY resets each owned sequence to its START."
   [db tables]
   (when (get (dbi/-schema db) :__seq__/name)
-    (vec
-     (mapcat
-      (fn [[seq-name increment]]
-        (into [[:db/add [:__seq__/name seq-name] :__seq__/value (- 1 increment)]]
-              (relation-definition-revision-tx db [seq-name])))
-      (distinct
-       (for [table tables
-             {:keys [seq-name]} (compute-identity-cols db table)
-             :let [seq-eid (ffirst (d/q '{:find [?e]
-                                          :where [[?e :__seq__/name ?n]]
-                                          :in [$ ?n]}
-                                        db seq-name))
-                   increment (or (when seq-eid
-                                   (ffirst (d/q '{:find [?i]
-                                                  :where [[?e :__seq__/increment ?i]]
-                                                  :in [$ ?e]}
-                                                db seq-eid)))
-                                 1)]
-             :when seq-eid]
-         [seq-name increment]))))))
+    (let [names (distinct (mapcat #(map :seq-name (compute-identity-cols db %)) tables))]
+      (into (sequence/install-called-attribute db)
+            (mapcat (fn [seq-name]
+                      (let [ref [:__seq__/name seq-name]
+                            entity (sequence/entity-by-name db seq-name)]
+                        (when entity
+                          (into [[:db/add ref :__seq__/value (:__seq__/start entity 1)]
+                                 [:db/add ref :__seq__/is-called false]]
+                                (relation-definition-revision-tx db [seq-name]))))))
+            names))))
 
 (defn- exec-truncate
   "TRUNCATE [TABLE] t1, t2, … — retract every row of every listed
@@ -9930,25 +9857,18 @@
    ddl/sequence-params expects as `:existing`, so ALTER validates the
    merge of old and new the way PG's init_params does."
   [db seq-name]
-  (when-let [eid (ffirst (d/q '{:find [?e]
-                                :where [[?e :__seq__/name ?n]]
-                                :in [$ ?n]}
-                              db seq-name))]
-    (let [attr (fn [a default]
-                 (let [v (ffirst (d/q {:find '[?v]
-                                       :where [['?e a '?v]]
-                                       :in '[$ ?e]}
-                                      db eid))]
-                   (if (some? v) v default)))
-          incr (attr :__seq__/increment 1)]
-      {:eid eid
-       :type (attr :__seq__/type "bigint")
+  (when-let [entity (sequence/entity-by-name db seq-name)]
+    (let [incr (get entity :__seq__/increment 1)]
+      {:type (get entity :__seq__/type "bigint")
        :increment incr
-       :minvalue (attr :__seq__/minvalue (if (pos? incr) 1 Long/MIN_VALUE))
-       :maxvalue (attr :__seq__/maxvalue (if (pos? incr) Long/MAX_VALUE -1))
-       :start (attr :__seq__/start 1)
-       :cache (attr :__seq__/cache 1)
-       :cycle? (boolean (attr :__seq__/cycle false))})))
+       :minvalue (get entity :__seq__/minvalue (if (pos? incr) 1 Long/MIN_VALUE))
+       :maxvalue (get entity :__seq__/maxvalue (if (pos? incr) Long/MAX_VALUE -1))
+       :start (get entity :__seq__/start 1)
+       :cache (get entity :__seq__/cache 1)
+       :cycle? (get entity :__seq__/cycle false)
+       :legacy-position (when (nil? (:__seq__/is-called entity))
+                          (sequence/position entity))
+       :stored-value (:__seq__/value entity)})))
 
 (defn- exec-ddl-alter-sequence
   "ALTER SEQUENCE [IF EXISTS] name options…
@@ -9979,9 +9899,12 @@
         (let [params (ddl/sequence-params seq-opts {:existing existing})
               sequence-ref [:__seq__/name seq-name]
               rewrite? (some #(not= :owned-by (first %)) seq-opts)
-              ;; The stored counter is the last value handed out, so a
-              ;; RESTART to N is stored as N - increment for the next
-              ;; advance to land exactly on N.
+              position-tx (if-let [restart (:restart params)]
+                            (sequence/position-tx current-db sequence-ref [restart false])
+                            (when-let [[value called?] (:legacy-position existing)]
+                              (conj (sequence/install-called-attribute current-db)
+                                    [:db/cas sequence-ref :__seq__/value (:stored-value existing) value]
+                                    [:db/cas sequence-ref :__seq__/is-called nil called?])))
               tx-data (cond-> [[:db/add sequence-ref :__seq__/increment (:increment params)]
                                [:db/add sequence-ref :__seq__/minvalue (:minvalue params)]
                                [:db/add sequence-ref :__seq__/maxvalue (:maxvalue params)]
@@ -9989,9 +9912,8 @@
                                [:db/add sequence-ref :__seq__/cycle (:cycle? params)]
                                [:db/add sequence-ref :__seq__/start (:start params)]
                                [:db/add sequence-ref :__seq__/type (:type params)]]
-                        (:restart params)
-                        (conj [:db/add sequence-ref :__seq__/value
-                               (- (:restart params) (:increment params))])
+                        (seq position-tx)
+                        (into position-tx)
                         rewrite?
                         (into (relation-definition-revision-tx current-db [seq-name])))]
           (if (:in-tx? @tx-state)
@@ -14222,6 +14144,12 @@
                                        :as opts}]]
   (admit-unique-index-enforcement!
    conn (or (:unique-admissions opts) fallback-unique-admissions))
+  ;; Install the flag before a legacy database takes a statement or
+  ;; transaction snapshot. A reservation must then change only positions.
+  (let [db (d/db conn)]
+    (when (contains? (dbi/-schema db) :__seq__/name)
+      (when-let [schema-tx (seq (sequence/install-called-attribute db))]
+        (transact-recorded! conn schema-tx))))
   (let [prepared-analyses (java.util.WeakHashMap.)
         silently-accept (resolve-silently-accept opts)
         max-result-rows (normalize-max-result-rows

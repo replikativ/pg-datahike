@@ -91,7 +91,7 @@
     ;; and for DDL-emitted constraints / catalog integrity. These live
     ;; on ident entities to tune the SQL-side view; they must not
     ;; themselves appear as virtual tables.
-    "datahike.pg" "datahike.pg.index" "pg"})
+    "datahike.pg" "datahike.pg.index" "pg" "__seq__"})
 
 (defn- internal-namespace? [ns]
   (or (contains? internal-ns-prefixes ns)

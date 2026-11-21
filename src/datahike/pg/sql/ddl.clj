@@ -26,6 +26,7 @@
             [datahike.pg.jsonb :as jb]
             [datahike.pg.pg-catalog :as pg-catalog]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector])
@@ -1381,6 +1382,7 @@
                                   :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
                                  {:db/ident :__seq__/value :db/valueType :db.type/long
                                   :db/cardinality :db.cardinality/one}
+                                 sequence/called-attribute
                                  {:db/ident :__seq__/increment :db/valueType :db.type/long
                                   :db/cardinality :db.cardinality/one}
                                  {:db/ident :__seq__/minvalue :db/valueType :db.type/long
@@ -1400,7 +1402,8 @@
                                  {:db/ident :__seq__/owned-by-table :db/valueType :db.type/string
                                   :db/cardinality :db.cardinality/one}
                                  (cond-> {:__seq__/name seq-name
-                                          :__seq__/value 0
+                                          :__seq__/value 1
+                                          :__seq__/is-called false
                                           :__seq__/increment 1
                                           :__seq__/minvalue 1
                                           :__seq__/maxvalue max-value
@@ -1586,6 +1589,7 @@
     :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
    {:db/ident :__seq__/value :db/valueType :db.type/long
     :db/cardinality :db.cardinality/one}
+   sequence/called-attribute
    {:db/ident :__seq__/increment :db/valueType :db.type/long
     :db/cardinality :db.cardinality/one}
    {:db/ident :__seq__/minvalue :db/valueType :db.type/long
@@ -1604,16 +1608,11 @@
     :db/cardinality :db.cardinality/one}])
 
 (defn sequence-entity
-  "The stored entity for a sequence with the given resolved params.
-
-   `:__seq__/value` holds the last value HANDED OUT, so a fresh sequence
-   stores `start - increment` and the first advance lands exactly on
-   start. (PG models this as last_value + is_called=false; the offset
-   encoding is equivalent for a single-value-at-a-time nextval and is
-   what the IDENTITY path in translate-create-table already assumes.)"
+  "A fresh sequence stores START and returns it on its first nextval."
   [seq-name {:keys [increment minvalue maxvalue start cache cycle? type]}]
   {:__seq__/name seq-name
-   :__seq__/value (- start increment)
+   :__seq__/value start
+   :__seq__/is-called false
    :__seq__/increment increment
    :__seq__/minvalue minvalue
    :__seq__/maxvalue maxvalue

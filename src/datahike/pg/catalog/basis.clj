@@ -9,7 +9,8 @@
   (:require [clojure.string :as str]
             [datahike.db.interface :as dbi]
             [datahike.db.utils :as dbu]
-            [datahike.dependency-tracking :as tracking])
+            [datahike.dependency-tracking :as tracking]
+            [datahike.pg.sequence :as sequence])
   (:import [java.math BigDecimal BigInteger]
            [java.util Date IdentityHashMap UUID]))
 
@@ -39,7 +40,7 @@
    ;; single counter every CREATE bumps: it says an object was allocated
    ;; somewhere, never what this statement reads. Keeping it made an
    ;; unrelated session's CREATE/DROP pair abort a live write.
-   :exclude-attributes #{:__seq__/value :datahike.pg.catalog/next-oid}})
+   :exclude-attributes (conj sequence/position-attributes :datahike.pg.catalog/next-oid)})
 
 (def tracking-options {:track-dependencies {::catalog tracking-selector}})
 
@@ -82,8 +83,7 @@
   [attr]
   (when (keyword? attr)
     (let [n (namespace attr)]
-      (and (not= :__seq__/value attr)
-           (not= :datahike.pg.catalog/next-oid attr)
+      (and (not (contains? (:exclude-attributes tracking-selector) attr))
            (or (= :db/ident attr)
                (= "pg" n)
                (= "datahike.pg" n)

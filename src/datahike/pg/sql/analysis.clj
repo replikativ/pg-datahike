@@ -123,6 +123,7 @@
 (def ^:private fixed-table-functions
   {"pg_input_error_info" {:names ["message" "detail" "hint" "sql_error_code"] :oids [25 25 25 25] :arity #{2}}
    "pg_partition_ancestors" {:names ["relid"] :oids [types/oid-regclass] :arity #{1}}
+   "pg_get_sequence_data" {:names ["last_value" "is_called"] :oids [types/oid-int8 types/oid-bool] :arity #{1}}
    "pg_options_to_table" {:names ["option_name" "option_value"] :oids [25 25] :arity #{1}}
    "pg_get_keywords" {:names ["word" "catcode" "barelabel" "catdesc" "baredesc"] :oids [25 18 16 25 25] :arity #{0}}
    "jsonb_array_elements" {:names ["value"] :oids [3802] :arity #{1}}
@@ -146,6 +147,12 @@
 (defn- no-overload! [name]
   (throw (ex-info (str "function " name " does not exist for these argument types")
                   {:sqlstate "42883" :error :undefined-function})))
+
+(defn implicit-regclass-argument?
+  "OID aliases are outside the general operator coercion matrix."
+  [oid]
+  (contains? #{nil types/oid-int2 types/oid-int4 types/oid-int8
+               types/oid-oid types/oid-regclass} oid))
 
 (defn- series-oid [oids]
   (let [n (count oids)
@@ -178,6 +185,9 @@
         outputs (mapv #(expression-output % schema db) arguments)
         argument-oids (mapv :oid outputs)
         fixed (get fixed-table-functions function-name)
+        _ (when (and (= function-name "pg_get_sequence_data")
+                     (not (implicit-regclass-argument? (first argument-oids))))
+            (no-overload! function-name))
         _ (when (or fixed (str/starts-with? function-name "json"))
             (let [expected (cond
                              (str/starts-with? function-name "jsonb_") [3802]
