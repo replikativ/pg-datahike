@@ -529,8 +529,8 @@
 (deftest test-pg-current-setting
   (testing "known GUC parameters return expected values"
     (is (= [["UTC"]]    (rows (.execute *handler* "SELECT current_setting('TimeZone')"))))
-    (is (= [["17.7"]]   (rows (.execute *handler* "SELECT current_setting('server_version')"))))
-    (is (= [["170007"]] (rows (.execute *handler* "SELECT current_setting('server_version_num')"))))
+    (is (= [["18.6"]]   (rows (.execute *handler* "SELECT current_setting('server_version')"))))
+    (is (= [["180006"]] (rows (.execute *handler* "SELECT current_setting('server_version_num')"))))
     (is (= [["UTF8"]]   (rows (.execute *handler* "SELECT current_setting('client_encoding')"))))
     (is (= [["UTF8"]]   (rows (.execute *handler* "SELECT current_setting('server_encoding')"))))
     (is (= [["on"]]     (rows (.execute *handler* "SELECT current_setting('standard_conforming_strings')")))))
@@ -1067,7 +1067,7 @@
 
   (testing "SHOW server_version"
     (let [r (.execute *handler* "SHOW server_version")]
-      (is (= [["17.7"]] (rows r))))))
+      (is (= [["18.6"]] (rows r))))))
 
 ;; ============================================================================
 ;; DISTINCT

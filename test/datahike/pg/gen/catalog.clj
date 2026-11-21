@@ -17,7 +17,7 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]))
 
-(def default-source ".internal/postgres-REL_17_7")
+(def default-source ".internal/postgres-REL_18_6")
 
 (def output-path "src/datahike/pg/pg_catalog.edn")
 
