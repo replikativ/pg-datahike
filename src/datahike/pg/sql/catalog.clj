@@ -73,6 +73,7 @@
     "pg_namespace" "pg_database" "pg_proc" "pg_roles" "pg_settings"
     "pg_authid" "pg_auth_members" "pg_am" "pg_language" "pg_tablespace"
     "pg_operator" "pg_opclass" "pg_opfamily" "pg_amop" "pg_amproc"
+    "pg_conversion" "pg_ts_parser" "pg_ts_template" "pg_ts_dict" "pg_ts_config"
     "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
     "pg_foreign_table" "pg_init_privs" "pg_transform"
     "pg_foreign_data_wrapper" "pg_foreign_server" "pg_default_acl"
@@ -333,10 +334,23 @@
                                   (:pg_type/oid r))))))
               rows)
         "pg_attribute"
-        (mapv (fn [r]
-                (assoc r :pg_attribute/attcollation
-                       (long (types/typcollation (:pg_attribute/atttypid r)))))
-              rows)
+        (let [type-layouts (delay (into {}
+                                        (map (juxt :pg_type/oid identity))
+                                        (catalog-data-for* "pg_type" user-schema cte-db)))]
+          (mapv (fn [row]
+                  (let [oid (:pg_attribute/atttypid row)
+                        type (types/catalog-type oid)
+                        layout (when-not (and (:typlen type) (:typalign type))
+                                 (get @type-layouts oid))
+                        length (or (:typlen type) (:pg_type/typlen layout))
+                        alignment (or (:typalign type) (:pg_type/typalign layout))]
+                    (cond-> (merge {:pg_attribute/attislocal true
+                                    :pg_attribute/atthasmissing false
+                                    :pg_attribute/attcollation (long (types/typcollation oid))}
+                                   row)
+                      length (assoc :pg_attribute/attlen length)
+                      alignment (assoc :pg_attribute/attalign alignment))))
+                rows))
         "pg_constraint"
         ;; All supported constraints are enforced, local and non-temporal.
         (let [rows (if (>= (parse-long PgWireServer/SERVER_VERSION_NUM) 180000)
@@ -409,7 +423,14 @@
      {:db/ident :pg_type/typisdefined :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_type") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_attribute"
-    [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+    [{:db/ident :pg_attribute/attlen :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_attribute/attalign :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_attribute/attislocal :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_attribute/atthasmissing :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_attribute/attmissingval :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "anyarray"}
+     {:db/ident :pg_attribute/attoptions :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
+     {:db/ident :pg_attribute/attfdwoptions :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_text"}
+     {:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      ;; atttypid is PG's `oid` type — declare it so `array_agg(atttypid)`
      ;; (asyncpg's typeinfo attrtypoids) infers oid[] (1028), the array type
      ;; asyncpg core-registers. Reporting int8[] (1016) made asyncpg loop
@@ -701,6 +722,53 @@
      {:db/ident :pg_operator/oprrest :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
      {:db/ident :pg_operator/oprjoin :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
      {:db/ident (pgs/row-marker-attr "pg_operator") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_conversion"
+    [{:db/ident :pg_conversion/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_conversion/conname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_conversion/connamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_conversion/conowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_conversion/conforencoding :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_conversion/contoencoding :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_conversion/conproc :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_conversion/condefault :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident (pgs/row-marker-attr "pg_conversion") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_ts_parser"
+    [{:db/ident :pg_ts_parser/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_parser/prsname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_ts_parser/prsnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_parser/prsstart :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_ts_parser/prstoken :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_ts_parser/prsend :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_ts_parser/prsheadline :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_ts_parser/prslextype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident (pgs/row-marker-attr "pg_ts_parser") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_ts_template"
+    [{:db/ident :pg_ts_template/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_template/tmplname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_ts_template/tmplnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_template/tmplinit :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident :pg_ts_template/tmpllexize :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident (pgs/row-marker-attr "pg_ts_template") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_ts_dict"
+    [{:db/ident :pg_ts_dict/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_dict/dictname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_ts_dict/dictnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_dict/dictowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_dict/dicttemplate :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_dict/dictinitoption :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "text"}
+     {:db/ident (pgs/row-marker-attr "pg_ts_dict") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_ts_config"
+    [{:db/ident :pg_ts_config/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_config/cfgname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_ts_config/cfgnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_config/cfgowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_ts_config/cfgparser :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident (pgs/row-marker-attr "pg_ts_config") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_cast"
     [{:db/ident :pg_cast/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
@@ -1662,7 +1730,8 @@
                                    :name (:datahike.pg.column/name column)
                                    :attnum (:datahike.pg.column/attnum column)
                                    :type-oid (:datahike.pg.column/type-oid column)
-                                   :typmod (:datahike.pg.column/typmod column)))))
+                                   :typmod (:datahike.pg.column/typmod column)
+                                   :local? (get column :datahike.pg.column/local? true)))))
                   registered)
             columns)]))
      (sort-by key tables))))
@@ -1712,7 +1781,7 @@
    base type's output and send functions, and stores as the base does."
   [base-row]
   (merge (select-keys base-row (conj (mapv #(keyword "pg_type" (name %)) type-io-keys)
-                                     :pg_type/typisdefined))
+                                     :pg_type/typisdefined :pg_type/typlen))
          {:pg_type/typinput "domain_in" :pg_type/typreceive "domain_recv"
           :pg_type/typmodin "-" :pg_type/typmodout "-" :pg_type/typanalyze "-"
           :pg_type/typsubscript "-"}))
@@ -1946,7 +2015,9 @@
   (let [marker (pgs/row-marker-attr table)]
     (mapv (fn [row]
             (into {marker true}
-                  (map (fn [[column value]] [(keyword table (name column)) value]))
+                  (keep (fn [[column value]]
+                          (when (some? value)
+                            [(keyword table (name column)) value])))
                   row))
           rows)))
 
@@ -2149,6 +2220,7 @@
            :pg_attribute/attnum (long (or (:attnum col) (inc idx)))
            :pg_attribute/attrelid (long tbl-oid)
            :pg_attribute/attnotnull (boolean (or pk? (:not-null? col)))
+           :pg_attribute/attislocal (get col :local? true)
            :pg_attribute/atthasdef (contains? default-idents (:attr col))
            :pg_attribute/attidentity identity-code
            :pg_attribute/attgenerated (or (:generated col) "")
@@ -2195,6 +2267,7 @@
            :pg_attribute/atttypid 0
            :pg_attribute/attnum (:datahike.pg.column/attnum column)
            :pg_attribute/attrelid (:datahike.pg.object/oid relation)
+           :pg_attribute/attislocal (get column :datahike.pg.column/local? true)
            :pg_attribute/attnotnull false
            :pg_attribute/atthasdef false
            :pg_attribute/attidentity ""
@@ -2517,6 +2590,21 @@
              :pg_operator/oprrest (operator-routine-oid rest) :pg_operator/oprjoin (operator-routine-oid join)
              (pgs/row-marker-attr "pg_operator") true})
           pg-cat/operators)
+
+    "pg_conversion"
+    (bootstrap-catalog-rows "pg_conversion" pg-cat/conversions)
+
+    "pg_ts_parser"
+    (bootstrap-catalog-rows "pg_ts_parser" pg-cat/ts-parsers)
+
+    "pg_ts_template"
+    (bootstrap-catalog-rows "pg_ts_template" pg-cat/ts-templates)
+
+    "pg_ts_dict"
+    (bootstrap-catalog-rows "pg_ts_dict" pg-cat/ts-dicts)
+
+    "pg_ts_config"
+    (bootstrap-catalog-rows "pg_ts_config" pg-cat/ts-configs)
 
     "pg_cast"
     (vec (map-indexed

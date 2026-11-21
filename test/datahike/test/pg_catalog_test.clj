@@ -1106,7 +1106,7 @@
   (testing "a real PostgreSQL column we do not serve"
     (doseq [[rel col] [["pg_class" "relnatts"]
                        ["pg_class" "relrewrite"]
-                       ["pg_attribute" "attlen"]
+                       ["pg_attribute" "attndims"]
                        ["pg_type" "typdefault"]]]
       (is (= "42703" (:sqlstate (ex (str "SELECT r." col " FROM " rel " r"))))
           (str rel "." col " must raise, not answer NULL"))))

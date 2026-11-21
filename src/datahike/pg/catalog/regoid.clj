@@ -504,7 +504,8 @@
                [16382 "vector_send" [16383] 17]])))
 
 (def ^:private builtins
-  (let [rows (into (mapv #(assoc % :namespace-oid 11) catalog/procs) extensions)]
+  (let [rows (into (mapv #(assoc % :namespace-oid 11) (concat catalog/procs catalog/snowball-procs))
+                   extensions)]
     (when-not (= (count rows) (count (set (map :oid rows))))
       (throw (ex-info "Duplicate static routine OID" {})))
     rows))

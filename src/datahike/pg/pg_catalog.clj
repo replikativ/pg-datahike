@@ -48,6 +48,32 @@
 (def amops (rows :amops))
 (def amprocs (rows :amprocs))
 
+(def conversions (rows :conversions))
+
+;; initdb creates Snowball after the bootstrap catalog. Use its PG17
+;; identities for the English configuration implemented by pg-datahike.
+(def snowball-procs
+  [{:oid 13258 :proname "dsnowball_init" :args [2281] :ret 2281 :kind "f"
+    :strict true :volatile "v" :retset false :variadic 0 :language 13}
+   {:oid 13259 :proname "dsnowball_lexize" :args [2281 2281 2281 2281] :ret 2281 :kind "f"
+    :strict true :volatile "v" :retset false :variadic 0 :language 13}])
+
+(def ts-parsers (rows :ts-parsers))
+
+(def ts-templates
+  (conj (rows :ts-templates)
+        {:oid 13260 :tmplname "snowball" :tmplnamespace 11
+         :tmplinit 13258 :tmpllexize 13259}))
+
+(def ts-dicts
+  (conj (rows :ts-dicts)
+        {:oid 13273 :dictname "english_stem" :dictnamespace 11 :dictowner 10
+         :dicttemplate 13260 :dictinitoption "language = 'english', stopwords = 'english'"}))
+
+(def ts-configs
+  (conj (rows :ts-configs)
+        {:oid 13274 :cfgname "english" :cfgnamespace 11 :cfgowner 10 :cfgparser 3722}))
+
 (def type-by-oid (into {} (map (juxt :oid identity)) types))
 
 (def type-by-name (into {} (map (juxt :typname identity)) types))

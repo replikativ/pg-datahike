@@ -213,22 +213,30 @@
   (let [configure (slurp (io/file src "configure.ac"))]
     (second (re-find #"AC_INIT\(\[PostgreSQL\], \[([^\]]+)\]" configure))))
 
-(def ^:private operator-catalogs
-  {:opclasses [:oid :opcmethod :opcname :opcnamespace :opcowner :opcfamily
-               :opcintype :opcdefault :opckeytype]
-   :opfamilies [:oid :opfmethod :opfname :opfnamespace :opfowner]
-   :amops [:oid :amopfamily :amoplefttype :amoprighttype :amopstrategy
-           :amoppurpose :amopopr :amopmethod :amopsortfamily]
-   :amprocs [:oid :amprocfamily :amproclefttype :amprocrighttype :amprocnum :amproc]})
+(def ^:private bootstrap-catalog-specs
+  [[:opclasses "pg_opclass" [:oid :opcmethod :opcname :opcnamespace :opcowner :opcfamily
+                             :opcintype :opcdefault :opckeytype]]
+   [:opfamilies "pg_opfamily" [:oid :opfmethod :opfname :opfnamespace :opfowner]]
+   [:amops "pg_amop" [:oid :amopfamily :amoplefttype :amoprighttype :amopstrategy
+                      :amoppurpose :amopopr :amopmethod :amopsortfamily]]
+   [:amprocs "pg_amproc" [:oid :amprocfamily :amproclefttype :amprocrighttype :amprocnum :amproc]]
+   [:conversions "pg_conversion" [:oid :conname :connamespace :conowner :conforencoding
+                                  :contoencoding :conproc :condefault]]
+   [:ts-parsers "pg_ts_parser" [:oid :prsname :prsnamespace :prsstart :prstoken :prsend
+                                :prsheadline :prslextype]]
+   [:ts-templates "pg_ts_template" [:oid :tmplname :tmplnamespace :tmplinit :tmpllexize]]
+   [:ts-dicts "pg_ts_dict" [:oid :dictname :dictnamespace :dictowner :dicttemplate :dictinitoption]]
+   [:ts-configs "pg_ts_config" [:oid :cfgname :cfgnamespace :cfgowner :cfgparser]]])
 
 (defn- bki-value [column value]
   (case column
-    (:opcname :opfname :amoppurpose) value
-    :opcdefault (->bool value)
+    (:opcname :opfname :amoppurpose :conname :prsname :tmplname :dictname :cfgname) value
+    :dictinitoption (when-not (= "_null_" value) value)
+    (:opcdefault :condefault) (->bool value)
     (or (parse-long value)
         (throw (ex-info "Invalid numeric catalog value" {:column column :value value})))))
 
-(defn- operator-catalog-rows [bki table columns]
+(defn- bootstrap-catalog-rows [bki table columns]
   (let [begin (str "open " table)
         end (str "close " table)
         rows (->> (str/split-lines bki)
@@ -245,7 +253,7 @@
               (zipmap columns (map bki-value columns values))))
           rows)))
 
-(defn- bootstrap-operator-catalogs
+(defn- bootstrap-catalogs
   "Use PostgreSQL's own BKI generation for catalog-assigned object OIDs."
   [src version]
   (let [include (.getCanonicalFile (io/file src "src/include"))
@@ -265,9 +273,8 @@
           (throw (ex-info "PostgreSQL catalog generation failed" {:exit exit :out out :err err})))
         (let [bki (slurp (io/file tmp "postgres.bki"))]
           (into {}
-                (map (fn [[key table]] [key (operator-catalog-rows bki table (operator-catalogs key))]))
-                [[:opclasses "pg_opclass"] [:opfamilies "pg_opfamily"]
-                 [:amops "pg_amop"] [:amprocs "pg_amproc"]])))
+                (map (fn [[key table cols]] [key (bootstrap-catalog-rows bki table cols)]))
+                bootstrap-catalog-specs)))
       (finally
         (doseq [file (reverse (file-seq tmp))]
           (io/delete-file file))))))
@@ -281,7 +288,7 @@
         language-oids (into {} (map (fn [row] [(:lanname row) (parse-long (:oid row))]))
                             (read-dat src "pg_language"))
         version (source-version src)]
-    (merge (bootstrap-operator-catalogs src version)
+    (merge (bootstrap-catalogs src version)
            {:pg-version version
             :types ts
             :casts (casts src type-oid)
@@ -309,7 +316,7 @@
     :procs [:oid :proname :args :ret :kind :strict :volatile :retset :variadic]
     :proc-languages [:oid :language]
     :operators [:oid :oprname :kind :left :right :result :code :com :negate :rest :join]}
-   operator-catalogs))
+   (map (fn [[key _ cols]] [key cols]) bootstrap-catalog-specs)))
 
 (defn sha256 [^String s]
   (let [md (java.security.MessageDigest/getInstance "SHA-256")]
