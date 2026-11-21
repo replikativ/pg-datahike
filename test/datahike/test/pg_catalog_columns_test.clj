@@ -190,3 +190,52 @@
              (run h "SELECT tableoid, amproc::oid, amproc FROM pg_amproc
                        WHERE amprocfamily = 1976 AND amproclefttype = 23
                          AND amprocrighttype = 23 AND amprocnum = 1"))))))
+
+(deftest catalog-shapes-for-unavailable-facilities
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (doseq [source ["pg_foreign_data_wrapper WHERE fdwowner = 10"
+                      "pg_foreign_server WHERE srvfdw = 1"
+                      "pg_default_acl WHERE defaclrole = 10"
+                      "pg_event_trigger WHERE evtfoid = 1"
+                      "pg_subscription WHERE subname = 'missing'"
+                      "pg_seclabels WHERE label IS NOT NULL"
+                      "pg_publication WHERE pubowner = 10 OR pubgencols = 's'"]]
+        (is (= "0" (run h (str "SELECT count(*) FROM pg_catalog." source))) source)))))
+
+(deftest catalog-options-as-rows
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (= "one|x=y|f|1\nbare||t|2\nempty||f|3"
+             (run h "SELECT option_name, option_value, option_value IS NULL, ordinality
+                       FROM pg_catalog.pg_options_to_table(ARRAY['one=x=y', 'bare', 'empty='])
+                       WITH ORDINALITY ORDER BY ordinality")))
+      (is (= "0" (run h "SELECT count(*) FROM pg_options_to_table(NULL::text[])")))
+      (is (= "22004" (.sqlstate (.execute h "SELECT * FROM pg_options_to_table(ARRAY[NULL]::text[])"))))
+      (is (= "42883" (.sqlstate (.execute h "SELECT * FROM pg_options_to_table(1)")))))))
+
+(deftest array-subqueries-over-unqualified-outer-function-arguments
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (doseq [sql ["CREATE TABLE option_sets (id int PRIMARY KEY, opts text[])"
+                   "INSERT INTO option_sets VALUES (1, ARRAY['z=last','a=first']), (2, NULL)"]]
+        (is (nil? (.error (.execute h ^String sql))) sql))
+      (is (= "1|{first,last}\n2|{}"
+             (run h "SELECT id, ARRAY(SELECT option_value FROM pg_options_to_table(opts)
+                                     ORDER BY option_name)
+                       FROM option_sets ORDER BY id")))
+      (is (= ""
+             (run h "SELECT evtname, ARRAY(SELECT quote_literal(x) FROM unnest(evttags) AS t(x))
+                       FROM pg_event_trigger"))))))
+
+(deftest plain-index-catalog-state
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (doseq [sql ["CREATE TABLE indexed (id int PRIMARY KEY, amount int)"
+                   "CREATE INDEX indexed_amount ON indexed (amount)"]]
+        (is (nil? (.error (.execute h ^String sql))) sql))
+      (is (= "indexed_amount|t|t|f|t|t\nindexed_pkey|t|t|f|t|t"
+             (run h "SELECT c.relname, i.indisvalid, i.indisready,
+                            i.indnullsnotdistinct, i.indpred IS NULL, i.indexprs IS NULL
+                       FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+                       WHERE i.indrelid = 'indexed'::regclass ORDER BY c.relname"))))))

@@ -551,6 +551,13 @@
                    (when table-real
                      (keyword table-real col-name)))
           props (when attr (get schema attr))
+          ;; FROM-function arguments can read a bound outer column by name.
+          ;; A local column still owns the unqualified reference when present.
+          outer-oid (when-not (or col-table props)
+                      (let [owners (params/binding-column-owners from-binding-oids col-name
+                                                                 params/*outer-scope-aliases*)]
+                        (when (= 1 (count owners))
+                          (get-in from-binding-oids [(first owners) col-name]))))
           valuetype (:db/valueType props)
           cardinality (:db/cardinality props)
           base-oid (when valuetype (pgs/oid-for-valuetype valuetype))
@@ -568,6 +575,7 @@
         ;; A pre-analyzed correlated reference is represented by NULL at
         ;; runtime, but retains the outer column's declared SQL type here.
         bound-oid bound-oid
+        outer-oid outer-oid
         ;; Native PG array column wins over the storage-type fallback.
         pg-name-oid pg-name-oid
         (nil? base-oid) nil

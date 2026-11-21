@@ -6501,18 +6501,22 @@
 
 (defn- row-subquery-correlation-refs [ctx inner]
   (let [qualified (correlated-subquery-refs inner (outer-alias-set ctx) (ctx-level ctx))
-        ;; An inner SELECT without FROM resolves its unqualified columns in
-        ;; the outer scope. PostgreSQL's own ROWCOMPARE regression uses
-        ;; `(SELECT f1, f2)` in precisely this shape.
-        unqualified (when (and (instance? PlainSelect inner)
-                               (nil? (.getFromItem ^PlainSelect inner)))
+        ;; A SELECT without FROM resolves its unqualified columns against
+        ;; the outer scope. The first FROM function's arguments are also
+        ;; outside the scope of its own output columns and later joins.
+        outer-only (when (instance? PlainSelect inner)
+                     (let [from (.getFromItem ^PlainSelect inner)]
+                       (cond
+                         (nil? from) (plain-select-scope-nodes inner)
+                         (instance? net.sf.jsqlparser.statement.select.TableFunction from)
+                         [(.getFunction ^net.sf.jsqlparser.statement.select.TableFunction from)])))
+        unqualified (when (seq outer-only)
                       (into #{}
                             (keep (fn [^Column col]
                                     (when (str/blank?
                                            (some-> col .getTable .getName))
                                       (resolved-outer-column-ref ctx col))))
-                            (mapcat params/ast-columns
-                                    (plain-select-scope-nodes inner))))]
+                            (mapcat params/ast-columns outer-only)))]
     (not-empty (into (set qualified) unqualified))))
 
 (defn- analyze-row-comparison-subquery!
