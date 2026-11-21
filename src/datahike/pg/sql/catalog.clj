@@ -72,7 +72,8 @@
   #{"pg_type" "pg_class" "pg_tables" "pg_views" "pg_matviews" "pg_attribute"
     "pg_namespace" "pg_database" "pg_proc" "pg_roles" "pg_settings"
     "pg_authid" "pg_auth_members" "pg_am" "pg_language" "pg_tablespace"
-    "pg_operator" "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
+    "pg_operator" "pg_opclass" "pg_opfamily" "pg_amop" "pg_amproc"
+    "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
     "pg_foreign_table" "pg_init_privs" "pg_transform"
     "pg_shdepend"
     ;; Session views. These are the only catalogs here that are NOT
@@ -635,6 +636,47 @@
      {:db/ident :pg_tablespace/spcname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_tablespace/spcowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident (pgs/row-marker-attr "pg_tablespace") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_opclass"
+    [{:db/ident :pg_opclass/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opclass/opcmethod :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opclass/opcname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_opclass/opcnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opclass/opcowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opclass/opcfamily :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opclass/opcintype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opclass/opcdefault :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :pg/type "bool"}
+     {:db/ident :pg_opclass/opckeytype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident (pgs/row-marker-attr "pg_opclass") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_opfamily"
+    [{:db/ident :pg_opfamily/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opfamily/opfmethod :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opfamily/opfname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_opfamily/opfnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_opfamily/opfowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident (pgs/row-marker-attr "pg_opfamily") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_amop"
+    [{:db/ident :pg_amop/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amop/amopfamily :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amop/amoplefttype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amop/amoprighttype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amop/amopstrategy :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_amop/amoppurpose :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_amop/amopopr :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amop/amopmethod :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amop/amopsortfamily :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident (pgs/row-marker-attr "pg_amop") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+
+    "pg_amproc"
+    [{:db/ident :pg_amproc/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amproc/amprocfamily :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amproc/amproclefttype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amproc/amprocrighttype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_amproc/amprocnum :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_amproc/amproc :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "regproc"}
+     {:db/ident (pgs/row-marker-attr "pg_amproc") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_operator"
     ;; From the generated catalog (pg_operator.dat), the same source the
@@ -1821,6 +1863,14 @@
             (get-in index [:by-oid oid])
             (get-in index [:by-name [(:namespace-oid request) (:name request)]]))))))
 
+(defn- bootstrap-catalog-rows [table rows]
+  (let [marker (pgs/row-marker-attr table)]
+    (mapv (fn [row]
+            (into {marker true}
+                  (map (fn [[column value]] [(keyword table (name column)) value]))
+                  row))
+          rows)))
+
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
    per-table body; library consumers add more via the registry."
@@ -2362,6 +2412,18 @@
              :pg_tablespace/spcowner pg-role-oid
              (pgs/row-marker-attr "pg_tablespace") true})
           [[1663 "pg_default"] [1664 "pg_global"]])
+
+    "pg_opclass"
+    (bootstrap-catalog-rows "pg_opclass" pg-cat/opclasses)
+
+    "pg_opfamily"
+    (bootstrap-catalog-rows "pg_opfamily" pg-cat/opfamilies)
+
+    "pg_amop"
+    (bootstrap-catalog-rows "pg_amop" pg-cat/amops)
+
+    "pg_amproc"
+    (bootstrap-catalog-rows "pg_amproc" pg-cat/amprocs)
 
     "pg_operator"
     (mapv (fn [{:keys [oid oprname kind left right result code com negate rest join]}]

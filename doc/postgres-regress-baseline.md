@@ -221,22 +221,23 @@ Routine discovery now has typed routine ACLs and language OIDs. The type
 scan reads the first byte of a PostgreSQL `name` using a zero-based
 subscript. The operator scan can cast an implementation routine's
 `regproc` to its numeric OID. The local candidate gets through all three
-scans and stops at `pg_opclass`.
+scans, then reads the generated operator classes and families. It stops
+at `pg_ts_parser`.
 
 The native SQL was captured with
 `PGOPTIONS='-c log_statement=all' pg_dump --schema-only`. The first replay
 produced errors in 32 of 48 read queries. With the planner fix, relation
 metadata and qualified casts applied, 23 errored. With routine, type,
-and operator metadata added, 17 errored. The latter two replays
-substituted the candidate's fixture OIDs for the native OIDs. A query
+and operator metadata added, 17 errored. With the generated operator class,
+family and access-method catalogs added, 14 errored. These replays substituted the candidate's fixture OIDs for the native OIDs. A query
 that runs still needs its rows and the resulting dump checked.
 
 | SQLSTATE | Queries | Remaining work |
 |---|---:|---|
-| `42P01` | 14 | Operator classes, families, access-method operators, conversions and text search need built-in catalog data. Foreign data, default ACL, event trigger, subscription and security-label scans need the catalog shapes for those facilities. |
+| `42P01` | 11 | Conversions and text search need built-in catalog data. Foreign data, default ACL, event trigger, subscription and security-label scans need the catalog shapes for those facilities. |
 | `42703` | 3 | Constraint `tableoid` in the column scan, index readiness and publication owner |
 
-The next stock dump blocker is the built-in operator class scan. After
+The next stock dump blocker is the built-in text search parser scan. After
 catalog discovery, compare the fixture's columns, indexes, constraints,
 and view definition in the restored database. The candidate advertises
 the vector extension, so verify the dump's extension membership and test

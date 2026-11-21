@@ -173,3 +173,20 @@
              (run h "SELECT ('é_'::name)[0], ('é_'::name)[1], ('é_'::name)[2],
                             ('é_'::name)[-1] IS NULL")))
       (is (= "0A000" (.sqlstate (.execute h "SELECT ('abc'::name)[0:2]")))))))
+
+(deftest built-in-operator-class-links-match-postgresql
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (= "2616|1978|2753|1976|2602|96|t"
+             (run h "SELECT c.tableoid, c.oid, f.tableoid, f.oid, a.tableoid,
+                            a.amopopr, c.opcdefault
+                       FROM pg_opclass c
+                       JOIN pg_opfamily f ON c.opcfamily = f.oid
+                       JOIN pg_amop a ON a.amopfamily = f.oid
+                       WHERE c.opcname = 'int4_ops' AND c.opcmethod = 403
+                         AND a.amoplefttype = 23 AND a.amoprighttype = 23
+                         AND a.amopstrategy = 3")))
+      (is (= "2603|351|btint4cmp"
+             (run h "SELECT tableoid, amproc::oid, amproc FROM pg_amproc
+                       WHERE amprocfamily = 1976 AND amproclefttype = 23
+                         AND amprocrighttype = 23 AND amprocnum = 1"))))))
