@@ -480,9 +480,10 @@ jobs:
           name: asyncpg run
           command: bash test/integration/asyncpg/run.sh
           environment:
-            # The complete codec module can exceed 120 seconds on CI while
-            # still making progress. Keep the hard timeout and exact verdict gate.
-            ASYNCPG_MODULE_TIMEOUT: "180"
+            # The PostgreSQL 18 codec module completed in 198 seconds under
+            # concurrent local test load. Retain a hard cap and the exact
+            # expected-failure gate.
+            ASYNCPG_MODULE_TIMEOUT: "240"
           no_output_timeout: 20m
       # run.sh redirects pytest's per-test output to a file and prints only
       # the summary, so without this the console shows WHICH tests the gate
