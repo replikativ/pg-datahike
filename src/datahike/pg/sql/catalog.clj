@@ -31,9 +31,12 @@
             [datahike.pg.pg-catalog :as pg-cat]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.ddl :as ddl]
+            [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
-  (:import [net.sf.jsqlparser.schema Table]
+  (:import [datahike.pg PgWireServer]
+           [net.sf.jsqlparser.schema Table]
            [net.sf.jsqlparser.statement.select PlainSelect Join ParenthesedSelect SetOperationList]
            [net.sf.jsqlparser.expression.operators.relational EqualsTo]
            [net.sf.jsqlparser.expression StringValue]))
@@ -229,6 +232,45 @@
 
 (declare catalog-schema-for* catalog-data-for* built-in-catalog-tables)
 
+(defn- constraint-oid [kind name table]
+  ;; Tag the high bit to avoid collisions with table OIDs.
+  (bit-or 0x50000000
+          (Math/abs (.hashCode ^String (str kind ":" name ":" table)))))
+
+(defn- not-null-constraint-rows [rows user-schema db]
+  (let [hints (pgs/schema-hints db)
+        tables (pgs/derive-virtual-tables user-schema hints)
+        by-table (group-by :pg_constraint/conrelid rows)]
+    (mapcat
+     (fn [[table {:keys [columns]}]]
+       (let [relid (long (or (pgs/table-oid db table) (Math/abs (.hashCode ^String table))))
+             names (into #{} (map :pg_constraint/conname) (get by-table relid))]
+         (:rows
+          (reduce
+           (fn [{:keys [names rows] :as state} column]
+             (let [col (:name column)
+                   attnum (pgs/column-attnum user-schema table col hints)]
+               (if (and attnum (or (:not-null? column) (= :db.unique/identity (:unique column))))
+                 (let [name (ddl/generated-constraint-name names table col "not_null")]
+                   {:names (conj names name)
+                    :rows (conj rows {:pg_constraint/oid (long (constraint-oid "n" name table))
+                                      :pg_constraint/conname name
+                                      :pg_constraint/contype "n"
+                                      :pg_constraint/conindid 0
+                                      :pg_constraint/conrelid relid
+                                      :pg_constraint/connamespace 2200
+                                      :pg_constraint/confrelid 0
+                                      :pg_constraint/condeferrable false
+                                      :pg_constraint/condeferred false
+                                      :pg_constraint/convalidated true
+                                      :pg_constraint/conkey (str "{" attnum "}")
+                                      :pg_constraint/condef (str "NOT NULL " (fns/quote-identifier col))
+                                      (pgs/row-marker-attr "pg_constraint") true})})
+                 state)))
+           {:names names :rows []}
+           columns))))
+     (sort-by key tables))))
+
 (def ^:dynamic *registered-databases*
   "When bound (by the server's handler factory), a seq of strings — the
    names of databases registered at server-start time. Surfaced as rows
@@ -292,10 +334,16 @@
               rows)
         "pg_constraint"
         ;; All supported constraints are enforced, local and non-temporal.
-        (mapv #(assoc % :pg_constraint/conenforced true
+        (let [rows (if (>= (parse-long PgWireServer/SERVER_VERSION_NUM) 180000)
+                     (into rows (not-null-constraint-rows rows user-schema cte-db))
+                     rows)]
+          (mapv #(assoc % :pg_constraint/conenforced true
+                      :pg_constraint/conislocal true
+                      :pg_constraint/coninhcount 0
+                      :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
                       :pg_constraint/conparentid 0
                       :pg_constraint/conperiod false)
-              rows)
+                rows))
         rows))))
 
 (defn catalog-schema-for*
@@ -1013,8 +1061,11 @@
      {:db/ident :pg_constraint/conenforced :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/convalidated :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/conperiod :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_constraint/conkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_constraint/confkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conislocal :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/coninhcount :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_constraint/connoinherit :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_int2"}
+     {:db/ident :pg_constraint/confkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_int2"}
      {:db/ident :pg_constraint/condef :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_constraint") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_extension"
@@ -2704,10 +2755,6 @@
                                 (or-join [?e ?n] [?e :pg/fk-conname ?n] [?e :pg/fk-name ?n])]}
                       cte-db)
                 (catch Throwable _ []))
-          ->oid (fn [kind nm tbl]
-                  ;; Tag the high bit to avoid collisions with table OIDs.
-                  (bit-or 0x50000000
-                          (Math/abs (.hashCode ^String (str kind ":" nm ":" tbl)))))
           ;; Prefer durable PostgreSQL attnums. Positional fallback keeps
           ;; bare/native databases usable before handler migration.
           attnum-for (fn [tname col-name]
@@ -2740,7 +2787,7 @@
                     condef   (str (if primary? "PRIMARY KEY (" "UNIQUE (")
                                   (:name col) ")")
                     attnum   (attnum-for tname (:name col))]]
-          {:pg_constraint/oid           (long (->oid contype cname tname))
+          {:pg_constraint/oid           (long (constraint-oid contype cname tname))
            :pg_constraint/conname       cname
            :pg_constraint/contype       contype
            :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
@@ -2777,7 +2824,7 @@
                     tbl-oid (or (pgs/table-oid cte-db tname)
                                 (Math/abs (.hashCode ^String tname)))
                     attnums (keep #(attnum-for tname %) cols)]]
-          {:pg_constraint/oid           (long (->oid contype cname tname))
+          {:pg_constraint/oid           (long (constraint-oid contype cname tname))
            :pg_constraint/conname       cname
            :pg_constraint/contype       contype
            :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
@@ -2796,7 +2843,7 @@
         (for [{cname :name tname :table cexpr :expr} checks
               :let [tbl-oid (or (pgs/table-oid cte-db tname)
                                 (Math/abs (.hashCode ^String tname)))]]
-          {:pg_constraint/oid           (long (->oid "c" cname tname))
+          {:pg_constraint/oid           (long (constraint-oid "c" cname tname))
            :pg_constraint/conname       cname
            :pg_constraint/contype       "c"
            :pg_constraint/conindid      0
@@ -2834,7 +2881,7 @@
                     ps (parse-cols parent-cols)
                     child-attnums  (vec (keep #(attnum-for child %) cs))
                     parent-attnums (vec (keep #(attnum-for parent %) ps))]]
-          {:pg_constraint/oid           (long (->oid "f" cname child))
+          {:pg_constraint/oid           (long (constraint-oid "f" cname child))
            :pg_constraint/conname       cname
            :pg_constraint/contype       "f"
            :pg_constraint/conrelid      (long tbl-oid)

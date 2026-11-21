@@ -521,7 +521,11 @@
                  (let [^EqualsTo eq expr
                        left (.getLeftExpression eq)
                        right (.getRightExpression eq)]
-                   (and (instance? Column left) (instance? Column right))))
+                   (and (instance? Column left) (instance? Column right)
+                        ;; JSqlParser stores an array subscript on its Column
+                        ;; node. This shortcut can only join whole attributes.
+                        (nil? (.getArrayConstructor ^Column left))
+                        (nil? (.getArrayConstructor ^Column right)))))
             (let [^EqualsTo eq expr
                   left (.getLeftExpression eq)
                   right (.getRightExpression eq)
@@ -1361,8 +1365,8 @@
     (params/check-cancel!)
     result))
 
-(defn- table-function-has-column-reference?
-  "Whether a table function argument contains a column reference.
+(defn- table-function-has-unbound-column?
+  "Whether a table function needs a column outside its current bindings.
 
    Look through the complete argument expression. Checking only for an
    argument that *is* a Column misses `generate_series(1, t.n + 1)` and
@@ -1370,9 +1374,11 @@
    `r` and silently returned that value for every outer row."
   [^net.sf.jsqlparser.statement.select.TableFunction tf]
   (boolean
-   (some seq
-         (map params/ast-columns
-              (or (.getParameters (.getFunction tf)) [])))))
+   (some (fn [^Column col]
+           (let [alias (some-> col .getTable .getName unquote-ident str/lower-case)
+                 name (-> col .getColumnName unquote-ident str/lower-case)]
+             (not (contains? (get params/*from-bindings* alias) name))))
+         (mapcat params/ast-columns (.getParameters (.getFunction tf))))))
 
 (defn- reject-unmaterialized-table-function!
   "Raise a PostgreSQL error when a FROM table function reaches the end of
@@ -1600,12 +1606,23 @@
        ;; (`arrayfuncs.c`, ArrayGetNItems over ndim) — `ARRAY[[1,2],[3,4]]`
        ;; yields 4 rows, not 2 sub-arrays.
          (let [pa (when (seq params) (eval-fn (first params)))
+               db (or (:db scope) params/*parse-db*)
+               array-oid (when (and (= 1 (count params)) (or (fns/sql-null? pa) (string? pa)))
+                           (oid/expr-oid (first params)
+                                         {:schema (:schema db) :db db
+                                          :from-binding-oids params/*from-binding-oids*}))
+               element-oid (types/array-oid->element-oid array-oid)
+               element-type (types/oid->elem-kw element-oid)
                vals (cond
                       (pg-arr/array? pa) (vec (pg-arr/flat-elements pa))
                       (sequential? pa)   (vec pa)
+                      (and element-oid (fns/sql-null? pa)) []
+                      (and element-type (string? pa))
+                      (vec (pg-arr/flat-elements (pg-arr/from-pg-text pa element-type)))
                       :else              nil)]
            (when vals
-             (let [oid (when (pg-arr/array? pa) (types/elem-kw->oid (:elem-type pa)))]
+             (let [oid (or element-oid
+                           (when (pg-arr/array? pa) (types/elem-kw->oid (:elem-type pa))))]
                (with-ordinality ["unnest"] (mapv vector vals)
                  [(or (types/dh-type-for-oid oid) (vtype-of (first vals)))]
                  [(types/oid-preserving-pg-name oid)]))))
@@ -4099,7 +4116,8 @@
         ;; after `ctx` exists (search lsrf-spec below).
         lsrf-var-counter (atom 0)
         lsrf-spec (when (and db (instance? net.sf.jsqlparser.statement.select.TableFunction
-                                           from-item))
+                                           from-item)
+                             (table-function-has-unbound-column? from-item))
                     (correlated-table-fn->spec
                      ^net.sf.jsqlparser.statement.select.TableFunction from-item
                      db lsrf-var-counter))
@@ -4131,7 +4149,7 @@
 
           (and db (instance? net.sf.jsqlparser.statement.select.TableFunction from-item))
           (if-let [{vdb :db vschema :schema vname :name valias :alias}
-                   (or (when-not (table-function-has-column-reference? from-item)
+                   (or (when-not (table-function-has-unbound-column? from-item)
                          (table-fn->virtual-table
                           ^net.sf.jsqlparser.statement.select.TableFunction from-item db))
                        ;; A set-returning function this database defines is
@@ -4293,7 +4311,7 @@
                ;; every reference to it raised `column "g" does not
                ;; exist`.
                (and db (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
-                    (not (table-function-has-column-reference? rt))
+                    (not (table-function-has-unbound-column? rt))
                     (table-fn->virtual-table
                      ^net.sf.jsqlparser.statement.select.TableFunction rt db))
                (let [{vdb :db vschema :schema vname :name valias :alias}

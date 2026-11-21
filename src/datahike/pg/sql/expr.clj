@@ -3795,6 +3795,12 @@
                      locals (into #{} (keep local-item-alias) local-items)
                      visible (set/difference visible-outers locals)
                      scope-nodes (plain-select-scope-nodes ps)
+                     from-function-refs
+                     (mapcat (fn [item]
+                               (when (instance? net.sf.jsqlparser.statement.select.TableFunction item)
+                                 (refs (.getFunction ^net.sf.jsqlparser.statement.select.TableFunction item)
+                                       visible)))
+                             local-items)
                      own-refs (into #{}
                                     (keep (fn [^Column col]
                                             (let [alias (some-> col .getTable .getName
@@ -3843,7 +3849,7 @@
                                                     (catch Throwable _ nil))]
                                  (refs body visible-outers)))
                              with-items)]
-                 (into own-refs (concat with-refs
+                 (into own-refs (concat from-function-refs with-refs
                                         (mapcat #(refs % visible) children))))
 
               ;; Expression roots (notably CASE) are not SELECT scopes, but
