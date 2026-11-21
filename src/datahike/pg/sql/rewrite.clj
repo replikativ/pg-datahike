@@ -973,13 +973,15 @@
   "The table-level `PARTITION BY <strategy> (...)` clause of a CREATE
    TABLE, as {:strategy \"RANGE\" :span [start end]}, or nil.
 
-   Only `PARTITION BY` at paren depth 0 right after the column list's `)`
-   counts; a window's `OVER (PARTITION BY ...)` is always inside
-   parentheses, and strings/comments are opaque tokens."
+   Look after the column list and optional INHERITS clause, before
+   table access and storage options."
   [toks]
   (let [code (vec (remove #(= :comment (:type %)) toks))]
-    (when-let [i (create-table-options-start code)]
-      (let [t (nth code i nil)
+    (when-let [start (create-table-options-start code)]
+      (let [inherits? (and (= "inherits" (kw-text (nth code start nil)))
+                           (punct? (nth code (inc start) nil) "("))
+            i (if inherits? (match-paren-group code (inc start)) start)
+            t (nth code i nil)
             strategy-token (nth code (+ i 2) nil)
             strategy (or (kw-text strategy-token)
                          (when (= :quoted (:type strategy-token)) (:value strategy-token)))]
@@ -992,6 +994,9 @@
               (when-not (#{"range" "list" "hash"} (str/lower-case strategy))
                 (throw (errors/pg-error :invalid-parameter-value
                                         {:message (str "unrecognized partitioning strategy \"" strategy "\"")})))
+              (when inherits?
+                (throw (ex-info "cannot create partitioned table as inheritance child"
+                                {:error :invalid-object-definition :sqlstate "42P17"})))
               {:strategy (str/upper-case strategy)
                :span [(:pos t) (:end (nth code (dec end)))]})))))))
 

@@ -89,7 +89,8 @@
             [["WITH OIDS" "42601"] ["WITH (oids)" "0A000"]
              ["WITH (oids = true)" "0A000"] ["WITH (oids = 0, oids = true)" "0A000"]
              ["WITH (oids = 2)" "42601"] ["PARTITION BY MAGIC (id)" "22023"]
-             ["PARTITION BY \"unknown\" (id)" "22023"] ["PARTITION BY RANGE (id)" "0A000"]]]
+             ["PARTITION BY \"unknown\" (id)" "22023"] ["PARTITION BY RANGE (id)" "0A000"]
+             ["INHERITS (some_table) PARTITION BY LIST (id)" "42P17"]]]
       (testing option
         (is (= [:error state]
                (vec (take 2 (run c (str "CREATE TABLE rejected_option (id int) " option))))))

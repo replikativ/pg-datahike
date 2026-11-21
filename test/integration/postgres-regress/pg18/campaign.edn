@@ -84,6 +84,10 @@
        :source-lines [91 91]
        :gate "test/datahike/test/pg_check_constraint_test.clj"
        :test-var "postgres-create-table-rejects-invalid-defaults"}
+      {:id :reject-partition-clause-on-inheritance-child
+       :source-lines [120 122]
+       :gate "test/datahike/test/pg_check_constraint_test.clj"
+       :test-var "postgres-create-table-rejects-invalid-options"}
       {:id :reject-unknown-partition-strategy
        :source-lines [161 163]
        :gate "test/datahike/test/pg_check_constraint_test.clj"
