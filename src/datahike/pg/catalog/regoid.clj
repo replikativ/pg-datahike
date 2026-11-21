@@ -480,7 +480,7 @@
   ;; PostgreSQL's core catalog does not describe their extension-assigned OIDs.
   (into (mapv (fn [[name args ret]]
                 {:oid (long (Math/abs (.hashCode ^String name))) :proname name
-                 :args args :ret ret :namespace-oid 2200 :kind "f"
+                 :args args :ret ret :namespace-oid 2200 :kind "f" :language 13
                  :strict true :volatile "i" :retset false})
               [["vector_dims" [16383] 23]
                ["vector_norm" [16383] 701]
@@ -495,7 +495,7 @@
         ;; and the transactional user allocator (16384).
         (mapv (fn [[oid name args ret]]
                 {:oid oid :proname name :args args :ret ret
-                 :namespace-oid 2200 :kind "f" :strict true
+                 :namespace-oid 2200 :kind "f" :language 13 :strict true
                  :volatile "i" :retset false})
               [[16378 "vector_in" [2275 26 23] 16383]
                [16379 "vector_out" [16383] 2275]
@@ -533,6 +533,7 @@
       (fail! "23505" (str "routine OID " oid " conflicts with a static catalog identity")))
     {:oid (:datahike.pg.function/oid ent) :proname full-name
      :namespace-oid 2200
+     :language (if (= "plpgsql" (:datahike.pg.function/language ent)) 13671 14)
      ;; Stored definitions currently belong to public and keep type spellings.
      ;; Decode them in that defining context, independently of the reader's path.
      :args (binding [*search-path* ["public"]]

@@ -401,6 +401,14 @@
   [^String s]
   (carrier/->date (in/date-in s (datetime-ctx))))
 
+(defn internal-char-output
+  "The text form of an unsigned PostgreSQL internal char byte."
+  [b]
+  (cond
+    (zero? b) ""
+    (< b 0x80) (str (char b))
+    :else (format "\\%03o" b)))
+
 (defn- internal-char-in
   "PostgreSQL's charin followed by charout (utils/adt/char.c), since a
    `\"char\"` is held as its output text. Input is a `\\ooo` octal escape or
@@ -412,10 +420,7 @@
             (empty? t) 0
             (re-matches #"\\[0-3][0-7][0-7]" t) (Long/parseLong (subs t 1) 8)
             :else (bit-and 0xff (aget (.getBytes t java.nio.charset.StandardCharsets/UTF_8) 0)))]
-    (cond
-      (zero? b) ""
-      (< b 0x80) (str (char b))
-      :else (format "\\%03o" b))))
+    (internal-char-output b)))
 
 (def month-names
   ;; PostgreSQL's own table (`datetktbl` in datetime.c) takes the
