@@ -5124,8 +5124,7 @@
             (let [fn-param (symbol (str "?cast-s" (swap! (:var-counter ctx) inc)))
                   cast-fn  (fn [v]
                              (cond
-                               (nil? v)           nil
-                               (= :__null__ v)    :__null__
+                               (fns/sql-null? v)  :__null__
                                (pg-rec/record? v)
                                (if composite-type
                                  (pg-rec/with-layout
