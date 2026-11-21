@@ -182,6 +182,11 @@ public final class PgWireServer {
          */
         default QueryResult executeInGroup(String sql) { return execute(sql); }
 
+        /** Execute a member of a Simple Query whose statement count is known. */
+        default QueryResult executeInGroup(String sql, boolean multiStatement) {
+            return executeInGroup(sql);
+        }
+
         /**
          * Extended Query protocol Parse phase. Translate the SQL once
          * and return an opaque state object that subsequent Bind/
@@ -1068,6 +1073,20 @@ public final class PgWireServer {
     // Connection handling
     // ========================================================================
 
+    private static final class CopyState {
+        boolean active;
+        SimpleQuery simpleQuery;
+    }
+
+    private static final class SimpleQuery {
+        final String[] statements;
+        int next;
+
+        SimpleQuery(String[] statements) {
+            this.statements = statements;
+        }
+    }
+
     private void handleConnection(Socket client) {
         QueryHandler handler = null;
         Socket transport = client;
@@ -1102,13 +1121,13 @@ public final class PgWireServer {
             // and doesn't enter this state — handleQuery always ends with
             // ReadyForQuery regardless of errors inside.
             boolean[] inError = new boolean[]{false};
-            // COPY-IN sub-protocol state. 0 = NONE, 1 = COPY_IN. The
-            // wire loop dispatches 'd' (CopyData), 'c' (CopyDone),
+            // COPY-IN state also holds the suspended Simple Query, if any.
+            // The wire loop dispatches 'd' (CopyData), 'c' (CopyDone),
             // 'f' (CopyFail) messages to the handler's copyChunk /
             // copyComplete / copyAbort callbacks while in COPY_IN.
             // 'H' (Flush) and 'S' (Sync) are silently ignored in this
             // state, per PG protocol.sgml:1313-1318.
-            int[] copyState = new int[]{0};
+            CopyState copyState = new CopyState();
 
             // Deferred-CC INSERT batch buffer. Populated when the
             // handler returns a {@link QueryResult#batchable} result;
@@ -1145,7 +1164,7 @@ public final class PgWireServer {
                 // waits for its next CopyData frame. A CancelRequest in this
                 // window must remain pending instead of being discarded as
                 // an idle-session cancel.
-                if (doingCommandRead != null) doingCommandRead.set(copyState[0] != 1);
+                if (doingCommandRead != null) doingCommandRead.set(!copyState.active);
                 int msgType = in.read();
                 if (msgType == -1) break;
 
@@ -1218,54 +1237,59 @@ public final class PgWireServer {
                     // (CopyFail). 'H' (Flush) and 'S' (Sync) are
                     // ignored here, per PG protocol.sgml:1313-1318.
                     // Anything else aborts the copy with an error.
-                    if (copyState[0] == 1) {
+                    if (copyState.active) {
+                        boolean failed;
                         switch (msgType) {
                             case 'd' -> {
                                 handler.copyChunk(body);
+                                continue;
                             }
                             case 'c' -> {
                                 QueryResult cr = handler.copyComplete();
-                                copyState[0] = 0;
-                                if (cr != null && cr.error != null) {
+                                failed = cr != null && cr.error != null;
+                                if (failed) {
                                     sendError(out, "ERROR",
                                             cr.sqlstate != null ? cr.sqlstate : "XX000",
                                             cr.error, cr.errorFields);
-                                    if (txStatus[0] == 'T') txStatus[0] = 'E';
                                 } else {
                                     sendCommandComplete(out,
                                             cr != null && cr.commandTag != null
                                                 ? cr.commandTag : "COPY 0");
                                 }
-                                sendReadyForQuery(out, txStatus[0]);
-                                out.flush();
-                                clearStatementCancel(cancelState[0]);
                             }
                             case 'f' -> {
                                 String reason = readCopyFailReason(body);
                                 handler.copyAbort(reason);
-                                copyState[0] = 0;
                                 sendError(out, "ERROR", "57014",
                                         "COPY from stdin failed: " + reason);
-                                if (txStatus[0] == 'T') txStatus[0] = 'E';
-                                sendReadyForQuery(out, txStatus[0]);
-                                out.flush();
-                                clearStatementCancel(cancelState[0]);
+                                failed = true;
                             }
                             // Flush / Sync — ignored during COPY-IN
-                            case 'H', 'S' -> { /* no-op */ }
+                            case 'H', 'S' -> { continue; }
                             case 'X' -> { return; }
                             default -> {
                                 handler.copyAbort("unexpected message type during COPY-IN: " + (char) msgType);
-                                copyState[0] = 0;
                                 sendError(out, "ERROR", "08P01",
                                         "Unsupported message during COPY-IN: " + (char) msgType);
-                                if (txStatus[0] == 'T') txStatus[0] = 'E';
-                                sendReadyForQuery(out, txStatus[0]);
-                                out.flush();
-                                clearStatementCancel(cancelState[0]);
+                                failed = true;
                             }
                         }
-                        // Skip the regular dispatch for this iteration
+                        SimpleQuery simpleQuery = copyState.simpleQuery;
+                        copyState.active = false;
+                        copyState.simpleQuery = null;
+                        if (failed && txStatus[0] == 'T') txStatus[0] = 'E';
+                        if (simpleQuery == null) {
+                            sendReadyForQuery(out, txStatus[0]);
+                            out.flush();
+                        } else if (failed) {
+                            finishSimpleQuery(out, txStatus, handler, batch, true);
+                        } else {
+                            runSimpleQuery(simpleQuery, out, txStatus, handler, copyState, batch);
+                        }
+                        if (!copyState.active) {
+                            if (simpleQuery != null && txStatus[0] != 'T') portals.clear();
+                            clearStatementCancel(cancelState[0]);
+                        }
                         continue;
                     }
 
@@ -1278,12 +1302,12 @@ public final class PgWireServer {
                                 // explicit transaction remains open.
                                 portals.remove("");
                             }
-                            handleQuery(body, out, txStatus, handler, copyState, batch);
+                            handleQuery(simpleQuery, out, txStatus, handler, copyState, batch);
                             // Simple Query includes its own transaction
                             // boundary. BEGIN leaves 'T'; COMMIT, ROLLBACK,
                             // autocommit, and failed transactions invalidate
                             // every non-holdable extended-query portal.
-                            if (txStatus[0] != 'T') portals.clear();
+                            if (!copyState.active && txStatus[0] != 'T') portals.clear();
                         }
                         case 'X' -> { return; }
                         case 'P' -> handleParse(body, extBatch.curOut, statements, handler);
@@ -1368,7 +1392,7 @@ public final class PgWireServer {
                 // boundary yet. CopyDone/CopyFail clear inside the COPY
                 // routing block above, before its early continue.
                 if ((msgType == 'E' || msgType == 'Q' || msgType == 'S')
-                        && copyState[0] != 1) {
+                        && !copyState.active) {
                     clearStatementCancel(cancelState[0]);
                 }
             }
@@ -1722,8 +1746,9 @@ public final class PgWireServer {
     // Simple Query protocol
     // ========================================================================
 
-    private void handleQuery(byte[] body, DataOutputStream out, char[] txStatus, QueryHandler handler, int[] copyState, BatchBuffer batch) throws IOException {
-        String sql = new String(body, 0, body.length - 1, StandardCharsets.UTF_8).trim();
+    private void handleQuery(String sql, DataOutputStream out, char[] txStatus, QueryHandler handler,
+                             CopyState copyState, BatchBuffer batch) throws IOException {
+        sql = sql.trim();
 
         // Before the split: a statement that reports its own source
         // (PREPARE, for pg_prepared_statements) needs the string the
@@ -1762,13 +1787,17 @@ public final class PgWireServer {
             return;
         }
 
+        runSimpleQuery(new SimpleQuery(statements), out, txStatus, handler, copyState, batch);
+    }
+
+    private void runSimpleQuery(SimpleQuery query, DataOutputStream out, char[] txStatus,
+                                QueryHandler handler, CopyState copyState, BatchBuffer batch) throws IOException {
         // On first error, stop processing remaining statements (PG semantics:
         // a Simple Query with multiple statements aborts the whole batch on
         // the first failure).
         boolean errored = false;
-        for (String stmt : statements) {
-            if (errored) break;
-            stmt = stripComments(stmt);
+        while (!errored && query.next < query.statements.length) {
+            String stmt = stripComments(query.statements[query.next++]);
             // stripComments replaces a comment with a SPACE (to keep token
             // separation), so a comment-only fragment comes back as " ",
             // not "" — test the trimmed form or it reaches the parser.
@@ -1822,7 +1851,7 @@ public final class PgWireServer {
                 // executeInGroup: a write opens/joins this 'Q''s implicit
                 // transaction (committed at end-of-'Q' below) so a
                 // multi-statement Simple Query is atomic — PG semantics.
-                QueryResult result = handler.executeInGroup(stmt);
+                QueryResult result = handler.executeInGroup(stmt, query.statements.length > 1);
                 // Clear any pending interrupt bit left by the safety-net
                 // cancel path so it doesn't bleed into the next
                 // statement's socket read on this thread.
@@ -1874,7 +1903,8 @@ public final class PgWireServer {
                     }
                     sendCopyInResponse(out, result.copyColumnCount);
                     out.flush();
-                    copyState[0] = 1;
+                    copyState.simpleQuery = query;
+                    copyState.active = true;
                     return;
                 } else if (result.copyOutMode) {
                     // COPY ... TO STDOUT. Drain the held batch first so
@@ -1932,6 +1962,11 @@ public final class PgWireServer {
             }
         }
 
+        finishSimpleQuery(out, txStatus, handler, batch, errored);
+    }
+
+    private void finishSimpleQuery(DataOutputStream out, char[] txStatus, QueryHandler handler,
+                                   BatchBuffer batch, boolean errored) throws IOException {
         // End-of-Q drain. On the error path the rows were never
         // CommandComplete'd to the client, so dropping them keeps
         // wire response and persisted state in sync. On the success
@@ -2607,7 +2642,7 @@ public final class PgWireServer {
                                   java.util.Map<String, Portal> portals,
                                   char[] txStatus,
                                   QueryHandler handler,
-                                  int[] copyState,
+                                  CopyState copyState,
                                   ExtBatchBuffer extBatch) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         String portalName = readCString(buf);
@@ -2735,7 +2770,7 @@ public final class PgWireServer {
             extBatch.resetCur();
             sendCopyInResponse(out, result.copyColumnCount);
             out.flush();
-            copyState[0] = 1;
+            copyState.active = true;
             return;
         } else if (result.copyOutMode) {
             // Extended-Query COPY-OUT. Same ordering obligation as the

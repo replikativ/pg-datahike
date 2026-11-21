@@ -187,6 +187,7 @@
   "Open a startup-completed pgwire connection and call (f in out)."
   [f]
   (with-open [sock (Socket. "127.0.0.1" (int *port*))]
+    (.setSoTimeout sock 15000)
     (let [out (DataOutputStream. (.getOutputStream sock))
           in (DataInputStream. (.getInputStream sock))]
       (send-msg! out nil (ba [:i32 196608]
@@ -228,11 +229,14 @@
   (send-msg! out \E (ba (cstr "") [:i32 0]))
   (send-msg! out \S (byte-array 0)))
 
-(defn- read-until-tag [^DataInputStream in terminal]
+(defn- read-until-tags [^DataInputStream in terminals]
   (loop [acc []]
     (let [[tag body :as msg] (read-msg in)
           acc (conj acc msg)]
-      (if (= terminal tag) acc (recur acc)))))
+      (if (terminals tag) acc (recur acc)))))
+
+(defn- read-until-tag [in terminal]
+  (read-until-tags in #{terminal}))
 
 (defn- parse-describe-execute-many
   "Parse and Describe one named statement, then Bind and Execute it for
@@ -952,3 +956,102 @@
     (testing "and through Parse"
       (let [r (parse-describe-execute "SELECT 1 /* oops" [] [])]
         (is (= "42601" (get-in r [:error \C])))))))
+
+(defn- send-copy-data! [out ^String data]
+  (send-msg! out \d (.getBytes data StandardCharsets/UTF_8))
+  (send-msg! out \c (byte-array 0)))
+
+(defn- ready-status [messages]
+  (some (fn [[tag ^bytes body]] (when (= \Z tag) (char (aget body 0))))
+        messages))
+
+(deftest postgres-simple-query-resumes-after-each-copy
+  (simple "CREATE TABLE copy_group (id int PRIMARY KEY)")
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q
+                 (cstr (str "SELECT 0; COPY copy_group FROM STDIN;"
+                            " COPY copy_group FROM STDIN; SELECT count(*) FROM copy_group")))
+      (let [prefix (read-until-tags in #{\G \Z})]
+        (is (= [\T \D \C \G] (mapv first prefix)))
+        (is (= [["0"]] (:rows (decode prefix)))))
+      (send-copy-data! out "1\n")
+      (let [next-copy (read-until-tags in #{\G \Z})]
+        (is (= [\C \G] (mapv first next-copy)))
+        (is (= "COPY 1" (:command-complete (decode next-copy))))
+        (is (= [["0"]] (:rows (simple "SELECT count(*) FROM copy_group"))))
+        (when (= \G (ffirst (rseq next-copy)))
+          (send-copy-data! out "2\n")
+          (let [suffix (read-until-ready in)]
+            (is (= [\C \T \D \C \Z] (mapv first suffix)))
+            (is (= "COPY 1" (:command-complete (decode (take 1 suffix)))))
+            (is (= [["2"]] (:rows (decode suffix))))
+            (is (= \I (ready-status suffix))))))))
+  (is (= [["1"] ["2"]] (:rows (simple "SELECT id FROM copy_group ORDER BY id")))))
+
+(deftest simple-query-copy-failures-roll-back-the-group
+  (simple "CREATE TABLE copy_group (id int PRIMARY KEY)")
+  (doseq [[label tail finish! sqlstate]
+          [[:copy-row-error "COPY copy_group FROM STDIN; SELECT 42"
+            #(send-copy-data! % "not-an-integer\n") "22P02"]
+           [:copy-fail "COPY copy_group FROM STDIN; SELECT 42"
+            #(send-msg! % \f (cstr "copy canceled by test")) "57014"]
+           [:suffix-error "SELECT 1 / 0; SELECT 42" nil "22012"]]]
+    (testing (name label)
+      (with-conn
+        (fn [in out]
+          (send-msg! out \Q (cstr (str "INSERT INTO copy_group VALUES (1);"
+                                       " COPY copy_group FROM STDIN; " tail)))
+          (is (= [\C \G] (mapv first (read-until-tags in #{\G \Z}))))
+          (send-copy-data! out "2\n")
+          (let [result (if finish!
+                         (let [next-copy (read-until-tags in #{\G \Z})]
+                           (is (= [\C \G] (mapv first next-copy)))
+                           (if (= \G (ffirst (rseq next-copy)))
+                             (do (finish! out) (read-until-ready in))
+                             next-copy))
+                         (read-until-ready in))]
+            (is (= sqlstate (get-in (decode result) [:error \C])))
+            (is (nil? (:rows (decode result))))
+            (is (= \I (ready-status result))))
+          (send-msg! out \Q (cstr "SELECT count(*) FROM copy_group"))
+          (is (= [["0"]] (:rows (decode (read-until-ready in))))))))))
+
+(deftest simple-query-copy-error-keeps-an-explicit-transaction-aborted
+  (simple "CREATE TABLE copy_group (id int PRIMARY KEY)")
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "BEGIN; COPY copy_group FROM STDIN; SELECT 1 / 0"))
+      (is (= [\C \G] (mapv first (read-until-tags in #{\G \Z}))))
+      (send-copy-data! out "1\n")
+      (let [result (read-until-ready in)]
+        (is (= "22012" (get-in (decode result) [:error \C])))
+        (is (= \E (ready-status result))))
+      (send-msg! out \Q (cstr "SELECT * FROM copy_group"))
+      (is (= "25P02" (get-in (decode (read-until-ready in)) [:error \C])))
+      (send-msg! out \Q (cstr "ROLLBACK"))
+      (is (= \I (ready-status (read-until-ready in))))))
+  (is (= [] (or (:rows (simple "SELECT id FROM copy_group")) []))))
+
+(deftest simple-query-copy-can-transition-to-an-explicit-transaction
+  (simple "CREATE TABLE copy_group (id int PRIMARY KEY)")
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "COPY copy_group FROM STDIN; BEGIN"))
+      (is (= [\G] (mapv first (read-until-tags in #{\G \Z}))))
+      (send-copy-data! out "1\n")
+      (is (= \T (ready-status (read-until-ready in))))
+      (is (= [["0"]] (:rows (simple "SELECT count(*) FROM copy_group"))))
+      (send-msg! out \Q (cstr "ROLLBACK"))
+      (is (= \I (ready-status (read-until-ready in))))))
+  (is (= [["0"]] (:rows (simple "SELECT count(*) FROM copy_group")))))
+
+(deftest disconnect-during-a-later-copy-discards-the-group
+  (simple "CREATE TABLE copy_group (id int PRIMARY KEY)")
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "COPY copy_group FROM STDIN; COPY copy_group FROM STDIN"))
+      (is (= [\G] (mapv first (read-until-tags in #{\G \Z}))))
+      (send-copy-data! out "1\n")
+      (is (= [\C \G] (mapv first (read-until-tags in #{\G \Z}))))))
+  (is (= [["0"]] (:rows (simple "SELECT count(*) FROM copy_group")))))
