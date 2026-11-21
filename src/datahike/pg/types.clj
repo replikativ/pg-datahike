@@ -530,6 +530,7 @@
     "xid"         oid-xid
     ;; Catalog ACL columns carry NULL, but clients still describe their type.
     "_aclitem"    1034
+    "anyarray"    2277
     ;; The catalogs' own vector type: `pg_index.indkey`,
     ;; `pg_proc.proargtypes`. Declaring it is what lets a value written
     ;; SPACE-separated be read as the vector it is.

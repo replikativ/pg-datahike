@@ -7014,7 +7014,7 @@
           (swap! (:nullable-vars ctx) conj out-var)
           out-var)))))
 
-(defn- tableoid-ref?
+(defn tableoid-ref?
   [expr]
   (and (instance? Column expr)
        (nil? (.getArrayConstructor ^Column expr))
@@ -7029,18 +7029,33 @@
   [ctx ^Column expr]
   (let [aliases (:table-aliases ctx)
         tbl (.getTable expr)
-        relation (if tbl
-                   (get aliases (params/unquote-ident (.getName ^Table tbl)))
-                   (let [occurrences (or (seq (:relation-aliases (meta aliases)))
-                                         (seq (distinct (vals aliases)))
-                                         (some-> (:default-table ctx) vector))]
-                     (when (> (count occurrences) 1)
-                       (params/ambiguous-column! "tableoid"))
-                     (some->> (first occurrences) (#(get aliases % %)))))]
-    (or (when (and relation (not (contains? (set (:derived-aliases ctx)) relation)))
-          (or (get catalog-objects/catalog-relation-oids relation)
-              (some-> (:db ctx) (pgs/table-oid relation))))
-        (throw (errors/pg-error :undefined-column {:column "tableoid"})))))
+        alias (if tbl
+                (params/unquote-ident (.getName ^Table tbl))
+                (let [occurrences (or (seq (:relation-aliases (meta aliases)))
+                                      (seq (distinct (vals aliases)))
+                                      (some-> (:default-table ctx) vector))]
+                  (when (> (count occurrences) 1)
+                    (params/ambiguous-column! "tableoid"))
+                  (first occurrences)))
+        relation (if tbl (get aliases alias) (get aliases alias alias))
+        oid (when (and relation (not (contains? (set (:derived-aliases ctx)) relation)))
+              (or (get catalog-objects/catalog-relation-oids relation)
+                  (some-> (:db ctx) (pgs/table-oid relation))))
+        evar (get @(:entity-vars ctx) alias)]
+    (when-not oid
+      (throw (errors/pg-error :undefined-column {:column "tableoid"})))
+    (if (and (contains? @(:left-join-evars ctx) evar)
+             (not= alias (:join-condition-right-alias ctx)))
+      ;; A null-extended row has no tableoid. The current ON condition
+      ;; considers only actual rows of its right relation.
+      (let [arg (symbol (str "?tableoid-" (swap! (:var-counter ctx) inc)))
+            result (ctx/fresh-var! ctx)]
+        (swap! (:in-params ctx) conj arg)
+        (swap! (:in-args ctx) conj #(if (fns/sql-null? %) :__null__ oid))
+        (swap! (:nullable-vars ctx) conj result)
+        (ctx/add-clause! ctx [(list arg evar) result])
+        result)
+      oid)))
 
 (defn column-value!
   "Return a column's SQL value variable. Most Datahike scalar values are
@@ -8731,6 +8746,8 @@
                 ;; are values; this branch has to let them reach it.
                 (not (bare-session-value-column? left))
                 (not (bare-session-value-column? right))
+                (not (tableoid-ref? left))
+                (not (tableoid-ref? right))
                 (nil? (.getArrayConstructor ^Column left))
                 (nil? (.getArrayConstructor ^Column right))
                 (not (jsonb-column? ctx left))
@@ -9377,6 +9394,7 @@
         ;; through resolve-column / col-var!.
         (if (and *conjunctive-where*
                  (instance? Column left)
+                 (not (tableoid-ref? left))
                  (not= types/oid-vector (source-oid ctx left))
                  (nil? (.getArrayConstructor ^Column left))
                  (instance? JdbcParameter right)
@@ -9409,6 +9427,7 @@
                                   'datahike.pg.query-fns/sql-eq?)]
                 (conj guards [(list equality-fn v pv)]))))
           (if (and (instance? Column left)
+                   (not (tableoid-ref? left))
                    (not= types/oid-vector (source-oid ctx left))
                    (nil? (.getArrayConstructor ^Column left))
                    ;; `outer.col = 1` inside a correlated subquery compares

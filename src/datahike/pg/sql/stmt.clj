@@ -387,6 +387,7 @@
                     (unquote-ident (str/trim (.getName ^Alias al))))]
             {:name a :alias a}))
         right-alias (or alias name)
+        ctx (assoc ctx :join-condition-right-alias right-alias)
         ;; Multi-condition ON (A AND B AND ...) lands as a single
         ;; AndExpression, not split per `getOnExpressions`. Flatten so
         ;; each conjunct is recognised as its own EqualsTo and the
@@ -522,6 +523,8 @@
                        left (.getLeftExpression eq)
                        right (.getRightExpression eq)]
                    (and (instance? Column left) (instance? Column right)
+                        (not (expr/tableoid-ref? left))
+                        (not (expr/tableoid-ref? right))
                         ;; JSqlParser stores an array subscript on its Column
                         ;; node. This shortcut can only join whole attributes.
                         (nil? (.getArrayConstructor ^Column left))

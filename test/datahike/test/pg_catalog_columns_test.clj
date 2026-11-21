@@ -239,3 +239,46 @@
                             i.indnullsnotdistinct, i.indpred IS NULL, i.indexprs IS NULL
                        FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
                        WHERE i.indrelid = 'indexed'::regclass ORDER BY c.relname"))))))
+
+(deftest generated-text-search-and-conversion-metadata
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (= "english|default|3717\nsimple|default|3717"
+             (run h "SELECT c.cfgname, p.prsname, p.prsstart::oid
+                       FROM pg_ts_config c JOIN pg_ts_parser p ON c.cfgparser = p.oid
+                       ORDER BY c.cfgname")))
+      (is (= "english_stem|snowball|dsnowball_lexize\nsimple|simple|dsimple_lexize"
+             (run h "SELECT d.dictname, t.tmplname, t.tmpllexize
+                       FROM pg_ts_dict d JOIN pg_ts_template t ON d.dicttemplate = t.oid
+                       ORDER BY d.dictname")))
+      (is (= "2607|4375|utf8_to_iso8859_1"
+             (run h "SELECT tableoid, conproc::oid, conproc FROM pg_conversion
+                       WHERE conforencoding = 6 AND contoencoding = 8 AND condefault"))))))
+
+(deftest attribute-layout-and-column-locality
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (doseq [sql ["CREATE TABLE exported_parent (id integer)"
+                   "CREATE TABLE exported_child (label text) INHERITS (exported_parent)"]]
+        (is (nil? (.error (.execute h ^String sql))) sql))
+      (is (= "id|4|i|f|f|t|t\nlabel|-1|i|t|f|t|t"
+             (run h "SELECT a.attname, a.attlen, a.attalign, a.attislocal,
+                            a.atthasmissing, a.attoptions IS NULL, a.attfdwoptions IS NULL
+                       FROM pg_attribute a
+                       WHERE a.attrelid = 'exported_child'::regclass
+                       ORDER BY a.attnum"))))))
+
+(deftest tableoid-follows-left-join-row-presence
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (doseq [sql ["CREATE TABLE tableoid_left (id int)"
+                   "CREATE TABLE tableoid_right (id int)"
+                   "INSERT INTO tableoid_left VALUES (1), (2)"
+                   "INSERT INTO tableoid_right VALUES (1)"]]
+        (is (nil? (.error (.execute h ^String sql))) sql))
+      (is (= "1|tableoid_right|f\n2||t"
+             (run h "SELECT l.id, c.relname, r.tableoid IS NULL
+                       FROM tableoid_left l LEFT JOIN tableoid_right r
+                         ON r.id = l.id AND r.tableoid = 'tableoid_right'::regclass
+                       LEFT JOIN pg_class c ON c.oid = r.tableoid
+                       ORDER BY l.id"))))))
