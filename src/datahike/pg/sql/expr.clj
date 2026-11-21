@@ -1886,6 +1886,14 @@
                                   "pg_get_triggerdef" [:pg_trigger/oid :pg_trigger/tgdef])]
         (catalog-def-lookup! ctx (or (first args) :__null__) key-attr def-attr result-var))
 
+      (and (= fname "isfinite")
+           (= types/oid-interval (first (call-arg-oids ctx arg-exprs))))
+      (let [fn-param (symbol (str "?isfinite-interval" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj fns/sql-isfinite-interval)
+        (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
+        result-var)
+
       ;; abs on a declared integer column is width-checked:
       ;; abs(INT_MIN) is out of range in PostgreSQL, while Java's abs
       ;; WRAPS and returns the negative input unchanged -- an absolute

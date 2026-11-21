@@ -108,6 +108,7 @@
              [:lookup-ref/unique         "23505"]
              [:query/binding             "42601"]
              [:query/where               "42601"]
+             [:query/intermediate-limit  "54000"]
              [:transact/cas              "40001"]
              [:transact/ensure           "23514"]
              [:transact/purge            "22023"]

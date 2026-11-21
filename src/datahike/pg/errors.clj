@@ -491,6 +491,7 @@
    :query/where                 "42601"
    :query/where-conflict        "42703"
    :query/binding               "42601"
+   :query/intermediate-limit    "54000"
 
    ;; CAS / serialization
    :transact/cas                "40001"

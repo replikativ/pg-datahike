@@ -64,10 +64,22 @@
    :detail "The catalog reports relispopulated true for an unpopulated view even though a direct scan rejects it."}
   {:id :or-join-heap-exhaustion
    :file "join" :lines [3835 3836] :state :open :impact :internal-error
-   :detail "The OR join over two 10,000-row inputs terminated its connection with a Java heap error."}
+   :detail "The frozen target exhausted its heap. Datahike PR 1137 at f4ef9e5 rejects the same 10,000-row self-join under an enabled slot limit. pg-datahike translates the rejection to 54000 and the handler remains usable. Activation on a released dependency and native row-count parity remain open."}
   {:id :infinite-interval-date-bin
-   :file "interval" :lines [772 773] :state :open :impact :internal-error
-   :detail "An infinite interval stride reaches a Java date-to-interval cast instead of a PostgreSQL error."}
+   :file "interval" :lines [772 773] :state :covered :impact :internal-error
+   :detail "The untyped infinite strides used to reach a Java cast. The gate checks PostgreSQL SQLSTATE 22008 for both signs."}
+  {:id :average-finite-intervals
+   :file "interval" :lines [169 169] :state :covered :impact :internal-error
+   :detail "The typed overload now averages stored intervals and isfinite filters both infinities. The gate checks the interval OID and value in the supported postgres output style."}
+  {:id :unparenthesized-arithmetic-default
+   :file "constraints" :lines [32 33] :state :open :impact :unsupported
+   :detail "The arithmetic default is rejected at the plus sign. Later errors in this block follow from the destination table being absent."}
+  {:id :foreign-key-definition-validation
+   :file "foreign_key" :lines [538 543] :state :open :impact :wrong-result
+   :detail "Invalid referenced columns can be accepted and leave a relation and dependency behind. An isolated missing-column reference reproduced the error on the native server and persisted the child on the target."}
+  {:id :reset-transaction-isolation
+   :file "transactions" :lines [39 42] :state :open :impact :wrong-result
+   :detail "After a transaction reads, RESET transaction_isolation succeeds on the target. Native returns 0A000 and the next query fails with 25P02."}
   {:id :database-rename-fixture
    :file "database" :lines [1 5] :state :boundary :impact :fixture
    :detail "Unsupported rename leaves a run-created database under the original name."}

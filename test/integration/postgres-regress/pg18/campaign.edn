@@ -68,7 +68,18 @@
     {:name "timestamptz",
      :boundaries #{:time-zones :functions :casts :operators :temporal},
      :mode :unmeasured}
-    {:name "interval", :boundaries #{:functions :casts :operators :temporal}, :mode :unmeasured}
+    {:name "interval", :boundaries #{:functions :casts :operators :temporal}, :mode :discovery
+     :blockers #{:interval-window-aggregates}
+     :accepted-differences #{:interval-output-style}
+     :strict-slices
+     [{:id :average-finite-intervals
+       :source-lines [169 169]
+       :gate "test/datahike/test/pg_datetime_functions_test.clj"
+       :test-var "postgres-average-of-finite-intervals"}
+      {:id :infinite-interval-date-bin
+       :source-lines [772 773]
+       :gate "test/datahike/test/pg_datetime_functions_test.clj"
+       :test-var "postgres-date-bin-rejects-infinite-interval-strides"}]}
     {:name "create_table", :boundaries #{:defaults :ddl :type-metadata}, :mode :discovery
      :blockers #{:partitioning :catalog-persistence}
      :strict-slices

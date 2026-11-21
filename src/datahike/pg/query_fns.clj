@@ -24,6 +24,8 @@
 (def filter-jsonb-agg-ordered-desc       fns/filter-jsonb-agg-ordered-desc)
 (def filter-avg                          fns/filter-avg)
 (def filter-avg-numeric                  fns/filter-avg-numeric)
+(def avg-interval                        fns/avg-interval)
+(def avg-interval-distinct               fns/avg-interval-distinct)
 (def filter-bool-and                     fns/filter-bool-and)
 (def filter-bool-or                      fns/filter-bool-or)
 (def filter-corr                         fns/filter-corr)
