@@ -4535,6 +4535,16 @@
 
       :else identity)))
 
+(defn time-now-cast?
+  "A time literal whose constant depends on when the statement is parsed."
+  [node]
+  (when (instance? CastExpression node)
+    (let [^CastExpression cast node
+          inner (.getLeftExpression cast)]
+      (and (= :time (types/cast-category (str (.getColDataType cast))))
+           (instance? StringValue inner)
+           (= "now" (str/lower-case (str/trim (string-value-text inner))))))))
+
 (defn translate-cast-expr
   "Translate a CAST expression to a Datalog function binding.
    For constant values, performs the cast at translation time.
@@ -4624,6 +4634,14 @@
         zone-shift (zone-crossing src-oid target-oid types/*time-zone*)
         inner-raw (zone-shift inner-raw)]
     (cond
+      (time-now-cast? cast-expr)
+      (let [precision (some-> (re-find #"\(\s*(\d+)\s*\)" type-str) second parse-long)
+            kind (if (= target-oid types/oid-timetz) "current_time" "localtime")]
+        ;; PostgreSQL reads the special text literal during parse. Keep it
+        ;; in this prepared plan and out of the shared translation cache.
+        (params/session-dependent!)
+        (statement-clock kind precision types/*time-zone*))
+
       is-vector?
       (let [cast1 #(sql-cast/cast-scalar % type-str {:explicit? true})]
         (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))

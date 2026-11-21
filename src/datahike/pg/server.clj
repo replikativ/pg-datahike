@@ -784,9 +784,10 @@
                                                                   (aget ^ints oids 0)))]))))
                 (into-array (Class/forName "[Ljava.lang.String;")
                             (make-array String 0 0)))]
-     (PgWireServer$QueryResult.
-      col-names oids rows
-      (str "SELECT " (alength ^"[[Ljava.lang.String;" rows))))))
+     (.asRowSet
+      (PgWireServer$QueryResult.
+       col-names oids rows
+       (str "SELECT " (alength ^"[[Ljava.lang.String;" rows)))))))
 
 (defn- empty-result [tag]
   (PgWireServer$QueryResult/empty tag))
@@ -14584,12 +14585,13 @@
                 [aliases oids] (select-output-shape parsed db (effective-item-oids parsed))
                 oids (int-array (map #(types/oid->wire-int (or % PgWireServer/OID_TEXT)) oids))
                 sources (compute-column-sources parsed db)
-                qr (PgWireServer$QueryResult.
-                    (into-array String aliases)
-                    oids
-                    (into-array (Class/forName "[Ljava.lang.String;")
-                                (make-array String 0 0))
-                    "SELECT 0")]
+                qr (.asRowSet
+                    (PgWireServer$QueryResult.
+                     (into-array String aliases)
+                     oids
+                     (into-array (Class/forName "[Ljava.lang.String;")
+                                 (make-array String 0 0))
+                     "SELECT 0"))]
             (if sources
               (-> qr
                   (.withColumnSources (first sources) (second sources))

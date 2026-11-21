@@ -2272,7 +2272,9 @@
             "analyze" {:kind :maintenance-noop :tag "ANALYZE"}
 
           ;; --- SELECT may hijack common zero-arg fns + advisory locks
-            "select"  (classify-select rest-toks)
+            "select"  (if (every? #(and (= :punct (:type %)) (= ";" (:text %))) rest-toks)
+                        {:kind :select-empty-projection}
+                        (classify-select rest-toks))
             "with"    {:kind :generic-sql}  ; CTE: DML follows
             "table"   {:kind :generic-sql}  ; TABLE t shorthand
             "values"  {:kind :generic-sql}

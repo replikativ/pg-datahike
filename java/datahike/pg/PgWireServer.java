@@ -107,6 +107,8 @@ public final class PgWireServer {
     public static final String SERVER_VERSION_NUM = "170007";
 
     public static final int OID_CHAR        = 18;  // PG internal "char" (1 byte)
+    public static final int OID_BIT         = 1560;
+    public static final int OID_VARBIT      = 1562;
     public static final int OID_NAME        = 19;
     public static final int OID_INT8        = 20;   // bigint
     public static final int OID_INT2        = 21;   // smallint
@@ -731,6 +733,18 @@ public final class PgWireServer {
             this.error = null;
             this.sqlstate = null;
             this.txStatus = '\0';  // no opinion — see field doc
+        }
+
+        private boolean rowSet;
+
+        /** Mark an actual result set, which may have zero columns. */
+        public QueryResult asRowSet() {
+            rowSet = true;
+            return this;
+        }
+
+        private boolean returnsRows() {
+            return columnNames != null && (columnNames.length > 0 || rowSet);
         }
 
         /** Error result with default XX000 SQLSTATE. */
@@ -1921,7 +1935,7 @@ public final class PgWireServer {
                         break;
                     }
                     sendCopyOut(out, result);
-                } else if (result.columnNames.length == 0) {
+                } else if (!result.returnsRows()) {
                     // Non-batchable single command (DDL, SET, BEGIN,
                     // …). Drain the held batch first so its rows are
                     // visible to anything that follows; surface a
@@ -2605,7 +2619,7 @@ public final class PgWireServer {
         }
 
         // Empty-query statement: emit NoData regardless of type.
-        if (meta == null || meta.columnNames == null || meta.columnNames.length == 0) {
+        if (meta == null || !meta.returnsRows()) {
             out.writeByte('n'); // NoData
             out.writeInt(4);
             trace("send NoData");
@@ -2703,8 +2717,7 @@ public final class PgWireServer {
             result = handler.executePrepared(portal.parsed, portal.boundParams);
             // Clear any interrupt bit left by the safety-net cancel path.
             Thread.interrupted();
-            if (result != null && result.error == null
-                    && result.columnNames != null && result.columnNames.length > 0) {
+            if (result != null && result.error == null && result.returnsRows()) {
                 portal.activeResult = result;
             }
         }
@@ -2787,7 +2800,7 @@ public final class PgWireServer {
             extBatch.resetCur();
             sendCopyOut(out, result);
             return;
-        } else if (result.columnNames.length == 0) {
+        } else if (!result.returnsRows()) {
             // Non-batchable command (DDL, BEGIN, COMMIT, …). Commit
             // any held INSERTs first, write their bytes to wire, then
             // drain the current statement's pre-Execute responses, then
