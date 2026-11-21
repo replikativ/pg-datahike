@@ -1,7 +1,8 @@
 # PostgreSQL regression baseline
 
-The regression campaign is pinned to PostgreSQL 17.7 (`REL_17_7`).
-The schedule inventory records which files have been classified; the output
+The default regression profile is PostgreSQL 17.7 (`REL_17_7`). The
+PostgreSQL 18.6 (`REL_18_6`) profile has its own inventory and strict gate.
+The schedule inventory records which files have been classified. The output
 comparison helps locate differences in SQL behavior. Neither is a percentage
 of PostgreSQL features implemented.
 
@@ -111,6 +112,42 @@ establish the supported subset.
 Row order without ORDER BY can also differ. Investigate ordering required
 by a SQL construct independently from incidental order in expected output;
 an aggregate's ORDER BY is part of its contract.
+
+## PostgreSQL 18.6
+
+The live whole-file gate starts with `advisory_lock`, `boolean`, `comments`,
+`delete`, `lseg`, `macaddr`, `md5`, `select_having` and `select_implicit`.
+Each matched a fresh native 18.6 oracle and pg-datahike v0.1.390 after removing
+source excerpts and their caret markers. The gate uses the pinned upstream
+output and gives each file a separate database. Focused tests also cover
+upstream `CREATE TABLE` and `CREATE TABLE LIKE` slices, including catalog
+state after rejected statements.
+
+| Discovery case | Observed gaps |
+|---|---|
+| `aggregates` | Custom aggregate fixtures cause cascades. Built-in aggregate coverage and resolution remain open. |
+| `arrays` | Array input and bounds, type resolution, and functions such as `array_sort`, `array_sample` and `array_reverse`. |
+| `copyselect` | Legacy `FORCE QUOTE` syntax and a second `COPY FROM STDIN` in one simple-query message. The latter leaves the second row unwritten. |
+| `create_table` and `create_table_like` | Partitioning, some persistence metadata and optional LIKE properties such as `INCLUDING GENERATED`. A subquery in a default is rejected with a different SQLSTATE. |
+| `groupingsets` | Grouping sets, rollup and cube are unsupported. The v0.1.390 replay completed with early rejections; the initial October run exhausted the heap. |
+| `prepare` | Arity, declared type coercion and unknown-type errors now agree in focused probes. `CREATE TABLE AS EXECUTE`, path inference and catalog output still differ. |
+
+The October intake attempted the 164 selected files. The native run completed
+164 and the then-current pg-datahike build completed 162. The two incomplete
+target cases were `groupingsets` and `database`, where unsupported database
+rename left a run-created database behind. Global database DDL discovery
+requires an exclusive disposable endpoint. The full agreement manifest
+remains unqualified. Use [the campaign manifest](../test/integration/postgres-regress/pg18/campaign.edn)
+for admissions and per-file blockers, and [the fixture descriptor](../test/integration/postgres-regress/pg18/fixtures.edn)
+for prerequisite and native-helper boundaries.
+
+Run the current gate with PostgreSQL 18 clients and a pg-datahike server with
+database provisioning enabled:
+
+```bash
+PG_REGRESS_PROFILE=18 bb pg-regress-setup
+PG_REGRESS_PROFILE=18 bb pg-regress-wave strict
+```
 
 ## Running the comparison
 

@@ -366,7 +366,8 @@
                        (:sql-count audited-inventory) (:expected-count audited-inventory)
                        (:application-count audited-inventory)))
       (println (str "  unscheduled  " (str/join ", " (:unscheduled audited-inventory))))
-      (println "  admission    unverified; inventory is source classification, not execution coverage"))
+      (println (str "  admission    " (name (get-in audited-inventory [:manifest :admission]))
+                    "; inventory describes source scope")))
     (println (format "  campaign     %d" campaign-count))
     (println (format (str "    classified %.1f%% of %d application-facing files; "
                           "%.1f%% of the complete schedule")
@@ -423,41 +424,58 @@
       (println (format "  admitted   %s/%s lines %d-%d"
                        name (clojure.core/name id) (first source-lines) (second source-lines))))))
 
+(defn- run-tests! [runner env names]
+  (apply shell {:dir (str repo-root)}
+         (concat ["env"
+                  (str "PG_REGRESS_PROFILE=" (:profile reference-config))
+                  (str "POSTGRES_SOURCE=" postgres-source)]
+                 env
+                 ["bash" (str (fs/file here runner))]
+                 names)))
+
+(defn- run-audited-tests! [tests]
+  (let [output-root (not-empty (System/getenv "PG_REGRESS_OUTPUT"))]
+    (doseq [{test-name :name mode :mode} tests]
+      (let [strict? (= :strict mode)
+            runner (if strict? "run.sh" "run-with-api-fixtures.sh")]
+        (when strict? (reference/require-authoritative! reference-config))
+        (run-tests! runner
+                    (concat (when output-root
+                              [(str "PG_REGRESS_OUTPUT=" (fs/file output-root test-name))])
+                            (when strict?
+                              ["PG_REGRESS_API_STRICT=1" "PG_REGRESS_ISOLATE=1"]))
+                    [test-name])))))
+
+(defn- run-wave! [wave-arg mode-arg]
+  (let [wave-id (parse-long wave-arg)
+        wave (some #(when (= wave-id (:id %)) %) (:waves campaign))
+        mode (when mode-arg (keyword mode-arg))]
+    (when-not wave (fail! (str "unknown wave: " wave-arg)))
+    (when (and mode (not ((:modes campaign) mode)))
+      (fail! (str "unknown mode: " mode-arg)))
+    (let [tests (cond->> (:tests wave) mode (filter #(= mode (:mode %))))]
+      (when (empty? tests) (fail! "selection contains no tests"))
+      (println (str "running wave " wave-id
+                    (when mode (str " mode " (name mode)))
+                    ": " (str/join " " (map :name tests))))
+      (if audited-inventory
+        (run-audited-tests! tests)
+        (let [prerequisites (->> tests (mapcat :requires) distinct vec)
+              runner (if (some #{"test_setup"} prerequisites)
+                       "run-with-api-fixtures.sh"
+                       "run.sh")
+              names (distinct (concat (remove #{"test_setup"} prerequisites) (map :name tests)))]
+          (when (= mode :strict) (reference/require-authoritative! reference-config))
+          (run-tests! runner (when (= mode :strict) ["PG_REGRESS_API_STRICT=1"]) names))))))
+
 (validate!)
 
-(if (= ["inventory"] *command-line-args*)
-  (print-inventory!)
-  (if (empty? *command-line-args*)
-    (print-campaign!)
-    (let [[wave-arg mode-arg] *command-line-args*
-          wave-id (parse-long wave-arg)
-          wave (some #(when (= wave-id (:id %)) %) (:waves campaign))
-          mode (when mode-arg (keyword mode-arg))]
-      (when-not wave (fail! (str "unknown wave: " wave-arg)))
-      (when (and mode (not ((:modes campaign) mode)))
-        (fail! (str "unknown mode: " mode-arg)))
-      (let [tests (cond->> (:tests wave) mode (filter #(= mode (:mode %))))
-            prerequisites (->> tests (mapcat :requires) distinct vec)
-            api-fixtures? (some #{"test_setup"} prerequisites)
-            names (->> (concat (remove #{"test_setup"} prerequisites)
-                               (map :name tests))
-                       distinct
-                       vec)]
-        (when (empty? names) (fail! "selection contains no tests"))
-        (println (str "running wave " wave-id
-                      (when mode (str " mode " (clojure.core/name mode)))
-                      ": " (str/join " " names)))
-        (when (= mode :strict)
-          (reference/require-authoritative! reference-config))
-        (let [runner ["bash" (str (fs/file here
-                                           (if api-fixtures?
-                                             "run-with-api-fixtures.sh"
-                                             "run.sh")))]
-              ;; Preserve the validated profile and checkout in the child runner.
-              command (into ["env"
-                             (str "PG_REGRESS_PROFILE=" (:profile reference-config))
-                             (str "POSTGRES_SOURCE=" postgres-source)]
-                            (concat (when (= mode :strict)
-                                      ["PG_REGRESS_API_STRICT=1"])
-                                    runner))]
-          (apply shell {:dir (str repo-root)} (concat command names)))))))
+(cond
+  (= ["inventory"] *command-line-args*) (print-inventory!)
+  (empty? *command-line-args*) (print-campaign!)
+  (= ["strict"] *command-line-args*)
+  (let [tests (filter #(= :strict (:mode %)) (campaign-tests))]
+    (when-not audited-inventory (fail! "use WAVE strict for this profile"))
+    (when (empty? tests) (fail! "selection contains no strict tests"))
+    (run-audited-tests! tests))
+  :else (apply run-wave! (take 2 (concat *command-line-args* [nil]))))

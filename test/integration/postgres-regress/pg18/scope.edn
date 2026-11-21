@@ -24,7 +24,7 @@
     "create_operator"
     "merge"},
   :collation #{"collate"},
-  :relational-queries #{"select_into" "select_views" "groupingsets" "tablesample" "select_implicit"},
+  :relational-queries #{"select_into" "select_views" "tablesample"},
   :json-and-xml
   #{"xml"
     "sqljson_jsontable"
@@ -44,14 +44,12 @@
     "misc"
     "regex"
     "unicode"
-    "md5"
     "misc_functions"
     "numerology"},
   :unscheduled-numeric #{"numeric_big"},
-  :transactions-and-concurrency #{"plancache" "mvcc" "async" "prepared_xacts" "advisory_lock" "lock"},
+  :transactions-and-concurrency #{"plancache" "mvcc" "async" "prepared_xacts" "lock"},
   :scalar-and-structural-types
-  #{"macaddr"
-    "path"
+  #{"path"
     "box"
     "xid"
     "pg_lsn"
@@ -67,8 +65,7 @@
     "txid"
     "circle"
     "timetz"
-    "point"
-    "lseg"},
+    "point"},
   :catalog-and-client-api
   #{"object_address" "psql_pipeline" "psql_crosstab" "database" "test_setup" "dbsize" "sysviews"}},
  :out-of-scope

@@ -9,7 +9,8 @@
     {:name "prepare",
      :boundaries #{:parameter-inference :type-lookup :prepared-sql},
      :requires ["test_setup"],
-     :mode :unmeasured}
+     :mode :discovery
+     :blockers #{:create-table-as-execute :path-parameter-inference :prepared-catalog-rendering}}
     {:name "errors",
      :boundaries #{:transaction-errors :name-resolution :sqlstate},
      :requires ["test_setup"],
@@ -24,7 +25,8 @@
     {:name "arrays",
      :boundaries #{:array-expressions :array-codec :polymorphism},
      :requires ["test_setup"],
-     :mode :unmeasured}
+     :mode :discovery
+     :blockers #{:array-functions :array-input-and-bounds :array-type-resolution}}
     {:name "uuid",
      :boundaries
      #{:scalar-type :type-inference :input-codec :volatile-functions :operators :temporal-extraction},
@@ -44,7 +46,10 @@
   {:id 2,
    :name "application DDL, DML, and relational SQL",
    :tests
-   [{:name "boolean", :boundaries #{:errors :scalar-type :casts}, :mode :unmeasured}
+   [{:name "boolean", :boundaries #{:errors :scalar-type :casts}, :mode :strict}
+    {:name "lseg", :boundaries #{:geometry :scalar-type}, :mode :strict}
+    {:name "macaddr", :boundaries #{:input-codec :scalar-type}, :mode :strict}
+    {:name "md5", :boundaries #{:functions}, :mode :strict}
     {:name "char", :boundaries #{:scalar-type :casts}, :requires ["test_setup"], :mode :unmeasured}
     {:name "name", :boundaries #{:scalar-type :catalogs}, :mode :unmeasured}
     {:name "varchar", :boundaries #{:scalar-type :typmods}, :requires ["test_setup"], :mode :unmeasured}
@@ -64,12 +69,30 @@
      :boundaries #{:time-zones :functions :casts :operators :temporal},
      :mode :unmeasured}
     {:name "interval", :boundaries #{:functions :casts :operators :temporal}, :mode :unmeasured}
-    {:name "create_table", :boundaries #{:defaults :ddl :type-metadata}, :mode :unmeasured}
+    {:name "create_table", :boundaries #{:defaults :ddl :type-metadata}, :mode :discovery
+     :blockers #{:partitioning :catalog-persistence}
+     :strict-slices
+     [{:id :reject-oid-storage
+       :source-lines [63 69]
+       :gate "test/datahike/test/pg_check_constraint_test.clj"
+       :test-var "postgres-create-table-rejects-invalid-options"}
+      {:id :reject-invalid-default-expressions
+       :source-lines [81 87]
+       :gate "test/datahike/test/pg_check_constraint_test.clj"
+       :test-var "postgres-create-table-rejects-invalid-defaults"}
+      {:id :reject-set-returning-default
+       :source-lines [91 91]
+       :gate "test/datahike/test/pg_check_constraint_test.clj"
+       :test-var "postgres-create-table-rejects-invalid-defaults"}
+      {:id :reject-unknown-partition-strategy
+       :source-lines [161 163]
+       :gate "test/datahike/test/pg_check_constraint_test.clj"
+       :test-var "postgres-create-table-rejects-invalid-options"}]}
     {:name "constraints", :boundaries #{:constraints :ddl}, :mode :unmeasured}
     {:name "insert", :boundaries #{:constraints :defaults :insert-select :dml}, :mode :unmeasured}
     {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :unmeasured}
     {:name "update", :boundaries #{:update-from :dml :row-assignment}, :mode :unmeasured}
-    {:name "delete", :boundaries #{:name-resolution :dml}, :mode :unmeasured}
+    {:name "delete", :boundaries #{:name-resolution :dml}, :mode :strict}
     {:name "returning",
      :boundaries #{:defaults :result-metadata :expressions :dml},
      :requires ["test_setup"],
@@ -79,7 +102,8 @@
      :requires ["test_setup"],
      :mode :unmeasured}
     {:name "case", :boundaries #{:expressions}, :mode :unmeasured}
-    {:name "select_having", :boundaries #{:errors :having :grouping :aggregates}, :mode :unmeasured}
+    {:name "select_having", :boundaries #{:errors :having :grouping :aggregates}, :mode :strict}
+    {:name "select_implicit", :boundaries #{:name-resolution :relational}, :mode :strict}
     {:name "subselect",
      :boundaries #{:name-resolution :scalar-subqueries :write-expressions :relational},
      :requires ["test_setup"],
@@ -89,7 +113,10 @@
     {:name "aggregates",
      :boundaries #{:aggregates},
      :requires ["test_setup" "create_aggregate"],
-     :mode :unmeasured}
+     :mode :discovery
+     :blockers #{:custom-aggregate-ddl :missing-aggregates :aggregate-resolution}}
+    {:name "groupingsets", :boundaries #{:aggregates :grouping}, :mode :discovery
+     :blockers #{:grouping-sets :rollup :cube :grouping-function}}
     {:name "window",
      :boundaries #{:windows :aggregates :expressions},
      :requires ["test_setup"],
@@ -136,7 +163,9 @@
    [{:name "copy", :boundaries #{:errors :copy :text-codec}, :mode :unmeasured}
     {:name "copy2", :boundaries #{:errors :copy :text-codec :csv-codec}, :mode :unmeasured}
     {:name "copydml", :boundaries #{:copy :returning :dml}, :mode :unmeasured}
-    {:name "copyselect", :boundaries #{:copy :ordering :relational}, :mode :unmeasured}
+    {:name "copyselect", :boundaries #{:copy :ordering :relational}, :mode :discovery
+     :blockers #{:copy-force-quote :multi-command-copy-from}
+     :accepted-differences #{:copy-error-diagnostics}}
     {:name "temp", :boundaries #{:name-resolution :temporary-tables :ddl :transactions}, :mode :unmeasured}
     {:name "truncate", :boundaries #{:constraints :ddl :dml :transactions}, :mode :unmeasured}
     {:name "portals",
@@ -144,6 +173,7 @@
      :requires ["test_setup"],
      :mode :unmeasured}
     {:name "portals_p2", :boundaries #{:cursors :transactions}, :requires ["portals"], :mode :unmeasured}
+    {:name "advisory_lock", :boundaries #{:advisory-locks :transactions}, :mode :strict}
     {:name "psql",
      :boundaries #{:prepared-statements :copy :catalogs :client-tooling},
      :requires ["test_setup"],
@@ -160,5 +190,15 @@
     {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :unmeasured}
     {:name "create_schema", :boundaries #{:name-resolution :schemas :ddl}, :mode :unmeasured}
     {:name "drop_if_exists", :boundaries #{:conditional-ddl :errors :ddl}, :mode :unmeasured}
-    {:name "create_table_like", :boundaries #{:constraints :ddl :schema-copy}, :mode :unmeasured}
-    {:name "comments", :boundaries #{:comments :string-literals :ddl}, :mode :unmeasured}]}]}
+    {:name "create_table_like", :boundaries #{:constraints :ddl :schema-copy}, :mode :discovery
+     :blockers #{:like-including-generated :like-including-constraints :like-including-indexes}
+     :strict-slices
+     [{:id :definition-copy-with-generated-column
+       :source-lines [69 74]
+       :gate "test/datahike/test/pg_create_table_like_test.clj"
+       :test-var "postgres-like-including-defaults-skips-generation-expressions"}
+      {:id :including-defaults-with-generated-column
+       :source-lines [81 82]
+       :gate "test/datahike/test/pg_create_table_like_test.clj"
+       :test-var "postgres-like-including-defaults-skips-generation-expressions"}]}
+    {:name "comments", :boundaries #{:comments :string-literals :ddl}, :mode :strict}]}]}

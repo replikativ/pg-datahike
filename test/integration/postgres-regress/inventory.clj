@@ -1,5 +1,5 @@
 (ns postgres-inventory
-  "Validate an audited release's complete SQL inventory without admitting behavior."
+  "Validate an audited release's SQL inventory and explicitly scoped admissions."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.set :as set]
@@ -38,6 +38,9 @@
         declared-names (map first declared)
         entries (:dispositions manifest)
         entry-names (map :name entries)
+        tests (mapcat :tests (:waves campaign))
+        strict-tests (filter #(= :strict (:mode %)) tests)
+        admitted? (= :partial (:admission manifest))
         expected-files (into (sorted-map)
                              (for [file (.listFiles (io/file root "expected"))
                                    :when (and (.isFile file) (str/ends-with? (.getName file) ".out"))]
@@ -64,13 +67,20 @@
     (check! (set/subset? scheduled-names sql-names) "scheduled source file missing")
     (check! (set/subset? (set (map :name (mapcat :tests (:waves campaign)))) scheduled-names)
             "campaign entries must belong to the schedule")
-    (check! (= :unverified (:admission manifest)) "unsupported admission policy")
-    (check! (every? #(and (not= :strict (:mode %)) (empty? (:strict-slices %)))
-                    (mapcat :tests (:waves campaign)))
-            "unverified release cannot inherit strict modes or slices")
+    (check! (#{:unverified :partial} (:admission manifest)) "unsupported admission policy")
+    (if admitted?
+      (let [fixture-boundaries (into {} (map (juxt :name :fixture-boundaries)) entries)]
+        (check! (seq strict-tests) "partial admission needs a strict whole-file gate")
+        (check! (every? #(and (empty? (:requires %))
+                              (= #{} (get fixture-boundaries (:name %)))
+                              (empty? (get-in manifest [:ordering-prerequisites (:name %)])))
+                        strict-tests)
+                "strict whole-file gates must run independently of fixtures"))
+      (check! (and (empty? strict-tests) (every? (comp empty? :strict-slices) tests))
+              "unverified release cannot inherit strict modes or slices"))
     (check! (and (empty? (:evidence ledger))
                  (every? #(= :unverified (:status %)) (vals (:capabilities ledger))))
-            "unverified release cannot inherit capability or evidence admissions")
+            "audited release cannot inherit routine/trigger capability or evidence admissions")
     (doseq [{:keys [name scheduled? sql-sha256 expected-sha256] :as entry} entries]
       (check! (= (select-keys entry [:status :reason :wave]) (get (into {} declared) name))
               (str "classification disagrees for " name))

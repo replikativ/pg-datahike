@@ -50,12 +50,17 @@ if [[ ! -x "${pg_bindir}/psql" ]]; then
 fi
 
 cleanup_isolated_db() {
+  local run_status="$1"
   if [[ "${database_created}" == "1" ]]; then
-    reference_psql -X \
+    if ! reference_psql -X \
       --host="${target_host}" --port="${target_port}" --username="${target_user}" \
       --dbname="${admin_db}" --set=ON_ERROR_STOP=1 \
-      --command="DROP DATABASE IF EXISTS \"${isolated_db}\"" >/dev/null || true
+      --command="DROP DATABASE IF EXISTS \"${isolated_db}\"" >/dev/null; then
+      echo "Could not clean up the isolated database ${isolated_db}." >&2
+      if [[ "${run_status}" == "0" ]]; then run_status=2; fi
+    fi
   fi
+  exit "${run_status}"
 }
 
 if [[ "${PG_REGRESS_ISOLATE:-0}" == "1" ]]; then
@@ -63,7 +68,7 @@ if [[ "${PG_REGRESS_ISOLATE:-0}" == "1" ]]; then
   # target a caller-supplied database. SQL CREATE/DROP DATABASE requires a
   # server configured with :database-template or provisioning hooks.
   isolated_db="pgdh_regress_$(date -u +%Y%m%d%H%M%S)_$$_${RANDOM}"
-  trap cleanup_isolated_db EXIT
+  trap 'cleanup_isolated_db "$?"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   reference_psql -X \
@@ -150,6 +155,23 @@ fi
 
 shopt -s nullglob
 result_files=("${output_dir}"/results/*.out)
+
+normalize_api_output() {
+  awk '
+    excerpt != "" {
+      if ($0 ~ /^[[:space:]]*\^[[:space:]]*$/) {
+        excerpt = ""
+        next
+      }
+      print excerpt
+      excerpt = ""
+    }
+    /^LINE [0-9]+: / { excerpt = $0; next }
+    { print }
+    END { if (excerpt != "") print excerpt }
+  ' "$1"
+}
+
 all_api_match=0
 if (( ${#result_files[@]} > 0 )); then
   all_api_match=1
@@ -176,8 +198,8 @@ if (( ${#result_files[@]} > 0 )); then
       # They are presentation rather than SQL result semantics; keep every
       # error message, DETAIL/HINT, row, type and table-formatting line.
       if diff -q \
-        <(sed -e '/^LINE [0-9][0-9]*: /d' -e '/^[[:space:]]*\^$/d' "${expected_file}") \
-        <(sed -e '/^LINE [0-9][0-9]*: /d' -e '/^[[:space:]]*\^$/d' "${result_file}") \
+        <(normalize_api_output "${expected_file}") \
+        <(normalize_api_output "${result_file}") \
         >/dev/null; then
         api_match="yes"
       else

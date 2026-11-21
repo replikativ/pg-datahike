@@ -220,6 +220,8 @@ jobs:
     executor: clj-jdk21
     steps:
       - checkout
+      - attach_workspace:
+          at: /home/circleci
       - install-clj-tools
       - run:
           name: Materialize pinned PostgreSQL regression source
@@ -236,6 +238,20 @@ jobs:
             bb pg-regress-wave inventory
             PG_REGRESS_PROFILE=18 bb pg-regress-wave inventory
             PG_REGRESS_PROFILE=18 bb test/integration/postgres-regress/fixtures.clj validate-descriptor
+      - run:
+          name: Install PostgreSQL 18 regression driver and client
+          command: |
+            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc +              | sudo tee /usr/share/keyrings/pgdg.asc >/dev/null
+            echo "deb [signed-by=/usr/share/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" +              | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client-18 netcat-openbsd ripgrep
+      - start-pgwire-and-wait
+      - run:
+          name: Gate admitted PostgreSQL 18 regression files
+          command: PG_REGRESS_PROFILE=18 PG_REGRESS_TIMEOUT=120s bb pg-regress-wave strict
+      - store_artifacts:
+          path: .internal/pg-regress/REL_18_6
+          destination: postgres-18-regress
 
   sqllogictest:
     executor: clj-jdk21
@@ -686,7 +702,7 @@ workflows:
       - campaign-inventory:
           context: ghcr-read-package
           requires:
-            - setup
+            - build
       - sqllogictest:
           context: ghcr-read-package
           requires:

@@ -58,7 +58,7 @@
   pg-regress-gate {:doc "Measure per-file agreement and fail if any file lost ground against agreement.edn."
                    :task (shell "bash test/integration/postgres-regress/agreement.sh gate")}
 
-  pg-regress-wave {:doc "List/run a PostgreSQL compatibility wave or its inventory. Usage: bb pg-regress-wave [inventory|WAVE [MODE]]."
+  pg-regress-wave {:doc "List/run PostgreSQL compatibility waves. Usage: bb pg-regress-wave [inventory|strict (PG18)|WAVE [MODE]]."
                    :task (apply shell "bb test/integration/postgres-regress/campaign.clj"
                                 *command-line-args*)}
 

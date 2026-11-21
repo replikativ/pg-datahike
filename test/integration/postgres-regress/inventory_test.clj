@@ -56,6 +56,7 @@
                     :surface-decisions {"foo" {:scope :campaign :source-lines [1 1] :basis "Client SQL."}}
                     :dispositions (vec (for [[name file] (inventory/sql-files (str regress))]
                                          (merge {:name name :scheduled? (contains? #{"foo" "test_setup"} name)
+                                                 :fixture-boundaries #{}
                                                  :sql-sha256 (reference/file-sha256 file)
                                                  :expected-sha256 (get expected (str name ".out"))}
                                                 (get declared name))))}]
@@ -115,6 +116,22 @@
         (file! file text)
         (is (thrown? clojure.lang.ExceptionInfo (inventory/validate! cfg campaign scope ledger)))
         (if before (spit file before) (.delete file))))))
+
+(deftest partial-admission-requires-an-independent-whole-file-gate
+  (let [{:keys [cfg campaign scope ledger manifest manifest-file]} (fixture!)
+        strict (assoc-in campaign [:waves 0 :tests 0 :mode] :strict)
+        independent (assoc manifest :admission :partial :ordering-prerequisites {})]
+    (spit manifest-file (pr-str independent))
+    (is (= 4 (:sql-count (inventory/validate! cfg strict scope ledger))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs a strict"
+                          (inventory/validate! cfg campaign scope ledger)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"independently of fixtures"
+                          (inventory/validate! cfg
+                                               (assoc-in strict [:waves 0 :tests 0 :requires] ["test_setup"])
+                                               scope ledger)))
+    (spit manifest-file (pr-str (assoc manifest :admission :partial)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"independently of fixtures"
+                          (inventory/validate! cfg strict scope ledger)))))
 
 (deftest shared-campaign-entrypoint-validates-audit-before-agreement-or-waves
   (let [{:keys [cfg campaign scope ledger manifest manifest-file]} (fixture!)

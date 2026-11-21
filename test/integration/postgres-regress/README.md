@@ -18,33 +18,34 @@ bb pg-regress jsonb expressions
 | Profile | Source release | Available operations |
 |---|---|---|
 | `17` (default) | `REL_17_7` | Named tests, fixture runs, audited waves and agreement |
-| `18` | `REL_18_6` | Named/fixture discovery, audited inventory and unmeasured waves |
+| `18` | `REL_18_6` | Strict whole-file gate, named and fixture discovery, audited inventory |
 
 For example, with PostgreSQL 18's tools installed:
 
 ```bash
 PG_REGRESS_PROFILE=18 bb pg-regress-setup
-PG_REGRESS_PROFILE=18 bb pg-regress int4
+PG_REGRESS_PROFILE=18 bb pg-regress-wave strict
 ```
 
-This selects the test reference; it does not change pg-datahike's advertised
-version or runtime catalog. Profile 18 has a separate source-audited inventory,
-with 231 scheduled tests and 233 SQL files (including two unscheduled files).
-Its 80 campaign files start unmeasured; it has no strict slices, admitted routine
-evidence or agreement scores. The all-SQL scope selects 164 application-facing
-files and excludes 69 files with explicit scope reasons. Inventory counts
-describe source dispositions, not executed or passing tests.
+The strict wave runs each admitted upstream file in its own disposable database.
+The target must enable SQL database provisioning, as the standalone server does
+by default. The gate checks whole output and ignores paired source-line and
+caret diagnostics. CircleCI runs this gate on every build. For a single wave,
+use `PG_REGRESS_PROFILE=18 bb pg-regress-wave 2 strict`.
+
+The test profile selects the reference files and client tools. Profile 18 has
+231 scheduled tests and 233 SQL files, including two unscheduled files. The
+all-SQL scope selects 164 application-facing files and excludes 69 with explicit
+scope reasons. [Current admissions and gaps](../../../doc/postgres-regress-baseline.md#postgresql-186).
 
 ```bash
 PG_REGRESS_PROFILE=18 bb pg-regress-wave inventory
 ```
 
-The inventory fingerprints the SQL, schedule and all 265 expected output files,
-including platform variants. The source schedule documents shared setup and
-ordering requirements; those do not establish that every file is ready to run
-in isolation. Native regression helpers and encoding/file fixtures remain
-explicit fixture boundaries. A full agreement measurement requires validation
-of those prerequisites; the empty profile18 baseline is not a release gate.
+The inventory fingerprints the SQL, schedule and all 265 expected output
+files, including platform variants. Prerequisite-bearing files run individually
+with the fixture runner during discovery. The full 18 agreement baseline
+requires additional fixture qualification.
 
 Sources default to `.internal/postgres-REL_17_7` or
 `.internal/postgres-REL_18_6`. A missing pinned checkout is an error; the harness
