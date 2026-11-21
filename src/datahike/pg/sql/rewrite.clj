@@ -197,6 +197,17 @@
                       (:text t)))
                   (subvec toks from to))))
 
+(defn- referenced-relation-end [toks idx]
+  (loop [idx (skip-non-comment toks idx (constantly false))]
+    (if (contains? #{:ident :quoted} (:type (nth toks idx nil)))
+      (let [after-name (skip-non-comment toks (inc idx) (constantly false))]
+        (if (punct? (nth toks after-name nil) ".")
+          (recur (skip-non-comment toks (inc after-name) (constantly false)))
+          after-name))
+      idx)))
+
+(declare fk-column-count)
+
 (defn inline-references-rule
   "Inline `col TYPE … REFERENCES name [(cols)] [ON (DELETE|UPDATE) action]`.
    JSqlParser doesn't accept the inline form, so lift it to the equivalent
@@ -208,10 +219,7 @@
    **SET NULL / SET DEFAULT / ON UPDATE non-trivial** raise
       0A000; not yet implemented at the runtime side.
 
-   Distinguishes inline from table-level by checking the previous
-   non-comment token: if it's `)` (from `FOREIGN KEY (col)`), we
-   leave the whole REFERENCES alone so JSqlParser parses it natively
-   as a ForeignKeyIndex."
+   Leaves table-level FOREIGN KEY clauses to the table-level rule."
   [toks]
   ;; Wrap so the outer caller can pass the SQL string for substr lookups.
   (let [n (count toks)]
@@ -222,12 +230,10 @@
           (if (not= "references" (kw-text t))
             (recur (inc i) acc)
             (let [prev (non-comment-before toks i)]
-              (if (punct? prev ")")
+              (if (and (punct? prev ")") (fk-column-count toks i))
                 (recur (inc i) acc)
                 (let [start (:pos t)
-                      after-name-idx (skip-non-comment toks (inc i)
-                                                       #(or (ident-tok? %)
-                                                            (punct? % ".")))
+                      after-name-idx (referenced-relation-end toks (inc i))
                       after-cols-idx (match-paren-group toks after-name-idx)
                       ;; `MATCH FULL` sits here, before the ON clauses.
                       ;; It used to be left behind while the REFERENCES
@@ -327,17 +333,24 @@
     (when close-idx
       (loop [k (dec close-idx), depth 0, commas 0]
         (cond
-          (neg? k) (inc commas)
+          (neg? k) nil
           (punct? (nth toks k) ")") (recur (dec k) (inc depth) commas)
           (punct? (nth toks k) "(") (if (zero? depth)
-                                      (inc commas)
+                                      (let [key-token (non-comment-before toks k)
+                                            key-idx (loop [i (dec k)]
+                                                      (if (= :comment (:type (nth toks i nil)))
+                                                        (recur (dec i))
+                                                        i))]
+                                        (when (and (= "key" (kw-text key-token))
+                                                   (= "foreign" (kw-text (non-comment-before toks key-idx))))
+                                          (inc commas)))
                                       (recur (dec k) (dec depth) commas))
           (and (zero? depth) (punct? (nth toks k) ","))
           (recur (dec k) depth (inc commas))
           :else (recur (dec k) depth commas))))))
 
 (defn table-level-fk-match-rule
-  "Strip `MATCH FULL | MATCH PARTIAL | MATCH SIMPLE` from a TABLE-LEVEL
+  "Supply omitted referenced columns and strip supported MATCH clauses from a TABLE-LEVEL
    foreign key -- `FOREIGN KEY (...) REFERENCES t (...) MATCH FULL`, in
    CREATE TABLE and in ALTER TABLE ADD CONSTRAINT alike. JSqlParser's
    grammar has no production for it in either position.
@@ -360,18 +373,21 @@
         (let [t (nth toks i)]
           (if (not= "references" (kw-text t))
             (recur (inc i) acc)
-            (let [prev (non-comment-before toks i)]
-              (if-not (punct? prev ")")
+            (let [prev (non-comment-before toks i)
+                  ncols (when (punct? prev ")") (fk-column-count toks i))]
+              (if-not ncols
                 (recur (inc i) acc)
-                (let [after-name-idx (skip-non-comment toks (inc i)
-                                                       #(or (ident-tok? %)
-                                                            (punct? % ".")))
+                (let [after-name-idx (referenced-relation-end toks (inc i))
                       after-cols-idx (match-paren-group toks after-name-idx)
-                      mt (kw-text (nth toks (inc after-cols-idx) nil))]
+                      mt (kw-text (nth toks (inc after-cols-idx) nil))
+                      name-end (:end (non-comment-before toks after-name-idx))
+                      acc (cond-> acc
+                            (and (> after-name-idx (inc i)) (= after-name-idx after-cols-idx))
+                            (conj [name-end name-end " (__pg_default_pk__)"]))]
                   (if-not (and (= "match" (kw-text (nth toks after-cols-idx nil)))
                                (contains? #{"full" "partial" "simple"} mt))
                     (recur (inc i) acc)
-                    (let [ncols (or (fk-column-count toks i) 1)]
+                    (do
                       (when (and (> ncols 1) (not= "simple" mt))
                         (throw (ex-info "unsupported foreign-key match type"
                                         {:error :feature-not-supported

@@ -155,6 +155,34 @@
   (is (= [["1" nil] ["2" "1"]]
          (rows (run "SELECT * FROM self_parent ORDER BY id")))))
 
+(deftest postgres-rejects-invalid-foreign-key-definitions
+  (is (ok? (run "CREATE TABLE pktable (ptest1 int PRIMARY KEY, someoid oid)")))
+  (doseq [[name columns state]
+          [["fktable_fail1" "ftest1 int, CONSTRAINT fkfail1 FOREIGN KEY (ftest2) REFERENCES pktable" "42703"]
+           ["fktable_fail2" "ftest1 int, CONSTRAINT fkfail1 FOREIGN KEY (ftest1) REFERENCES pktable(ptest2)" "42703"]
+           ["fktable_fail3" "ftest1 int, CONSTRAINT fkfail1 FOREIGN KEY (tableoid) REFERENCES pktable(someoid)" "0A000"]
+           ["fktable_fail4" "ftest1 oid, CONSTRAINT fkfail1 FOREIGN KEY (ftest1) REFERENCES pktable(tableoid)" "0A000"]
+           ["fktable_fail5" "ftest1 oid REFERENCES pktable(someoid)" "42830"]
+           ["fktable_fail6" "a int, b int, FOREIGN KEY (a,b) REFERENCES pktable(ptest1,ptest1)" "42830"]]]
+    (let [sql (str "CREATE TABLE " name " (" columns ")")
+          result (run sql)]
+      (is (= state (.sqlstate ^PgWireServer$QueryResult result)) (str sql " => " (err result)))
+      (is (empty? (rows (run (str "SELECT oid FROM pg_class WHERE relname = '" name "'")))))))
+  (is (= [["0"]] (rows (run "SELECT count(*) FROM pg_constraint WHERE contype = 'f'"))))
+  (is (ok? (run "DROP TABLE pktable"))))
+
+(deftest fk-resolves-new-self-and-existing-unique-keys
+  (is (ok? (run "CREATE TABLE self_ref (id int PRIMARY KEY, parent int REFERENCES self_ref)")))
+  (is (ok? (run "INSERT INTO self_ref VALUES (1, NULL), (2, 1)")))
+  (is (ok? (run "CREATE TABLE fk_index_parent (a int, b int)")))
+  (is (ok? (run "CREATE UNIQUE INDEX fk_index ON fk_index_parent (a, b)")))
+  (is (ok? (run "CREATE TABLE fk_index_child (a int, b int, FOREIGN KEY (b, a) REFERENCES fk_index_parent (b, a))")))
+  (let [result (run "ALTER TABLE fk_index_child ADD FOREIGN KEY (a) REFERENCES fk_index_parent (c)")]
+    (is (= "42703" (.sqlstate ^PgWireServer$QueryResult result))))
+  (let [result (run "ALTER TABLE fk_index_child ADD FOREIGN KEY (a) REFERENCES fk_index_parent (a)")]
+    (is (= "42830" (.sqlstate ^PgWireServer$QueryResult result))))
+  (is (= [["1"]] (rows (run "SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conrelid = 'fk_index_child'::regclass")))))
+
 (deftest ordinary-insert-compiles-and-caches-one-row-plan
   (is (ok? (run "CREATE TABLE plan_plain (id INT, note TEXT)")))
   (let [calls (atom 0)

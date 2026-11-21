@@ -75,11 +75,11 @@
    :file "constraints" :lines [32 33] :state :open :impact :unsupported
    :detail "The arithmetic default is rejected at the plus sign. Later errors in this block follow from the destination table being absent."}
   {:id :foreign-key-definition-validation
-   :file "foreign_key" :lines [538 543] :state :open :impact :wrong-result
-   :detail "Invalid referenced columns can be accepted and leave a relation and dependency behind. An isolated missing-column reference reproduced the error on the native server and persisted the child on the target."}
+   :file "foreign_key" :lines [538 543] :state :covered :impact :wrong-result
+   :detail "Invalid foreign keys previously left relations and dependencies behind. The gate checks missing and system columns, non-unique target keys, and a clean catalog after rejection."}
   {:id :reset-transaction-isolation
-   :file "transactions" :lines [39 42] :state :open :impact :wrong-result
-   :detail "After a transaction reads, RESET transaction_isolation succeeds on the target. Native returns 0A000 and the next query fails with 25P02."}
+   :file "transactions" :lines [39 42] :state :covered :impact :wrong-result
+   :detail "RESET of a current transaction characteristic now returns 0A000. The gate checks that the transaction then returns 25P02 until rollback."}
   {:id :database-rename-fixture
    :file "database" :lines [1 5] :state :boundary :impact :fixture
    :detail "Unsupported rename leaves a run-created database under the original name."}

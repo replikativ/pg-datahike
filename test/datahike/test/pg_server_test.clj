@@ -586,6 +586,19 @@
   (is (nil? (err (.execute *handler*
                            "UPDATE person SET age = 2 WHERE name = 'Alice'")))))
 
+(deftest postgres-transaction-characteristics-cannot-be-reset
+  (doseq [[begin setting] [["BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE" "transaction_isolation"]
+                           ["BEGIN TRANSACTION READ ONLY" "transaction_read_only"]
+                           ["BEGIN TRANSACTION DEFERRABLE" "transaction_deferrable"]]]
+    (is (nil? (err (.execute *handler* begin))))
+    (is (nil? (err (.execute *handler* "SELECT count(*) FROM person"))))
+    (let [result (.execute *handler* (str "RESET " setting))]
+      (is (= "0A000" (.sqlstate result)))
+      (is (= (str "parameter \"" setting "\" cannot be reset") (err result))))
+    (is (= "25P02" (.sqlstate (.execute *handler* "SELECT 1"))))
+    (is (nil? (err (.execute *handler* "ROLLBACK"))))
+    (is (= [["1"]] (rows (.execute *handler* "SELECT 1"))))))
+
 (deftest temporary-tables-are-hidden-across-sessions
   (let [h1 (pg/make-query-handler *conn*)
         h2 (pg/make-query-handler *conn*)]
