@@ -7019,7 +7019,8 @@
                       :tx-options {}
                       :ddl-version 0
                       :owned-locks #{})
-               (dissoc :temp-tables-before
+               (dissoc :speculative-db
+                       :temp-tables-before
                        :local-sequence-reservations
                        :local-sequence-generations
                        :local-sequence-identities)))))
@@ -12112,6 +12113,121 @@
                                    keys))])
                   (column-index-dependents db table column)))))))
 
+(defn- alterable-column [db table relation-oid name action]
+  (let [relation (catalog-objects/object-by-address db catalog-objects/pg-class-oid relation-oid)
+        column (catalog-objects/column-by-name db relation-oid name)]
+    (when (and relation (not= :table (:datahike.pg.object/kind relation)))
+      (throw (ex-info (str "ALTER action ALTER COLUMN ... " action
+                           " cannot be performed on relation \"" table "\"")
+                      {:sqlstate "42809"})))
+    (when-not (:datahike.pg.column/storage-ident column)
+      (throw (errors/pg-error :undefined-column {:table table :column name})))
+    (when (or (not (:datahike.pg.column/local? column))
+              (pos? (or (:datahike.pg.column/inherit-count column) 0))
+              (seq (inherited-column-dependents
+                    db (:datahike.pg.column/address-key column))))
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str action " on inherited columns is not supported")})))
+    column))
+
+(defn- identity-storage-column? [db table attr]
+  (and (get (dbi/-schema db) :__seq__/identity-generation)
+       (:__seq__/identity-generation
+        (d/entity db [:__seq__/name (str table "_" (name attr) "_seq")]))))
+
+(defn- alter-column-nullability-tx
+  [db table relation-oid {:keys [op name]}]
+  (let [action (if (= :set-not-null op) "SET NOT NULL" "DROP NOT NULL")
+        attr (:datahike.pg.column/storage-ident
+              (alterable-column db table relation-oid name action))
+        schema (dbi/-schema db)]
+    (let [entity (d/entity db attr)
+          eid (:db/id entity)]
+      (case op
+        :set-not-null
+        (when-not (:pg/not-null entity)
+          (when (some #(nil? (get (d/entity db %) attr)) (table-row-eids db table))
+            (throw (ex-info (str "column \"" name "\" of relation \"" table
+                                 "\" contains null values")
+                            {:sqlstate "23502" :table table :column name})))
+          [[:db/add eid :pg/not-null true]])
+
+        :drop-not-null
+        (do
+          (when (identity-storage-column? db table attr)
+            (throw (ex-info (str "column \"" name "\" of relation \"" table
+                                 "\" is an identity column")
+                            {:sqlstate "42601"})))
+          (when (or (= :db.unique/identity (get-in schema [attr :db/unique]))
+                    (some (fn [[ident {:db/keys [unique tupleAttrs]}]]
+                            (and (keyword? ident) (= table (namespace ident))
+                                 (= :db.unique/identity unique)
+                                 (some #{attr} tupleAttrs)))
+                          schema))
+            (throw (ex-info (str "column \"" name "\" is in a primary key")
+                            {:sqlstate "42P16"})))
+          (when (:pg/not-null entity)
+            [[:db/retract eid :pg/not-null true]]))))))
+
+(defn- alter-default-metadata [default type-name column]
+  (let [{:keys [kind value raw]} default]
+    (when (= :unsupported kind)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "DEFAULT expression " (pr-str raw)
+                             " on column \"" column "\" is not supported")})))
+    (when (some? value)
+      (cond-> {:pg/default-kind (if (and (= kind :literal) (string? value)
+                                         (#{"bit" "varbit"} type-name))
+                                  :bit-coerced
+                                  kind)
+               :pg/default-value (str value)}
+        (= kind :nextval) (assoc :pg/default-arg value)))))
+
+(defn- alter-column-default-tx [db table relation-oid {:keys [name default]}]
+  (let [action (if default "SET DEFAULT" "DROP DEFAULT")
+        column (alterable-column db table relation-oid name action)
+        attr (:datahike.pg.column/storage-ident column)
+        entity (d/entity db attr)
+        eid (:db/id entity)
+        metadata (alter-default-metadata default (types/oid->pg-name (:datahike.pg.column/type-oid column)) name)]
+    (when (or (:pg/generated entity) (identity-storage-column? db table attr))
+      (throw (ex-info (str "column \"" name "\" of relation \"" table "\" "
+                           (if (:pg/generated entity) "is a generated column" "is an identity column"))
+                      {:sqlstate "42601"})))
+    (when (#{:literal :bit :bit-coerced} (:pg/default-kind metadata))
+      (stmt/coerce-insert-value (:pg/default-value metadata) attr (dbi/-schema db) db))
+    (into (vec (for [attr [:pg/default-kind :pg/default-value :pg/default-arg]
+                     :let [old (get entity attr)]
+                     :when (and (some? old) (not (contains? metadata attr)))]
+                 [:db/retract eid attr old]))
+          (map (fn [[attr value]] [:db/add eid attr value]))
+          metadata)))
+
+(defn- backfill-added-column-tx [db table relation-oid {:keys [name not-null?]}]
+  (let [column (alterable-column db table relation-oid name "ADD COLUMN with a default or NOT NULL")
+        attr (:datahike.pg.column/storage-ident column)
+        entity (d/entity db attr)
+        kind (:pg/default-kind entity)
+        rows (table-row-eids db table)]
+    (when (and (seq rows) (#{:nextval :expr} kind))
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "backfilling an expression default on ADD COLUMN is not supported"})))
+    (let [value (when (#{:literal :bit :bit-coerced :fn} kind)
+                  (stmt/coerce-insert-value
+                   (row-constraints/eval-default kind (:pg/default-value entity))
+                   attr (dbi/-schema db) db))]
+      (when (and not-null? (seq rows) (nil? value))
+        (throw (ex-info (str "column \"" name "\" of relation \"" table
+                             "\" contains null values")
+                        {:sqlstate "23502" :table table :column name})))
+      (cond-> (if (some? value)
+                (mapv (fn [eid] [:db/add eid attr value]) rows)
+                [])
+        not-null? (conj [:db/add (:db/id entity) :pg/not-null true])))))
+
 (defn- inherited-add-column-tx-data
   "Propagate newly added parent columns through the inheritance tree.
 
@@ -12341,9 +12457,10 @@
                                                (case op
                                                  :add-column
                                                  (for [{:keys [name]} columns
-                                                       :let [{:keys [type storage-ident base-type typmod
+                                                       :let [{:keys [type storage-ident base-type typmod default
                                                                      type-object normalized-type]}
                                                              (get add-spec-by-name name)
+                                                             metadata (alter-default-metadata default base-type name)
                                                              raw-type type
                                                              unsupported-base (str/replace raw-type #"\s*\([^)]*\)" "")
                                                              _ (when (types/unsupported-input-type? unsupported-base)
@@ -12358,9 +12475,10 @@
                                                                          :db.type/string)
                                                              type-kind (:datahike.pg.object/kind type-object)
                                                              type-name (:datahike.pg.object/name type-object)]]
-                                                   (cond-> {:db/ident storage-ident
-                                                            :db/valueType dh-type
-                                                            :db/cardinality :db.cardinality/one}
+                                                   (cond-> (merge {:db/ident storage-ident
+                                                                   :db/valueType dh-type
+                                                                   :db/cardinality :db.cardinality/one}
+                                                                  metadata)
                                   ;; The SAME hint CREATE TABLE records.
                                   ;; This used to cover json/jsonb only,
                                   ;; so a column added by ALTER as `date`
@@ -12462,10 +12580,27 @@
                         (rename-column-tx-data db table relation-oid operation)
                         nil))
                     operations)
-            tx-data (into schema-and-constraint-data
-                          (concat added-constraint-data attnum-data
-                                  inherited-column-data
-                                  hint-data lifecycle-data))
+            nullability-ops (group-by :op (filter #(#{:set-not-null :drop-not-null} (:op %))
+                                                  operations))
+            nullability-tx (fn [op]
+                             (mapv (fn [change]
+                                     [:db.fn/call alter-column-nullability-tx table relation-oid change])
+                                   (get nullability-ops op)))
+            default-ops (filter #(= :alter-default (:op %)) operations)
+            default-tx (map (fn [change]
+                              [:db.fn/call alter-column-default-tx table relation-oid change])
+                            default-ops)
+            backfill-tx (for [{:keys [not-null? default] :as column} added-column-specs
+                              :when (or not-null? (some? (:value default)))]
+                          [:db.fn/call backfill-added-column-tx table relation-oid column])
+            ;; PostgreSQL drops nullability before adding columns, then
+            ;; validates SET NOT NULL against the resulting table. Run the
+            ;; scan in the writer as well as on a speculative transaction.
+            tx-data (into (nullability-tx :drop-not-null)
+                          (concat schema-and-constraint-data added-constraint-data
+                                  attnum-data inherited-column-data hint-data backfill-tx
+                                  lifecycle-data default-tx
+                                  (nullability-tx :set-not-null)))
             tx-data (if (and relation-oid (seq tx-data))
                       (into tx-data
                             (catalog-objects/bump-revision-tx
@@ -12487,7 +12622,9 @@
               ;; historical accept-as-no-op behavior (uniqueness is
               ;; still enforced by the SQL layer's identity checks)
               ;; instead of failing statements that used to succeed.
-              (if (and (not-any? #(= :add-column (:op %)) operations)
+              (if (and (empty? nullability-ops)
+                       (empty? default-ops)
+                       (not-any? #(= :add-column (:op %)) operations)
                        (re-find #"Update not supported"
                                 (str (.getMessage e))))
                 (empty-result "ALTER TABLE")

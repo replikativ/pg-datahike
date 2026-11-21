@@ -21,18 +21,22 @@ run_psql() {
 }
 
 cat > "$artifacts/fixture.sql" <<'SQL'
-CREATE TABLE client_parent (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE client_parent (id int PRIMARY KEY, name text);
+ALTER TABLE client_parent ALTER COLUMN name SET NOT NULL;
 CREATE TABLE client_child (id int PRIMARY KEY, parent_id int REFERENCES client_parent, amount int CHECK (amount > 0));
+ALTER TABLE client_child ADD COLUMN priority int DEFAULT 7 NOT NULL;
 CREATE INDEX client_child_amount_idx ON client_child (amount);
 CREATE VIEW client_view AS SELECT id FROM client_child;
 SQL
 
 cat > "$artifacts/schema.sql" <<'SQL'
 SELECT c.relname, c.relkind, a.attnum, a.attname,
-       pg_catalog.format_type(a.atttypid,a.atttypmod), a.attnotnull
+       pg_catalog.format_type(a.atttypid,a.atttypmod), a.attnotnull,
+       pg_catalog.pg_get_expr(d.adbin, d.adrelid)
   FROM pg_class c
   JOIN pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_attribute a ON c.oid = a.attrelid
+  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
  WHERE n.nspname = 'public'
    AND c.relname IN ('client_parent','client_child','client_view')
    AND a.attnum > 0 AND NOT a.attisdropped
@@ -99,3 +103,27 @@ diff -u "$artifacts/oracle-schema.txt" "$artifacts/restored-schema.txt"
 run_psql "$PG_EXPORT_RESTORE" -Atq -f "$artifacts/behavior.sql" > "$artifacts/behavior.txt"
 printf '2\n' | diff -u - "$artifacts/behavior.txt"
 echo 'Schema, view, and constraint checks passed.'
+
+cat > "$artifacts/data.sql" <<'SQL'
+INSERT INTO client_parent VALUES (1, 'parent'), (2, 'escaped' || chr(9) || chr(10) || 'value');
+INSERT INTO client_child (id, parent_id, amount) VALUES (21, 1, 7), (22, 2, 9), (23, NULL, 2);
+SQL
+
+cat > "$artifacts/rows.sql" <<'SQL'
+SELECT id, encode(convert_to(name, 'UTF8'), 'hex') FROM client_parent ORDER BY id;
+SELECT id, parent_id, amount, priority FROM client_child ORDER BY id;
+SELECT id FROM client_view ORDER BY id;
+SQL
+
+run_psql "$PG_EXPORT_SOURCE" -q -f "$artifacts/data.sql"
+run_psql "$PG_EXPORT_ORACLE" -q -f "$artifacts/data.sql"
+for relation in client_parent client_child; do
+  run_psql "$PG_EXPORT_SOURCE" -q -c "COPY public.$relation TO STDOUT" \
+    > "$artifacts/$relation.copy"
+  run_psql "$PG_EXPORT_RESTORE" -q -c "COPY public.$relation FROM STDIN" \
+    < "$artifacts/$relation.copy"
+done
+run_psql "$PG_EXPORT_ORACLE" -Atq -f "$artifacts/rows.sql" > "$artifacts/oracle-rows.txt"
+run_psql "$PG_EXPORT_RESTORE" -Atq -f "$artifacts/rows.sql" > "$artifacts/restored-rows.txt"
+diff -u "$artifacts/oracle-rows.txt" "$artifacts/restored-rows.txt"
+echo 'COPY data export and native restore passed.'

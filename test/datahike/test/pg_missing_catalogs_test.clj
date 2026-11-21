@@ -56,7 +56,7 @@
   (with-open [c (jdbc)]
     (testing "from the generated catalog data"
       (is (= "799" (one c "SELECT count(*)::text FROM pg_operator")))
-      (is (= "229" (one c "SELECT count(*)::text FROM pg_cast"))))
+      (is (= "235" (one c "SELECT count(*)::text FROM pg_cast"))))
     (testing "fixed rows of the catalog"
       (is (= "7" (one c "SELECT count(*)::text FROM pg_am")))
       (is (= "4" (one c "SELECT count(*)::text FROM pg_language")))

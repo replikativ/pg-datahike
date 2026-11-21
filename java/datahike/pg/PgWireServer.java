@@ -103,8 +103,8 @@ public final class PgWireServer {
     // campaign and the semantics are pinned to REL_17_7. Clients branch on
     // these (psql, pg_dump, libpq PQserverVersion, driver feature gates),
     // so every place that reports a version reads them from here.
-    public static final String SERVER_VERSION = "17.7";
-    public static final String SERVER_VERSION_NUM = "170007";
+    public static final String SERVER_VERSION = "18.6";
+    public static final String SERVER_VERSION_NUM = "180006";
 
     public static final int OID_CHAR        = 18;  // PG internal "char" (1 byte)
     public static final int OID_BIT         = 1560;

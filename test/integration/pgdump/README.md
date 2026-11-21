@@ -48,14 +48,19 @@ Needs pg-datahike on `localhost:15432` and a source PostgreSQL. Outputs
 `pagila-default-format.sql` (the generated dump); both are kept as CI
 artifacts because the console prints only counts.
 
-## Schema export into native PostgreSQL
+## Schema and data export into native PostgreSQL
 
 `schema-export.sh` checks the reverse direction with stock PostgreSQL 18
 client binaries on `PATH`. It creates the same ordinary schema fixture in
 pg-datahike and in native PostgreSQL, dumps the former, and restores it into
-a second native database. It compares the restored schema, reads the view,
-and checks rejection of duplicate keys, NULLs, missing parent rows, and
-failed checks.
+a second native database. It compares the restored schema, including the
+default and nullability added by ALTER TABLE, and checks the view and
+constraint behavior. It then exports rows via `COPY TO STDOUT` and checks
+that native `COPY FROM STDIN` restores the same values, including escaped
+text and a NULL foreign key.
+
+PostgreSQL 18 `pg_dump` queries `pg_get_sequence_data` for dumps that
+include data. That function and sequence-state round-tripping remain open.
 
 Set `PG_EXPORT_SOURCE`, `PG_EXPORT_ORACLE`, and `PG_EXPORT_RESTORE` to three
 empty disposable database URLs. Use an 18.6 candidate as the source and make

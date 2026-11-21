@@ -66,9 +66,9 @@
 ;; ALTER COLUMN … DROP DEFAULT
 ;; ============================================================================
 
-(deftest alter-column-drop-default-still-rewrites
-  (testing "ALTER COLUMN x DROP DEFAULT clause is removed (no-op in our schema)"
-    (is (= "ALTER TABLE t   ADD COLUMN y INT"
+(deftest alter-column-drop-default-reaches-the-parser
+  (testing "ALTER COLUMN x DROP DEFAULT reaches the ALTER executor"
+    (is (= "ALTER TABLE t ALTER COLUMN x DROP DEFAULT, ADD COLUMN y INT"
            (preprocess "ALTER TABLE t ALTER COLUMN x DROP DEFAULT, ADD COLUMN y INT")))))
 
 (deftest alter-column-drop-default-in-string-literal

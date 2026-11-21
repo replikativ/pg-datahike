@@ -216,7 +216,12 @@
        :gate "test/datahike/test/pg_constraints_test.clj"
        :test-var "postgres-rejects-invalid-foreign-key-definitions"}]}
     {:name "create_view", :boundaries #{:ddl :relational :views}, :mode :unmeasured}
-    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :unmeasured}]}
+    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :unmeasured
+     :strict-slices
+     [{:id :alter-column-nullability
+       :source-lines [876 908]
+       :gate "test/datahike/test/pg_constraints_test.clj"
+       :test-var "alter-column-nullability"}]}]}
   {:id 5,
    :name "bulk I/O, temporary relations, and client tooling",
    :tests
@@ -260,6 +265,13 @@
        :source-lines [17 21]
        :gate "test/datahike/test/pg_matview_test.clj"
        :test-var "postgres-materialized-view-with-no-data"}]}
+    {:name "fast_default", :boundaries #{:defaults :ddl :dml}, :mode :discovery
+     :blockers #{:expression-default-backfill :table-rewrite-events}
+     :strict-slices
+     [{:id :alter-table-preserves-existing-default-values
+       :source-lines [87 98]
+       :gate "test/datahike/test/pg_expression_default_test.clj"
+       :test-var "fast-default-keeps-old-row-values"}]}
     {:name "generated_stored", :boundaries #{:copy :ddl :generated-columns :dml}, :mode :unmeasured}
     {:name "identity", :boundaries #{:identity-columns :sequences :ddl :dml}, :mode :unmeasured}
     {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :unmeasured}

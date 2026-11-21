@@ -2277,16 +2277,6 @@
              (let [t (str/lower-case (str/trim (str (first es))))]
                (or (= t "true") (= t "1 = 1")))))))
 
-(defn- values-expression-rows
-  "Return a VALUES node as rows of expression ASTs. JSqlParser flattens a
-   single row but wraps each row of a multi-row VALUES in its own expression
-   list."
-  [^Values values]
-  (let [raw (vec (.getExpressions values))]
-    (if (and (seq raw) (instance? ParenthesedExpressionList (first raw)))
-      (mapv (fn [^ParenthesedExpressionList row] (vec row)) raw)
-      [raw])))
-
 (defn analyze-values-output
   "VALUES output columns inferred from ASTs, without evaluating any cell."
   [values schema db]
@@ -2295,7 +2285,7 @@
 (defn translate-literal-values
   "Make a SELECT leaf for literal VALUES rows used in a set operation."
   [values schema db]
-  (let [expressions (values-expression-rows values)
+  (let [expressions (analysis/values-expression-rows values)
         columns (analyze-values-output values schema db)
         rows (when-not params/*analysis-only?*
                (mapv #(mapv eval-values-literal %) expressions))
@@ -2423,7 +2413,7 @@
   [^Values values]
   (str/join " UNION ALL "
             (map (fn [row] (str "SELECT " (str/join ", " (map str row))))
-                 (values-expression-rows values))))
+                 (analysis/values-expression-rows values))))
 
 (defn- lateral-subselect->spec
   "`JOIN LATERAL (SELECT …) s ON true` whose inner references an outer
@@ -2468,7 +2458,7 @@
                                       (unquote-ident (.-name c)))
                                     (or (.getAliasColumns ^Alias a) []))))
             items (when-not values? (vec (.getSelectItems ^PlainSelect inner)))
-            value-rows (when values? (values-expression-rows inner))
+            value-rows (when values? (analysis/values-expression-rows inner))
             cols (vec (or alias-cols
                           (map-indexed (fn [i si] (select-item-col-name si i)) items)
                           (map-indexed (fn [i _] (str "column" (inc i)))
@@ -2978,13 +2968,7 @@
            branch-parsed
            (cond
              values?
-             (let [^Values values inner
-                   raw-exprs (.getExpressions values)
-                   row-exprs (if (and (seq raw-exprs)
-                                      (instance? ParenthesedExpressionList (first raw-exprs)))
-                               (mapv #(vec (iterator-seq (.iterator ^ParenthesedExpressionList %)))
-                                     raw-exprs)
-                               [(vec raw-exprs)])
+             (let [row-exprs (analysis/values-expression-rows inner)
                    rows (mapv #(mapv eval-values-literal %) row-exprs)
                    width (count (first rows))
                    aliases (if (= width (count explicit-aliases))
@@ -10381,44 +10365,12 @@
 
       ;; Normal INSERT with VALUES
       (and (instance? Values select) (seq col-names))
-      (let [^Values values select
-            expr-list (.getExpressions values)
-            ;; Bind extract-value with schema+db for scalar subquery support
-            ev (fn [e] (extract-value e schema db))
-            ;; Multi-row INSERT: VALUES (1,'a'), (2,'b') →
-            ;; JSqlParser 5.x: each row is a ParenthesedExpressionList
-            ;; Disambiguation when all PELs have exactly 1 element:
-            ;;   - If PEL count == column count → single row with parenthesized scalars
-            ;;     e.g. INSERT INTO t(a,b,c) VALUES (('1'::int), ('x'), ('2'::int))
-            ;;   - If PEL count != column count → multi-row single-column table
-            ;;     e.g. INSERT INTO t(name) VALUES ('alice'), ('bob')
-            all-pel? (every? #(instance? ParenthesedExpressionList %) expr-list)
+      (let [ev (fn [e] (extract-value e schema db))
             num-cols (count col-names)
-            row-exprs (cond
-                        ;; All PELs have >1 element → genuine multi-row VALUES
-                        (and all-pel?
-                             (every? #(> (count %) 1) expr-list))
-                        (mapv (fn [^ParenthesedExpressionList pel] (vec pel))
-                              expr-list)
-
-                        ;; All PELs have exactly 1 element AND count matches columns
-                        ;; → single row with parenthesized expressions
-                        (and all-pel?
-                             (every? #(= (count %) 1) expr-list)
-                             (= (count expr-list) num-cols))
-                        [(mapv (fn [^ParenthesedExpressionList pel] (first pel))
-                               expr-list)]
-
-                        ;; All PELs have exactly 1 element but count != columns
-                        ;; → multi-row for single-column (or N-column) table
-                        (and all-pel?
-                             (every? #(= (count %) 1) expr-list))
-                        (mapv (fn [^ParenthesedExpressionList pel] (vec pel))
-                              expr-list)
-
-                        ;; Direct list of values (single row without parens)
-                        :else
-                        [(vec expr-list)])
+            row-exprs (analysis/values-expression-rows select)
+            width (count (first row-exprs))
+            _ (when (some #(not= width (count %)) row-exprs)
+                (throw (ex-info "VALUES lists must all be the same length" {:sqlstate "42601"})))
             _ (when (and partial? (some target-list-srf? (mapcat identity row-exprs)))
                 (throw (errors/pg-error :feature-not-supported
                                         {:feature "set-returning expressions with subscripted INSERT targets"})))
@@ -11619,15 +11571,7 @@
   (params/check-cancel!)
   (try
     (when-let [[anchor recursive] (recursive-cte-branches wi)]
-      (let [col-list  (.getWithItemList wi)
-            col-names (mapv (fn [item]
-                              (let [expr (.getExpression ^SelectItem item)]
-                                (unquote-ident
-                                 (if (instance? Column expr)
-                                   (.getColumnName ^Column expr)
-                                   (str expr)))))
-                            col-list)
-            row-marker (pgs/row-marker-attr target-name)
+      (let [row-marker (pgs/row-marker-attr target-name)
             ;; AST-level param detection (robust to translation constant-folding
             ;; a table-free `$n` cast). A parameterised CTE can't run its anchor
             ;; at parse, so we defer — unless the anchor has no FROM (table-free
@@ -11637,6 +11581,10 @@
             param? (or anchor-param?
                        (boolean (seq (params/ast-param-indices recursive))))
             anchor-from (.getFromItem ^PlainSelect anchor)
+            rule-anchor? (and param? anchor-param? (nil? anchor-from))
+            anchor-parsed (when-not rule-anchor? (translate-select anchor schema db))
+            col-names (or (not-empty (recursive-analysis-column-names wi))
+                          (:find-aliases anchor-parsed))
             mk-data-tx (fn [coercions rows]
                          (vec (for [row (checked-rows rows)]
                                 (assoc (into {} (keep-indexed
@@ -11648,14 +11596,13 @@
                                        row-marker true))))]
         (cond
           ;; Table-free parameterised anchor → rule/B2 owns it.
-          (and param? anchor-param? (nil? anchor-from))
+          rule-anchor?
           nil
 
           ;; Parameterised (table-full) → defer data to Execute. Enrich only the
           ;; schema now; column types come from the anchor's inferred OIDs.
           param?
-          (let [anchor-parsed (translate-select anchor schema db)
-                anchor-oids (:select-item-oids anchor-parsed)
+          (let [anchor-oids (:select-item-oids anchor-parsed)
                 col-types (mapv (fn [i]
                                   (or (some-> (nth anchor-oids i nil) types/dh-type-for-oid)
                                       :db.type/string))
@@ -11691,8 +11638,7 @@
 
           ;; No params — materialise now.
           :else
-          (let [anchor-parsed (translate-select anchor schema db)
-                anchor-edb  (or (:enriched-db anchor-parsed) db)
+          (let [anchor-edb  (or (:enriched-db anchor-parsed) db)
                 anchor-rows (visible-query-rows anchor-parsed anchor-edb)
                 anchor-oids (:select-item-oids anchor-parsed)
                 col-types (mapv (fn [i]

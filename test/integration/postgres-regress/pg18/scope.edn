@@ -16,7 +16,6 @@
     "rules"
     "inherit"
     "event_trigger"
-    "fast_default"
     "triggers"
     "plpgsql"
     "alter_generic"
