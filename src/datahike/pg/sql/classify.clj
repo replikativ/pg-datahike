@@ -1247,6 +1247,17 @@
               (= ")" txt) (recur (inc i) (dec depth) (conj elem t) out)
               :else       (recur (inc i) depth (conj elem t) out))))))))
 
+(defn- ctas-execute-invocation [query]
+  (let [[execute name & tail] (tokenize query)]
+    (when (and (kw=? execute "execute") (ident-tok? name))
+      (let [invocation {:name (str/lower-case (ident-text name))}]
+        (if (empty? tail)
+          invocation
+          (when-let [[args remainder] (read-balanced tail)]
+            (when (empty? remainder)
+              (assoc invocation :args-text
+                     (binding [*source* query] (slice-between args))))))))))
+
 (defn- classify-create-table
   "CREATE TABLE is JSqlParser's, with one exception: a `LIKE source`
    element, which JSqlParser's grammar has no place for. Those are
@@ -1270,15 +1281,16 @@
            ts (if ine? (drop 3 toks) toks)]
        (when-let [[nm after-name] (read-relation-name ts)]
          (when-let [t (read-as-query-tail after-name)]
-           ;; A plain `CREATE TABLE t AS <query>` is JSqlParser's
-           ;; already and stays there; only the two things it cannot
-           ;; parse are taken over here.
-           (when (or (seq (:columns t)) (not (:with-data? t))
-                     (re-find #"(?is)\Wwith\s+data\s*;?\s*$" *source*))
-             (assoc t :kind :create-table-as
-                    :table-name nm
-                    :relation-sql (slice-between (take (- (count ts) (count after-name)) ts))
-                    :if-not-exists? (boolean ine?)))))))
+           (let [invocation (ctas-execute-invocation (:query t))]
+             ;; A plain SELECT without a column list or WithData tail
+             ;; remains JSqlParser's form. EXECUTE needs its session plan.
+             (when (or invocation (seq (:columns t)) (not (:with-data? t))
+                       (re-find #"(?is)\Wwith\s+data\s*;?\s*$" *source*))
+               (cond-> (assoc t :kind :create-table-as
+                              :table-name nm
+                              :relation-sql (slice-between (take (- (count ts) (count after-name)) ts))
+                              :if-not-exists? (boolean ine?))
+                 invocation (assoc :execute-invocation invocation))))))))
    (if-not (re-find #"(?i)\blike\b" *source*)
      {:kind :generic-sql}
      (let [elems (create-table-like-elements)]

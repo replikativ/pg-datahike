@@ -153,6 +153,38 @@
       (is (= [["0"]] (rows (exec h "SELECT count(*) FROM pg_class WHERE relname = 'repeated'"))))
       (finally (release! h)))))
 
+(deftest postgres-create-table-as-execute
+  (let [h (fresh-handler)]
+    (try
+      (doseq [sql ["CREATE SEQUENCE arg_seq"
+                   "CREATE SEQUENCE body_seq"
+                   (str "PREPARE q(int) AS SELECT $1 AS a, nextval('body_seq') AS b,"
+                        "3 AS c, 4 AS d, 5 AS e, 6 AS f, 7 AS g, 8 AS h, 9 AS i")]]
+        (is (nil? (.error (exec h sql))) sql))
+      (let [r (exec h (str "CREATE TEMP TABLE empty_target AS "
+                           "EXECUTE q(nextval('arg_seq')::int) WITH NO DATA"))]
+        (is (nil? (.error r)))
+        (is (= "SELECT 0" (.commandTag r))))
+      (is (= [] (rows (exec h "SELECT a,b FROM empty_target"))))
+      (let [r (exec h (str "CREATE TEMP TABLE full_target (\"A\") AS "
+                           "EXECUTE q(nextval('arg_seq')::int)"))]
+        (is (nil? (.error r)))
+        (is (= "SELECT 1" (.commandTag r))))
+      (is (= [["2" "1" "3" "4" "5" "6" "7" "8" "9"]]
+             (rows (exec h "SELECT * FROM full_target")))
+          "WITH NO DATA evaluates the argument and skips the SELECT. Columns retain order.")
+      (is (= [["2"]] (rows (exec h "SELECT \"A\" FROM full_target"))))
+      (is (= "CREATE TABLE AS" (.commandTag (exec h (str "CREATE TEMP TABLE IF NOT EXISTS "
+                                                         "full_target AS EXECUTE missing")))))
+      (is (= "26000" (.sqlstate (exec h "CREATE TABLE no_statement AS EXECUTE missing"))))
+      (is (= "42601" (.sqlstate (exec h "CREATE TABLE bad_arity AS EXECUTE q WITH NO DATA"))))
+      (is (= "22P02" (.sqlstate (exec h "CREATE TABLE bad_arg AS EXECUTE q('bad') WITH NO DATA"))))
+      (is (nil? (.error (exec h "CREATE TABLE ordinary (x int)"))))
+      (is (nil? (.error (exec h "PREPARE d(int) AS INSERT INTO ordinary VALUES ($1) RETURNING x"))))
+      (is (= "42809" (.sqlstate (exec h "CREATE TABLE bad_source AS EXECUTE d(1) WITH NO DATA"))))
+      (is (= [["0"]] (rows (exec h "SELECT count(*) FROM ordinary"))))
+      (finally (release! h)))))
+
 (deftest ctas-stores-the-rows-in-the-selects-order
   ;; `select_implicit`'s whole remaining gap, and a silent wrong answer
   ;; of a kind nothing downstream can repair: the ORDER BY decides what

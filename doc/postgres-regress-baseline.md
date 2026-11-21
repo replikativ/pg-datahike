@@ -132,7 +132,7 @@ state after rejected statements.
 | `copyselect` | COPY diagnostics. Strict wire slices check legacy `FORCE QUOTE` CSV output and successive `COPY FROM STDIN` commands. |
 | `create_table` and `create_table_like` | Partitioning, some persistence metadata and optional LIKE properties such as `INCLUDING GENERATED`. A subquery in a default is rejected with a different SQLSTATE. |
 | `groupingsets` | Grouping sets, rollup and cube are unsupported. The v0.1.390 replay completed with early rejections; the initial October run exhausted the heap. |
-| `prepare` | Arity, declared type coercion and unknown-type errors now agree in focused probes. `CREATE TABLE AS EXECUTE`, path inference and catalog output still differ. |
+| `prepare` | Arity, declared type coercion and unknown-type errors now agree in focused probes. A strict slice covers `CREATE TABLE AS EXECUTE`; path inference and catalog output still differ. |
 
 The October intake attempted the 164 selected files. The native run completed
 164 and the then-current pg-datahike build completed 162. The two incomplete
