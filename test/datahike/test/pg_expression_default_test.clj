@@ -18,7 +18,9 @@
             [datahike.api :as d]
             [datahike.pg.dump :as dump]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager SQLException]))
+  (:import [java.io StringReader]
+           [java.sql Connection DriverManager SQLException]
+           [org.postgresql PGConnection]))
 
 (def ^:dynamic *port* nil)
 (def ^:dynamic *conn* nil)
@@ -69,6 +71,58 @@
       ;; Both are parse errors bare and parse wrapped, which is what the
       ;; rule does -- it used to fire only for nextval/currval/lastval.
       (is (= [[3 "ab"]] (rows c "SELECT d,e FROM t"))))))
+
+(deftest alter-column-defaults-and-backfill
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE task (id int PRIMARY KEY)")
+    (exec! c "INSERT INTO task VALUES (1)")
+    (exec! c "ALTER TABLE task ADD COLUMN priority int DEFAULT 7 NOT NULL")
+    (exec! c "ALTER TABLE task ADD COLUMN tag text DEFAULT 'old'")
+    (exec! c "ALTER TABLE task ALTER COLUMN priority SET DEFAULT (40 + 2)")
+    (exec! c "INSERT INTO task (id) VALUES (2)")
+    (with-open [payload (StringReader. "3\n")]
+      (is (= 1 (.copyIn (.getCopyAPI (.unwrap c PGConnection))
+                        "COPY task (id) FROM STDIN" payload))))
+    (exec! c "ALTER TABLE task ALTER COLUMN tag DROP DEFAULT")
+    (exec! c "INSERT INTO task (id) VALUES (4)")
+    (is (= [[1 7 "old"] [2 42 "old"] [3 42 "old"] [4 42 nil]]
+           (rows c "SELECT id, priority, tag FROM task ORDER BY id")))
+    (exec! c "BEGIN")
+    (exec! c "ALTER TABLE task ALTER COLUMN priority SET DEFAULT 5")
+    (exec! c "INSERT INTO task (id) VALUES (5)")
+    (is (= [[5]] (rows c "SELECT priority FROM task WHERE id = 5")))
+    (exec! c "ROLLBACK")
+    (exec! c "INSERT INTO task (id) VALUES (5)")
+    (is (= [[42]] (rows c "SELECT priority FROM task WHERE id = 5")))
+    (is (= "23502"
+           (try
+             (exec! c "ALTER TABLE task ADD COLUMN missing int NOT NULL")
+             (catch SQLException e (.getSQLState e)))))
+    (is (= [[0]]
+           (rows c (str "SELECT count(*)::int FROM pg_attribute "
+                        "WHERE attrelid = 'task'::regclass AND attname = 'missing'"))))))
+
+(deftest fast-default-keeps-old-row-values
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE t (pk int NOT NULL PRIMARY KEY, c_int int DEFAULT 1)")
+    (exec! c "INSERT INTO t VALUES (1), (2)")
+    (exec! c (str "ALTER TABLE t ADD COLUMN c_bpchar bpchar(5) DEFAULT 'hello', "
+                  "ALTER COLUMN c_int SET DEFAULT 2"))
+    (exec! c "INSERT INTO t VALUES (3), (4)")
+    (exec! c (str "ALTER TABLE t ADD COLUMN c_text text DEFAULT 'world', "
+                  "ALTER COLUMN c_bpchar SET DEFAULT 'dog'"))
+    (exec! c "INSERT INTO t VALUES (5), (6)")
+    (is (= [[1 1 "hello" "world"] [2 1 "hello" "world"]
+            [3 2 "hello" "world"] [4 2 "hello" "world"]
+            [5 2 "dog" "world"] [6 2 "dog" "world"]]
+           (rows c "SELECT pk, c_int, c_bpchar::text, c_text FROM t ORDER BY pk")))
+    (exec! c "INSERT INTO t VALUES ((7), (8))")
+    (is (= [[7 8]] (rows c "SELECT pk, c_int FROM t WHERE pk = 7")))
+    (is (= "42601"
+           (try
+             (exec! c "INSERT INTO t VALUES (10), (11, 12)")
+             (catch SQLException e (.getSQLState e)))))
+    (is (= [[7]] (rows c "SELECT count(*)::int FROM t")))))
 
 (deftest compound-arithmetic-defaults
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]

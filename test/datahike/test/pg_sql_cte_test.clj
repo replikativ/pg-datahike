@@ -562,6 +562,17 @@
       (is (= "0A000" (.getSQLState ^SQLException e)))
       (is (re-find #"recursive CTE shape" (.getMessage ^SQLException e))))))
 
+(deftest recursive-cte-uses-anchor-column-names
+  (with-open [c (jdbc)]
+    (is (= [["1" "1"] ["1" "2"] ["1" "3"] ["1" "4"] ["1" "5"]]
+           (rows c (str "WITH RECURSIVE walk AS ("
+                        "SELECT n.id AS root, n.id AS child FROM node n WHERE n.parent = 0 "
+                        "UNION "
+                        "SELECT w.root, n.id FROM walk w "
+                        "JOIN node n ON n.parent = w.child "
+                        "JOIN node r ON r.id = w.root) "
+                        "SELECT root, child FROM walk ORDER BY child"))))))
+
 (deftest postgres-recursive-outer-join-slice
   ;; PostgreSQL with.sql lines 977-992. The recursive relation may not occupy
   ;; the nullable side of an outer join during fixed-point evaluation.

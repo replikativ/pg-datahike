@@ -511,8 +511,8 @@
    :sql-sha256 "86e36b4cf628f1134659bf2e270f4f098d9049c46c6f863567bfb39f415bf6ea",
    :expected-sha256 "a56a0c667b03375e4ae6352e5d1841791b036a36f6dd998543db60a7360edda3",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :ddl-and-dml}
+   :status :campaign,
+   :wave 6}
   {:name "float4",
    :scheduled? true,
    :sql-sha256 "94e1c3a91ac5220e8759810845380ba93d5c2f904c86357ddc0743a586ed1351",

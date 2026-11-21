@@ -211,6 +211,12 @@ NULL` removes that state. The regression checks rollback and atomicity
 when an ALTER contains several actions. Explicit constraint names and
 changing nullability on inherited columns remain open.
 
+Adding a column with a literal default fills existing rows. Changing or
+dropping the default affects later writes, including COPY with an omitted
+column. The `fast_default.sql` slice also checks that short rows in a
+multi-row VALUES insert retain their original boundaries. Backfilling
+expression defaults on populated tables remains open.
+
 The first stock dump query over relations also exposed a Datahike planner
 problem. It exhausted a 1.2 GiB heap on this fixture. The planner projected
 the outer relation's join keys, kept repeated bindings, and joined those
@@ -243,6 +249,11 @@ The fixture contains no vector columns.
 Use `test/integration/pgdump/schema-export.sh` for the same check. All
 eleven strict files also match on the candidate after source-position
 normalization.
+
+The expanded fixture compares ALTER-generated defaults as part of the
+schema restore. It exports table data through COPY and restores it into
+native 18.6, then compares the actual values. Data-bearing `pg_dump`
+still needs `pg_get_sequence_data` and correct sequence state.
 
 ## Running the comparison
 

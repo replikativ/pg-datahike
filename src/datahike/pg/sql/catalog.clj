@@ -79,7 +79,7 @@
     "pg_authid" "pg_auth_members" "pg_am" "pg_language" "pg_tablespace"
     "pg_operator" "pg_opclass" "pg_opfamily" "pg_amop" "pg_amproc"
     "pg_conversion" "pg_ts_parser" "pg_ts_template" "pg_ts_dict" "pg_ts_config"
-    "pg_cast" "pg_sequence" "pg_range" "pg_statistic"
+    "pg_cast" "pg_sequence" "pg_range" "pg_statistic" "pg_partitioned_table" "pg_largeobject_metadata"
     "pg_foreign_table" "pg_init_privs" "pg_transform"
     "pg_foreign_data_wrapper" "pg_foreign_server" "pg_default_acl"
     "pg_event_trigger" "pg_subscription" "pg_seclabels"
@@ -369,6 +369,24 @@
                         :pg_constraint/conperiod false)
                 rows))
         rows))))
+
+(def ^:private partitioned-table-schema
+  ;; pg_dump inspects partition keys even during an ordinary data-only dump.
+  [{:db/ident :pg_partitioned_table/partrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+   {:db/ident :pg_partitioned_table/partstrat :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+   {:db/ident :pg_partitioned_table/partnatts :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+   {:db/ident :pg_partitioned_table/partdefid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+   {:db/ident :pg_partitioned_table/partattrs :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "int2vector"}
+   {:db/ident :pg_partitioned_table/partclass :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "oidvector"}
+   {:db/ident :pg_partitioned_table/partcollation :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "oidvector"}
+   {:db/ident :pg_partitioned_table/partexprs :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_node_tree"}
+   {:db/ident (pgs/row-marker-attr "pg_partitioned_table") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}])
+
+(def ^:private largeobject-metadata-schema
+  [{:db/ident :pg_largeobject_metadata/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+   {:db/ident :pg_largeobject_metadata/lomowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+   {:db/ident :pg_largeobject_metadata/lomacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
+   {:db/ident (pgs/row-marker-attr "pg_largeobject_metadata") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}])
 
 (defn catalog-schema-for*
   "Built-in catalog schema — every table-name is a key in a case
@@ -999,10 +1017,14 @@
     ;; Synthesized from the :pg/default-* facts stored on column schema
     ;; entities. pgjdbc LEFT JOINs this table and psql uses a correlated
     ;; subquery over it for the Default column of `\d`.
-    [{:db/ident :pg_attrdef/adrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+    [{:db/ident :pg_attrdef/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_attrdef/adrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_attrdef/adnum :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_attrdef/adbin :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_attrdef") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_partitioned_table" partitioned-table-schema
+    "pg_largeobject_metadata" largeobject-metadata-schema
+
     "pg_description"
     ;; Always empty — we don't track COMMENT ON anything. Metabase's
     ;; get-tables query LEFT JOINs against this; an empty real table
@@ -1731,6 +1753,7 @@
                                      (get physical-by-ident
                                           (:datahike.pg.column/storage-ident column))]
                             (assoc physical
+                                   :column-eid (:db/id column)
                                    :name (:datahike.pg.column/name column)
                                    :attnum (:datahike.pg.column/attnum column)
                                    :type-oid (:datahike.pg.column/type-oid column)
@@ -2936,9 +2959,15 @@
              :let [default (get defaults (:attr col))]
              :when default
              :let [tbl-oid (or (pgs/table-oid cte-db tname)
-                               (Math/abs (.hashCode ^String tname)))]]
-         {:pg_attrdef/adrelid (long tbl-oid)
-          :pg_attrdef/adnum (long (or (:attnum col) (inc idx)))
+                               (Math/abs (.hashCode ^String tname)))
+                   attnum (or (:attnum col) (inc idx))
+                   ;; Use the durable column subobject rather than a name
+                   ;; or the shared storage attribute on inherited columns.
+                   oid (or (:column-eid col)
+                           (:db/id (d/entity cte-db (:attr col))))]]
+         {:pg_attrdef/oid (long oid)
+          :pg_attrdef/adrelid (long tbl-oid)
+          :pg_attrdef/adnum (long attnum)
           :pg_attrdef/adbin (render default col)
           (pgs/row-marker-attr "pg_attrdef") true})))
     ;; `vector` is built into this compatibility surface, but expose it as an
@@ -3031,6 +3060,7 @@
     ;; The server has no foreign-data objects, default grants, event
     ;; triggers, subscriptions, or security label providers.
     ("pg_foreign_data_wrapper" "pg_foreign_server" "pg_default_acl"
+                               "pg_partitioned_table" "pg_largeobject_metadata"
                                "pg_event_trigger" "pg_subscription" "pg_seclabels")
     []
     "pg_publication"

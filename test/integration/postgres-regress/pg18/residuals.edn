@@ -80,6 +80,15 @@
   {:id :alter-column-nullability
    :file "alter_table" :lines [876 908] :state :covered :impact :wrong-result
    :detail "SET and DROP NOT NULL on ordinary tables update enforcement and the catalog together. The gate checks rejecting existing NULL rows, atomic failure with multiple ALTER actions, and visibility before and after rollback."}
+  {:id :alter-table-preserves-existing-default-values
+   :file "fast_default" :lines [87 98] :state :covered :impact :wrong-result
+   :detail "ADD COLUMN with a literal default fills existing rows. SET DEFAULT affects later writes, and short rows in a VALUES list remain separate rows."}
+  {:id :expression-default-backfill
+   :file "fast_default" :lines [67 67] :state :open :impact :unsupported
+   :detail "Adding a column with an expression default to a populated table requires backfill evaluation. The volatile default case needs a separate value per existing row."}
+  {:id :sequence-data-discovery
+   :file "sequence" :lines [416 417] :state :open :impact :unsupported
+   :detail "PostgreSQL 18 pg_dump uses pg_get_sequence_data to read last_value and is_called in data-bearing dumps. Schema-only pg_dump and direct COPY pass the ordinary fixture."}
   {:id :reset-transaction-isolation
    :file "transactions" :lines [39 42] :state :covered :impact :wrong-result
    :detail "RESET of a current transaction characteristic now returns 0A000. The gate checks that the transaction then returns 25P02 until rollback."}

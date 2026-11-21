@@ -63,7 +63,9 @@
            [net.sf.jsqlparser.statement.update Update UpdateSet]
            [net.sf.jsqlparser.statement.delete Delete]
            [net.sf.jsqlparser.statement.drop Drop]
-           [net.sf.jsqlparser.statement.alter Alter AlterExpression AlterExpression$ColumnDataType]
+           [net.sf.jsqlparser.statement.alter
+            Alter AlterExpression AlterExpression$ColumnDataType
+            AlterExpression$ColumnSetDefault AlterExpression$ColumnDropDefault]
            [net.sf.jsqlparser.statement ExplainStatement SavepointStatement RollbackStatement Commit]
            [net.sf.jsqlparser.statement.create.index CreateIndex]))
 
@@ -85,6 +87,33 @@
                       ["DROP" "NOT" "NULL"] :drop-not-null} tokens)]
       (when operation
         {:op operation :name (unquote-ident (.getColumnName column))}))))
+
+(defn- alter-added-column [column]
+  (let [^ColumnDefinition definition
+        (if (instance? ColumnDefinition column)
+          column
+          (let [^AlterExpression$ColumnDataType data column]
+            (ColumnDefinition. (.getColumnName data) (.getColDataType data)
+                               (.getColumnSpecs data))))]
+    {:name (unquote-ident (.getColumnName definition))
+     ;; Keep quoted type names distinct from built-ins.
+     :type (str (.getColDataType definition))
+     :primary-key? (ddl/column-is-primary-key? definition)
+     :unique? (ddl/column-is-unique? definition)
+     :not-null? (ddl/column-is-not-null? definition)
+     :default (ddl/column-default-spec definition)}))
+
+(defn- alter-column-default [^AlterExpression expression]
+  (if-let [^AlterExpression$ColumnSetDefault set-default
+           (first (.getColumnSetDefaultList expression))]
+    (let [definition (doto (ColumnDefinition.)
+                       (.setColumnSpecs ["DEFAULT" (.getDefaultValue set-default)]))]
+      {:op :alter-default
+       :name (unquote-ident (.getColumnName set-default))
+       :default (ddl/column-default-spec definition)})
+    (when-let [^AlterExpression$ColumnDropDefault drop-default
+               (first (.getColumnDropDefaultList expression))]
+      {:op :alter-default :name (unquote-ident (.getColumnName drop-default))})))
 
 (defn- create-index-options
   "Normalize JSqlParser's `WITH (...)` tail into a keyword map.  PostgreSQL's
@@ -567,7 +596,6 @@
      - reserved-keyword aliases (`AS select` → `AS \"select\"`)
      - COLLATE strip (qualified + bare)
      - OPERATOR(qual.op) → bare op
-     - ALTER COLUMN … DROP DEFAULT removal
      - (PRIMARY KEY(col)) → (id serial) for INHERITS bodies
      - ALTER TABLE … TYPE … USING half stripping
      - reserved column name (INDEX/KEY varchar) quoting
@@ -2469,48 +2497,8 @@
                                                (seq (.getColDataTypeList exp))
                                                (or (.hasColumn exp)
                                                    (nil? (.getIndex exp))))
-                                          (let [cdts (.getColDataTypeList exp)]
-                                            {:op :add-column
-                                             :columns (mapv (fn [cdt]
-                                                              (let [definition?
-                                                                    (instance? ColumnDefinition cdt)
-                                                                    name (if definition?
-                                                                           (.getColumnName
-                                                                            ^ColumnDefinition cdt)
-                                                                           (.getColumnName
-                                                                            ^net.sf.jsqlparser.statement.alter.AlterExpression$ColumnDataType
-                                                                            cdt))
-                                                                    col-type
-                                                                    (if definition?
-                                                                      (.getColDataType
-                                                                       ^ColumnDefinition cdt)
-                                                                      (.getColDataType
-                                                                       ^net.sf.jsqlparser.statement.alter.AlterExpression$ColumnDataType
-                                                                       cdt))
-                                                                    specs (when-not definition?
-                                                                            (.getColumnSpecs
-                                                                             ^net.sf.jsqlparser.statement.alter.AlterExpression$ColumnDataType
-                                                                             cdt))
-                                                                    upper-specs
-                                                                    (into #{} (map (comp str/upper-case str)) specs)]
-                                                                {:name (unquote-ident name)
-                                                               ;; Preserve identifier quotes/case here. The executor
-                                                               ;; normalizes valid built-ins; lowercasing now would turn
-                                                               ;; distinct `"Vector"` into pgvector's `vector` silently.
-                                                                 :type (str col-type)
-                                                                 :primary-key?
-                                                                 (if definition?
-                                                                   (boolean
-                                                                    (ddl/column-is-primary-key?
-                                                                     ^ColumnDefinition cdt))
-                                                                   (contains? upper-specs "PRIMARY"))
-                                                                 :unique?
-                                                                 (if definition?
-                                                                   (boolean
-                                                                    (ddl/column-is-unique?
-                                                                     ^ColumnDefinition cdt))
-                                                                   (contains? upper-specs "UNIQUE"))}))
-                                                            cdts)})
+                                          {:op :add-column
+                                           :columns (mapv alter-added-column (.getColDataTypeList exp))}
                                 ;; ADD [CONSTRAINT name] PRIMARY KEY / UNIQUE —
                                 ;; carry the columns so the executor can upgrade
                                 ;; the attributes to :db/unique (single column)
@@ -2593,6 +2581,7 @@
                                                            (str exp))))}
                                           (= op "ALTER")
                                           (or (alter-column-nullability exp)
+                                              (alter-column-default exp)
                                               {:op :other :raw (str exp)})
                                           :else {:op :other :raw (str exp)})))
                                     expressions)]

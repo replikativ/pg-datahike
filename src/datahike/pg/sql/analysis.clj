@@ -91,12 +91,21 @@
                                (expression-typmod (unwrap expression) output-oid schema db nil)))
       (nil? (:name column)) (assoc :name "?column?"))))
 
+(defn values-expression-rows
+  "Return the rows of a VALUES node. A single row has a parenthesized
+   outer list, even when every expression in that row is parenthesized."
+  [^Values values]
+  (let [expressions (.getExpressions values)]
+    (if (and (not (instance? ParenthesedExpressionList expressions))
+             (seq expressions)
+             (every? #(instance? ParenthesedExpressionList %) expressions))
+      (mapv vec expressions)
+      [(vec expressions)])))
+
 (defn values-output
   "Resolve VALUES columns across every expression row without evaluating cells."
-  [^Values values schema db]
-  (let [raw (vec (.getExpressions values))
-        rows (if (and (seq raw) (instance? ParenthesedExpressionList (first raw)))
-               (mapv vec raw) [raw])
+  [values schema db]
+  (let [rows (values-expression-rows values)
         width (count (first rows))]
     (when (some #(not= width (count %)) rows)
       (throw (ex-info "VALUES lists must all be the same length" {:sqlstate "42601"})))

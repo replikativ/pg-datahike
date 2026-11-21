@@ -632,43 +632,6 @@
                 (recur (inc i) acc)))))))))
 
 ;; ============================================================================
-;; ALTER COLUMN <name> DROP DEFAULT — no-op clause. Strip the whole clause
-;; (and the trailing comma if present) so the surrounding ALTER TABLE
-;; survives.
-;; ============================================================================
-
-(defn alter-column-drop-default-rule
-  "Match `ALTER COLUMN [<quote>]<name>[<quote>] DROP DEFAULT [,]` anywhere
-   in the token stream and remove it. JSqlParser would parse the form
-   but our schema can't honour it (we don't store DEFAULT values that
-   could be dropped); the regex tail in preprocess-sql used to handle
-   this. Token rule is immune to the substring appearing in literals or
-   comments."
-  [toks]
-  (let [n (count toks)]
-    (loop [i 0, acc []]
-      (if (>= i (- n 4))
-        acc
-        (let [t (nth toks i)]
-          (if-not (= "alter" (kw-text t))
-            (recur (inc i) acc)
-            (let [t1 (nth toks (inc i) nil)
-                  t2 (nth toks (+ i 2) nil)
-                  t3 (nth toks (+ i 3) nil)
-                  t4 (nth toks (+ i 4) nil)
-                  t5 (nth toks (+ i 5) nil)]
-              (if (and (= "column" (kw-text t1))
-                       (or (ident-tok? t2) (= :quoted (:type t2)))
-                       (= "drop" (kw-text t3))
-                       (= "default" (kw-text t4)))
-                (let [end-pos (if (punct? t5 ",")
-                                (:end t5)
-                                (:end t4))
-                      next-i (if (punct? t5 ",") (+ i 6) (+ i 5))]
-                  (recur next-i (conj acc [(:pos t) end-pos " "])))
-                (recur (inc i) acc)))))))))
-
-;; ============================================================================
 ;; (PRIMARY KEY (<col>)) — INHERITS table body that contains only a PK.
 ;; Replace the outer parenthesised body with `(id serial)` so JSqlParser
 ;; sees a viable column list. We don't enforce inherited PKs on the child;
@@ -1467,7 +1430,6 @@
    adjacent-string-literal-rule
    collate-rule
    operator-paren-rule
-   alter-column-drop-default-rule
    primary-key-only-body-rule
    type-using-rule
    reserved-column-name-rule
