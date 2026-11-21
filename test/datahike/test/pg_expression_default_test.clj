@@ -70,6 +70,29 @@
       ;; rule does -- it used to fire only for nextval/currval/lastval.
       (is (= [[3 "ab"]] (rows c "SELECT d,e FROM t"))))))
 
+(deftest compound-arithmetic-defaults
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE SEQUENCE DEFAULT_SEQ")
+    (exec! c (str "CREATE TABLE defaultexpr_tbl (i1 int DEFAULT 100 + (200-199) * 2, "
+                  "i2 int DEFAULT nextval('default_seq'))"))
+    (exec! c "INSERT INTO defaultexpr_tbl VALUES (-1, -2)")
+    (exec! c "INSERT INTO defaultexpr_tbl (i1) VALUES (-3)")
+    (exec! c "INSERT INTO defaultexpr_tbl (i2) VALUES (-4)")
+    (exec! c "INSERT INTO defaultexpr_tbl (i2) VALUES (NULL)")
+    (is (= [[-3 1] [-1 -2] [102 -4] [102 nil]]
+           (rows c "SELECT i1,i2 FROM defaultexpr_tbl ORDER BY i1,i2 NULLS LAST")))
+    (exec! c "ALTER SEQUENCE DEFAULT_SEQ RESTART WITH 9")
+    (is (= [[9]] (rows c "SELECT nextval('DEFAULT_SEQ')")))
+    (is (= [[9]] (rows c "SELECT currval('public.default_seq')")))
+    (is (= [[10]] (rows c "SELECT setval('public.DEFAULT_SEQ', 10)")))
+    (is (= [[10]] (rows c "SELECT currval('default_seq')")))
+    (exec! c (str "CREATE TEMP TABLE nested_defaults ("
+                  "a int DEFAULT (1 + 2) /* expression continues */ * 3 NOT NULL, "
+                  "b int DEFAULT 1 + 2 * 3 CHECK (b > 0), "
+                  "c int DEFAULT 9)"))
+    (exec! c "INSERT INTO nested_defaults DEFAULT VALUES")
+    (is (= [[9 7 9]] (rows c "SELECT a,b,c FROM nested_defaults")))))
+
 (deftest a-volatile-default-is-evaluated-per-row
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TABLE t (a int, u uuid DEFAULT gen_random_uuid())")

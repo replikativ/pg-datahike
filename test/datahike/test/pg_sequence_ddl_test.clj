@@ -178,4 +178,8 @@
       (is (= :ddl-create-sequence (:type r)))
       (is (true? (:if-not-exists? r)))
       (is (= "s" (:seq-name r)))
-      (is (= 20 (-> r :seq-params :increment))))))
+      (is (= 20 (-> r :seq-params :increment)))))
+  (testing "sequence names fold only when unquoted"
+    (doseq [[spelling name] [["MIXED_SEQ" "mixed_seq"] ["\"Mixed_Seq\"" "Mixed_Seq"]]]
+      (is (= name (:seq-name (ddl/translate-create-sequence
+                              (cls/classify (str "CREATE SEQUENCE public." spelling)))))))))
