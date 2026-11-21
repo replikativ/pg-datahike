@@ -474,7 +474,7 @@
         (throw e)
         (throw (ex-info (.getMessage e) (assoc (ex-data e) :regoid-hard-error? true) e))))))
 
-(def ^:private extensions
+(def vector-extension-routines
   ;; Preserve the existing extension catalog identities when replacing the
   ;; old hand-written pg_proc projection. These are executable functions;
   ;; PostgreSQL's core catalog does not describe their extension-assigned OIDs.
@@ -505,7 +505,7 @@
 
 (def ^:private builtins
   (let [rows (into (mapv #(assoc % :namespace-oid 11) (concat catalog/procs catalog/snowball-procs))
-                   extensions)]
+                   vector-extension-routines)]
     (when-not (= (count rows) (count (set (map :oid rows))))
       (throw (ex-info "Duplicate static routine OID" {})))
     rows))

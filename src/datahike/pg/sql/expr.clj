@@ -96,7 +96,7 @@
             BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem AllColumns ParenthesedSelect Join Values
-            Select SetOperationList FromItem OrderByElement WithItem]
+            Select SetOperationList FromItem ParenthesedFromItem OrderByElement WithItem]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]))
 
 (defn- unwrap-parenthesed-select
@@ -131,7 +131,7 @@
    constants. The cutoff is far above ordinary application numerics while
    bounding the cost of Clojure's scale-insensitive numeric hash."
   4096)
-(declare source-oid string-value-text op-sym->sql)
+(declare source-oid string-value-text op-sym->sql render-view-definition)
 
 (declare translate-expr
          column-value!
@@ -1635,7 +1635,9 @@
 
       (= fname "pg_get_viewdef")
       (let [fn-param (symbol (str "?viewdef" (swap! (:var-counter ctx) inc)))
-            definitions (if-let [db (:db ctx)]
+            path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+            db (:db ctx)
+            definitions (if db
                           (into {}
                                 (map (fn [[name definition]]
                                        [(long
@@ -1657,7 +1659,9 @@
                                   (string? oid) (try (Long/parseLong oid)
                                                      (catch Exception _ nil))
                                   :else nil)]
-                        (or (get definitions oid) :__null__)))]
+                        (if-let [definition (get definitions oid)]
+                          (render-view-definition db definition path)
+                          :__null__)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -3714,6 +3718,66 @@
      group-exprs
      (map #(.getExpression ^OrderByElement %) (or (.getOrderByElements ps) []))
      (mapcat #(or (.getOnExpressions ^Join %) []) joins))))
+
+(defn- qualify-view-relations! [db ^Select root]
+  (letfn [(walk-scope [^Select select inherited]
+            (let [withs (.getWithItemsList select)
+                  cte-name (fn [^WithItem item] (some-> item .getAlias .getName unquote-ident))
+                  ctes (into inherited (keep cte-name) withs)
+                  recursive? (some (fn [^WithItem item] (.isRecursive item)) withs)]
+              (reduce (fn [visible ^WithItem item]
+                        (let [body (.getParenthesedStatement item)]
+                          (when (instance? Select body)
+                            (walk-scope body (if recursive? ctes visible))))
+                        (conj visible (cte-name item)))
+                      inherited withs)
+              (cond
+                (instance? ParenthesedSelect select)
+                (walk-scope (.getSelect ^ParenthesedSelect select) ctes)
+
+                (instance? SetOperationList select)
+                (doseq [branch (.getSelects ^SetOperationList select)]
+                  (walk-scope branch ctes))
+
+                (instance? PlainSelect select)
+                (let [^PlainSelect plain select]
+                  (walk-from (.getFromItem plain) ctes)
+                  (doseq [^Join join (.getJoins plain)]
+                    (walk-from (.getRightItem join) ctes))
+                  (doseq [child (mapcat nested-selects-in (plain-select-scope-nodes plain))]
+                    (walk-scope child ctes))))))
+
+          (walk-from [item ctes]
+            (cond
+              (instance? Table item)
+              (let [^Table table item
+                    name (params/unquote-ident (.getName table))]
+                (when (and (str/blank? (.getSchemaName table))
+                           (not (contains? ctes name))
+                           (pgs/table-oid db name))
+                  (.setSchemaName table "public")))
+
+              (instance? Select item)
+              (walk-scope item ctes)
+
+              (instance? ParenthesedFromItem item)
+              (let [^ParenthesedFromItem from item]
+                (walk-from (.getFromItem from) ctes)
+                (doseq [^Join join (.getJoins from)]
+                  (walk-from (.getRightItem join) ctes)))
+
+              :else
+              (doseq [child (nested-selects-in item)]
+                (walk-scope child ctes))))]
+    (walk-scope root #{})
+    root))
+
+(defn- render-view-definition [db definition search-path]
+  (let [sql (str/trim definition)
+        sql (if (some #{"public"} search-path)
+              sql
+              (str (qualify-view-relations! db (CCJSqlParserUtil/parse sql))))]
+    (if (str/ends-with? sql ";") sql (str sql ";"))))
 
 (defn- row-scope-owner
   "The visible row-scope alias (row-eval) that has a column `cname`."
