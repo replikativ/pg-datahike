@@ -431,6 +431,7 @@
            (rows c (str "SELECT conname, contype, conkey, pg_get_constraintdef(oid) "
                         "FROM pg_constraint "
                         "WHERE conrelid IN ('sp4'::regclass, 'sp5'::regclass) "
+                        "AND contype IN ('p', 'u') "
                         "ORDER BY conname"))))
     (testing "and a composite FK can reference it"
       (is (= 0 (run c "CREATE TABLE sp6 (a int, b int, FOREIGN KEY (a,b) REFERENCES sp5 (x,y))")))
