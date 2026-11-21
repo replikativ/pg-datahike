@@ -338,11 +338,11 @@
                      (into rows (not-null-constraint-rows rows user-schema cte-db))
                      rows)]
           (mapv #(assoc % :pg_constraint/conenforced true
-                      :pg_constraint/conislocal true
-                      :pg_constraint/coninhcount 0
-                      :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
-                      :pg_constraint/conparentid 0
-                      :pg_constraint/conperiod false)
+                        :pg_constraint/conislocal true
+                        :pg_constraint/coninhcount 0
+                        :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
+                        :pg_constraint/conparentid 0
+                        :pg_constraint/conperiod false)
                 rows))
         rows))))
 
