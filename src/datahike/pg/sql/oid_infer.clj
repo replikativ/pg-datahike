@@ -976,6 +976,9 @@
         array?   (and ad (pos? (.size ^java.util.List ad)))
         scalar-oid (sql-type-name->oid type-str (:db env))]
     (cond
+      ;; The parser leaves array brackets in getDataType for qualified names.
+      (and (not array?) type-str (str/ends-with? type-str "[]"))
+      (some-> type-str types/parse-array-type-name :pg-name types/pg-name->oid)
       (nil? scalar-oid) nil
       array? (or (get types/element-oid->array-oid scalar-oid)
                  (do

@@ -195,7 +195,10 @@ pg_dump --schema-only --no-owner --no-privileges > fixture-schema.sql
 
 The first changes cover `pg_constraint.conperiod`, `conenforced`,
 `conparentid`, the typed extension configuration columns, and the typed
-namespace ACL column. The schema-only dump now reaches `pg_class.relpages`.
+namespace ACL column. Relation discovery now has the PostgreSQL field types
+for the relation estimates and freeze horizons. Datahike reports zero heap
+pages and invalid freeze IDs because its storage has no PostgreSQL heap.
+A tuple estimate of `-1` denotes an unknown estimate.
 Basic `\d` on the 18.6 candidate shows both tables, the view, the primary
 and secondary indexes, the check, and both directions of the foreign-key
 relationship. That path exercises a set-returning function and `UNION ALL
@@ -208,19 +211,30 @@ unnamed constraints. Explicit `NOT NULL` constraint names need durable
 metadata. `ALTER COLUMN SET NOT NULL` and `DROP NOT NULL` still leave that
 metadata unchanged.
 
-A discovery run captured the native dump SQL with
-`PGOPTIONS='-c log_statement=all' pg_dump --schema-only` against the fixture.
-Of 48 read queries replayed separately on the 18.6 candidate after the first
-constraint and extension fix, 32 errored. These are query counts from that
-revision. Native object IDs appeared in some queries, so empty results in
-the replay do not establish parity.
+The first stock dump query over relations also exposed a Datahike planner
+problem. It exhausted a 1.2 GiB heap on this fixture. The planner projected
+the outer relation's join keys, kept repeated bindings, and joined those
+copies back to the same outer rows. With the upstream fix applied locally,
+that query completed and stock `pg_dump` next stopped at `pg_transform`
+during routine discovery.
 
-| SQLSTATE | Queries | Next investigation |
+The native SQL was captured with
+`PGOPTIONS='-c log_statement=all' pg_dump --schema-only`. The first replay
+produced errors in 32 of 48 read queries. With the planner fix, relation
+metadata and qualified casts applied, 23 errored. The second replay
+substituted the candidate's fixture OIDs for the native OIDs. A query that
+runs still needs its rows and the resulting dump checked.
+
+| SQLSTATE | Queries | Remaining work |
 |---|---:|---|
-| `42P01` | 17 | Missing catalog relations, including `pg_init_privs`, `pg_opclass`, `pg_amop`, `pg_transform`, foreign data and text search catalogs |
-| `42703` | 8 | Missing fields and system columns, including `relpages`, `proacl`, `pubowner`, and `tableoid` on several catalogs |
-| `0A000` | 6 | OID-array `unnest` and correlated catalog projections |
-| `42804` | 1 | `pg_type` scan with an internal `"char"` CASE branch |
+| `42P01` | 17 | Routine discovery needs `pg_transform` and `pg_init_privs`. Operator classes, conversions and text search need built-in catalog data. The other scans need the catalog shape for facilities such as foreign data, logical replication and event triggers. |
+| `42703` | 4 | Routine ACL, index readiness, publication owner and the constraint `tableoid` used in the column scan |
+| `0A000` | 1 | Zero-based subscripting of PostgreSQL's `name` type in the type scan |
+| `22P02` | 1 | Converting a catalog operator implementation from `regproc` to `oid` |
+
+Prioritize routine and type discovery first, then fixture columns, indexes,
+and the view and dependency scans. Keep the built-in catalog work tied to
+the native metadata it represents.
 
 The cutover needs successful stock-client describe and schema export on
 this fixture, an export restored into an empty native database with the

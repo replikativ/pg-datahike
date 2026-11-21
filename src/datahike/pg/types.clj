@@ -35,6 +35,7 @@
 (def oid-text       25)
 (def oid-oid        26)
 (def oid-tid        27)
+(def oid-xid        28)
 (def oid-json      114)
 (def oid-point     600)
 ;; The rest of the geometric family. Their pg_type rows were already
@@ -418,6 +419,19 @@
    "macaddr"           :macaddr
    "macaddr8"          :macaddr8})
 
+(defn- pg-catalog-qualified-type
+  "Remove pg_catalog qualification from a built-in type's actual name."
+  [s]
+  (when (str/includes? s ".")
+    (when-let [[_ ident suffix]
+               (re-matches #"(?s)^(?:(?i:pg_catalog)|\"pg_catalog\")\s*\.\s*(\"[a-zA-Z0-9_]+\"|[a-zA-Z_][a-zA-Z0-9_]*)(.*)$"
+                           s)]
+      (let [name (if (str/starts-with? ident "\"")
+                   (subs ident 1 (dec (count ident)))
+                   (str/lower-case ident))]
+        (when (contains? pg-catalog/type-by-name name)
+          (str (if (= name "char") "\"char\"" name) suffix))))))
+
 (defn parse-array-type-name
   "Parse a SQL type string for arrays. Returns
    `{:elem <kw> :pg-name \"_T\" :ndim N}` or `nil` if not an array.
@@ -437,9 +451,9 @@
        \"int ARRAY[3]\" → {:elem :int4, :pg-name \"_int4\", :ndim 1}
        \"numeric(p,s)[]\" → {:elem :numeric, :pg-name \"_numeric\", :ndim 1}"
   [^String s]
-  (let [norm (-> s
+  (let [s (str/trim s)
+        norm (-> (or (pg-catalog-qualified-type s) s)
                  str/lower-case
-                 str/trim
                  (str/replace #"\s*\([^)]*\)" "")  ;; strip typmod (p,s)
                  ;; "int ARRAY" / "int ARRAY[3]" → "int[]" (size ignored)
                  (str/replace #"\s+array\s*\[\s*\d*\s*\]" "[]")
@@ -513,6 +527,7 @@
     "vector"      oid-vector
     "pg_lsn"      oid-pg-lsn
     "oid"         oid-oid
+    "xid"         oid-xid
     ;; Catalog ACL columns carry NULL, but clients still describe their type.
     "_aclitem"    1034
     ;; The catalogs' own vector type: `pg_index.indkey`,
@@ -820,18 +835,19 @@
                          (str/trim (str sql-type-name))))))
 
 (defn normalize-sql-type-name
-  "Normalize supported schema-qualified pgvector and OID alias types.
+  "Normalize pg_catalog built-ins and supported pgvector spellings.
    JSqlParser preserves schema qualification and identifier quotes in
-   different fields depending on CAST versus DDL. PostgreSQL installs the
-   extension in public by default, so these all resolve to the same type."
+   different fields depending on CAST versus DDL."
   [sql-type-name]
   (when sql-type-name
     (let [s (clojure.string/trim (str sql-type-name))
+          catalog-type (pg-catalog-qualified-type s)
           routine-prefix
           #"^(?:(?:(?i:pg_catalog)|\"pg_catalog\")\s*\.\s*)?((?i:(?:regproc(?:edure)?|regclass|regtype|regnamespace))|\"regproc\"|\"regprocedure\"|\"regclass\"|\"regtype\"|\"regnamespace\")(?=\s*(?:\[|$))"
           valid-prefix
           #"^(?:(?:(?i:public)|\"public\")\s*\.\s*)?(?:(?i:vector)|\"vector\")(?=\s*(?:\(|\[|$))"]
       (cond
+        catalog-type catalog-type
         (re-find routine-prefix s)
         (str/replace-first s routine-prefix
                            #(str/lower-case (unquote-type-name (second %))))
@@ -876,7 +892,7 @@
    Positive = fixed size in bytes, -1 = variable length."
   (into {}
         (map (fn [[oid]] [oid (:typlen (catalog-type oid))]))
-        (conj pg-type-catalog [oid-char])))
+        (conj pg-type-catalog [oid-char] [oid-xid])))
 
 ;; ============================================================================
 ;; Type resolution — PostgreSQL's category / preferred / implicit-cast

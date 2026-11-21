@@ -8053,7 +8053,8 @@
           ;; PgArray to match the target element-keyword and pass
           ;; non-array inputs through `pg-arr/array` for consistency.
           array-data (try (.getArrayData col-data-type) (catch Throwable _ nil))
-          array-target? (and (some? type-str) (seq array-data))]
+          ;; Qualified names can carry the brackets in getDataType instead.
+          array-target? (and type-str (or (seq array-data) (str/ends-with? type-str "[]")))]
       (when (and array-target?
                  (= :vector (types/cast-category
                              (str/replace type-str #"\[\]$" ""))))
