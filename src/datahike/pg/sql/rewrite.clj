@@ -17,6 +17,7 @@
 
    Callers: sql/preprocess-sql."
   (:require [clojure.string :as str]
+            [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]))
 
@@ -906,42 +907,98 @@
 ;; made at execute.
 ;; ============================================================================
 
+(defn- create-table-options-start
+  "First token after a CREATE TABLE column list."
+  [code]
+  (when (= "create" (kw-text (first code)))
+    (let [table (skip-non-comment code 1
+                                  #(contains? #{"global" "local" "temp" "temporary" "unlogged"}
+                                              (kw-text %)))]
+      (when (= "table" (kw-text (nth code table nil)))
+        (let [name-start (if (= "if" (kw-text (nth code (inc table) nil)))
+                           (+ table 4)
+                           (inc table))
+              after-name (loop [i (inc name-start)]
+                           (if (punct? (nth code i nil) ".") (recur (+ i 2)) i))]
+          (when (punct? (nth code after-name nil) "(")
+            (let [after-cols (match-paren-group code after-name)]
+              (when (punct? (nth code (dec after-cols) nil) ")")
+                after-cols))))))))
+
+(defn- table-oids-rule
+  "Accept the legacy opt-out and reject OID storage before parsing DDL."
+  [toks]
+  (let [code (vec (remove #(= :comment (:type %)) toks))]
+    (when-let [start (create-table-options-start code)]
+      (loop [i start]
+        (let [t (nth code i nil)
+              next-token (nth code (inc i) nil)
+              keyword (kw-text t)]
+          (cond
+            (or (nil? t) (= "as" keyword) (punct? t ";")) nil
+            (and (= "without" keyword) (= "oids" (kw-text next-token)))
+            [[(:pos t) (:end next-token) " "]]
+            (and (= "with" keyword) (= "oids" (kw-text next-token)))
+            (throw (errors/pg-error :syntax-error {:message "syntax error at or near \"OIDS\""}))
+            (and (= "with" keyword) (punct? next-token "("))
+            (let [end (match-paren-group code (inc i))]
+              (when (punct? (nth code (dec end) nil) ")")
+                (doseq [[name equals value :as option]
+                        (->> (subvec code (+ i 2) (dec end))
+                             (partition-by #(punct? % ","))
+                             (remove #(punct? (first %) ",")))
+                        :when (= "oids" (or (kw-text name)
+                                            (when (= :quoted (:type name)) (:value name))))]
+                  (let [boolean-word (some-> (or (kw-text value)
+                                                 (when (= :string (:type value)) (:value value)))
+                                             str/lower-case)]
+                    (cond
+                      (or (= 1 (count option))
+                          (and (= "=" (:text equals))
+                               (or (#{"true" "on"} boolean-word)
+                                   (= "1" (:text value)))))
+                      (throw (errors/pg-error :feature-not-supported
+                                              {:message "tables declared WITH OIDS are not supported"}))
+
+                      (not (and (= 3 (count option)) (= "=" (:text equals))
+                                (or (#{"false" "off"} boolean-word)
+                                    (= "0" (:text value)))))
+                      (throw (errors/pg-error :syntax-error
+                                              {:message "oids requires a Boolean value"})))))
+                (recur end)))
+            (punct? t "(") (recur (match-paren-group code i))
+            :else (recur (inc i))))))))
+
 (defn partition-by-clause
   "The table-level `PARTITION BY <strategy> (...)` clause of a CREATE
    TABLE, as {:strategy \"RANGE\" :span [start end]}, or nil.
 
-   Only `PARTITION BY` at paren depth 0 right after the column list's `)`
-   counts; a window's `OVER (PARTITION BY ...)` is always inside
-   parentheses, and strings/comments are opaque tokens."
+   Look after the column list and optional INHERITS clause, before
+   table access and storage options."
   [toks]
-  (let [code (vec (remove #(= :comment (:type %)) toks))
-        n (count code)
-        create-table? (and (= "create" (kw-text (first code)))
-                           (some #(= "table" (kw-text %)) (take 6 code)))
-        close-of (fn [open-idx]
-                   (loop [k (inc open-idx), depth 1]
-                     (cond
-                       (>= k n) nil
-                       (punct? (nth code k) "(") (recur (inc k) (inc depth))
-                       (punct? (nth code k) ")") (if (= depth 1) k (recur (inc k) (dec depth)))
-                       :else (recur (inc k) depth))))]
-    (when create-table?
-      (loop [i 0, depth 0]
-        (when (< i (- n 3))
-          (let [t (nth code i)]
-            (cond
-              (punct? t "(") (recur (inc i) (inc depth))
-              (punct? t ")") (recur (inc i) (dec depth))
-              (and (zero? depth) (pos? i)
-                   (punct? (nth code (dec i)) ")")
-                   (= "partition" (kw-text t))
-                   (= "by" (kw-text (nth code (inc i))))
-                   (#{"range" "list" "hash"} (kw-text (nth code (+ i 2))))
-                   (punct? (nth code (+ i 3)) "("))
-              (when-let [close (close-of (+ i 3))]
-                {:strategy (str/upper-case (kw-text (nth code (+ i 2))))
-                 :span [(:pos t) (:end (nth code close))]})
-              :else (recur (inc i) depth))))))))
+  (let [code (vec (remove #(= :comment (:type %)) toks))]
+    (when-let [start (create-table-options-start code)]
+      (let [inherits? (and (= "inherits" (kw-text (nth code start nil)))
+                           (punct? (nth code (inc start) nil) "("))
+            i (if inherits? (match-paren-group code (inc start)) start)
+            t (nth code i nil)
+            strategy-token (nth code (+ i 2) nil)
+            strategy (or (kw-text strategy-token)
+                         (when (= :quoted (:type strategy-token)) (:value strategy-token)))]
+        (when (and (= "partition" (kw-text t))
+                   (= "by" (kw-text (nth code (inc i) nil)))
+                   strategy
+                   (punct? (nth code (+ i 3) nil) "("))
+          (let [end (match-paren-group code (+ i 3))]
+            (when (punct? (nth code (dec end) nil) ")")
+              (when-not (#{"range" "list" "hash"} (str/lower-case strategy))
+                (throw (errors/pg-error :invalid-parameter-value
+                                        {:message (str "unrecognized partitioning strategy \"" strategy "\"")})))
+              (when inherits?
+                (throw (ex-info "cannot create partitioned table as inheritance child"
+                                {:error :invalid-object-definition :sqlstate "42P17"})))
+              {:strategy (str/upper-case strategy)
+               :span [(:pos t) (:end (nth code (dec end)))]})))))))
 
 (defn partition-by-rule
   "Remove the table-level `PARTITION BY` clause, which JSqlParser cannot
@@ -1341,4 +1398,5 @@
    hash-xor-rule
    like-operator-rule
    json-path-operator-spacing-rule
+   table-oids-rule
    partition-by-rule])

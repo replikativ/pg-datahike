@@ -6,8 +6,8 @@
   "Upstream documents possible create_index dependencies; ordering edges alone do not establish isolated per-file fixture equivalence.",
   :native-fixtures
   "PG_LIBDIR/PG_DLSUFFIX require the release's regression library. Missing native helpers are fixture boundaries, not blanket exclusions of client-visible behavior.",
-  :measurement :unmeasured},
- :admission :unverified,
+  :measurement :partial},
+ :admission :partial,
  :ordering-prerequisites
  {"select_parallel" ["create_misc"],
   "horology" ["date" "time" "timetz" "timestamp" "timestamptz" "interval"],
@@ -26,8 +26,8 @@
    :sql-sha256 "83e83e4358fb4db57212aa0f91740e18ef7033f254ca9d1688ccdc405ad3c467",
    :expected-sha256 "810dc5dff384080a30069434ea2bbf14c3b82c319f2546c0e4c12473a0803606",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :transactions-and-concurrency}
+   :status :campaign,
+   :wave 5}
   {:name "aggregates",
    :scheduled? true,
    :sql-sha256 "48fb78e1ee6539a8e6cb3392d0d740f1f6199d18af3321b6781c1415f6140772",
@@ -588,8 +588,8 @@
    :sql-sha256 "f830785bc7ae465d2ee471cad2fd7ab099924e95e3debac1e3664c52d26e4aa5",
    :expected-sha256 "c51b12145ecf9185e5d0e8416864a9adcecc53bcddc6a27457723a30302c29ef",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :relational-queries}
+   :status :campaign,
+   :wave 2}
   {:name "guc",
    :scheduled? true,
    :sql-sha256 "f1bdbf5826ee2637649e2c2e34e501b0a8b21b5adb5ed128ef18b88d60414f2e",
@@ -826,15 +826,15 @@
    :sql-sha256 "609da0baf26df878ce30b1b82360c35f92cf2b2e6e33bec94522d03e42b23e66",
    :expected-sha256 "02430d225357a113f420a46466b42a68952ed8319fcc9119afc1121fb22fc4a9",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :scalar-and-structural-types}
+   :status :campaign,
+   :wave 2}
   {:name "macaddr",
    :scheduled? true,
    :sql-sha256 "1bd6038c0936f12834270c75796054659ea634c667696772dd08552a7d440fa4",
    :expected-sha256 "70b806200b02d24a0f5212130ea3083cfa43988a98727a0dd990987ef757e86f",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :scalar-and-structural-types}
+   :status :campaign,
+   :wave 2}
   {:name "macaddr8",
    :scheduled? true,
    :sql-sha256 "8ec47cccbcb8500fe8ae38f9f3a3c68d1d52f0c0ddeb219f996b3435b70df459",
@@ -861,8 +861,8 @@
    :sql-sha256 "1ac70abdb09d828aa6d11120b1a14dd31a672d5c2b80545b5f1aeee245cba147",
    :expected-sha256 "3d2b594f7b18203f6fad6356cffd3699ecbfd1497e184c0bea1f8eb6ccec12d7",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :expressions-and-builtins}
+   :status :campaign,
+   :wave 2}
   {:name "memoize",
    :scheduled? true,
    :sql-sha256 "1013722d8b8484b47d9aed1d2c0fe9b5fffa6537f9973cfbf4efaf6932168510",
@@ -1286,8 +1286,8 @@
    :sql-sha256 "6799daddc61a5558e2921c2d30f45dfe7e1eca8a0a62776329a86b54ffaa82c5",
    :expected-sha256 "4531ef0c077171c8176e6ff9b7629a23789c99ac225d57cd42dd48b32fad2b06",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :relational-queries}
+   :status :campaign,
+   :wave 2}
   {:name "select_into",
    :scheduled? true,
    :sql-sha256 "0db0e9a8bc130ea264ebcf36f7abfda4bc6e673092b147671342e3678d9348e2",

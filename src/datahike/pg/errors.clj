@@ -360,6 +360,10 @@
    {:sqlstate "42803"
     :format (fn [{:keys [message detail]}] (or message detail))}
 
+   :windowing-error
+   {:sqlstate "42P20"
+    :format (fn [{:keys [message detail]}] (or message detail))}
+
    :wrong-object-type
    {:sqlstate "42809"
     :format (fn [{:keys [message detail]}] (or message detail))}

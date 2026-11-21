@@ -51,6 +51,7 @@
            (str "#!/usr/bin/env bash\nset -eu\n"
                 "if [[ -n \"${REFERENCE_TEST_TOOL_LOG:-}\" ]]; then echo psql >> \"$REFERENCE_TEST_TOOL_LOG\"; fi\n"
                 "if [[ \"${1:-}\" == --version ]]; then echo 'psql (PostgreSQL) " major ".7'; exit 0; fi\n"
+                "if [[ \"$*\" == *DROP*DATABASE* && \"${REFERENCE_TEST_FAIL_CLEANUP:-0}\" == 1 ]]; then exit 1; fi\n"
                 "if [[ \"$*\" == *DROP*DATABASE* && -n \"${REFERENCE_TEST_HANG_CLEANUP:-}\" ]]; then echo $$ > \"$REFERENCE_TEST_HANG_CLEANUP\"; trap '' TERM; while :; do sleep 1; done; fi\n"
                 "case \"$*\" in\n"
                 " *current_setting*) printf '17.7\\t170007\\tUTC\\tUTF8\\n' ;;\n"
@@ -65,6 +66,7 @@
                 " --*) ;;\n *) names+=(\"$arg\") ;;\nesac; done\n"
                 "mkdir -p \"$out/results\"\n"
                 "for name in \"${names[@]}\"; do cp \"$input/expected/$name.out\" \"$out/results/$name.out\"; done\n"
+                "if [[ -n \"${REFERENCE_TEST_RESULT:-}\" ]]; then cp \"$REFERENCE_TEST_RESULT\" \"$out/results/foo.out\"; exit 1; fi\n"
                 "if [[ \"${REFERENCE_TEST_PARTIAL:-0}\" == 1 ]]; then exit 124; fi\n"
                 "if [[ \" ${names[*]} \" == *\" foo \"* && -n \"${REFERENCE_TEST_HANG_DRIVER:-}\" ]]; then echo $$ > \"$REFERENCE_TEST_HANG_DRIVER\"; trap '' TERM; while :; do sleep 1; done; fi\n"))
     (.setExecutable psql true)
@@ -230,6 +232,29 @@
       (is (= "17.7" (get-in receipt [:target :server-version])))
       (is (= :unverified (get-in receipt [:target :code-revision])))
       (is (= :complete (:status receipt))))))
+
+(deftest strict-api-comparison-keeps-standalone-caret-and-source-like-lines
+  (let [{:keys [env]} (cfg! "18")]
+    (doseq [[label output expected-exit]
+            [["excerpt" "checked output\nLINE 1: query excerpt\n  ^\n" 0]
+             ["caret" "checked output\n  ^\n" 1]
+             ["line" "checked output\nLINE 1: a literal output line\n" 1]]]
+      (let [actual (file! (io/file *temporary* (str label ".out")) output)
+            result (sh/sh "bash" "test/integration/postgres-regress/run.sh" "foo"
+                          :env (assoc env "PG_REGRESS_API_STRICT" "1"
+                                      "REFERENCE_TEST_RESULT" actual
+                                      "PG_REGRESS_OUTPUT" (str (io/file *temporary* label))))]
+        (is (= expected-exit (:exit result)) (str (:out result) (:err result)))))))
+
+(deftest named-strict-gate-fails-when-isolated-database-cleanup-fails
+  (let [{:keys [env]} (cfg! "18")
+        result (sh/sh "bash" "test/integration/postgres-regress/run.sh" "foo"
+                      :env (assoc env "PG_REGRESS_API_STRICT" "1"
+                                  "PG_REGRESS_ISOLATE" "1"
+                                  "REFERENCE_TEST_FAIL_CLEANUP" "1"
+                                  "PG_REGRESS_OUTPUT" (str (io/file *temporary* "cleanup-failed"))))]
+    (is (= 2 (:exit result)) (str (:out result) (:err result)))
+    (is (str/includes? (:err result) "Could not clean up the isolated database"))))
 
 (deftest a-dirty-source-fails-the-wrapper-before-running-reference-tools
   (let [{:keys [source env]} (cfg! "17")

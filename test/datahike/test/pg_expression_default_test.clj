@@ -98,14 +98,9 @@
 (deftest a-default-that-cannot-be-evaluated-says-so
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (testing "a column reference"
-      ;; PostgreSQL rejects this at CREATE TABLE ("cannot use column
-      ;; reference in DEFAULT expression"); we reject it at the write,
-      ;; because the default is evaluated with no row in scope and the
-      ;; name simply does not resolve. Different moment, same refusal --
-      ;; what matters is that it is not silently NULL.
-      (exec! c "CREATE TABLE t (a int, b int DEFAULT a + 1)")
-      (let [e (is (thrown? SQLException (exec! c "INSERT INTO t (a) VALUES (1)")))]
-        (is (= "42703" (.getSQLState ^SQLException e)))))
+      (let [e (is (thrown? SQLException (exec! c "CREATE TABLE t (a int, b int DEFAULT a + 1)")))]
+        (is (= "0A000" (.getSQLState ^SQLException e))))
+      (is (empty? (rows c "SELECT relname FROM pg_class WHERE relname = 't'"))))
     (testing "an unknown function"
       (exec! c "CREATE TABLE v (a int, b int DEFAULT no_such_fn(1))")
       (let [e (is (thrown? SQLException (exec! c "INSERT INTO v (a) VALUES (1)")))]

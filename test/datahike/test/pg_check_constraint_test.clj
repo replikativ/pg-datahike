@@ -63,6 +63,43 @@
 (defn- domain-violation [domain]
   [:error "23514" (str "value for domain " domain " violates check constraint \"" domain "_check\"")])
 
+(deftest postgres-create-table-rejects-invalid-defaults
+  (with-open [c (jdbc)]
+    (doseq [[expr state message]
+            [["id" "0A000" "cannot use column reference in DEFAULT expression"]
+             ["bar.id" "0A000" "cannot use column reference in DEFAULT expression"]
+             ["coalesce(abs(id), 0)" "0A000" "cannot use column reference in DEFAULT expression"]
+             ["avg(id)" "0A000" "cannot use column reference in DEFAULT expression"]
+             ["avg(non_existent)" "0A000" "cannot use column reference in DEFAULT expression"]
+             ["avg(1)" "42803" "aggregate functions are not allowed in DEFAULT expressions"]
+             ["pg_catalog.avg(1)" "42803" "aggregate functions are not allowed in DEFAULT expressions"]
+             ["generate_series(1,3)" "0A000" "set-returning functions are not allowed in DEFAULT expressions"]
+             ["row_number() OVER ()" "42P20" "window functions are not allowed in DEFAULT expressions"]]]
+      (testing expr
+        (is (= [:error state message]
+               (run c (str "CREATE TABLE rejected_default (id int DEFAULT (" expr "))"))))
+        (is (= [] (run c "SELECT relname FROM pg_class WHERE relname = 'rejected_default'")))))
+    (is (= 0 (run c "CREATE TABLE rejected_default (id int DEFAULT (abs(-7)))")))
+    (is (= 1 (run c "INSERT INTO rejected_default DEFAULT VALUES")))
+    (is (= ["7"] (run c "SELECT id FROM rejected_default")))))
+
+(deftest postgres-create-table-rejects-invalid-options
+  (with-open [c (jdbc)]
+    (doseq [[option state]
+            [["WITH OIDS" "42601"] ["WITH (oids)" "0A000"]
+             ["WITH (oids = true)" "0A000"] ["WITH (oids = 0, oids = true)" "0A000"]
+             ["WITH (oids = 2)" "42601"] ["PARTITION BY MAGIC (id)" "22023"]
+             ["PARTITION BY \"unknown\" (id)" "22023"] ["PARTITION BY RANGE (id)" "0A000"]
+             ["INHERITS (some_table) PARTITION BY LIST (id)" "42P17"]]]
+      (testing option
+        (is (= [:error state]
+               (vec (take 2 (run c (str "CREATE TABLE rejected_option (id int) " option))))))
+        (is (= [] (run c "SELECT relname FROM pg_class WHERE relname = 'rejected_option'")))))
+    (is (= 0 (run c "CREATE TEMP TABLE no_oids () WITHOUT /* legacy */ OIDS")))
+    (is (= 0 (run c "DROP TABLE no_oids")))
+    (is (= 0 (run c "CREATE TEMP TABLE no_oids () WITH (oids = false)")))
+    (is (= 0 (run c "DROP TABLE no_oids")))))
+
 (deftest check-constraints-use-sql-semantics
   (with-open [c (jdbc)]
     (run c "CREATE DOMAIN posint AS int CHECK (VALUE > 0)")

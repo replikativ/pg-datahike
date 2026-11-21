@@ -93,6 +93,18 @@
     (ok! h "CREATE TABLE dst (x int, LIKE src, y text)")
     (is (= ["x" "a" "b" "y"] (mapv first (described h "dst"))))))
 
+(deftest postgres-like-including-defaults-skips-generation-expressions
+  (with-h [h (fresh-handler)]
+    (ok! h (str "CREATE TABLE src (b int DEFAULT 42, "
+                "c int GENERATED ALWAYS AS (a * 2) STORED, a int CHECK (a > 0))"))
+    (ok! h "CREATE TABLE plain (LIKE src)")
+    (ok! h "CREATE TABLE with_defaults (LIKE src INCLUDING DEFAULTS)")
+    (doseq [table ["plain" "with_defaults"]]
+      (is (= ["b" "c" "a"] (mapv first (described h table))))
+      (ok! h (str "INSERT INTO " table " (a) VALUES (11)")))
+    (is (= [["11" nil nil]] (rows (ok! h "SELECT a, b, c FROM plain"))))
+    (is (= [["11" "42" nil]] (rows (ok! h "SELECT a, b, c FROM with_defaults"))))))
+
 (deftest a-missing-source-is-an-error-not-an-empty-table
   (with-h [h (fresh-handler)]
     (let [r (exec h "CREATE TABLE dst (LIKE nosuch)")]
