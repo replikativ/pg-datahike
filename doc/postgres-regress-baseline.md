@@ -162,6 +162,67 @@ PG_REGRESS_PROFILE=18 bb pg-regress-setup
 PG_REGRESS_PROFILE=18 bb pg-regress-wave strict
 ```
 
+### PostgreSQL 18 client cutover
+
+The advertised server version remains 17.7. PostgreSQL 18 client behavior
+is checked separately from the strict SQL regression profile. The existing
+`pgdump-roundtrip` CI job uses native PostgreSQL as the dump source and
+pg-datahike as the restore target.
+
+Load the following into disposable native and pg-datahike databases to
+reproduce the client probes. For the candidate only, build a throwaway copy
+with `SERVER_VERSION` set to `18.6` and `SERVER_VERSION_NUM` to `180006` in
+`PgWireServer.java` before compiling Java.
+
+```sql
+CREATE TABLE client_parent (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE client_child (
+  id int PRIMARY KEY,
+  parent_id int REFERENCES client_parent,
+  amount int CHECK (amount > 0)
+);
+CREATE INDEX client_child_amount_idx ON client_child (amount);
+CREATE VIEW client_view AS SELECT id FROM client_child;
+```
+
+Point `PGHOST`, `PGPORT`, `PGUSER`, and `PGDATABASE` at each endpoint and
+use the PostgreSQL 18 binaries to run:
+
+```bash
+psql -X -E -v ON_ERROR_STOP=1 -c '\d client_child' -c '\d+ client_child'
+pg_dump --schema-only --no-owner --no-privileges > fixture-schema.sql
+```
+
+The first changes cover `pg_constraint.conperiod`, `conenforced`,
+`conparentid`, the typed extension configuration columns, and the typed
+namespace ACL column. The schema-only dump now reaches `pg_class.relpages`.
+Basic `\d` on the 18.6 candidate shows both tables, the view, the primary
+and secondary indexes, the check, and both directions of the foreign-key
+relationship. That path exercises a set-returning function and `UNION ALL
+VALUES` for foreign-key discovery. Detailed `\d+` still fails when it
+reads a correlated catalog array with `unnest`.
+Native PostgreSQL 18 separately reports `NOT NULL` constraints in
+`pg_constraint` (`contype = 'n'`).
+
+A discovery run captured the native dump SQL with
+`PGOPTIONS='-c log_statement=all' pg_dump --schema-only` against the fixture.
+Of 48 read queries replayed separately on the 18.6 candidate after the first
+constraint and extension fix, 32 errored. These are query counts from that
+revision. Native object IDs appeared in some queries, so empty results in
+the replay do not establish parity.
+
+| SQLSTATE | Queries | Next investigation |
+|---|---:|---|
+| `42P01` | 17 | Missing catalog relations, including `pg_init_privs`, `pg_opclass`, `pg_amop`, `pg_transform`, foreign data and text search catalogs |
+| `42703` | 8 | Missing fields and system columns, including `relpages`, `proacl`, `pubowner`, and `tableoid` on several catalogs |
+| `0A000` | 6 | OID-array `unnest` and correlated catalog projections |
+| `42804` | 1 | `pg_type` scan with an internal `"char"` CASE branch |
+
+The cutover needs successful stock-client describe and schema export on
+this fixture, an export restored into an empty native database with the
+same tables, view, index and constraints, and a passing PostgreSQL 18
+regression gate on the candidate build.
+
 ## Running the comparison
 
 ```bash
