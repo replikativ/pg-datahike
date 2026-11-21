@@ -192,10 +192,13 @@
     {:name "copy2", :boundaries #{:errors :copy :text-codec :csv-codec}, :mode :unmeasured}
     {:name "copydml", :boundaries #{:copy :returning :dml}, :mode :unmeasured}
     {:name "copyselect", :boundaries #{:copy :ordering :relational}, :mode :discovery
-     :blockers #{:copy-force-quote}
      :accepted-differences #{:copy-error-diagnostics}
      :strict-slices
-     [{:id :simple-query-copy-continuation
+     [{:id :legacy-copy-force-quote
+       :source-lines [65 65]
+       :gate "test/datahike/test/pg_copy_e2e_test.clj"
+       :test-var "legacy-force-quote-applies-to-query-copy"}
+      {:id :simple-query-copy-continuation
        :source-lines [90 96]
        :gate "test/datahike/test/pg_declared_param_oid_test.clj"
        :test-var "postgres-simple-query-resumes-after-each-copy"}]}

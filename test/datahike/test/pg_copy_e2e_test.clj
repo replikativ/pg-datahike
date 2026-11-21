@@ -745,6 +745,14 @@
                                  "WHERE (id + 0) > 0 ORDER BY id DESC) "
                                  "TO STDOUT"))))))
 
+(deftest legacy-force-quote-applies-to-query-copy
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (= 2 (copy-in-text c "COPY users FROM STDIN"
+                           "1\tada\ta@x\tt\n2\tgrace\t\\N\tf\n")))
+    (is (= "name,email\n\"ada\",a@x\n\"grace\",\n"
+           (copy-out-text c (str "COPY (SELECT name,email FROM users ORDER BY id) "
+                                 "TO STDOUT CSV HEADER FORCE QUOTE name"))))))
+
 (defn- copy-error-state [^Connection c sql]
   (try (copy-out-text c sql) nil
        (catch java.sql.SQLException e (.getSQLState e))))

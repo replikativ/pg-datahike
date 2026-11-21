@@ -84,8 +84,8 @@
    :file "database" :lines [1 5] :state :boundary :impact :fixture
    :detail "Unsupported rename leaves a run-created database under the original name."}
   {:id :legacy-copy-force-quote
-   :file "copyselect" :lines [65 65] :state :open :impact :unsupported
-   :detail "The legacy FORCE QUOTE option is rejected."}
+   :file "copyselect" :lines [65 65] :state :covered :impact :unsupported
+   :detail "The legacy FORCE QUOTE column list now uses the existing CSV formatter. The upstream query COPY emits the same header and quoted value as PostgreSQL 18.6."}
   {:id :array-sort
    :file "arrays" :lines [865 868] :state :open :impact :unsupported
    :detail "PostgreSQL array_sort overloads are missing."}
