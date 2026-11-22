@@ -563,6 +563,12 @@
 (defn- as-of-view? [db]
   (and db (= :as-of (get-in (dbi/-secondary-view db) [:system :mode]))))
 
+(defn- retired-table-names [db]
+  (when (and db (get (dbi/-schema db) :datahike.pg.partition/retired-storage))
+    (set (d/q '[:find [?storage ...]
+                :where [_ :datahike.pg.partition/retired-storage ?storage]]
+              db))))
+
 (defn- schema-hints*
   [db]
   (let [q-fn d/q
@@ -570,6 +576,7 @@
         ;; conn without ensure-pg-schema!) — keep the query resilient
         ;; to each attr being absent by using per-attr lookups instead
         ;; of a single join.
+        retired (retired-table-names db)
         rows (q-fn '{:find [?for-ident ?e]
                      :where [[?e :datahike.pg/for-ident ?for-ident]]}
                    db)
@@ -660,6 +667,7 @@
                            generateds)
                    ::column-order column-order
                    ::catalog-db db)
+      (seq retired) (assoc ::retired-tables retired)
       ;; An as-of DB delegates its structural schema map to the current
       ;; DB. Exclude attributes and row markers created after the snapshot.
       (as-of-view? db)
@@ -1001,7 +1009,12 @@
 (defn- derive-virtual-tables*
   [schema hints]
   (let [visible-idents (::visible-idents hints)
+        retired (::retired-tables hints)
         schema (if visible-idents (select-keys schema visible-idents) schema)
+        schema (if (seq retired)
+                 (into {} (remove (fn [[attr _]] (and (keyword? attr)
+                                                      (contains? retired (namespace attr))))) schema)
+                 schema)
         user-attrs (remove (fn [[k _]] (or (not (keyword? k))
                                            (internal-attr? k)
                                            (nil? (namespace k))
@@ -1292,8 +1305,10 @@
   "Return sorted list of virtual table names for a schema."
   ([schema] (table-names schema nil))
   ([schema db]
-   (let [visibility (when (as-of-view? db)
-                      (select-keys (schema-hints db) [::visible-idents]))]
+   (let [visibility (if (as-of-view? db)
+                      (select-keys (schema-hints db) [::visible-idents ::retired-tables])
+                      (when-let [retired (seq (retired-table-names db))]
+                        {::retired-tables (set retired)}))]
      (sort (keys (derive-virtual-tables schema (or visibility {})))))))
 
 ;; ============================================================================

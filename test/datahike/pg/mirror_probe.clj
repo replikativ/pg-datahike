@@ -497,8 +497,8 @@
                    (check! (deref release-copy 30000 false) "Probe did not release the staging snapshot" {}))
                  (copy-original publisher destination table on-bytes))
                transfer
-               (fn [staged destination table on-bytes]
-                 (transfer-original staged destination table on-bytes)
+               (fn [staged destination table live-table on-bytes]
+                 (transfer-original staged destination table live-table on-bytes)
                  (throw (ex-info "Interrupted refresh before durable cutover" {})))}
               (fn []
                 (try
@@ -961,6 +961,153 @@
           (when (= ["false"] (slot-query source native-slot "active::text"))
             (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")"))))))))
 
+(defn run-partition-probe!
+  "Compare leaf-routed partitions with PostgreSQL, including a populated
+   attachment, writes during staging, crash recovery, and detachment."
+  [source-url reference-url source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-partitions-" (make-array FileAttribute 0)))
+        path (str directory "/store")
+        slot-name (str "mirror_partition_ref_" (str/replace (str (random-uuid)) "-" ""))
+        config {:source-url source-url :publication "partition_pub" :store-path path :server {:port 0}}
+        subscriber (atom nil)
+        ddl [(str "CREATE TABLE pay (bucket integer, id integer, note varchar(40), "
+                  "occurred timestamptz(6) DEFAULT '2024-02-29 12:00:00.123456+00', "
+                  "PRIMARY KEY (bucket,id)) PARTITION BY RANGE (bucket)")
+             "CREATE TABLE pay_jan PARTITION OF pay FOR VALUES FROM (0) TO (10)"
+             "CREATE TABLE pay_second PARTITION OF pay FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (bucket)"
+             "CREATE TABLE pay_feb PARTITION OF pay_second FOR VALUES FROM (10) TO (20)"
+             "CREATE TABLE pay_audit (id integer PRIMARY KEY, note text)"]
+        row-query "SELECT bucket, id, note, occurred::text FROM pay ORDER BY bucket, id"
+        parent-oid-query "SELECT oid FROM pg_class WHERE relname = 'pay' AND relkind = 'p'"
+        edges-query (str "SELECT p.relname, c.relname FROM pg_inherits i "
+                         "JOIN pg_class p ON i.inhparent = p.oid JOIN pg_class c ON i.inhrelid = c.oid "
+                         "WHERE c.relkind IN ('r','p') ORDER BY p.relname, c.relname")
+        snapshot-at (fn [] (inspect-db path #(str (.toInstant ^java.util.Date
+                                                   (:db/txInstant (d/entity % (:max-tx %)))))))
+        probe-rows (fn [conn]
+                     [(rows conn row-query)
+                      (rows conn "SELECT bucket, id, note FROM pay_second ORDER BY bucket,id")
+                      (rows conn "SELECT count(*) FROM ONLY pay")
+                      (rows conn "SELECT * FROM pay_audit ORDER BY id")])
+        check-rows (fn [source reference sink]
+                     (let [expected (probe-rows source)]
+                       (await! "Native partition subscriber did not converge" #(= expected (probe-rows reference)))
+                       (await! "Mirror partition rows did not converge"
+                               #(let [state (mirror/status @subscriber)]
+                                  (check! (not (#{:failed :paused} (:state state)))
+                                          "Mirror paused during partition refresh" state)
+                                  (= expected (probe-rows sink))))
+                       (check! (= (rows source edges-query) (rows sink edges-query))
+                               "Partition catalog edges differ" {:source (rows source edges-query)
+                                                                 :mirror (rows sink edges-query)})))]
+    (prn {:artifacts directory})
+    (with-open [source (DriverManager/getConnection source-url)
+                reference (DriverManager/getConnection reference-url)]
+      (try
+        (doseq [c [source reference]]
+          (sql! c "SET TIME ZONE 'UTC'")
+          (apply sql! c ddl))
+        (sql! source
+              "INSERT INTO pay VALUES (1,1,'moves'), (2,2,'truncate'), (11,1,'existing')"
+              "INSERT INTO pay_audit VALUES (1,'initial')"
+              "CREATE PUBLICATION partition_pub FOR TABLE pay, pay_audit"
+              "CREATE PUBLICATION partition_root_pub FOR TABLE pay WITH (publish_via_partition_root = true)")
+        (let [report (mirror/publication-report (assoc config :publication "partition_root_pub"))]
+          (check! (some #(= :root-partition-routing (:reason %)) (mapcat :issues (:tables report)))
+                  "Root-routed publication lacked a routing blocker" report))
+        (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal slot-name) ", 'pgoutput')"))
+        (sql! reference (str "CREATE SUBSCRIPTION partition_native CONNECTION " (literal source-conninfo)
+                             " PUBLICATION partition_pub WITH (create_slot=false, slot_name=" (literal slot-name) ")"))
+        (reset! subscriber (mirror/start! config))
+        (let [{:keys [slot]} (await-state! @subscriber :following)]
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (check-rows source reference sink)
+            (sql! source "UPDATE pay SET bucket=12 WHERE bucket=1 AND id=1" "TRUNCATE pay_jan")
+            (check-rows source reference sink)
+            (let [pre-attach (rows sink row-query)
+                  pre-attach-at (snapshot-at)
+                  parent-oid (rows sink parent-oid-query)
+                  ddl [(str "CREATE TABLE pay_mar (id integer, note varchar(40), bucket integer, "
+                            "occurred timestamptz(6) DEFAULT '2024-02-29 12:00:00.123457+00', "
+                            "PRIMARY KEY (bucket,id))")
+                       "ALTER TABLE pay ATTACH PARTITION pay_mar FOR VALUES FROM (20) TO (30)"]
+                  started (promise)
+                  continue-copy (promise)
+                  copy-original @#'mirror/copy-table!
+                  install-original @#'mirror/install-staged-tables!]
+              (apply sql! reference ddl)
+              (with-redefs-fn
+                {#'mirror/copy-table!
+                 (fn [publisher destination table on-bytes]
+                   (when (= "pay_mar" (:name table))
+                     (deliver started true)
+                     (check! (deref continue-copy 30000 false) "Partition stage was not released" {}))
+                   (copy-original publisher destination table on-bytes))
+                 #'mirror/install-staged-tables!
+                 (fn [stage destination check-running! max-bytes]
+                   (install-original stage destination check-running! max-bytes)
+                   (throw (ex-info "Interrupted partition cutover" {})))}
+                (fn []
+                  (try
+                    (sql! source "BEGIN" (first ddl)
+                          "INSERT INTO pay_mar VALUES (2,'attached rows',21)" (second ddl) "COMMIT")
+                    (sql! reference "ALTER SUBSCRIPTION partition_native REFRESH PUBLICATION")
+                    (check! (deref started 30000 false) "Attached partition was not staged"
+                            (mirror/status @subscriber))
+                    (sql! source "BEGIN"
+                          "UPDATE pay SET bucket=22 WHERE bucket=12 AND id=1"
+                          "UPDATE pay_audit SET note='during attach' WHERE id=1" "COMMIT")
+                    (await! "Unrelated rows stopped following during partition refresh"
+                            #(= [["1" "during attach"]] (rows sink "SELECT * FROM pay_audit")))
+                    (check! (= pre-attach (rows sink row-query)) "Partition changes escaped before cutover" {})
+                    (finally (deliver continue-copy true)))
+                  (check! (= "Interrupted partition cutover"
+                             (get-in (await-state! @subscriber :paused) [:last-error :message]))
+                          "The interrupted partition cutover did not reach installation" {})
+                  (check! (= pre-attach (rows sink row-query)) "Partition cutover rollback changed parent rows" {})))
+              (mirror/stop! @subscriber)
+              (child-crash! (assoc config :probe-crash-mode :refresh) (str directory "/crash.log"))
+              (await! "The crashed partition slot remained active"
+                      #(= ["false"] (slot-query source slot "active::text")))
+              (let [[confirmed] (slot-query source slot "confirmed_flush_lsn")
+                    cutover (durable-position path)]
+                (check! (= [["t"]] (rows source (str "SELECT " (literal confirmed)
+                                                     "::pg_lsn < " (literal cutover) "::pg_lsn")))
+                        "The partition cutover was acknowledged before the crash" {}))
+              (reset! subscriber (mirror/start! config))
+              (with-open [restarted (DriverManager/getConnection (sink-url @subscriber))]
+                (check-rows source reference restarted)
+                (check! (= parent-oid (rows restarted parent-oid-query)) "Partition attachment changed the parent OID" {})
+                (sql! restarted (str "SET datahike.as_of = " (literal pre-attach-at)))
+                (check! (= pre-attach (rows restarted row-query)) "Historical parent lost the pre-attach rows" {})
+                (sql! restarted "RESET datahike.as_of")
+                (let [before (rows restarted row-query)
+                      before-at (snapshot-at)]
+                  (sql! reference "ALTER TABLE pay DETACH PARTITION pay_mar")
+                  (sql! source "ALTER TABLE pay DETACH PARTITION pay_mar")
+                  (sql! reference "ALTER SUBSCRIPTION partition_native REFRESH PUBLICATION")
+                  (check-rows source reference restarted)
+                  (check! (= "42P01" (try (rows restarted "SELECT * FROM pay_mar") nil
+                                          (catch SQLException error (.getSQLState error))))
+                          "The detached publication leaf stayed queryable" {})
+                  (sql! restarted (str "SET datahike.as_of = " (literal before-at)))
+                  (check! (= before (rows restarted row-query)) "Historical parent lost detached partition rows" {})
+                  (sql! restarted "RESET datahike.as_of")
+                  (sql! reference "TRUNCATE pay_mar" (second ddl))
+                  (sql! source "UPDATE pay_mar SET note='changed while detached'" (second ddl))
+                  (sql! reference "ALTER SUBSCRIPTION partition_native REFRESH PUBLICATION")
+                  (check-rows source reference restarted)
+                  (sql! source "TRUNCATE pay")
+                  (check-rows source reference restarted)))))
+          (mirror/stop! @subscriber)
+          (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
+          {:status :passed :artifacts directory})
+        (finally
+          (when @subscriber (mirror/stop! @subscriber))
+          (sql! reference "DROP SUBSCRIPTION IF EXISTS partition_native")
+          (when (= ["false"] (slot-query source slot-name "active::text"))
+            (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot-name) ")"))))))))
+
 (defn -main [& [argument]]
   (if (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
@@ -970,6 +1117,7 @@
       (check! (every? seq [source reference conninfo])
               "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
       (prn ((case argument
+              "--partitions" run-partition-probe!
               "--primary-key-refresh" run-primary-key-probe!
               "--schema-refresh" run-schema-refresh-probe!
               "--refresh" run-refresh-probe!

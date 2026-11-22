@@ -2850,7 +2850,9 @@
          (mapv (fn [{:keys [name oid typmod vtype pg-type array-elem record-fields]}]
                  (let [element (or array-elem (some-> oid types/array-oid->element-oid types/oid->elem-kw))
                        pg-type (or pg-type (get types/oid->pg-type-marker oid))
-                       vtype (or vtype (when element :db.type/string) (types/dh-type-for-oid oid))]
+                       vtype (or vtype
+                                 (when (or element (types/timestamp-type? pg-type)) :db.type/string)
+                                 (types/dh-type-for-oid oid))]
                    (when-not (and vtype pg-type)
                      (throw (errors/pg-error :feature-not-supported
                                              {:feature "analysis of this output type"})))
@@ -3439,14 +3441,21 @@
         ;; table.
            col-record (mapv (fn [i] (first (filter pg-rec/record? (sample-rows i))))
                             (range (count sub-aliases)))
+           col-timestamp (mapv (fn [i]
+                                 (let [oid (nth sub-oids i nil)]
+                                   (when (#{types/oid-timestamp types/oid-timestamptz} oid)
+                                     (types/oid->pg-type-marker oid))))
+                               (range (count sub-aliases)))
            col-pg-type (mapv (fn [i]
                                (cond
                                  (nth col-array-elem i) (str "_" (name (nth col-array-elem i)))
                                  (nth col-record i)     "record"
+                                 (nth col-timestamp i)  (nth col-timestamp i)
                                  :else (get types/oid-preserving-pg-name (nth sub-oids i nil))))
                              (range (count sub-aliases)))
         ;; Per-column inferred type + coercion fn, computed once.
-           col-types (mapv (fn [i] (if (or (nth col-array-elem i) (nth col-record i))
+           col-types (mapv (fn [i] (if (or (nth col-array-elem i) (nth col-record i)
+                                           (nth col-timestamp i))
                                      :db.type/string
                                      (col-vtype i)))
                            (range (count sub-aliases)))
@@ -3463,6 +3472,9 @@
                                              (pg-rec/record? v) (pg-rec/to-pg-text v)
                                              (string? v)        v
                                              :else              (str v)))
+
+                                   (nth col-timestamp i)
+                                   (partial sql-cast/timestamp-value->storage (nth col-timestamp i) nil)
 
                                    :else (col-coerce (nth col-types i))))
                                (range (count sub-aliases)))
@@ -4080,15 +4092,28 @@
                   (when-not (and (contains? params/*temp-table-map* view-name)
                                  (or (nil? (.getSchemaName table))
                                      (= "pg_temp" (.getSchemaName table))))
-                    (first
-                     (d/q '{:find [?definition ?columns]
-                            :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
-                            :where [[?e ?name-attr ?view-name]
-                                    [?e ?definition-attr ?definition]
-                                    [?e ?columns-attr ?columns]]}
-                          db :datahike.pg/view-name
-                          :datahike.pg/view-definition
-                          :datahike.pg/view-columns view-name)))]
+                    (or
+                     (when (and (contains? schema :datahike.pg.partition/definition)
+                                (not (contains? params/*only-tables* (str/lower-case view-name)))
+                                (not (contains? *cte-namespaces* view-name))
+                                (or (nil? (.getSchemaName table))
+                                    (= "public" (unquote-ident (.getSchemaName table)))))
+                       (when-let [oid (pgs/table-oid db view-name)]
+                         (let [query (d/q '[:find ?definition .
+                                            :in $ ?oid
+                                            :where [?e :datahike.pg.object/oid ?oid]
+                                            [?e :datahike.pg.partition/definition ?definition]]
+                                          db oid)]
+                           (when (seq query) [query nil]))))
+                     (first
+                      (d/q '{:find [?definition ?columns]
+                             :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
+                             :where [[?e ?name-attr ?view-name]
+                                     [?e ?definition-attr ?definition]
+                                     [?e ?columns-attr ?columns]]}
+                           db :datahike.pg/view-name
+                           :datahike.pg/view-definition
+                           :datahike.pg/view-columns view-name))))]
               (if definition
                 (let [columns (try (edn/read-string columns-str)
                                    (catch Exception _ nil))

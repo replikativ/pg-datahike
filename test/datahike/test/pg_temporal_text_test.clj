@@ -823,6 +823,11 @@
     (is (= "2024-02-29 13:55:19.124" (one c "SELECT rounded FROM precise WHERE id = 2")))
     (is (= "1" (one c "SELECT id FROM precise WHERE ts = '2024-02-29 13:55:19.123456'")))
     (is (= "2" (one c "SELECT id FROM precise WHERE ts > '2024-02-29 13:55:19.123456'")))
+    (is (= "2024-02-29 13:55:19.123457"
+           (one c (str "SELECT ts FROM (SELECT ts FROM precise WHERE id = 1 UNION ALL "
+                       "SELECT ts FROM precise WHERE id = 2) p WHERE ts > '2024-02-29 13:55:19.123456'"))))
+    (is (= "2024-02-29 13:55:19.123457+00"
+           (one c "WITH p AS (SELECT tz FROM precise) SELECT tz FROM p ORDER BY tz DESC LIMIT 1")))
     (with-open [st (.prepareStatement c "SELECT id FROM precise WHERE ts = ?")]
       (.setObject st 1 (java.time.LocalDateTime/parse "2024-02-29T13:55:19.123457"))
       (with-open [rs (.executeQuery st)]

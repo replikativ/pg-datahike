@@ -63,8 +63,8 @@ composite non-deferrable primary key and default replica identity. It copies col
 supported types, and primary keys into a fresh read model. Publisher defaults,
 triggers and cascades run on PostgreSQL. The mirror applies the resulting rows
 and preserves their transaction boundaries using the normal Datahike writer.
-Source DDL, generated columns, sequence counters, partitioning, inheritance, and
-row filters or column projections require separate handling.
+Generated columns, sequence counters, legacy inheritance, row filters, and
+column projections require separate handling.
 
 Supported column types are boolean, smallint, integer, bigint, real, double
 precision, numeric, text, varchar, character, bytea, uuid, date, time,
@@ -80,6 +80,26 @@ Domains can have a default, `NOT NULL`, and one validated `CHECK`.
 The admission report identifies unsupported type definitions by column.
 The mirror installs type definitions with the tables or columns that use
 them. A change to an installed type definition pauses the mirror.
+
+## Mirror partitions
+
+Use the publisher's default leaf routing, with
+`publish_via_partition_root = false`, for declarative partitions in
+`public`. The mirror copies and applies changes to each published leaf.
+When the publication covers all leaves, readers can query the parent or
+any intermediate parent. `ONLY` reads the empty physical parent.
+`pg_class` and `pg_inherits` expose the mirrored table hierarchy.
+
+A new attachment takes a consistent snapshot of the affected leaves.
+The new parent layout and its rows become visible at the same durable
+WAL boundary. A detached leaf disappears from current reads when it
+leaves the publication. Historical reads preserve its earlier rows and
+parent layout.
+
+The admission report flags root routing because direct leaf truncations
+are absent from its WAL stream. A pending detach entry in the publisher's
+catalog pauses the mirror until the catalog has settled and the worker
+restarts.
 
 ## Add tables to an active mirror
 
@@ -187,7 +207,8 @@ mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
 Pass `--schema-refresh` to exercise publisher DDL, table name reuse, restart,
 and historical row and catalog reads. Pass `--primary-key-refresh` to compare
 replacement keys, key order, historical constraints, and rejected cutovers
-with PostgreSQL.
+with PostgreSQL. Pass `--partitions` to check populated attachment,
+detachment, reattachment, truncation and crash recovery under leaf routing.
 
 The next stages are wider publication type and relation support, streaming and
 spooling of large transactions, and failover slots. See the

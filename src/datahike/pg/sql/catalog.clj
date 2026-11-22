@@ -1056,10 +1056,10 @@
      {:db/ident :pg_depend/deptype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_depend") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_inherits"
-    ;; Always empty — we don't model table inheritance.
     [{:db/ident :pg_inherits/inhrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_inherits/inhparent :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_inherits/inhseqno :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_inherits/inhdetachpending :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_inherits") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_enum"
     ;; Always empty — we don't model PG enum types. Metabase's
@@ -1963,7 +1963,18 @@
      ;; in table-names like any other -- but it is relkind 'm', which
      ;; is how psql's \\dm and every tool that distinguishes the two
      ;; tell them apart.
-         (let [matviews (into {}
+         (let [partitions (into {}
+                                (d/q '{:find [?oid ?parent]
+                                       :where [[?e :datahike.pg.partition/parent-oid ?parent]
+                                               [?e :datahike.pg.object/oid ?oid]]}
+                                     cte-db))
+               parents (into #{} (map first)
+                             (d/q '{:find [?oid]
+                                    :where [[?e :datahike.pg.partition/definition _]
+                                            [?e :datahike.pg.object/oid ?oid]]}
+                                  cte-db))
+               has-partitions (set (vals partitions))
+               matviews (into {}
                               (d/q '{:find [?n ?populated]
                                      :where [[?e :datahike.pg.matview/name ?n]
                                              [(get-else $ ?e :datahike.pg.matview/populated? true)
@@ -1981,8 +1992,12 @@
                        {:pg_class/oid (long tbl-oid)
                         :pg_class/relname logical-name
                         :pg_class/relnamespace (or (:namespace-oid identity) 2200)
-                        :pg_class/relispartition false
-                        :pg_class/relkind (if (contains? matviews t) "m" "r")
+                        :pg_class/relispartition (contains? partitions tbl-oid)
+                        :pg_class/relhassubclass (contains? has-partitions tbl-oid)
+                        :pg_class/relkind (cond
+                                            (contains? parents tbl-oid) "p"
+                                            (contains? matviews t) "m"
+                                            :else "r")
                         :pg_class/relispopulated (get matviews t true)
                         :pg_class/reltype
                         (long (if (= :row-type (:datahike.pg.object/kind row-type))
@@ -3110,7 +3125,16 @@
                       regoid/vector-extension-routines))
           (sequence-dependencies cte-db user-schema))
     "pg_inherits"
-    []
+    (mapv (fn [[oid parent]]
+            {:pg_inherits/inhrelid oid
+             :pg_inherits/inhparent parent
+             :pg_inherits/inhseqno 1
+             :pg_inherits/inhdetachpending false
+             (pgs/row-marker-attr "pg_inherits") true})
+          (d/q '{:find [?oid ?parent]
+                 :where [[?e :datahike.pg.partition/parent-oid ?parent]
+                         [?e :datahike.pg.object/oid ?oid]]}
+               cte-db))
     "pg_enum"
     (vec
      (for [{:keys [oid values]} (pgs/enum-types cte-db)

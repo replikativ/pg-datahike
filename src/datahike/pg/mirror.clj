@@ -159,9 +159,14 @@
 
 (defn- read-publication-row [^ResultSet row]
   (let [schema (.getString row "schemaname")
+        parent-id (.getLong row "partition_parent")
+        leaves (when-let [ids (.getArray row "partition_leaves")]
+                 (mapv long (.getArray ids)))
         relation (when schema
-                   {:schema schema :name (.getString row "tablename")
-                    :relation-id (.getLong row "relation_id")})
+                   (cond-> {:schema schema :name (.getString row "tablename")
+                            :relation-id (.getLong row "relation_id")}
+                     (pos? parent-id) (assoc :partition-parent parent-id)
+                     leaves (assoc :partition-leaves leaves)))
         column-name (.getString row "attname")
         key-position (.getInt row "key_position")
         user-type (when column-name (source-user-type row))
@@ -182,13 +187,18 @@
        (cond-> []
          (= "pgdh_mirror" schema) (conj {:reason :reserved-schema})
          (.getBoolean row "has_filter") (conj {:reason :row-filter})
-         (or (.getBoolean row "relispartition") (= "p" (.getString row "relkind")))
-         (conj {:reason :partitioning})
+         (and (= "p" (.getString row "relkind")) (nil? leaves))
+         (conj {:reason :root-partition-routing})
+         (and (or leaves (.getBoolean row "relispartition")) (not= "public" schema))
+         (conj {:reason :partition-schema})
+         (.getBoolean row "partition_detach_pending") (conj {:reason :partition-detach-pending})
          (not (#{"r" "p"} (.getString row "relkind"))) (conj {:reason :relation-kind})
          (not= "p" (.getString row "relpersistence")) (conj {:reason :nonpermanent-table})
          (not= "d" (.getString row "relreplident"))
          (conj {:reason :replica-identity :mode (.getString row "relreplident")})
-         (.getBoolean row "has_inheritance") (conj {:reason :inheritance})
+         (and (= "r" (.getString row "relkind"))
+              (not (.getBoolean row "relispartition"))
+              (.getBoolean row "has_inheritance")) (conj {:reason :inheritance})
          (.getBoolean row "has_row_security") (conj {:reason :row-security})))
      :column column
      :column-issues
@@ -207,10 +217,42 @@
                  (conj {:reason :type-modifier :typmod (:typmod column)})))))}))
 
 (defn- scan-publication [source publication]
+  ;; Read leaves, parent layouts and columns from one publisher snapshot.
+  ;; A parent read projection requires coverage of every descendant leaf.
   (let [rows (query source
-                    (str "SELECT pub.oid AS publication_oid, pub.pubinsert, pub.pubupdate, pub.pubdelete, pub.pubtruncate, "
+                    (str "WITH publication AS (SELECT * FROM pg_catalog.pg_publication WHERE pubname = ?), "
+                         "published AS (SELECT c.oid AS relation_id, p.schemaname, p.tablename, p.attnames, p.rowfilter "
+                         "  FROM publication pub JOIN pg_catalog.pg_publication_tables p ON p.pubname = pub.pubname "
+                         "  JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname "
+                         "  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename), "
+                         "parent_candidates AS ("
+                         "  SELECT c.oid FROM publication pub JOIN pg_catalog.pg_class c ON c.relkind = 'p' "
+                         "  WHERE NOT pub.pubviaroot AND c.relpersistence = 'p' AND c.oid >= 16384 AND (pub.puballtables "
+                         "    OR EXISTS (SELECT 1 FROM pg_catalog.pg_publication_rel pr "
+                         "               WHERE pr.prpubid = pub.oid AND pr.prrelid = c.oid) "
+                         "    OR EXISTS (SELECT 1 FROM pg_catalog.pg_publication_namespace pn "
+                         "               WHERE pn.pnpubid = pub.oid AND pn.pnnspid = c.relnamespace)) "
+                         "  UNION SELECT c.oid FROM publication pub, published p "
+                         "  JOIN pg_catalog.pg_class leaf ON leaf.oid = p.relation_id AND leaf.relispartition "
+                         "  CROSS JOIN LATERAL pg_catalog.pg_partition_ancestors(p.relation_id) a(ancestor) "
+                         "  JOIN pg_catalog.pg_class c ON c.oid = a.ancestor AND c.relkind = 'p' WHERE NOT pub.pubviaroot), "
+                         "parents AS ("
+                         "  SELECT c.oid, ARRAY(SELECT t.relid::oid FROM pg_catalog.pg_partition_tree(c.oid) t "
+                         "                     WHERE t.isleaf ORDER BY t.relid::oid) AS leaves "
+                         "  FROM parent_candidates c "
+                         "  WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_partition_tree(c.oid) t "
+                         "                    WHERE t.isleaf AND NOT EXISTS "
+                         "                      (SELECT 1 FROM published p WHERE p.relation_id = t.relid))), "
+                         "relations AS ("
+                         "  SELECT p.*, NULL::oid[] AS partition_leaves FROM published p "
+                         "  UNION ALL SELECT c.oid, n.nspname, c.relname, NULL, NULL, p.leaves FROM parents p "
+                         "  JOIN pg_catalog.pg_class c ON c.oid = p.oid "
+                         "  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace) "
+                         "SELECT pub.oid AS publication_oid, pub.pubinsert, pub.pubupdate, pub.pubdelete, pub.pubtruncate, "
                          "       p.schemaname, p.tablename, c.oid AS relation_id, p.rowfilter IS NOT NULL AS has_filter, "
                          "       c.relkind, c.relpersistence, c.relreplident, c.relispartition, "
+                         "       parent.inhparent AS partition_parent, p.partition_leaves, "
+                         "       coalesce(parent.inhdetachpending, false) AS partition_detach_pending, "
                          "       pg_catalog.row_security_active(c.oid) AS has_row_security, "
                          "       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits "
                          "               WHERE inhrelid = c.oid OR inhparent = c.oid) AS has_inheritance, "
@@ -224,13 +266,13 @@
                          "       e.labels AS enum_labels, dc.count AS domain_check_count, "
                          "       coalesce(dc.validated, true) AS domain_validated, "
                          "       dc.name AS domain_check_name, dc.expression AS domain_check_expr, "
-                         "       a.attname = ANY(p.attnames) AS is_published, "
+                         "       (p.partition_leaves IS NOT NULL OR a.attname = ANY(p.attnames)) AS is_published, "
                          "       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') AS can_select, "
                          "       pk.key_position, idx.relname AS primary_key_name "
-                         "FROM pg_catalog.pg_publication pub "
-                         "LEFT JOIN pg_catalog.pg_publication_tables p ON p.pubname = pub.pubname "
-                         "LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname "
-                         "LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename "
+                         "FROM publication pub "
+                         "LEFT JOIN relations p ON true "
+                         "LEFT JOIN pg_catalog.pg_class c ON c.oid = p.relation_id "
+                         "LEFT JOIN pg_catalog.pg_inherits parent ON c.relispartition AND parent.inhrelid = c.oid "
                          "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
                          "LEFT JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype IN ('d', 'e') "
                          "LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace "
@@ -246,7 +288,7 @@
                          "LEFT JOIN LATERAL (SELECT k.pos AS key_position "
                          " FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, pos) "
                          " WHERE k.pos <= i.indnkeyatts AND k.attnum = a.attnum) pk ON true "
-                         "WHERE pub.pubname = ? ORDER BY p.schemaname, p.tablename, a.attnum")
+                         "ORDER BY p.schemaname, p.tablename, a.attnum")
                     [publication] read-publication-row)
         {:keys [publication-oid operations]} (first rows)
         tables (mapv (fn [table-rows]
@@ -256,7 +298,8 @@
                          (assoc relation :columns columns :primary-key-name primary-key-name
                                 :issues (cond-> issues
                                           (empty? columns) (conj {:reason :no-columns})
-                                          (not-any? :key? columns) (conj {:reason :missing-immediate-primary-key})))))
+                                          (and (nil? (:partition-leaves relation)) (not-any? :key? columns))
+                                          (conj {:reason :missing-immediate-primary-key})))))
                      (partition-by :relation (filter :relation rows)))
         disabled (into [] (remove #(get operations %)) [:insert :update :delete :truncate])
         issues (cond
@@ -264,8 +307,10 @@
                  :else (cond-> []
                          (empty? tables) (conj {:reason :empty-publication})
                          (seq disabled) (conj {:reason :disabled-operations :operations disabled})))]
-    {:publication publication :publication-oid publication-oid :issues issues :tables tables
-     :compatible? (and (empty? issues) (every? (comp empty? :issues) tables))}))
+    (cond-> {:publication publication :publication-oid publication-oid :issues issues
+             :tables (into [] (remove :partition-leaves) tables)
+             :compatible? (and (empty? issues) (every? (comp empty? :issues) tables))}
+      (some :partition-leaves tables) (assoc :partition-parents (filterv :partition-leaves tables)))))
 
 (defn- publisher-types [tables]
   (into (sorted-map)
@@ -273,11 +318,17 @@
                 (when user-type [(:name user-type) user-type])))
         (mapcat :columns tables)))
 
+(defn- all-relations [manifest]
+  (into (:tables manifest) (:partition-parents manifest)))
+
 (defn- publication-manifest [source publication]
-  (let [{:keys [publication-oid tables compatible?] :as report} (scan-publication source publication)]
+  (let [{:keys [publication-oid tables partition-parents compatible?] :as report}
+        (scan-publication source publication)]
     (require! compatible? "Publication cannot be mirrored" {:report report})
-    (let [user-types (publisher-types tables)]
-      (cond-> {:publication-oid publication-oid :catalog-version 3 :tables (mapv #(dissoc % :issues) tables)}
+    (let [user-types (publisher-types (all-relations report))]
+      (cond-> {:publication-oid publication-oid :catalog-version 3
+               :tables (mapv #(dissoc % :issues) tables)}
+        (seq partition-parents) (assoc :partition-parents (mapv #(dissoc % :issues) partition-parents))
         (seq user-types) (assoc :types user-types)))))
 
 (defn- validate-source-options! [source-url publication]
@@ -477,7 +528,51 @@
           (when native-key? (str ", PRIMARY KEY (" (ident (:name (first keys))) ")"))
           ")"))
     (set-column-metadata! destination table)
-    (when-not native-key? (install-primary-key! destination table))))
+    (when (and (seq keys) (not native-key?))
+      (install-primary-key! destination table))))
+
+(defn- partition-query [parent tables]
+  (let [columns (comma-list (map (comp ident :name) (:columns parent)))]
+    (str/join " UNION ALL "
+              (map (fn [id] (str "SELECT " columns " FROM " (relation-name (tables id))))
+                   (:partition-leaves parent)))))
+
+(defn- partition-topology-tx [db manifest]
+  (let [relations (all-relations manifest)
+        by-id (into {} (map (juxt :relation-id identity)) relations)
+        local (into {} (map (fn [[id table]]
+                              [id (catalog-objects/object-by-address
+                                   db catalog-objects/pg-class-oid
+                                   (pgs/storage-table-oid db (:name (storage-table table))))])) by-id)
+        schema (dbi/-schema db)
+        attributes (when (seq (:partition-parents manifest))
+                     (for [[attr vtype] [[:datahike.pg.partition/definition :db.type/string]
+                                         [:datahike.pg.partition/parent-oid :db.type/long]]
+                           :when (not (contains? schema attr))]
+                       {:db/ident attr :db/valueType vtype :db/cardinality :db.cardinality/one}))]
+    (into (vec attributes)
+          (mapcat
+           (fn [{:keys [relation-id partition-parent partition-leaves] :as table}]
+             (let [{eid :db/id oid :datahike.pg.object/oid} (get local relation-id)
+                   _ (require! eid "Missing local partition relation" {:table (relation-name table)})
+                   old (d/entity db eid)
+                   definition (when partition-leaves (partition-query table by-id))
+                   parent-oid (get-in local [partition-parent :datahike.pg.object/oid])
+                   changes (into []
+                                 (keep (fn [[attr value]]
+                                         (let [before (get old attr)]
+                                           (cond
+                                             (= before value) nil
+                                             (nil? value) [:db/retract eid attr before]
+                                             :else [:db/add eid attr value]))))
+                                 [[:datahike.pg.partition/definition definition]
+                                  [:datahike.pg.partition/parent-oid parent-oid]])]
+               (when (seq changes)
+                 (into changes (catalog-objects/bump-revision-tx db catalog-objects/pg-class-oid oid))))))
+          relations)))
+
+(defn- install-partition-topology! [destination manifest]
+  (stage-data! destination #(partition-topology-tx % manifest)))
 
 (defn- slot-info [source slot]
   (first (query source
@@ -532,6 +627,10 @@
                (check-running!)
                (create-table! destination table)
                (copy-table! source destination table on-bytes))
+             (doseq [parent (:partition-parents manifest)]
+               (create-table! destination parent))
+             (when (seq (:partition-parents manifest))
+               (install-partition-topology! destination manifest))
              (sink-prepared! destination
                              (str "UPDATE " checkpoint-table " SET manifest = ?, end_lsn = ? WHERE id = 1")
                              [(pr-str manifest) end-lsn]))))))))
@@ -787,6 +886,32 @@
 (defn- tables-by-id [manifest]
   (into {} (map (juxt :relation-id identity)) (:tables manifest)))
 
+(defn- relations-by-id [manifest]
+  (into {} (map (juxt :relation-id identity)) (all-relations manifest)))
+
+(defn- partition-layout [manifest]
+  (into {} (keep (fn [{:keys [relation-id partition-parent partition-leaves]}]
+                   (when (or partition-parent partition-leaves)
+                     [relation-id [partition-parent partition-leaves]])))
+        (all-relations manifest)))
+
+(defn- partition-affected [previous current]
+  ;; Resnapshot the affected tree as a unit so cross-leaf changes share
+  ;; the same cutover as the new parent projection.
+  (let [old-layout (partition-layout previous)
+        new-layout (partition-layout current)]
+    (into #{}
+          (mapcat (fn [id]
+                    (let [old (get old-layout id)
+                          new (get new-layout id)]
+                      (when (not= new old)
+                        (into [id] (concat (second old) (second new)))))))
+          (into (set (keys old-layout)) (keys new-layout)))))
+
+(defn- removed-relations [previous current]
+  (let [remaining (relations-by-id current)]
+    (into [] (remove #(contains? remaining (:relation-id %))) (all-relations previous))))
+
 (defn- wire-table [table]
   (update (select-keys table [:schema :name :relation-id :columns])
           :columns #(mapv (fn [column] (select-keys column [:name :oid :typmod :key?])) %)))
@@ -795,7 +920,7 @@
   (if (every? :attnum (:columns previous))
     (let [shape (fn [table]
                   (-> table
-                      (dissoc :storage-name :primary-key-name)
+                      (dissoc :storage-name :primary-key-name :partition-leaves :partition-parent)
                       (update :columns (fn [cols] (mapv #(dissoc % :key-position) cols)))))]
       (and current (= (shape previous) (shape current))
            (or (nil? (:primary-key-name previous))
@@ -804,12 +929,12 @@
                        (mapv :attnum (key-columns current)))))))
     (and current (= (wire-table previous) (wire-table current)))))
 
-(defn- changed-tables! [previous current allow-schema-refresh?]
-  (let [before (tables-by-id previous)
-        after (tables-by-id current)
+(defn- changed-tables! [previous current affected removed allow-schema-refresh?]
+  (let [before (relations-by-id previous)
         types-by-oid (into {} (map (juxt :oid identity)) (vals (:types previous)))
-        occupied (into #{} (map (comp :name storage-table)) (:tables previous))
-        missing (remove #(get after (:relation-id %)) (:tables previous))]
+        occupied (into (or (:retired-storage previous) #{})
+                       (map (comp :name storage-table)) (all-relations previous))
+        missing (remove #(or (:partition-parent %) (:partition-leaves %)) removed)]
     (require! (and (= (:publication-oid previous) (:publication-oid current)) (empty? missing))
               "Publication schema or membership changed"
               {:removed (mapv relation-name missing)})
@@ -822,6 +947,7 @@
     (let [changes (filterv (fn [table]
                              (let [prior (get before (:relation-id table))]
                                (or (nil? prior)
+                                   (contains? affected (:relation-id table))
                                    (contains? (:pending-schema previous) (:relation-id table))
                                    (not (same-table? prior table))
                                    (and allow-schema-refresh?
@@ -829,7 +955,7 @@
                                             (and (nil? (:primary-key-name prior))
                                                  (not= (mapv :attnum (key-columns prior))
                                                        (mapv :attnum (key-columns table)))))))))
-                           (:tables current))]
+                           (all-relations current))]
       (mapv (fn [table]
               (let [prior (get before (:relation-id table))
                     storage (if prior
@@ -837,7 +963,7 @@
                               (if (contains? occupied (:name table))
                                 (new-slot-name "pgdh_relation")
                                 (:name table)))]
-                (when prior
+                (when (and prior (not (same-table? prior table)))
                   (require! allow-schema-refresh?
                             "Publication schema or membership changed" {:table (relation-name prior)})
                   (require! (and (or (every? :attnum (:columns prior)) (same-table? prior table))
@@ -856,9 +982,11 @@
             changes))))
 
 (defn- require-stable-manifest! [target source]
-  (let [after (tables-by-id source)]
+  (let [after (relations-by-id source)]
     (require! (and (= (:publication-oid target) (:publication-oid source))
-                   (every? (fn [table] (same-table? table (get after (:relation-id table)))) (:tables target)))
+                   (= (partition-layout target) (partition-layout source))
+                   (every? (fn [table] (same-table? table (get after (:relation-id table))))
+                           (all-relations target)))
               "Publication changed during refresh" {})))
 
 (defn- typed-column [column]
@@ -1130,7 +1258,7 @@
                            (contains? barriers barrier))}))))
 
 (defn- start-refresh! [config origin manifest changes check-running!]
-  (let [tables (mapv :table changes)
+  (let [tables (into [] (comp (map :table) (remove :partition-leaves)) changes)
         store {:store {:backend :memory :id (random-uuid)}
                :schema-flexibility :write :keep-history? false :max-string-length 0}
         _ (d/create-database store)
@@ -1170,10 +1298,37 @@
                  (catalog-objects/rename-table-tx db (pgs/storage-table-oid db storage-name)
                                                   logical-name))))
 
+(defn- retire-partition! [destination table]
+  ;; Keep the old attributes and entities for AS OF. The catalog advances
+  ;; to a fresh storage name if the publisher later reuses the SQL name.
+  (let [storage (:name (storage-table table))
+        retired-name (new-slot-name "pgdh_retired")]
+    (stage-data!
+     destination
+     (fn [db]
+       (let [oid (pgs/storage-table-oid db storage)
+             object (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid)
+             eid (:db/id object)
+             row-type (catalog-objects/object-by-identity
+                       db catalog-objects/pg-type-oid catalog-objects/public-namespace-oid (:name table))
+             primary (catalog-objects/primary-index-oid db oid)
+             entity (d/entity db eid)
+             attr :datahike.pg.partition/retired-storage
+             schema-tx (when-not (contains? (dbi/-schema db) attr)
+                         [{:db/ident attr :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])]
+         (into (cond-> (conj (vec schema-tx) [:db/add eid attr storage])
+                 row-type (conj [:db/add (:db/id row-type) :datahike.pg.object/kind :retired-row-type]))
+               (concat (catalog-objects/rename-table-tx db oid retired-name)
+                       (when primary (catalog-objects/drop-object-tx db catalog-objects/pg-class-oid primary))
+                       (keep (fn [attr]
+                               (when-let [value (get entity attr)]
+                                 [:db/retract eid attr value]))
+                             [:datahike.pg.partition/definition :datahike.pg.partition/parent-oid]))))))))
+
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
-        {:keys [changes]} stage
+        {:keys [changes removed installed-manifest refresh-topology?]} stage
         rekeys (filterv (fn [{:keys [table previous]}]
                           (and previous (primary-key-changed? previous table)))
                         changes)
@@ -1185,15 +1340,19 @@
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
       (install-types! destination (:new-types stage))
-      (doseq [{:keys [previous storage-name]} rekeys]
+      (doseq [table removed]
+        (check-running!)
+        (retire-partition! destination table))
+      (doseq [{:keys [previous storage-name]} rekeys :when (seq (key-columns previous))]
         (check-running!)
         (drop-primary-key! destination (assoc previous :name storage-name)))
       (doseq [{:keys [table previous storage-name]} changes :when previous]
         (check-running!)
-        (let [live-table (assoc table :name storage-name)
-              key-indexes (matching-key-indexes! previous table)]
+        (let [live-table (assoc table :name storage-name)]
           (adapt-layout! destination previous live-table)
-          (reconcile-table! destination stage-db table live-table key-indexes check-running!)
+          (when-not (:partition-leaves table)
+            (reconcile-table! destination stage-db table live-table
+                              (matching-key-indexes! previous table) check-running!))
           (set-column-metadata! destination live-table)))
       ;; Vacate every old SQL name before assigning the new names. This
       ;; handles name swaps and tables added under a just-vacated name.
@@ -1205,19 +1364,23 @@
         (check-running!)
         (let [live-table (assoc table :name storage-name)]
           (create-table! destination live-table)
-          (transfer-staged-table! staged destination table live-table on-bytes)
+          (when-not (:partition-leaves table)
+            (transfer-staged-table! staged destination table live-table on-bytes))
           (when (not= storage-name (:name table))
             (set-table-name! destination storage-name (:name table)))))
       ;; Relation and index names share a PostgreSQL namespace. Install
       ;; the replacement keys after retiring old names across the batch.
       (doseq [{:keys [table storage-name]} rekeys]
         (check-running!)
-        (install-primary-key! destination (assoc table :name storage-name))))))
+        (when (seq (key-columns table))
+          (install-primary-key! destination (assoc table :name storage-name))))
+      (when refresh-topology?
+        (install-partition-topology! destination installed-manifest)))))
 
 (defn- changed-relation-ids [changes]
   (into #{} (mapcat #(if (= :truncate (:op %)) (:relation-ids %) [(:relation-id %)])) changes))
 
-(defn- installed-manifest [current previous changes]
+(defn- installed-manifest [current previous changes removed]
   ;; Legacy tables retain their stored definitions until they participate
   ;; in a refresh. Observing their source metadata does not install it.
   (let [installed (into {}
@@ -1226,13 +1389,14 @@
                                 (cond-> table
                                   (not= (:name table) storage-name) (assoc :storage-name storage-name))]))
                         changes)
-        prior (tables-by-id previous)
-        types (merge (:types previous) (:types current))]
-    (cond-> (update current :tables (fn [tables]
-                                      (mapv (fn [table]
-                                              (let [id (:relation-id table)]
-                                                (or (get installed id) (get prior id table))))
-                                            tables)))
+        prior (relations-by-id previous)
+        types (merge (:types previous) (:types current))
+        retired (into (or (:retired-storage previous) #{})
+                      (map (comp :name storage-table)) removed)
+        layouts (fn [tables] (mapv #(or (get installed (:relation-id %)) (get prior (:relation-id %))) tables))]
+    (cond-> (update current :tables layouts)
+      (seq (:partition-parents current)) (update :partition-parents layouts)
+      (seq retired) (assoc :retired-storage retired)
       (seq types) (assoc :types types)
       (:last-schema-refresh previous) (assoc :last-schema-refresh (:last-schema-refresh previous)))))
 
@@ -1258,26 +1422,33 @@
                      (vreset! observed (tables-by-id current))
                      (if-let [active @stage]
                        (require-stable-manifest! (:source-manifest active) current)
-                       (let [changes (changed-tables! @applied current schema-refresh?)]
-                         (when (seq changes)
-                           (doseq [{:keys [table previous]} changes :when previous]
+                       (let [affected (partition-affected @applied current)
+                             removed (removed-relations @applied current)
+                             changes (changed-tables! @applied current affected removed schema-refresh?)]
+                         (when (or (seq changes) (seq removed))
+                           (doseq [{:keys [table previous]} changes
+                                   :when (and previous (nil? (:partition-leaves table)))]
                              (matching-key-indexes! previous table))
-                           (let [new-pending (into {}
-                                                   (keep (fn [{:keys [table previous]}]
-                                                           (when previous [(:relation-id table) @durable])))
-                                                   changes)
-                                 manifest (installed-manifest current @applied changes)]
+                           (let [pending-tables (into removed (keep :previous) changes)
+                                 new-pending (into {}
+                                                   (comp (remove :partition-leaves)
+                                                         (map (fn [table] [(:relation-id table) @durable])))
+                                                   pending-tables)
+                                 manifest (installed-manifest current @applied changes removed)]
                              (vswap! pending-schema #(merge new-pending %))
                              (vreset! stage (assoc (start-refresh! config origin current changes check-running!)
                                                    :installed-manifest manifest
                                                    :source-manifest current
+                                                   :removed removed
+                                                   :refresh-topology? (or (seq (:partition-parents @applied))
+                                                                          (seq (:partition-parents current)))
                                                    :new-types (apply dissoc (:types current) (keys (:types @applied)))))
                              (vreset! stage-signaled? false)))))))
         live? (fn [id] (and (contains? @live id) (not (contains? @pending-schema id))))
         validate-transaction! (fn [relations changes]
                                 (let [ids (changed-relation-ids changes)
                                       stale? (fn [id]
-                                               (or (not (contains? @observed id))
+                                               (or (and (not (contains? @observed id)) (not (contains? @live id)))
                                                    (and (live? id)
                                                         (not (matches-relation? (get @live id)
                                                                                 (get relations id))))))]
