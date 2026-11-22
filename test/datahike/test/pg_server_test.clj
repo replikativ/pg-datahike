@@ -586,6 +586,21 @@
   (is (nil? (err (.execute *handler*
                            "UPDATE person SET age = 2 WHERE name = 'Alice'")))))
 
+(deftest database-read-only-cannot-be-overridden-by-a-session
+  (let [handler (pg/make-query-handler *conn* {:database-read-only? true})]
+    (try
+      (is (= [["on"]] (rows (.execute handler "SHOW default_transaction_read_only"))))
+      (doseq [statement ["BEGIN READ WRITE"
+                         "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"
+                         "CREATE SCHEMA ignored"
+                         "COPY person TO '/tmp/unused-mirror-output'"
+                         "COPY person FROM STDIN"]]
+        (is (= "25006" (sqlstate (.execute handler statement))) statement))
+      (let [parsed (.parse handler "UPDATE person SET age = $1 WHERE name = 'Alice'" (int-array [23]))]
+        (is (= "25006" (sqlstate (.executePrepared handler parsed (object-array [nil 40]))))))
+      (is (= [["30"]] (rows (.execute handler "SELECT age FROM person WHERE name = 'Alice'"))))
+      (finally (.close handler)))))
+
 (deftest postgres-transaction-characteristics-cannot-be-reset
   (doseq [[begin setting] [["BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE" "transaction_isolation"]
                            ["BEGIN TRANSACTION READ ONLY" "transaction_read_only"]

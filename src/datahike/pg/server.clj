@@ -1417,6 +1417,12 @@
 
 (declare direct-sequence-value-write?)
 
+(def ^:dynamic ^:private *database-read-only?* false)
+
+(defn- assert-database-writable! [operation]
+  (when *database-read-only?*
+    (throw (errors/pg-error :read-only-sql-transaction {:operation operation}))))
+
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
    recent-commit ring. EVERY server-side transact must go through this
@@ -1426,6 +1432,7 @@
   ([conn tx-data]
    (transact-recorded! conn tx-data nil))
   ([conn tx-data tx-options]
+   (assert-database-writable! "write")
    (let [db-before @conn
          report (d/transact conn (cond-> {:tx-data (guard-catalog-tx tx-data)}
                                    (seq tx-options)
@@ -1450,6 +1457,7 @@
    expanded from; a concurrent advance returns 40001 instead of applying EIDs
    or uniqueness decisions derived from a stale database."
   [conn db-before spec-report]
+  (assert-database-writable! "write")
   (let [expected-max-tx (:max-tx db-before)
         ;; A history-enabled `dc/with` includes its speculative transaction's
         ;; txInstant datom. The real transact creates its own metadata; replaying
@@ -1571,13 +1579,14 @@
 
       (= setting-name "default_transaction_read_only")
       (show-setting "default_transaction_read_only"
-                    (if (:read-only? @session-state) "on" "off"))
+                    (if (or *database-read-only?* (:read-only? @session-state)) "on" "off"))
 
       (= setting-name "transaction_read_only")
       (show-setting "transaction_read_only"
-                    (if (if (:in-tx? @tx-state)
-                          (:read-only? @tx-state)
-                          (:read-only? @session-state))
+                    (if (or *database-read-only?*
+                            (if (:in-tx? @tx-state)
+                              (:read-only? @tx-state)
+                              (:read-only? @session-state)))
                       "on" "off"))
 
       ;; `SHOW transaction_isolation` and `SHOW TRANSACTION ISOLATION
@@ -7058,6 +7067,17 @@
   (let [write-type (if (copy-from? parsed)
                      :copy-from-stdin
                      (:type parsed))]
+    (when (and *database-read-only?*
+               (or (str/starts-with? (name (or write-type :unknown)) "ddl-")
+                   (contains? #{:insert :update :delete :truncate :copy-from-stdin} write-type)
+                   (and (= :copy-from-stdin (:kind parsed)) (:file (:target parsed)))
+                   (contains? #{:create-database :drop-database :dh-create-branch
+                                :dh-delete-branch :nextval :setval :schema-noop :privilege-noop
+                                :comment :create-extension} (:system-type parsed))
+                   (and (contains? #{:begin :set-session-access :set-transaction-access}
+                                   (or (:system-type parsed) write-type))
+                        (false? (:read-only? parsed)))))
+      (assert-database-writable! (str/upper-case (name (or (:system-type parsed) write-type)))))
     (when (and (or (contains? write-parse-types write-type)
                    (= :copy-from-stdin write-type))
                (if (:in-tx? @tx-state)
@@ -15326,29 +15346,35 @@
   "`handler`, every call made with Datahike resolving query symbols through
    `datahike.pg.resolve/symbol-resolver`, and every statement run with a
    notice collector in scope."
-  ^PgWireServer$QueryHandler [^PgWireServer$QueryHandler h]
-  (reify PgWireServer$QueryHandler
-    (execute [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.execute h sql))))
-    (executeInGroup [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.executeInGroup h sql))))
-    (executeInGroup [_ sql multi-statement?]
-      (collecting-notices #(pg-resolve/with-symbol-resolver (.executeInGroup h sql multi-statement?))))
-    (parse [_ sql oids] (pg-resolve/with-symbol-resolver (.parse h sql oids)))
-    (reparse [_ sql oids previous] (pg-resolve/with-symbol-resolver (.reparse h sql oids previous)))
-    (describeParams [_ parsed] (pg-resolve/with-symbol-resolver (.describeParams h parsed)))
-    (describeResult [_ parsed] (pg-resolve/with-symbol-resolver (.describeResult h parsed)))
-    (executePrepared [_ parsed params] (collecting-notices #(pg-resolve/with-symbol-resolver (.executePrepared h parsed params))))
-    (planCacheToken [_] (pg-resolve/with-symbol-resolver (.planCacheToken h)))
-    (setQueryString [_ sql] (.setQueryString h sql))
-    (markTransactionFailed [_] (pg-resolve/with-symbol-resolver (.markTransactionFailed h)))
-    (close [_] (pg-resolve/with-symbol-resolver (.close h)))
-    (copyChunk [_ chunk] (pg-resolve/with-symbol-resolver (.copyChunk h chunk)))
-    (copyComplete [_] (pg-resolve/with-symbol-resolver (.copyComplete h)))
-    (copyAbort [_ reason] (pg-resolve/with-symbol-resolver (.copyAbort h reason)))
-    (beginBatchScope [_] (pg-resolve/with-symbol-resolver (.beginBatchScope h)))
-    (flushBatch [_ tx-data] (pg-resolve/with-symbol-resolver (.flushBatch h tx-data)))
-    (discardBatch [_] (pg-resolve/with-symbol-resolver (.discardBatch h)))
-    (commitImplicit [_] (pg-resolve/with-symbol-resolver (.commitImplicit h)))
-    (rollbackImplicit [_] (pg-resolve/with-symbol-resolver (.rollbackImplicit h)))))
+  ^PgWireServer$QueryHandler [^PgWireServer$QueryHandler h database-read-only?]
+  (let [run (if database-read-only?
+              (fn [f]
+                (binding [*database-read-only?* true]
+                  (pg-resolve/with-symbol-resolver (f))))
+              (fn [f] (pg-resolve/with-symbol-resolver (f))))
+        statement (fn [f] (collecting-notices #(run f)))]
+    (reify PgWireServer$QueryHandler
+      (execute [_ sql] (statement #(.execute h sql)))
+      (executeInGroup [_ sql] (statement #(.executeInGroup h sql)))
+      (executeInGroup [_ sql multi-statement?]
+        (statement #(.executeInGroup h sql multi-statement?)))
+      (parse [_ sql oids] (run #(.parse h sql oids)))
+      (reparse [_ sql oids previous] (run #(.reparse h sql oids previous)))
+      (describeParams [_ parsed] (run #(.describeParams h parsed)))
+      (describeResult [_ parsed] (run #(.describeResult h parsed)))
+      (executePrepared [_ parsed params] (statement #(.executePrepared h parsed params)))
+      (planCacheToken [_] (run #(.planCacheToken h)))
+      (setQueryString [_ sql] (.setQueryString h sql))
+      (markTransactionFailed [_] (run #(.markTransactionFailed h)))
+      (close [_] (run #(.close h)))
+      (copyChunk [_ chunk] (run #(.copyChunk h chunk)))
+      (copyComplete [_] (run #(.copyComplete h)))
+      (copyAbort [_ reason] (run #(.copyAbort h reason)))
+      (beginBatchScope [_] (run #(.beginBatchScope h)))
+      (flushBatch [_ tx-data] (run #(.flushBatch h tx-data)))
+      (discardBatch [_] (run #(.discardBatch h)))
+      (commitImplicit [_] (run #(.commitImplicit h)))
+      (rollbackImplicit [_] (run #(.rollbackImplicit h))))))
 
 (defn make-query-handler
   "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
@@ -15397,7 +15423,8 @@
   ;; resolver.
   (scoped-handler
    (pg-resolve/with-symbol-resolver
-     (make-query-handler* conn opts))))
+     (make-query-handler* conn opts))
+   (:database-read-only? opts)))
 
 (defn- reject-unknown-db-handler
   "QueryHandler that rejects every query with SQLSTATE 3D000. Returned
@@ -15486,7 +15513,8 @@
               raw (or (.get ^java.util.Map startup-params "database")
                       (first (keys registry)))
               [requested _] (parse-db-name raw)]
-          (when-not (contains? registry requested)
+          (when-not (and (contains? registry requested)
+                         (or (not (:database-read-only? opts)) (not (str/includes? raw ":"))))
             (throw (PgWireServer$PgProtocolException.
                     "3D000"
                     (str "database \"" requested "\" does not exist"))))))
@@ -15673,6 +15701,8 @@
                 — Reject plaintext startup before requesting a password.
                   Automatically true for every non-loopback bind.
      :on-query  — Callback (fn [sql-string]) for logging
+     :database-read-only?
+                — Reject SQL writes for every database on this listener.
      :max-result-rows
                 — Maximum rows returned by one SELECT before SQLSTATE 54000
                   (default 100000). Set false to disable the guard.
@@ -15746,7 +15776,7 @@
         unique-admissions (atom {})
         factory-opts (-> (select-keys opts [:on-query :compat :silently-accept
                                             :dispatch-stats :tx-wrap
-                                            :max-result-rows
+                                            :max-result-rows :database-read-only?
                                             :secondary-index-config
                                             :secondary-index-build-timeout-ms])
                          (assoc :unique-admissions unique-admissions)

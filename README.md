@@ -398,6 +398,12 @@ that need explicit branch administration.
 pg-datahike round-trips with real PostgreSQL via `pg_dump` SQL on both
 sides. Three concrete workflows:
 
+### Live PostgreSQL → pg-datahike
+
+Mirror a fixed PostgreSQL 18 publication into a read-only pg-datahike database
+with Datahike history. See the [logical replication guide](doc/postgres-mirroring.md)
+for setup and supported tables.
+
 ### Real PostgreSQL → pg-datahike (load a `pg_dump` file)
 
 `pg_dump` output replays straight into pg-datahike via `psql` or any

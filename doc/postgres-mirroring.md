@@ -1,167 +1,104 @@
-# Mirroring a live PostgreSQL, with our semantics
+# PostgreSQL logical replication into pg-datahike
 
-**Two-table subscriber verified locally against PostgreSQL 18.6.**
-The [prototype](../test/datahike/pg/mirror_prototype.clj) uses native
-`pgoutput`, COPY and pg-datahike's existing SQL transaction path.
-See the [roadmap](consolidation-plan.md) for productizing the subscriber.
+The read-only subscriber mirrors a publication from a PostgreSQL 18 primary.
+It takes a consistent initial snapshot and then follows committed transactions
+over PostgreSQL's native logical replication protocol. The mirror keeps
+Datahike history from the snapshot onward. PostgreSQL remains the write endpoint.
 
-## The goal
+## Start a mirror
 
-A read-only pg-datahike database mirrors a publication from an existing
-PostgreSQL database. PostgreSQL remains the write endpoint. The mirror
-loads a consistent snapshot, follows native logical replication, and
-applies each upstream commit as one local transaction. Clients can query
-it with SQL or Datalog and inspect history from the initial snapshot
-onward with `FOR SYSTEM_TIME AS OF`.
+Enable `wal_level=logical` on the publisher and create a publication with the
+tables to mirror.
 
-## The three shapes, and which ones we want
-
-| | What | Verdict |
-|---|---|---|
-| **Option 1** | upstream PostgreSQL → pg-datahike live mirror (CDC in) | **Next prototype after the compatibility batch.** |
-| **Option 2** | a running PostgreSQL querying us through `postgres_fdw` / `dblink` | Independent interoperability work that shares catalog and test infrastructure. |
-| **Option 3** | pg-datahike as a logical-replication publisher (CDC out) | **Defer.** Needs a durable commit cursor and consumer-pinned GC roots in datahike, after the 1.0 id layout |
-
-## Native subscriber and apply path
-
-Use pgJDBC to connect in replication mode to a stock PostgreSQL publisher.
-Start with `pgoutput` protocol version 1 in text mode. Create a logical
-slot with an exported snapshot, import it on a regular connection, and
-COPY the published tables into a staging mirror. Catch up from the slot's
-consistent position before making the mirror available to readers.
-Configure the upstream connection, publication, and slot explicitly.
-`CREATE SUBSCRIPTION` can come later as a SQL management interface.
-[PostgreSQL replication protocol](https://www.postgresql.org/docs/18/protocol-logical-replication.html) · [Exported snapshots](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html#LOGICALDECODING-SNAPSHOTS)
-
-**Verified against PostgreSQL 18.6 with pgJDBC 42.7.3.** The slot snapshot
-showed the original rows while writes committed. The stream delivered an
-update, insert, and delete across two tables in one commit and omitted
-a rolled-back insert. Receiving the commit and sending status feedback
-left `confirmed_flush_lsn` at the slot's start position. Setting the
-applied and flushed LSNs explicitly advanced it to the transaction's end
-position. The prototype applies decoded rows and updates its checkpoint
-in one local SQL transaction. The ordinary SQL commit uses
-`transact-recorded!`.
-
-Generate parameterized SQL from decoded row changes for the first apply
-implementation. Keep one write path and one commit boundary. Use the
-existing transaction machinery through `transact-recorded!`. Consider
-direct datom generation if the prototype shows a measurable SQL cost or
-uncovers apply semantics that the shared path cannot express.
-
-- Resolve updates and deletes by the source key. Use the old key for a
-  key-changing update. The destination already represents single and
-  composite primary keys.
-- Leave an unchanged TOAST column out of the update. Set a column to
-  SQL NULL when the stream provides an explicit NULL. This allows tables
-  with large values to use ordinary primary-key replica identity.
-- Apply `TRUNCATE` to the published relations as part of the source
-  transaction. With history enabled, reads before the truncate still see
-  the original rows.
-
-[PostgreSQL row change formats](https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html)
-
-## Apply and recovery guarantees
-
-1. **Apply the upstream effects once.** Use an internal apply mode on the
-   existing write path for source-computed values and effects. Keep
-   destination storage invariants in force and define how apply handles
-   transactions whose source constraints were deferred.
-2. **Commit through `transact-recorded!`.** This keeps the conflict ring
-   consistent. Pass transaction metadata through the same path when
-   needed.
-3. **Acknowledge only after a durable commit.** One worker owns feedback
-   for the slot.
-4. **Commit rows and the checkpoint together.** Persist the source
-   transaction's end LSN in a cursor entity in the same transaction.
-   Skip redeliveries at or below the recorded position. Record the
-   upstream commit timestamp separately from Datahike's transaction time.
-5. **No code may assume dense tx ids.** See the `ring-write-eas` note
-   below.
-6. **Refuse a mirror on a volatile store** (`:memory`, a non-fsyncing
-   backend) unless explicitly allowed: "durable" is the whole argument.
-
-## Seams to land early
-
-Independently useful, and cheap. Doing them now means nothing built in
-the meantime has to be reworked, and the mirror never has a standing
-reason to go around the one required write path.
-
-- **Optional tx-meta on `transact-recorded!`** (constraint 2).
-- **A database-level read-only flag.** Every client DML/DDL answers
-  `25006`, `default_transaction_read_only` reports `on`, and only the
-  replicator's internal handle writes. Useful on its own for a read-only
-  branch or replica, and it is what makes the sole-writer argument
-  behind the cursor sound.
-- **`ring-write-eas` density.** It assumes `max-tx` increments by
-  exactly one per transaction. Under a Datomic-style shared `t` counter
-  (`tx = (3<<42)|t`) the difference over-counts, every window becomes
-  `::gap`, and every COMMIT falls back to a full-database conflict scan
-  -- about 1 s at 3M datoms. 1-2 days, no prerequisites, and required
-  before the 1.0 ids regardless of whether we ever build a mirror.
-
-## Shared compatibility work
-
-- **Catalog fidelity** (consolidation-plan Phase 4 and the `sysviews`
-  cluster). Discover source columns and keys through PostgreSQL's
-  catalogs. Load the mirror's schema through the existing DDL path so its
-  SQL translator, catalogs, and `\d` agree.
-- **FDW session settings** (Phase 1.5). A shared settings store lets
-  `postgres_fdw` sessions select an `AS OF` through
-  `OPTIONS (options '-c ...')`.
-
-## Scope: two regression files are excluded by inertia
-
-`scope.edn` puts `foreign_data` and `plpgsql` out of scope under
-`:server-extension-hooks`. Both are stale against our own plan:
-`foreign_data` is the natural gate for Option 2, and Phase 7.3 commits
-to plpgsql. Move each in when its feature lands rather than leaving it
-excluded.
-
-## Subscriber milestones
-
-- [x] Verify the native transport, slot snapshot, and explicit feedback.
-- [x] Use a local REPL prototype to mirror
-  two ordinary keyed tables. Keep writes going during COPY. Apply a
-  multi-table transaction with a key change, a delete, and an update that
-  leaves a large value unchanged. Kill the worker after the destination
-  commit and before acknowledgement, then restart and compare current
-  rows and historical reads. Verify one local transaction per applied
-  source commit and confirm that a rolled-back source change stays absent.
-- [ ] Turn the prototype into a read-only mirror with durable storage,
-  staging and cutover, schema drift detection, `TRUNCATE`, and lag and
-  checkpoint status. Run the focused PostgreSQL oracle during development
-  and the full integration suites before opening the PR.
-- [ ] Extend table synchronization and schema evolution, recovery after
-  slot loss, failover handling, and support for large transactions.
-
-### Running the prototype probe
-
-Set `PG_MIRROR_SOURCE_URL` to a JDBC URL for an empty native PostgreSQL
-18 database on a server with `wal_level=logical`. The connection needs
-to create the test publication and replication slot. Run the probe from
-the repository root after compiling the Java sources with `bb prep`.
-
-```bash
-clojure -M:dev -m datahike.pg.mirror-probe
+```sql
+CREATE PUBLICATION analytics FOR TABLE public.accounts, public.events;
 ```
 
-The probe opens a file-backed pg-datahike store with history enabled.
-While COPY reads the exported snapshot, the publisher commits an update
-with an unchanged TOAST field, a primary-key change, an insert and a
-delete. A separate process applies the commit and is halted before
-acknowledgement. The probe reopens the store, verifies the duplicate
-arrives without adding history, then follows another commit with an
-explicit NULL. It compares current rows, the checkpoint, and historical
-rows from before the first apply.
+Use a publisher role with `LOGIN`, `REPLICATION`, database access, and
+`SELECT` on all published tables. The role needs access to
+`pg_logical_emit_message(boolean, text, text)` for catch-up barriers. Use a
+direct connection to the publisher primary.
 
-The prototype accepts whole-table publications with default primary-key
-replica identity and supported primitive column types. Keep the
-destination private to the worker while exercising the probe. A
-database-enforced read-only endpoint, schema drift handling beyond
-rejection, and transactional streaming for large commits are separate
-subscriber milestones. The probe prints the local store and worker log
-directory and uses a slot in the disposable source database.
+Save a configuration as `mirror.edn`.
+
+```clojure
+{:publication "analytics"
+ :store-path "/var/lib/pg-datahike/analytics"
+ :server {:port 15432 :default "analytics"}}
+```
+
+```bash
+export PG_MIRROR_SOURCE_URL='jdbc:postgresql://publisher.example/production?user=mirror&sslmode=verify-full'
+java -jar pg-datahike-standalone.jar mirror mirror.edn
+```
+
+From a source checkout, use `clojure -M -m datahike.pg.main mirror mirror.edn`
+after `bb prep`. Embedded callers use `datahike.pg.mirror/start!` with the
+same configuration plus `:source-url`, then use `status` and `stop!`.
+The listener uses the ordinary pgwire authentication and TLS options.
+
+Use a dedicated store path. Keep its adjacent `.mirror-lock` file with the
+store. One worker owns the store and a generated permanent `pgoutput` slot.
+The SQL listener opens after snapshot copy and catch-up. Client writes return
+SQLSTATE `25006`.
+
+## Supported publications
+
+This version accepts whole, unfiltered, permanent tables with a single or
+composite non-deferrable primary key and default replica identity. It copies column names,
+supported types, and primary keys into a fresh read model. Publisher defaults,
+triggers and cascades run on PostgreSQL. The mirror applies the resulting rows
+and preserves their transaction boundaries using the normal Datahike writer.
+Source DDL, generated columns, sequence counters, partitioning, inheritance, and
+row filters or column projections require separate handling.
+
+Supported column types without modifiers are boolean, smallint, integer, bigint,
+text, varchar, real, double precision, numeric, uuid, and date. Timestamp
+columns require a storage carrier that preserves PostgreSQL microseconds.
+Choose a fixed publication and coordinate schema changes with the
+mirror operator. The worker checks publication membership and relation
+definitions and pauses on incompatibility. A new store and snapshot are needed
+to adopt a changed publication or start a new history epoch after slot loss.
+
+## Recovery and status
+
+The checkpoint in `pgdh_mirror.checkpoint` stores the publisher identity, end
+LSN, transaction ID, and publisher commit timestamp. Each source commit and its
+checkpoint reach durable storage together. Feedback reports committed positions
+only. After a disconnect, commits already in the checkpoint are acknowledged
+and skipped. Slot loss, a changed publisher timeline, or a publisher
+confirmation ahead of the durable checkpoint pauses the mirror.
+
+Status includes the applied and confirmed LSNs, retained WAL, and the most recent
+error. A paused worker that has already cut over serves the last committed
+state. When a connection drops, the worker reconnects with backoff and catches
+up from its durable checkpoint. For a history gap, preserve the old store and
+bootstrap the replacement at a fresh path.
+
+Snapshot and transaction buffering are bounded by `:max-snapshot-bytes` and
+`:max-transaction-bytes`. The defaults are 128 MiB and 64 MiB respectively.
+The worker pauses when it hits a limit. Stop the worker and adjust the limit to
+retry. Cutover and occasional idle WAL confirmation use transactional logical
+messages. Their checkpoint transactions can appear in Datahike history.
+
+Stopping a subscriber leaves its slot available for resume. After permanently
+retiring a mirror, drop its recorded slot on the publisher to release retained
+WAL once the worker has stopped.
+
+## Verification and follow-up
+
+The [replication probe](../test/datahike/pg/mirror_probe.clj) compares the
+mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
+18 databases, a source and native reference subscriber. Set
+`PG_MIRROR_SOURCE_URL` and `PG_MIRROR_REFERENCE_URL` to the JDBC URLs and
+`PG_MIRROR_SOURCE_CONNINFO` to the source libpq connection string used by
+`CREATE SUBSCRIPTION`. The source server needs `wal_level=logical`. Run
+`clojure -M:dev -m datahike.pg.mirror-probe` after `bb prep`.
+
+The next stages are per-table synchronization for online table addition,
+coordinated schema evolution, streaming and spooling of large transactions,
+and failover slots. See the [consolidation plan](consolidation-plan.md) and
+[PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 
 ## Known performance trap in Option 2, today
 
@@ -190,20 +127,8 @@ cursor) without a correctness argument to preserve.
 
 ## Open questions
 
-Answered: **startup `options`** is read by two regexes only, so FDW time
-travel waits on the settings store.
-
-Measurements, not opinions: are datahike branch create/reset/merge cheap
-and atomic enough to stage a multi-GB snapshot; is a multi-million-datom
-retraction for TRUNCATE acceptable or do we want a datahike primitive;
-does the writer preserve `transact!` submission order (wanted as a test
-either way).
-
-Decisions: mirror as a component in the server process or a separate
-writer (affects where pgjdbc lives, and whether it is a separate
-artifact); read-only forever, or "mirror plus local tables" -- local
-extras break the sole-writer argument, so v1 is read-only; one upstream
-schema per mirror database, or the schema folded into the attribute
-namespace (`:sales.orders/id`); per-row valid time from upstream
-`valid_from`/`valid_to` columns, where datahike has tx-level
-`:db.valid/from`/`to` and not per-row.
+The next subscriber stages need measurements of staging large tables and
+retracting large relation sets on TRUNCATE. Mapping upstream `valid_from`
+and `valid_to` values to Datahike's transaction-level valid time also needs
+a separate design. FDW time travel depends on support for startup
+`options` in the session settings.
