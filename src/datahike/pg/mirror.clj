@@ -517,6 +517,17 @@
                                       " (id, origin, slot_name, publication) VALUES (1, ?, ?, ?)")
                      [(pr-str origin) slot publication]))))
 
+(defn- update-checkpoint-manifest! [destination {:keys [slot end-lsn] :as saved} manifest]
+  (transaction!
+   destination
+   (fn []
+     (let [result (sink-prepared! destination
+                                  (str "UPDATE " checkpoint-table " SET manifest = ? WHERE id = 1 AND slot_name = ? AND end_lsn = ?")
+                                  [(pr-str manifest) slot end-lsn])]
+       (require! (= 1 (affected-count result)) "Mirror checkpoint changed while recording its manifest"
+                 {:slot slot :checkpoint end-lsn}))))
+  (assoc saved :manifest manifest))
+
 (defn- local-column-attrs [db {:keys [name columns] :as table}]
   (let [relation (pgs/storage-table-oid db name)]
     (require! relation "Missing local mirror relation" {:table (relation-name table)})
@@ -745,12 +756,17 @@
       (f end-lsn)
       (finally (command! source "ROLLBACK")))))
 
-(defn- bootstrap! [replication source destination {:keys [slot publication origin]} failover? check-running! max-snapshot-bytes]
+(defn- clear-incomplete-slot! [source slot failover?]
   (when-let [existing (slot-info source slot)]
-    ;; The unique slot name was persisted locally before its first creation.
-    (require! (and (compatible-slot? existing failover?) (not (:active? existing)))
-              "Cannot restart an incomplete snapshot while its slot is in use or has changed" {:slot slot})
-    (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil)))
+    (require! (compatible-slot? existing failover?)
+              "Cannot restart an incomplete snapshot while its slot has changed" {:slot slot})
+    (when (:active? existing)
+      (throw (SQLException. "The incomplete snapshot's slot is still active" "55006")))
+    (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil))))
+
+(defn- bootstrap! [replication source destination {:keys [slot publication origin]} failover? check-running! max-snapshot-bytes]
+  ;; The unique slot name was persisted locally before its first creation.
+  (clear-incomplete-slot! source slot failover?)
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)]
     (with-slot-snapshot!
       replication source slot false failover?
@@ -935,7 +951,7 @@
       (require! (= 1 count) "A mirrored change did not affect exactly one row"
                 {:relation-id relation-id :operation op :affected count}))))
 
-(defn- apply-commit! [destination relations previous {:keys [end-lsn xid commit-micros changes install! manifest origin]}]
+(defn- apply-commit! [destination relations previous {:keys [end-lsn xid commit-micros changes install! manifest origin slot]}]
   (transaction!
    destination
    (fn []
@@ -947,10 +963,12 @@
                                        " SET end_lsn = ?, source_xid = ?, source_commit_micros = ?"
                                        (when manifest ", manifest = ?")
                                        (when origin ", origin = ?")
+                                       (when slot ", slot_name = ?")
                                        " WHERE id = 1 AND end_lsn = ?")
-                                  (conj (cond-> [end-lsn (str xid) (str commit-micros)]
+                                  (conj (cond-> [end-lsn (some-> xid str) (some-> commit-micros str)]
                                           manifest (conj (pr-str manifest))
-                                          origin (conj (pr-str origin)))
+                                          origin (conj (pr-str origin))
+                                          slot (conj slot))
                                         previous))]
        (require! (= 1 (affected-count result)) "Mirror checkpoint changed while applying a transaction"
                  {:expected previous :next end-lsn})))))
@@ -1027,20 +1045,33 @@
                   (assoc context :reason :timeline-fork-before-checkpoint :fork-lsn switchpoint
                          :resnapshot-required? true))))))
 
+(defn- unavailable-slot! [context reason]
+  (throw (ex-info "Replication slot cannot resume from the durable checkpoint"
+                  (assoc context :reason reason :resnapshot-required? true))))
+
+(defn- usable-slot! [source slot failover?]
+  (let [info (slot-info source slot)
+        context {:slot slot :slot-status info}]
+    (cond
+      (nil? info) (unavailable-slot! context :slot-missing)
+      (not (:matches? info)) (unavailable-slot! context :incompatible-slot)
+      (not (compatible-slot? info failover?))
+      (throw (ex-info "Mirror configuration and publisher slot disagree about failover"
+                      (assoc context :reason :slot-failover-mismatch :failover? (boolean failover?))))
+      (:invalidation info) (unavailable-slot! context :slot-invalidated)
+      :else info)))
+
 (defn- validate-resume! [source {:keys [slot end-lsn]} failover? timeline-changed?]
-  (let [{:keys [active? invalidation confirmed-lsn restart-lsn synced?] :as info} (slot-info source slot)]
-    (require! (or (not (:matches? info)) (= (boolean failover?) (:failover? info)))
-              "Mirror configuration and publisher slot disagree about failover"
-              {:reason :slot-failover-mismatch :slot slot :failover? (boolean failover?) :slot-status info})
-    (require! (and (compatible-slot? info failover?) (nil? invalidation) confirmed-lsn restart-lsn
-                   (not (pos? (compare-lsn restart-lsn confirmed-lsn)))
-                   (not (pos? (compare-lsn confirmed-lsn end-lsn))))
-              "Replication slot cannot resume from the durable checkpoint"
-              {:slot slot :checkpoint end-lsn :slot-status info :resnapshot-required? true})
+  (let [{:keys [active? confirmed-lsn restart-lsn synced?] :as info} (usable-slot! source slot failover?)
+        context {:slot slot :checkpoint end-lsn :slot-status info}]
+    (when-not (and confirmed-lsn restart-lsn (not (pos? (compare-lsn restart-lsn confirmed-lsn))))
+      (unavailable-slot! context :slot-position-unavailable))
     (require! (or (not timeline-changed?) synced?) "The promoted primary has no synchronized slot for the mirror"
-              {:reason :unsynchronized-slot :slot slot :checkpoint end-lsn :slot-status info :resnapshot-required? true})
+              (assoc context :reason :unsynchronized-slot :resnapshot-required? true))
     (when active?
       (throw (SQLException. "Replication slot is still active" "55006")))
+    (when (pos? (compare-lsn confirmed-lsn end-lsn))
+      (unavailable-slot! context :slot-confirmation-ahead))
     info))
 
 (defn- emit-barrier!
@@ -1054,10 +1085,7 @@
   (swap! state merge (select-keys info [:confirmed-lsn :restart-lsn :retained-wal-bytes :unconfirmed-wal-bytes])))
 
 (defn- checked-running-slot! [source slot state failover?]
-  (let [{:keys [invalidation] :as info} (slot-info source slot)]
-    (require! (and (compatible-slot? info failover?) (nil? invalidation))
-              "Replication slot is unavailable" {:slot slot :slot-status info :resnapshot-required? true})
-    (publish-status! state info)))
+  (publish-status! state (usable-slot! source slot failover?)))
 
 (defn- new-slot-name [prefix]
   (str prefix "_" (str/replace (str (UUID/randomUUID)) "-" "")))
@@ -1443,6 +1471,19 @@
   (sink-execute! destination "SET DateStyle = 'ISO, YMD'")
   (sink-execute! destination "SET TIME ZONE 'UTC'"))
 
+(defn- copy-snapshot! [source destination changes check-running! on-bytes]
+  (let [relations (mapv :table changes)]
+    (transaction!
+     destination
+     (fn []
+       (install-types! destination (publisher-types relations))
+       (doseq [table relations]
+         (check-running!)
+         (create-table! destination table))
+       (doseq [table relations :when (nil? (:partition-leaves table))]
+         (check-running!)
+         (copy-table! source destination table on-bytes))))))
+
 (defn- stage-tables! [{:keys [source-url publication max-snapshot-bytes max-transaction-bytes]}
                       origin manifest {:keys [conn changes tables barrier phase]} check-running!]
   (with-publisher
@@ -1458,17 +1499,7 @@
                         replication source slot true false
                         (fn [position]
                           (require-stable-manifest! manifest (publication-manifest source publication))
-                          (transaction!
-                           destination
-                           (fn []
-                             (let [relations (mapv :table changes)]
-                               (install-types! destination (publisher-types relations))
-                               (doseq [table relations]
-                                 (check-running!)
-                                 (create-table! destination table)))
-                             (doseq [table tables]
-                               (check-running!)
-                               (copy-table! source destination table on-bytes))))
+                          (copy-snapshot! source destination changes check-running! on-bytes)
                           position))
               expected (into {} (map (juxt :relation-id identity)) tables)
               included? (set (keys expected))]
@@ -1489,17 +1520,26 @@
                                                #(doseq [change changes] (apply-change! destination expected change))))
                                (contains? barriers barrier))}))))))
 
+(defn- open-stage-store []
+  (let [store {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :write :keep-history? false :max-string-length 0}]
+    (d/create-database store)
+    (try {:store store :conn (d/connect store)}
+         (catch Throwable error
+           (d/delete-database store)
+           (throw error)))))
+
+(defn- close-stage-store! [{:keys [conn store]}]
+  (try (d/release conn) (finally (d/delete-database store))))
+
 (defn- start-refresh! [config origin manifest changes check-running!]
   (let [tables (into [] (comp (map :table) (remove :partition-leaves)) changes)
-        store {:store {:backend :memory :id (random-uuid)}
-               :schema-flexibility :write :keep-history? false :max-string-length 0}
-        _ (d/create-database store)
-        conn (d/connect store)
+        local-store (open-stage-store)
         stopped? (atom false)
         done (promise)
-        stage {:store store :conn conn :tables tables :changes changes :manifest manifest
-               :phase (atom :copying) :barrier (str (UUID/randomUUID))
-               :stopped? stopped? :done done}
+        stage (assoc local-store :tables tables :changes changes :manifest manifest
+                     :phase (atom :copying) :barrier (str (UUID/randomUUID))
+                     :stopped? stopped? :done done)
         running! #(do (check-running!)
                       (require! (not @stopped?) "Table refresh stopped" {}))
         worker (Thread. (fn []
@@ -1510,10 +1550,10 @@
     (.start worker)
     (assoc stage :worker worker)))
 
-(defn- stop-refresh! [{:keys [worker stopped? conn store]}]
+(defn- stop-refresh! [{:keys [worker stopped?] :as stage}]
   (reset! stopped? true)
   (.join ^Thread worker)
-  (try (d/release conn) (finally (d/delete-database store))))
+  (close-stage-store! stage))
 
 (defn- refresh-result! [stage check-running!]
   (let [deadline (+ (System/nanoTime) (.toNanos TimeUnit/MINUTES 10))]
@@ -1635,11 +1675,119 @@
         retired (into (or (:retired-storage previous) #{})
                       (map (comp :name storage-table)) removed)
         layouts (fn [tables] (mapv #(or (get installed (:relation-id %)) (get prior (:relation-id %))) tables))]
-    (cond-> (update current :tables layouts)
+    (cond-> (merge (select-keys previous [:last-schema-refresh :recovery-gaps :slots-to-retire])
+                   (update current :tables layouts))
       (seq (:partition-parents current)) (update :partition-parents layouts)
       (seq retired) (assoc :retired-storage retired)
-      (seq types) (assoc :types types)
-      (:last-schema-refresh previous) (assoc :last-schema-refresh (:last-schema-refresh previous)))))
+      (seq types) (assoc :types types))))
+
+(defn- installation-plan [previous current changes removed type-changes]
+  {:installed-manifest (installed-manifest current previous changes removed type-changes)
+   :source-manifest current
+   :changes changes
+   :removed removed
+   :type-changes type-changes
+   :refresh-topology? (or (seq (:partition-parents previous)) (seq (:partition-parents current)))
+   :new-types (apply dissoc (:types current) (keys (:types previous)))})
+
+(defn- recoverable-slot-loss? [error]
+  (contains? #{:slot-missing :slot-invalidated :slot-confirmation-ahead} (:reason (ex-data error))))
+
+(defn- retire-slot! [source slot failover?]
+  (if-let [info (slot-info source slot)]
+    (when (and (compatible-slot? info failover?) (not (:active? info)))
+      (try
+        (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil))
+        true
+        (catch SQLException error
+          (case (.getSQLState error)
+            "42704" true
+            ("42501" "55006") false
+            (throw error)))))
+    true))
+
+(defn- retire-replaced-slots! [source destination {:keys [manifest slot] :as saved} state failover?]
+  (let [pending (:slots-to-retire manifest)
+        remaining (into #{} (remove #(and (not= slot %) (retire-slot! source % failover?))) pending)]
+    (if (seq remaining)
+      (swap! state assoc :slots-to-retire remaining)
+      (swap! state dissoc :slots-to-retire))
+    (if (= (set pending) remaining)
+      saved
+      (update-checkpoint-manifest! destination saved
+                                   (cond-> (dissoc manifest :slots-to-retire)
+                                     (seq remaining) (assoc :slots-to-retire remaining))))))
+
+(defn- recovery-reservation! [destination {:keys [manifest] :as saved} slot-prefix error]
+  (let [{:keys [reason slot-status]} (ex-data error)
+        reservation (cond-> {:slot (new-slot-name slot-prefix) :reason reason}
+                      (:invalidation slot-status) (assoc :invalidation (:invalidation slot-status)))]
+    (update-checkpoint-manifest! destination saved (assoc manifest :pending-recovery reservation))))
+
+(defn- recover-checkpoint! [replication source destination saved origin state check-running!
+                            {:keys [failover? schema-refresh? max-snapshot-bytes resnapshot-on-slot-loss?]}]
+  (let [{old-slot :slot previous :manifest :keys [end-lsn publication]} saved
+        {new-slot :slot :as pending} (:pending-recovery previous)
+        status {:state :copying :old-slot old-slot :new-slot new-slot :from-lsn end-lsn :reason (:reason pending)}]
+    (require! resnapshot-on-slot-loss? "A slot recovery is pending. Enable resnapshot-on-slot-loss? to resume it."
+              {:reason :pending-slot-recovery :recovery status})
+    (swap! state assoc :state :recovering :recovery status)
+    (clear-incomplete-slot! source new-slot failover?)
+    (let [stage (open-stage-store)]
+      (try
+        (with-open [staged (pg/make-query-handler (:conn stage))]
+          (set-copy-format! staged)
+          (set-copy-format! destination)
+          (with-slot-snapshot!
+            replication source new-slot false failover?
+            (fn [position]
+              (require! (not (neg? (compare-lsn position end-lsn))) "Replacement snapshot precedes the durable checkpoint"
+                        {:snapshot position :checkpoint end-lsn})
+              (let [current (publication-manifest source publication)
+                    removed (removed-relations previous current)
+                    type-changes (type-changes! previous current schema-refresh?)
+                    affected (into #{} (map :relation-id) (all-relations current))
+                    changes (changed-tables! previous current affected removed type-changes schema-refresh?)
+                    plan (installation-plan previous current changes removed type-changes)
+                    gap (merge (dissoc pending :slot)
+                               (dissoc status :state) {:snapshot-lsn position
+                                                       :from-timeline (get-in saved [:origin :timeline])
+                                                       :snapshot-timeline (:timeline origin)})
+                    manifest (cond-> (update (:installed-manifest plan) :recovery-gaps (fnil conj []) gap)
+                               (not= :slot-missing (:reason pending))
+                               (update :slots-to-retire (fnil conj #{}) old-slot))]
+                (copy-snapshot! source staged changes check-running! (snapshot-budget check-running! max-snapshot-bytes))
+                (check-running!)
+                (try (validate-resume! source {:slot new-slot :end-lsn position} failover? false)
+                     (catch clojure.lang.ExceptionInfo error
+                       (throw (ex-info "Replacement slot became unavailable during recovery"
+                                       (assoc (ex-data error) :reason :replacement-slot-unavailable) error))))
+                (swap! state assoc :recovery (assoc status :state :installing :snapshot-lsn position))
+                (apply-commit! destination {} end-lsn
+                               {:end-lsn position :manifest manifest :origin origin :slot new-slot
+                                :install! #(install-staged-tables! (merge stage plan) % check-running! max-snapshot-bytes)})))))
+        (checkpoint destination)
+        (finally
+          (close-stage-store! stage)
+          (swap! state dissoc :recovery))))))
+
+(defn- resumable-checkpoint! [replication source destination saved origin state check-running!
+                              {:keys [failover? resnapshot-on-slot-loss? slot-prefix] :as config}]
+  (let [timeline-changed? (not= (:origin saved) origin)
+        {:keys [info reserved]}
+        (if (get-in saved [:manifest :pending-recovery])
+          {:reserved saved}
+          (try {:info (validate-resume! source saved failover? timeline-changed?)}
+               (catch clojure.lang.ExceptionInfo error
+                 (if (and resnapshot-on-slot-loss? (recoverable-slot-loss? error))
+                   {:reserved (recovery-reservation! destination saved slot-prefix error)}
+                   (throw error)))))
+        saved (if reserved
+                (recover-checkpoint! replication source destination reserved origin state check-running! config)
+                saved)
+        info (or info (validate-resume! source saved failover? false))]
+    (swap! state assoc :last-recovery (peek (get-in saved [:manifest :recovery-gaps])))
+    {:saved (retire-replaced-slots! source destination saved state failover?) :info info}))
 
 (defn- consume! [copy source destination saved origin state confirmed-lsn check-running! ready! config]
   (let [{:keys [manifest end-lsn publication slot]} saved
@@ -1677,16 +1825,9 @@
                                                    (comp (remove :partition-leaves)
                                                          (map (fn [table] [(:relation-id table) @durable])))
                                                    pending-tables)
-                                 manifest (installed-manifest current @applied changes removed type-changes)]
+                                 install (installation-plan @applied current changes removed type-changes)]
                              (vswap! pending-schema #(merge new-pending %))
-                             (vreset! stage (assoc (start-refresh! config origin current changes check-running!)
-                                                   :installed-manifest manifest
-                                                   :source-manifest current
-                                                   :removed removed
-                                                   :type-changes type-changes
-                                                   :refresh-topology? (or (seq (:partition-parents @applied))
-                                                                          (seq (:partition-parents current)))
-                                                   :new-types (apply dissoc (:types current) (keys (:types @applied)))))
+                             (vreset! stage (merge (start-refresh! config origin current changes check-running!) install))
                              (vreset! stage-signaled? false)))))))
         live? (fn [id] (and (contains? @live id) (not (contains? @pending-schema id))))
         validate-transaction! (fn [relations changes]
@@ -1822,18 +1963,26 @@
         (validate-origin! replication saved origin failover?)
         (swap! state assoc :slot (:slot saved) :applied-lsn (:end-lsn saved)
                :source-timeline (get-in saved [:origin :timeline]))
-        (let [{:keys [slot end-lsn] :as saved} (if (:end-lsn saved)
-                                                 saved
-                                                 (do
-                                                   (swap! state assoc :state :snapshot)
-                                                   (bootstrap! replication source destination (assoc saved :origin origin)
-                                                               failover? check-running! max-snapshot-bytes)
-                                                   (checkpoint destination)))
-              {:keys [confirmed-lsn] :as info} (validate-resume! source saved failover? (not= (:origin saved) origin))]
+        (let [saved (if (:end-lsn saved)
+                      saved
+                      (do
+                        (swap! state assoc :state :snapshot)
+                        (bootstrap! replication source destination (assoc saved :origin origin)
+                                    failover? check-running! max-snapshot-bytes)
+                        (checkpoint destination)))
+              {{:keys [slot end-lsn] :as saved} :saved {:keys [confirmed-lsn] :as info} :info}
+              (resumable-checkpoint! replication source destination saved origin state check-running! config)]
           (publish-status! state info)
-          (swap! state assoc :state :catching-up :applied-lsn end-lsn :source-timeline (get-in saved [:origin :timeline]))
-          (consume! (replication-copy replication slot publication confirmed-lsn)
-                    source destination saved origin state confirmed-lsn check-running! ready! config))))))
+          (swap! state assoc :state :catching-up :slot slot :applied-lsn end-lsn
+                 :source-timeline (get-in saved [:origin :timeline]))
+          (try
+            (consume! (replication-copy replication slot publication confirmed-lsn)
+                      source destination saved origin state confirmed-lsn check-running! ready! config)
+            (catch SQLException error
+              ;; Replication can report slot loss before the SQL status poll.
+              (when (#{"42704" "55000" "58P01"} (.getSQLState error))
+                (usable-slot! source slot failover?))
+              (throw error))))))))
 
 (defn- retryable? [error]
   (and (instance? SQLException error)
@@ -1880,7 +2029,8 @@
                           (replicate! config destination state check-running! ready!)
                           (catch Exception e e))]
               (when-not @stopping?
-                (let [retry? (retryable? error)
+                (let [retry? (or (retryable? error)
+                                 (and (:resnapshot-on-slot-loss? config) (recoverable-slot-loss? error)))
                       delay (if (= :following (:state @state)) 250 retry-ms)]
                   (swap! state assoc :state (if retry? :reconnecting :paused)
                          :last-error (mirror-error error))
@@ -1924,7 +2074,8 @@
   "Start a PostgreSQL 18 subscriber. Bootstrap and catch-up run asynchronously.
    The :server options are passed to the read-only pgwire listener after catch-up.
    Monitor with status and release resources with stop!. Use a dedicated :store-path."
-  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes schema-refresh? failover?]
+  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes schema-refresh? failover?
+           resnapshot-on-slot-loss?]
     :or {slot-prefix "pgdh_mirror"
          max-snapshot-bytes (* 128 1024 1024)
          max-transaction-bytes (* 64 1024 1024)}
@@ -1937,6 +2088,8 @@
   (require! (or (nil? schema-refresh?) (boolean? schema-refresh?))
             "Expected a boolean schema-refresh? option" {})
   (require! (or (nil? failover?) (boolean? failover?)) "Expected a boolean failover? option" {})
+  (require! (or (nil? resnapshot-on-slot-loss?) (boolean? resnapshot-on-slot-loss?))
+            "Expected a boolean resnapshot-on-slot-loss? option" {})
   (require! (and (or (nil? server) (map? server))
                  (not-any? #(get server %) [:database-template :on-create-database :on-delete-database]))
             "Mirror listeners do not support database provisioning" {})

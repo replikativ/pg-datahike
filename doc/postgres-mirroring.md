@@ -190,14 +190,13 @@ The checkpoint in `pgdh_mirror.checkpoint` stores the publisher identity, end
 LSN, transaction ID, and publisher commit timestamp. Each source commit and its
 checkpoint reach durable storage together. Feedback reports committed positions
 only. After a disconnect, commits already in the checkpoint are acknowledged
-and skipped. Slot loss or a publisher confirmation ahead of the durable
-checkpoint pauses the mirror.
+and skipped.
 
 Status includes the applied and confirmed LSNs, retained WAL, and the most recent
 error. A paused worker that has already cut over serves the last committed
 state. When a connection drops, the worker reconnects with backoff and catches
-up from its durable checkpoint. For a history gap, preserve the old store and
-bootstrap the replacement at a fresh path.
+up from its durable checkpoint. A missing slot, an invalidated slot, or a
+confirmation ahead of the checkpoint pauses the mirror by default.
 
 Snapshot and transaction buffering are bounded by `:max-snapshot-bytes` and
 `:max-transaction-bytes`. The defaults are 128 MiB and 64 MiB respectively.
@@ -208,6 +207,30 @@ messages. Their checkpoint transactions can appear in Datahike history.
 Stopping a subscriber leaves its slot available for resume. After permanently
 retiring a mirror, drop its recorded slot on the publisher to release retained
 WAL once the worker has stopped.
+
+## Resnapshot after slot loss
+
+Set `:resnapshot-on-slot-loss? true` to recover from a missing or invalidated
+slot or a confirmation ahead of the durable checkpoint. The worker checks
+the publisher identity and publication, reserves a replacement slot, and
+copies a consistent snapshot. It installs the snapshot, new slot name, and
+WAL gap record together. If the original slot is present, allow room for
+one more logical slot. The worker retires the original after cutover when
+the slot still matches the mirror's configuration and is inactive.
+
+An open listener serves the last durable snapshot while the replacement
+copies. Earlier rows and catalog definitions remain queryable with
+`datahike.as_of`. The recovery records the interval it replaced. It keeps
+matching entities by their previous keys and uses the ordinary schema
+refresh rules for publisher DDL.
+
+Status reports the copy or install phase under `:recovery` and the latest
+completed interval under `:last-recovery`. The checkpoint manifest keeps
+each interval under `:recovery-gaps`, including the old and new slot names,
+timelines, the last durable LSN, and the replacement snapshot LSN. Keep
+the option enabled through restart while recovery is pending. A restart
+before install copies again using the reserved slot name. A restart after
+install follows the replacement slot and retries any pending slot retirement.
 
 ## Follow a promoted PostgreSQL standby
 
@@ -234,7 +257,8 @@ To enable failover on an existing mirror, stop it and use
 `ALTER_REPLICATION_SLOT slot_name (FAILOVER true)` over a PostgreSQL replication
 connection, then restart with `:failover? true`. When failover is disabled, a
 timeline change pauses the mirror. A lost or invalidated slot, or a timeline
-that forked before the checkpoint, requires a new snapshot.
+that forked before the checkpoint, requires a new snapshot. For a fork
+before the checkpoint, preserve the old store and bootstrap at a fresh path.
 
 ## Verification and follow-up
 
@@ -257,9 +281,12 @@ Run `sh test/integration/postgres-regress/mirror-failover.sh promote` with
 `PG_MIRROR_PG_BIN` pointing to PostgreSQL 18 binaries to promote a disposable
 standby during a schema refresh. The `diverge` mode promotes a standby that
 forked before the checkpoint and verifies that the mirror pauses.
+Run `sh test/integration/postgres-regress/mirror-slot-recovery.sh` to check
+recovery from dropped and invalidated slots, recovery while serving reads,
+and the snapshot cutover before and after a crash.
 
-The next stages are wider publication type and relation support, streaming and
-spooling of large transactions, and recovery after slot loss. See the
+The next stages cover more publication types and relations and stream large
+transactions with spooling. See the
 [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 

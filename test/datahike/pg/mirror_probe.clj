@@ -1461,8 +1461,201 @@
         {:status :passed :mode mode}
         (finally (when @subscriber (mirror/stop! @subscriber)))))))
 
+(defn- pause-on-slot-loss! [config subscriber expected]
+  (reset! subscriber (mirror/start! (assoc config :resnapshot-on-slot-loss? false)))
+  (let [{:keys [last-error]} (await-state! @subscriber :paused)]
+    (check! (= expected (:reason last-error)) "Mirror paused for a different slot condition" last-error))
+  (mirror/stop! @subscriber))
+
+(defn- interrupted-slot-recovery! [config subscriber]
+  (let [install-var #'mirror/install-staged-tables!
+        original @install-var]
+    (with-redefs-fn
+      {install-var (fn [& args]
+                     (apply original args)
+                     (throw (ex-info "Interrupted replacement snapshot" {})))}
+      (fn []
+        (reset! subscriber (mirror/start! config))
+        (try
+          (let [{:keys [last-error]} (await-state! @subscriber :paused)]
+            (check! (= "Interrupted replacement snapshot" (:message last-error))
+                    "Recovery paused before reaching its install boundary" last-error))
+          (finally (mirror/stop! @subscriber)))))))
+
+(defn- invalidate-idle-slot! [source slot]
+  (try
+    (sql! source "ALTER SYSTEM SET idle_replication_slot_timeout = '1s'" "SELECT pg_reload_conf()")
+    (await! "PostgreSQL did not enable idle slot expiry"
+            #(= [["1s"]] (rows source "SHOW idle_replication_slot_timeout")))
+    (await! "Slot did not become eligible for idle expiry"
+            #(= ["t"] (slot-query source slot "NOT active AND clock_timestamp() - inactive_since >= interval '1 second'")))
+    (sql! source "CHECKPOINT")
+    (check! (= ["idle_timeout"] (slot-query source slot "invalidation_reason")) "PostgreSQL did not invalidate the idle slot" {})
+    (finally
+      (sql! source "ALTER SYSTEM RESET idle_replication_slot_timeout" "SELECT pg_reload_conf()")
+      (await! "PostgreSQL did not disable idle slot expiry"
+              #(= [["0"]] (rows source "SHOW idle_replication_slot_timeout"))))))
+
+(defn- history-preserving-slot-recovery! [config source subscriber original-slot path]
+  (let [copy-started (promise)
+        release-copy (promise)
+        copy-var #'mirror/copy-table!
+        original @copy-var]
+    (with-redefs-fn
+      {copy-var (fn [publisher destination table on-bytes]
+                  (when (= "recovery_items" (:name table))
+                    (deliver copy-started true)
+                    (check! (deref release-copy 25000 false) "Probe did not release the recovery copy" {}))
+                  (original publisher destination table on-bytes))}
+      (fn []
+        (reset! subscriber (mirror/start! config))
+        (try
+          (check! (deref copy-started 25000 false) "Recovery did not start copying the replacement snapshot"
+                  (mirror/status @subscriber))
+          (check! (= ["idle_timeout"] (slot-query source original-slot "invalidation_reason"))
+                  "Original slot was retired before installation" {})
+          (check! (= original-slot (:slot (durable-checkpoint path))) "Copy advanced the durable slot before install" {})
+          (sql! source "INSERT INTO recovery_items VALUES (5,'during snapshot',21)")
+          (finally (deliver release-copy true)))
+        (let [status (await-state! @subscriber :following)]
+          (check! (= :slot-invalidated (get-in status [:last-recovery :reason])) "Idle timeout was not recorded" status)
+          (check! (nil? (slot-query source original-slot "slot_name")) "Retired slot remains on the publisher" {})
+          (check! (not= original-slot (:slot status)) "Recovery reused the invalid slot" status)
+          status)))))
+
+(defn- recover-while-following! [source subscriber sink query]
+  (let [old-slot (:slot (mirror/status @subscriber))
+        before (rows sink query)
+        reconnecting (promise)
+        allow-reconnect (promise)
+        replicate-var #'mirror/replicate!
+        original @replicate-var]
+    (with-redefs-fn
+      {replicate-var (fn [& args]
+                       (deliver reconnecting true)
+                       (check! (deref allow-reconnect 20000 false) "Probe did not release the reconnect" {})
+                       (apply original args))}
+      (fn []
+        (try
+          (check! (= ["t"] (slot-query source old-slot "pg_terminate_backend(active_pid, 3000)"))
+                  "Could not terminate the publisher's active decoder" {})
+          (check! (deref reconnecting 20000 false) "Mirror did not attempt to reconnect" (mirror/status @subscriber))
+          (sql! source (str "SELECT pg_drop_replication_slot(" (literal old-slot) ")")
+                "INSERT INTO recovery_items (id,label,stamp) VALUES (6,'lost while following',22)")
+          (check! (= before (rows sink query)) "The existing listener stopped serving the durable snapshot" {})
+          (finally (deliver allow-reconnect true)))
+        (await! "The running mirror did not recover its lost slot"
+                #(let [{:keys [state slot port]} (mirror/status @subscriber)]
+                   (and (= :following state) (not= old-slot slot) port (= (rows source query) (rows sink query)))))))))
+
+(defn- recover-from-ahead-slot! [config source subscriber query]
+  (let [old-slot (:slot (mirror/status @subscriber))]
+    (mirror/stop! @subscriber)
+    (sql! source "INSERT INTO recovery_items (id,label,stamp) VALUES (7,'ahead of the mirror',23)"
+          (str "SELECT pg_replication_slot_advance(" (literal old-slot) ", pg_current_wal_lsn())"))
+    (reset! subscriber (mirror/start! config))
+    (let [{:keys [last-recovery]} (await-state! @subscriber :following)]
+      (check! (= [:slot-confirmation-ahead old-slot] ((juxt :reason :old-slot) last-recovery))
+              "The mirror did not recover its ahead slot" last-recovery)
+      (check! (nil? (slot-query source old-slot "slot_name")) "The ahead slot was not retired" {}))
+    (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+      (check! (= (rows source query) (rows sink query)) "Snapshot recovery lost rows from the skipped WAL interval" {}))))
+
+(defn run-slot-recovery-probe! [source-url follower-url directory]
+  (let [path (str directory "/store")
+        config {:source-url follower-url :publication "recovery_pub" :store-path path
+                :schema-refresh? true :resnapshot-on-slot-loss? true :server {:port 0}}
+        subscriber (atom nil)
+        first-id #(inspect-db path (fn [db] (d/q '[:find ?e . :where [?e :recovery_items/id 1]] db)))
+        original-query "SELECT id,note FROM recovery_items ORDER BY id"
+        updated-query "SELECT id,label,stamp FROM recovery_items ORDER BY id"]
+    (with-open [source (DriverManager/getConnection source-url)]
+      (try
+        (sql! source "CREATE TABLE recovery_items (id int PRIMARY KEY, note text)"
+              "INSERT INTO recovery_items VALUES (1,'original'),(2,'deleted during gap')"
+              "CREATE PUBLICATION recovery_pub FOR TABLE recovery_items"
+              "CREATE ROLE mirror_recovery_reader LOGIN REPLICATION"
+              "GRANT SELECT ON recovery_items TO mirror_recovery_reader"
+              "GRANT EXECUTE ON FUNCTION pg_logical_emit_message(boolean, text, text, boolean) TO mirror_recovery_reader")
+        (reset! subscriber (mirror/start! config))
+        (let [{old-slot :slot} (await-state! @subscriber :following)
+              old-id (first-id)
+              before (with-open [sink (DriverManager/getConnection (sink-url @subscriber))] (rows sink original-query))
+              before-at (inspect-db path #(str (.toInstant ^java.util.Date
+                                                (:db/txInstant (d/entity % (:max-tx %))))))]
+          (mirror/stop! @subscriber)
+          (let [old (durable-checkpoint path)]
+            (sql! source (str "SELECT pg_drop_replication_slot(" (literal old-slot) ")")
+                  "BEGIN"
+                  "ALTER TABLE recovery_items RENAME COLUMN note TO label"
+                  "ALTER TABLE recovery_items ADD COLUMN stamp integer DEFAULT 7"
+                  "UPDATE recovery_items SET label='changed during gap' WHERE id=1"
+                  "DELETE FROM recovery_items WHERE id=2"
+                  "INSERT INTO recovery_items VALUES (3,'inserted during gap',12)"
+                  "CREATE TABLE recovery_new (id int PRIMARY KEY, note text)"
+                  "INSERT INTO recovery_new VALUES (1,'new published table')"
+                  "GRANT SELECT ON recovery_new TO mirror_recovery_reader"
+                  "ALTER PUBLICATION recovery_pub ADD TABLE recovery_new"
+                  "COMMIT")
+            (pause-on-slot-loss! config subscriber :slot-missing)
+            (check! (= old (durable-checkpoint path)) "Default slot loss changed the durable checkpoint" {})
+            (interrupted-slot-recovery! config subscriber)
+            (let [{:keys [slot end-lsn manifest]} (durable-checkpoint path)
+                  reserved (get-in manifest [:pending-recovery :slot])]
+              (check! (and (= slot old-slot) (= end-lsn (:end-lsn old)) (seq reserved)
+                           (= (:manifest old) (dissoc manifest :pending-recovery)))
+                      "Interrupted recovery altered the visible publication or cursor" manifest)
+              (check! (= [[reserved]] (rows source "SELECT slot_name FROM pg_replication_slots"))
+                      "Recovery did not persist its only replacement slot before copying" {})
+              (check! (= old-id (first-id)) "Interrupted recovery changed existing identity" {})
+              (pause-on-slot-loss! config subscriber :pending-slot-recovery)
+              (child-crash! (assoc config :probe-crash-mode :refresh) (str directory "/recovery-crash.log"))
+              (let [cutover (durable-checkpoint path)
+                    gap (peek (get-in cutover [:manifest :recovery-gaps]))]
+                (check! (= [reserved reserved old-slot (:end-lsn old) (:end-lsn cutover) :slot-missing]
+                           [(:slot cutover) (:new-slot gap) (:old-slot gap) (:from-lsn gap) (:snapshot-lsn gap) (:reason gap)])
+                        "Durable gap or replacement slot differs" {:expected-slot reserved :gap gap})
+                (check! (nil? (get-in cutover [:manifest :pending-recovery])) "Installed recovery stayed pending" {})
+                (await! "Replacement slot was still active after crash"
+                        #(= [(:snapshot-lsn gap) "false"] (slot-query source reserved "confirmed_flush_lsn,active::text")))
+                (check! (= [[reserved]] (rows source "SELECT slot_name FROM pg_replication_slots")) "Recovery leaked a slot after restart" {})
+                (sql! source "INSERT INTO recovery_items VALUES (4,'after recovery crash',18)")
+                (reset! subscriber (mirror/start! config))
+                (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+                  (check! (= (rows source updated-query) (rows sink updated-query)) "Post-crash WAL did not catch up" {})
+                  (check! (= (rows source "SELECT * FROM recovery_new ORDER BY id")
+                             (rows sink "SELECT id,note FROM recovery_new ORDER BY id")) "Recovery lost a new table" {})
+                  (check! (= old-id (first-id)) "Recovery changed a matched entity's identity" {})
+                  (sql! sink (str "SET datahike.as_of = " (literal before-at)))
+                  (check! (= before (rows sink original-query)) "Recovery changed pre-gap history" {}))
+                (mirror/stop! @subscriber)
+                (check! (= [gap] (get-in (durable-checkpoint path) [:manifest :recovery-gaps]))
+                        "Post-crash startup repeated the gap" {})
+                (invalidate-idle-slot! source reserved)
+                (sql! source "UPDATE recovery_items SET stamp=14 WHERE id=1")
+                (history-preserving-slot-recovery! config source subscriber reserved path)
+                (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+                  (check! (= (rows source updated-query) (rows sink updated-query))
+                          "Recovery lost a change committed during its replacement snapshot" {})
+                  (sql! source "ALTER TABLE recovery_items ADD COLUMN after_recovery text DEFAULT 'included'")
+                  (await! "Schema refresh did not finish after slot recovery"
+                          #(get-in (mirror/status @subscriber) [:last-schema-refresh :cutover]))
+                  (check! (= [["included"]] (rows sink "SELECT after_recovery FROM recovery_items WHERE id=1"))
+                          "Post-recovery schema refresh failed" {})
+                  (check! (= [:slot-missing :slot-invalidated]
+                             (mapv :reason (get-in (durable-checkpoint path) [:manifest :recovery-gaps])))
+                          "Schema refresh lost the durable gap records" {})
+                  (recover-while-following! source subscriber sink updated-query))
+                (recover-from-ahead-slot! config source subscriber updated-query)
+                (check! (= [:slot-missing :slot-invalidated :slot-missing :slot-confirmation-ahead]
+                           (mapv :reason (get-in (durable-checkpoint path) [:manifest :recovery-gaps])))
+                        "Recovery lost or repeated a gap record" {})))))
+        {:status :passed :probe :slot-recovery}
+        (finally (when @subscriber (mirror/stop! @subscriber)))))))
+
 (defn -main [& [argument mode]]
-  (if (= "--failover" argument)
+  (cond
+    (= "--failover" argument)
     (prn (run-failover-probe! {:pg-bin (System/getenv "PG_MIRROR_PG_BIN")
                                :fixture-dir (System/getenv "PG_MIRROR_FAILOVER_DIR")
                                :primary-dir (System/getenv "PG_MIRROR_PRIMARY_DIR")
@@ -1470,18 +1663,23 @@
                                :primary-url (System/getenv "PG_MIRROR_PRIMARY_URL")
                                :standby-url (System/getenv "PG_MIRROR_STANDBY_URL")
                                :source-url (System/getenv "PG_MIRROR_SOURCE_URL") :mode mode}))
-    (if (= "--crash-worker" argument)
-      (run-crash-worker! (edn/read (PushbackReader. *in*)))
-      (let [source (System/getenv "PG_MIRROR_SOURCE_URL")
-            reference (System/getenv "PG_MIRROR_REFERENCE_URL")
-            conninfo (System/getenv "PG_MIRROR_SOURCE_CONNINFO")]
-        (check! (every? seq [source reference conninfo])
-                "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
-        (prn ((case argument
-                "--partitions" run-partition-probe!
-                "--type-refresh" run-type-refresh-probe!
-                "--primary-key-refresh" run-primary-key-probe!
-                "--schema-refresh" run-schema-refresh-probe!
-                "--refresh" run-refresh-probe!
-                run-probe!)
-              source reference conninfo))))))
+    (= "--slot-recovery" argument)
+    (prn (run-slot-recovery-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
+                                   (System/getenv "PG_MIRROR_SOURCE_URL")
+                                   (System/getenv "PG_MIRROR_RECOVERY_DIR")))
+    (= "--crash-worker" argument)
+    (run-crash-worker! (edn/read (PushbackReader. *in*)))
+    :else
+    (let [source (System/getenv "PG_MIRROR_SOURCE_URL")
+          reference (System/getenv "PG_MIRROR_REFERENCE_URL")
+          conninfo (System/getenv "PG_MIRROR_SOURCE_CONNINFO")]
+      (check! (every? seq [source reference conninfo])
+              "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
+      (prn ((case argument
+              "--partitions" run-partition-probe!
+              "--type-refresh" run-type-refresh-probe!
+              "--primary-key-refresh" run-primary-key-probe!
+              "--schema-refresh" run-schema-refresh-probe!
+              "--refresh" run-refresh-probe!
+              run-probe!)
+            source reference conninfo)))))
