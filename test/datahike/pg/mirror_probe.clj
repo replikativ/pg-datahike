@@ -1728,15 +1728,25 @@
                    (and (= :following state) (not= old-slot slot) port (= (rows source query) (rows sink query)))))))))
 
 (defn- recover-from-ahead-slot! [config source subscriber query]
-  (let [old-slot (:slot (mirror/status @subscriber))]
+  (let [old-slot (:slot (mirror/status @subscriber))
+        replication-copy #'mirror/replication-copy
+        original @replication-copy
+        advanced? (atom false)]
     (mirror/stop! @subscriber)
-    (sql! source "INSERT INTO recovery_items (id,label,stamp) VALUES (7,'ahead of the mirror',23)"
-          (str "SELECT pg_replication_slot_advance(" (literal old-slot) ", pg_current_wal_lsn())"))
-    (reset! subscriber (mirror/start! config))
-    (let [{:keys [last-recovery]} (await-state! @subscriber :following)]
-      (check! (= [:slot-confirmation-ahead old-slot] ((juxt :reason :old-slot) last-recovery))
-              "The mirror did not recover its ahead slot" last-recovery)
-      (check! (nil? (slot-query source old-slot "slot_name")) "The ahead slot was not retired" {}))
+    (sql! source "INSERT INTO recovery_items (id,label,stamp) VALUES (7,'ahead of the mirror',23)")
+    (with-redefs-fn
+      {replication-copy
+       (fn [replication slot publication position]
+         (when (and (= slot old-slot) (compare-and-set! advanced? false true))
+           (sql! source (str "SELECT pg_replication_slot_advance(" (literal old-slot) ", pg_current_wal_lsn())")))
+         (original replication slot publication position))}
+      (fn []
+        (reset! subscriber (mirror/start! config))
+        (let [{:keys [last-recovery]} (await-state! @subscriber :following)]
+          (check! @advanced? "Probe did not advance the slot between validation and acquisition" {})
+          (check! (= [:slot-confirmation-ahead old-slot] ((juxt :reason :old-slot) last-recovery))
+                  "The mirror did not recover its ahead slot" last-recovery)
+          (check! (nil? (slot-query source old-slot "slot_name")) "The ahead slot was not retired" {}))))
     (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
       (check! (= (rows source query) (rows sink query)) "Snapshot recovery lost rows from the skipped WAL interval" {}))))
 

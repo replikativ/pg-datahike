@@ -266,8 +266,9 @@ confirmation ahead of the checkpoint pauses the mirror by default.
 
 Snapshot and transaction sizes are bounded by `:max-snapshot-bytes` and
 `:max-transaction-bytes`. The defaults are 128 MiB and 64 MiB respectively.
-The worker pauses when it hits a limit. Stop the worker and adjust the limit to
-retry. Cutover and occasional idle WAL confirmation use transactional logical
+The worker checks ordinary row frames before decoding their fields. pgJDBC
+holds one complete wire frame in memory. The worker pauses when it hits a
+limit. Stop the worker and adjust the limit to retry. Cutover and occasional idle WAL confirmation use transactional logical
 messages. Their checkpoint transactions can appear in Datahike history.
 
 The mirror uses pgoutput streaming for large transactions. It keeps their

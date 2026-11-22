@@ -1309,7 +1309,11 @@
       (:invalidation info) (unavailable-slot! context :slot-invalidated)
       :else info)))
 
-(defn- validate-resume! [source {:keys [slot end-lsn]} failover? timeline-changed?]
+(defn- check-slot-confirmation! [{:keys [slot end-lsn]} {:keys [confirmed-lsn] :as info}]
+  (when (pos? (compare-lsn confirmed-lsn end-lsn))
+    (unavailable-slot! {:slot slot :checkpoint end-lsn :slot-status info} :slot-confirmation-ahead)))
+
+(defn- validate-resume! [source {:keys [slot end-lsn] :as saved} failover? timeline-changed?]
   (let [{:keys [active? confirmed-lsn restart-lsn synced?] :as info} (usable-slot! source slot failover?)
         context {:slot slot :checkpoint end-lsn :slot-status info}]
     (when-not (and confirmed-lsn restart-lsn (not (pos? (compare-lsn restart-lsn confirmed-lsn))))
@@ -1318,8 +1322,7 @@
               (assoc context :reason :unsynchronized-slot :resnapshot-required? true))
     (when active?
       (throw (SQLException. "Replication slot is still active" "55006")))
-    (when (pos? (compare-lsn confirmed-lsn end-lsn))
-      (unavailable-slot! context :slot-confirmation-ahead))
+    (check-slot-confirmation! saved info)
     info))
 
 (defn- emit-barrier!
@@ -1791,7 +1794,13 @@
                   (require! (pos? subxid) "Invalid streamed change transaction ID" {:xid segment})
                   (spool/append! journal segment subxid data)
                   (recur relations pending segment durable))
-                (let [{:keys [op xid subxid first? relation-id end-lsn transactional? payload] :as message}
+                (let [bytes (+ (or (:bytes pending) 0) size)
+                      _ (when (or (streamed-row-ops tag) (= \T tag))
+                          ;; JDBC supplies one wire frame. Enforce the limit before
+                          ;; expanding the frame into fields and strings.
+                          (require! (<= bytes max-transaction-bytes) "Transaction exceeds the configured byte limit"
+                                    {:xid (:xid pending) :limit max-transaction-bytes}))
+                      {:keys [op xid subxid first? relation-id end-lsn transactional? payload] :as message}
                       (decode data false)]
                   (require! (or (nil? segment) (#{:stream-stop :origin} op))
                             "Unexpected message inside a streamed segment" {:operation op :xid segment})
@@ -1842,10 +1851,8 @@
                         (let [[stop? position] (finish! relations durable (assoc pending :end-lsn end-lsn))]
                           (if stop? position (recur relations nil nil position))))
 
-                    (let [bytes (+ (or (:bytes pending) 0) size)]
+                    (do
                       (require! pending "Received a change outside a pgoutput transaction" {:operation op})
-                      (require! (<= bytes max-transaction-bytes) "Transaction exceeds the configured byte limit"
-                                {:xid (:xid pending) :limit max-transaction-bytes})
                       (recur relations
                              (let [change (select-change! message)]
                                (cond-> (assoc pending :bytes bytes)
@@ -2453,8 +2460,14 @@
           (swap! state assoc :state :catching-up :slot slot :applied-lsn end-lsn
                  :source-timeline (get-in saved [:origin :timeline]))
           (try
-            (consume! (replication-copy replication slot (or leaf-publication publication) confirmed-lsn)
-                      source destination saved origin state confirmed-lsn check-running! ready! config)
+            (let [copy (replication-copy replication slot (or leaf-publication publication) confirmed-lsn)
+                  acquired-info (usable-slot! source slot failover?)]
+              ;; START_REPLICATION uses the greater of the requested and confirmed
+              ;; positions. Recheck once the COPY has exclusive slot ownership.
+              (check-slot-confirmation! saved acquired-info)
+              (publish-status! state acquired-info)
+              (consume! copy source destination saved origin state (:confirmed-lsn acquired-info)
+                        check-running! ready! config))
             (catch SQLException error
               ;; Replication can report slot loss before the SQL status poll.
               (when (#{"42704" "55000" "58P01"} (.getSQLState error))

@@ -242,6 +242,24 @@
       (is (= 1 (run c "INSERT INTO mc VALUES (1, 'b')")))
       (is (= "23514" (second (run c "INSERT INTO mc VALUES (2, 'a')")))))))
 
+(deftest adding-a-column-validates-custom-type-backfills
+  (with-open [c (jdbc)]
+    (run c "CREATE TYPE mood AS ENUM ('ok')")
+    (run c "CREATE DOMAIN positive AS integer CHECK (VALUE > 0)")
+    (run c "CREATE DOMAIN required_int AS integer NOT NULL")
+    (run c "CREATE TABLE populated (id int)")
+    (run c "INSERT INTO populated VALUES (1)")
+    (run c "CREATE TABLE empty (id int)")
+    (doseq [table ["populated" "empty"]]
+      (is (= "22P02" (second (run c (str "ALTER TABLE " table " ADD COLUMN rejected mood DEFAULT 'bad'")))))
+      (is (= "42703" (second (run c (str "SELECT rejected FROM " table))))))
+    (is (= "23514" (second (run c "ALTER TABLE populated ADD COLUMN amount positive DEFAULT 0"))))
+    (is (= "23502" (second (run c "ALTER TABLE populated ADD COLUMN required required_int"))))
+    (is (= 0 (run c "ALTER TABLE empty ADD COLUMN amount positive DEFAULT 0, ADD COLUMN required required_int")))
+    (is (= 0 (run c (str "ALTER TABLE populated ADD COLUMN mood_value mood DEFAULT 'ok', "
+                         "ADD COLUMN amount positive DEFAULT 5"))))
+    (is (= [["1" "ok" "5"]] (rows c "SELECT * FROM populated")))))
+
 (deftest update-and-domain-definitions-are-validated
   (with-open [c (jdbc)]
     (is (= [:error "0A000" "cannot use subquery in check constraint"]

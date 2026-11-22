@@ -12155,6 +12155,11 @@
                   (stmt/coerce-insert-value
                    (row-constraints/eval-default kind (:pg/default-value entity))
                    attr (dbi/-schema db) db))]
+      (when (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))
+        (when-let [spec (get-in (row-constraints/constraint-plan db table) [:domain-enum name])]
+          (when (if (= :enum (:kind spec)) (some? value) (seq rows))
+            (row-constraints/validate-pre-arbiter!
+             db table {attr value} {:domain-enum {name spec}} (row-eval/check-fn db) nil))))
       (when (and not-null? (seq rows) (nil? value))
         (throw (ex-info (str "column \"" name "\" of relation \"" table
                              "\" contains null values")
@@ -12766,8 +12771,9 @@
                          (map (fn [change]
                                 [:db.fn/call alter-column-default-tx table relation-oid change])
                               (get default-groups before-rewrite?)))
-            backfill-tx (for [{:keys [not-null? default] :as column} added-column-specs
-                              :when (or not-null? (some? (:value default)))]
+            backfill-tx (for [{:keys [not-null? default type-object] :as column} added-column-specs
+                              :when (or not-null? (some? (:value default))
+                                        (= :domain (:datahike.pg.object/kind type-object)))]
                           [:db.fn/call backfill-added-column-tx table relation-oid column])
             ;; PostgreSQL drops nullability before adding columns, then
             ;; validates SET NOT NULL against the resulting table. Run the
