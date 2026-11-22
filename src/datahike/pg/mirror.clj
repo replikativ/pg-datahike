@@ -219,6 +219,11 @@
   (let [schema (.getString row "schemaname")
         replica-identity (.getString row "relreplident")
         primary-key-name (.getString row "primary_key_name")
+        identity-index-oid (.getLong row "identity_index_oid")
+        identity-index (when (.getBoolean row "identity_usable")
+                         {:oid identity-index-oid
+                          :name (.getString row "identity_index_name")
+                          :attnums (mapv long (.getArray (.getArray row "identity_key_attnums")))})
         parent-id (.getLong row "partition_parent")
         leaves (when-let [ids (.getArray row "partition_leaves")]
                  (mapv long (.getArray ids)))
@@ -235,6 +240,7 @@
                    (cond-> {:schema schema :name (.getString row "tablename")
                             :relation-id (.getLong row "relation_id")}
                      (= "f" replica-identity) (assoc :replica-identity \f)
+                     identity-index (assoc :replica-identity \i :identity-index identity-index)
                      (pos? parent-id) (assoc :partition-parent parent-id)
                      partition-bound (assoc :partition-bound partition-bound)
                      leaves (assoc :partition-leaves leaves :partition-key partition-key)))
@@ -265,9 +271,11 @@
          (.getBoolean row "partition_detach_pending") (conj {:reason :partition-detach-pending})
          (not (#{"r" "p"} (.getString row "relkind"))) (conj {:reason :relation-kind})
          (not= "p" (.getString row "relpersistence")) (conj {:reason :nonpermanent-table})
-         (not (or (= "d" replica-identity)
+         (not (or (= "d" replica-identity) identity-index
                   (and (= "f" replica-identity) primary-key-name)))
-         (conj {:reason :replica-identity :mode replica-identity})
+         (conj (cond-> {:reason :replica-identity :mode replica-identity}
+                 (= "i" replica-identity)
+                 (assoc :detail (if (pos? identity-index-oid) :unsupported-index :missing-index))))
          (and (= "r" (.getString row "relkind"))
               (not (.getBoolean row "relispartition"))
               (.getBoolean row "has_inheritance")) (conj {:reason :inheritance})
@@ -275,12 +283,14 @@
      :column column
      :column-issues
      (when column
-       (let [source-type (.getString row "source_type")]
+       (let [source-type (.getString row "source_type")
+             can-select (.getObject row "can_select")]
          (mapv #(assoc % :column column-name :source-type source-type)
                (cond-> []
                  (not= "" (.getString row "attgenerated")) (conj {:reason :generated-column})
                  (not (.getBoolean row "is_published")) (conj {:reason :unpublished-column})
-                 (not (.getBoolean row "can_select")) (conj {:reason :missing-select})
+                 (nil? can-select) (conj {:reason :catalog-changed-during-scan})
+                 (false? can-select) (conj {:reason :missing-select})
                  (:problem user-type)
                  (conj {:reason :type-definition :detail (:problem user-type) :oid (:oid column)})
                  (and (nil? user-type) (not (contains? sql-types (:oid column))))
@@ -345,7 +355,13 @@
                          source-type-fields ", "
                          "       (p.partition_leaves IS NOT NULL OR a.attname = ANY(p.attnames)) AS is_published, "
                          "       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') AS can_select, "
-                         "       pk.key_position, idx.relname AS primary_key_name "
+                         "       pk.key_position, idx.relname AS primary_key_name, "
+                         "       ri.indexrelid AS identity_index_oid, ri_class.relname AS identity_index_name, "
+                         "       ri_keys.attnums AS identity_key_attnums, "
+                         "       (ri.indisunique AND ri.indimmediate AND ri.indisvalid AND ri.indisready "
+                         "        AND ri.indislive AND NOT ri.indisexclusion AND ri.indpred IS NULL "
+                         "        AND ri.indexprs IS NULL AND ri_am.amname = 'btree' "
+                         "        AND ri_keys.usable) AS identity_usable "
                          "FROM publication pub "
                          "LEFT JOIN relations p ON true "
                          "LEFT JOIN pg_catalog.pg_class c ON c.oid = p.relation_id "
@@ -361,6 +377,20 @@
                          "LEFT JOIN LATERAL (SELECT k.pos AS key_position "
                          " FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, pos) "
                          " WHERE k.pos <= i.indnkeyatts AND k.attnum = a.attnum) pk ON true "
+                         "LEFT JOIN pg_catalog.pg_index ri ON c.relreplident = 'i' "
+                         " AND ri.indrelid = c.oid AND ri.indisreplident "
+                         "LEFT JOIN pg_catalog.pg_class ri_class ON ri_class.oid = ri.indexrelid "
+                         "LEFT JOIN pg_catalog.pg_am ri_am ON ri_am.oid = ri_class.relam "
+                         "LEFT JOIN LATERAL ("
+                         " SELECT array_agg(k.attnum ORDER BY k.pos) AS attnums, "
+                         "        bool_and(coalesce(ka.attnotnull AND opc.opcdefault "
+                         "                 AND (coll.oid IS NULL OR coll.collisdeterministic), false)) AS usable "
+                         " FROM unnest(ri.indkey) WITH ORDINALITY AS k(attnum, pos) "
+                         " LEFT JOIN pg_catalog.pg_attribute ka ON ka.attrelid = c.oid "
+                         "  AND ka.attnum = k.attnum AND ka.attnum > 0 AND NOT ka.attisdropped "
+                         " LEFT JOIN pg_catalog.pg_opclass opc ON opc.oid = ri.indclass[k.pos - 1] "
+                         " LEFT JOIN pg_catalog.pg_collation coll ON coll.oid = ri.indcollation[k.pos - 1] "
+                         " WHERE k.pos <= ri.indnkeyatts) ri_keys ON ri.indexrelid IS NOT NULL "
                          "ORDER BY p.schemaname, p.tablename, a.attnum")
                     [publication] read-publication-row)
         {:keys [publication-oid operations]} (first rows)
@@ -371,7 +401,8 @@
                          (assoc relation :columns columns :primary-key-name primary-key-name
                                 :issues (cond-> issues
                                           (empty? columns) (conj {:reason :no-columns})
-                                          (and (nil? (:partition-leaves relation)) (not-any? :key? columns))
+                                          (and (nil? (:partition-leaves relation))
+                                               (nil? (:identity-index relation)) (not-any? :key? columns))
                                           (conj {:reason :missing-immediate-primary-key})))))
                      (partition-by :relation (filter :relation rows)))
         disabled (into [] (remove #(get operations %)) [:insert :update :delete :truncate])
@@ -463,10 +494,19 @@
   (try (f) (finally (command! source "ROLLBACK"))))
 
 (defn- poll-publication-manifest [source config tracked-types]
-  (if (or (:leaf-publication config) (seq tracked-types))
-    ;; Publication definitions, columns, and registered types share a snapshot.
-    (read-catalog-snapshot! source #(publication-manifest source config tracked-types))
-    (publication-manifest source config)))
+  (let [read! #(if (or (:leaf-publication config) (seq tracked-types))
+                 ;; Publication definitions, columns, and registered types share a snapshot.
+                 (read-catalog-snapshot! source (fn [] (publication-manifest source config tracked-types)))
+                 (publication-manifest source config))]
+    (try
+      (read!)
+      (catch clojure.lang.ExceptionInfo error
+        ;; has_column_privilege can see a dropped column before the query's
+        ;; catalog snapshot does. NULL indicates the column is gone.
+        (if (some #(= :catalog-changed-during-scan (:reason %))
+                  (mapcat :issues (all-relations (:report (ex-data error)))))
+          (read!)
+          (throw error))))))
 
 (defn- validate-source-options! [{:keys [source-url publication leaf-publication]}]
   (let [valid-name? #(and (string? %) (re-matches #"[a-z_][a-z0-9_]{0,62}" %))]
@@ -644,11 +684,32 @@
 (defn- key-columns [table]
   (sort-by #(or (:key-position %) (:attnum %)) (filter :key? (:columns table))))
 
+(defn- identity-index-columns [table]
+  (when-let [attnums (get-in table [:identity-index :attnums])]
+    (let [columns (into {} (map (juxt :attnum identity)) (:columns table))]
+      (mapv columns attnums))))
+
+(defn- separate-identity-index [table]
+  (let [index (:identity-index table)]
+    (when (and index (not= (:name index) (:primary-key-name table)))
+      index)))
+
+(defn- create-unique-index! [destination table name columns]
+  (sink-execute! destination
+                 (str "CREATE UNIQUE INDEX " (ident name) " ON " (relation-name table)
+                      " (" (comma-list (map (comp ident :name) columns)) ")")))
+
+(defn- install-identity-index! [destination table]
+  (when-let [index (separate-identity-index table)]
+    (create-unique-index! destination table (:name index) (identity-index-columns table))))
+
+(defn- drop-identity-index! [destination table]
+  (when-let [index (separate-identity-index table)]
+    (sink-execute! destination (str "DROP INDEX " (ident (:name index))))))
+
 (defn- install-primary-key! [destination table]
   (let [name (:primary-key-name table)]
-    (sink-execute! destination
-                   (str "CREATE UNIQUE INDEX " (ident name) " ON " (relation-name table)
-                        " (" (comma-list (map (comp ident :name) (key-columns table))) ")"))
+    (create-unique-index! destination table name (key-columns table))
     (stage-data! destination
                  (fn [db]
                    (let [object (catalog-objects/object-by-identity
@@ -723,7 +784,8 @@
           ")"))
     (set-column-metadata! destination table)
     (when (and (seq keys) (not native-key?))
-      (install-primary-key! destination table))))
+      (install-primary-key! destination table))
+    (install-identity-index! destination table)))
 
 (defn- partition-query [parent tables]
   (let [columns (comma-list (map (comp ident :name) (:columns parent)))]
@@ -990,9 +1052,15 @@
 (defn- cast-param [{:keys [oid user-type]}]
   (str "CAST(? AS " (if user-type (ident (:name user-type)) (sql-types oid)) ")"))
 
+(defn- locator-column-predicate [table]
+  (if-let [index (:identity-index table)]
+    (let [attnums (set (:attnums index))]
+      (comp attnums :attnum))
+    :key?))
+
 (defn- key-pairs [table values]
-  (let [pairs (filterv (comp :key? first) (tuple-pairs table values))]
-    (require! (every? #(and (some? (second %)) (not= ::unchanged (second %))) pairs)
+  (let [pairs (filterv (comp (locator-column-predicate table) first) (tuple-pairs table values))]
+    (require! (and (seq pairs) (every? #(and (some? (second %)) (not= ::unchanged (second %))) pairs))
               "pgoutput omitted a replica identity column" {:table (:name table)})
     pairs))
 
@@ -1041,7 +1109,7 @@
                   old-key-values (into {} keys)
                   changed (filterv (fn [[column value]]
                                      (and (not= ::unchanged value)
-                                          (or (not (:key? column))
+                                          (or (not (contains? old-key-values column))
                                               (not= value (get old-key-values column)))))
                                    (tuple-pairs table new))]
               (if (empty? changed)
@@ -1351,14 +1419,24 @@
            (not= (:primary-key-name previous) (:primary-key-name table)))))
 
 (defn- matching-key-indexes! [previous table]
-  (let [by-attnum (into {} (map-indexed (fn [i col] [(:attnum col) [i col]])) (:columns table))]
-    (mapv (fn [before]
-            (let [[i after] (get by-attnum (:attnum before))]
-              (require! (and after (= (typed-column before) (typed-column after)))
-                        "Schema refresh cannot match rows without the previous primary key columns and types"
-                        {:table (relation-name table) :reason :missing-previous-key :column (:name before)})
-              i))
-          (key-columns previous))))
+  (let [by-attnum (into {} (map-indexed (fn [i col] [(:attnum col) [i col]])) (:columns table))
+        positions (fn [columns]
+                    (let [indexes (mapv (fn [before]
+                                          (let [[i after] (get by-attnum (:attnum before))]
+                                            (when (and after (= (typed-column before) (typed-column after)))
+                                              i)))
+                                        columns)]
+                      (when (and (seq indexes) (every? some? indexes)) indexes)))
+        primary (key-columns previous)
+        identity (identity-index-columns previous)
+        indexes (or (when (= (set (map :attnum primary)) (set (map :attnum (key-columns table))))
+                      (positions primary))
+                    (positions identity)
+                    (positions primary))]
+    (require! indexes "Schema refresh cannot match rows without the previous key columns and types"
+              {:table (relation-name table) :reason :missing-previous-key
+               :primary-key (mapv :name primary) :identity-index (mapv :name identity)})
+    indexes))
 
 (defn- drop-primary-key! [destination previous]
   (stage-data!
@@ -1451,7 +1529,7 @@
             (check-running!)
             (let [key (previous-key columns (mapv values key-indexes))]
               (require! (and (every? some? key) (not (contains? @seen key)))
-                        "Schema refresh found a missing or duplicate value in the previous primary key"
+                        "Schema refresh found a missing or duplicate value in the previous key"
                         {:table (relation-name table) :reason :ambiguous-previous-key})
               (vswap! seen conj key)
               [key values]))
@@ -1511,9 +1589,14 @@
 
 (defn- matches-relation? [table message]
   (and table (= (replica-identity table) (:identity message))
-       (= (cond-> (wire-table table)
-            (full-identity? table) (update :columns #(mapv (fn [column] (assoc column :key? true)) %)))
-          (wire-table message))))
+       (let [flagged? (cond
+                        (full-identity? table) (constantly true)
+                        (:identity-index table) (locator-column-predicate table))]
+         (= (wire-table
+             (cond-> table
+               flagged? (update :columns
+                                #(mapv (fn [column] (assoc column :key? (boolean (flagged? column)))) %))))
+            (wire-table message)))))
 
 (defn- select-change [included? {:keys [op relation-id relation-ids] :as message}]
   (if (= :truncate op)
@@ -1768,6 +1851,7 @@
   ;; to a fresh storage name if the publisher later reuses the SQL name.
   (let [storage (:name (storage-table table))
         retired-name (new-slot-name "pgdh_retired")]
+    (drop-identity-index! destination table)
     (stage-data!
      destination
      (fn [db]
@@ -1814,6 +1898,12 @@
         rekeys (filterv (fn [{:keys [table previous]}]
                           (and previous (primary-key-changed? previous table)))
                         changes)
+        index-shape (fn [table]
+                      (when-let [index (separate-identity-index table)]
+                        [index (mapv #(select-keys % [:name :oid :typmod]) (identity-index-columns table))]))
+        identity-index-changes (filterv (fn [{:keys [table previous]}]
+                                          (and previous (not= (index-shape previous) (index-shape table))))
+                                        changes)
         renames (into []
                       (keep (fn [{:keys [table previous storage-name]}]
                               (when (and previous (not= (:name previous) (:name table)))
@@ -1834,6 +1924,9 @@
       (doseq [[old current :as change] (vals edits)]
         (when (not= (dissoc old :name) (dissoc current :name))
           (stage-data! destination #(refresh-type-tx % change))))
+      (doseq [{:keys [previous]} identity-index-changes]
+        (check-running!)
+        (drop-identity-index! destination previous))
       (doseq [{:keys [previous storage-name]} rekeys :when (seq (key-columns previous))]
         (check-running!)
         (drop-primary-key! destination (assoc previous :name storage-name)))
@@ -1861,6 +1954,9 @@
         (check-running!)
         (when (seq (key-columns table))
           (install-primary-key! destination (assoc table :name storage-name))))
+      (doseq [{:keys [table storage-name]} identity-index-changes]
+        (check-running!)
+        (install-identity-index! destination (assoc table :name storage-name)))
       (when refresh-topology?
         (install-partition-topology! destination installed-manifest)))))
 
@@ -2005,7 +2101,7 @@
         pending-schema (volatile! (or (:pending-schema manifest) {}))
         live (volatile! (tables-by-id manifest))
         observed (volatile! @live)
-        validated-full (volatile! {})
+        validated-identity-relations (volatile! {})
         stage (volatile! nil)
         stage-signaled? (volatile! false)
         following? (volatile! false)
@@ -2049,14 +2145,14 @@
                                                                 (keep (fn [{:keys [oid user-type]}]
                                                                         (when user-type [oid user-type]))))
                                                        ids)]
-                                  ;; FULL marks every column on the wire. A new
-                                  ;; Relation message can hide a changed primary
-                                  ;; key behind an identical column layout.
+                                  ;; FULL and USING INDEX can send identical
+                                  ;; wire flags after the primary key or the
+                                  ;; selected index changes.
                                   (when (or (some stale? ids)
                                             (some (fn [id]
                                                     (and (live? id)
-                                                         (= \f (:identity (get relations id)))
-                                                         (not (identical? (get @validated-full id)
+                                                         (#{\f \i} (:identity (get relations id)))
+                                                         (not (identical? (get @validated-identity-relations id)
                                                                           (get relations id)))))
                                                   ids)
                                             ;; A changed enum spelling can also
@@ -2071,8 +2167,8 @@
                                     (throw (ex-info "Publication relation changed"
                                                     {:relation (get relations id)})))
                                   (doseq [id ids
-                                          :when (and (live? id) (= \f (:identity (get relations id))))]
-                                    (vswap! validated-full assoc id (get relations id)))))
+                                          :when (and (live? id) (#{\f \i} (:identity (get relations id))))]
+                                    (vswap! validated-identity-relations assoc id (get relations id)))))
         apply-live! (fn [previous transaction cutover? active]
                       (let [candidate (cond
                                         cutover?
@@ -2152,7 +2248,7 @@
                      (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros)
                      (when cutover?
                        (vreset! live (tables-by-id @applied))
-                       (vreset! validated-full {})
+                       (vreset! validated-identity-relations {})
                        (vreset! pending-schema {})
                        (vreset! stage nil)
                        (stop-refresh! active)

@@ -59,12 +59,22 @@ publication options.
 
 ## Supported publications
 
-This version accepts whole, unfiltered, permanent tables with a single or
-composite non-deferrable primary key. Both default replica identity and
-`REPLICA IDENTITY FULL` are supported. The mirror uses the publisher's primary
-key to identify the old row in an update or delete, including when PostgreSQL
-sends the whole old row under `FULL`. It copies column names, supported types,
-and primary keys into a fresh read model. Publisher defaults,
+This version accepts whole, unfiltered, permanent tables. Default replica
+identity and `REPLICA IDENTITY FULL` require a single or composite
+non-deferrable primary key. The mirror uses that key to identify the old row
+in an update or delete, including when PostgreSQL sends the whole old row
+under `FULL`.
+
+`REPLICA IDENTITY USING INDEX` supports tables with or without a primary
+key. The selected index must be an immediate unique B-tree index over
+non-null columns with default operator classes and deterministic collations.
+The mirror uses the selected key columns for updates and deletes. It copies
+those columns as a unique index and preserves the publisher's primary key
+separately when one exists. Index `INCLUDE` columns are copied as table
+columns.
+
+The mirror copies column names and supported types into a fresh read model.
+Publisher defaults,
 triggers and cascades run on PostgreSQL. The mirror applies the resulting rows
 and preserves their transaction boundaries using the normal Datahike writer.
 Generated columns, sequence counters, legacy inheritance, row filters, and
@@ -176,7 +186,7 @@ before the next schema change.
 Keep this option enabled through restart while a refresh is pending.
 
 Columns can change between supported built-in types, enums, and domains if
-the previous primary key can still match rows. The mirror matches renamed
+a previous key can still match rows. The mirror matches renamed
 enum key labels by the publisher's enum member OIDs. Renaming a tracked
 enum or domain preserves its mirror type OID. When the publisher drops
 one and reuses its name, the replacement receives a new mirror type OID.
@@ -190,7 +200,7 @@ schema refresh. Let that refresh finish before renaming an enum label.
 
 The worker uses PostgreSQL's post-migration rows at the shared WAL boundary.
 The refreshed schema and rows become visible with the checkpoint. Existing
-Datahike entities keep their identity when their primary keys match, and
+Datahike entities keep their identity when their previous keys match, and
 historical SQL reads retain the old columns and values. Source default
 expressions are recorded as catalog metadata. PostgreSQL evaluates them
 when applications write to the publisher.
@@ -199,14 +209,14 @@ A table rename preserves the mirror's relation OID and Datahike entities.
 The new SQL name becomes visible at cutover. Earlier snapshots keep the
 old name, including when the publisher adds a new table under that name.
 
-The mirror follows changes to a primary key's columns and their order.
-It matches rows by the previous key during refresh and uses the new key
-for WAL changes after cutover. Keep the previous key columns, their types,
-and their non-null, unique values through cutover. The mirror pauses if
-the previous key columns are missing or retyped, or their values make the
-row match ambiguous. A later migration can remove the previous columns.
-A change between default replica identity and `FULL` also uses schema
-refresh. Keep a supported primary key in place through the cutover.
+The mirror follows changes to the primary key and changes to the selected
+replica identity. During refresh, it matches rows by a retained primary key
+or the previous identity index. It can also use the previous primary key
+when its columns survive a key change. After cutover, it uses the new
+replica identity for WAL changes. Keep the matching columns, their types,
+and their non-null, unique values through cutover. The mirror pauses if it
+cannot establish a row match. A later migration can remove the previous
+columns.
 
 The affected tables have a resnapshot window. Their publisher changes during
 that window are reflected in the cutover transaction. Status and the durable

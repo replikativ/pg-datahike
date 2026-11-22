@@ -979,9 +979,11 @@
         (mirror/stop! @subscriber)
         (reset! subscriber (mirror/start! config))
         (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
-          (check! (= [(rows source row-query) (primary-key-layout source)]
-                     [(rows sink row-query) (primary-key-layout sink)])
-                  "Restoring the old key did not recover the pending refresh" {})
+          (await! "Restoring the old key did not recover the pending refresh"
+                  #(and (nil? (:refresh (mirror/status @subscriber)))
+                        (empty? (get-in (durable-checkpoint path) [:manifest :pending-schema]))
+                        (= [(rows source row-query) (primary-key-layout source)]
+                           [(rows sink row-query) (primary-key-layout sink)])))
           (let [before (rows sink row-query)
                 layout (primary-key-layout sink)]
             (sql! source "ALTER TABLE key_items DROP CONSTRAINT key_items_v2, DROP COLUMN region, ADD PRIMARY KEY (item_no)")
@@ -2068,6 +2070,135 @@
         {:status :passed :probe :type-lifecycle}
         (finally (when @subscriber (mirror/stop! @subscriber)))))))
 
+(defn run-index-identity-probe! [source-url reference-url source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-index-identity-" (make-array FileAttribute 0)))
+        path (str directory "/store")
+        config {:source-url source-url :publication "mirror_identity_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        slot (atom nil)
+        native-slot "mirror_identity_native"
+        account-query "SELECT id, external_id, account_code, label FROM indexed_accounts ORDER BY id, external_id"
+        member-query "SELECT project_id, member_no, note FROM indexed_members ORDER BY project_id, member_no"
+        catalog-query (str "SELECT ic.relname, i.indisprimary, i.indisunique FROM pg_index i "
+                           "JOIN pg_class ic ON ic.oid = i.indexrelid "
+                           "WHERE i.indrelid = '%s'::regclass ORDER BY ic.relname")
+        manifest-index (fn [name]
+                         (some #(when (= name (:name %)) (:identity-index %))
+                               (get-in (durable-checkpoint path) [:manifest :tables])))]
+    (prn {:artifacts directory})
+    (with-open [source (DriverManager/getConnection source-url)
+                reference (DriverManager/getConnection reference-url)]
+      (let [agrees? (fn [sink]
+                      (every? #(= (rows source %) (rows reference %) (rows sink %))
+                              [account-query member-query]))]
+        (try
+          (doseq [conn [source reference]]
+            (sql! conn
+                  (str "CREATE TABLE indexed_accounts (id integer PRIMARY KEY, external_id text NOT NULL, "
+                       "account_code integer NOT NULL, label text)")
+                  "CREATE UNIQUE INDEX accounts_external ON indexed_accounts (external_id) INCLUDE (label)"
+                  "ALTER TABLE indexed_accounts REPLICA IDENTITY USING INDEX accounts_external"
+                  "CREATE TABLE indexed_members (project_id integer NOT NULL, member_no bigint NOT NULL, note text)"
+                  "CREATE UNIQUE INDEX members_identity ON indexed_members (member_no, project_id) INCLUDE (note)"
+                  "ALTER TABLE indexed_members REPLICA IDENTITY USING INDEX members_identity"))
+          (sql! source
+                "INSERT INTO indexed_accounts VALUES (1, 'first', 101, 'one'), (2, 'second', 102, 'two')"
+                "INSERT INTO indexed_members VALUES (7, 101, NULL), (8, 101, 'other project'), (7, 102, 'obsolete')"
+                "CREATE PUBLICATION mirror_identity_pub FOR TABLE indexed_accounts, indexed_members"
+                "CREATE TABLE indexed_pattern (name text NOT NULL)"
+                "CREATE UNIQUE INDEX indexed_pattern_key ON indexed_pattern (name text_pattern_ops)"
+                "ALTER TABLE indexed_pattern REPLICA IDENTITY USING INDEX indexed_pattern_key"
+                "CREATE PUBLICATION mirror_pattern_pub FOR TABLE indexed_pattern")
+          (let [report (mirror/publication-report config)
+                unsupported (mirror/publication-report (assoc config :publication "mirror_pattern_pub"))]
+            (check! (:compatible? report) "The source indexes were not admitted" report)
+            (check! (some #(= :unsupported-index (:detail %))
+                          (get-in unsupported [:tables 0 :issues]))
+                    "A non-default identity operator class was admitted" unsupported)
+            (sql! source "DROP INDEX indexed_pattern_key")
+            (let [missing (mirror/publication-report (assoc config :publication "mirror_pattern_pub"))]
+              (check! (some #(= :missing-index (:detail %)) (get-in missing [:tables 0 :issues]))
+                      "A table without its selected index was admitted" missing)))
+          (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
+          (sql! reference (str "CREATE SUBSCRIPTION mirror_identity_native CONNECTION "
+                               (literal source-conninfo) " PUBLICATION mirror_identity_pub "
+                               "WITH (create_slot=false, slot_name=" (literal native-slot) ")"))
+          (reset! subscriber (mirror/start! config))
+          (reset! slot (:slot (await-state! @subscriber :following)))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (await! "Snapshot disagrees with native replication" #(agrees? sink))
+            (check! (= [["accounts_external" "f" "t"] ["indexed_accounts_pkey" "t" "t"]]
+                       (rows sink (format catalog-query "indexed_accounts")))
+                    "The selected identity index replaced the real primary key" {})
+            (check! (= [["members_identity" "f" "t"]] (rows sink (format catalog-query "indexed_members")))
+                    "The mirror fabricated a primary key for a keyless join table" {})
+            (let [account-eid (rows sink "SELECT db_id FROM indexed_accounts WHERE id = 1")
+                  member-eid (rows sink "SELECT db_id FROM indexed_members WHERE project_id = 7 AND member_no = 101")
+                  prior-index (manifest-index "indexed_members")]
+              (check! (= [2 1] (:attnums prior-index)) "Index INCLUDE column became part of the row key" prior-index)
+              (sql! source "BEGIN"
+                    "UPDATE indexed_accounts SET label = 'same locator' WHERE id = 1"
+                    "UPDATE indexed_accounts SET id = 3, external_id = 'third' WHERE id = 1"
+                    "DELETE FROM indexed_accounts WHERE id = 2"
+                    "UPDATE indexed_members SET member_no = 103, note = 'changed' WHERE project_id = 7 AND member_no = 101"
+                    "DELETE FROM indexed_members WHERE project_id = 7 AND member_no = 102"
+                    "COMMIT")
+              (await! "Indexed updates/deletes did not match the native subscriber" #(agrees? sink))
+              (check! (= account-eid (rows sink "SELECT db_id FROM indexed_accounts WHERE id = 3"))
+                      "Indexed update lost the entity behind the primary key" {})
+              (doseq [conn [reference source]]
+                (sql! conn "BEGIN"
+                      "ALTER TABLE indexed_members REPLICA IDENTITY NOTHING"
+                      "DROP INDEX members_identity"
+                      "CREATE UNIQUE INDEX members_identity ON indexed_members (member_no, project_id)"
+                      "ALTER TABLE indexed_members REPLICA IDENTITY USING INDEX members_identity"
+                      "COMMIT"))
+              (sql! source "UPDATE indexed_members SET note = 'replacement index' WHERE project_id = 7")
+              (await! "Replacement index with identical wire flags did not refresh the manifest"
+                      #(and (not= (:oid prior-index) (:oid (manifest-index "indexed_members"))) (agrees? sink)))
+              (check! (= member-eid (rows sink "SELECT db_id FROM indexed_members WHERE project_id = 7 AND member_no = 103"))
+                      "Keyless schema refresh changed the entity" {})
+              (sql! reference "ALTER TABLE indexed_accounts DROP CONSTRAINT indexed_accounts_pkey")
+              (sql! source "BEGIN"
+                    "ALTER TABLE indexed_accounts DROP CONSTRAINT indexed_accounts_pkey"
+                    "INSERT INTO indexed_accounts VALUES (3, 'fourth', 104, 'duplicate former key')"
+                    "COMMIT")
+              (await! "Primary key removal did not retain the indexed identity"
+                      #(and (= [["accounts_external" "f" "t"]] (rows sink (format catalog-query "indexed_accounts")))
+                            (agrees? sink)))
+              (check! (= account-eid (rows sink "SELECT db_id FROM indexed_accounts WHERE external_id = 'third'"))
+                      "Primary key removal changed the entity" {})
+              (sql! source "UPDATE indexed_accounts SET id = 5 WHERE external_id = 'fourth'")
+              (await! "The former primary key was not updated through the selected index" #(agrees? sink))
+              (doseq [conn [reference source]]
+                (sql! conn "BEGIN"
+                      "ALTER TABLE indexed_accounts ADD PRIMARY KEY (id)"
+                      "ALTER TABLE indexed_accounts REPLICA IDENTITY USING INDEX indexed_accounts_pkey"
+                      "DROP INDEX accounts_external"
+                      "COMMIT"))
+              (sql! source "UPDATE indexed_accounts SET label = 'using the primary index' WHERE id = 3")
+              (await! "Selecting the primary index did not retire the old identity index"
+                      #(and (= "indexed_accounts_pkey" (:name (manifest-index "indexed_accounts")))
+                            (= [["indexed_accounts_pkey" "t" "t"]] (rows sink (format catalog-query "indexed_accounts")))
+                            (agrees? sink)))))
+          (mirror/stop! @subscriber)
+          (reset! subscriber (mirror/start! config))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (sql! source "BEGIN"
+                  "UPDATE indexed_accounts SET id = 4 WHERE id = 3"
+                  "DELETE FROM indexed_members WHERE project_id = 8 AND member_no = 101"
+                  "COMMIT")
+            (await! "Durable restart lost an indexed lookup" #(agrees? sink)))
+          {:status :passed :artifacts directory}
+          (finally
+            (when @subscriber (mirror/stop! @subscriber))
+            (when (= ["false"] (slot-query source @slot "active::text"))
+              (sql! source (str "SELECT pg_drop_replication_slot(" (literal @slot) ")")))
+            (sql! reference "DROP SUBSCRIPTION IF EXISTS mirror_identity_native")
+            (when (= ["false"] (slot-query source native-slot "active::text"))
+              (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")")))))))))
+
 (defn -main [& [argument mode]]
   (cond
     (= "--failover" argument)
@@ -2103,6 +2234,7 @@
               "--root-publication" run-root-publication-probe!
               "--type-refresh" run-type-refresh-probe!
               "--primary-key-refresh" run-primary-key-probe!
+              "--index-identity" run-index-identity-probe!
               "--full-identity" #(run-primary-key-probe! %1 %2 %3 true)
               "--full-identity-recovery" #(run-probe! %1 %2 %3 true)
               "--schema-refresh" run-schema-refresh-probe!
