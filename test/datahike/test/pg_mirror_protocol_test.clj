@@ -21,8 +21,8 @@
       (fn []
         (let [error (try
                       (#'mirror/stream! nil "0/1" "0/1" {:max-transaction-bytes 16}
-                       {:tick! (constantly nil) :check-running! (constantly nil)
-                        :select-change! identity})
+                                        {:tick! (constantly nil) :check-running! (constantly nil)
+                                         :select-change! identity})
                       nil
                       (catch clojure.lang.ExceptionInfo error error))]
           (is (= "Transaction exceeds the configured byte limit" (ex-message error)))

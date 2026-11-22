@@ -492,7 +492,6 @@
           original "[2:4]={1,2,3}"]
       (is (= original (decode-arr oid (encode-arr oid original)))))))
 
-
 (deftest stored-temporal-array-output-preserves-legacy-date-style
   (let [date-array (types/element-oid->array-oid types/oid-date)]
     (binding [types/*date-style* [:iso :mdy]]

@@ -1287,8 +1287,8 @@
                                     (str/lower-case (:text prev))))
                 ;; Through to the next token's start, so the space goes too.
                 [(:pos t) (:pos nxt) (if-let [marker params/*only-table-marker*]
-                                          (str marker " ")
-                                          "")])))
+                                       (str marker " ")
+                                       "")])))
           (range 1 (count sig)))))
 
 (defn order-by-using-rule
