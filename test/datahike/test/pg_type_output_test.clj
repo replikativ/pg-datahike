@@ -207,6 +207,60 @@
     (doseq [zone ["1 day" "1 month" "infinity"]]
       (is (= "22023" (state c (str "SELECT TIMETZ '00:00+00' AT TIME ZONE INTERVAL '" zone "'")))))))
 
+(deftest fixed-expression-zone-offsets-match-postgres
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (is (= [["2020-05-03 03:04:05.123456+00" "2020-05-01 03:04:05.123456"
+             "03:04:05.123456-168" "2020-05-02 00:00:00+00"
+             "2020-05-02 04:06:08.123456+00" "2020-05-01 21:34:05.123456+00"]]
+           (rows c (str "SELECT timestamp '2020-05-02 03:04:05.123456' AT TIME ZONE 'UTC+24', "
+                        "timestamptz '2020-05-02 03:04:05.123456+00' AT TIME ZONE 'UTC+24', "
+                        "timetz '03:04:05.123456+00' AT TIME ZONE 'UTC+167:59:60', "
+                        "date_trunc('day', timestamptz '2020-05-02 03:04:05.123456+00', 'UTC+24'), "
+                        "timezone('UTC+1:2:3', timestamp '2020-05-02 03:04:05.123456'), "
+                        "make_timestamptz(2020, 5, 2, 3, 4, 5.123456, '+0530')"))))
+    (doseq [zone ["UTC+168" "UTC+24:60" "UTC+24:10:61" "+0530" "UTC "]]
+      (is (= "22023" (state c (str "SELECT timestamp '2020-05-02' AT TIME ZONE '" zone "'")))
+          (pr-str zone)))
+    (doseq [zone ["24" "+24" "-24:30:1"]]
+      (is (= "22023" (state c (str "SELECT make_timestamptz(2020, 5, 2, 0, 0, 0, '" zone "')")))
+          (pr-str zone)))
+    (with-open [stmt (.prepareStatement c
+                                        (str "SELECT timezone(?, timestamp '2020-05-02 03:04:05.123456'), "
+                                             "make_timestamptz(2020, 5, 2, 3, 4, 5.123456, ?)"))]
+      (.setString stmt 1 "+05:30")
+      (.setString stmt 2 "+05:30")
+      (with-open [result (.executeQuery stmt)]
+        (is (.next result))
+        (is (= ["2020-05-02 08:34:05.123456+00" "2020-05-01 21:34:05.123456+00"]
+               (mapv #(.getString result (int %)) [1 2])))))))
+
+(deftest insert-timezone-expressions-use-the-execution-clock
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE clock_writes (id int, a timestamp, b timestamp, rendered text)")
+    (exec! c (str "PREPARE insert_clock (int, text) AS INSERT INTO clock_writes VALUES "
+                  "($1, now() AT TIME ZONE $2, timezone($2, now()), (now() AT TIME ZONE $2)::text)"))
+    (exec! c "BEGIN")
+    (exec! c "EXECUTE insert_clock(1, 'Asia/Kolkata')")
+    (is (= [["t" "t" "t"]]
+           (rows c (str "SELECT a = b, a = timezone('Asia/Kolkata', now()), rendered = a::text "
+                        "FROM clock_writes WHERE id = 1"))))
+    (exec! c "COMMIT")
+    (exec! c "SELECT pg_sleep(0.025)")
+    (exec! c "EXECUTE insert_clock(2, 'Asia/Kolkata')")
+    (is (= [["t"]]
+           (rows c (str "SELECT later.a > earlier.a FROM clock_writes earlier "
+                        "CROSS JOIN clock_writes later WHERE earlier.id = 1 AND later.id = 2"))))
+    (is (= "22023" (state c "EXECUTE insert_clock(3, 'Nonsense/Zone')")))
+    (with-open [st (.prepareStatement c
+                                      (str "INSERT INTO clock_writes VALUES "
+                                           "(3, now() AT TIME ZONE ?, timezone(?, now()), "
+                                           "(now() AT TIME ZONE ?)::text)"))]
+      (doseq [index [1 2 3]]
+        (.setString st index "Asia/Kolkata"))
+      (is (= 1 (.executeUpdate st))))
+    (is (= [["t" "t"]] (rows c "SELECT a = b, rendered = a::text FROM clock_writes WHERE id = 3")))))
+
 (deftest timezone-uses-the-current-session-setting
   (with-open [c (jdbc)]
     (exec! c "SET TIME ZONE 2.5")
@@ -322,6 +376,27 @@
       (is (.next rs))
       (is (= java.time.LocalTime/MAX (.getObject rs 1 java.time.LocalTime))))
     (is (= "22008" (state c "SELECT '24:00:01'::time")))))
+
+(deftest timetz-order-and-view-output
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE zoned_times (id int, t timetz)")
+    (exec! c (str "INSERT INTO zoned_times VALUES (1, '07:07-08'), (2, '08:08-04'), "
+                  "(3, '10:00+01'), (4, '09:00+00'), (5, '24:00+00'), (6, NULL)"))
+    (is (= [["3"] ["4"] ["2"] ["1"] ["5"] ["6"]]
+           (rows c "SELECT id FROM zoned_times ORDER BY t")))
+    (is (= [["6" nil] ["5" "24:00:00+00"] ["1" "07:07:00-08"]]
+           (rows c "SELECT id, t AS x FROM zoned_times ORDER BY x DESC NULLS FIRST LIMIT 3")))
+    (doseq [columns ["id, t" "*"]]
+      (is (= [["3" "10:00:00+01"] ["4" "09:00:00+00"]]
+             (rows c (str "SELECT " columns " FROM zoned_times ORDER BY 2 LIMIT 2")))))
+    (is (= [["3" "10:00:00+01" "10:00:00+01"]]
+           (rows c "SELECT *, t AS \"Local Clock\" FROM zoned_times ORDER BY \"Local Clock\" LIMIT 1")))
+    (is (= [["t"]] (rows c "SELECT '10:00+01'::timetz < '09:00+00'::timetz")))
+    (exec! c (str "CREATE VIEW zoned_view AS SELECT id, timezone('UTC', t) AS z "
+                  "FROM zoned_times WHERE id IN (1, 2) ORDER BY t"))
+    (is (= [["2" "12:08:00+00" "time with time zone"]
+            ["1" "15:07:00+00" "time with time zone"]]
+           (rows c "SELECT id, z, pg_typeof(z) FROM zoned_view")))))
 
 (deftest time-precision-comparison-and-fixed-width-text
   (with-open [c (jdbc)]
@@ -494,3 +569,111 @@
       (is (= "1" (one "SELECT count(*) FROM tzc WHERE ts = tstz")))
       (is (= "1" (one "SELECT count(*) FROM tzc WHERE tstz < d")))
       (is (= "1" (one "SELECT count(*) FROM tzc WHERE tstz = '2026-06-14 22:30'::timestamp"))))))
+
+(deftest postgres-date-trunc-slices
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (exec! c "SET DateStyle TO ISO, MDY")
+    (doseq [[source sql sqlstate text]
+            [["date.sql:315" "SELECT DATE_TRUNC('MILLENNIUM', TIMESTAMP '1970-03-20 04:30:00.00000');" "00000" "1001-01-01 00:00:00"]
+             ["date.sql:316" "SELECT DATE_TRUNC('MILLENNIUM', DATE '1970-03-20');" "00000" "1001-01-01 00:00:00+00"]
+             ["date.sql:317" "SELECT DATE_TRUNC('CENTURY', TIMESTAMP '1970-03-20 04:30:00.00000');" "00000" "1901-01-01 00:00:00"]
+             ["date.sql:318" "SELECT DATE_TRUNC('CENTURY', DATE '1970-03-20');" "00000" "1901-01-01 00:00:00+00"]
+             ["date.sql:319" "SELECT DATE_TRUNC('CENTURY', DATE '2004-08-10');" "00000" "2001-01-01 00:00:00+00"]
+             ["date.sql:320" "SELECT DATE_TRUNC('CENTURY', DATE '0002-02-04');" "00000" "0001-01-01 00:00:00+00"]
+             ["date.sql:321" "SELECT DATE_TRUNC('CENTURY', DATE '0055-08-10 BC');" "00000" "0100-01-01 00:00:00+00 BC"]
+             ["date.sql:322" "SELECT DATE_TRUNC('DECADE', DATE '1993-12-25');" "00000" "1990-01-01 00:00:00+00"]
+             ["date.sql:323" "SELECT DATE_TRUNC('DECADE', DATE '0004-12-25');" "00000" "0001-01-01 00:00:00+00 BC"]
+             ["date.sql:324" "SELECT DATE_TRUNC('DECADE', DATE '0002-12-31 BC');" "00000" "0011-01-01 00:00:00+00 BC"]
+             ["timestamp.sql:177" "SELECT date_trunc( 'week', timestamp '2004-02-29 15:44:17.71393' ) AS week_trunc;" "00000" "2004-02-23 00:00:00"]
+             ["timestamp.sql:178" "SELECT date_trunc( 'week', timestamp 'infinity' ) AS inf_trunc;" "00000" "infinity"]
+             ["timestamp.sql:179" "SELECT date_trunc( 'timezone', timestamp '2004-02-29 15:44:17.71393' ) AS notsupp_trunc;" "0A000" nil]
+             ["timestamp.sql:180" "SELECT date_trunc( 'timezone', timestamp 'infinity' ) AS notsupp_inf_trunc;" "0A000" nil]
+             ["timestamp.sql:181" "SELECT date_trunc( 'ago', timestamp 'infinity' ) AS invalid_trunc;" "22023" nil]
+             ["timestamptz.sql:219" "SELECT date_trunc( 'week', timestamp with time zone '2004-02-29 15:44:17.71393' ) AS week_trunc;" "00000" "2004-02-23 00:00:00+00"]
+             ["timestamptz.sql:220" "SELECT date_trunc( 'week', timestamp with time zone 'infinity' ) AS inf_trunc;" "00000" "infinity"]
+             ["timestamptz.sql:221" "SELECT date_trunc( 'timezone', timestamp with time zone '2004-02-29 15:44:17.71393' ) AS notsupp_trunc;" "0A000" nil]
+             ["timestamptz.sql:222" "SELECT date_trunc( 'timezone', timestamp with time zone 'infinity' ) AS notsupp_inf_trunc;" "0A000" nil]
+             ["timestamptz.sql:223" "SELECT date_trunc( 'ago', timestamp with time zone 'infinity' ) AS invalid_trunc;" "22023" nil]
+             ["timestamptz.sql:225" "SELECT date_trunc('day', timestamp with time zone '2001-02-16 20:38:40+00', 'Australia/Sydney') as sydney_trunc;" "00000" "2001-02-16 13:00:00+00"]
+             ["timestamptz.sql:226" "SELECT date_trunc('day', timestamp with time zone '2001-02-16 20:38:40+00', 'GMT') as gmt_trunc;" "00000" "2001-02-16 00:00:00+00"]
+             ["timestamptz.sql:227" "SELECT date_trunc('day', timestamp with time zone '2001-02-16 20:38:40+00', 'VET') as vet_trunc;" "00000" "2001-02-16 04:00:00+00"]
+             ["timestamptz.sql:228" "SELECT date_trunc('timezone', timestamp with time zone 'infinity', 'GMT') AS notsupp_zone_trunc;" "0A000" nil]
+             ["timestamptz.sql:229" "SELECT date_trunc( 'week', timestamp with time zone 'infinity', 'GMT') AS inf_zone_trunc;" "00000" "infinity"]
+             ["timestamptz.sql:230" "SELECT date_trunc('ago', timestamp with time zone 'infinity', 'GMT') AS invalid_zone_trunc;" "22023" nil]]]
+      (if (= sqlstate "00000")
+        (is (= [[text]] (rows c sql)) source)
+        (is (= sqlstate (state c sql)) source)))))
+
+(deftest date-trunc-types-and-precision-match-postgres
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (is (= [["2020-03-15 12:34:56.123" "timestamp without time zone"
+             "2020-03-15 12:34:56.123456+00" "timestamp with time zone"]]
+           (rows c (str "SELECT date_trunc('milliseconds', timestamp '2020-03-15 12:34:56.123456'), "
+                        "pg_typeof(date_trunc('milliseconds', timestamp '2020-03-15 12:34:56.123456')), "
+                        "date_trunc('microseconds', timestamptz '2020-03-15 12:34:56.123456+00'), "
+                        "pg_typeof(date_trunc('microseconds', timestamptz '2020-03-15 12:34:56.123456+00'))"))))
+    (is (= [["2020-11-01 05:00:00+00" "2020-11-01 06:00:00+00" "2020-10-03 15:00:00+00"]]
+           (rows c (str "SELECT date_trunc('hour', timestamptz '2020-11-01 01:30:20-04', 'America/New_York'), "
+                        "date_trunc('hour', timestamptz '2020-11-01 01:30:20-05', 'America/New_York'), "
+                        "date_trunc('hour', timestamptz '2020-10-04 02:50:00+11', 'Australia/Lord_Howe')"))))
+    (is (= [["12:34:00" "interval" "24:00:00" "infinity" nil]]
+           (rows c (str "SELECT date_trunc('minute', time '12:34:56'), "
+                        "pg_typeof(date_trunc('minute', time '12:34:56')), "
+                        "date_trunc('minute', time '24:00:00'), date_trunc('day', interval 'infinity'), "
+                        "date_trunc('day', now(), NULL)"))))
+    (doseq [[expected sql] [["42725" "SELECT date_trunc('day', '2020-03-15 12:34:56')"]
+                            ["42883" "SELECT date_trunc('day', '2020-03-15 12:34:56'::text)"]
+                            ["42883" "SELECT date_trunc('day', 1584275696)"]
+                            ["42883" "SELECT date_trunc('day', interval '2 days', 'UTC')"]
+                            ["42883" "SELECT date_trunc('minute', timetz '12:34:56+02')"]
+                            ["22023" "SELECT date_trunc('day', timestamptz 'infinity', 'Frogs/Unknown')"]
+                            ["22023" "SELECT date_trunc('day', timestamptz '2020-03-15 12:34', ' UTC ')"]
+                            ["22007" "SELECT date_trunc(NULL, 'invalid', 'UTC')"]
+                            ["22007" "SELECT date_trunc('day', 'invalid', NULL)"]
+                            ["0A000" "SELECT date_trunc('week', interval 'infinity')"]]]
+      (is (= expected (state c sql)) sql))
+    (with-open [stmt (.prepareStatement c "SELECT pg_catalog.date_trunc(?, ?, ?)")]
+      (let [metadata (.getParameterMetaData stmt)]
+        (is (= ["text" "timestamptz" "text"]
+               (mapv #(.getParameterTypeName metadata %) [1 2 3])))))
+    (exec! c "CREATE TABLE trunc_params (ts timestamp, tz timestamptz)")
+    (exec! c "INSERT INTO trunc_params VALUES ('2020-03-15 02:01', '2020-03-15 02:01+00'), (NULL, NULL)")
+    (with-open [stmt (.prepareStatement c
+                                        (str "SELECT date_trunc(?, ts, ?), date_trunc(?, tz) "
+                                             "FROM trunc_params ORDER BY ts NULLS FIRST"))]
+      (.setPrepareThreshold ^org.postgresql.PGStatement stmt 1)
+      (.setString stmt 1 "day")
+      (.setString stmt 2 "Asia/Kolkata")
+      (.setString stmt 3 "day")
+      (is (= "timestamptz" (.getColumnTypeName (.getMetaData stmt) 1)))
+      (with-open [result (.executeQuery stmt)]
+        (is (.next result))
+        (is (nil? (.getString result 1)))
+        (is (.next result))
+        (is (= "2020-03-14 18:30:00+00" (.getString result 1)))
+        (is (= "2020-03-15 00:00:00+00" (.getString result 2))))
+      (exec! c "SET TIME ZONE 'Asia/Tokyo'")
+      (.setNull stmt 2 java.sql.Types/VARCHAR)
+      (with-open [result (.executeQuery stmt)]
+        (is (.next result))
+        (is (nil? (.getString result 1)))
+        (is (.next result))
+        (is (nil? (.getString result 1)))
+        (is (= "2020-03-15 00:00:00+09" (.getString result 2)))))))
+
+(deftest date-trunc-prepared-input-uses-the-right-session-zone
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (exec! c "PREPARE trunc_literal AS SELECT date_trunc('hour', '2020-03-15 02:01', 'UTC')")
+    (exec! c "PREPARE trunc_bound AS SELECT date_trunc($1, $2, $3)")
+    (exec! c "SET DateStyle TO ISO, MDY")
+    (exec! c "PREPARE trunc_style AS SELECT date_trunc('day', '03/04/2020', 'UTC')")
+    (exec! c "SET TIME ZONE 'Asia/Tokyo'")
+    (exec! c "SET DateStyle TO ISO, DMY")
+    (is (= [["2020-03-15 11:00:00+09"]] (rows c "EXECUTE trunc_literal")))
+    (is (= [["2020-03-15 02:00:00+09"]] (rows c "EXECUTE trunc_bound('hour', '2020-03-15 02:01', 'UTC')")))
+    (exec! c "CREATE TABLE trunc_catalog_change (id int)")
+    (is (= [["2020-03-15 11:00:00+09"]] (rows c "EXECUTE trunc_literal")))
+    (is (= [["2020-03-04 09:00:00+09"]] (rows c "EXECUTE trunc_style")))))

@@ -40,11 +40,15 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.datetime.in :as datetime-in]
+            [datahike.pg.datetime.lex :as datetime-lex]
+            [datahike.pg.datetime.tokens :as datetime-tokens]
+            [datahike.pg.datetime.decode :as datetime-decode]
             [datahike.pg.datetime.zone :as datetime-zone]
             [datahike.pg.errors :as errors]
             [datahike.pg.geo :as geo]
             [datahike.pg.mac :as mac]
             [datahike.pg.input :as input]
+            [datahike.pg.interval.tokens :as interval-tokens]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.numeric-format :as numfmt]
             [datahike.pg.records :as pg-rec]
@@ -490,6 +494,21 @@
                 (if-not (zero? c) c
                         (compare (vec (:lbounds a)) (vec (:lbounds b))))))))))))
 
+(defn timetz-sort-key
+  "PostgreSQL compares UTC-equivalent microseconds, then seconds west."
+  [value]
+  (if (sql-null? value)
+    :__null__
+    (let [[usec west]
+          (if (instance? java.time.OffsetTime value)
+            (let [^java.time.OffsetTime time value]
+              [(quot (.toNanoOfDay (.toLocalTime time)) 1000)
+               (- (.getTotalSeconds (.getOffset time)))])
+            (let [{:keys [usec west]}
+                  (datetime-in/timetz-in value {:date-order :mdy :session-zone types/utc-zone})]
+              [usec west]))]
+      [(+ usec (* west 1000000)) west])))
+
 (defn order-cmp
   "`compare`, with two corrections.
 
@@ -530,6 +549,8 @@
         (Long/compareUnsigned (.getLeastSignificantBits ua)
                               (.getLeastSignificantBits ub))
         high))
+    (and (instance? java.time.OffsetTime a) (instance? java.time.OffsetTime b))
+    (compare (timetz-sort-key a) (timetz-sort-key b))
     (and (pg-rec/record? a) (pg-rec/record? b)) (record-order-cmp a b)
     (and (pg-arr/array? a) (pg-arr/array? b)) (array-order-cmp a b)
     ;; PostgreSQL has no operator between a composite and a scalar.
@@ -3818,12 +3839,11 @@
     (instance? java.time.LocalDateTime v) (.atZone ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
     :else nil))
 
-(defn- time-zone-and-abbreviation [zone]
-  (if (instance? java.time.ZoneId zone)
-    [zone nil]
-    (let [name (str zone)
-          dynamic (datetime-zone/dynamic-abbreviation name)]
-      [(types/resolve-time-zone name) (:abbrev dynamic)])))
+(defn- east-at-wall [wall {:keys [east zone abbrev]}]
+  (or east (.getTotalSeconds (datetime-zone/offset-at-local-time wall zone abbrev))))
+
+(defn- east-at-instant [instant {:keys [east zone abbrev]}]
+  (or east (.getTotalSeconds (datetime-zone/offset-at-instant instant zone abbrev))))
 
 (defn- transaction-instant ^java.time.Instant []
   (if-let [^java.util.Date time datetime-in/*transaction-time*]
@@ -3926,7 +3946,7 @@
 (def ^:private pg-end-timestamp
   (.plusSeconds pg-epoch (quot datetime-in/end-timestamp usecs-per-sec)))
 
-(defn- shift-timestamp [^java.time.Instant t seconds]
+(defn- shift-timestamp ^java.time.Instant [^java.time.Instant t seconds]
   (let [shifted (.plusSeconds t (long seconds))]
     (when (or (.isBefore shifted pg-min-timestamp)
               (not (.isBefore shifted pg-end-timestamp)))
@@ -3951,21 +3971,18 @@
 
                   (or interval? (interval-value? zone))
                   (interval-zone-offset zone))
-           [zid abbrev] (when-not east (time-zone-and-abbreviation zone))]
+           zone (if east {:east east} (types/resolve-expression-time-zone zone))]
        (case kind
          :timestamp
-         (let [ldt (local-date-time v)
-               east (or east (.getTotalSeconds (datetime-zone/offset-at-local-time ldt zid abbrev)))]
-           (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- east)))
+         (let [ldt (local-date-time v)]
+           (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- (east-at-wall ldt zone))))
 
          :timestamptz
-         (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)
-               east (or east (.getTotalSeconds (datetime-zone/offset-at-instant inst zid abbrev)))]
-           (shift-timestamp inst east))
+         (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)]
+           (shift-timestamp inst (east-at-instant inst zone)))
 
          :timetz
-         (shift-timetz v (or east (.getTotalSeconds
-                                   (datetime-zone/offset-at-instant (transaction-instant) zid abbrev)))))))))
+         (shift-timetz v (east-at-instant (transaction-instant) zone)))))))
 
 (defn sql-timezone-local
   "The one-argument timezone overloads use the current session's zone."
@@ -4097,6 +4114,32 @@
     :__null__
     (make-local-timestamp y mo d h mi sec)))
 
+(defn- make-timestamptz-zone [zone]
+  ;; parse_sane_timezone tries DecodeTimezone before names. Its signed
+  ;; numeric fields count east and accept compact hhmm.
+  (if (instance? java.time.ZoneId zone)
+    (types/resolve-expression-time-zone zone)
+    (let [name (str zone)]
+      (cond
+        (re-find #"^[0-9]" name)
+        (throw (errors/pg-error
+                :invalid-parameter-value
+                {:message (str "invalid input syntax for type numeric time zone: \"" name "\"")
+                 :hint "Numeric time zones must have \"-\" or \"+\" as first character."}))
+
+        (#{\+ \-} (first name))
+        (try
+          {:east (- (datetime-decode/decode-timezone name))}
+          (catch clojure.lang.ExceptionInfo e
+            (case (::datetime-lex/dterr (ex-data e))
+              :bad-format (types/resolve-expression-time-zone name)
+              :tzdisp-overflow
+              (throw (errors/pg-error :invalid-parameter-value
+                                      {:message (str "numeric time zone \"" name "\" out of range")}))
+              (throw e))))
+
+        :else (types/resolve-expression-time-zone name)))))
+
 (defn sql-make-timestamptz
   "`make_timestamptz(y, m, d, h, mi, s [, zone])`: the wall clock placed
    in `zone`, else in `session-zone`, which the translator passes."
@@ -4104,9 +4147,9 @@
   (if (or (some sql-null? [y mo d h mi sec]) (and zone (sql-null? zone)))
     :__null__
     (let [ldt (make-local-timestamp y mo d h mi sec)
-          [zid abbrev] (time-zone-and-abbreviation (or zone session-zone java.time.ZoneOffset/UTC))
-          offset (datetime-zone/offset-at-local-time ldt zid abbrev)]
-      (java.time.OffsetDateTime/ofInstant (.toInstant ldt offset) java.time.ZoneOffset/UTC))))
+          zone (make-timestamptz-zone (or zone session-zone java.time.ZoneOffset/UTC))
+          instant (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- (east-at-wall ldt zone)))]
+      (java.time.OffsetDateTime/ofInstant instant java.time.ZoneOffset/UTC))))
 
 (defn sql-make-interval
   "`make_interval(years, months, weeks, days, hours, mins, secs)`, each
@@ -4419,27 +4462,11 @@
   ([field v zone]
    (sql-extract-in field v zone)))
 
-;; datetime.c's deltatktbl, the UNITS words DecodeUnits matches -- by
-;; their first TOKMAXLEN (10) characters, which is why the table spells
-;; `microsecon`. Plus the datetktbl words extract also accepts.
 (def ^:private extract-units
-  (merge
-   (zipmap ["c" "cent" "centuries" "century"] (repeat :century))
-   (zipmap ["d" "day" "days"] (repeat :day))
-   (zipmap ["dec" "decade" "decades" "decs"] (repeat :decade))
-   (zipmap ["h" "hour" "hours" "hr" "hrs"] (repeat :hour))
-   (zipmap ["m" "min" "mins" "minute" "minutes"] (repeat :minute))
-   (zipmap ["microsecon" "us" "usec" "useconds" "usecs"] (repeat :microsec))
-   (zipmap ["mil" "millennia" "millennium" "mils"] (repeat :millennium))
-   (zipmap ["millisecon" "ms" "msec" "mseconds" "msecs"] (repeat :millisec))
-   (zipmap ["mon" "mons" "month" "months"] (repeat :month))
-   (zipmap ["qtr" "quarter"] (repeat :quarter))
-   (zipmap ["s" "sec" "second" "seconds" "secs"] (repeat :second))
-   {"timezone" :tz "timezone_h" :tz-hour "timezone_m" :tz-minute}
-   (zipmap ["w" "week" "weeks"] (repeat :week))
-   (zipmap ["y" "year" "years" "yr" "yrs"] (repeat :year))
-   {"dow" :dow "doy" :doy "isodow" :isodow "isoyear" :isoyear "julian" :julian
-    "epoch" :epoch}))
+  (into {"dow" :dow "doy" :doy "isodow" :isodow "isoyear" :isoyear "julian" :julian
+         "epoch" :epoch}
+        (keep (fn [[token [kind unit]]] (when (= kind :units) [token unit])))
+        interval-tokens/deltatktbl))
 
 (defn- time-part
   "time_part_common / timetz_part_common (date.c), the numeric form
@@ -4506,49 +4533,139 @@
                      (.getTotalSeconds (.getOffset ^java.time.OffsetTime v)))
           :else (sql-extract* f v zone))))))
 
-(defn interval-trunc
-  "interval_trunc (timestamp.c): the interval's fields from the unit
-   down zeroed -- millennium, century and decade round the YEAR toward
-   zero, quarter the month -- and recombined. `week` is refused because
-   months usually have fractional weeks, any other non-truncatable unit
-   is 0A000 and an unknown one 22023.
+(defn date-trunc-resolution
+  "Resolve the four pg_proc signatures for date_trunc. Nil arguments
+   represent UNKNOWN. Returns a result OID, :none or :ambiguous."
+  [[field source zone :as arguments]]
+  (let [text-arg? #(or (nil? %) (types/implicit-coercible? % types/oid-text))]
+    (cond
+      (not (text-arg? field)) :none
+      (= 3 (count arguments))
+      (if (and (text-arg? zone)
+               (or (nil? source)
+                   (types/implicit-coercible? source types/oid-timestamptz)))
+        types/oid-timestamptz
+        :none)
+      (not= 2 (count arguments)) :none
+      (nil? source) :ambiguous
+      (#{types/oid-timestamp types/oid-timestamptz types/oid-interval} source) source
+      (= source types/oid-date) types/oid-timestamptz
+      (= source types/oid-time) types/oid-interval
+      :else :none)))
 
-   date_trunc over an interval handed its input back unchanged, and a
-   `time` -- which reaches this through its implicit cast to interval
-   -- did the same: `date_trunc('hour', '13:45'::time)` was 13:45."
-  [units v]
-  (let [units (str/lower-case (str/replace (str units) #"^'|'$" ""))
-        unit (get extract-units (subs units 0 (min 10 (count units))))
-        {:keys [year mon mday hour min sec usec]} ((requiring-resolve 'datahike.pg.interval.core/fields) v)
-        tm (case unit
-             (:millennium :century :decade :year :quarter :month :day :hour :minute :second)
-             (let [year (case unit
-                          :millennium (* 1000 (quot year 1000))
-                          :century (* 100 (quot year 100))
-                          :decade (* 10 (quot year 10))
-                          year)
-                   order [:millennium :century :decade :year :quarter :month :day :hour :minute :second]
-                   at (.indexOf ^java.util.List order unit)
-                   from (fn [k] (<= at (.indexOf ^java.util.List order k)))]
-               {:year year
-                :mon (cond (from :year) 0 (from :quarter) (* 3 (quot mon 3)) :else mon)
-                :mday (if (from :month) 0 mday)
-                :hour (if (from :day) 0 hour)
-                :min (if (from :hour) 0 min)
-                :sec (if (from :minute) 0 sec)
-                :usec 0})
-             :millisec {:year year :mon mon :mday mday :hour hour :min min :sec sec
-                        :usec (* 1000 (quot usec 1000))}
-             :microsec {:year year :mon mon :mday mday :hour hour :min min :sec sec :usec usec}
-             nil (throw (errors/pg-error :invalid-parameter-value
-                                         {:message (str "unit \"" units "\" not recognized for type interval")}))
-             (throw (errors/pg-error :feature-not-supported
-                                     (cond-> {:message (str "unit \"" units "\" not supported for type interval")}
-                                       (= unit :week) (assoc :detail "Months usually have fractional weeks.")))))]
-    ((requiring-resolve 'datahike.pg.interval.core/interval)
-     (+ (* 12 (:year tm)) (:mon tm))
-     (:mday tm)
-     (+ (* 1000000 (+ (* 3600 (:hour tm)) (* 60 (:min tm)) (:sec tm))) (:usec tm)))))
+(def ^:private calendar-trunc-units
+  #{:millennium :century :decade :year :quarter :month :week :day})
+
+(def ^:private clock-trunc-units
+  {:hour java.time.temporal.ChronoUnit/HOURS
+   :minute java.time.temporal.ChronoUnit/MINUTES
+   :second java.time.temporal.ChronoUnit/SECONDS
+   :millisec java.time.temporal.ChronoUnit/MILLIS
+   :microsec java.time.temporal.ChronoUnit/MICROS})
+
+(defn- trunc-unit! [field result-oid]
+  (let [name (datetime-tokens/ascii-lower (str field))
+        [kind unit] (interval-tokens/decode-units name)
+        interval-week? (and (= result-oid types/oid-interval) (= unit :week))]
+    (if (and (= kind :units)
+             (or (clock-trunc-units unit) (and (calendar-trunc-units unit) (not interval-week?))))
+      unit
+      (let [known? (= kind :units)
+            type-name (types/format-type result-oid -1)]
+        (throw (errors/pg-error
+                (if known? :feature-not-supported :invalid-parameter-value)
+                (cond-> {:message (str "unit \"" name "\" not "
+                                       (if known? "supported" "recognized") " for type " type-name)}
+                  interval-week? (assoc :detail "Months usually have fractional weeks."))))))))
+
+(defn- interval-trunc [unit interval]
+  (let [{:keys [year mon mday hour min sec usec]} ((requiring-resolve 'datahike.pg.interval.core/fields) interval)
+        year (case unit
+               :millennium (* 1000 (quot year 1000))
+               :century (* 100 (quot year 100))
+               :decade (* 10 (quot year 10))
+               year)
+        mon (case unit
+              (:millennium :century :decade :year) 0
+              :quarter (* 3 (quot mon 3))
+              mon)
+        mday (if (and (calendar-trunc-units unit) (not= unit :day)) 0 mday)
+        hour (if (calendar-trunc-units unit) 0 hour)
+        min (if (or (calendar-trunc-units unit) (= unit :hour)) 0 min)
+        sec (if (#{:second :millisec :microsec} unit) sec 0)
+        usec (case unit
+               :millisec (* 1000 (quot usec 1000))
+               :microsec usec
+               0)]
+    (@interval-make (+ (* 12 year) mon) mday
+                    (+ (* usecs-per-sec (+ (* 3600 hour) (* 60 min) sec)) usec))))
+
+(defn- trunc-wall-clock ^java.time.LocalDateTime [^java.time.LocalDateTime value unit]
+  (if-let [precision (clock-trunc-units unit)]
+    (.truncatedTo value precision)
+    (let [date (.toLocalDate value)
+          year (.getYear date)
+          month (.getMonthValue date)
+          first-day (case unit
+                      :day date
+                      :week (.minusDays date (dec (.getValue (.getDayOfWeek date))))
+                      :month (.withDayOfMonth date 1)
+                      :quarter (java.time.LocalDate/of year (inc (* 3 (quot (dec month) 3))) 1)
+                      :year (.withDayOfYear date 1)
+                      :decade (java.time.LocalDate/of (* 10 (Math/floorDiv (int year) (int 10))) 1 1)
+                      ;; PostgreSQL calendar years have no year zero.
+                      (:century :millennium)
+                      (let [period (if (= unit :century) 100 1000)]
+                        (java.time.LocalDate/of (inc (* period (Math/floorDiv (int (dec year)) (int period))))
+                                                1 1)))]
+      (.atStartOfDay ^java.time.LocalDate first-day))))
+
+(defn sql-date-trunc
+  "Truncate on a wall clock. For timestamptz, keep the source offset
+   below a day and resolve the new local offset for calendar units."
+  ([source-oid result-oid session field value]
+   (sql-date-trunc source-oid result-oid session field value (:time-zone session)))
+  ([source-oid result-oid {:keys [time-zone date-style]} field value zone]
+   (if (or (sql-null? field) (sql-null? value)
+           (and (= result-oid types/oid-timestamptz) (sql-null? zone)))
+     :__null__
+     (let [value (if (and (nil? source-oid) (string? value))
+                   (binding [types/*time-zone* time-zone
+                             types/*date-style* date-style]
+                     (sql-cast/cast-scalar value "timestamptz" {:explicit? true :prefer-local-datetime? true}))
+                   value)
+           ;; DecodeTimezoneNameToTz uses the underlying zone of a
+           ;; dynamic abbreviation for date_trunc.
+           zone (when (= result-oid types/oid-timestamptz)
+                  (dissoc (types/resolve-expression-time-zone zone) :abbrev))
+           unit (trunc-unit! field result-oid)]
+       (cond
+         (types/infinite-datetime value) value
+
+         (= result-oid types/oid-interval)
+         (interval-trunc unit
+                         (if (= source-oid types/oid-time)
+                           (@interval-make 0 0 (if (instance? java.time.LocalTime value)
+                                                 (quot (.toNanoOfDay ^java.time.LocalTime value) 1000)
+                                                 (:usec (datetime-in/time-in value {}))))
+                           (@interval-coerce value)))
+
+         (= result-oid types/oid-timestamp)
+         (let [wall (trunc-wall-clock (local-date-time value) unit)]
+           (shift-timestamp (.toInstant wall java.time.ZoneOffset/UTC) 0)
+           wall)
+
+         :else
+         (let [instant (if (#{types/oid-timestamp types/oid-date} source-oid)
+                         (sql-at-time-zone value time-zone :timestamp)
+                         (ts-instant value))
+               east (east-at-instant instant zone)
+               source-wall (java.time.LocalDateTime/ofInstant
+                            (.plusSeconds ^java.time.Instant instant east) java.time.ZoneOffset/UTC)
+               wall (trunc-wall-clock source-wall unit)
+               target-east (if (calendar-trunc-units unit) (east-at-wall wall zone) east)]
+           (.atOffset (shift-timestamp (.toInstant wall java.time.ZoneOffset/UTC) (- target-east))
+                      java.time.ZoneOffset/UTC)))))))
 
 (defn sql-extract-date
   "`EXTRACT(field FROM date)` -- extract_date (date.c), which, unlike

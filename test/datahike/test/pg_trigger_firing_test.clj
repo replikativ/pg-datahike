@@ -309,3 +309,27 @@
     (is (= ["2"] (col1 c "SELECT count(*) FROM rt")))
     (testing "fired once per row, and each sees the whole statement's rows"
       (is (= ["2" "2"] (col1 c "SELECT n FROM rlog"))))))
+
+(deftest before-trigger-veto-controls-returning-and-delete-actions
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE parent (id int PRIMARY KEY, n int)")
+    (exec! c "CREATE TABLE child (id int REFERENCES parent(id) ON DELETE CASCADE)")
+    (exec! c "CREATE TABLE blocker (id int REFERENCES parent(id) ON DELETE RESTRICT)")
+    (exec! c "CREATE TABLE source (id int, n int)")
+    (exec! c "INSERT INTO parent VALUES (1,10),(2,20),(3,30)")
+    (exec! c "INSERT INTO child VALUES (1),(2),(3)")
+    (exec! c "INSERT INTO blocker VALUES (2)")
+    (exec! c "INSERT INTO source VALUES (1,100),(2,200)")
+    (trigfn! c "skip_update" "BEGIN IF OLD.id = 2 THEN RETURN NULL; END IF; NEW.n := NEW.n + 1; RETURN NEW; END")
+    (trigfn! c "skip_delete" "BEGIN IF OLD.id = 2 THEN RETURN NULL; END IF; RETURN OLD; END")
+    (exec! c "CREATE TRIGGER bu BEFORE UPDATE ON parent FOR EACH ROW EXECUTE FUNCTION skip_update()")
+    (exec! c "CREATE TRIGGER bd BEFORE DELETE ON parent FOR EACH ROW EXECUTE FUNCTION skip_delete()")
+    (is (= ["101:100"]
+           (col1 c (str "UPDATE parent p SET n = s.n FROM source s WHERE s.id = p.id "
+                        "RETURNING p.n::text || ':' || s.n::text"))))
+    (is (= ["101" "20" "30"] (col1 c "SELECT n FROM parent ORDER BY id")))
+    (is (= ["1"]
+           (col1 c "DELETE FROM parent p USING source s WHERE s.id = p.id RETURNING s.id")))
+    (is (= ["2" "3"] (col1 c "SELECT id FROM child ORDER BY id")))
+    (is (= ["2"] (col1 c "SELECT id FROM blocker")))
+    (is (= ["2" "3"] (col1 c "SELECT id FROM parent ORDER BY id")))))

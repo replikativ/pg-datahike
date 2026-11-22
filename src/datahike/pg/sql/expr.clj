@@ -49,6 +49,8 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.catalog.regoid :as regoid]
+            [datahike.pg.pg-catalog :as pg-catalog]
             [datahike.pg.errors :as errors]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.geo :as geo]
@@ -220,6 +222,14 @@
     :hint (str "No function matches the given name and argument "
                "types. You might need to add explicit type casts.")}))
 
+(defn- ambiguous-function [fname arg-oids]
+  (errors/pg-error :ambiguous-function
+                   {:message (str "function " fname "("
+                                  (str/join ", " (map #(get types/oid->pg-name % "unknown") arg-oids))
+                                  ") is not unique")
+                    :hint (str "Could not choose a best candidate function. "
+                               "You might need to add explicit type casts.")}))
+
 (defn- call-arg-oids
   "The argument types a 42883 names: an untyped literal is PostgreSQL's
    `unknown`, and so is an argument this layer cannot type."
@@ -256,13 +266,7 @@
         oids (call-arg-oids ctx arg-exprs)]
     (case (types/aggregate-resolution fname oids unknown?)
       :none (throw (no-such-function fname oids))
-      :ambiguous (throw (errors/pg-error
-                         :ambiguous-function
-                         {:message (str "function " fname "("
-                                        (str/join ", " (map #(get types/oid->pg-name % "unknown") oids))
-                                        ") is not unique")
-                          :hint (str "Could not choose a best candidate function. "
-                                     "You might need to add explicit type casts.")}))
+      :ambiguous (throw (ambiguous-function fname oids))
       nil)))
 
 (def ^:private vector-function-names
@@ -1351,6 +1355,43 @@
 
     :else (ctx/materialize-arg! ctx v)))
 
+(def ^:private viewdef-oid-inputs
+  (into #{types/oid-oid}
+        (keep (fn [{:keys [source target context]}]
+                (when (and (= target types/oid-oid) (= context "i")) source)))
+        pg-catalog/casts))
+
+(defn- viewdef-by-name? [fname oids]
+  (let [[relation modifier] oids
+        by-name? (or (nil? relation) (types/implicit-coercible? relation types/oid-text))
+        by-oid? (or (nil? relation) (contains? viewdef-oid-inputs relation))]
+    (case (count oids)
+      1 (cond
+          by-name? true
+          by-oid? false
+          :else (throw (no-such-function fname oids)))
+      2 (cond
+          ;; With an unknown modifier, PostgreSQL can use the one known
+          ;; argument type to distinguish a wrap width from a pretty flag.
+          (nil? modifier)
+          (cond
+            (and relation by-name?) true
+            (and relation by-oid? (types/implicit-coercible? relation types/oid-int4)) false
+            by-oid? (throw (errors/pg-error
+                            :ambiguous-function
+                            {:message (str "function " fname "("
+                                           (str/join ", " (map #(get types/oid->pg-name % "unknown") oids))
+                                           ") is not unique")
+                             :hint (str "Could not choose a best candidate function. "
+                                        "You might need to add explicit type casts.")}))
+            :else (throw (no-such-function fname oids)))
+
+          (and by-name? (types/implicit-coercible? modifier types/oid-bool)) true
+          (and by-oid? (or (types/implicit-coercible? modifier types/oid-bool)
+                           (types/implicit-coercible? modifier types/oid-int4))) false
+          :else (throw (no-such-function fname oids)))
+      (throw (no-such-function fname oids)))))
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -1715,7 +1756,7 @@
 
       (= fname "pg_get_viewdef")
       (let [fn-param (symbol (str "?viewdef" (swap! (:var-counter ctx) inc)))
-            path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+            by-name? (viewdef-by-name? fname (call-arg-oids ctx arg-exprs))
             db (:db ctx)
             definitions (if db
                           (into {}
@@ -1733,15 +1774,17 @@
                                                [?e :datahike.pg/view-definition ?definition]]}
                                      db))
                           {})
-            impl-fn (fn [oid & _]
-                      (let [oid (cond
-                                  (number? oid) (long oid)
-                                  (string? oid) (try (Long/parseLong oid)
-                                                     (catch Exception _ nil))
-                                  :else nil)]
-                        (if-let [definition (get definitions oid)]
-                          (render-view-definition db definition path)
-                          :__null__)))]
+            impl-fn (fn [reference & modifiers]
+                      (if (some #(or (nil? %) (fns/sql-null? %)) (cons reference modifiers))
+                        :__null__
+                        (let [oid (if by-name?
+                                    (binding [regoid/*db* db
+                                              regoid/*relation-db* db]
+                                      (regoid/relation-name-oid reference))
+                                    (sql-cast/cast-to-integer reference "oid"))]
+                          (if-let [definition (get definitions oid)]
+                            (render-view-definition db definition regoid/*search-path*)
+                            :__null__))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -2503,114 +2546,28 @@
                 result-var])
         result-var)
 
-      ;; DATE_TRUNC(precision, ts) → floor to precision boundary.
-      ;; Accepts ts as either:
-      ;;   - java.util.Date  (the type Datahike returns for :db.type/instant
-      ;;     attrs — Metabase's Question Builder breakouts go through this
-      ;;     branch with `temporal-unit "month"`)
-      ;;   - Long/epoch-seconds (some legacy callers / synthetic values)
-      ;; and returns the same shape it received, so downstream
-      ;; aggregations / projections see a value of the original type.
-      ;; PG's DATE_TRUNC also returns a TIMESTAMP, so Date in / Date out
-      ;; is the right wire-side default.
       (= fname "date_trunc")
-      (let [[precision ts zone-arg] args
-            ;; A timestamptz -- or a date, which resolves to the
-            ;; timestamptz overload -- is truncated on its wall clock in
-            ;; a zone: the explicit third argument, else the session's.
-            ;; In UTC, `date_trunc('day', ts)` under America/New_York
-            ;; answered 20:00 the evening before.
-            tz-input? (contains? #{types/oid-timestamptz types/oid-date}
-                                 (source-oid ctx (second params)))
-            session-zone (when tz-input? (or types/*time-zone* java.time.ZoneOffset/UTC))
-            fn-param (symbol (str "?date-trunc" (swap! (:var-counter ctx) inc)))
-            trunc-zdt (fn [unit ^java.time.ZonedDateTime zdt]
-                        (case unit
-                          "second"  (.truncatedTo zdt java.time.temporal.ChronoUnit/SECONDS)
-                          "minute"  (.truncatedTo zdt java.time.temporal.ChronoUnit/MINUTES)
-                          "hour"    (.truncatedTo zdt java.time.temporal.ChronoUnit/HOURS)
-                          "day"     (.truncatedTo zdt java.time.temporal.ChronoUnit/DAYS)
-                          "week"    (let [dow (.getValue (.getDayOfWeek zdt))
-                                          start (.minusDays zdt (dec dow))]
-                                      (.truncatedTo start java.time.temporal.ChronoUnit/DAYS))
-                          "month"   (.truncatedTo (.withDayOfMonth zdt 1)
-                                                  java.time.temporal.ChronoUnit/DAYS)
-                          "quarter" (let [m (.getMonthValue zdt)
-                                          qstart (- m (mod (dec m) 3))]
-                                      (.truncatedTo (.withDayOfMonth (.withMonth zdt qstart) 1)
-                                                    java.time.temporal.ChronoUnit/DAYS))
-                          "year"    (.truncatedTo (.withDayOfYear zdt 1)
-                                                  java.time.temporal.ChronoUnit/DAYS)
-                          zdt))
-            trunc-fn (fn [prec ts & [zone-text]]
-                       ;; NULL out, not nil: a datalog binding that yields nil
-                       ;; FILTERS THE ROW, so `date_trunc('month', d)` dropped
-                       ;; every row whose d was NULL.
-                       (if (or (fns/sql-null? prec) (fns/sql-null? ts)
-                               (and zone-arg (fns/sql-null? zone-text)))
-                         :__null__
-                         ;; An infinite timestamp truncates to itself --
-                         ;; there is no day for it to be the start of.
-                         ;; Reading the sentinel's instant answered
-                         ;; `292278994-08-17 00:00:00`.
-                         (if (types/infinite-datetime ts)
-                           ts
-                           (let [unit (let [u (if (keyword? prec) (name prec) (str prec))]
-                                        (str/replace u #"s$" ""))]
-                             (let [^java.time.ZoneId zone
-                                   (cond zone-arg (types/resolve-time-zone (str zone-text))
-                                         session-zone session-zone
-                                         :else java.time.ZoneOffset/UTC)]
-                               (cond
-                                 (or (instance? java.util.Date ts)
-                                     (instance? java.time.OffsetDateTime ts))
-                                 (let [inst (if (instance? java.util.Date ts)
-                                              (.toInstant ^java.util.Date ts)
-                                              (.toInstant ^java.time.OffsetDateTime ts))
-                                       zdt (.atZone inst zone)
-                                       trunc (trunc-zdt unit zdt)]
-                                   (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
-
-                             ;; A `date` column arrives as a LocalDate, which
-                             ;; the fall-through returned UNTRUNCATED --
-                             ;; `date_trunc('month', d)` answered d. PostgreSQL
-                             ;; resolves a date argument to the timestamptz
-                             ;; overload, so the result is an instant.
-                                 (instance? java.time.LocalDate ts)
-                                 (let [zdt (.atStartOfDay ^java.time.LocalDate ts zone)
-                                       trunc (trunc-zdt unit zdt)]
-                                   (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
-
-                             ;; A `timestamp` (no zone) stays zone-less.
-                                 (instance? java.time.LocalDateTime ts)
-                                 (let [zdt (.atZone ^java.time.LocalDateTime ts
-                                                    java.time.ZoneOffset/UTC)]
-                                   (.toLocalDateTime ^java.time.ZonedDateTime (trunc-zdt unit zdt)))
-
-                                 ;; date_trunc(text, interval) -- and a time,
-                                 ;; which resolves to it through the implicit
-                                 ;; time -> interval cast.
-                                 ((requiring-resolve 'datahike.pg.interval.core/interval?) ts)
-                                 (fns/interval-trunc prec ts)
-                                 (instance? java.time.LocalTime ts)
-                                 (fns/interval-trunc
-                                  prec ((requiring-resolve 'datahike.pg.interval.core/interval)
-                                        0 0 (quot (.toNanoOfDay ^java.time.LocalTime ts) 1000)))
-
-                                 (number? ts)
-                                 (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
-                                                    java.time.ZoneOffset/UTC)
-                                       trunc (trunc-zdt unit zdt)]
-                                   (.getEpochSecond (.toInstant ^java.time.ZonedDateTime trunc)))
-
-                                 :else ts))))))]
+      (let [operands (mapv params/unwrap-scalar-parens arg-exprs)
+            [_ source-oid :as oids] (call-arg-oids ctx operands)
+            result-oid (fns/date-trunc-resolution oids)
+            _ (case result-oid
+                :none (throw (no-such-function fname oids))
+                :ambiguous (throw (ambiguous-function fname oids))
+                nil)
+            ;; A literal coerced during Parse keeps that input time zone
+            ;; even when the resulting instant is truncated after SET.
+            source (second operands)
+            args (if (and (nil? source-oid) (instance? StringValue source))
+                   (assoc args 1 (sql-cast/cast-scalar (string-value-text source) "timestamptz"
+                                                       {:explicit? true :prefer-local-datetime? true}))
+                   args)
+            session (if (= result-oid types/oid-timestamptz)
+                      (session-temporal-context! ctx)
+                      {})
+            fn-param (ctx/fresh-var! ctx)]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj trunc-fn)
-        (swap! (:where-clauses ctx) conj
-               [(if zone-arg
-                  (list fn-param precision ts zone-arg)
-                  (list fn-param precision ts))
-                result-var])
+        (swap! (:in-args ctx) conj (partial fns/sql-date-trunc source-oid result-oid))
+        (swap! (:where-clauses ctx) conj [(apply list fn-param session args) result-var])
         result-var)
 
       ;; DATE_ADD(unit, amount, epoch-seconds) → add amount to timestamp

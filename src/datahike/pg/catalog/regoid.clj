@@ -154,7 +154,7 @@
                       {:sqlstate "0A000" :regoid-hard-error? true})))
     r))
 
-(defn- relation-input [names]
+(defn- relation-input [names missing-schema-error?]
   (when (> (count names) 3)
     (throw (ex-info "improper relation name (too many dotted names)"
                     {:sqlstate "42601" :regoid-hard-error? true})))
@@ -167,10 +167,19 @@
         _ (when (and (or (nil? schema) (= schema "pg_temp")) (contains? temps name))
             (throw (ex-info "temporary relation OID aliases require temporary schema identities"
                             {:sqlstate "0A000" :regoid-hard-error? true})))
-        path (if schema [(namespace-oid *db* schema)] (search-path *db*))
+        schema-oid (when schema (namespace-oid *db* schema))
+        _ (when (and schema missing-schema-error? (nil? schema-oid))
+            (fail! "3F000" (str "schema \"" schema "\" does not exist")))
+        path (if schema [schema-oid] (search-path *db*))
         found (some #(relation {:namespace-oid % :name name}) (remove nil? path))]
     (or (:oid found)
         (fail! "42P01" (str "relation \"" (str/join "." names) "\" does not exist")))))
+
+(defn relation-name-oid
+  "Resolve a relation name directly. A missing explicit schema raises
+   undefined_schema. Numeric strings are names."
+  [value]
+  (relation-input (parse-qualified-name value) true))
 
 (defn- namespace-input [names]
   (when-not (= 1 (count names)) (fail! "42602" "invalid name syntax"))
@@ -635,7 +644,7 @@
               (fail! "22003" "OID out of range")))
           (numeric-oid s)
           (case kind
-            "regclass" (relation-input (parse-qualified-name s))
+            "regclass" (relation-input (parse-qualified-name s) false)
             "regnamespace" (namespace-input (parse-qualified-name s))
             "regtype" (type-oid *db* s)
             (let [[names args] (if (= kind "regprocedure")
@@ -726,7 +735,7 @@
       (= oid 4089) (if-let [name (namespace-name *db* id)] (quote-ident name) (str id))
       (= oid 2205)
       (if-let [{:keys [name namespace-oid]} (relation {:oid id})]
-        (let [visible? (= id (try (relation-input [name])
+        (let [visible? (= id (try (relation-input [name] false)
                                   (catch clojure.lang.ExceptionInfo _ nil)))]
           (str (when-not visible? (str (quote-ident (namespace-name *db* namespace-oid)) "."))
                (quote-ident name)))

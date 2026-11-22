@@ -1689,24 +1689,23 @@
 ;; ============================================================================
 
 (defn- returning-items
-  "RETURNING's output columns, {:kind :name :expr}, with `*` and `t.*`
-   expanded to the table's columns (inherited ones included) in order.
-   The expressions are resolved, validated and typed where they are
-   compiled, as a projection over the row (row-eval)."
-  [returning db table-name table-alias schema]
-  (let [visible (or table-alias table-name)]
-    (vec
-     (mapcat
-      (fn [{:keys [kind table] :as item}]
-        (if (= :star kind)
-          (do
-            (when (and table (not= table visible))
-              (throw (ex-info (str "missing FROM-clause entry for table \"" table "\"")
-                              {:error :undefined-table :sqlstate "42P01" :table table})))
-            (map (fn [{:keys [name]}] {:kind :column :name name})
-                 (row-eval/table-columns db schema table-name)))
-          [item]))
-      returning))))
+  "Expand RETURNING stars in target/source order. Keep each expanded
+   column's relation so duplicate column names remain distinct."
+  [returning db table-name table-alias schema source-scopes]
+  (let [visible (or table-alias table-name)
+        scopes (into [{:alias visible :columns (row-eval/table-columns db schema table-name)}]
+                     source-scopes)]
+    (into []
+          (mapcat (fn [{:keys [kind table] :as item}]
+                    (if (= :star kind)
+                      (let [selected (if table (filter #(= table (:alias %)) scopes) scopes)]
+                        (when (empty? selected)
+                          (throw (ex-info (str "missing FROM-clause entry for table \"" table "\"")
+                                          {:error :undefined-table :sqlstate "42P01" :table table})))
+                        (for [{:keys [alias columns]} selected, {:keys [name]} columns]
+                          {:kind :column :name name :table alias}))
+                      [item])))
+          returning)))
 
 (declare ^:dynamic *cached-bound*)
 
@@ -1718,9 +1717,9 @@
         ;; and a stored name need not be a plain identifier (`"MyCol"`,
         ;; `"Order"`, `"sp ace"`).
         quoted #(str \" (str/replace % "\"" "\"\"") \")]
-    (mapv (fn [{:keys [kind name expr]}]
+    (mapv (fn [{:keys [kind name table expr]}]
             (if (and (= :column kind) (not (instance? Column expr)))
-              (Column. (net.sf.jsqlparser.schema.Table. ^String (quoted visible))
+              (Column. (net.sf.jsqlparser.schema.Table. ^String (quoted (or table visible)))
                        ^String (quoted name))
               expr))
           items)))
@@ -1729,11 +1728,12 @@
   "RETURNING as {:items :asts :oids}: the output columns, the expressions
    evaluated per row, and their OIDs as the compiled projection types them
    -- what Describe reports and Execute renders with."
-  [returning db table-name table-alias schema]
-  (let [items (returning-items returning db table-name table-alias schema)
+  [returning db table-name table-alias schema & [source-scopes]]
+  (let [items (returning-items returning db table-name table-alias schema source-scopes)
         visible (or table-alias table-name)
         asts (returning-asts items visible)
-        plan-oids (row-eval/row-oids asts table-name schema db {:alias visible})]
+        plan-oids (row-eval/row-oids asts table-name schema db
+                                     {:alias visible :source-scopes source-scopes})]
     {:items items
      :asts asts
      :oids (mapv #(or % PgWireServer/OID_TEXT) plan-oids)}))
@@ -1748,22 +1748,24 @@
    eids: entity IDs to return.
    table-name: the table name (namespace prefix for attributes).
    schema: database schema."
-  [returning row-db subquery-db eids table-name table-alias schema command]
+  [returning row-db subquery-db eids table-name table-alias schema command
+   & [{:keys [source-scopes source-values]}]]
   (let [;; A templated simple query carries its literals only as the
         ;; 1-indexed *cached-bound*; RETURNING `i + 1` read `$1` as NULL.
         bound (or params/*bound-params* (some-> *cached-bound* rest vec))
         {:keys [items asts oids]} (binding [params/*bound-params* bound]
                                     (returning-columns returning row-db table-name
-                                                       table-alias schema))
+                                                       table-alias schema source-scopes))
         col-names (mapv :name items)
         visible (or table-alias table-name)
         results (binding [params/*bound-params* bound]
                   (mapv (fn [eid]
                           (row-eval/row-values
-                           asts (into {} (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
+                           asts (into {::row-eval/source-values (get source-values eid)}
+                                      (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
                                       (d/datoms row-db :eavt eid))
                            table-name schema row-db
-                           {:alias visible :exec-db subquery-db}))
+                           {:alias visible :exec-db subquery-db :source-scopes source-scopes}))
                         eids))
         row-arrays (into-array (Class/forName "[Ljava.lang.String;")
                                (for [{:keys [values]} results]
@@ -3141,15 +3143,14 @@
                row)))
 
 (defn- apply-before-row-updates
-  "Run the BEFORE ROW UPDATE triggers. Returns `[tx-data rows]`, where
-   the tx-data is what should actually be written -- a trigger may have
-   changed the row or returned NULL to cancel the update for it -- and
-   `rows` is what the AFTER triggers will see."
+  "Run BEFORE ROW UPDATE triggers. Return [tx-data after-rows updated-eids].
+   UPDATE counts and RETURNING use the rows that survived the triggers,
+   including rows whose values stayed the same."
   [db table-name tx-data changed-columns eids]
   (let [by-eid (update-rows-from-ops db table-name tx-data eids)
         triggers (matching-triggers db table-name :update :before :row changed-columns)]
     (if (or (empty? triggers) (empty? by-eid))
-      [tx-data (mapv (fn [[_ r]] (select-keys r [:old :new])) by-eid) 0]
+      [tx-data (mapv (fn [[_ r]] (select-keys r [:old :new])) by-eid) eids]
       (let [handler (trigger-handler! table-name)
             outcomes (into {}
                            (map (fn [[eid {:keys [old new base]}]]
@@ -3178,7 +3179,9 @@
          (into [] (keep (fn [[_ {:keys [row old]}]]
                           (when row {:old old :new row})))
                outcomes)
-         (count (remove (comp :row val) outcomes))]))))
+         (let [vetoed (into #{} (keep (fn [[eid outcome]] (when (nil? (:row outcome)) eid)))
+                            outcomes)]
+           (filterv (complement vetoed) eids))]))))
 
 (defn- entity-columns
   "A stored row as `{column value}`, for OLD."
@@ -3454,10 +3457,9 @@
   `(binding [sql-ctx/*relation-namespaces* (or (:cte-namespaces ~parsed) {})]
      ~@body))
 
-(defn- build-delete-tx
-  "Build entity IDs and tx-data for a DELETE against `db`.
-   Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
-   that need speculative tempid remapping should remap afterward.
+(defn- match-plain-delete-rows
+  "Match target rows for a DELETE against `db`. The result contains the
+   real entity IDs, including rows from the speculative transaction.
 
    When `parsed` carries an `:enriched-db` (CTEs were materialised at
    parse-sql time), the WHERE-clause query runs against it and the
@@ -3527,47 +3529,41 @@
                    (if (seq in-args)
                      (run-param-query q #(apply d/q q query-db in-args))
                      (run-param-query q #(d/q q query-db))))]
-    {:eids eids
-     :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
+    {:eids eids}))
 
-(defn- execute-delete [conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
+(declare joined-write-rows)
+
+(defn- match-delete-rows [ctx db schema parsed]
+  (if (:from-sql parsed)
+    (joined-write-rows ctx db schema parsed)
+    (match-plain-delete-rows db schema parsed)))
+
+(defn- prepare-delete-effects
+  "Run BEFORE triggers and resolve foreign-key effects for rows that will be deleted."
+  [db table eids]
+  (fire-statement-triggers! db table :delete :before)
+  (let [old-rows (into {} (map (fn [eid] [eid (entity-columns db table eid)])) eids)
+        kept (vec (keep-row-deletes db table eids old-rows))
+        cascaded (collect-fk-cascade-retractions! db table kept)]
+    {:eids kept
+     :deleted-eids (into kept (remove (set kept)) cascaded)
+     :after-rows (mapv (fn [eid] {:old (get old-rows eid)}) kept)}))
+
+(defn- execute-delete [ctx conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-delete-tx db schema parsed))
-          ;; For RETURNING, snapshot values BEFORE delete
-          returning (:returning parsed)
-          returning-result (when returning
+          matched (with-cte-namespaces parsed (match-delete-rows ctx db schema parsed))
+          {:keys [eids deleted-eids after-rows]} (prepare-delete-effects db table (:eids matched))
+          returning-result (when-let [returning (:returning parsed)]
                              (build-returning-result returning db db eids table
-                                                     (:alias parsed) schema :delete))
-          ;; FK enforcement — RESTRICT raises, CASCADE returns extra eids
-          ;; to retract atomically alongside the parent deletion.
-          cascade-eids (collect-fk-cascade-retractions! db table eids)
-          cascade-tx (when (seq cascade-eids)
-                       (mapv (fn [e] [:db/retractEntity e]) cascade-eids))
-          ;; BEFORE ROW sees the row as OLD and may veto the delete by
-          ;; returning NULL; the rows it kept are what is retracted and
-          ;; what AFTER ROW then sees.
-          _ (fire-statement-triggers! db table :delete :before)
-          old-rows (into {} (map (fn [e] [e (entity-columns db table e)])) eids)
-          kept (vec (keep-row-deletes db table eids old-rows))
-          suppressed (- (count eids) (count kept))
-          tx-data (if (zero? suppressed)
-                    tx-data
-                    (filterv (fn [op]
-                               (or (not (vector? op))
-                                   (not= :db/retractEntity (first op))
-                                   (some #{(second op)} kept)))
-                             tx-data))
-          full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))
-          full-tx (tx-wrap full-tx)]
-      (when (seq full-tx)
-        (transact-recorded! conn full-tx))
-      (let [deleted-rows (mapv (fn [e] {:old (get old-rows e)}) kept)]
-        (fire-after-row-triggers! db table :delete deleted-rows)
-        (fire-statement-triggers! db table :delete :after deleted-rows))
-      (or returning-result
-          (empty-result (str "DELETE " (count kept)))))
+                                                     (:alias parsed) schema :delete matched))
+          tx-data (tx-wrap (mapv (fn [eid] [:db/retractEntity eid]) deleted-eids))]
+      (when (seq tx-data)
+        (transact-recorded! conn tx-data))
+      (fire-after-row-triggers! db table :delete after-rows)
+      (fire-statement-triggers! db table :delete :after after-rows)
+      (or returning-result (empty-result (str "DELETE " (count eids)))))
     (catch Exception e
       (classified-error "DELETE error: " e))))
 
@@ -3633,29 +3629,35 @@
       (when-not (types/assignment-cast-exists? source target)
         (or (second src-type) (types/format-type source -1))))))
 
-(defn- update-set-plan
-  "An UPDATE's SET list as PostgreSQL plans it: a query over the target
-   whose target list computes the new values (preprocess_targetlist),
-   here `SELECT <target>.db_id, (<e1>), ... FROM <target> [AS a] WHERE
-   <where>`, translated by the SELECT translator once per statement.
-   Returns {:plan :assignments}; an assignment of DEFAULT projects the
-   column's default -- `nextval(...)` per row -- or carries a
-   :default-fill for a constant one.
+(defn- joined-write-source-scopes [plan db aliases]
+  (let [db (or (:enriched-db plan) db)
+        relations (into {} (:relation-sources plan))
+        scopes (mapv (fn [alias]
+                       (when-not (contains? relations alias)
+                         (throw (errors/pg-error :undefined-table {:table alias})))
+                       (let [columns (pgs/column-info (dbi/-schema db) (get relations alias) db)]
+                         {:alias alias
+                          :columns (into [] (comp (remove #(= "db_id" (:name %)))
+                                                  (map #(select-keys % [:name :oid]))) columns)}))
+                     aliases)]
+    (mapv #(assoc %1 :offset %2)
+          scopes (reductions + 0 (map (comp count :columns) scopes)))))
 
-   UPDATE ... FROM joins the source relation into that same query, as
-   PostgreSQL does: the SET list is evaluated for EVERY joined pair, and
-   a target row matched by several of them is updated once (which pair
-   wins is unspecified). Identical pairs collapse here, which is only
-   visible to a volatile SET expression.
+(defn- joined-write-plan
+  "Plan the target and source tuple used by UPDATE or DELETE through SELECT.
+   Project the target identity, any SET values, and source columns needed
+   by RETURNING. DEFAULT either supplies a typed expression or carries a
+   constant :default-fill.
 
-   The values are computed where PostgreSQL computes them: over the
-   pre-statement rows the WHERE keeps, with one statement time, and with
-   uncorrelated subqueries run once."
+   SET runs over the command snapshot for each joined match. A target row
+   matched several times is modified once, using the selected source tuple."
   [parsed schema db]
-  (let [k [::set-plan (pg-cache/identity-key parsed) (pg-cache/identity-key schema)]]
+  (let [k [::set-plan (pg-cache/identity-key parsed) (pg-cache/identity-key schema)
+           params/*analysis-only?*]]
     (or (when-not (:execution-materialization? parsed)
           (.get ^java.util.Map update-row-match-cache k))
-        (let [{:keys [table alias assignments where-expr from-sql]} parsed
+        (let [{:keys [table alias assignments where-expr from-sql returning from-aliases]} parsed
+              sources (when (seq returning) from-aliases)
               visible (or alias
                           (when (str/starts-with? table temp-table-prefix)
                             (second (re-matches #"[^_]*_(.*)"
@@ -3706,6 +3708,7 @@
               text (str (:with-sql parsed)
                         "SELECT " (quoted (or visible table)) ".db_id"
                         (apply str (map #(str ", (" (:sql %) ")") assignments))
+                        (apply str (map #(str ", " (quoted %) ".*") sources))
                         " FROM " from-name (when visible (str " AS " (quoted visible)))
                         (when from-sql (str ", " from-sql))
                         (when where-expr (str " WHERE " where-expr)))
@@ -3746,7 +3749,8 @@
                                          " but expression is of type " mismatch)
                                     {:sqlstate "42804"
                                      :hint "You will need to rewrite or cast the expression."}))))
-              v {:plan plan :assignments assignments}]
+              v {:plan plan :assignments assignments
+                 :source-scopes (when (seq sources) (joined-write-source-scopes plan db sources))}]
           ;; A plan enriched against db ROWS (a derived, VALUES or
           ;; function source is materialised into a snapshot) is valid
           ;; only for that db, exactly as the parse cache's own
@@ -3758,20 +3762,17 @@
             (.put ^java.util.Map update-row-match-cache k v))
           v))))
 
-(defn- build-update-tx-from-plan
-  "The SET values come from update-set-plan's query -- over the target,
-   joined to the source relation when the statement has a FROM --
-   run by the SELECT executor (select-rows) against `db`, then take the
-   assignment cast into the column. {:eids :tx-data}."
+(defn- joined-write-rows
+  "Select the target and joined source together. Preserve the selected
+   source tuple for RETURNING and keep one match for each target row."
   [ctx db schema parsed]
-  (let [{:keys [ns]} parsed
-        ;; `update-set-plan` translates at EXECUTE time, after the
+  (let [;; The SELECT is translated at EXECUTE time, after the
         ;; binding made at parse time has gone, so `ONLY` is restored
         ;; from the parsed map for it.
-        {:keys [plan assignments]}
+        {:keys [plan assignments source-scopes]}
         (binding [params/*only-tables* (or (:only-tables parsed)
                                            params/*only-tables*)]
-          (update-set-plan parsed schema db))
+          (joined-write-plan parsed schema db))
         bound *cached-bound*
         plan (if bound (resolve-param-refs plan bound) plan)
         ;; A correlated subquery is translated per row and reads `$n`
@@ -3797,15 +3798,25 @@
                                             child-markers))))
                           rows))
                rows)
-        ;; UPDATE ... FROM: a target row several source rows match is
-        ;; updated once. PostgreSQL leaves the winning pair unspecified.
+        ;; Each target is modified once. PostgreSQL leaves the selected
+        ;; source unspecified when several rows match it.
         rows (if (:from-sql parsed)
                (second (reduce (fn [[seen out] row]
                                  (if (contains? seen (first row))
                                    [seen out]
                                    [(conj seen (first row)) (conj out row)]))
                                [#{} []] rows))
-               rows)
+               rows)]
+    (cond-> {:rows rows :assignments assignments :eids (mapv first rows)}
+      (seq source-scopes)
+      (assoc :source-scopes source-scopes
+             :source-values (into {} (map (fn [row]
+                                            [(first row) (subvec row (inc (count assignments)))])
+                                          rows))))))
+
+(defn- build-update-tx-from-plan [ctx db schema parsed]
+  (let [{:keys [ns]} parsed
+        {:keys [rows assignments] :as matched} (joined-write-rows ctx db schema parsed)
         ;; GENERATED ALWAYS AS (expr) STORED. Two obligations, and the
         ;; UPDATE path is the only place with both the row as it was and
         ;; the values replacing it.
@@ -3879,7 +3890,7 @@
                                                                 schema db))))
                                            gen-cols)))))))
                       rows)]
-    {:eids (mapv first rows) :tx-data tx-data}))
+    (assoc (dissoc matched :rows :assignments) :tx-data tx-data)))
 
 (defn- build-update-tx
   "Build entity IDs and tx-data for an UPDATE against `db`.
@@ -4011,7 +4022,7 @@
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-update-tx ctx db schema parsed))
+          {:keys [eids tx-data] :as built} (with-cte-namespaces parsed (build-update-tx ctx db schema parsed))
           _ (check-update-identity-collisions! db schema tx-data)
           _ (check-not-null-on-update! db tx-data)
           _ (check-updates-against-row-constraints!
@@ -4023,8 +4034,8 @@
                                          (name (nth op 2))))
                                      tx-data))
           _ (fire-statement-triggers! db table :update :before nil changed-columns)
-          [tx-data after-rows cancelled] (apply-before-row-updates
-                                          db table tx-data changed-columns eids)
+          [tx-data after-rows updated-eids] (apply-before-row-updates
+                                             db table tx-data changed-columns eids)
           tx-data (tx-wrap tx-data)
           returning (:returning parsed)
           tx-report (when (seq tx-data)
@@ -4036,8 +4047,8 @@
       (if returning
         ;; RETURNING: read values from db-after
         (let [db-after (if tx-report (:db-after tx-report) db)
-              result (build-returning-result returning db-after db eids table (:alias parsed)
-                                             (:schema db-after) :update)]
+              result (build-returning-result returning db-after db updated-eids table (:alias parsed)
+                                             (:schema db-after) :update built)]
           (when (seq tx-data) (transact-speculative-report! conn db tx-report))
           (fire-after-row-triggers! db table :update after-rows changed-columns)
           (fire-statement-triggers! db table :update :after after-rows changed-columns)
@@ -4047,7 +4058,7 @@
             ;; A row a BEFORE trigger cancelled was not updated, so it
             ;; is not counted. Every other MATCHED row is, including one
             ;; whose new value equals its old.
-            (empty-result (str "UPDATE " (- (count eids) cancelled))))))
+            (empty-result (str "UPDATE " (count updated-eids))))))
     (catch Exception e
       (classified-error "UPDATE error: " e))))
 
@@ -5835,6 +5846,8 @@
   [parsed bound]
   (let [fetch (fn [idx] (nth bound idx))]
     (cond-> parsed
+      (contains? parsed :values-rows)
+      (params/substitute-select-plan fetch)
       (contains? parsed :in-args)
       (update :in-args params/substitute-params fetch)
       (contains? parsed :tx-data)
@@ -7670,26 +7683,24 @@
                                   (assoc-in [:local-sequence-reservations generation] position))))
             next))))))
 
+(defn- session-nextval! [conn tx-state session-state reference]
+  (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        sequence-name (sequence-reference-name db reference)
+        value (nextval-for-tx! conn tx-state sequence-name)]
+    (when session-state
+      (swap! session-state
+             (fn [state]
+               (-> state
+                   (assoc :last-sequence sequence-name)
+                   (update :seq-called (fnil conj #{}) sequence-name)))))
+    value))
+
 (defn- handle-nextval
-  "SELECT nextval('seq_name') — wire wrapper around `nextval!`."
+  "SELECT nextval('seq_name') with session-local currval and lastval state."
   [{:keys [conn tx-state session-state]} parsed]
   (try
-    (let [lookup-db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
-          seq-name (sequence-reference-name lookup-db (:seq-name parsed))
-          v (nextval-for-tx! conn tx-state seq-name)]
-      ;; Remember which sequence this session last advanced so lastval()
-      ;; can answer. PG scopes lastval to the session for exactly this
-      ;; reason — it is the "what id did my INSERT just get" idiom, and
-      ;; a global answer would hand back another connection's value.
-      (when session-state
-        (swap! session-state
-               (fn [st]
-                 (-> st
-                     (assoc :last-sequence seq-name)
-                     ;; currval is only defined for sequences THIS
-                     ;; session has advanced.
-                     (update :seq-called (fnil conj #{}) seq-name)))))
-      (single-row-result "nextval" PgWireServer/OID_INT8 (str v)))
+    (single-row-result "nextval" PgWireServer/OID_INT8
+                       (str (session-nextval! conn tx-state session-state (:seq-name parsed))))
     (catch Exception e
       ;; No prefix: every error reachable here is already PG-shaped
       ;; ("relation \"s\" does not exist", "nextval: reached maximum
@@ -8693,7 +8704,7 @@
       (catch Exception _ [query in-args nil]))
     [query in-args nil]))
 
-(defn- select-rows
+(defn- select-rows*
   "The row-producing half of `exec-select`: run the plan and apply every
    server-side pass (hidden-column stripping, windows, HAVING, compound
    aggregates, deferred correlated subqueries, DISTINCT, nextval markers).
@@ -8721,7 +8732,7 @@
             resolve-result-value
             #(params/resolve-nextvals!
               % (fn [sequence-name]
-                  (nextval-for-tx! (:conn ctx) tx-state sequence-name))
+                  (session-nextval! (:conn ctx) tx-state session-state sequence-name))
               nil call-seen)
             ;; Catalog-only SELECT: re-resolve the enriched-db against the
             ;; CURRENT db so a reused prepared statement reflects catalog
@@ -9167,6 +9178,32 @@
         {:results results :find-aliases find-aliases
          :query query :query-db query-db}))))
 
+(defn- select-rows
+  [ctx {:keys [values-rows sql-order-by sql-limit sql-offset fetch-with-ties? find-aliases] :as parsed}]
+  (if-not values-rows
+    (select-rows* ctx parsed)
+    (let [offset (or sql-offset 0)
+          _ (when (neg? offset)
+              (throw (errors/pg-error :invalid-row-count-in-result-offset-clause
+                                      {:message "OFFSET must not be negative"})))
+          _ (when (and sql-limit (neg? sql-limit))
+              (throw (errors/pg-error :invalid-row-count-in-limit-clause
+                                      {:message "LIMIT must not be negative"})))
+          cmp (when sql-order-by (null-safe-order-cmp sql-order-by))
+          plans (cond
+                  (= 0 sql-limit) []
+                  (and sql-limit (nil? cmp)) (take (+' offset sql-limit) values-rows)
+                  :else values-rows)
+          rows (mapcat (fn [row]
+                         (params/check-cancel!)
+                         (:results (select-rows* ctx row))) plans)
+          offset-rows (drop offset (if cmp (sort cmp rows) rows))
+          results (cond
+                    fetch-with-ties? (take-with-ties sql-limit cmp offset-rows)
+                    sql-limit (take sql-limit offset-rows)
+                    :else offset-rows)]
+      {:literal? true :results results :find-aliases find-aliases})))
+
 (defn- select-result-oids
   "The result column OIDs of a plain SELECT, as wire ints: schema-derived,
    blended with the parse-time OIDs, then the window outputs' and the
@@ -9224,6 +9261,10 @@
                       schema-oids)]
     (int-array (map types/oid->wire-int (blend-visible-item-oids parsed schema-oids)))))
 
+(defn- values-typmods [{:keys [values-rows output-columns]}]
+  (when (and values-rows (some :typmod output-columns))
+    (int-array (map #(or (:typmod %) -1) output-columns))))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -9246,9 +9287,10 @@
             schema-oids (when item-oids
                           (int-array
                            (map #(types/oid->wire-int (or % -1)) item-oids)))]
-        (format-query-result results
-                             find-aliases
-                             schema-oids))
+        (if-let [typmods (values-typmods parsed)]
+          (.withColumnTypmods ^PgWireServer$QueryResult
+           (format-query-result results find-aliases schema-oids typmods) typmods)
+          (format-query-result results find-aliases schema-oids)))
       ;; Derive schema-based OIDs for proper type metadata.
       ;; Shared with describeResult; see compute-schema-oids.
       (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
@@ -9550,7 +9592,7 @@
               ;; conflict window from BEGIN→COMMIT to first-write→COMMIT.
               _ (when (empty? (:tx-buffer @tx-state))
                   (rebase-tx-state! conn tx-state))
-              {:keys [eids tx-data]}
+              {:keys [eids tx-data] :as built}
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
                       {:keys [eids] :as built} (with-cte-namespaces parsed (build-update-tx ctx spec-db schema parsed))
@@ -9586,9 +9628,9 @@
                                          tx-data))
               _ (fire-statement-triggers! spec-db (:table parsed) :update :before
                                           nil changed-columns)
-              [tx-data after-rows cancelled] (apply-before-row-updates
-                                              spec-db (:table parsed) tx-data
-                                              changed-columns eids)
+              [tx-data after-rows updated-eids] (apply-before-row-updates
+                                                 spec-db (:table parsed) tx-data
+                                                 changed-columns eids)
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-report (dc/with spec-db tx-data)
               _ (unique-constraints/validate-report! spec-report)
@@ -9606,8 +9648,8 @@
               db-after (:db-after spec-report)
               returning-result
               (when-let [returning (:returning parsed)]
-                (build-returning-result returning db-after spec-db eids (:table parsed)
-                                        (:alias parsed) (:schema db-after) :update))]
+                (build-returning-result returning db-after spec-db updated-eids (:table parsed)
+                                        (:alias parsed) (:schema db-after) :update built))]
           ;; A failing RETURNING projection aborts the statement without
           ;; changing the transaction's speculative image or commit buffer.
           (swap! tx-state (fn [ts]
@@ -9619,7 +9661,7 @@
           (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
                                     :update :after after-rows changed-columns)
           (or returning-result
-              (empty-result (str "UPDATE " (- (count eids) cancelled)))))
+              (empty-result (str "UPDATE " (count updated-eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
@@ -9634,10 +9676,10 @@
               ;; Same blocking row-lock + rebase discipline as exec-update.
               _ (when (empty? (:tx-buffer @tx-state))
                   (rebase-tx-state! conn tx-state))
-              {:keys [eids]}
+              matched
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-delete-tx spec-db schema parsed))
+                      {:keys [eids] :as built} (with-cte-namespaces parsed (match-delete-rows ctx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db)))
@@ -9652,43 +9694,20 @@
                     built)))
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
-              ;; ON DELETE CASCADE. This called the compatibility shim,
-              ;; which walks the FK graph for its RESTRICT raise and
-              ;; THROWS THE CASCADE EIDS AWAY -- its own docstring says
-              ;; so and tells new callers not to use it. So a parent
-              ;; row was deleted and its children were left behind:
-              ;; silent orphans, on the path a plain `DELETE` takes.
-              cascade-eids (collect-fk-cascade-retractions!
-                            spec-db (:table parsed) eids)
-              _ (fire-statement-triggers! spec-db (:table parsed) :delete :before)
-              old-rows (into {} (map (fn [e] [e (entity-columns spec-db (:table parsed) e)]))
-                             eids)
-              ;; A BEFORE ROW DELETE trigger returning NULL cancels the
-              ;; delete for that row.
-              eids (vec (keep-row-deletes spec-db (:table parsed) eids old-rows))
+              {:keys [eids deleted-eids after-rows]}
+              (prepare-delete-effects spec-db (:table parsed) (:eids matched))
               returning-result (when-let [returning (:returning parsed)]
                                  (build-returning-result returning spec-db spec-db eids
                                                          (:table parsed) (:alias parsed)
-                                                         (:schema spec-db) :delete))
-              ;; Apply to speculative-db with ORIGINAL entity IDs.
-              ;; The cascaded children go in the SAME transaction, as
-              ;; retractEntity is atomic and PostgreSQL's cascade is
-              ;; part of the deleting statement.
-              spec-tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
-                                 (map (fn [eid] [:db/retractEntity eid]))
-                                 cascade-eids)
+                                                         (:schema spec-db) :delete matched))
+              spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) deleted-eids)
               spec-report (dc/with spec-db spec-tx-data)
-              ;; A row inserted earlier in this SQL transaction has no
-              ;; committed entity to retract. Cancel its entity map and any
-              ;; subsequent updates instead of emitting retractEntity with a
-              ;; tempid, which Datahike rejects. Persisted rows still receive
-              ;; ordinary entity retractions.
+              ;; Direct targets inserted within the transaction still use
+              ;; tempids in the commit buffer.
               inserted-eids (into #{} (filter #(contains? eid->tempid %)) eids)
               deleted-tempids (into #{} (map eid->tempid) inserted-eids)
-              commit-tx-data (into []
-                                   (comp (remove inserted-eids)
-                                         (map (fn [eid] [:db/retractEntity eid])))
-                                   (concat eids cascade-eids))]
+              commit-tx-data (filterv (fn [[_ eid]] (not (contains? inserted-eids eid)))
+                                      spec-tx-data)]
           (swap! tx-state (fn [ts]
                             (let [buffer (if (seq deleted-tempids)
                                            (into [] (remove #(writes-tempid? deleted-tempids %))
@@ -9698,16 +9717,15 @@
                                   (assoc :tx-buffer (into buffer (guard-catalog-tx commit-tx-data))
                                          :speculative-db (:db-after spec-report))
                                   (update :eid->tempid #(apply dissoc % inserted-eids))))))
-          (let [deleted-rows (mapv (fn [e] {:old (get old-rows e)}) eids)]
-            (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
-                                      :delete deleted-rows)
-            (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
-                                      :delete :after deleted-rows))
+          (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
+                                    :delete after-rows)
+          (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
+                                    :delete :after after-rows)
           (or returning-result (empty-result (str "DELETE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "DELETE error: " e)))
-      (execute-delete conn parsed schema :tx-wrap (:tx-wrap ctx)))))
+      (execute-delete ctx conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
 (defn- table-row-eids
   "All row entity-ids of `table` in `db` — union across EVERY attr in
@@ -14913,8 +14931,11 @@
                      (d/db conn))
                 schema (dbi/-schema db)
                 table-ns (or (:ns parsed) (:table parsed))
+                source-scopes (when (seq (:from-aliases parsed))
+                                (binding [params/*analysis-only?* true]
+                                  (:source-scopes (joined-write-plan parsed schema db))))
                 {:keys [items oids]} (returning-columns (:returning parsed) db table-ns
-                                                        (:alias parsed) schema)
+                                                        (:alias parsed) schema source-scopes)
                 names (mapv :name items)
                 oids (int-array (map types/oid->wire-int oids))]
             (PgWireServer$QueryResult.
@@ -14950,7 +14971,9 @@
               (-> qr
                   (.withColumnSources (first sources) (second sources))
                   (.withColumnTypmods (nth sources 2)))
-              qr))
+              (if-let [typmods (values-typmods parsed)]
+                (.withColumnTypmods qr typmods)
+                qr)))
 
           ;; UNION / UNION ALL / INTERSECT / EXCEPT — the executor
           ;; runs each branch separately and combines, but pgjdbc on

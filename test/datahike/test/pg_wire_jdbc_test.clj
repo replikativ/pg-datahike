@@ -124,6 +124,34 @@
         (is (.next rs)) (is (= "Charlie" (.getString rs 1)))
         (is (not (.next rs)))))))
 
+(deftest test-standalone-values
+  (testing "Common column type and bound row limit over the extended protocol"
+    (with-conn [c {:prepareThreshold 1}]
+      (with-open [ps (.prepareStatement c "VALUES (NULL), (?), (5) LIMIT ?")]
+        (.setObject ps 1 "4" Types/OTHER)
+        (.setLong ps 2 2)
+        (is (= Types/INTEGER (.getParameterType (.getParameterMetaData ps) 1)))
+        (with-open [rs (.executeQuery ps)]
+          (is (= "column1" (.getColumnLabel (.getMetaData rs) 1)))
+          (is (= Types/INTEGER (.getColumnType (.getMetaData rs) 1)))
+          (is (.next rs))
+          (is (nil? (.getObject rs 1)))
+          (is (.next rs))
+          (is (= 4 (.getInt rs 1)))
+          (is (not (.next rs)))))))
+  (testing "An unordered LIMIT does not evaluate later sequence calls"
+    (with-conn [c {:preferQueryMode "simple"}]
+      (with-open [st (.createStatement c)]
+        (.execute st "CREATE SEQUENCE values_seq")
+        (with-open [rs (.executeQuery st (str "VALUES (nextval('values_seq')), "
+                                              "(nextval('values_seq')) LIMIT 1"))]
+          (is (.next rs))
+          (is (= 1 (.getLong rs 1)))
+          (is (not (.next rs))))
+        (with-open [rs (.executeQuery st "SELECT currval('values_seq')")]
+          (is (.next rs))
+          (is (= 1 (.getLong rs 1))))))))
+
 (deftest test-command-tag-select-rowcount
   (testing "SELECT command tag reports the visible row count"
     (with-conn [c {:preferQueryMode "simple"}]

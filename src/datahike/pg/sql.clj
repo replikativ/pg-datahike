@@ -227,7 +227,10 @@
       item-typmods)))
 
 (defn- translate-create-view [^CreateView cv schema db]
-  (let [view-name (unquote-ident (str (.getView cv)))
+  (let [^Table view (.getView cv)
+        view-name (unquote-ident (if (= "public" (unquote-ident (.getSchemaName view)))
+                                   (.getName view)
+                                   (str view)))
         existing-eid (ffirst
                       (d/q '{:find [?e]
                              :in [$ ?name-attr ?view-name]
@@ -2175,24 +2178,20 @@
 
                     (instance? ParenthesedSelect stmt)
                     (let [inner (.getSelect ^ParenthesedSelect stmt)]
-                      (if (instance? PlainSelect inner)
+                      (cond
+                        (instance? PlainSelect inner)
                         (let [result (translate-select ^PlainSelect inner schema db)]
                           (cond-> (assoc result :type :select)
                             (not (identical? db orig-db)) (assoc :enriched-db db)))
+
+                        (instance? Values inner)
+                        (stmt/translate-values inner schema db stmt)
+
+                        :else
                         {:type :error :message (str "Unsupported nested select: " (type inner))}))
 
-                    ;; A standalone VALUES relation cannot execute an SRF in
-                    ;; one of its cells. INSERT ... VALUES is intentionally a
-                    ;; different PostgreSQL context and remains legal.
                     (instance? Values stmt)
-                    (if (some stmt/contains-target-list-srf?
-                              (.getExpressions ^Values stmt))
-                      (throw (errors/pg-error
-                              :feature-not-supported
-                              {:message "set-returning functions are not allowed in VALUES"}))
-                      {:type :error
-                       :message "standalone VALUES is not supported"
-                       :sqlstate "0A000"})
+                    (stmt/translate-values stmt schema db)
 
           ;; UNION / UNION ALL / INTERSECT / EXCEPT
                     (instance? SetOperationList stmt)

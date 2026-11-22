@@ -1,6 +1,11 @@
 # test_date.test
 # Date function tests (epoch-seconds representation)
 
+# Convert stored epoch seconds to a PostgreSQL timestamp before truncating.
+
+statement ok
+SET TIME ZONE 'UTC'
+
 statement ok
 CREATE TABLE events (id INTEGER, ts INTEGER)
 
@@ -10,7 +15,7 @@ INSERT INTO events VALUES (1, 1705312200), (2, 1705398600), (3, 1705485000), (4,
 
 # DATE_TRUNC day
 query II rowsort
-SELECT id, DATE_TRUNC('day', ts) FROM events
+SELECT id, EXTRACT(EPOCH FROM DATE_TRUNC('day', TO_TIMESTAMP(ts)))::bigint FROM events
 ----
 1	1705276800
 2	1705363200
@@ -20,7 +25,7 @@ SELECT id, DATE_TRUNC('day', ts) FROM events
 
 # GROUP BY DATE_TRUNC
 query IR rowsort
-SELECT DATE_TRUNC('day', ts) AS day, COUNT(*) FROM events GROUP BY DATE_TRUNC('day', ts)
+SELECT EXTRACT(EPOCH FROM DATE_TRUNC('day', TO_TIMESTAMP(ts)))::bigint AS day, COUNT(*) FROM events GROUP BY 1
 ----
 1705276800	1.000000
 1705363200	1.000000
@@ -30,7 +35,7 @@ SELECT DATE_TRUNC('day', ts) AS day, COUNT(*) FROM events GROUP BY DATE_TRUNC('d
 
 # DATE_TRUNC hour (truncates to top of the hour)
 query II rowsort
-SELECT id, DATE_TRUNC('hour', ts) FROM events
+SELECT id, EXTRACT(EPOCH FROM DATE_TRUNC('hour', TO_TIMESTAMP(ts)))::bigint FROM events
 ----
 1	1705309200
 2	1705395600

@@ -135,3 +135,29 @@
          (v "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'restore_nested'")))
   (is (= "FOREIGN KEY (pid) REFERENCES public.restore_parent (id)"
          (v "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f'"))))
+
+(deftest view-definitions-resolve-names-and-oids
+  (doseq [sql ["CREATE TABLE view_source (n int)"
+               "INSERT INTO view_source VALUES (42)"
+               "CREATE VIEW \"Mirror View\" AS SELECT n FROM view_source"]]
+    (is (nil? (err sql)) sql))
+  (let [definition (v "SELECT pg_get_viewdef('\"Mirror View\"', true)")]
+    (is (= "SELECT n FROM view_source;" definition))
+    (is (= definition (v "SELECT pg_get_viewdef('\"Mirror View\"'::regclass, false)")))
+    (is (nil? (v "SELECT pg_get_viewdef('view_source')")))
+    (is (nil? (v "SELECT pg_get_viewdef('\"Mirror View\"', NULL::boolean)")))
+    (doseq [[sql state] [["SELECT pg_get_viewdef('23')" "42P01"]
+                         ["SELECT pg_get_viewdef('missing_schema.some_view')" "3F000"]
+                         ["SELECT 'missing_schema.some_view'::regclass" "42P01"]
+                         ["SELECT pg_get_viewdef('\"Mirror View\"', NULL)" "42725"]]]
+      (is (= state (.-sqlstate ^PgWireServer$QueryResult (run sql))) sql)))
+  (is (= "42P01" (v (str "SELECT sql_error_code FROM pg_input_error_info("
+                         "'missing_schema.some_view', 'regclass')"))))
+  (is (nil? (err "SET search_path TO pg_catalog")))
+  (is (= "42P01" (.-sqlstate ^PgWireServer$QueryResult
+                  (run "SELECT pg_get_viewdef('\"Mirror View\"')"))))
+  (let [definition (v "SELECT pg_get_viewdef('public.\"Mirror View\"', true)")]
+    (is (= "SELECT n FROM public.view_source;" definition))
+    (is (nil? (err (str "CREATE VIEW public.restore_view AS " definition))))
+    (is (= [["42"]] (rows "TABLE public.restore_view")))
+    (is (nil? (err "DROP VIEW public.restore_view")))))

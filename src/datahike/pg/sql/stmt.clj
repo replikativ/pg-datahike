@@ -3526,6 +3526,9 @@
                                    (nth col-timestamp i)
                                    (partial sql-cast/timestamp-value->storage (nth col-timestamp i) nil)
 
+                                   (#{"time" "timetz"} (nth col-pg-type i))
+                                   (fn [v] (or (types/temporal->pg-text v) (str v)))
+
                                    :else (col-coerce (nth col-types i))))
                                (range (count sub-aliases)))
            schema-tx
@@ -4098,6 +4101,10 @@
       (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
     case-var))
 
+(defn- qualified-star-alias [^net.sf.jsqlparser.statement.select.AllTableColumns expression]
+  (when-let [^Table table (.getTable expression)]
+    (unquote-ident (or (some-> table .getAlias .getName) (.getName table)))))
+
 (defn translate-select
   "Translate a SELECT while sharing anonymous relation identities across its
    complete nested query tree."
@@ -4105,6 +4112,94 @@
   (binding [*anonymous-derived-counter*
             (or *anonymous-derived-counter* (atom -1))]
     (translate-select* select schema db options)))
+
+(defn- select-row-bounds [^Select select schema db order-by]
+  (let [limit-expr (.getLimit select)
+        limit-val (when limit-expr
+                    (let [rc (.getRowCount ^Limit limit-expr)]
+                      (when (contains-target-list-srf? rc)
+                        (throw (errors/pg-error
+                                :feature-not-supported
+                                {:message "set-returning functions are not allowed in LIMIT"})))
+                      (let [value (extract-value rc schema db)]
+                        (when-not (params/param-ref? value)
+                          (when (and (some? value) (not (integer? value)))
+                            (throw (errors/pg-error
+                                    :feature-not-supported
+                                    {:detail (str "LIMIT expression is not supported: " rc)})))
+                          (when (and (integer? value) (neg? value))
+                            (throw (errors/pg-error
+                                    :invalid-row-count-in-limit-clause
+                                    {:message "LIMIT must not be negative"}))))
+                        value)))
+        ;; Fetch.getRowCount returns primitive `long` and unboxes a nullable
+        ;; field.  It crashes for the SQL-standard default count and for
+        ;; expression counts, so always inspect getExpression instead.
+        fetch-expr (.getFetch select)
+        fetch-param (when fetch-expr
+                      (.getFetchParam
+                       ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
+        fetch-with-ties? (and fetch-param
+                              (str/includes? (str/upper-case (str fetch-param))
+                                             "WITH TIES"))
+        fetch-count-expr (when fetch-expr
+                           (.getExpression
+                            ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
+        _ (when (contains-target-list-srf? fetch-count-expr)
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "set-returning functions are not allowed in LIMIT"})))
+        fetch-count (when fetch-expr
+                      (cond
+                        ;; An omitted count defaults to one.
+                        (nil? fetch-count-expr) 1
+                        ;; PostgreSQL rejects a bare NULL for WITH TIES, but
+                        ;; deliberately permits a computed NULL such as
+                        ;; (NULL + 1), which behaves as no limit.
+                        (instance? NullValue fetch-count-expr)
+                        (when fetch-with-ties?
+                          (throw
+                           (errors/pg-error
+                            :invalid-row-count-in-limit-clause
+                            {:message "row count cannot be null in FETCH FIRST ... WITH TIES clause"})))
+                        :else (extract-value fetch-count-expr schema db)))
+        _ (when (and (some? fetch-count)
+                     (not (integer? fetch-count)))
+            (throw
+             (errors/pg-error
+              :feature-not-supported
+              {:detail (str "FETCH FIRST row count expression is not supported: "
+                            fetch-count-expr)})))
+        _ (when (and (integer? fetch-count) (neg? fetch-count))
+            (throw
+             (errors/pg-error
+              :invalid-row-count-in-limit-clause
+              {:message "FETCH FIRST row count must not be negative"})))
+        limit-val (if fetch-expr fetch-count limit-val)
+        _ (when (and fetch-with-ties? (empty? order-by))
+            (throw
+             (errors/pg-error
+              :syntax-error
+              {:message "WITH TIES cannot be specified without ORDER BY clause"})))
+        offset-expr (.getOffset select)
+        offset-val (when offset-expr
+                     (let [ofs (.getOffset ^Offset offset-expr)]
+                       (when (contains-target-list-srf? ofs)
+                         (throw (errors/pg-error
+                                 :feature-not-supported
+                                 {:message "set-returning functions are not allowed in OFFSET"})))
+                       (let [value (extract-value ofs schema db)]
+                         (when-not (params/param-ref? value)
+                           (when (and (some? value) (not (integer? value)))
+                             (throw (errors/pg-error
+                                     :feature-not-supported
+                                     {:detail (str "OFFSET expression is not supported: " ofs)})))
+                           (when (and (integer? value) (neg? value))
+                             (throw (errors/pg-error
+                                     :invalid-row-count-in-result-offset-clause
+                                     {:message "OFFSET must not be negative"}))))
+                         value)))]
+    {:limit limit-val :offset offset-val :fetch-with-ties? fetch-with-ties?}))
 
 (defn translate-select*
   "Translate a PlainSelect into a Datalog query map + metadata.
@@ -5468,13 +5563,7 @@
                 ;; tables — Metabase's build_privilege_map and pgjdbc's
                 ;; getSchemas idiom both rely on it.
                 (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
-                (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
-                      ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
-                      raw-name (when tbl
-                                 (str/lower-case
-                                  (or (when-let [a (.getAlias tbl)]
-                                        (.getName ^Alias a))
-                                      (.getName tbl))))
+                (let [raw-name (qualified-star-alias expr)
                       ;; Resolve alias → real table via table-aliases.
                       real (or (get table-aliases raw-name) raw-name)
                       cols (pgs/column-info schema real db)]
@@ -6131,13 +6220,7 @@
                            ;; AllTableColumns must come BEFORE AllColumns
                            ;; (it's a subclass).
                      (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
-                     (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
-                           ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
-                           raw-name (when tbl
-                                      (str/lower-case
-                                       (or (when-let [a (.getAlias tbl)]
-                                             (.getName ^Alias a))
-                                           (.getName tbl))))
+                     (let [raw-name (qualified-star-alias expr)
                            real (or (get table-aliases raw-name) raw-name)
                            cols (pgs/column-info schema real db)
                            picked (remove #(= "db_id" (:name %)) cols)]
@@ -6205,9 +6288,7 @@
                          explicit (select-item-alias item)]
                      (cond
                        (instance? net.sf.jsqlparser.statement.select.AllTableColumns expression)
-                       (output-star-columns
-                        (some-> ^net.sf.jsqlparser.statement.select.AllTableColumns expression
-                                .getTable .getName unquote-ident))
+                       (output-star-columns (qualified-star-alias expression))
                        (instance? AllColumns expression) (output-star-columns nil)
                        :else
                        (let [oid (or (oid/expr-oid expression oid-env)
@@ -6409,6 +6490,12 @@
                                                 "NULLS_FIRST" :first
                                                 "NULLS_LAST"  :last
                                                 nil)
+                                        alias-idx
+                                        (when (and (instance? Column expr)
+                                                   (nil? (.getTable ^Column expr)))
+                                          (let [idx (.indexOf ^java.util.List fa-snap
+                                                              (unquote-ident (.getColumnName ^Column expr)))]
+                                            (when-not (neg? idx) idx)))
                                         order-source-expr
                                         (cond
                                           (instance? LongValue expr)
@@ -6418,22 +6505,12 @@
                                                (nth select-items (dec pos)))))
 
                                           (instance? Column expr)
-                                          (let [col-name (.getColumnName ^Column expr)
-                                                tbl (.getTable ^Column expr)
-                                                alias-idx (when (nil? tbl)
-                                                            (some (fn [[i a]]
-                                                                    (when (= a col-name) i))
-                                                                  (map-indexed vector fa-snap)))]
-                                            (if (and alias-idx (< alias-idx (count select-items)))
-                                              (let [selected (.getExpression ^SelectItem
-                                                              (nth select-items alias-idx))]
-                                                ;; `SELECT * ... ORDER BY col`: star expansion
-                                                ;; creates one find alias per physical column,
-                                                ;; but `select-items` still contains only the
-                                                ;; single `*` AST node. Keep the ORDER BY column
-                                                ;; as the type source in that case.
-                                                (if (instance? AllColumns selected) expr selected))
-                                              expr))
+                                          (if (and alias-idx (< alias-idx (count select-items)))
+                                            (let [selected (.getExpression ^SelectItem
+                                                            (nth select-items alias-idx))]
+                                              ;; A star has no single column type.
+                                              (if (instance? AllColumns selected) expr selected))
+                                            expr)
 
                                           :else expr)
                                         matching-select-idx
@@ -6535,16 +6612,9 @@
                                             {:post-window matching-window-out-pos}
 
                                             (instance? Column expr)
-                                            (let [col-name (.getColumnName ^Column expr)
-                                                  tbl (.getTable ^Column expr)
-                                                  ;; Only alias-resolve unqualified column refs
-                                                  alias-idx (when (nil? tbl)
-                                                              (some (fn [[i a]]
-                                                                      (when (= a col-name) i))
-                                                                    (map-indexed vector fa-snap)))]
-                                              (if alias-idx
-                                                (nth fe-snap alias-idx)
-                                                (expr/translate-expr ctx expr)))
+                                            (if alias-idx
+                                              (nth fe-snap alias-idx)
+                                              (expr/translate-expr ctx expr))
 
                                             (some? matching-select-idx)
                                             (nth fe-snap matching-select-idx)
@@ -6602,6 +6672,22 @@
                                                    (not (map? v)))
                                             (expr/enum-rank-var! ctx enum-spec v)
                                             v)
+                                        ;; The visible OIDs include expanded stars, so
+                                        ;; ORDER BY an ordinal can use the projected type.
+                                        order-oid
+                                        (or (when-let [index (if (instance? LongValue expr)
+                                                               (dec (.getValue ^LongValue expr))
+                                                               alias-idx)]
+                                              (nth select-item-oids index nil))
+                                            (oid/expr-oid order-source-expr agg-oid-env))
+                                        ;; In storage a timetz is text. Build its typed
+                                        ;; sort key before the original value is projected.
+                                        v (if (and (symbol? v)
+                                                   (= types/oid-timetz order-oid)
+                                                   (not (some #(= v (:out-var %)) project-set-specs)))
+                                            (ctx/materialize-arg!
+                                             ctx (list 'datahike.pg.query-fns/timetz-sort-key v))
+                                            v)
                                         ;; An aggregate written out in ORDER BY rather
                                         ;; than referenced by alias. PostgreSQL allows it
                                         ;; whether or not it is projected — `SELECT dept
@@ -6650,95 +6736,13 @@
                                                             {:error :feature-not-supported
                                                              :feature "ORDER BY on aggregate not in SELECT list"
                                                              :detail (str "ORDER BY on aggregate not in SELECT list is not supported: " (str expr))})))]
-                                    [v (if asc? :asc :desc) nulls]))
+                                    [v (if asc? :asc :desc) nulls order-oid]))
                                 order-by)))
 
 ;; LIMIT / OFFSET / FETCH FIRST
-        limit-expr (.getLimit select)
-        limit-val (when limit-expr
-                    (let [rc (.getRowCount ^Limit limit-expr)]
-                      (when (contains-target-list-srf? rc)
-                        (throw (errors/pg-error
-                                :feature-not-supported
-                                {:message "set-returning functions are not allowed in LIMIT"})))
-                      (let [value (extract-value rc schema db)]
-                        (when-not (params/param-ref? value)
-                          (when (and (some? value) (not (integer? value)))
-                            (throw (errors/pg-error
-                                    :feature-not-supported
-                                    {:detail (str "LIMIT expression is not supported: " rc)})))
-                          (when (and (integer? value) (neg? value))
-                            (throw (errors/pg-error
-                                    :invalid-row-count-in-limit-clause
-                                    {:message "LIMIT must not be negative"})))
-                          value))))
-        ;; Fetch.getRowCount returns primitive `long` and unboxes a nullable
-        ;; field.  It crashes for the SQL-standard default count and for
-        ;; expression counts, so always inspect getExpression instead.
-        fetch-expr (.getFetch select)
-        fetch-param (when fetch-expr
-                      (.getFetchParam
-                       ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
-        fetch-with-ties? (and fetch-param
-                              (str/includes? (str/upper-case (str fetch-param))
-                                             "WITH TIES"))
-        fetch-count-expr (when fetch-expr
-                           (.getExpression
-                            ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
-        _ (when (contains-target-list-srf? fetch-count-expr)
-            (throw (errors/pg-error
-                    :feature-not-supported
-                    {:message "set-returning functions are not allowed in LIMIT"})))
-        fetch-count (when fetch-expr
-                      (cond
-                        ;; An omitted count defaults to one.
-                        (nil? fetch-count-expr) 1
-                        ;; PostgreSQL rejects a bare NULL for WITH TIES, but
-                        ;; deliberately permits a computed NULL such as
-                        ;; (NULL + 1), which behaves as no limit.
-                        (instance? NullValue fetch-count-expr)
-                        (when fetch-with-ties?
-                          (throw
-                           (errors/pg-error
-                            :invalid-row-count-in-limit-clause
-                            {:message "row count cannot be null in FETCH FIRST ... WITH TIES clause"})))
-                        :else (extract-value fetch-count-expr schema db)))
-        _ (when (and (some? fetch-count)
-                     (not (integer? fetch-count)))
-            (throw
-             (errors/pg-error
-              :feature-not-supported
-              {:detail (str "FETCH FIRST row count expression is not supported: "
-                            fetch-count-expr)})))
-        _ (when (and (integer? fetch-count) (neg? fetch-count))
-            (throw
-             (errors/pg-error
-              :invalid-row-count-in-limit-clause
-              {:message "FETCH FIRST row count must not be negative"})))
-        limit-val (if fetch-expr fetch-count limit-val)
-        _ (when (and fetch-with-ties? (empty? order-by))
-            (throw
-             (errors/pg-error
-              :syntax-error
-              {:message "WITH TIES cannot be specified without ORDER BY clause"})))
-        offset-expr (.getOffset select)
-        offset-val (when offset-expr
-                     (let [ofs (.getOffset ^Offset offset-expr)]
-                       (when (contains-target-list-srf? ofs)
-                         (throw (errors/pg-error
-                                 :feature-not-supported
-                                 {:message "set-returning functions are not allowed in OFFSET"})))
-                       (let [value (extract-value ofs schema db)]
-                         (when-not (params/param-ref? value)
-                           (when (and (some? value) (not (integer? value)))
-                             (throw (errors/pg-error
-                                     :feature-not-supported
-                                     {:detail (str "OFFSET expression is not supported: " ofs)})))
-                           (when (and (integer? value) (neg? value))
-                             (throw (errors/pg-error
-                                     :invalid-row-count-in-result-offset-clause
-                                     {:message "OFFSET must not be negative"})))
-                           value))))
+        {:keys [limit offset fetch-with-ties?]} (select-row-bounds select schema db order-by)
+        limit-val (when-not (params/param-ref? limit) limit)
+        offset-val (when-not (params/param-ref? offset) offset)
 
         ;; FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE
         ;; + optional NOWAIT / SKIP LOCKED / (default: block)
@@ -7837,6 +7841,7 @@
         (when (and (pos-int? limit-val)
                    (= 1 (count order-by))
                    (= 1 (count order-by-spec))
+                   (not= types/oid-timetz (get-in order-by-spec [0 3]))
                    (not fetch-with-ties?)
                    default-table
                    (not @has-aggregates?)
@@ -8017,6 +8022,7 @@
              ;; SQL projection types before hidden inputs reshape :find.
              :visible-select-items visible-select-items
              :output-columns output-columns
+             :relation-sources star-relations
              ;; Unlike an ordinary projection, UNION/INTERSECT/EXCEPT keep
              ;; bare strings, NULL and undeclared parameters as UNKNOWN while
              ;; finding a per-column common type. This parallel vector
@@ -8325,6 +8331,29 @@
                (run-const-select (pf sql schema db) db))))
           (run-const-select p db))))))
 
+(defn- deferred-const-value
+  "Plan a VALUES scalar through SELECT and evaluate it at the candidate's
+   column stage. The shared projection marker keeps clocks and volatile
+   result expressions out of the INSERT plan cache."
+  [e schema db]
+  (when-not (and params/*parse-sql* schema db)
+    (throw (errors/pg-error :feature-not-supported
+                            {:message (str "cannot evaluate expression here: " e)})))
+  (let [plan (binding [params/*bound-params* nil]
+               (params/*parse-sql* (str "SELECT " e) schema db))]
+    (when (= :error (:type plan))
+      (throw (ex-info (:message plan)
+                      {:sqlstate (:sqlstate plan) :error-fields (:error-fields plan)})))
+    {:fn :projection
+     :projection-fn
+     (fn []
+       (let [current-db (or params/*runtime-db* db)
+             fetch #(nth params/*bound-params* (dec (long %)) nil)
+             bound-plan (params/substitute-select-plan plan fetch)]
+         (if-let [run params/*row-execute*]
+           (sql-value (ffirst (run bound-plan current-db)))
+           (run-const-select bound-plan current-db))))}))
+
 (defn- extract-numeric-binary
   "Evaluate a binary numeric expression in INSERT ... VALUES using the
    same PostgreSQL arithmetic helpers as SELECT/UPDATE."
@@ -8515,15 +8544,6 @@
     ;; transactor (issue #14).
      (instance? TimeKeyExpression e)
      {:fn :now}
-    ;; now() AT TIME ZONE 'UTC' → current timestamp marker, like the
-    ;; bare-function case above. Any other AT TIME ZONE is an ordinary
-    ;; expression; it used to become now() as well.
-     (and (instance? TimezoneExpression e)
-          (let [left (.getLeftExpression ^TimezoneExpression e)]
-            (and (instance? net.sf.jsqlparser.expression.Function left)
-                 (= "now" (expr/resolution-name (.getName ^net.sf.jsqlparser.expression.Function left))))))
-     {:fn :now}
-
     ;; ArrayConstructor literal: ARRAY[1,2,3] / ARRAY[ARRAY[1,2],…].
     ;; Build a typed PgArray; coerce-insert-value will serialize it
     ;; for storage on an array column. Recurses on nested
@@ -9177,12 +9197,12 @@
                         :feature-not-supported
                         {:feature "nextval() in RETURNING"})))
               (cond
-                (instance? AllColumns item-expr)
-                {:kind :star}
-
                 (instance? AllTableColumns item-expr)
                 {:kind :star
                  :table (some-> ^AllTableColumns item-expr .getTable .getName unquote-ident)}
+
+                (instance? AllColumns item-expr)
+                {:kind :star}
 
                 :else
                 {:kind :expr
@@ -9982,6 +10002,111 @@
          (nil? (some-> ^Column expression .getTable .getName))
          (.equalsIgnoreCase "default" (.getColumnName ^Column expression)))))
 
+(defn- values-tail? [^Select statement]
+  (or (seq (.getOrderByElements statement)) (.getLimit statement)
+      (.getOffset statement) (.getFetch statement)))
+
+(defn- values-order [^Select statement names]
+  (into []
+        (mapcat
+         (fn [^OrderByElement item]
+           (let [expression (.getExpression item)
+                 position
+                 (cond
+                   (instance? LongValue expression)
+                   (let [position (.getValue ^LongValue expression)]
+                     (when-not (<= 1 position (count names))
+                       (throw (ex-info (str "ORDER BY position " position " is not in select list")
+                                       {:sqlstate "42P10"})))
+                     (dec position))
+
+                   (instance? Column expression)
+                   (let [column (unquote-ident (.getColumnName ^Column expression))
+                         index (.indexOf ^java.util.List names column)]
+                     (when (or (neg? index) (.getTable ^Column expression))
+                       (throw (errors/pg-error :undefined-column {:column column})))
+                     index)
+
+                   :else
+                   (throw (errors/pg-error :feature-not-supported
+                                           {:feature "VALUES ordered by an expression"})))]
+             [position (if (.isAsc item) :asc :desc)
+              (case (str (.getNullOrdering item))
+                "NULLS_FIRST" :first
+                "NULLS_LAST" :last
+                nil)])))
+        (.getOrderByElements statement)))
+
+(defn- values-cell [expression actual expected]
+  (if (= actual expected)
+    expression
+    (do
+      (when (and actual (not (types/implicit-coercible? actual expected)))
+        (throw (ex-info (str "VALUES could not convert type " (types/format-type actual -1)
+                             " to " (types/format-type expected -1))
+                        {:sqlstate "42846"})))
+      (let [type-name (get types/oid->pg-name expected)]
+        (when-not type-name
+          (throw (errors/pg-error :feature-not-supported
+                                  {:feature "implicit VALUES casts to user-defined types"})))
+        (CastExpression. ^net.sf.jsqlparser.expression.Expression expression ^String type-name)))))
+
+(defn translate-values
+  "Plan each VALUES row as an ordinary scalar projection. Determine a
+   common type for every column before planning its implicit casts."
+  [^Values statement schema db & [^Select outer]]
+  (when (or (seq (.getWithItemsList statement)) (seq (some-> outer .getWithItemsList)))
+    (throw (errors/pg-error :feature-not-supported {:feature "WITH before standalone VALUES"})))
+  (when (or (.getForMode statement) (some-> outer .getForMode))
+    (throw (errors/pg-error :feature-not-supported {:feature "row locking on VALUES"})))
+  (let [tail (if (and outer (values-tail? outer))
+               (do
+                 (when (values-tail? statement)
+                   (throw (errors/pg-error :feature-not-supported
+                                           {:feature "both inner and outer VALUES row bounds"})))
+                 outer)
+               statement)
+        rows (analysis/values-expression-rows statement)]
+    (doseq [cell (mapcat identity rows)]
+      (when (insert-default-expression? cell)
+        (throw (ex-info "DEFAULT is not allowed in this context" {:sqlstate "42601"})))
+      (when (contains-target-list-srf? cell)
+        (throw (errors/pg-error :feature-not-supported
+                                {:message "set-returning functions are not allowed in VALUES"})))
+      (when (seq (params/ast-window-names cell))
+        (throw (errors/pg-error :windowing-error
+                                {:message "window functions are not allowed in VALUES"})))
+      (when (some (comp fns/aggregate-function? srf-base-name) (params/ast-function-names cell))
+        (throw (ex-info "aggregate functions are not allowed in VALUES" {:sqlstate "42803"}))))
+    (let [outputs (analysis/analyze-values-cells rows schema db)
+          columns (analysis/values-columns outputs)
+          names (mapv :name columns)
+          oids (mapv :oid columns)
+          converted (mapv #(mapv values-cell %1 (mapv :oid %2) oids) rows outputs)
+          row-plans (mapv (fn [row]
+                            (let [select (doto (PlainSelect.)
+                                           (.setSelectItems
+                                            (mapv (fn [^net.sf.jsqlparser.expression.Expression cell column-name]
+                                                    (SelectItem. cell (Alias. column-name)))
+                                                  row names)))]
+                              (translate-select select schema db)))
+                          converted)
+          order-by (not-empty (values-order tail names))
+          {:keys [limit offset fetch-with-ties?]} (select-row-bounds tail schema db order-by)]
+      {:type :select :values-rows row-plans
+       :runtime-subqueries? (boolean (some :runtime-subqueries? row-plans))
+       :execution-materialization? (boolean (some :execution-materialization? row-plans))
+       :find-aliases names :select-item-oids oids :select-item-resolution-oids oids
+       :output-columns columns
+       :param-oids (into (into {} (keep (fn [value]
+                                          (when (params/param-ref? value)
+                                            [(:idx value) types/oid-int8])))
+                               [limit offset])
+                         (mapcat #(params/where-param-oids % schema nil {})
+                                 (mapcat identity converted)))
+       :sql-order-by order-by :sql-limit limit :sql-offset offset
+       :fetch-with-ties? fetch-with-ties?})))
+
 (defn- compile-insert-assignment-plans
   "Compile column expressions for an INSERT containing partial targets.
    Each physical column has one complete value, evaluated in column order."
@@ -10138,6 +10263,16 @@
       (assoc result :insert-source-targets assignment-targets
              :insert-shared-assignment-plans assignment-plans)
       (assoc result :insert-source-order source-attrs))))
+
+(defn- timezone-value-expression? [expression]
+  (let [expression (unwrap-parens expression)]
+    (cond
+      (instance? TimezoneExpression expression) true
+      (instance? Function expression)
+      (= "timezone" (expr/resolution-name (.getName ^Function expression)))
+      (instance? CastExpression expression)
+      (recur (.getLeftExpression ^CastExpression expression))
+      :else false)))
 
 (defn- expand-insert-values-srfs
   "Expand top-level SRFs in one INSERT ... VALUES row.
@@ -10472,7 +10607,10 @@
 
       ;; Normal INSERT with VALUES
       (and (instance? Values select) (seq col-names))
-      (let [ev (fn [e] (extract-value e schema db))
+      (let [ev (fn [e]
+                 (if (timezone-value-expression? e)
+                   (deferred-const-value e schema db)
+                   (extract-value e schema db)))
             num-cols (count col-names)
             row-exprs (analysis/values-expression-rows select)
             width (count (first row-exprs))
@@ -10692,6 +10830,18 @@
                  :catalog-target-name raw-table)
           returning (assoc :returning returning))))))
 
+(defn- from-item-name [^FromItem item]
+  (when item
+    (if-let [alias (.getAlias item)]
+      (unquote-ident (.getName ^Alias alias))
+      (when (instance? Table item)
+        (unquote-ident (.getName ^Table item))))))
+
+(defn- write-with-sql [withs]
+  (when (seq withs)
+    ;; A WithItem renders its own RECURSIVE keyword.
+    (str "WITH " (str/join ", " (map str withs)) " ")))
+
 (defn translate-delete
   "Translate a DELETE statement to Datahike retraction query + tx-data."
   [^Delete delete schema]
@@ -10708,7 +10858,12 @@
         table-name (first (canonical-relation schema raw-table []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
-        _ (reject-hidden-target-name! delete raw-table alias-name)
+        using (.getUsingList delete)
+        from-names (into [] (keep from-item-name) using)
+        _ (when-let [dup (some #{(or alias-name raw-table)} from-names)]
+            (throw (ex-info (str "table name \"" dup "\" specified more than once")
+                            {:error :duplicate-alias :sqlstate "42712" :table dup})))
+        _ (reject-hidden-target-name! delete raw-table alias-name from-names)
         ns table-name
         where-expr (.getWhere delete)]
     (let [returning (.getReturningClause delete)]
@@ -10717,7 +10872,12 @@
                :alias alias-name
                :ns ns
                :where-expr where-expr}
-        (and (not returning)
+        (seq using)
+        (assoc :from-sql (str/join ", " (map str using))
+               :from-aliases from-names
+               :with-sql (write-with-sql (.getWithItemsList delete))
+               :declared-param-oids params/*declared-param-oids*)
+        (and (empty? using) (not returning)
              (target-delete-expression? where-expr raw-table alias-name))
         (assoc :catalog-dependency-shape :target-delete-v1
                :catalog-target-name raw-table)
@@ -10830,13 +10990,7 @@
         ;; its own name (only a Table has one to clash with).
         from-items (cons (.getFromItem update)
                          (map #(.getRightItem ^Join %) (or (.getJoins update) [])))
-        from-names (keep (fn [item]
-                           (when item
-                             (if-let [a (.getAlias ^FromItem item)]
-                               (unquote-ident (.getName ^Alias a))
-                               (when (instance? Table item)
-                                 (unquote-ident (.getName ^Table item))))))
-                         from-items)
+        from-names (into [] (keep from-item-name) from-items)
         ;; PostgreSQL's target is in the range table with the rest, so a
         ;; FROM relation visible under the same name is 42712
         ;; (setTargetTable / checkNameSpaceConflicts).
@@ -10903,9 +11057,7 @@
         ;; parsed as ordinary SQL: the CTE is then materialised by the
         ;; SELECT translator, for the FROM relation and for a subquery
         ;; in SET alike.
-        with-sql (when (seq withs)
-                   ;; A WithItem renders its own RECURSIVE keyword.
-                   (str "WITH " (str/join ", " (map str withs)) " "))
+        with-sql (write-with-sql withs)
         ;; The FROM relation as written, joins included: the SET list is
         ;; translated at Execute as a query over the target joined to it
         ;; (server/update-set-plan). The shapes below are what the
@@ -10931,6 +11083,7 @@
                ;; PostgreSQL plans UPDATE ... FROM.
              :with-sql with-sql
              :from-sql from-sql
+             :from-aliases (vec from-names)
                ;; The parameter types this statement was translated with:
                ;; the SET list is translated again at Execute
                ;; (server/update-set-plan) and must see the same ones.

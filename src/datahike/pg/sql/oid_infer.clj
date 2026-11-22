@@ -219,7 +219,7 @@
    ;; Reporting timestamptz for all of them made `date_trunc('day', ts)`
    ;; on a plain timestamp render with a `+00` offset, which is a
    ;; different instant for a client that reads it as local time.
-   "date_trunc"    :arg2-type
+   "date_trunc"    :date-trunc
    "date_part"     types/oid-float8
    "extract"       types/oid-float8
    "age"           types/oid-interval
@@ -859,21 +859,14 @@
           #{types/oid-timestamp} types/oid-timestamptz
           #{types/oid-time types/oid-timetz} types/oid-timetz
           types/oid-timestamp))
-      ;; The SECOND argument's type -- `date_trunc(unit, ts)` returns
-      ;; whatever ts is.
+      (= rule :date-trunc)
+      (let [result (fns/date-trunc-resolution
+                    (mapv #(resolution-oid (params/unwrap-scalar-parens %) env) args))]
+        (when (number? result) result))
       (= rule :arg2-type)
       (when-let [a2 (second args)]
-        ;; A `date` has no date_trunc overload of its own and coerces
-        ;; implicitly to BOTH timestamp and timestamptz, so function
-        ;; resolution falls to the category's PREFERRED type -- verified
-        ;; against the oracle: `date_trunc('month', date_col)` comes back
-        ;; with a `+00`.
-        ;; Nor does a `time`: date_trunc(text, time) resolves through
-        ;; time's implicit cast to interval, so it returns an interval.
-        (let [o (expr-oid a2 env)]
-          (cond (= o types/oid-date) types/oid-timestamptz
-                (and (= o types/oid-time) (= fname "date_trunc")) types/oid-interval
-                :else o)))
+        (let [oid (expr-oid a2 env)]
+          (if (= oid types/oid-date) types/oid-timestamptz oid)))
       ;; COALESCE / NULLIF / GREATEST / LEAST resolve a COMMON type over
       ;; every argument, the same way CASE and UNION do.
       (= rule :common-type)

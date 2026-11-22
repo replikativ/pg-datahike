@@ -1504,32 +1504,25 @@
       (when (and (< minute 60) (<= second 60) (<= west (* 18 3600)))
         (java.time.ZoneOffset/ofTotalSeconds (int (if (= "-" sign) west (- west))))))))
 
-(defn resolve-time-zone
-  "A PostgreSQL time-zone spec as a java.time ZoneId. A dynamic
-   abbreviation names the zone used for calendar operations.
-   A NUMERIC spec -- `+05`,
-   `-03:30`, `UTC+3` -- is POSIX-style, so its sign is INVERTED: `+05` is
-   five hours WEST of UTC (datetime.c DecodePosixTimezone). Unknown names
-   raise 22023, as in PostgreSQL."
-  ^java.time.ZoneId [zone]
-  (let [z (clojure.string/trim (str zone))
-        posix (fn [sign h m sec]
-                (let [total (+ (* 3600 (Long/parseLong h))
-                               (* 60 (Long/parseLong (or m "0")))
-                               (Long/parseLong (or sec "0")))]
-                  (java.time.ZoneOffset/ofTotalSeconds
-                   (int (if (= "-" sign) total (- total))))))]
-    (or (when-let [offset (:offset (datetime-tokens/zone-abbrev (str/lower-case z)))]
-          (java.time.ZoneOffset/ofTotalSeconds (int offset)))
-        (quoted-posix-zone-offset z)
-        (when-let [[_ sign h m sec]
-                   (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
-          (posix sign h m sec))
-        (some-> (datetime-zone/dynamic-abbreviation z) :zone datetime-zone/resolve-zone-name)
-        (datetime-zone/zone-id z)
-        (throw (errors/pg-error
-                :invalid-parameter-value
-                {:message (str "time zone \"" z "\" not recognized")})))))
+(defn resolve-expression-time-zone
+  "Resolve PostgreSQL expression time zones in abbreviation, tzdb, POSIX
+   order. Fixed offsets use seconds east of UTC."
+  [zone]
+  (if (instance? java.time.ZoneId zone)
+    {:zone zone}
+    (let [name (str zone)]
+      (or (when-let [east (:offset (datetime-tokens/zone-abbrev (datetime-tokens/ascii-lower name)))]
+            {:east east})
+          (when-let [{:keys [zone abbrev]} (datetime-zone/dynamic-abbreviation name)]
+            (when (= name (str/trim name))
+              (when-let [zid (datetime-zone/registered-zone-id zone)]
+                {:zone zid :abbrev abbrev})))
+          (when-let [zid (datetime-zone/registered-zone-id name)]
+            {:zone zid})
+          (when-let [west (datetime-zone/posix-zone-seconds-west name)]
+            {:east (- west)})
+          (throw (errors/pg-error :invalid-parameter-value
+                                  {:message (str "time zone \"" name "\" not recognized")}))))))
 
 (defrecord PgLsn [^java.math.BigInteger value]
   Object
