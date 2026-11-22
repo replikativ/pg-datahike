@@ -169,12 +169,15 @@
   (let [conn (#'mirror/open-store path)]
     (try (f (d/db conn)) (finally (d/release conn)))))
 
-(defn- durable-position [path]
+(defn- durable-checkpoint [path]
   (let [conn (#'mirror/open-store path)]
     (try
       (with-open [handler (pg/make-query-handler conn)]
-        (:end-lsn (#'mirror/checkpoint handler)))
+        (#'mirror/checkpoint handler))
       (finally (d/release conn)))))
+
+(defn- durable-position [path]
+  (:end-lsn (durable-checkpoint path)))
 
 (defn- check-admission! [source config]
   (sql! source
@@ -1277,19 +1280,208 @@
           (when (= ["false"] (slot-query source @main-slot "active::text"))
             (sql! source (str "SELECT pg_drop_replication_slot(" (literal @main-slot) ")"))))))))
 
-(defn -main [& [argument]]
-  (if (= "--crash-worker" argument)
-    (run-crash-worker! (edn/read (PushbackReader. *in*)))
-    (let [source (System/getenv "PG_MIRROR_SOURCE_URL")
-          reference (System/getenv "PG_MIRROR_REFERENCE_URL")
-          conninfo (System/getenv "PG_MIRROR_SOURCE_CONNINFO")]
-      (check! (every? seq [source reference conninfo])
-              "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
-      (prn ((case argument
-              "--partitions" run-partition-probe!
-              "--type-refresh" run-type-refresh-probe!
-              "--primary-key-refresh" run-primary-key-probe!
-              "--schema-refresh" run-schema-refresh-probe!
-              "--refresh" run-refresh-probe!
-              run-probe!)
-            source reference conninfo)))))
+(defn- pg-control! [pg-bin directory & args]
+  (let [command (into [(str pg-bin "/pg_ctl") "-D" directory "-w" "-t" "30"] args)
+        process (-> (ProcessBuilder. ^java.util.List command) (.redirectErrorStream true) .start)]
+    (when-not (.waitFor process 35 TimeUnit/SECONDS)
+      (.destroyForcibly process)
+      (throw (ex-info "Timed out waiting for pg_ctl" {:command command})))
+    (check! (zero? (.exitValue process)) "pg_ctl failed"
+            {:command command :output (slurp (.getInputStream process))})))
+
+(defn- caught-up-standby! [standby position]
+  (await! "Standby has not replayed the test checkpoint"
+          #(= [["t"]] (rows standby (str "SELECT pg_last_wal_replay_lsn() >= " (literal position) "::pg_lsn")))))
+
+(defn- synchronize-slot! [{:keys [pg-bin standby-dir]} source standby slot]
+  (let [synced-position #(first (slot-query standby slot
+                                            (str "CASE WHEN synced AND failover AND NOT temporary "
+                                                 "AND invalidation_reason IS NULL THEN confirmed_flush_lsn END")))]
+    (loop [attempt 0]
+      (when-not (synced-position)
+        (check! (< attempt 50) "Standby did not synchronize the mirror slot"
+                {:slot (slot-query standby slot "restart_lsn, confirmed_flush_lsn, temporary::text, synced::text")})
+        ;; Let the decoder serialize a snapshot as the standby's temporary
+        ;; slot waits for the primary to reach its retention horizon.
+        (sql! source "SELECT pg_log_standby_snapshot()" "SELECT pg_log_standby_snapshot()")
+        (#'mirror/emit-barrier! source)
+        (Thread/sleep 400)
+        (recur (inc attempt))))
+    ;; Freeze slot synchronization while the physical standby keeps replaying.
+    ;; This makes the promoted slot replay WAL already committed in the mirror.
+    (spit (str standby-dir "/postgresql.auto.conf") "\nsync_replication_slots = off\n" :append true)
+    (pg-control! pg-bin standby-dir "reload")
+    (await! "Standby slot sync worker did not stop"
+            #(and (= [["off"]] (rows standby "SHOW sync_replication_slots"))
+                  (= [["t"]] (rows standby (str "SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                                "WHERE backend_type = 'slot sync worker')")))))
+    (synced-position)))
+
+(defn- failover-checkpoint! [path slot expected-timeline]
+  (let [saved (durable-checkpoint path)]
+    (check! (= [slot expected-timeline] [(:slot saved) (get-in saved [:origin :timeline])])
+            "Slot or timeline in the durable checkpoint is incorrect" saved)
+    saved))
+
+(defn- reject-confirmation-ahead! [config promoted subscriber slot]
+  (mirror/stop! @subscriber)
+  (let [path (:store-path config)
+        before (failover-checkpoint! path slot 2)]
+    (sql! promoted "INSERT INTO ha_items VALUES (4,'never acknowledged by the mirror',41)"
+          (str "SELECT pg_replication_slot_advance(" (literal slot) ", pg_current_wal_lsn())"))
+    (let [[confirmed] (slot-query promoted slot "confirmed_flush_lsn")]
+      (check! (pos? (#'mirror/compare-lsn confirmed (:end-lsn before)))
+              "Probe did not move the slot past the checkpoint" {})
+      (reset! subscriber (mirror/start! config))
+      (let [{:keys [last-error port]} (await-state! @subscriber :paused)]
+        (check! (and (nil? port) (:resnapshot-required? last-error)
+                     (= confirmed (get-in last-error [:slot-status :confirmed-lsn])))
+                "Mirror did not reject the confirmation ahead of its checkpoint" last-error))
+      (check! (= before (durable-checkpoint path)) "Ahead slot changed the durable checkpoint" {})
+      (check! (= [confirmed] (slot-query promoted slot "confirmed_flush_lsn")) "Rejected resume advanced the slot" {}))))
+
+(defn- promote-during-refresh! [fixture config source standby subscriber sink slot]
+  (let [{:keys [pg-bin primary-dir standby-dir standby-url]} fixture
+        path (:store-path config)
+        original-checkpoint (failover-checkpoint! path slot 1)
+        synced-before (synchronize-slot! fixture source standby slot)
+        first-row-id #(inspect-db path (fn [db] (d/q '[:find ?e . :where [?e :ha_items/id 1]] db)))
+        old-row-id (first-row-id)
+        old-rows (rows sink "SELECT id,note FROM ha_items ORDER BY id")
+        old-at (inspect-db path #(str (.toInstant ^java.util.Date
+                                       (:db/txInstant (d/entity % (:max-tx %))))))
+        copy-started (promise)
+        release-copy (promise)
+        first-copy? (atom true)
+        copy-var #'mirror/copy-table!
+        copy-original @copy-var]
+    (with-redefs-fn
+      {copy-var (fn [publisher destination table on-bytes]
+                  (when (and (= "ha_items" (:name table)) (compare-and-set! first-copy? true false))
+                    (deliver copy-started true)
+                    (check! (deref release-copy 35000 false) "Probe did not release the staged COPY" {}))
+                  (copy-original publisher destination table on-bytes))}
+      (fn []
+        (let [before (try
+                       (sql! source "ALTER TABLE ha_items ADD COLUMN stamp integer DEFAULT 12")
+                       (check! (deref copy-started 25000 false) "Mirror did not start a schema refresh"
+                               (mirror/status @subscriber))
+                       (sql! source "BEGIN" "INSERT INTO ha_items (id,note) VALUES (2,'staged')"
+                             "UPDATE ha_audit SET note='durable before promotion' WHERE id=1" "COMMIT")
+                       (await! "The unrelated table did not follow during staging"
+                               #(= [["durable before promotion"]] (rows sink "SELECT note FROM ha_audit")))
+                       (let [{:keys [manifest end-lsn] :as saved} (durable-checkpoint path)]
+                         (check! (seq (:pending-schema manifest)) "Pending refresh was not durable" saved)
+                         (check! (pos? (#'mirror/compare-lsn end-lsn synced-before))
+                                 "Probe needs a standby slot behind the checkpoint" {:checkpoint end-lsn :synced synced-before})
+                         (caught-up-standby! standby end-lsn)
+                         (pg-control! pg-bin primary-dir "stop" "-m" "fast")
+                         (pg-control! pg-bin standby-dir "promote")
+                         saved)
+                       (finally (deliver release-copy true)))]
+          (with-open [promoted (DriverManager/getConnection standby-url)]
+            (sql! promoted "INSERT INTO ha_items VALUES (3,'after promotion',31)")
+            (await! "Mirror did not restart and finish the refresh on timeline 2"
+                    #(let [status (mirror/status @subscriber)]
+                       (check! (not (#{:paused :failed} (:state status))) "Mirror stopped after promotion" status)
+                       (and (= :following (:state status)) (= 2 (:source-timeline status))
+                            (:last-schema-refresh status) (nil? (:refresh status)))))
+            (let [query "SELECT id,note,stamp FROM ha_items ORDER BY id"
+                  expected (rows promoted query)
+                  after (failover-checkpoint! path slot 2)]
+              (check! (= expected (rows sink query)) "Rows differ after the promoted primary's refresh" {})
+              (check! (and old-row-id (= old-row-id (first-row-id))) "Failover refresh changed an existing entity ID" {})
+              (check! (and (pos? (#'mirror/compare-lsn (:end-lsn after) (:end-lsn before)))
+                           (nil? (get-in after [:manifest :pending-schema])))
+                      "Failover did not finish and checkpoint the schema refresh" after)
+              (check! (= 1 (inspect-db path #(count (d/q '[:find ?tx
+                                                           :where [_ :ha_audit/note "durable before promotion" ?tx]]
+                                                         (d/history %)))))
+                      "Replaying the lagging synchronized slot rewrote durable history" {})
+              (sql! sink (str "SET datahike.as_of = " (literal old-at)))
+              (check! (= old-rows (rows sink "SELECT id,note FROM ha_items ORDER BY id")) "Failover changed historical rows" {})
+              (check! (= (get-in original-checkpoint [:origin :timeline])
+                         (:timeline (edn/read-string (ffirst (rows sink "SELECT origin FROM pgdh_mirror.checkpoint")))))
+                      "Historical checkpoint moved to the new timeline" {})
+              (sql! sink "RESET datahike.as_of")
+              (mirror/stop! @subscriber)
+              (reset! subscriber (mirror/start! config))
+              (with-open [restarted (DriverManager/getConnection (sink-url @subscriber))]
+                (check! (= expected (rows restarted query)) "Restart on the promoted primary changed rows" {}))
+              (reject-confirmation-ahead! config promoted subscriber slot))))))))
+
+(defn- reject-divergent-promotion! [fixture config source standby subscriber sink slot]
+  (let [{:keys [pg-bin primary-dir standby-dir fixture-dir standby-url]} fixture
+        synced-before (synchronize-slot! fixture source standby slot)]
+    (sql! source "ALTER SYSTEM SET synchronized_standby_slots = ''" "SELECT pg_reload_conf()")
+    (await! "Publisher did not release its logical decoder from standby feedback"
+            #(= [[""]] (rows source "SHOW synchronized_standby_slots")))
+    (pg-control! pg-bin standby-dir "stop" "-m" "fast")
+    (sql! source "INSERT INTO ha_items VALUES (99,'durable on the old timeline only')")
+    (await! "Mirror did not apply the divergent row"
+            #(= [["99"]] (rows sink "SELECT id FROM ha_items WHERE id=99")))
+    (let [before (failover-checkpoint! (:store-path config) slot 1)]
+      (pg-control! pg-bin primary-dir "stop" "-m" "fast")
+      (pg-control! pg-bin standby-dir "start" "-l" (str fixture-dir "/standby.log"))
+      (pg-control! pg-bin standby-dir "promote")
+      (with-open [promoted (DriverManager/getConnection standby-url)]
+        (check! (empty? (rows promoted "SELECT id FROM ha_items WHERE id=99"))
+                "Probe did not create a divergent primary" {})
+        (let [{:keys [last-error]} (await-state! @subscriber :paused)]
+          (check! (= :timeline-fork-before-checkpoint (:reason last-error))
+                  "Mirror paused for the wrong promotion condition" last-error))
+        (check! (= before (durable-checkpoint (:store-path config))) "Rejected failover altered the checkpoint" {})
+        (check! (= [["99"]] (rows sink "SELECT id FROM ha_items WHERE id=99")) "Rejected failover changed served rows" {})
+        (check! (= [synced-before] (slot-query promoted slot "confirmed_flush_lsn"))
+                "Rejected failover acknowledged divergent WAL" {})))))
+
+(defn run-failover-probe! [{:keys [primary-url standby-url source-url fixture-dir mode] :as fixture}]
+  (let [config {:source-url source-url :publication "failover_pub" :store-path (str fixture-dir "/store")
+                :server {:port 0} :schema-refresh? true :failover? true}
+        subscriber (atom nil)]
+    (with-open [source (DriverManager/getConnection primary-url)
+                standby (DriverManager/getConnection standby-url)]
+      (try
+        (sql! source "CREATE TABLE ha_items (id integer PRIMARY KEY, note text)"
+              "CREATE TABLE ha_audit (id integer PRIMARY KEY, note text)"
+              "INSERT INTO ha_items VALUES (1,'initial')" "INSERT INTO ha_audit VALUES (1,'initial')"
+              "CREATE PUBLICATION failover_pub FOR TABLE ha_items, ha_audit"
+              "CREATE ROLE mirror_follower LOGIN REPLICATION"
+              "GRANT SELECT ON ha_items, ha_audit TO mirror_follower"
+              "GRANT EXECUTE ON FUNCTION pg_logical_emit_message(boolean, text, text, boolean) TO mirror_follower")
+        (reset! subscriber (mirror/start! config))
+        (let [{:keys [slot source-timeline]} (await-state! @subscriber :following)]
+          (check! (= 1 source-timeline) "Probe requires a fresh primary on timeline 1" {})
+          (check! (= ["true" "false"] (slot-query source slot "failover::text, synced::text"))
+                  "The initial mirror slot did not advertise failover" {:slot slot})
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (case mode
+              "promote" (promote-during-refresh! fixture config source standby subscriber sink slot)
+              "diverge" (reject-divergent-promotion! fixture config source standby subscriber sink slot))))
+        {:status :passed :mode mode}
+        (finally (when @subscriber (mirror/stop! @subscriber)))))))
+
+(defn -main [& [argument mode]]
+  (if (= "--failover" argument)
+    (prn (run-failover-probe! {:pg-bin (System/getenv "PG_MIRROR_PG_BIN")
+                               :fixture-dir (System/getenv "PG_MIRROR_FAILOVER_DIR")
+                               :primary-dir (System/getenv "PG_MIRROR_PRIMARY_DIR")
+                               :standby-dir (System/getenv "PG_MIRROR_STANDBY_DIR")
+                               :primary-url (System/getenv "PG_MIRROR_PRIMARY_URL")
+                               :standby-url (System/getenv "PG_MIRROR_STANDBY_URL")
+                               :source-url (System/getenv "PG_MIRROR_SOURCE_URL") :mode mode}))
+    (if (= "--crash-worker" argument)
+      (run-crash-worker! (edn/read (PushbackReader. *in*)))
+      (let [source (System/getenv "PG_MIRROR_SOURCE_URL")
+            reference (System/getenv "PG_MIRROR_REFERENCE_URL")
+            conninfo (System/getenv "PG_MIRROR_SOURCE_CONNINFO")]
+        (check! (every? seq [source reference conninfo])
+                "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
+        (prn ((case argument
+                "--partitions" run-partition-probe!
+                "--type-refresh" run-type-refresh-probe!
+                "--primary-key-refresh" run-primary-key-probe!
+                "--schema-refresh" run-schema-refresh-probe!
+                "--refresh" run-refresh-probe!
+                run-probe!)
+              source reference conninfo))))))

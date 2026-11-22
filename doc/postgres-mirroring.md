@@ -16,8 +16,8 @@ CREATE PUBLICATION analytics FOR TABLE public.accounts, public.events;
 
 Use a publisher role with `LOGIN`, `REPLICATION`, database access, and
 `SELECT` on all published tables. The role needs access to
-`pg_logical_emit_message(boolean, text, text)` for catch-up barriers. Use a
-direct connection to the publisher primary.
+`pg_logical_emit_message(boolean, text, text, boolean)` for catch-up barriers.
+Connect to the publisher primary.
 
 Save a configuration as `mirror.edn`.
 
@@ -190,8 +190,8 @@ The checkpoint in `pgdh_mirror.checkpoint` stores the publisher identity, end
 LSN, transaction ID, and publisher commit timestamp. Each source commit and its
 checkpoint reach durable storage together. Feedback reports committed positions
 only. After a disconnect, commits already in the checkpoint are acknowledged
-and skipped. Slot loss, a changed publisher timeline, or a publisher
-confirmation ahead of the durable checkpoint pauses the mirror.
+and skipped. Slot loss or a publisher confirmation ahead of the durable
+checkpoint pauses the mirror.
 
 Status includes the applied and confirmed LSNs, retained WAL, and the most recent
 error. A paused worker that has already cut over serves the last committed
@@ -208,6 +208,33 @@ messages. Their checkpoint transactions can appear in Datahike history.
 Stopping a subscriber leaves its slot available for resume. After permanently
 retiring a mirror, drop its recorded slot on the publisher to release retained
 WAL once the worker has stopped.
+
+## Follow a promoted PostgreSQL standby
+
+Set `:failover? true` to create a permanent logical slot with `FAILOVER`
+enabled. Configure a physical standby with slot synchronization and make
+the publisher wait for the standby's physical slot through
+`synchronized_standby_slots`. Verify that the standby has synchronized the
+mirror's slot before promotion. The PostgreSQL failover procedure describes
+these publisher settings. [PostgreSQL logical replication failover](https://www.postgresql.org/docs/18/logical-replication-failover.html)
+
+Supply a primary-aware endpoint or a multi-host JDBC URL so the mirror can
+find the promoted primary. The mirror selects a primary for both logical
+replication and SQL, and checks that the connections reached the same instance.
+
+The promoted primary must retain the same synchronized slot. The mirror
+checks the database identity and timeline history, and requires the old
+timeline to contain the durable checkpoint before the fork. It replays
+from the synchronized slot, skips already committed positions, and records
+the new timeline with the first durable commit before reporting feedback.
+Status reports the timeline under `:source-timeline`. A pending schema
+refresh starts its staging snapshot again on the promoted primary.
+
+To enable failover on an existing mirror, stop it and use
+`ALTER_REPLICATION_SLOT slot_name (FAILOVER true)` over a PostgreSQL replication
+connection, then restart with `:failover? true`. When failover is disabled, a
+timeline change pauses the mirror. A lost or invalidated slot, or a timeline
+that forked before the checkpoint, requires a new snapshot.
 
 ## Verification and follow-up
 
@@ -226,9 +253,13 @@ with PostgreSQL. Pass `--partitions` to check populated attachment,
 detachment, reattachment, truncation and crash recovery under leaf routing.
 Pass `--type-refresh` to compare enum and domain changes, column conversions,
 and historical type catalogs across an interrupted cutover and restart.
+Run `sh test/integration/postgres-regress/mirror-failover.sh promote` with
+`PG_MIRROR_PG_BIN` pointing to PostgreSQL 18 binaries to promote a disposable
+standby during a schema refresh. The `diverge` mode promotes a standby that
+forked before the checkpoint and verifies that the mirror pauses.
 
 The next stages are wider publication type and relation support, streaming and
-spooling of large transactions, and failover slots. See the
+spooling of large transactions, and recovery after slot loss. See the
 [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 

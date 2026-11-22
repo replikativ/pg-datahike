@@ -14,7 +14,7 @@
             [datahike.pg.sql.rewrite :as rewrite]
             [datahike.pg.types :as types])
   (:import [datahike.pg PgWireServer PgWireServer$QueryHandler PgWireServer$QueryResult]
-           [java.io ByteArrayOutputStream]
+           [java.io ByteArrayOutputStream IOException]
            [java.nio ByteBuffer]
            [java.nio.channels FileChannel OverlappingFileLockException]
            [java.nio.charset StandardCharsets]
@@ -72,10 +72,21 @@
         (recur (conj rows (row result)))
         rows))))
 
-(defn- connect [url replication?]
+(defn- close-publisher! [^Connection conn]
+  (try
+    (.close conn)
+    (catch SQLException error
+      ;; pgjdbc can fail to send Terminate after a disconnect, after it
+      ;; has already closed the socket. Preserve the connection's error.
+      (when-not (instance? IOException (ex-cause error))
+        (throw error)))))
+
+(defn- connect [url replication? primary?]
   (let [properties (doto (Properties.)
                      (.setProperty "connectTimeout" "10")
                      (.setProperty "socketTimeout" "30"))]
+    (when primary?
+      (.setProperty properties "targetServerType" "primary"))
     (when replication?
       (.setProperty properties "replication" "database")
       (.setProperty properties "assumeMinServerVersion" "10")
@@ -90,23 +101,40 @@
           (command! connection "SET search_path = pg_catalog"))
         connection
         (catch Throwable error
-          (.close connection)
+          (close-publisher! connection)
           (throw error))))))
 
+(defn- with-publisher [url f]
+  (let [replication (connect url true true)]
+    (try
+      (let [source (connect url false true)]
+        (try (f replication source)
+             (finally (close-publisher! source))))
+      (finally (close-publisher! replication)))))
+
+(defn- publisher-session [connection]
+  (first (query connection
+                (str "SELECT datname, oid, current_setting('server_version_num'), pg_is_in_recovery(), "
+                     "inet_server_addr()::text, inet_server_port(), extract(epoch FROM pg_postmaster_start_time())::text "
+                     "FROM pg_database WHERE datname = current_database()")
+                [] (fn [^ResultSet r]
+                     {:database (.getString r 1) :database-oid (.getLong r 2) :version (.getInt r 3)
+                      :in-recovery? (.getBoolean r 4)
+                      :instance [(.getString r 5) (.getInt r 6) (.getString r 7)]}))))
+
 (defn- source-identity [^Connection replication source]
-  (with-open [stmt (.createStatement replication)
-              result (.executeQuery stmt "IDENTIFY_SYSTEM")]
-    (require! (.next result) "IDENTIFY_SYSTEM returned no row" {})
-    (let [database (.getString result "dbname")
-          [sql-database database-oid version]
-          (first (query source
-                        (str "SELECT datname, oid, current_setting('server_version_num') "
-                             "FROM pg_database WHERE datname = current_database()")
-                        [] (fn [^ResultSet r] [(.getString r 1) (.getLong r 2) (.getInt r 3)])))]
-      (require! (and (= database sql-database) version (<= 180000 version 189999))
-                "Expected a PostgreSQL 18 publication database" {:version version :database database})
+  (let [{:keys [database database-oid version in-recovery?] :as session} (publisher-session source)]
+    (require! (and version (<= 180000 version 189999))
+              "Expected a PostgreSQL 18 publication database" {:version version :database database})
+    (when (or in-recovery? (not= session (publisher-session replication)))
+      (throw (SQLException. "Publisher connections did not reach the same PostgreSQL primary" "08006")))
+    (with-open [stmt (.createStatement replication)
+                result (.executeQuery stmt "IDENTIFY_SYSTEM")]
+      (require! (.next result) "IDENTIFY_SYSTEM returned no row" {})
+      (require! (= database (.getString result "dbname")) "IDENTIFY_SYSTEM returned a different database"
+                {:database database})
       {:system-id (.getString result "systemid")
-       :timeline (.getInt result "timeline") :database database :database-oid database-oid})))
+       :timeline (.getLong result "timeline") :database database :database-oid database-oid})))
 
 (defn- builtin-ddl-type [{:keys [oid typmod]}]
   (let [base (sql-types oid)]
@@ -381,7 +409,7 @@
    Returns publication-wide issues and the issues for every table."
   [{:keys [source-url publication]}]
   (validate-source-options! source-url publication)
-  (with-open [source (connect source-url false)]
+  (with-open [source (connect source-url false false)]
     (let [version (first (query source "SHOW server_version_num" [] #(.getInt ^ResultSet % 1)))]
       (require! (and version (<= 180000 version 189999))
                 "Expected a PostgreSQL 18 publication database" {:version version})
@@ -682,16 +710,20 @@
   (first (query source
                 (str "SELECT confirmed_flush_lsn::text, restart_lsn::text, active, invalidation_reason, "
                      "       plugin = 'pgoutput' AND database = current_database() "
-                     "       AND NOT temporary AND NOT two_phase AND NOT failover, "
+                     "       AND NOT temporary AND NOT two_phase, "
                      "       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::text, "
-                     "       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::text "
+                     "       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::text, failover, synced "
                      "FROM pg_replication_slots WHERE slot_name = ?")
                 [slot] (fn [^ResultSet r]
                          {:confirmed-lsn (.getString r 1) :restart-lsn (.getString r 2)
                           :active? (.getBoolean r 3) :invalidation (.getString r 4)
                           :matches? (.getBoolean r 5)
                           :retained-wal-bytes (some-> (.getString r 6) parse-long)
-                          :unconfirmed-wal-bytes (some-> (.getString r 7) parse-long)}))))
+                          :unconfirmed-wal-bytes (some-> (.getString r 7) parse-long)
+                          :failover? (.getBoolean r 8) :synced? (.getBoolean r 9)}))))
+
+(defn- compatible-slot? [info failover?]
+  (and (:matches? info) (= (:failover? info) (boolean failover?))))
 
 (defn- snapshot-budget [check-running! limit]
   (let [copied (volatile! 0)]
@@ -699,28 +731,29 @@
       (check-running!)
       (require! (<= (vswap! copied + n) limit) "Snapshot exceeds the configured byte limit" {:limit limit}))))
 
-(defn- with-slot-snapshot! [^Connection replication source slot temporary? f]
-  (let [api (.getReplicationAPI (.unwrap replication PGConnection))
-        builder (-> api .createReplicationSlot .logical (.withSlotName slot) (.withOutputPlugin "pgoutput"))
-        created (.make (if temporary? (.withTemporaryOption builder) builder))
-        snapshot (.getSnapshotName created)]
-    (require! (seq snapshot) "The slot did not export a snapshot" {:slot slot})
+(defn- with-slot-snapshot! [replication source slot temporary? failover? f]
+  (let [command (str "CREATE_REPLICATION_SLOT " (ident slot) (when temporary? " TEMPORARY")
+                     " LOGICAL pgoutput (SNAPSHOT 'export'" (when failover? ", FAILOVER true") ")")
+        [snapshot end-lsn] (first (query replication command [] (fn [^ResultSet r]
+                                                                  [(.getString r "snapshot_name")
+                                                                   (.getString r "consistent_point")])))]
+    (require! (and (seq snapshot) (seq end-lsn)) "The slot did not export a snapshot" {:slot slot})
     (command! source "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
     (try
       (command! source (str "SET TRANSACTION SNAPSHOT " (literal snapshot)))
       (command! source "SET LOCAL row_security = off")
-      (f (.asString (.getConsistentPoint created)))
+      (f end-lsn)
       (finally (command! source "ROLLBACK")))))
 
-(defn- bootstrap! [replication source destination {:keys [slot publication]} check-running! max-snapshot-bytes]
+(defn- bootstrap! [replication source destination {:keys [slot publication origin]} failover? check-running! max-snapshot-bytes]
   (when-let [existing (slot-info source slot)]
     ;; The unique slot name was persisted locally before its first creation.
-    (require! (and (:matches? existing) (not (:active? existing)))
+    (require! (and (compatible-slot? existing failover?) (not (:active? existing)))
               "Cannot restart an incomplete snapshot while its slot is in use or has changed" {:slot slot})
     (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil)))
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)]
     (with-slot-snapshot!
-      replication source slot false
+      replication source slot false failover?
       (fn [end-lsn]
         (let [manifest (publication-manifest source publication)]
           (transaction!
@@ -736,8 +769,8 @@
              (when (seq (:partition-parents manifest))
                (install-partition-topology! destination manifest))
              (sink-prepared! destination
-                             (str "UPDATE " checkpoint-table " SET manifest = ?, end_lsn = ? WHERE id = 1")
-                             [(pr-str manifest) end-lsn]))))))))
+                             (str "UPDATE " checkpoint-table " SET manifest = ?, end_lsn = ?, origin = ? WHERE id = 1")
+                             [(pr-str manifest) end-lsn (pr-str origin)]))))))))
 
 (defn- lsn [value] (LogSequenceNumber/valueOf (str value)))
 
@@ -902,7 +935,7 @@
       (require! (= 1 count) "A mirrored change did not affect exactly one row"
                 {:relation-id relation-id :operation op :affected count}))))
 
-(defn- apply-commit! [destination relations previous {:keys [end-lsn xid commit-micros changes install! manifest]}]
+(defn- apply-commit! [destination relations previous {:keys [end-lsn xid commit-micros changes install! manifest origin]}]
   (transaction!
    destination
    (fn []
@@ -913,9 +946,11 @@
                                   (str "UPDATE " checkpoint-table
                                        " SET end_lsn = ?, source_xid = ?, source_commit_micros = ?"
                                        (when manifest ", manifest = ?")
+                                       (when origin ", origin = ?")
                                        " WHERE id = 1 AND end_lsn = ?")
                                   (conj (cond-> [end-lsn (str xid) (str commit-micros)]
-                                          manifest (conj (pr-str manifest)))
+                                          manifest (conj (pr-str manifest))
+                                          origin (conj (pr-str origin)))
                                         previous))]
        (require! (= 1 (affected-count result)) "Mirror checkpoint changed while applying a transaction"
                  {:expected previous :next end-lsn})))))
@@ -958,14 +993,54 @@
              {:reply? (= 1 (.get buffer))})
         (throw (ex-info "Unexpected PostgreSQL replication packet" {}))))))
 
-(defn- validate-resume! [source {:keys [slot end-lsn]}]
-  (let [{:keys [matches? active? invalidation confirmed-lsn] :as info} (slot-info source slot)]
-    (when active?
-      (throw (SQLException. "Replication slot is still active" "55006")))
-    (require! (and matches? (nil? invalidation) confirmed-lsn
+(defn- timeline-switchpoints [replication timeline]
+  (let [command (str "TIMELINE_HISTORY " timeline)
+        content (first (query replication command []
+                              #(String. (.getBytes ^ResultSet % "content") StandardCharsets/ISO_8859_1)))
+        rows (remove #(or (str/blank? %) (str/starts-with? (str/triml %) "#"))
+                     (str/split-lines (or content "")))]
+    (reduce (fn [history line]
+              (let [[_ number position] (re-matches #"\s*([0-9]+)\s+([0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8})(?:\s.*)?" line)
+                    ancestor (some-> number parse-long)
+                    [prior-timeline prior-position] (last history)]
+                (require! (and ancestor (< (or prior-timeline 0) ancestor timeline)
+                               (or (nil? prior-position) (not (neg? (compare-lsn position prior-position)))))
+                          "Publisher returned invalid timeline history"
+                          {:reason :invalid-timeline-history :source-timeline timeline})
+                (assoc history ancestor position)))
+            (sorted-map) rows)))
+
+(defn- validate-origin! [replication {:keys [end-lsn] old :origin} origin failover?]
+  (require! (= (dissoc old :timeline) (dissoc origin :timeline))
+            "The mirror belongs to a different PostgreSQL database"
+            {:reason :different-origin :saved-origin old :origin origin})
+  (when (not= (:timeline old) (:timeline origin))
+    (let [context {:saved-timeline (:timeline old) :source-timeline (:timeline origin) :checkpoint end-lsn}]
+      (require! failover? "Publisher timeline changed and mirror failover is disabled"
+                (assoc context :reason :failover-disabled))
+      (let [switchpoint (when (< (:timeline old) (:timeline origin))
+                          (get (timeline-switchpoints replication (:timeline origin)) (:timeline old)))]
+        (require! switchpoint "Publisher timeline does not descend from the durable origin"
+                  (assoc context :reason :unrelated-timeline))
+        (require! (or (nil? end-lsn) (not (pos? (compare-lsn end-lsn switchpoint))))
+                  "Publisher timeline forked before the durable checkpoint"
+                  (assoc context :reason :timeline-fork-before-checkpoint :fork-lsn switchpoint
+                         :resnapshot-required? true))))))
+
+(defn- validate-resume! [source {:keys [slot end-lsn]} failover? timeline-changed?]
+  (let [{:keys [active? invalidation confirmed-lsn restart-lsn synced?] :as info} (slot-info source slot)]
+    (require! (or (not (:matches? info)) (= (boolean failover?) (:failover? info)))
+              "Mirror configuration and publisher slot disagree about failover"
+              {:reason :slot-failover-mismatch :slot slot :failover? (boolean failover?) :slot-status info})
+    (require! (and (compatible-slot? info failover?) (nil? invalidation) confirmed-lsn restart-lsn
+                   (not (pos? (compare-lsn restart-lsn confirmed-lsn)))
                    (not (pos? (compare-lsn confirmed-lsn end-lsn))))
               "Replication slot cannot resume from the durable checkpoint"
               {:slot slot :checkpoint end-lsn :slot-status info :resnapshot-required? true})
+    (require! (or (not timeline-changed?) synced?) "The promoted primary has no synchronized slot for the mirror"
+              {:reason :unsynchronized-slot :slot slot :checkpoint end-lsn :slot-status info :resnapshot-required? true})
+    (when active?
+      (throw (SQLException. "Replication slot is still active" "55006")))
     info))
 
 (defn- emit-barrier!
@@ -978,9 +1053,9 @@
 (defn- publish-status! [state info]
   (swap! state merge (select-keys info [:confirmed-lsn :restart-lsn :retained-wal-bytes :unconfirmed-wal-bytes])))
 
-(defn- checked-running-slot! [source slot state]
-  (let [{:keys [matches? invalidation] :as info} (slot-info source slot)]
-    (require! (and matches? (nil? invalidation))
+(defn- checked-running-slot! [source slot state failover?]
+  (let [{:keys [invalidation] :as info} (slot-info source slot)]
+    (require! (and (compatible-slot? info failover?) (nil? invalidation))
               "Replication slot is unavailable" {:slot slot :slot-status info :resnapshot-required? true})
     (publish-status! state info)))
 
@@ -1370,47 +1445,49 @@
 
 (defn- stage-tables! [{:keys [source-url publication max-snapshot-bytes max-transaction-bytes]}
                       origin manifest {:keys [conn changes tables barrier phase]} check-running!]
-  (with-open [replication (connect source-url true)
-              source (connect source-url false)
-              destination (pg/make-query-handler conn)]
-    (require! (= origin (source-identity replication source)) "Publisher changed during table refresh" {})
-    (set-copy-format! destination)
-    (let [slot (new-slot-name "pgdh_sync")
-          on-bytes (snapshot-budget check-running! max-snapshot-bytes)
-          end-lsn (with-slot-snapshot!
-                    replication source slot true
-                    (fn [position]
-                      (require-stable-manifest! manifest (publication-manifest source publication))
-                      (transaction!
-                       destination
-                       (fn []
-                         (let [relations (mapv :table changes)]
-                           (install-types! destination (publisher-types relations))
-                           (doseq [table relations]
-                             (check-running!)
-                             (create-table! destination table)))
-                         (doseq [table tables]
-                           (check-running!)
-                           (copy-table! source destination table on-bytes))))
-                      position))
-          expected (into {} (map (juxt :relation-id identity)) tables)
-          included? (set (keys expected))]
-      (reset! phase :catching-up)
-      (stream! (replication-copy replication slot publication end-lsn)
-               end-lsn end-lsn max-transaction-bytes
-               {:tick! (fn [_] (check-running!))
-                :barrier? #(= barrier %)
-                :relation-frame! (fn [{:keys [relation-id] :as message}]
-                                   (when-let [table (get expected relation-id)]
-                                     (require! (matches-relation? table message)
-                                               "Staged relation changed" {:relation relation-id})))
-                :select-change! #(select-change included? %)
-                :commit! (fn [_ _ {:keys [changes bytes barriers]}]
-                           (when (seq changes)
-                             (on-bytes bytes)
-                             (transaction! destination
-                                           #(doseq [change changes] (apply-change! destination expected change))))
-                           (contains? barriers barrier))}))))
+  (with-publisher
+    source-url
+    (fn [replication source]
+      (with-open [destination (pg/make-query-handler conn)]
+        (when (not= origin (source-identity replication source))
+          (throw (SQLException. "Publisher changed during table refresh" "08006")))
+        (set-copy-format! destination)
+        (let [slot (new-slot-name "pgdh_sync")
+              on-bytes (snapshot-budget check-running! max-snapshot-bytes)
+              end-lsn (with-slot-snapshot!
+                        replication source slot true false
+                        (fn [position]
+                          (require-stable-manifest! manifest (publication-manifest source publication))
+                          (transaction!
+                           destination
+                           (fn []
+                             (let [relations (mapv :table changes)]
+                               (install-types! destination (publisher-types relations))
+                               (doseq [table relations]
+                                 (check-running!)
+                                 (create-table! destination table)))
+                             (doseq [table tables]
+                               (check-running!)
+                               (copy-table! source destination table on-bytes))))
+                          position))
+              expected (into {} (map (juxt :relation-id identity)) tables)
+              included? (set (keys expected))]
+          (reset! phase :catching-up)
+          (stream! (replication-copy replication slot publication end-lsn)
+                   end-lsn end-lsn max-transaction-bytes
+                   {:tick! (fn [_] (check-running!))
+                    :barrier? #(= barrier %)
+                    :relation-frame! (fn [{:keys [relation-id] :as message}]
+                                       (when-let [table (get expected relation-id)]
+                                         (require! (matches-relation? table message)
+                                                   "Staged relation changed" {:relation relation-id})))
+                    :select-change! #(select-change included? %)
+                    :commit! (fn [_ _ {:keys [changes bytes barriers]}]
+                               (when (seq changes)
+                                 (on-bytes bytes)
+                                 (transaction! destination
+                                               #(doseq [change changes] (apply-change! destination expected change))))
+                               (contains? barriers barrier))}))))))
 
 (defn- start-refresh! [config origin manifest changes check-running!]
   (let [tables (into [] (comp (map :table) (remove :partition-leaves)) changes)
@@ -1564,9 +1641,10 @@
       (seq types) (assoc :types types)
       (:last-schema-refresh previous) (assoc :last-schema-refresh (:last-schema-refresh previous)))))
 
-(defn- consume! [copy source destination saved state confirmed-lsn check-running! ready! config]
-  (let [{:keys [origin manifest end-lsn publication slot]} saved
-        {:keys [max-transaction-bytes max-snapshot-bytes schema-refresh?]} config
+(defn- consume! [copy source destination saved origin state confirmed-lsn check-running! ready! config]
+  (let [{:keys [manifest end-lsn publication slot]} saved
+        {:keys [max-transaction-bytes max-snapshot-bytes schema-refresh? failover?]} config
+        origin-update (volatile! (when (not= (:origin saved) origin) origin))
         applied (volatile! manifest)
         durable (volatile! end-lsn)
         pending-schema (volatile! (or (:pending-schema manifest) {}))
@@ -1651,8 +1729,12 @@
                         (apply-commit! destination relations previous
                                        (cond-> (assoc transaction :changes changes)
                                          candidate (assoc :manifest candidate)
+                                         @origin-update (assoc :origin @origin-update)
                                          cutover?
                                          (assoc :install! #(install-staged-tables! active % check-running! max-snapshot-bytes))))
+                        (when @origin-update
+                          (swap! state assoc :source-timeline (:timeline origin))
+                          (vreset! origin-update nil))
                         (when candidate (vreset! applied candidate))))]
     (swap! state assoc :last-schema-refresh (:last-schema-refresh manifest))
     (try
@@ -1664,7 +1746,7 @@
                    (when-not @following?
                      (require! (< now initial-deadline) "Timed out waiting for the initial catch-up barrier" {}))
                    (when (>= now @next-check)
-                     (checked-running-slot! source slot state)
+                     (checked-running-slot! source slot state failover?)
                      (refresh!)
                      (vreset! next-check (+ now (.toNanos TimeUnit/SECONDS 5)))
                      (when (and @following? between-transactions? (>= now @next-watermark)
@@ -1723,30 +1805,35 @@
         (when-let [active @stage] (stop-refresh! active))
         (swap! state dissoc :refresh)))))
 
-(defn- replicate! [{:keys [source-url publication slot-prefix max-snapshot-bytes] :as config}
+(defn- replicate! [{:keys [source-url publication slot-prefix max-snapshot-bytes failover?] :as config}
                    destination state check-running! ready!]
-  (with-open [replication (connect source-url true)
-              source (connect source-url false)]
-    (let [origin (source-identity replication source)
-          saved (or (checkpoint destination)
-                    (let [slot (new-slot-name slot-prefix)]
+  (with-publisher
+    source-url
+    (fn [replication source]
+      (let [origin (source-identity replication source)
+            saved (or (checkpoint destination)
+                      (let [slot (new-slot-name slot-prefix)]
                       ;; Validate before creating a slot that pins WAL.
-                      (publication-manifest source publication)
-                      (init-checkpoint! destination origin slot publication)
-                      (checkpoint destination)))]
-      (require! (= [origin publication] ((juxt :origin :publication) saved))
-                "The mirror belongs to a different publisher, timeline, or publication"
-                {:saved-origin (:origin saved) :origin origin :saved-publication (:publication saved)})
-      (swap! state assoc :slot (:slot saved) :applied-lsn (:end-lsn saved))
-      (when-not (:end-lsn saved)
-        (swap! state assoc :state :snapshot)
-        (bootstrap! replication source destination saved check-running! max-snapshot-bytes)))
-    (let [{:keys [slot end-lsn] :as saved} (checkpoint destination)
-          {:keys [confirmed-lsn] :as info} (validate-resume! source saved)]
-      (publish-status! state info)
-      (swap! state assoc :state :catching-up :applied-lsn end-lsn)
-      (consume! (replication-copy replication slot publication confirmed-lsn)
-                source destination saved state confirmed-lsn check-running! ready! config))))
+                        (publication-manifest source publication)
+                        (init-checkpoint! destination origin slot publication)
+                        (checkpoint destination)))]
+        (require! (= publication (:publication saved)) "The mirror belongs to a different publication"
+                  {:reason :different-publication :saved-publication (:publication saved)})
+        (validate-origin! replication saved origin failover?)
+        (swap! state assoc :slot (:slot saved) :applied-lsn (:end-lsn saved)
+               :source-timeline (get-in saved [:origin :timeline]))
+        (let [{:keys [slot end-lsn] :as saved} (if (:end-lsn saved)
+                                                 saved
+                                                 (do
+                                                   (swap! state assoc :state :snapshot)
+                                                   (bootstrap! replication source destination (assoc saved :origin origin)
+                                                               failover? check-running! max-snapshot-bytes)
+                                                   (checkpoint destination)))
+              {:keys [confirmed-lsn] :as info} (validate-resume! source saved failover? (not= (:origin saved) origin))]
+          (publish-status! state info)
+          (swap! state assoc :state :catching-up :applied-lsn end-lsn :source-timeline (get-in saved [:origin :timeline]))
+          (consume! (replication-copy replication slot publication confirmed-lsn)
+                    source destination saved origin state confirmed-lsn check-running! ready! config))))))
 
 (defn- retryable? [error]
   (and (instance? SQLException error)
@@ -1837,7 +1924,7 @@
   "Start a PostgreSQL 18 subscriber. Bootstrap and catch-up run asynchronously.
    The :server options are passed to the read-only pgwire listener after catch-up.
    Monitor with status and release resources with stop!. Use a dedicated :store-path."
-  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes schema-refresh?]
+  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes schema-refresh? failover?]
     :or {slot-prefix "pgdh_mirror"
          max-snapshot-bytes (* 128 1024 1024)
          max-transaction-bytes (* 64 1024 1024)}
@@ -1849,6 +1936,7 @@
             "Expected a store path, slot prefix and positive byte limits" {})
   (require! (or (nil? schema-refresh?) (boolean? schema-refresh?))
             "Expected a boolean schema-refresh? option" {})
+  (require! (or (nil? failover?) (boolean? failover?)) "Expected a boolean failover? option" {})
   (require! (and (or (nil? server) (map? server))
                  (not-any? #(get server %) [:database-template :on-create-database :on-delete-database]))
             "Mirror listeners do not support database provisioning" {})
