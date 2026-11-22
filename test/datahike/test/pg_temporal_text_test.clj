@@ -676,6 +676,23 @@
     (is (= "22007" (first (err-of c "SELECT '2001-02-03T04:05:06'::time"))))
     (is (= "22007" (first (err-of c "SELECT '2001-02-03'::time"))))))
 
+(deftest postgres-time-input-needs-a-date-for-variable-zone-offsets
+  (with-open [c (jdbc)]
+    (is (= "15:36:39" (one c "SELECT '2003-03-07 15:36:39 America/New_York'::time")))
+    (is (= "15:36:39-05" (one c "SELECT '2003-03-07 15:36:39 America/New_York'::timetz")))
+    (is (= "15:36:39-04" (one c "SELECT '2003-07-07 15:36:39 America/New_York'::timetz")))
+    (is (= "15:36:39+00" (one c "SELECT '15:36:39 Etc/UTC'::timetz")))
+    (exec! c "CREATE TABLE time_zone_input (v time(2))")
+    (exec! c "INSERT INTO time_zone_input VALUES ('2003-03-07 15:36:39 America/New_York')")
+    (exec! c "INSERT INTO time_zone_input VALUES ('2003-07-07 15:36:39 America/New_York')")
+    (is (= "22007" (first (err-of c "INSERT INTO time_zone_input VALUES ('15:36:39 America/New_York')"))))
+    (is (= "2" (one c "SELECT count(*) FROM time_zone_input")))
+    (doseq [sql-type ["time" "timetz"]]
+      (is (= "22007" (first (err-of c (str "SELECT '15:36:39 America/New_York'::" sql-type)))))
+      (is (= "f" (one c (str "SELECT pg_input_is_valid('15:36:39 America/New_York', '" sql-type "')"))))
+      (is (= "22007" (one c (str "SELECT sql_error_code FROM "
+                                 "pg_input_error_info('15:36:39 America/New_York', '" sql-type "')")))))))
+
 (deftest reserved-datetime-inputs
   (with-open [c (jdbc)]
     (testing "epoch and allballs"

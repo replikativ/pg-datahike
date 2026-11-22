@@ -444,14 +444,17 @@
             (when (time-overflows? tm) (dec/dterr :field-overflow))
             (when (not= (set/intersection fmask dec/time-fields) dec/time-fields)
               (dec/dterr :bad-format))
-            ;; A zone that is not a plain offset needs a DATE to resolve
-            ;; against. With no date at all the CURRENT date is used;
-            ;; with a partial one it is an error.
+            ;; A named zone with a variable offset needs an explicit date.
+            ;; Only a dynamic abbreviation or the session zone can fall back
+            ;; to the current date.
             (let [has-date? (= (set/intersection fmask dec/date-fields) dec/date-fields)
                   partial-date? (and (not has-date?)
                                      (seq (set/intersection fmask dec/date-fields)))
                   zone (or zone (when zone? {:kind :session}))]
               (when (and zone (not= (:kind zone) :offset) partial-date?)
+                (dec/dterr :bad-format))
+              (when (and (not has-date?) (= :named (:kind zone))
+                         (nil? (zone/fixed-offset (zone/resolve-zone-name (:name zone)))))
                 (dec/dterr :bad-format))
               {:dtype (:dtype st) :tm tm :fields fmask :zone zone
                ;; A DELAY, because reading the clock must not be

@@ -1477,8 +1477,8 @@
    :sql-sha256 "35b80fe866e9eff0ff23f4d100fddbfa5d52db0c54d705fb5e5160f004f4292d",
    :expected-sha256 "08f0aa98270b120a459af4940cee0f8ed4e64f86c79327b641f831d62e87c860",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :scalar-and-structural-types}
+   :status :campaign,
+   :wave 2}
   {:name "transactions",
    :scheduled? true,
    :sql-sha256 "6889e30b2347e32933bec4b5d84c4bd699b2a2781d908a6bd848dd4172433252",
