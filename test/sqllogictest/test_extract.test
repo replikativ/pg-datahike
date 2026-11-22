@@ -2,6 +2,11 @@
 # EXTRACT function for date/time components, DATE_TRUNC with various units.
 # Inspired by PostgreSQL regression/date.sql and timestamp.sql.
 
+# Convert stored epoch seconds to a PostgreSQL timestamp before truncating.
+
+statement ok
+SET TIME ZONE 'UTC'
+
 statement ok
 CREATE TABLE events (ts INTEGER, label TEXT)
 
@@ -19,7 +24,7 @@ INSERT INTO events VALUES (1705311045, 'a'), (1705324500, 'b'), (1708416000, 'c'
 # ============================================================
 
 query II rowsort
-SELECT DATE_TRUNC('day', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('day', ts)
+SELECT EXTRACT(EPOCH FROM DATE_TRUNC('day', TO_TIMESTAMP(ts)))::bigint, COUNT(*) FROM events GROUP BY 1
 ----
 1705276800	2
 1708387200	1
@@ -30,7 +35,7 @@ SELECT DATE_TRUNC('day', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('day', ts
 # ============================================================
 
 query II rowsort
-SELECT DATE_TRUNC('hour', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('hour', ts)
+SELECT EXTRACT(EPOCH FROM DATE_TRUNC('hour', TO_TIMESTAMP(ts)))::bigint, COUNT(*) FROM events GROUP BY 1
 ----
 1705309200	1
 1705323600	1
@@ -42,7 +47,7 @@ SELECT DATE_TRUNC('hour', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('hour', 
 # ============================================================
 
 query I rowsort
-SELECT DATE_TRUNC('minute', ts) FROM events
+SELECT EXTRACT(EPOCH FROM DATE_TRUNC('minute', TO_TIMESTAMP(ts)))::bigint FROM events
 ----
 1705311000
 1705324500
@@ -54,7 +59,7 @@ SELECT DATE_TRUNC('minute', ts) FROM events
 # ============================================================
 
 query II rowsort
-SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('month', ts)
+SELECT EXTRACT(EPOCH FROM DATE_TRUNC('month', TO_TIMESTAMP(ts)))::bigint, COUNT(*) FROM events GROUP BY 1
 ----
 1704067200	2
 1706745600	1

@@ -148,8 +148,11 @@
     (is (nil? (v "SELECT pg_get_viewdef('\"Mirror View\"', NULL::boolean)")))
     (doseq [[sql state] [["SELECT pg_get_viewdef('23')" "42P01"]
                          ["SELECT pg_get_viewdef('missing_schema.some_view')" "3F000"]
+                         ["SELECT 'missing_schema.some_view'::regclass" "42P01"]
                          ["SELECT pg_get_viewdef('\"Mirror View\"', NULL)" "42725"]]]
       (is (= state (.-sqlstate ^PgWireServer$QueryResult (run sql))) sql)))
+  (is (= "42P01" (v (str "SELECT sql_error_code FROM pg_input_error_info("
+                         "'missing_schema.some_view', 'regclass')"))))
   (is (nil? (err "SET search_path TO pg_catalog")))
   (is (= "42P01" (.-sqlstate ^PgWireServer$QueryResult
                   (run "SELECT pg_get_viewdef('\"Mirror View\"')"))))
