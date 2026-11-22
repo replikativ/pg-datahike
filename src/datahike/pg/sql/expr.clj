@@ -1311,15 +1311,32 @@
     (swap! (:in-args ctx) conj session-fn)
     (ctx/materialize-arg! ctx (list fn-param))))
 
+(defn- timezone-operand-oid [ctx operand]
+  (cond
+    (instance? Parenthesis operand)
+    (recur ctx (.getExpression ^Parenthesis operand))
+
+    (and (instance? ParenthesedExpressionList operand) (= 1 (count operand)))
+    (recur ctx (first operand))
+
+    :else (first (call-arg-oids ctx [operand]))))
+
 (defn- timezone-value! [ctx v value-oid]
-  (let [v (ctx/materialize-arg! ctx v)]
-    (if (= value-oid types/oid-time)
-      ;; The timezone overloads take timetz. An ordinary time picks up
-      ;; the session offset through PostgreSQL's implicit cast.
-      (ctx/materialize-arg!
-       ctx (list 'datahike.pg.query-fns/sql-timezone-local
-                 v value-oid (session-temporal-context! ctx)))
-      v)))
+  (cond
+    (#{types/oid-date types/oid-time} value-oid)
+    ;; DATE uses the preferred timestamptz overload. Place its midnight in
+    ;; the session zone before applying the zone supplied by the query.
+    ;; TIME has a single implicit candidate, timetz, in the same session.
+    (ctx/materialize-arg!
+     ctx (list 'datahike.pg.query-fns/sql-timezone-local
+               (ctx/materialize-arg! ctx v)
+               (if (= value-oid types/oid-date) types/oid-timestamp value-oid)
+               (session-temporal-context! ctx)))
+
+    (and (nil? value-oid) (string? v))
+    (sql-cast/cast-scalar v "timestamptz" {:explicit? true :prefer-local-datetime? true})
+
+    :else (ctx/materialize-arg! ctx v)))
 
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
@@ -1464,7 +1481,7 @@
 
       ;; timezone(zone, value) is `value AT TIME ZONE zone`.
       (and (= fname "timezone") (= 2 (count args)))
-      (let [value-oid (source-oid ctx (second params))
+      (let [value-oid (timezone-operand-oid ctx (second arg-exprs))
             kind (condp contains? value-oid
                    #{types/oid-timestamp} :timestamp
                    #{types/oid-time types/oid-timetz} :timetz
@@ -8186,7 +8203,7 @@
           left-oid (if (and (instance? Function left)
                             (= "now" (str/lower-case (.getName ^Function left))))
                      types/oid-timestamptz
-                     (source-oid ctx left))]
+                     (timezone-operand-oid ctx left))]
       (first (reduce (fn [[v oid] z] (apply-zone v oid z))
                      [(translate-expr ctx left) left-oid]
                      zones)))

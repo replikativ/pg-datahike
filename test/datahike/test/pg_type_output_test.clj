@@ -117,6 +117,25 @@
     (is (= "22023" (state c "SELECT ts AT TIME ZONE '<EAST>-02:60' FROM tv")))
     (is (= "22023" (state c "SELECT ts AT TIME ZONE 'Mars/Olympus' FROM tv")))))
 
+(deftest timezone-coerces-date-and-untyped-timestamp-operands
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'America/New_York'")
+    (is (= [["2024-03-10 05:00:00" "2024-03-10 05:00:00"]]
+           (rows c (str "SELECT date '2024-03-10' AT TIME ZONE 'UTC', "
+                        "timezone('UTC', date '2024-03-10')"))))
+    (is (= [["2024-03-10 01:30:00.123456" "2024-03-10 01:30:00.123456"]]
+           (rows c (str "SELECT ('2024-03-10 03:30:00.123456+02') AT TIME ZONE 'UTC', "
+                        "timezone('UTC', '2024-03-10 03:30:00.123456+02')"))))
+    (exec! c "CREATE TABLE timezone_days (d date)")
+    (exec! c "INSERT INTO timezone_days VALUES ('2024-03-10'), (NULL)")
+    (exec! c "PREPARE zone_days AS SELECT d AT TIME ZONE 'UTC' FROM timezone_days ORDER BY d")
+    (is (= [["2024-03-10 05:00:00"] [nil]] (rows c "EXECUTE zone_days")))
+    (exec! c "BEGIN")
+    (exec! c "SET LOCAL TIME ZONE 'Europe/Paris'")
+    (is (= [["2024-03-09 23:00:00"] [nil]] (rows c "EXECUTE zone_days")))
+    (exec! c "ROLLBACK")
+    (is (= [["2024-03-10 05:00:00"] [nil]] (rows c "EXECUTE zone_days")))))
+
 (deftest historical-time-zone-abbreviations
   (with-open [c (jdbc)]
     (exec! c "SET TIME ZONE 'UTC'")
