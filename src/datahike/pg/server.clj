@@ -1424,37 +1424,31 @@
        (::record-effects-from-report (meta (second op)))))
 
 (defn- committed-write-eas
-  "Attribute deferred cleanup from the writer report. Keep entity deletions
-   as row-wide conflicts and preserve unrelated unknown operations."
+  "Include indirect effects of entity retractions and deferred sequence
+   cleanup. Keep submitted row tombstones and unknown operations opaque."
   [{:keys [db-before db-after tx-data]} submitted]
-  (let [estimated (tx-buffer-eas submitted db-before)]
-    (if (and (= ::opaque estimated) (some record-effects-from-report? submitted))
-      (let [direct (tx-buffer-eas (remove record-effects-from-report? submitted) db-before)]
-        (if (set? direct)
-          (let [with-deleted-entities
-                (into direct
-                      (comp (remove :added)
-                            (map :e)
-                            (distinct)
-                            (remove #(contains? direct [% ::all]))
-                            (filter #(empty? (dbi/datoms db-after :eavt [%])))
-                            (map #(vector % ::all)))
-                      tx-data)]
-            (into with-deleted-entities
-                  (keep (fn [^datahike.datom.Datom datom]
-                          (let [eid (.-e datom)
-                                attribute (.-a datom)
-                                ident (if (number? attribute)
-                                        (or (dbi/-ident-for db-after attribute)
-                                            (dbi/-ident-for db-before attribute)
-                                            attribute)
-                                        attribute)]
-                            (when (and (not= :db/txInstant ident)
-                                       (not (contains? with-deleted-entities [eid ::all])))
-                              [eid ident]))))
-                  tx-data))
-          direct))
-      estimated)))
+  (let [estimated (tx-buffer-eas submitted db-before)
+        deferred? (and (= ::opaque estimated) (some record-effects-from-report? submitted))
+        direct (if deferred?
+                 (tx-buffer-eas (remove record-effects-from-report? submitted) db-before)
+                 estimated)]
+    (if (and (set? direct)
+             (or deferred?
+                 (some #(and (vector? %)
+                             (#{:db/retractEntity :db.fn/retractEntity} (first %)))
+                       submitted)))
+      (into direct
+            (keep (fn [^datahike.datom.Datom datom]
+                    (let [attribute (.-a datom)
+                          ident (if (number? attribute)
+                                  (or (dbi/-ident-for db-after attribute)
+                                      (dbi/-ident-for db-before attribute)
+                                      attribute)
+                                  attribute)]
+                      (when-not (= :db/txInstant ident)
+                        [(.-e datom) ident]))))
+            tx-data)
+      direct)))
 
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the

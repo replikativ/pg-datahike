@@ -171,3 +171,22 @@
       (is (= [["1" "10"]]
              (pairs a (str "SELECT d.id, t.id FROM replay_doc d JOIN replay_target t "
                            "ON d.link = t.db_id WHERE d.id = 1")))))))
+
+(deftest deleting-a-native-reference-target-records-the-inbound-write
+  (with-open [a (jdbc)
+              b (jdbc)
+              sa (.createStatement a)
+              sb (.createStatement b)]
+    (.execute sa "BEGIN")
+    (is (= 1 (.executeUpdate sa "UPDATE person SET company = 2 WHERE id = 1")))
+    (is (= 1 (.executeUpdate sb "DELETE FROM company WHERE id = 1")))
+    (is (= [["Alice" nil]]
+           (pairs b "SELECT name, company FROM person WHERE id = 1")))
+    (is (= "40001"
+           (try
+             (.execute sa "COMMIT")
+             nil
+             (catch java.sql.SQLException e
+               (.getSQLState e)))))
+    (is (= [["Alice" nil]]
+           (pairs b "SELECT name, company FROM person WHERE id = 1")))))
