@@ -49,6 +49,8 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.catalog.regoid :as regoid]
+            [datahike.pg.pg-catalog :as pg-catalog]
             [datahike.pg.errors :as errors]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.geo :as geo]
@@ -1353,6 +1355,43 @@
 
     :else (ctx/materialize-arg! ctx v)))
 
+(def ^:private viewdef-oid-inputs
+  (into #{types/oid-oid}
+        (keep (fn [{:keys [source target context]}]
+                (when (and (= target types/oid-oid) (= context "i")) source)))
+        pg-catalog/casts))
+
+(defn- viewdef-by-name? [fname oids]
+  (let [[relation modifier] oids
+        by-name? (or (nil? relation) (types/implicit-coercible? relation types/oid-text))
+        by-oid? (or (nil? relation) (contains? viewdef-oid-inputs relation))]
+    (case (count oids)
+      1 (cond
+          by-name? true
+          by-oid? false
+          :else (throw (no-such-function fname oids)))
+      2 (cond
+          ;; With an unknown modifier, PostgreSQL can use the one known
+          ;; argument type to distinguish a wrap width from a pretty flag.
+          (nil? modifier)
+          (cond
+            (and relation by-name?) true
+            (and relation by-oid? (types/implicit-coercible? relation types/oid-int4)) false
+            by-oid? (throw (errors/pg-error
+                            :ambiguous-function
+                            {:message (str "function " fname "("
+                                           (str/join ", " (map #(get types/oid->pg-name % "unknown") oids))
+                                           ") is not unique")
+                             :hint (str "Could not choose a best candidate function. "
+                                        "You might need to add explicit type casts.")}))
+            :else (throw (no-such-function fname oids)))
+
+          (and by-name? (types/implicit-coercible? modifier types/oid-bool)) true
+          (and by-oid? (or (types/implicit-coercible? modifier types/oid-bool)
+                           (types/implicit-coercible? modifier types/oid-int4))) false
+          :else (throw (no-such-function fname oids)))
+      (throw (no-such-function fname oids)))))
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -1717,7 +1756,7 @@
 
       (= fname "pg_get_viewdef")
       (let [fn-param (symbol (str "?viewdef" (swap! (:var-counter ctx) inc)))
-            path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+            by-name? (viewdef-by-name? fname (call-arg-oids ctx arg-exprs))
             db (:db ctx)
             definitions (if db
                           (into {}
@@ -1735,15 +1774,17 @@
                                                [?e :datahike.pg/view-definition ?definition]]}
                                      db))
                           {})
-            impl-fn (fn [oid & _]
-                      (let [oid (cond
-                                  (number? oid) (long oid)
-                                  (string? oid) (try (Long/parseLong oid)
-                                                     (catch Exception _ nil))
-                                  :else nil)]
-                        (if-let [definition (get definitions oid)]
-                          (render-view-definition db definition path)
-                          :__null__)))]
+            impl-fn (fn [reference & modifiers]
+                      (if (some #(or (nil? %) (fns/sql-null? %)) (cons reference modifiers))
+                        :__null__
+                        (let [oid (if by-name?
+                                    (binding [regoid/*db* db
+                                              regoid/*relation-db* db]
+                                      (regoid/relation-name-oid reference))
+                                    (sql-cast/cast-to-integer reference "oid"))]
+                          (if-let [definition (get definitions oid)]
+                            (render-view-definition db definition regoid/*search-path*)
+                            :__null__))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj

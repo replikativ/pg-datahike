@@ -167,10 +167,18 @@
         _ (when (and (or (nil? schema) (= schema "pg_temp")) (contains? temps name))
             (throw (ex-info "temporary relation OID aliases require temporary schema identities"
                             {:sqlstate "0A000" :regoid-hard-error? true})))
-        path (if schema [(namespace-oid *db* schema)] (search-path *db*))
+        path (if schema
+               [(or (namespace-oid *db* schema)
+                    (fail! "3F000" (str "schema \"" schema "\" does not exist")))]
+               (search-path *db*))
         found (some #(relation {:namespace-oid % :name name}) (remove nil? path))]
     (or (:oid found)
         (fail! "42P01" (str "relation \"" (str/join "." names) "\" does not exist")))))
+
+(defn relation-name-oid
+  "Look up a relation name along the SQL search path. Numeric strings are names."
+  [value]
+  (relation-input (parse-qualified-name value)))
 
 (defn- namespace-input [names]
   (when-not (= 1 (count names)) (fail! "42602" "invalid name syntax"))
@@ -635,7 +643,7 @@
               (fail! "22003" "OID out of range")))
           (numeric-oid s)
           (case kind
-            "regclass" (relation-input (parse-qualified-name s))
+            "regclass" (relation-name-oid s)
             "regnamespace" (namespace-input (parse-qualified-name s))
             "regtype" (type-oid *db* s)
             (let [[names args] (if (= kind "regprocedure")

@@ -227,7 +227,10 @@
       item-typmods)))
 
 (defn- translate-create-view [^CreateView cv schema db]
-  (let [view-name (unquote-ident (str (.getView cv)))
+  (let [^Table view (.getView cv)
+        view-name (unquote-ident (if (= "public" (unquote-ident (.getSchemaName view)))
+                                   (.getName view)
+                                   (str view)))
         existing-eid (ffirst
                       (d/q '{:find [?e]
                              :in [$ ?name-attr ?view-name]
