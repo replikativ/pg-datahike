@@ -495,8 +495,8 @@
    ;; default name-from-ident path for unhinted columns.
    :col-overrides (merge-with merge
                               (reduce-kv (fn [acc ident h]
-                                           (if-let [col (when-not (or (:hidden h)
-                                                                      (= ident :datahike.pg.schema/catalog-db))
+                                           (if-let [col (when-not (or (= ident :datahike.pg.schema/catalog-db)
+                                                                      (:hidden h))
                                                           (:column h))]
                                              (let [ns (namespace ident)]
                                                (assoc-in acc [ns col] ident))
