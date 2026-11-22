@@ -1631,6 +1631,16 @@
     ;; Parse the text side with the record's element type and compare.
     (and (pg-arr/array? a) (string? b)) (sql-eq? a (pg-arr/from-pg-text b (:elem-type a)))
     (and (pg-arr/array? b) (string? a)) (sql-eq? (pg-arr/from-pg-text a (:elem-type b)) b)
+    (and (pg-arr/array? a) (pg-arr/array? b))
+    (let [elem-eq? (case (:elem-type a)
+                     :jsonb jb/jsonb-eq?
+                     :bpchar (fn [x y] (= (some-> x (str/replace #" +\z" ""))
+                                          (some-> y (str/replace #" +\z" ""))))
+                     sql-eq?)]
+      (and (= (:elem-type a) (:elem-type b))
+           (= (:dims a) (:dims b))
+           (= (:lbounds a) (:lbounds b))
+           (every? true? (map elem-eq? (pg-arr/flat-elements a) (pg-arr/flat-elements b)))))
     (and (bytes? a) (bytes? b)) (java.util.Arrays/equals ^bytes a ^bytes b)
     ;; INTERVAL uses the OPCLASS equality, not `.equals`. The carrier's
     ;; `.equals` is representational -- PostgreSQL's `datumIsEqual`, the

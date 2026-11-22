@@ -351,7 +351,9 @@
        ;; A timestamptz is an INSTANT, so it takes the Date carrier --
        ;; the same choice `cast-scalar` makes, for the same reason.
        :timestamptz (pair 'datahike.pg.datetime.in/timestamptz-in
-                          'datahike.pg.datetime.carrier/->date-value)})))
+                          'datahike.pg.datetime.carrier/->date-value)
+       :precise-timestamptz (pair 'datahike.pg.datetime.in/timestamptz-in
+                                  'datahike.pg.datetime.carrier/->offset-datetime)})))
 
 (def ^:private parsers
   {types/oid-bool parse-bool
@@ -409,6 +411,14 @@
    handled here."
   [oid]
   (get parsers oid))
+
+(defn array-element-parser
+  "Use a microsecond-precise carrier for array elements. Scalar callers
+   can keep the legacy instant carrier."
+  [oid]
+  (if (= oid types/oid-timestamptz)
+    (:precise-timestamptz @temporal-in)
+    (parser oid)))
 
 (defn parse
   "Read `s` as a value of type `oid` with PostgreSQL's input function,

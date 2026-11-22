@@ -2053,6 +2053,32 @@
         result-var)
 
       ;; --- Array meta functions -----------------------------------------
+      (#{"array_dims" "array_ndims"} fname)
+      (let [[oid :as oids] (call-arg-oids ctx arg-exprs)
+            element-oid (or (types/array-oid->element-oid oid)
+                            (let [{:keys [typelem typcategory]} (types/catalog-type oid)]
+                              (when (and (= "A" typcategory) (pos? typelem)) typelem)))
+            _ (when (or (not= 1 (count oids)) (and oid (nil? element-oid)))
+                (throw (no-such-function fname oids)))
+            _ (when-not element-oid
+                (throw (ex-info "could not determine polymorphic type because input has type unknown"
+                                {:sqlstate "42804"})))
+            element-type (types/oid->elem-kw element-oid)
+            fn-param (symbol (str "?arr-shape" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [arr]
+                      (let [a (coerce-pg-array arr element-type)]
+                        (if (and a (pos? (pg-arr/length a)))
+                          (if (= fname "array_ndims")
+                            (pg-arr/ndim a)
+                            (apply str
+                                   (for [d (range 1 (inc (pg-arr/ndim a)))]
+                                     (str "[" (pg-arr/lbound a d) ":" (pg-arr/ubound a d) "]"))))
+                          :__null__)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
+        result-var)
+
       ;; array_length(arr, dim) — NULL for empty or out-of-range dim,
       ;; per-dim count otherwise. Note PG returns NULL for length-0
       ;; even when dim is in range, so we check positivity.
@@ -8505,10 +8531,10 @@
    (or
     ;; An explicit `::jsonb` cast is a jsonb operand even though it is
     ;; not a column — `'[1,2,3]'::jsonb - 1`.
-    (and (instance? CastExpression expr)
-         (contains? #{"json" "jsonb"}
-                    (some-> ^CastExpression expr .getColDataType .getDataType
-                            str/lower-case)))
+    (when (instance? CastExpression expr)
+      (let [target (.getColDataType ^CastExpression expr)]
+        (and (empty? (.getArrayData target))
+             (contains? #{"json" "jsonb"} (some-> target .getDataType str/lower-case)))))
     ;; UPDATE ... FROM rows are runtime constant bindings rather than
     ;; relations in ctx.  Type probing must therefore be tolerant of an
     ;; otherwise-unresolvable qualified binding (`v.j`), just as

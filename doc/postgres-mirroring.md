@@ -82,11 +82,12 @@ column projections require separate handling.
 
 Supported column types are boolean, smallint, integer, bigint, real, double
 precision, numeric, text, varchar, character, bytea, uuid, date, time,
-timetz, timestamp, timestamptz, json, jsonb, text[], and tsvector.
+timetz, timestamp, timestamptz, json, jsonb, and tsvector. The mirror also
+supports arrays of these types, with element typmods, value dimensions,
+and lower bounds.
 The subscriber preserves character widths, numeric precision and scale,
 and time and timestamp precision. Snapshot COPY and live apply preserve
-PostgreSQL microseconds, `24:00:00`, `timetz` offsets, and `text[]`
-lower bounds. Array support in the subscriber currently covers `text[]`.
+PostgreSQL microseconds, `24:00:00`, and `timetz` offsets.
 
 The subscriber also copies enums in `public` and domains in `public`
 over supported scalar built-in types without base type modifiers.
@@ -335,6 +336,10 @@ with PostgreSQL. Pass `--full-identity` to run the key changes with
 `REPLICA IDENTITY FULL`, including mode changes, key-changing updates,
 unchanged toasted values, and restart. Pass `--full-identity-recovery` to
 exercise the snapshot and crash-replay probe with keyed `FULL` tables.
+Pass `--index-identity` to exercise index-based apply, index changes, and
+restart with a keyed table and a keyless join table.
+Pass `--array-refresh` to exercise adding and removing columns, changing an
+array element typmod, and matching rows by equivalent array keys at cutover.
 Pass `--partitions` to check populated attachment, detachment, reattachment,
 truncation and crash recovery under leaf routing.
 Pass `--root-publication` to run the same comparison with a matched

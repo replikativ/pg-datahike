@@ -641,6 +641,8 @@
                (cond
                  (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)
                  (pg-arr/array? v)   (pg-arr/to-pg-text v)
+                 (and (string? v) (types/session-formatted-array-oids src-oid))
+                 (types/->pg-text v src-oid)
                  (string? v)
                  (if (and (= types/oid-bpchar src-oid)
                           (not (#{"char" "character" "bpchar"} (types/base-type-name-of type-str))))

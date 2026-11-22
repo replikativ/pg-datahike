@@ -8562,7 +8562,7 @@
       (when-not (types/cast-category target)
         (throw (errors/pg-error :feature-not-supported
                                 {:feature "assignment to this array element type"})))
-      (sql-cast/cast-scalar value target {:explicit? false}))))
+      (sql-cast/cast-scalar value target {:explicit? false :prefer-local-datetime? true}))))
 
 (defn coerce-array-value
   "Canonicalize every array leaf through its assignment codec, retaining

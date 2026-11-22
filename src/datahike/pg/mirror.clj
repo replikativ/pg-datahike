@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
+            [datahike.pg.arrays :as arrays]
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.constraints.unique :as unique]
             [datahike.pg.jsonb :as jsonb]
@@ -31,7 +32,7 @@
 
 (def ^:private sql-types
   {16 "boolean" 17 "bytea" 20 "bigint" 21 "smallint" 23 "integer" 25 "text"
-   114 "json" 700 "real" 701 "double precision" 1009 "text[]"
+   114 "json" 700 "real" 701 "double precision"
    1042 "bpchar" 1043 "varchar" 1082 "date" 1083 "time" 1114 "timestamp"
    1184 "timestamptz" 1266 "timetz" 1700 "numeric" 2950 "uuid"
    3614 "tsvector" 3802 "jsonb"})
@@ -137,17 +138,19 @@
       {:system-id (.getString result "systemid")
        :timeline (.getLong result "timeline") :database database :database-oid database-oid})))
 
-(defn- builtin-ddl-type [{:keys [oid typmod]}]
-  (let [base (sql-types oid)]
-    (cond
-      (= -1 typmod) base
-      (and (#{1042 1043} oid) (> typmod types/var-hdr-sz))
-      (str base "(" (- typmod types/var-hdr-sz) ")")
-      (and (#{1083 1114 1184 1266} oid) (<= 0 typmod 6)) (str base "(" typmod ")")
-      (= 1700 oid)
-      (let [[precision scale] (types/decode-numeric-typmod typmod)]
-        (when (and precision (<= 1 precision 1000) (<= -1000 scale 1000))
-          (str base "(" precision "," scale ")"))))))
+(defn- builtin-ddl-type [{:keys [oid typmod] :as column}]
+  (if-let [element-oid (types/array-oid->element-oid oid)]
+    (some-> (builtin-ddl-type (assoc column :oid element-oid)) (str "[]"))
+    (let [base (sql-types oid)]
+      (cond
+        (= -1 typmod) base
+        (and (#{1042 1043} oid) (> typmod types/var-hdr-sz))
+        (str base "(" (- typmod types/var-hdr-sz) ")")
+        (and (#{1083 1114 1184 1266} oid) (<= 0 typmod 6)) (str base "(" typmod ")")
+        (= 1700 oid)
+        (let [[precision scale] (types/decode-numeric-typmod typmod)]
+          (when (and precision (<= 1 precision 1000) (<= -1000 scale 1000))
+            (str base "(" precision "," scale ")")))))))
 
 (defn- column-ddl-type [{:keys [user-type] :as column}]
   (if user-type (ident (:name user-type)) (builtin-ddl-type column)))
@@ -284,7 +287,8 @@
      :column-issues
      (when column
        (let [source-type (.getString row "source_type")
-             can-select (.getObject row "can_select")]
+             can-select (.getObject row "can_select")
+             builtin? (builtin-ddl-type (assoc column :typmod -1))]
          (mapv #(assoc % :column column-name :source-type source-type)
                (cond-> []
                  (not= "" (.getString row "attgenerated")) (conj {:reason :generated-column})
@@ -293,9 +297,9 @@
                  (false? can-select) (conj {:reason :missing-select})
                  (:problem user-type)
                  (conj {:reason :type-definition :detail (:problem user-type) :oid (:oid column)})
-                 (and (nil? user-type) (not (contains? sql-types (:oid column))))
+                 (and (nil? user-type) (not builtin?))
                  (conj {:reason :type :oid (:oid column)})
-                 (and (contains? sql-types (:oid column)) (nil? (column-ddl-type column)))
+                 (and builtin? (nil? (column-ddl-type column)))
                  (conj {:reason :type-modifier :typmod (:typmod column)})))))}))
 
 (defn- scan-publication [source publication]
@@ -1049,8 +1053,8 @@
               {:table (:name table) :columns (count columns) :values (count values)})
     (mapv vector columns values)))
 
-(defn- cast-param [{:keys [oid user-type]}]
-  (str "CAST(? AS " (if user-type (ident (:name user-type)) (sql-types oid)) ")"))
+(defn- cast-param [column]
+  (str "CAST(? AS " (column-ddl-type (assoc column :typmod -1)) ")"))
 
 (defn- locator-column-predicate [table]
   (if-let [index (:identity-index table)]
@@ -1502,12 +1506,19 @@
             :else [:db/add eid attr new]))
         (map vector attrs previous values)))
 
+(defn- scalar-key [oid value]
+  (condp = oid
+    types/oid-jsonb (jsonb/parse-jsonb value)
+    types/oid-bpchar (some-> value (str/replace #" +\z" ""))
+    (unique/canonical-key-value value)))
+
 (defn- previous-key [columns values]
   (mapv (fn [{:keys [oid user-type]} value]
-          (condp = (or (get-in user-type [:base-type :oid]) oid)
-            types/oid-jsonb (jsonb/parse-jsonb value)
-            types/oid-bpchar (some-> value (str/replace #" +\z" ""))
-            (unique/canonical-key-value value)))
+          (let [oid (or (get-in user-type [:base-type :oid]) oid)]
+            (if-let [elem-oid (when (some? value) (types/array-oid->element-oid oid))]
+              (let [array (arrays/from-pg-text value (types/oid->elem-kw elem-oid))]
+                [(:dims array) (:lbounds array) (mapv #(scalar-key elem-oid %) (arrays/flat-elements array))])
+              (scalar-key oid value))))
         columns values))
 
 (defn- enum-renames [type-changes]

@@ -196,6 +196,7 @@
    :json        oid-json
    :money       oid-money
    :jsonb       oid-jsonb
+   :tsvector    oid-tsvector
    :point       oid-point
    :lseg        oid-lseg
    :path        oid-path
@@ -402,6 +403,7 @@
    "uuid"              :uuid
    "json"              :json
    "jsonb"             :jsonb
+   "tsvector"          :tsvector
    "bytea"             :bytea
    "oid"               :oid
    ;; The geometric and MAC families. Omitting them did not make
@@ -1403,6 +1405,9 @@
     (if (neg? tm)
       base
       (cond
+        (array-oid->element-oid oid)
+        (str (format-type (array-oid->element-oid oid) tm) "[]")
+
         (= oid oid-numeric)
         (let [[precision scale] (decode-numeric-typmod tm)]
           (if precision (format "numeric(%d,%d)" precision scale) base))
@@ -2090,7 +2095,12 @@
   [pred render]
   (register-typed-output-function! pred (fn [v _oid] (render v))))
 
-(def ^:private routine-array-output
+(def session-formatted-array-oids
+  "Array types whose stored text needs the reader's session settings."
+  (into #{} (keep element-oid->array-oid)
+        (into regoid/alias-oids [oid-date oid-timestamp oid-timestamptz])))
+
+(def ^:private array-output
   ;; Array input/output live above this registry. Resolve after its namespace
   ;; has loaded, as temporal carrier renderers do, without a load-time cycle.
   (delay [(requiring-resolve 'datahike.pg.arrays/from-pg-text)
@@ -2113,8 +2123,8 @@
      ;; SQL NULL, including the internal sentinel: it must never render as
      ;; text (`concat(NULL, 'x')` answered ":__null__x").
      (or (nil? v) (= :__null__ v)) nil
-     (and (string? v) (contains? regoid/alias-oids (array-oid->element-oid src-oid)))
-     (let [[read-array render-array] @routine-array-output]
+     (and (string? v) (session-formatted-array-oids src-oid))
+     (let [[read-array render-array] @array-output]
        (render-array (read-array v (oid->elem-kw (array-oid->element-oid src-oid))) src-oid))
      (and (contains? regoid/alias-oids src-oid) (number? v))
      (regoid/output src-oid v #(or (get oid->pg-name %)

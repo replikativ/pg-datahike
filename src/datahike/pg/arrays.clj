@@ -574,12 +574,13 @@
     a))
 
 (defn to-storage-text
-  "Persist OID references as numeric identities, independent of the
-   session's search path or later catalog renames/deletions."
+  "Persist array text independently of the session's date style, time zone,
+   and search path. Store OID references by numeric identity."
   [a]
   (let [a (coerce-oid-elements a)]
-    (to-pg-text (if (contains? #{:regproc :regprocedure :regclass :regtype :regnamespace} (:elem-type a))
-                  (assoc a :elem-type :oid) a))))
+    (binding [types/*date-style* [:iso :ymd] types/*time-zone* types/utc-zone]
+      (to-pg-text (if (contains? #{:regproc :regprocedure :regclass :regtype :regnamespace} (:elem-type a))
+                    (assoc a :elem-type :oid) a)))))
 
 (defn- coerce-token
   "Coerce a raw token to the target element-type. Unquoted NULL token
@@ -594,7 +595,7 @@
       ;; An element is read by its type's input function, as array_in
       ;; calls the element typinput: range-checked, and an error on
       ;; invalid text rather than a string element.
-      (if-let [parse (some-> (types/elem-kw->oid elem-type) input/parser)]
+      (if-let [parse (some-> (types/elem-kw->oid elem-type) input/array-element-parser)]
         (parse raw)
         raw))))
 

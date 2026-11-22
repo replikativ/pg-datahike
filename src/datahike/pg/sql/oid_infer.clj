@@ -269,7 +269,9 @@
    "current_schemas"       types/oid-name-array
    "string_to_array"       types/oid-text-array
    "regexp_split_to_array" types/oid-text-array
-   ;; Array meta — all return INT4 or NULL
+   ;; Array metadata
+   "array_dims"    types/oid-text
+   "array_ndims"   types/oid-int4
    "array_length"  types/oid-int4
    "array_upper"   types/oid-int4
    "array_lower"   types/oid-int4

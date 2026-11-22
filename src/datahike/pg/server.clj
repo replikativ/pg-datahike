@@ -322,7 +322,7 @@
      ;; keyword branch, which would otherwise print the sentinel's name.
      (= jb/json-null v) "null"
      (or (contains? regoid/alias-oids oid)
-         (contains? regoid/alias-oids (types/array-oid->element-oid oid)))
+         (types/session-formatted-array-oids oid))
      (types/->pg-text v oid)
      ;; Keep the scalar cases before the structured wrapper predicates below.
      ;; Result sets are dominated by strings, booleans and integer identifiers;

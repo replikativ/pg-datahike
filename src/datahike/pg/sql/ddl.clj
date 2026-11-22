@@ -1120,8 +1120,8 @@
                                  (let [[p s] (types/parse-numeric-args raw-type)]
                                    (when (or p s)
                                      (types/encode-numeric-typmod p s))))
-                               temporal-typmod (when-not array-spec (or (types/parse-timestamp-precision raw-type)
-                                                                        (types/parse-time-precision raw-type)))
+                               temporal-typmod (or (types/parse-timestamp-precision raw-type)
+                                                   (types/parse-time-precision raw-type))
                                ;; varchar(n) / char(n): the declared
                                ;; length was dropped entirely, so the
                                ;; column reported as plain `text` with no

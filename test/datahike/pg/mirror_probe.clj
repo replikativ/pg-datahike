@@ -27,11 +27,12 @@
         "rounded timestamp(3) DEFAULT '1999-12-31 23:59:59.999500', "
         "FOREIGN KEY (tenant, parent_id) REFERENCES probe_parent(tenant, id) ON DELETE CASCADE)")
    (str "CREATE TABLE probe_types (id integer PRIMARY KEY, doc json, attrs jsonb, "
-        "observed timetz(6), wall time(3), fixed character(4), payload bytea, tags text[], lexemes tsvector)")
+        "observed timetz(6), wall time(3), fixed character(4), payload bytea, tags text[], lexemes tsvector, "
+        "member_ids uuid[], amounts numeric(8,-2)[], snapshots timestamptz(6)[], samples integer[])")
    (str "CREATE TABLE probe_type_keys (observed timetz(6), payload bytea, tags text[], "
         "attrs jsonb, fixed character(4), lexemes tsvector, label text, "
-        "rating probe_rating, released probe_year, "
-        "PRIMARY KEY (observed, payload, tags, attrs, fixed, lexemes, rating, released))")])
+        "rating probe_rating, released probe_year, ratios real[], entries jsonb[], "
+        "PRIMARY KEY (observed, payload, tags, attrs, fixed, lexemes, rating, released, ratios, entries))")])
 
 (defn- check! [condition message data]
   (when-not condition (throw (ex-info message data))))
@@ -51,11 +52,14 @@
 
 (defn- type-rows [conn]
   (rows conn (str "SELECT id, doc::text, attrs::text, observed::text, wall::text, fixed, "
-                  "payload::text, tags::text, lexemes::text FROM probe_types ORDER BY id")))
+                  "payload::text, tags::text, lexemes::text, member_ids::text, amounts::text, "
+                  "snapshots::text, samples::text, array_dims(samples), array_ndims(samples) "
+                  "FROM probe_types ORDER BY id")))
 
 (defn- type-key-rows [conn]
   (rows conn (str "SELECT observed::text, payload::text, tags::text, attrs::text, fixed::text, "
-                  "lexemes::text, label, rating::text, released::text FROM probe_type_keys ORDER BY label")))
+                  "lexemes::text, label, rating::text, released::text, ratios::text, entries::text "
+                  "FROM probe_type_keys ORDER BY label")))
 
 (defn- fixture-rows [conn]
   [(rows conn "SELECT tenant, id, label, payload, occurred::text FROM probe_parent ORDER BY tenant, id")
@@ -228,9 +232,12 @@
                   "AND column_name IN ('occurred', 'wall_time', 'rounded') ORDER BY column_name")))
 
 (defn- type-catalog [conn]
-  (rows conn (str "SELECT column_name, data_type, udt_name, datetime_precision, character_maximum_length, "
-                  "character_octet_length FROM information_schema.columns WHERE table_name = 'probe_types' "
-                  "AND column_name NOT IN ('id', 'db_id') ORDER BY column_name")))
+  [(rows conn (str "SELECT column_name, data_type, udt_name, datetime_precision, character_maximum_length, "
+                   "character_octet_length FROM information_schema.columns WHERE table_name = 'probe_types' "
+                   "AND column_name NOT IN ('id', 'db_id') ORDER BY column_name"))
+   (rows conn (str "SELECT attname, atttypid, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute "
+                   "WHERE attrelid = 'probe_types'::regclass "
+                   "AND attname IN ('member_ids', 'amounts', 'snapshots', 'samples') ORDER BY attname"))])
 
 (defn- user-type-catalog [conn]
   [(rows conn (str "SELECT column_name, data_type, udt_schema, udt_name, domain_schema, domain_name, is_nullable "
@@ -277,10 +284,16 @@
                    "'fox:3A cat:2 cat:1'::tsvector FROM generate_series(1, 1000) i")
               (str "INSERT INTO probe_types (id, attrs, observed, wall, fixed, payload, tags, lexemes) VALUES "
                    "(2, 'null', '24:00:00+01:30:45', '23:59:59.999500', '', decode('','hex'), '{}', '')")
+              (str "UPDATE probe_types SET "
+                   "member_ids = '[0:1]={82d1ad1a-a1ea-4660-9f33-4dcbdaa8ad76,NULL}', "
+                   "amounts = '{1234,NULL,-3456}', snapshots = '{\"2024-02-29 13:55:19.123457+05:30\",NULL}', "
+                   "samples = '[-1:0][3:4]={{1,NULL},{2,3}}' WHERE id = 1")
+              "UPDATE probe_types SET member_ids = '{}', samples = '{}' WHERE id = 2"
               (str "INSERT INTO probe_type_keys VALUES "
                    "('14:00:00.123456+04', decode('00ff','hex'), '[0:1]={a,NULL}', '{\"num\":1.200}', "
-                   "'a', 'cat:2 fox:1D', 'one', 'Unrated', DEFAULT), "
-                   "('24:00:00+01:30:45', decode('','hex'), '{}', 'null', '雪', '', 'two', 'G', 1998)")
+                   "'a', 'cat:2 fox:1D', 'one', 'Unrated', DEFAULT, '{-0,NaN,NULL}', "
+                   "'{\"{\\\"num\\\": 1.200}\",\"null\",NULL}'), "
+                   "('24:00:00+01:30:45', decode('','hex'), '{}', 'null', '雪', '', 'two', 'G', 1998, '{}', '{}')")
               "CREATE PUBLICATION mirror_pub FOR TABLE probe_parent, probe_child, probe_types, probe_type_keys")
         (check-admission! source config)
         (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
@@ -313,7 +326,8 @@
                        "INSERT INTO probe_child VALUES (12, 1, 1, NULL)"
                        (str "UPDATE probe_types SET observed = '23:59:59.123457-03:30', "
                             "wall = '22:00:59.999500', fixed = '雪', payload = decode('ff00','hex'), "
-                            "tags = '[0:2]={\"a,b\",\"NULL\",NULL}', lexemes = 'cat:1D fox:2B' WHERE id = 1")
+                            "tags = '[0:2]={\"a,b\",\"NULL\",NULL}', lexemes = 'cat:1D fox:2B', "
+                            "snapshots = '{\"2024-02-29 13:55:19.123458+05:30\",NULL}' WHERE id = 1")
                        "UPDATE probe_type_keys SET label = 'during copy' WHERE label = 'one'"
                        "DELETE FROM probe_parent WHERE tenant = 1 AND id = 2"
                        "COMMIT"))
@@ -338,6 +352,13 @@
             (check! (= (user-type-catalog source) (user-type-catalog sink))
                     "The mirror catalog changed enum or domain metadata"
                     {:source (user-type-catalog source) :mirror (user-type-catalog sink)})
+            (let [query "SELECT snapshots, snapshots::text FROM probe_types ORDER BY id"]
+              (try
+                (doseq [conn [source sink]] (sql! conn "SET TIME ZONE 'America/Vancouver'"))
+                (check! (= (rows source query) (rows sink query))
+                        "The mirror lost the reader's time zone when rendering an array" {})
+                (finally
+                  (doseq [conn [source sink]] (sql! conn "SET TIME ZONE 'UTC'")))))
             (check-read-only! sink)
             (let [[pid] (slot-query source slot "active_pid")]
               (sql! source (str "SELECT pg_terminate_backend(" pid ")"))
@@ -365,7 +386,9 @@
                   (str "UPDATE probe_parent SET label = 'after crash', payload = NULL, "
                        "occurred = '2024-02-29 13:55:19.123457+00' WHERE tenant = 1 AND id = 1")
                   (str "UPDATE probe_types SET doc = ' [1, 2] ', attrs = '{\"changed\": [true, null, 2.00]}', "
-                       "observed = '24:00:00+02', tags = ARRAY['', 'a'] WHERE id = 1")
+                       "observed = '24:00:00+02', tags = ARRAY['', 'a'], "
+                       "member_ids = '{104846d1-b048-4f78-8835-f4b5b98f9f18}', amounts = NULL, "
+                       "samples = '[1:2]={8,13}' WHERE id = 1")
                   (str "UPDATE probe_type_keys SET observed = '14:00:00.123457+04', rating = 'contains''quote', "
                        "released = 1997 WHERE label = 'during copy'")
                   "DELETE FROM probe_type_keys WHERE label = 'two'"
@@ -2199,6 +2222,43 @@
             (when (= ["false"] (slot-query source native-slot "active::text"))
               (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")")))))))))
 
+(defn run-array-refresh-probe! [source-url _reference-url _source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-array-refresh-" (make-array FileAttribute 0)))
+        config {:source-url source-url :publication "array_refresh_pub" :store-path (str directory "/store")
+                :schema-refresh? true :server {:port 0}}
+        query "SELECT id, locator::text, amounts::text, member_ids::text FROM array_refresh"
+        eid-query "SELECT db_id FROM array_refresh WHERE id = 1"]
+    (with-open [source (DriverManager/getConnection source-url)]
+      (sql! source
+            (str "CREATE TABLE array_refresh (id int NOT NULL, locator numeric[] PRIMARY KEY, "
+                 "obsolete text, amounts numeric(8,2)[])")
+            "INSERT INTO array_refresh VALUES (1, '[-1:0]={1.00,NULL}', 'old', '{1234.56}')"
+            "CREATE PUBLICATION array_refresh_pub FOR TABLE array_refresh")
+      (let [subscriber (mirror/start! config)]
+        (try
+          (with-open [sink (DriverManager/getConnection (sink-url subscriber))]
+            (let [eid (rows sink eid-query)]
+              (sql! source "BEGIN"
+                    (str "ALTER TABLE array_refresh DROP COLUMN obsolete, ADD COLUMN member_ids uuid[], "
+                         "ALTER COLUMN amounts TYPE numeric(8,-2)[]")
+                    (str "UPDATE array_refresh SET locator = '[-1:0]={1.0,NULL}', "
+                         "member_ids = '{82d1ad1a-a1ea-4660-9f33-4dcbdaa8ad76}' WHERE id = 1")
+                    "COMMIT")
+              (let [expected (rows source query)]
+                (await! "Array schema refresh did not match the publisher"
+                        #(when (:last-schema-refresh (mirror/status subscriber))
+                           (= expected (rows sink query)))))
+              (check! (= eid (rows sink eid-query)) "An equivalent array key changed the entity" {})
+              (sql! source "UPDATE array_refresh SET amounts = '{9399.5}' WHERE id = 1")
+              (await! "Live apply lost the array key after schema refresh"
+                      #(= (rows source query) (rows sink query)))))
+          {:status :passed :artifacts directory}
+          (finally
+            (let [slot (:slot (mirror/status subscriber))]
+              (mirror/stop! subscriber)
+              (when (= ["false"] (slot-query source slot "active::text"))
+                (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))))))))))
+
 (defn -main [& [argument mode]]
   (cond
     (= "--failover" argument)
@@ -2235,6 +2295,7 @@
               "--type-refresh" run-type-refresh-probe!
               "--primary-key-refresh" run-primary-key-probe!
               "--index-identity" run-index-identity-probe!
+              "--array-refresh" run-array-refresh-probe!
               "--full-identity" #(run-primary-key-probe! %1 %2 %3 true)
               "--full-identity-recovery" #(run-probe! %1 %2 %3 true)
               "--schema-refresh" run-schema-refresh-probe!
