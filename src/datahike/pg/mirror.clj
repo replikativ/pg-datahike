@@ -217,6 +217,8 @@
 
 (defn- read-publication-row [^ResultSet row]
   (let [schema (.getString row "schemaname")
+        replica-identity (.getString row "relreplident")
+        primary-key-name (.getString row "primary_key_name")
         parent-id (.getLong row "partition_parent")
         leaves (when-let [ids (.getArray row "partition_leaves")]
                  (mapv long (.getArray ids)))
@@ -232,6 +234,7 @@
         relation (when schema
                    (cond-> {:schema schema :name (.getString row "tablename")
                             :relation-id (.getLong row "relation_id")}
+                     (= "f" replica-identity) (assoc :replica-identity \f)
                      (pos? parent-id) (assoc :partition-parent parent-id)
                      partition-bound (assoc :partition-bound partition-bound)
                      leaves (assoc :partition-leaves leaves :partition-key partition-key)))
@@ -249,7 +252,7 @@
      :operations {:insert (.getBoolean row "pubinsert") :update (.getBoolean row "pubupdate")
                   :delete (.getBoolean row "pubdelete") :truncate (.getBoolean row "pubtruncate")}
      :relation relation
-     :primary-key-name (.getString row "primary_key_name")
+     :primary-key-name primary-key-name
      :table-issues
      (when relation
        (cond-> []
@@ -262,8 +265,9 @@
          (.getBoolean row "partition_detach_pending") (conj {:reason :partition-detach-pending})
          (not (#{"r" "p"} (.getString row "relkind"))) (conj {:reason :relation-kind})
          (not= "p" (.getString row "relpersistence")) (conj {:reason :nonpermanent-table})
-         (not= "d" (.getString row "relreplident"))
-         (conj {:reason :replica-identity :mode (.getString row "relreplident")})
+         (not (or (= "d" replica-identity)
+                  (and (= "f" replica-identity) primary-key-name)))
+         (conj {:reason :replica-identity :mode replica-identity})
          (and (= "r" (.getString row "relkind"))
               (not (.getBoolean row "relispartition"))
               (.getBoolean row "has_inheritance")) (conj {:reason :inheritance})
@@ -942,10 +946,12 @@
                    kind (byte-char buffer)
                    old (when (#{\K \O} kind) (read-tuple buffer))
                    new-kind (if old (byte-char buffer) kind)]
-               {:op :update :relation-id relation-id :old old
+               {:op :update :relation-id relation-id :old old :old-kind (when old kind)
                 :new (tuple-after buffer new-kind #{\N})})
-          \D {:op :delete :relation-id (uint32 buffer)
-              :old (tuple-after buffer (byte-char buffer) #{\K \O})}
+          \D (let [relation-id (uint32 buffer)
+                   kind (byte-char buffer)]
+               {:op :delete :relation-id relation-id :old-kind kind
+                :old (tuple-after buffer kind #{\K \O})})
           \T (let [count (.getInt buffer)
                    flags (.get buffer)]
                (require! (<= 1 count (quot (.remaining buffer) 4)) "Invalid truncate relation count" {:count count})
@@ -996,12 +1002,28 @@
                                 (str (ident (:name column)) " = " (cast-param column)))
                               keys))))
 
-(defn- apply-change! [destination relations {:keys [op relation-id relation-ids old new]}]
+(defn- replica-identity [table]
+  (or (:replica-identity table) \d))
+
+(defn- full-identity? [table]
+  (= \f (replica-identity table)))
+
+(defn- validate-old-tuple! [table op old-kind]
+  (when (#{:update :delete} op)
+    (require! (if (full-identity? table)
+                (= \O old-kind)
+                (or (= \K old-kind) (and (= :update op) (nil? old-kind))))
+              "pgoutput old tuple does not match the relation's replica identity"
+              {:relation-id (:relation-id table) :operation op :old-kind old-kind
+               :replica-identity (replica-identity table)})))
+
+(defn- apply-change! [destination relations {:keys [op relation-id relation-ids old old-kind new]}]
   (if (= op :truncate)
     (sink-execute! destination
                    (str "TRUNCATE "
                         (comma-list (map #(relation-name (relation! relations %)) relation-ids))))
     (let [table (relation! relations relation-id)
+          _ (validate-old-tuple! table op old-kind)
           table-name (relation-name table)
           [sql values read-check?]
           (case op
@@ -1257,7 +1279,8 @@
                (and (= (:primary-key-name previous) (:primary-key-name current))
                     (= (mapv :attnum (key-columns previous))
                        (mapv :attnum (key-columns current)))))))
-    (and current (= (wire-table previous) (wire-table current)))))
+    (and current (= (replica-identity previous) (replica-identity current))
+         (= (wire-table previous) (wire-table current)))))
 
 (defn- same-publication? [previous current]
   (= (select-keys previous [:publication-oid :leaf-publication])
@@ -1487,7 +1510,10 @@
                                                   renamed-labels check-running!))))
 
 (defn- matches-relation? [table message]
-  (and table (= \d (:identity message)) (= (wire-table table) (wire-table message))))
+  (and table (= (replica-identity table) (:identity message))
+       (= (cond-> (wire-table table)
+            (full-identity? table) (update :columns #(mapv (fn [column] (assoc column :key? true)) %)))
+          (wire-table message))))
 
 (defn- select-change [included? {:keys [op relation-id relation-ids] :as message}]
   (if (= :truncate op)
@@ -1979,6 +2005,7 @@
         pending-schema (volatile! (or (:pending-schema manifest) {}))
         live (volatile! (tables-by-id manifest))
         observed (volatile! @live)
+        validated-full (volatile! {})
         stage (volatile! nil)
         stage-signaled? (volatile! false)
         following? (volatile! false)
@@ -2022,9 +2049,18 @@
                                                                 (keep (fn [{:keys [oid user-type]}]
                                                                         (when user-type [oid user-type]))))
                                                        ids)]
-                                  ;; A changed enum spelling may identify a
-                                  ;; different key without any wire change.
+                                  ;; FULL marks every column on the wire. A new
+                                  ;; Relation message can hide a changed primary
+                                  ;; key behind an identical column layout.
                                   (when (or (some stale? ids)
+                                            (some (fn [id]
+                                                    (and (live? id)
+                                                         (= \f (:identity (get relations id)))
+                                                         (not (identical? (get @validated-full id)
+                                                                          (get relations id)))))
+                                                  ids)
+                                            ;; A changed enum spelling can also
+                                            ;; identify a different key.
                                             (when (seq used-types)
                                               (let [current (read-source-types source (keys used-types))]
                                                 (some (fn [[oid before]]
@@ -2033,7 +2069,10 @@
                                     (refresh!))
                                   (when-let [id (some #(when (stale? %) %) ids)]
                                     (throw (ex-info "Publication relation changed"
-                                                    {:relation (get relations id)})))))
+                                                    {:relation (get relations id)})))
+                                  (doseq [id ids
+                                          :when (and (live? id) (= \f (:identity (get relations id))))]
+                                    (vswap! validated-full assoc id (get relations id)))))
         apply-live! (fn [previous transaction cutover? active]
                       (let [candidate (cond
                                         cutover?
@@ -2113,6 +2152,7 @@
                      (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros)
                      (when cutover?
                        (vreset! live (tables-by-id @applied))
+                       (vreset! validated-full {})
                        (vreset! pending-schema {})
                        (vreset! stage nil)
                        (stop-refresh! active)

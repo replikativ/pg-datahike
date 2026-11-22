@@ -60,8 +60,11 @@ publication options.
 ## Supported publications
 
 This version accepts whole, unfiltered, permanent tables with a single or
-composite non-deferrable primary key and default replica identity. It copies column names,
-supported types, and primary keys into a fresh read model. Publisher defaults,
+composite non-deferrable primary key. Both default replica identity and
+`REPLICA IDENTITY FULL` are supported. The mirror uses the publisher's primary
+key to identify the old row in an update or delete, including when PostgreSQL
+sends the whole old row under `FULL`. It copies column names, supported types,
+and primary keys into a fresh read model. Publisher defaults,
 triggers and cascades run on PostgreSQL. The mirror applies the resulting rows
 and preserves their transaction boundaries using the normal Datahike writer.
 Generated columns, sequence counters, legacy inheritance, row filters, and
@@ -202,6 +205,8 @@ for WAL changes after cutover. Keep the previous key columns, their types,
 and their non-null, unique values through cutover. The mirror pauses if
 the previous key columns are missing or retyped, or their values make the
 row match ambiguous. A later migration can remove the previous columns.
+A change between default replica identity and `FULL` also uses schema
+refresh. Keep a supported primary key in place through the cutover.
 
 The affected tables have a resnapshot window. Their publisher changes during
 that window are reflected in the cutover transaction. Status and the durable
@@ -316,8 +321,12 @@ mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
 Pass `--schema-refresh` to exercise publisher DDL, table name reuse, restart,
 and historical row and catalog reads. Pass `--primary-key-refresh` to compare
 replacement keys, key order, historical constraints, and rejected cutovers
-with PostgreSQL. Pass `--partitions` to check populated attachment,
-detachment, reattachment, truncation and crash recovery under leaf routing.
+with PostgreSQL. Pass `--full-identity` to run the key changes with
+`REPLICA IDENTITY FULL`, including mode changes, key-changing updates,
+unchanged toasted values, and restart. Pass `--full-identity-recovery` to
+exercise the snapshot and crash-replay probe with keyed `FULL` tables.
+Pass `--partitions` to check populated attachment, detachment, reattachment,
+truncation and crash recovery under leaf routing.
 Pass `--root-publication` to run the same comparison with a matched
 leaf publication and verify admission and resume checks for the pair.
 Pass `--type-refresh` to compare enum and domain changes, column conversions,

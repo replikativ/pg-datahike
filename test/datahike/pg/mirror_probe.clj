@@ -247,7 +247,7 @@
 (defn run-probe!
   "Exercise initial snapshot, PostgreSQL row parity, SQL read-only enforcement,
    reconnect, crash replay, history, schema drift and lost slot detection."
-  [source-url reference-url source-conninfo]
+  [source-url reference-url source-conninfo & [full?]]
   (let [directory (str (Files/createTempDirectory "pgdh-mirror-oracle-" (make-array FileAttribute 0)))
         path (str directory "/store")
         log (str directory "/crash.log")
@@ -262,6 +262,10 @@
         (sql! reference "SET TIME ZONE 'UTC'")
         (apply sql! source schema-ddl)
         (apply sql! reference schema-ddl)
+        (when full?
+          (sql! source "ALTER TABLE probe_parent REPLICA IDENTITY FULL"
+                "ALTER TABLE probe_child REPLICA IDENTITY FULL"
+                "ALTER TABLE probe_type_keys REPLICA IDENTITY FULL"))
         (sql! source
               "INSERT INTO probe_parent SELECT 1, 1, 'before', string_agg(md5(i::text), '' ORDER BY i) FROM generate_series(1, 1000) i"
               "INSERT INTO probe_parent VALUES (1, 2, 'delete me', NULL)"
@@ -852,7 +856,7 @@
                   "JOIN pg_index i ON c.conindid = i.indexrelid "
                   "WHERE c.conrelid = 'key_items'::regclass AND c.contype = 'p' AND i.indisprimary")))
 
-(defn run-primary-key-probe! [source-url reference-url source-conninfo]
+(defn run-primary-key-probe! [source-url reference-url source-conninfo & [full?]]
   (let [directory (str (Files/createTempDirectory "pgdh-mirror-key-" (make-array FileAttribute 0)))
         path (str directory "/store")
         native-slot (str "mirror_key_ref_" (str/replace (str (random-uuid)) "-" ""))
@@ -861,8 +865,9 @@
         subscriber (atom nil)
         slot (atom nil)
         table-ddl (str "CREATE TABLE key_items (legacy integer PRIMARY KEY, region integer NOT NULL, "
-                       "item_no bigint NOT NULL, label text)")
-        row-query "SELECT legacy, region, item_no, label FROM key_items ORDER BY item_no, label"
+                       "item_no bigint NOT NULL, label text" (when full? ", payload text") ")")
+        row-query (str "SELECT legacy, region, item_no, label"
+                       (when full? ", md5(payload)") " FROM key_items ORDER BY item_no, label")
         key-column-query (str "SELECT column_name, ordinal_position FROM information_schema.key_column_usage "
                               "WHERE table_name = 'key_items' AND constraint_name = 'key_items_v2' ORDER BY ordinal_position")
         change-key (fn [key-name columns]
@@ -873,8 +878,16 @@
                 reference (DriverManager/getConnection reference-url)]
       (try
         (doseq [c [source reference]] (sql! c table-ddl))
+        (when full?
+          (sql! source "ALTER TABLE key_items REPLICA IDENTITY FULL"))
         (sql! source "INSERT INTO key_items VALUES (1, 7, 101, 'first'), (2, 7, 102, 'second')"
               "CREATE PUBLICATION mirror_key_pub FOR TABLE key_items")
+        (when full?
+          (sql! source (str "UPDATE key_items SET payload = "
+                            "(SELECT string_agg(md5(i::text),'') FROM generate_series(1,4000) i) "
+                            "WHERE legacy = 1"))
+          (check! (:compatible? (mirror/publication-report config))
+                  "Keyed FULL is not admitted" {}))
         (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
         (sql! reference (str "CREATE SUBSCRIPTION mirror_key_native CONNECTION "
                              (literal source-conninfo) " PUBLICATION mirror_key_pub"
@@ -883,6 +896,27 @@
         (reset! subscriber (mirror/start! config))
         (reset! slot (:slot (await-state! @subscriber :following)))
         (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+          (when full?
+            (let [entity (rows sink "SELECT db_id FROM key_items WHERE legacy = 1")
+                  identity-mode #(get-in (durable-checkpoint path) [:manifest :tables 0 :replica-identity])]
+              (check! (= \f (identity-mode)) "FULL mode was not recorded durably" {})
+              (sql! source "UPDATE key_items SET legacy = 9 WHERE legacy = 1")
+              (await! "FULL update did not use the old primary key"
+                      #(= (rows source row-query) (rows sink row-query) (rows reference row-query)))
+              (check! (= entity (rows sink "SELECT db_id FROM key_items WHERE legacy = 9"))
+                      "FULL key update changed the entity" {})
+              (sql! source "UPDATE key_items SET legacy = 1 WHERE legacy = 9")
+              (await! "FULL update did not restore the row"
+                      #(= (rows source row-query) (rows sink row-query)))
+              (doseq [[mode expected] [["DEFAULT" nil] ["FULL" \f]]]
+                (sql! source "BEGIN" (str "ALTER TABLE key_items REPLICA IDENTITY " mode)
+                      "UPDATE key_items SET label = label || ' refreshed' WHERE legacy = 1"
+                      "COMMIT")
+                (await! "Replica identity change did not reach a durable cutover"
+                        #(and (= expected (identity-mode))
+                              (= (rows source row-query) (rows sink row-query) (rows reference row-query))))
+                (check! (= entity (rows sink "SELECT db_id FROM key_items WHERE legacy = 1"))
+                        "Replica identity refresh changed the entity" {}))))
           (let [old-layout (primary-key-layout source)
                 old-at (inspect-db path :max-tx)
                 eid-query "SELECT db_id FROM key_items WHERE item_no = 101"
@@ -2069,6 +2103,8 @@
               "--root-publication" run-root-publication-probe!
               "--type-refresh" run-type-refresh-probe!
               "--primary-key-refresh" run-primary-key-probe!
+              "--full-identity" #(run-primary-key-probe! %1 %2 %3 true)
+              "--full-identity-recovery" #(run-probe! %1 %2 %3 true)
               "--schema-refresh" run-schema-refresh-probe!
               "--refresh" run-refresh-probe!
               run-probe!)
