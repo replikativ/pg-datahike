@@ -190,7 +190,7 @@
         "CREATE DOMAIN probe_multi_check AS integer CHECK (VALUE > 0) CHECK (VALUE < 42)"
         "CREATE TABLE probe_unhandled_domain (id integer PRIMARY KEY, n probe_multi_check)"
         "CREATE TABLE probe_no_key (note text)"
-        "ALTER TABLE probe_no_key REPLICA IDENTITY FULL"
+        "ALTER TABLE probe_no_key REPLICA IDENTITY NOTHING"
         "CREATE TABLE probe_no_columns ()"
         "CREATE PUBLICATION probe_empty"
         (str "CREATE PUBLICATION probe_incompatible FOR TABLE "
@@ -2419,6 +2419,148 @@
             (when (= ["false"] (slot-query source native-slot "active::text"))
               (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")")))))))))
 
+(defn run-keyless-full-probe! [source-url reference-url source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-keyless-full-" (make-array FileAttribute 0)))
+        path (str directory "/store")
+        config {:source-url source-url :publication "mirror_keyless_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        slot (atom nil)
+        native-slot "mirror_keyless_native"
+        fixture (str "CREATE TABLE loose_rows (tag text, amount numeric, doc jsonb, pad bpchar, "
+                     "scores real[], observed timetz(6), payload text)")
+        select-rows (fn [projection]
+                      (str "SELECT tag, amount::text, doc::text, scores::text, observed::text, md5(payload), "
+                           projection " FROM loose_rows ORDER BY tag NULLS FIRST, amount"))
+        query (select-rows "pad::text")
+        entity-query "SELECT db_id FROM loose_rows ORDER BY db_id"
+        rewrite-query "SELECT payload::text FROM loose_rewrite ORDER BY payload"]
+    (with-open [source (DriverManager/getConnection source-url)
+                reference (DriverManager/getConnection reference-url)]
+      (let [agrees? (fn [sink sql] (= (rows source sql) (rows reference sql) (rows sink sql)))
+            cutover #(get-in (mirror/status @subscriber) [:last-schema-refresh :cutover])]
+        (try
+          (doseq [conn [source reference]]
+            (sql! conn fixture
+                  "CREATE TABLE loose_rewrite (payload integer)"
+                  "CREATE TABLE loose_mode (tag text)"))
+          (sql! source
+                "ALTER TABLE loose_rows REPLICA IDENTITY FULL"
+                "ALTER TABLE loose_rewrite REPLICA IDENTITY FULL"
+                "ALTER TABLE loose_mode REPLICA IDENTITY FULL"
+                (str "INSERT INTO loose_rows SELECT 'dup', 7.00, '{\"scale\":1.00}', 'p  '::bpchar, "
+                     "'{-0,NaN,NULL}'::real[], '01:00:00.123456+05:45', j.payload FROM generate_series(1,2), "
+                     "(SELECT string_agg(md5(i::text), '' ORDER BY i) AS payload FROM generate_series(1,4000) i) j")
+                "INSERT INTO loose_rows (amount) VALUES (8), (8)"
+                "INSERT INTO loose_rows (amount) VALUES (6), (6)"
+                "INSERT INTO loose_rewrite VALUES (1), (1)"
+                "INSERT INTO loose_mode VALUES ('one'), ('two')"
+                "CREATE PUBLICATION mirror_keyless_pub FOR TABLE loose_rows, loose_rewrite, loose_mode"
+                "CREATE TABLE loose_json (payload json)"
+                "ALTER TABLE loose_json REPLICA IDENTITY FULL"
+                "CREATE PUBLICATION mirror_keyless_json_pub FOR TABLE loose_json")
+          (let [report (mirror/publication-report config)
+                invalid (mirror/publication-report (assoc config :publication "mirror_keyless_json_pub"))]
+            (check! (:compatible? report) "Keyless FULL publication was not admitted" report)
+            (check! (some #(= :missing-equality-operator (:detail %)) (get-in invalid [:tables 0 :issues]))
+                    "A keyless FULL column without equality was admitted" invalid))
+          (when (= [["1"]] (rows source "SELECT 1 FROM pg_catalog.pg_collation WHERE collprovider = 'i' LIMIT 1"))
+            (sql! source "CREATE COLLATION loose_icu (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+                  "CREATE TABLE loose_nondeterministic (payload text COLLATE loose_icu)"
+                  "ALTER TABLE loose_nondeterministic REPLICA IDENTITY FULL"
+                  "CREATE PUBLICATION mirror_keyless_icu_pub FOR TABLE loose_nondeterministic")
+            (let [report (mirror/publication-report (assoc config :publication "mirror_keyless_icu_pub"))]
+              (check! (some #(= :nondeterministic-collation (:detail %)) (get-in report [:tables 0 :issues]))
+                      "A keyless FULL column with nondeterministic collation was admitted" report)))
+          (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
+          (sql! reference (str "CREATE SUBSCRIPTION mirror_keyless_native CONNECTION "
+                               (literal source-conninfo) " PUBLICATION mirror_keyless_pub "
+                               "WITH (create_slot=false, slot_name=" (literal native-slot) ")"))
+          (reset! subscriber (mirror/start! config))
+          (reset! slot (:slot (await-state! @subscriber :following)))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (await! "Keyless FULL snapshot lost duplicate rows" #(agrees? sink query))
+            (let [[chosen other] (rows sink "SELECT db_id FROM loose_rows WHERE tag = 'dup' ORDER BY db_id")]
+              (sql! source "BEGIN"
+                    "UPDATE loose_rows SET amount = 9 WHERE ctid = (SELECT ctid FROM loose_rows WHERE tag = 'dup' LIMIT 1)"
+                    "UPDATE loose_rows SET tag = 'changed' WHERE tag = 'dup' AND amount = 9"
+                    "DELETE FROM loose_rows WHERE ctid = (SELECT ctid FROM loose_rows WHERE amount = 8 LIMIT 1)"
+                    "COMMIT")
+              (await! "Old tuples did not match one row at a time within the transaction" #(agrees? sink query))
+              (check! (= [chosen other]
+                         [(first (rows sink "SELECT db_id FROM loose_rows WHERE tag = 'changed'"))
+                          (first (rows sink "SELECT db_id FROM loose_rows WHERE tag = 'dup'"))])
+                      "Keyless apply did not choose the first matching entity" {}))
+            (let [entities (rows sink entity-query)
+                  before (inspect-db path :max-tx)
+                  previous (rows sink query)
+                  prior-cutover (cutover)
+                  updated-query (select-rows "note")]
+              (doseq [conn [reference source]]
+                (sql! conn (str "ALTER TABLE loose_rows DROP COLUMN pad, ADD COLUMN note integer DEFAULT 42, "
+                                "ALTER COLUMN amount TYPE numeric(12,3)")))
+              (await! "Keyless refresh did not preserve row multiplicities"
+                      #(and (not= prior-cutover (cutover)) (agrees? sink updated-query)))
+              (check! (= entities (rows sink entity-query)) "Keyless refresh replaced matching entities" {})
+              (sql! sink (str "SET datahike.as_of = " before))
+              (check! (= previous (rows sink query)) "Historical keyless rows were lost at refresh" {})
+              (sql! sink "RESET datahike.as_of"))
+            (let [old-ids (set (rows sink "SELECT db_id FROM loose_rewrite ORDER BY db_id"))
+                  prior-cutover (cutover)]
+              (doseq [conn [reference source]]
+                (sql! conn "ALTER TABLE loose_rewrite ALTER COLUMN payload TYPE text"))
+              (await! "Rewriting the last comparable column lost duplicates"
+                      #(and (not= prior-cutover (cutover)) (agrees? sink rewrite-query)))
+              (check! (not-any? old-ids (rows sink "SELECT db_id FROM loose_rewrite"))
+                      "A rewrite with no comparable columns reused old entity IDs" {}))
+            (let [query "SELECT tag FROM loose_mode ORDER BY tag"
+                  chosen (rows sink "SELECT db_id FROM loose_mode WHERE tag = 'one'")
+                  prior-cutover (cutover)]
+              (doseq [conn [reference source]]
+                (sql! conn "BEGIN"
+                      "ALTER TABLE loose_mode ADD PRIMARY KEY (tag)"
+                      "ALTER TABLE loose_mode REPLICA IDENTITY DEFAULT"
+                      "COMMIT"))
+              (await! "Adding a primary key did not cut over"
+                      #(and (not= prior-cutover (cutover)) (agrees? sink query)))
+              (sql! source "UPDATE loose_mode SET tag = 'changed' WHERE tag = 'one'")
+              (await! "Publisher key did not take over after refresh" #(agrees? sink query))
+              (check! (= chosen (rows sink "SELECT db_id FROM loose_mode WHERE tag = 'changed'"))
+                      "Adopting a key changed the entity" {})
+              (let [prior-cutover (cutover)]
+                (sql! reference "ALTER TABLE loose_mode DROP CONSTRAINT loose_mode_pkey")
+                (sql! source "BEGIN"
+                      "ALTER TABLE loose_mode DROP CONSTRAINT loose_mode_pkey"
+                      "ALTER TABLE loose_mode REPLICA IDENTITY FULL"
+                      "INSERT INTO loose_mode VALUES ('changed')"
+                      "COMMIT")
+                (await! "Dropping a primary key lost a row that now has a duplicate"
+                        #(and (not= prior-cutover (cutover)) (agrees? sink query))))
+              (check! (= chosen (take 1 (rows sink "SELECT db_id FROM loose_mode WHERE tag = 'changed' ORDER BY db_id")))
+                      "Dropping the previous key changed a matched entity" {})))
+          (mirror/stop! @subscriber)
+          (let [confirmed (slot-query source @slot "confirmed_flush_lsn")
+                checkpoint (durable-position path)]
+            (sql! source "DELETE FROM loose_rewrite WHERE ctid = (SELECT ctid FROM loose_rewrite LIMIT 1)")
+            (child-crash! config (str directory "/keyless-crash.log"))
+            (await! "The crashed keyless apply left its slot active"
+                    #(= (conj confirmed "false") (slot-query source @slot "confirmed_flush_lsn, active::text")))
+            (check! (not= checkpoint (durable-position path))
+                    "Keyless apply lost its checkpoint before feedback" {}))
+          (reset! subscriber (mirror/start! config))
+          (await-state! @subscriber :following)
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (sql! source "INSERT INTO loose_rewrite VALUES ('after restart')")
+            (await! "Restart applied a duplicate-row deletion twice" #(agrees? sink rewrite-query)))
+          {:status :passed :artifacts directory}
+          (finally
+            (when @subscriber (mirror/stop! @subscriber))
+            (when (and @slot (= ["false"] (slot-query source @slot "active::text")))
+              (sql! source (str "SELECT pg_drop_replication_slot(" (literal @slot) ")")))
+            (sql! reference "DROP SUBSCRIPTION IF EXISTS mirror_keyless_native")
+            (when (= ["false"] (slot-query source native-slot "active::text"))
+              (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")")))))))))
+
 (defn -main [& [argument mode]]
   (cond
     (= "--failover" argument)
@@ -2458,6 +2600,7 @@
               "--array-refresh" run-array-refresh-probe!
               "--generated-columns" run-generated-probe!
               "--full-identity" #(run-primary-key-probe! %1 %2 %3 true)
+              "--keyless-full" run-keyless-full-probe!
               "--full-identity-recovery" #(run-probe! %1 %2 %3 true)
               "--schema-refresh" run-schema-refresh-probe!
               "--refresh" run-refresh-probe!

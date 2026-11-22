@@ -60,10 +60,14 @@ publication options.
 ## Supported publications
 
 This version accepts whole, unfiltered, permanent tables. Default replica
-identity and `REPLICA IDENTITY FULL` require a single or composite
-non-deferrable primary key. The mirror uses that key to identify the old row
-in an update or delete, including when PostgreSQL sends the whole old row
-under `FULL`.
+identity requires a single or composite non-deferrable primary key. Under
+`REPLICA IDENTITY FULL`, the mirror uses that key when available. Otherwise
+it matches the entire old tuple, including NULL values, and applies the
+change to the matching row with the lowest local entity ID. The current
+rows preserve duplicate counts. Historical entity IDs reflect the mirror's
+choice among identical rows. Whole-row matching requires equality on every
+published column and deterministic collations. The admission report flags
+unsupported types such as `json` and `json[]` for those tables.
 
 `REPLICA IDENTITY USING INDEX` supports tables with or without a primary
 key. The selected index must be an immediate unique B-tree index over
@@ -190,9 +194,9 @@ related DDL in one PostgreSQL transaction and allow each refresh to finish
 before the next schema change.
 Keep this option enabled through restart while a refresh is pending.
 
-Columns can change between supported built-in types, enums, and domains if
-a previous key can still match rows. The mirror matches renamed
-enum key labels by the publisher's enum member OIDs. Renaming a tracked
+Columns can change between supported built-in types, enums, and domains.
+On keyed tables, the previous key must still match rows. The mirror matches
+renamed enum key labels by the publisher's enum member OIDs. Renaming a tracked
 enum or domain preserves its mirror type OID. When the publisher drops
 one and reuses its name, the replacement receives a new mirror type OID.
 Earlier snapshots retain the previous names, types, defaults, and checks.
@@ -222,10 +226,17 @@ The mirror follows changes to the primary key and changes to the selected
 replica identity. During refresh, it matches rows by a retained primary key
 or the previous identity index. It can also use the previous primary key
 when its columns survive a key change. After cutover, it uses the new
-replica identity for WAL changes. Keep the matching columns, their types,
-and their non-null, unique values through cutover. The mirror pauses if it
-cannot establish a row match. A later migration can remove the previous
-columns.
+replica identity for WAL changes. On keyed tables, keep the matching
+columns, their types, and their non-null, unique values through cutover.
+The mirror pauses if it cannot establish a row match. A later migration can
+remove the previous columns.
+
+When either layout uses `FULL` without a non-deferrable primary key, refresh
+pairs matching rows one at a time. It uses the previous key if it survives,
+or the columns with the same publisher column numbers and types in both
+layouts. This preserves IDs for matched duplicates, and new rows receive
+new IDs. When a rewrite leaves no comparable columns, all current rows
+receive new IDs. The earlier rows remain available in historical queries.
 
 The affected tables have a resnapshot window. Their publisher changes during
 that window are reflected in the cutover transaction. Status and the durable
@@ -344,6 +355,8 @@ with PostgreSQL. Pass `--full-identity` to run the key changes with
 `REPLICA IDENTITY FULL`, including mode changes, key-changing updates,
 unchanged toasted values, and restart. Pass `--full-identity-recovery` to
 exercise the snapshot and crash-replay probe with keyed `FULL` tables.
+Pass `--keyless-full` to compare duplicate-row apply, NULL and toasted values,
+schema refresh, primary-key transitions, and crash replay for keyless tables.
 Pass `--index-identity` to exercise index-based apply, index changes, and
 restart with a keyed table and a keyless join table.
 Pass `--array-refresh` to exercise adding and removing columns, changing an

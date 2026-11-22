@@ -278,8 +278,7 @@
          (.getBoolean row "partition_detach_pending") (conj {:reason :partition-detach-pending})
          (not (#{"r" "p"} (.getString row "relkind"))) (conj {:reason :relation-kind})
          (not= "p" (.getString row "relpersistence")) (conj {:reason :nonpermanent-table})
-         (not (or (= "d" replica-identity) identity-index
-                  (and (= "f" replica-identity) primary-key-name)))
+         (not (or (#{"d" "f"} replica-identity) identity-index))
          (conj (cond-> {:reason :replica-identity :mode replica-identity}
                  (= "i" replica-identity)
                  (assoc :detail (if (pos? identity-index-oid) :unsupported-index :missing-index))))
@@ -292,7 +291,9 @@
      (when column
        (let [source-type (.getString row "source_type")
              can-select (.getObject row "can_select")
-             builtin? (builtin-ddl-type (assoc column :typmod -1))]
+             builtin? (builtin-ddl-type (assoc column :typmod -1))
+             keyless-full? (and (= "f" replica-identity) (nil? primary-key-name))
+             base-oid (or (get-in user-type [:base-type :oid]) (:oid column))]
          (mapv #(assoc % :column column-name :source-type source-type)
                (cond-> []
                  (and (not= "" generated)
@@ -301,6 +302,10 @@
                  (not published?) (conj {:reason :unpublished-column})
                  (nil? can-select) (conj {:reason :catalog-changed-during-scan})
                  (false? can-select) (conj {:reason :missing-select})
+                 (and keyless-full? (.getBoolean row "nondeterministic_collation"))
+                 (conj {:reason :full-row-equality :detail :nondeterministic-collation})
+                 (and keyless-full? (= types/oid-json (or (types/array-oid->element-oid base-oid) base-oid)))
+                 (conj {:reason :full-row-equality :detail :missing-equality-operator})
                  (:problem user-type)
                  (conj {:reason :type-definition :detail (:problem user-type) :oid (:oid column)})
                  (and (nil? user-type) (not builtin?))
@@ -365,6 +370,7 @@
                          source-type-fields ", "
                          "       (p.partition_leaves IS NOT NULL OR a.attname = ANY(p.attnames)) AS is_published, "
                          "       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') AS can_select, "
+                         "       NOT column_collation.collisdeterministic AS nondeterministic_collation, "
                          "       pk.key_position, idx.relname AS primary_key_name, "
                          "       ri.indexrelid AS identity_index_oid, ri_class.relname AS identity_index_name, "
                          "       ri_keys.attnums AS identity_key_attnums, "
@@ -378,6 +384,7 @@
                          "LEFT JOIN pg_catalog.pg_inherits parent ON c.relispartition AND parent.inhrelid = c.oid "
                          "LEFT JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = c.oid "
                          "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+                         "LEFT JOIN pg_catalog.pg_collation column_collation ON column_collation.oid = a.attcollation "
                          "LEFT JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype IN ('d', 'e') "
                          source-type-joins
                          "LEFT JOIN pg_catalog.pg_attrdef def ON def.adrelid = a.attrelid AND def.adnum = a.attnum "
@@ -412,6 +419,7 @@
                                 :issues (cond-> issues
                                           (empty? columns) (conj {:reason :no-columns})
                                           (and (nil? (:partition-leaves relation))
+                                               (not= \f (:replica-identity relation))
                                                (nil? (:identity-index relation)) (not-any? :key? columns))
                                           (conj {:reason :missing-immediate-primary-key})))))
                      (partition-by :relation (filter :relation rows)))
@@ -1099,6 +1107,34 @@
 (defn- full-identity? [table]
   (= \f (replica-identity table)))
 
+(defn- keyless-full? [table]
+  (and (full-identity? table) (not-any? :key? (:columns table))))
+
+(defn- full-row-locator! [destination table pairs]
+  (require! (not-any? #(= ::unchanged (second %)) pairs)
+            "pgoutput omitted a column from a FULL old tuple" {:relation-id (:relation-id table)})
+  (let [predicates (map (fn [[column value]]
+                          (let [name (ident (:name column))]
+                            (if (nil? value)
+                              (str name " IS NULL")
+                              (str name " = " (cast-param column)))))
+                        pairs)
+        result (sink-prepared! destination
+                               (str "SELECT db_id FROM " (relation-name table) " WHERE "
+                                    (str/join " AND " predicates) " ORDER BY db_id LIMIT 1")
+                               (into [] (keep second) pairs))
+        eid (some-> (.-rows result) first first parse-long)]
+    (require! eid "No mirror row matches a FULL old tuple" {:relation-id (:relation-id table)})
+    [" WHERE db_id = CAST(? AS bigint)" [(str eid)]]))
+
+(defn- change-locator! [destination table old new]
+  (if (keyless-full? table)
+    (let [pairs (tuple-pairs table old)
+          [where values] (full-row-locator! destination table pairs)]
+      [where values pairs])
+    (let [keys (key-pairs table (or old new))]
+      [(key-filter keys) (mapv second keys) keys])))
+
 (defn- validate-old-tuple! [table op old-kind]
   (when (#{:update :delete} op)
     (require! (if (full-identity? table)
@@ -1128,25 +1164,25 @@
                new])
 
             :update
-            (let [keys (key-pairs table (or old new))
-                  old-key-values (into {} keys)
+            (let [[where locator-values previous] (change-locator! destination table old new)
+                  old-values (into {} previous)
                   changed (filterv (fn [[column value]]
                                      (and (not= ::unchanged value)
-                                          (or (not (contains? old-key-values column))
-                                              (not= value (get old-key-values column)))))
+                                          (or (not (contains? old-values column))
+                                              (not= value (get old-values column)))))
                                    (tuple-pairs table new))]
               (if (empty? changed)
-                [(str "SELECT 1 FROM " table-name (key-filter keys)) (mapv second keys) true]
+                [(str "SELECT 1 FROM " table-name where) locator-values true]
                 [(str "UPDATE " table-name " SET "
                       (comma-list (map (fn [[column _]]
                                          (str (ident (:name column)) " = " (cast-param column)))
                                        changed))
-                      (key-filter keys))
-                 (into (mapv second changed) (map second) keys)]))
+                      where)
+                 (into (mapv second changed) locator-values)]))
 
             :delete
-            (let [keys (key-pairs table old)]
-              [(str "DELETE FROM " table-name (key-filter keys)) (mapv second keys)]))
+            (let [[where locator-values] (change-locator! destination table old nil)]
+              [(str "DELETE FROM " table-name where) locator-values]))
           result (sink-prepared! destination sql values)
           count (if read-check? (count (.-rows result)) (affected-count result))]
       (require! (= 1 count) "A mirrored change did not affect exactly one row"
@@ -1441,21 +1477,26 @@
       (and (:primary-key-name previous)
            (not= (:primary-key-name previous) (:primary-key-name table)))))
 
+(defn- match-multiplicity? [previous table]
+  (or (keyless-full? previous) (keyless-full? table)))
+
 (defn- matching-key-indexes! [previous table]
   (let [by-attnum (into {} (map-indexed (fn [i col] [(:attnum col) [i col]])) (:columns table))
+        position (fn [before]
+                   (let [[i after] (get by-attnum (:attnum before))]
+                     (when (and after (= (typed-column before) (typed-column after)))
+                       i)))
         positions (fn [columns]
-                    (let [indexes (mapv (fn [before]
-                                          (let [[i after] (get by-attnum (:attnum before))]
-                                            (when (and after (= (typed-column before) (typed-column after)))
-                                              i)))
-                                        columns)]
+                    (let [indexes (mapv position columns)]
                       (when (and (seq indexes) (every? some? indexes)) indexes)))
         primary (key-columns previous)
         identity (identity-index-columns previous)
         indexes (or (when (= (set (map :attnum primary)) (set (map :attnum (key-columns table))))
                       (positions primary))
                     (positions identity)
-                    (positions primary))]
+                    (positions primary)
+                    (when (match-multiplicity? previous table)
+                      (into [] (keep position) (:columns previous))))]
     (require! indexes "Schema refresh cannot match rows without the previous key columns and types"
               {:table (relation-name table) :reason :missing-previous-key
                :primary-key (mapv :name primary) :identity-index (mapv :name identity)})
@@ -1552,20 +1593,22 @@
                     (when (seq renames) [name renames])))))
         type-changes))
 
-(defn- rows-by-previous-key! [table rows key-indexes check-running!]
-  (let [seen (volatile! #{})
+(defn- rows-by-previous-key! [table rows key-indexes match-multiplicity? check-running!]
+  (let [seen (when-not match-multiplicity? (volatile! #{}))
         columns (mapv (:columns table) key-indexes)]
     (mapv (fn [[_ values]]
             (check-running!)
             (let [key (previous-key columns (mapv values key-indexes))]
-              (require! (and (every? some? key) (not (contains? @seen key)))
-                        "Schema refresh found a missing or duplicate value in the previous key"
-                        {:table (relation-name table) :reason :ambiguous-previous-key})
-              (vswap! seen conj key)
+              (when seen
+                (require! (and (every? some? key) (not (contains? @seen key)))
+                          "Schema refresh found a missing or duplicate value in the previous key"
+                          {:table (relation-name table) :reason :ambiguous-previous-key})
+                (vswap! seen conj key))
               [key values]))
-          rows)))
+          (if match-multiplicity? (sort-by first rows) rows))))
 
-(defn- reconcile-table-tx [db table key-indexes staged-schema staged-rows renamed-labels check-running!]
+(defn- reconcile-table-tx
+  [db table key-indexes match-multiplicity? staged-schema staged-rows renamed-labels check-running!]
   (let [attrs (local-column-attrs db table)
         value-types (mapv #(get-in (dbi/-schema db) [% :db/valueType]) attrs)
         _ (require! (= staged-schema value-types) "Staged storage types differ from live storage types"
@@ -1574,9 +1617,17 @@
         key-columns (mapv (:columns table) key-indexes)
         key-renames (mapv #(get renamed-labels (get-in % [:user-type :name]) {}) key-columns)
         live-rows (stored-rows db table key-attrs)
-        live (into {} (map (fn [[eid key]]
-                             [(previous-key key-columns (mapv #(get %1 %2 %2) key-renames key)) eid]))
-                   live-rows)
+        live-key (fn [values]
+                   ;; With no comparable columns, retain the old rows only
+                   ;; for retraction. There is no basis for matching IDs.
+                   (if (seq key-columns)
+                     (previous-key key-columns (mapv #(get %1 %2 %2) key-renames values))
+                     ::unmatched))
+        live (if match-multiplicity?
+               (reduce (fn [buckets [eid values]]
+                         (update buckets (live-key values) (fnil conj []) eid))
+                       {} (sort-by first > live-rows))
+               (into {} (map (fn [[eid values]] [(live-key values) eid])) live-rows))
         ;; Retract every old spelling before adding any new one. A label
         ;; swap or reuse can otherwise collide with a native unique key.
         renamed-key-tx (when (some seq key-renames)
@@ -1595,8 +1646,11 @@
                     (require! (or (some? value) (not (:not-null? column)))
                               "Staged row violates publisher nullability"
                               {:table (relation-name table) :column (:name column)}))
-                  (let [eid (get @outstanding key)]
-                    (vswap! outstanding dissoc key)
+                  (let [matches (get @outstanding key)
+                        eid (if match-multiplicity? (peek matches) matches)]
+                    (if (and match-multiplicity? (< 1 (count matches)))
+                      (vswap! outstanding assoc key (pop matches))
+                      (vswap! outstanding dissoc key))
                     (if eid
                       (let [row (d/entity db eid)
                             previous (mapv #(get row %) attrs)]
@@ -1607,14 +1661,17 @@
                 [] staged-rows)]
     (into (into (vec renamed-key-tx)
                 (map (fn [eid] (check-running!) [:db/retractEntity eid]))
-                (vals @outstanding))
+                (if match-multiplicity? (mapcat val @outstanding) (vals @outstanding)))
           result)))
 
-(defn- reconcile-table! [destination stage-db table live-table key-indexes renamed-labels check-running!]
+(defn- reconcile-table! [destination stage-db table live-table previous renamed-labels check-running!]
   (let [attrs (local-column-attrs stage-db table)
         staged-schema (mapv #(get-in (dbi/-schema stage-db) [% :db/valueType]) attrs)
-        staged-rows (rows-by-previous-key! table (stored-rows stage-db table attrs) key-indexes check-running!)]
-    (stage-data! destination #(reconcile-table-tx % live-table key-indexes staged-schema staged-rows
+        key-indexes (matching-key-indexes! previous table)
+        match-multiplicity? (match-multiplicity? previous table)
+        staged-rows (rows-by-previous-key! table (stored-rows stage-db table attrs) key-indexes
+                                           match-multiplicity? check-running!)]
+    (stage-data! destination #(reconcile-table-tx % live-table key-indexes match-multiplicity? staged-schema staged-rows
                                                   renamed-labels check-running!))))
 
 (defn- matches-relation? [table message]
@@ -1965,8 +2022,7 @@
         (let [live-table (assoc table :name storage-name)]
           (adapt-layout! destination stage-db previous live-table table)
           (when-not (:partition-leaves table)
-            (reconcile-table! destination stage-db table live-table
-                              (matching-key-indexes! previous table) renamed-labels check-running!))
+            (reconcile-table! destination stage-db table live-table previous renamed-labels check-running!))
           (set-column-metadata! destination live-table)))
       (doseq [[storage logical] renames]
         (set-table-name! destination storage logical))
