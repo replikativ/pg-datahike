@@ -249,12 +249,16 @@
                      leaves (assoc :partition-leaves leaves :partition-key partition-key)))
         column-name (.getString row "attname")
         key-position (.getInt row "key_position")
+        generated (.getString row "attgenerated")
+        expression (.getString row "column_expr")
+        published? (.getBoolean row "is_published")
         user-type (when column-name (source-user-type row))
         column (when column-name
                  (cond-> {:name column-name :oid (.getLong row "atttypid")
                           :typmod (.getInt row "atttypmod") :key? (pos? key-position)
                           :attnum (.getInt row "attnum") :not-null? (.getBoolean row "attnotnull")
-                          :default (.getString row "default_expr")}
+                          :default (when (= "" generated) expression)}
+                   (and (= "s" generated) expression) (assoc :generated-expr expression)
                    (pos? key-position) (assoc :key-position key-position)
                    (and user-type (not (:problem user-type))) (assoc :user-type user-type)))]
     {:publication-oid (.getLong row "publication_oid")
@@ -291,8 +295,10 @@
              builtin? (builtin-ddl-type (assoc column :typmod -1))]
          (mapv #(assoc % :column column-name :source-type source-type)
                (cond-> []
-                 (not= "" (.getString row "attgenerated")) (conj {:reason :generated-column})
-                 (not (.getBoolean row "is_published")) (conj {:reason :unpublished-column})
+                 (and (not= "" generated)
+                      (not (and published? (:generated-expr column))))
+                 (conj {:reason :generated-column :kind generated})
+                 (not published?) (conj {:reason :unpublished-column})
                  (nil? can-select) (conj {:reason :catalog-changed-during-scan})
                  (false? can-select) (conj {:reason :missing-select})
                  (:problem user-type)
@@ -354,7 +360,7 @@
                          "       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits "
                          "               WHERE inhrelid = c.oid OR inhparent = c.oid) AS has_inheritance, "
                          "       a.attname, a.atttypid, a.atttypmod, a.attgenerated, a.attnum, a.attnotnull, "
-                         "       pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS default_expr, "
+                         "       pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS column_expr, "
                          "       pg_catalog.format_type(a.atttypid, a.atttypmod) AS source_type, "
                          source-type-fields ", "
                          "       (p.partition_leaves IS NOT NULL OR a.attname = ANY(p.attnames)) AS is_published, "
@@ -570,9 +576,19 @@
            (catch Throwable rollback-error (.addSuppressed error rollback-error)))
       (throw error))))
 
+(defn- copy-columns [table]
+  (comma-list (map (comp ident :name) (:columns table))))
+
 (defn- copy-relation [table]
-  (str (relation-name table) " ("
-       (comma-list (map (comp ident :name) (:columns table))) ")"))
+  (str (relation-name table) " (" (copy-columns table) ")"))
+
+(defn- copy-out-sql [table]
+  (str "COPY "
+       (if (some :generated-expr (:columns table))
+         ;; Like PostgreSQL tablesync, project generated values with SELECT.
+         (str "(SELECT " (copy-columns table) " FROM ONLY " (relation-name table) ")")
+         (copy-relation table))
+       " TO STDOUT"))
 
 (defn- load-copy! [^PgWireServer$QueryHandler destination table feed!]
   (let [reply (sink-execute! destination (str "COPY " (copy-relation table) " FROM STDIN"))]
@@ -586,7 +602,7 @@
 
 (defn- copy-table! [^Connection source destination table on-bytes]
   (let [source-api (.getCopyAPI (.unwrap source PGConnection))
-        out (.copyOut source-api (str "COPY " (copy-relation table) " TO STDOUT"))]
+        out (.copyOut source-api (copy-out-sql table))]
     (try
       (let [written (load-copy! destination table
                                 (fn [write!]
@@ -601,7 +617,7 @@
       (finally (when (.isActive out) (.cancelCopy out))))))
 
 (defn- transfer-staged-table! [stage destination table live-table on-bytes]
-  (let [export (sink-execute! stage (str "COPY " (copy-relation table) " TO STDOUT"))]
+  (let [export (sink-execute! stage (copy-out-sql table))]
     (require! (.-copyOutMode export) "Expected COPY OUT response" {:table (relation-name table)})
     (let [lines (.-copyOutLines export)
           written (load-copy! destination live-table
@@ -663,19 +679,22 @@
 (defn- column-metadata-tx [db table]
   (let [attrs (local-column-attrs db table)
         tx (into []
-                 (mapcat (fn [attr {:keys [not-null? default]}]
+                 (mapcat (fn [attr {:keys [not-null? default generated-expr]}]
                            (let [entity (d/entity db attr)
                                  eid (:db/id entity)
-                                 was-not-null? (true? (:pg/not-null entity))
-                                 kind (:pg/default-kind entity)
-                                 previous (:pg/default-value entity)]
-                             (cond-> []
-                               (and not-null? (not was-not-null?)) (conj [:db/add eid :pg/not-null true])
-                               (and (not not-null?) was-not-null?) (conj [:db/retract eid :pg/not-null true])
-                               (and (some? default) (not= kind :publisher)) (conj [:db/add eid :pg/default-kind :publisher])
-                               (and (some? default) (not= default previous)) (conj [:db/add eid :pg/default-value default])
-                               (and (nil? default) kind) (conj [:db/retract eid :pg/default-kind kind])
-                               (and (nil? default) previous) (conj [:db/retract eid :pg/default-value previous]))))
+                                 metadata {:pg/not-null (when not-null? true)
+                                           :pg/default-kind (when (some? default) :publisher)
+                                           :pg/default-value default
+                                           :pg/generated (when generated-expr "s")
+                                           :pg/generated-expr generated-expr
+                                           :pg/publisher-generated? (when generated-expr true)}]
+                             (keep (fn [[property value]]
+                                     (let [previous (get entity property)]
+                                       (cond
+                                         (= previous value) nil
+                                         (nil? value) [:db/retract eid property previous]
+                                         :else [:db/add eid property value])))
+                                   metadata)))
                          attrs (:columns table)))]
     (if (seq tx)
       (into tx (catalog-objects/bump-revision-tx
@@ -2112,7 +2131,7 @@
         pending-schema (volatile! (or (:pending-schema manifest) {}))
         live (volatile! (tables-by-id manifest))
         observed (volatile! @live)
-        validated-identity-relations (volatile! {})
+        catalog-checked-relations (volatile! {})
         stage (volatile! nil)
         stage-signaled? (volatile! false)
         following? (volatile! false)
@@ -2146,7 +2165,11 @@
                              (vreset! stage-signaled? false)))))))
         live? (fn [id] (and (contains? @live id) (not (contains? @pending-schema id))))
         validate-transaction! (fn [relations ids]
-                                (let [stale? (fn [id]
+                                (let [check-catalog? (fn [id]
+                                                       (and (live? id)
+                                                            (or (#{\f \i} (:identity (get relations id)))
+                                                                (some :generated-expr (:columns (get @live id))))))
+                                      stale? (fn [id]
                                                (or (and (not (contains? @observed id)) (not (contains? @live id)))
                                                    (and (live? id)
                                                         (not (matches-relation? (get @live id)
@@ -2156,14 +2179,12 @@
                                                                 (keep (fn [{:keys [oid user-type]}]
                                                                         (when user-type [oid user-type]))))
                                                        ids)]
-                                  ;; FULL and USING INDEX can send identical
-                                  ;; wire flags after the primary key or the
-                                  ;; selected index changes.
+                                  ;; Key and generation-expression changes can leave
+                                  ;; the wire descriptor identical.
                                   (when (or (some stale? ids)
                                             (some (fn [id]
-                                                    (and (live? id)
-                                                         (#{\f \i} (:identity (get relations id)))
-                                                         (not (identical? (get @validated-identity-relations id)
+                                                    (and (check-catalog? id)
+                                                         (not (identical? (get @catalog-checked-relations id)
                                                                           (get relations id)))))
                                                   ids)
                                             ;; A changed enum spelling can also
@@ -2177,9 +2198,8 @@
                                   (when-let [id (some #(when (stale? %) %) ids)]
                                     (throw (ex-info "Publication relation changed"
                                                     {:relation (get relations id)})))
-                                  (doseq [id ids
-                                          :when (and (live? id) (#{\f \i} (:identity (get relations id))))]
-                                    (vswap! validated-identity-relations assoc id (get relations id)))))
+                                  (doseq [id ids :when (check-catalog? id)]
+                                    (vswap! catalog-checked-relations assoc id (get relations id)))))
         apply-live! (fn [previous transaction cutover? active]
                       (let [candidate (cond
                                         cutover?
@@ -2259,7 +2279,7 @@
                      (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros)
                      (when cutover?
                        (vreset! live (tables-by-id @applied))
-                       (vreset! validated-identity-relations {})
+                       (vreset! catalog-checked-relations {})
                        (vreset! pending-schema {})
                        (vreset! stage nil)
                        (stop-refresh! active)

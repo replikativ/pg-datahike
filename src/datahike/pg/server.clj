@@ -4541,6 +4541,7 @@
               ;; reads.
               [:pg/generated str1]
               [:pg/generated-expr str1]
+              [:pg/publisher-generated? bool1]
               ;; Constraint identity: table + name (ddl/constraint-key).
               ;; PostgreSQL names are unique per table, so CHECK and FK
               ;; entities are keyed by both; :pg/check-conname and
@@ -13976,7 +13977,7 @@
                    (let [db (if (:in-tx? @(:tx-state ctx))
                               (:speculative-db @(:tx-state ctx))
                               (d/db (:conn ctx)))]
-                     (into #{} (comp (filter :generated) (map :name))
+                     (into #{} (comp (filter #(or (:generated %) (:publisher-generated? %))) (map :name))
                            (:columns (row-constraint-plan db table)))))
         _ (when-let [gen (first (filter gen-cols columns))]
             (throw (ex-info (str "column \"" gen "\" is a generated column")
@@ -13987,7 +13988,7 @@
                   (let [db (if (:in-tx? @(:tx-state ctx))
                              (:speculative-db @(:tx-state ctx))
                              (d/db (:conn ctx)))]
-                    (into [] (comp (remove :generated) (map :name))
+                    (into [] (comp (map :name) (remove gen-cols))
                           (:columns (row-constraint-plan db table))))
                   columns)
         sql (or query

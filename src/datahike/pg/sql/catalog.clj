@@ -2906,7 +2906,7 @@
                :information_schema_columns/is_generated
                (if (:generated col) "ALWAYS" "NEVER")
                :information_schema_columns/generation_expression
-               (or (:generated-expr col) "")
+               (:generated-expr col)
                :information_schema_columns/is_updatable           "YES"
                (pgs/row-marker-attr "information_schema_columns") true}))))
     "information_schema_tables"

@@ -49,6 +49,7 @@
                                              ancestors)
                                        attr))
                             entity (d/entity db attr)
+                            publisher-generated? (:pg/publisher-generated? entity)
                             kind (:pg/default-kind entity)]
                         {:name name :attr attr
                          :not-null? (true? (:pg/not-null entity))
@@ -56,8 +57,10 @@
                          ;; alongside the default and not as one: a
                          ;; default fills an omitted column, and this
                          ;; replaces whatever was written.
-                         :generated (:pg/generated entity)
-                         :generated-expr (:pg/generated-expr entity)
+                         ;; A mirror receives these values from PostgreSQL.
+                         :publisher-generated? publisher-generated?
+                         :generated (when-not publisher-generated? (:pg/generated entity))
+                         :generated-expr (when-not publisher-generated? (:pg/generated-expr entity))
                          :default (when kind
                                     [kind (:pg/default-value entity)
                                      (:pg/default-arg entity)])}))))

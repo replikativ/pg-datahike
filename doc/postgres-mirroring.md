@@ -77,8 +77,12 @@ The mirror copies column names and supported types into a fresh read model.
 Publisher defaults,
 triggers and cascades run on PostgreSQL. The mirror applies the resulting rows
 and preserves their transaction boundaries using the normal Datahike writer.
-Generated columns, sequence counters, legacy inheritance, row filters, and
-column projections require separate handling.
+The mirror supports stored generated columns when the publication includes
+them. For whole-table publications, set `publish_generated_columns = stored`
+on PostgreSQL. The publisher computes the values, and the mirror records
+their expression and generated status for catalog queries. Virtual generated
+columns, sequence counters, legacy inheritance, row filters, and partial
+column lists require separate handling.
 
 Supported column types are boolean, smallint, integer, bigint, real, double
 precision, numeric, text, varchar, character, bytea, uuid, date, time,
@@ -205,6 +209,10 @@ Datahike entities keep their identity when their previous keys match, and
 historical SQL reads retain the old columns and values. Source default
 expressions are recorded as catalog metadata. PostgreSQL evaluates them
 when applications write to the publisher.
+
+Schema refresh follows the addition, removal, and expression changes of
+published stored generated columns. It preserves the generated status and
+expression in earlier snapshots.
 
 A table rename preserves the mirror's relation OID and Datahike entities.
 The new SQL name becomes visible at cutover. Earlier snapshots keep the
@@ -340,6 +348,8 @@ Pass `--index-identity` to exercise index-based apply, index changes, and
 restart with a keyed table and a keyless join table.
 Pass `--array-refresh` to exercise adding and removing columns, changing an
 array element typmod, and matching rows by equivalent array keys at cutover.
+Pass `--generated-columns` to compare stored generated values with a native
+subscriber through COPY, live apply, expression changes, and restart.
 Pass `--partitions` to check populated attachment, detachment, reattachment,
 truncation and crash recovery under leaf routing.
 Pass `--root-publication` to run the same comparison with a matched

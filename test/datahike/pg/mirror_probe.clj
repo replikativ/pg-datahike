@@ -2259,6 +2259,166 @@
               (when (= ["false"] (slot-query source slot "active::text"))
                 (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))))))))))
 
+(defn- generated-column-catalog [conn]
+  [(rows conn (str "SELECT a.attname, a.attgenerated, a.atthasdef, pg_get_expr(d.adbin, d.adrelid) "
+                   "FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+                   "WHERE a.attrelid = 'public.mirror_generated'::regclass "
+                   "AND a.attname IN ('code', 'bonus') ORDER BY a.attname"))
+   (rows conn (str "SELECT column_name, is_generated, generation_expression, column_default FROM information_schema.columns "
+                   "WHERE table_schema = 'public' AND table_name = 'mirror_generated' "
+                   "AND column_name IN ('code', 'bonus') ORDER BY column_name"))])
+
+(defn- copy-text [^Connection conn command]
+  (let [writer (java.io.StringWriter.)]
+    (.copyOut (.getCopyAPI (.unwrap conn PGConnection)) ^String command writer)
+    (str writer)))
+
+(defn run-generated-probe! [source-url reference-url source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-generated-" (make-array FileAttribute 0)))
+        path (str directory "/store")
+        native-slot "mirror_generated_native"
+        config {:source-url source-url :publication "mirror_generated_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        slot (atom nil)
+        base-query "SELECT id, raw, code FROM public.mirror_generated ORDER BY id"
+        expanded-query "SELECT id, raw, code, bonus FROM public.mirror_generated ORDER BY id"
+        entity-query "SELECT db_id FROM public.mirror_generated WHERE id = 1"]
+    (with-open [source (DriverManager/getConnection source-url)
+                reference (DriverManager/getConnection reference-url)]
+      (let [agrees? (fn [sink query] (= (rows source query) (rows reference query) (rows sink query)))
+            metadata-matches? (fn [sink] (= (generated-column-catalog source) (generated-column-catalog sink)))
+            cutover #(get-in (mirror/status @subscriber) [:last-schema-refresh :cutover])]
+        (try
+          (sql! source
+                (str "CREATE FUNCTION public.derived_input(n int) RETURNS int IMMUTABLE LANGUAGE SQL "
+                     "AS 'SELECT CASE WHEN n < 0 THEN NULL ELSE n * 17 END'")
+                (str "CREATE TABLE public.mirror_generated (id integer PRIMARY KEY, raw integer NOT NULL, "
+                     "code integer GENERATED ALWAYS AS (public.derived_input(raw)) STORED)")
+                "INSERT INTO public.mirror_generated (id, raw) VALUES (1, 4), (2, -1)"
+                (str "CREATE PUBLICATION mirror_generated_pub FOR TABLE public.mirror_generated "
+                     "WITH (publish_generated_columns = stored)")
+                "CREATE PUBLICATION mirror_omits_generated FOR TABLE public.mirror_generated"
+                (str "CREATE TABLE public.mirror_virtual (id integer PRIMARY KEY, raw integer, "
+                     "code integer GENERATED ALWAYS AS (raw * 2) VIRTUAL)")
+                (str "CREATE PUBLICATION mirror_virtual_pub FOR TABLE public.mirror_virtual "
+                     "WITH (publish_generated_columns = stored)")
+                "SET search_path = pg_catalog")
+          (check! (:compatible? (mirror/publication-report config))
+                  "Stored generated column was not admitted" {})
+          (doseq [[publication kind] [["mirror_omits_generated" "s"] ["mirror_virtual_pub" "v"]]]
+            (let [report (mirror/publication-report (assoc config :publication publication))]
+              (check! (and (not (:compatible? report))
+                           (some #(and (= :generated-column (:reason %)) (= kind (:kind %)))
+                                 (get-in report [:tables 0 :issues])))
+                      "Unsupported generated column was admitted" report)))
+          ;; PostgreSQL checks the replica identity against every publication
+          ;; that publishes changes for the table.
+          (sql! source "DROP PUBLICATION mirror_omits_generated")
+          (sql! reference "CREATE TABLE public.mirror_generated (id integer PRIMARY KEY, raw integer NOT NULL, code integer)")
+          (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
+          (sql! reference (str "CREATE SUBSCRIPTION mirror_generated_native CONNECTION "
+                               (literal source-conninfo) " PUBLICATION mirror_generated_pub "
+                               "WITH (create_slot=false, slot_name=" (literal native-slot) ")"))
+          (reset! subscriber (mirror/start! config))
+          (reset! slot (:slot (await-state! @subscriber :following)))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (await! "Snapshot values differed from the native subscriber" #(agrees? sink base-query))
+            (check! (metadata-matches? sink) "The generated expression metadata differed"
+                    {:source (generated-column-catalog source) :mirror (generated-column-catalog sink)})
+            (doseq [command ["COPY public.mirror_generated TO STDOUT"
+                             "COPY (SELECT id, raw, code FROM public.mirror_generated ORDER BY id) TO STDOUT"]]
+              (check! (= (sort (str/split-lines (copy-text source command)))
+                         (sort (str/split-lines (copy-text sink command))))
+                      "COPY treated a generated column differently from PostgreSQL" {:command command}))
+            (let [entity (rows sink entity-query)]
+              (sql! source "BEGIN"
+                    "UPDATE public.mirror_generated SET raw = 6 WHERE id = 1"
+                    "INSERT INTO public.mirror_generated (id, raw) VALUES (3, 10)"
+                    "DELETE FROM public.mirror_generated WHERE id = 2"
+                    "COMMIT")
+              (await! "Live apply missed a generated value" #(agrees? sink base-query))
+              (let [before (inspect-db path :max-tx)
+                    old-catalog (generated-column-catalog sink)
+                    old-rows (rows sink base-query)
+                    prior-cutover (cutover)]
+                (sql! source "BEGIN"
+                      (str "ALTER TABLE public.mirror_generated ALTER COLUMN code "
+                           "SET EXPRESSION AS (public.derived_input(raw) + 100)")
+                      "UPDATE public.mirror_generated SET raw = raw + 1"
+                      "COMMIT")
+                (await! "The expression change did not reach a durable cutover"
+                        #(and (not= prior-cutover (cutover))
+                              (metadata-matches? sink) (agrees? sink base-query)))
+                (sql! sink (str "SET datahike.as_of = " before))
+                (check! (= [old-catalog old-rows] [(generated-column-catalog sink) (rows sink base-query)])
+                        "History lost the old generated expression or values" {})
+                (sql! sink "RESET datahike.as_of"))
+              (let [prior-cutover (cutover)]
+                (sql! reference "ALTER TABLE public.mirror_generated ADD COLUMN bonus integer")
+                (sql! source "BEGIN"
+                      "ALTER TABLE public.mirror_generated ALTER COLUMN code DROP EXPRESSION"
+                      "ALTER TABLE public.mirror_generated ALTER COLUMN code SET DEFAULT 404"
+                      (str "ALTER TABLE public.mirror_generated ADD COLUMN bonus integer "
+                           "GENERATED ALWAYS AS (public.derived_input(raw + 2)) STORED NOT NULL")
+                      "UPDATE public.mirror_generated SET code = 51"
+                      "COMMIT")
+                (await! "Column generation changes did not reach a durable cutover"
+                        #(and (not= prior-cutover (cutover))
+                              (metadata-matches? sink) (agrees? sink expanded-query))))
+              (check! (= entity (rows sink entity-query)) "Generation changes replaced the entity" {})))
+          (mirror/stop! @subscriber)
+          (reset! subscriber (mirror/start! config))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (sql! source "INSERT INTO public.mirror_generated (id, raw) VALUES (5, 8)")
+            (await! "Restart lost the new generated values or column default" #(agrees? sink expanded-query))
+            (let [prior-cutover (cutover)
+                  entity (rows sink entity-query)]
+              (sql! reference "ALTER TABLE public.mirror_generated ALTER COLUMN bonus SET NOT NULL")
+              (doseq [conn [reference source]]
+                (sql! conn "BEGIN"
+                      "CREATE UNIQUE INDEX mirror_generated_bonus ON public.mirror_generated (bonus)"
+                      "ALTER TABLE public.mirror_generated REPLICA IDENTITY USING INDEX mirror_generated_bonus"
+                      "COMMIT"))
+              (await! "Generated replica identity did not reach a durable cutover"
+                      #(and (not= prior-cutover (cutover))
+                            (= "mirror_generated_bonus"
+                               (get-in (durable-checkpoint path) [:manifest :tables 0 :identity-index :name]))))
+              (sql! source "UPDATE public.mirror_generated SET raw = 14 WHERE id = 1"
+                    "DELETE FROM public.mirror_generated WHERE id = 3")
+              (await! "Apply missed the changing generated replica identity" #(agrees? sink expanded-query))
+              (check! (= entity (rows sink entity-query)) "Generated key update replaced the entity" {}))
+            (let [query "SELECT id, raw, doubled FROM public.mirror_generated_later ORDER BY id"]
+              (sql! reference "CREATE TABLE public.mirror_generated_later (id integer PRIMARY KEY, raw integer, doubled integer)")
+              (sql! source "BEGIN"
+                    (str "CREATE TABLE public.mirror_generated_later (id integer PRIMARY KEY, raw integer, "
+                         "doubled integer GENERATED ALWAYS AS (raw * 2) STORED)")
+                    "INSERT INTO public.mirror_generated_later (id, raw) VALUES (1, 7), (2, 11)"
+                    "ALTER PUBLICATION mirror_generated_pub ADD TABLE public.mirror_generated_later"
+                    "COMMIT")
+              (sql! reference "ALTER SUBSCRIPTION mirror_generated_native REFRESH PUBLICATION")
+              (await! "An online table addition lost its generated columns"
+                      #(and (some (fn [table] (= "mirror_generated_later" (:name table)))
+                                  (get-in (durable-checkpoint path) [:manifest :tables]))
+                            (agrees? sink query)))
+              (sql! source "UPDATE public.mirror_generated_later SET raw = 12 WHERE id = 2")
+              (await! "Live apply lost the new table's generated columns" #(agrees? sink query))
+              (let [prior-cutover (cutover)
+                    query "SELECT id, raw FROM public.mirror_generated_later ORDER BY id"]
+                (doseq [conn [reference source]]
+                  (sql! conn "ALTER TABLE public.mirror_generated_later DROP COLUMN doubled"))
+                (sql! source "UPDATE public.mirror_generated_later SET raw = 13 WHERE id = 2")
+                (await! "Dropping a generated column did not reach a durable cutover"
+                        #(and (not= prior-cutover (cutover)) (agrees? sink query))))))
+          {:status :passed :artifacts directory}
+          (finally
+            (when @subscriber (mirror/stop! @subscriber))
+            (when (and @slot (= ["false"] (slot-query source @slot "active::text")))
+              (sql! source (str "SELECT pg_drop_replication_slot(" (literal @slot) ")")))
+            (sql! reference "DROP SUBSCRIPTION IF EXISTS mirror_generated_native")
+            (when (= ["false"] (slot-query source native-slot "active::text"))
+              (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")")))))))))
+
 (defn -main [& [argument mode]]
   (cond
     (= "--failover" argument)
@@ -2296,6 +2456,7 @@
               "--primary-key-refresh" run-primary-key-probe!
               "--index-identity" run-index-identity-probe!
               "--array-refresh" run-array-refresh-probe!
+              "--generated-columns" run-generated-probe!
               "--full-identity" #(run-primary-key-probe! %1 %2 %3 true)
               "--full-identity-recovery" #(run-probe! %1 %2 %3 true)
               "--schema-refresh" run-schema-refresh-probe!
