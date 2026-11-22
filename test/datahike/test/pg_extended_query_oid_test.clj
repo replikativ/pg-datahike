@@ -405,6 +405,19 @@
    (str "SELECT lag(v, 1, 2147483648::int8) OVER (ORDER BY v) "
         "FROM oid_lag_probe")))
 
+(deftest timestamp-binary-codec-preserves-postgres-microseconds
+  (doseq [[oid text decoded hex]
+          [[oid-timestamp "1999-12-31 23:59:59.999999"
+            (java.time.LocalDateTime/parse "1999-12-31T23:59:59.999999") "ffffffffffffffff"]
+           [oid-timestamptz "2000-01-01 05:45:00.000001+05:45"
+            (java.time.OffsetDateTime/parse "2000-01-01T00:00:00.000001Z") "0000000000000001"]
+           [oid-timestamp "0001-01-01 00:00:01.000001 BC"
+            (java.time.LocalDateTime/parse "0000-01-01T00:00:01.000001") "ff1fc63d1bc06241"]]]
+    (let [encoded (.parseHex (java.util.HexFormat/of) ^String hex)]
+      (is (= (seq encoded) (seq (datahike.pg.PgParamCodec/encodeBinary oid text))) text)
+      (is (= decoded (datahike.pg.PgParamCodec/decodeBinary oid encoded)) text)
+      (is (= (seq encoded) (seq (datahike.pg.PgParamCodec/encodeBinary oid decoded))) text))))
+
 (deftest timetz-binary-codec-round-trips-scalar-and-array
   (let [value (java.time.OffsetTime/parse "12:34:56.123456-07:30")
         bytes (datahike.pg.PgParamCodec/encodeBinary oid-timetz value)]

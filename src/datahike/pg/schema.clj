@@ -91,7 +91,7 @@
     ;; and for DDL-emitted constraints / catalog integrity. These live
     ;; on ident entities to tune the SQL-side view; they must not
     ;; themselves appear as virtual tables.
-    "datahike.pg" "datahike.pg.index" "pg"})
+    "datahike.pg" "datahike.pg.index" "pg" "__seq__"})
 
 (defn- internal-namespace? [ns]
   (or (contains? internal-ns-prefixes ns)
@@ -162,6 +162,28 @@
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one
     :db/doc "Column's SQL type is a registered DOMAIN (`:datahike.pg.domain/name`). Storage lowers to the domain's base type; the dump re-emits with the domain name."}])
+
+(defn registered-type-name-tx
+  "Change the SQL name of an enum or domain and its column annotations.
+   Passing nil removes the registry and catalog entry after source drop."
+  [db kind old-name new-name]
+  (let [[registry column-tag] (case kind
+                                :enum [:datahike.pg.enum/name :datahike.pg/enum-of]
+                                :domain [:datahike.pg.domain/name :datahike.pg/domain-of])
+        eid (d/q '[:find ?e . :in $ ?attr ?name :where [?e ?attr ?name]] db registry old-name)
+        oid (:datahike.pg.object/oid
+             (catalog-objects/object-by-identity db catalog-objects/pg-type-oid
+                                                 catalog-objects/public-namespace-oid old-name))]
+    (when-not eid
+      (throw (ex-info (str "type " (pr-str old-name) " does not exist")
+                      {:error :undefined-object :sqlstate "42704"})))
+    (if new-name
+      (into [[:db/retract eid registry old-name] [:db/add eid registry new-name]]
+            (concat (mapcat (fn [[column]]
+                              [[:db/retract column column-tag old-name] [:db/add column column-tag new-name]])
+                            (d/q '[:find ?e :in $ ?attr ?name :where [?e ?attr ?name]] db column-tag old-name))
+                    (catalog-objects/rename-object-tx db catalog-objects/pg-type-oid oid new-name nil)))
+      (into [[:db/retractEntity eid]] (catalog-objects/drop-object-tx db catalog-objects/pg-type-oid oid)))))
 
 (defn ensure-hint-schema!
   "Idempotently install the :datahike.pg/* hint schema attrs on `conn`.
@@ -560,6 +582,26 @@
 
 (def ^:const row-marker-col "db-row-exists")
 
+(def ^:const partition-scan-tableoid :datahike.pg.partition/scan-tableoid)
+
+(def mirror-checkpoint-id [:pgdh-mirror-key :checkpoint])
+
+(defn mirror-private-storage [db]
+  ;; Use the listener's live database so a historical SQL snapshot also
+  ;; hides the checkpoint table retained in older store histories.
+  (when (contains? (dbi/-schema db) (first mirror-checkpoint-id))
+    (when (:pgdh-mirror-legacy-checkpoint (d/entity db mirror-checkpoint-id))
+      #{"checkpoint"})))
+
+(defn- as-of-view? [db]
+  (and db (= :as-of (get-in (dbi/-secondary-view db) [:system :mode]))))
+
+(defn- retired-table-names [db]
+  (when (and db (get (dbi/-schema db) :datahike.pg.partition/retired-storage))
+    (set (d/q '[:find [?storage ...]
+                :where [_ :datahike.pg.partition/retired-storage ?storage]]
+              db))))
+
 (defn- schema-hints*
   [db]
   (let [q-fn d/q
@@ -567,6 +609,7 @@
         ;; conn without ensure-pg-schema!) — keep the query resilient
         ;; to each attr being absent by using per-attr lookups instead
         ;; of a single join.
+        retired (retired-table-names db)
         rows (q-fn '{:find [?for-ident ?e]
                      :where [[?e :datahike.pg/for-ident ?for-ident]]}
                    db)
@@ -645,18 +688,27 @@
                                  (update acc (namespace ident) (fnil conj []) (name ident))
                                  acc))
                              {} ordered-idents)]
-    (assoc (reduce (fn [acc [ident expr]]
-                     (update acc ident assoc :generated "s" :generated-expr expr))
-                   (reduce (fn [acc [ident]]
-                             (update acc ident assoc :not-null? true))
-                           (reduce (fn [acc [ident pt]]
-                                     (update acc ident assoc :pg-type pt))
-                                   ident-hints
-                                   pg-types)
-                           not-nulls)
-                   generateds)
-           ::column-order column-order
-           ::catalog-db db)))
+    (cond-> (assoc (reduce (fn [acc [ident expr]]
+                             (update acc ident assoc :generated "s" :generated-expr expr))
+                           (reduce (fn [acc [ident]]
+                                     (update acc ident assoc :not-null? true))
+                                   (reduce (fn [acc [ident pt]]
+                                             (update acc ident assoc :pg-type pt))
+                                           ident-hints
+                                           pg-types)
+                                   not-nulls)
+                           generateds)
+                   ::column-order column-order
+                   ::catalog-db db)
+      (seq retired) (assoc ::retired-tables retired)
+      ;; An as-of DB delegates its structural schema map to the current
+      ;; DB. Exclude attributes and row markers created after the snapshot.
+      (as-of-view? db)
+      (assoc ::visible-idents (into #{} (map second) ordered-idents)
+             ::visible-uniqueness
+             (into {} (q-fn '[:find ?ident ?unique
+                              :where [?e :db/ident ?ident] [?e :db/unique ?unique]]
+                            db))))))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
@@ -676,6 +728,25 @@
             v)))
     :else (schema-hints* db)))
 
+(defn column-storage-ident
+  "Resolve a visible SQL column to its schema attribute using rename and
+   rewrite hints. The ordinary unrenamed column is a direct lookup."
+  [schema hints table column]
+  (when table
+    (let [ident (keyword table column)
+          hint (get hints ident)]
+      (if (and (contains? schema ident)
+               (not (:hidden hint))
+               (= column (get hint :column column)))
+        ident
+        (some (fn [[attr h]]
+                (when (and (not (:hidden h))
+                           (= column (:column h))
+                           (= table (or (:table h) (namespace attr)))
+                           (contains? schema attr))
+                  attr))
+              hints)))))
+
 (defn row-marker-attr
   "Return the row-existence marker attribute for a table.
    E.g., :person/db-row-exists for table 'person'."
@@ -687,22 +758,31 @@
 ;; assume are stable. User tables get 16384+ to avoid any collision.
 (def ^:const first-user-oid catalog-objects/first-user-oid)
 
-(defn table-oid
-  "The table's authoritative persistent PostgreSQL OID. Prefer the shared
-   object registry and fall back to :pg/table-oid on the row-marker for bare
-   or pre-migration databases. Datahike's schema map only surfaces schema-
-   level attrs; custom attrs on the ident entity require a Datalog lookup."
+(defn- marker-table-oid [db table-name]
+  (ffirst (d/q '{:find [?oid]
+                 :in [$ ?ident]
+                 :where [[?e :db/ident ?ident]
+                         [?e :pg/table-oid ?oid]]}
+               db (row-marker-attr table-name))))
+
+(defn- registered-table-oid
   [db table-name]
-  (or (:datahike.pg.object/oid
-       (catalog-objects/object-by-identity
-        db catalog-objects/pg-class-oid
-        catalog-objects/public-namespace-oid table-name))
-      (let [q-fn d/q]
-        (ffirst (q-fn '{:find [?oid]
-                        :in [$ ?ident]
-                        :where [[?e :db/ident ?ident]
-                                [?e :pg/table-oid ?oid]]}
-                      db (row-marker-attr table-name))))))
+  (:datahike.pg.object/oid
+   (catalog-objects/object-by-identity
+    db catalog-objects/pg-class-oid
+    catalog-objects/public-namespace-oid table-name)))
+
+(defn table-oid
+  "The table's persistent PostgreSQL OID. Prefer the registry for SQL names
+   and fall back to the row marker for bare or pre-migration databases."
+  [db table-name]
+  (or (registered-table-oid db table-name) (marker-table-oid db table-name)))
+
+(defn storage-table-oid
+  "Return the relation OID for a physical table namespace, including when
+   another relation now uses that namespace's name in SQL."
+  [db storage-name]
+  (or (marker-table-oid db storage-name) (registered-table-oid db storage-name)))
 
 (defn next-user-oid
   "Deprecated read-only view of the next shared user OID.  DDL must transact
@@ -889,7 +969,7 @@
    ;; to the wrong column: `invalid input syntax for numeric:
    ;; "2014-12-23"` in ResultSetTest.testUpdateWithPGobject.
    (let [db (::catalog-db hints)
-         relation-oid (when db (table-oid db table-name))
+         relation-oid (when db (storage-table-oid db table-name))
          column (when relation-oid
                   (catalog-objects/column-by-name db relation-oid col-name))]
      (or (:datahike.pg.column/attnum column)
@@ -907,6 +987,11 @@
   (when-let [ns (namespace ident)]
     (or (internal-namespace? ns)
         (= (name ident) row-marker-col))))
+
+(defn schema-unique [hints attr props]
+  (if-let [visible (::visible-uniqueness hints)]
+    (get visible attr)
+    (:db/unique props)))
 
 (defn relation-membership-attrs
   "Describe the physical attributes that establish membership in `table-name`.
@@ -956,7 +1041,14 @@
 
 (defn- derive-virtual-tables*
   [schema hints]
-  (let [user-attrs (remove (fn [[k _]] (or (not (keyword? k))
+  (let [visible-idents (::visible-idents hints)
+        retired (::retired-tables hints)
+        schema (if visible-idents (select-keys schema visible-idents) schema)
+        schema (if (seq retired)
+                 (into {} (remove (fn [[attr _]] (and (keyword? attr)
+                                                      (contains? retired (namespace attr))))) schema)
+                 schema)
+        user-attrs (remove (fn [[k _]] (or (not (keyword? k))
                                            (internal-attr? k)
                                            (nil? (namespace k))
                                            (:hidden (get hints k))))
@@ -967,6 +1059,7 @@
                                    h (get hints ident)
                                    col-name (or (:column h) local-col)
                                    vtype (:db/valueType props)
+                                   unique (schema-unique hints ident props)
                                    col {:name        col-name
                                         :attr        ident
                                         :oid         (declared-col-oid
@@ -974,7 +1067,7 @@
                                                       vtype)
                                         :valuetype   vtype
                                         :cardinality (:db/cardinality props)
-                                        :unique      (:db/unique props)
+                                        :unique      unique
                                         ;; `NOT NULL` as DDL recorded it,
                                         ;; carried on the hint map because
                                         ;; `(:schema db)` surfaces only the
@@ -988,7 +1081,7 @@
                                         :ref?        (= vtype :db.type/ref)
                                         :references  (:references h)
                                         :internal-index? (:internal-index? h)
-                                        :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
+                                        :indexed?    (or (:db/index props) (some? unique))}]
                                (-> tables
                                    (update-in [table-name :columns] (fnil conj []) col)
                                    (assoc-in [table-name :attrs col-name] ident))))
@@ -1116,7 +1209,8 @@
       (into {}
             (for [relation (mapcat #(catalog-objects/objects-by-kind db %)
                                    [:table :view])
-                  :let [table-name (:datahike.pg.object/name relation)
+                  :let [table-name (or (:datahike.pg.object/storage-name relation)
+                                       (:datahike.pg.object/name relation))
                         relation-oid (:datahike.pg.object/oid relation)
                         columns (catalog-objects/columns-by-relation db relation-oid)
                         known-storage (into #{} (map :datahike.pg.column/storage-ident) columns)
@@ -1242,8 +1336,13 @@
 
 (defn table-names
   "Return sorted list of virtual table names for a schema."
-  [schema]
-  (sort (keys (derive-virtual-tables schema))))
+  ([schema] (table-names schema nil))
+  ([schema db]
+   (let [visibility (if (as-of-view? db)
+                      (select-keys (schema-hints db) [::visible-idents ::retired-tables])
+                      (when-let [retired (seq (retired-table-names db))]
+                        {::retired-tables (set retired)}))]
+     (sort (keys (derive-virtual-tables schema (or visibility {})))))))
 
 ;; ============================================================================
 ;; Catalog query helpers (pg_tables, information_schema, etc.)
@@ -1285,11 +1384,8 @@
    column belongs to the ancestor's namespace."
   [db table-name]
   (when db
-    (when-let [relation (catalog-objects/object-by-identity
-                         db catalog-objects/pg-class-oid
-                         catalog-objects/public-namespace-oid table-name)]
-      (seq (catalog-objects/columns-by-relation
-            db (:datahike.pg.object/oid relation) true)))))
+    (when-let [relation-oid (storage-table-oid db table-name)]
+      (seq (catalog-objects/columns-by-relation db relation-oid true)))))
 
 (defn column-order-from-db
   "Return columns in durable PostgreSQL attnum order. Databases without

@@ -61,7 +61,6 @@
     "rangetypes"
     "txid"
     "circle"
-    "timetz"
     "point"},
   :catalog-and-client-api
   #{"object_address" "psql_pipeline" "psql_crosstab" "database" "test_setup" "dbsize" "sysviews"}},

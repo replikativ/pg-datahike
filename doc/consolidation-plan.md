@@ -491,16 +491,13 @@ N+1 and is the thing 7.2 and 7.3 must avoid wherever the shape allows.
 
 ## After the PostgreSQL 18.6 compatibility batch — live PostgreSQL mirroring
 
-Finish the 18.6 cutover and the current application-facing batch covering
-schema changes, writes, transactions, and COPY. Then prototype a read-only
-pg-datahike mirror of a PostgreSQL publication. Start with an exported
-snapshot loaded via COPY, follow native `pgoutput` with pgJDBC, and replay
-each committed transaction as parameterized SQL. The transport probe
-passed against PostgreSQL 18.6. The prototype milestone is a two-table
-mirror that resumes after a crash with the same current rows and no
-duplicate history. Track the remaining SQL work in the
-[regression baseline](postgres-regress-baseline.md) and the subscriber
-milestones in [the mirroring proposal](postgres-mirroring.md).
+The 18.6 cutover shipped in v0.1.414. The read-only subscriber loads an
+exported COPY snapshot, follows native `pgoutput` and records committed
+changes with their source positions in Datahike history. Its fixed-publication
+scope and recovery workflow are in the [mirroring guide](postgres-mirroring.md).
+Next are per-table synchronization, schema evolution, large transactions,
+and publisher failover. The remaining SQL work is tracked in the
+[regression baseline](postgres-regress-baseline.md).
 
 The mirror reuses catalog, schema, and type handling from the compatibility
 work. `postgres_fdw` and `dblink` are independent interoperability work.

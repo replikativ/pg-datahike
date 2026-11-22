@@ -13,14 +13,17 @@
                               | {:type :insert :tx-data [...]}
                               | {:type :system :result QueryResult}
                               | {:type :error :message str}"
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [datahike.api :as d]
             [datahike.query :as dq]
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.basis :as catalog-basis]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.catalog.regoid :as regoid]
+            [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.classify :as cls]
@@ -43,6 +46,7 @@
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.template :as template]
+            [datahike.pg.sql.virtual-db :as virtual-db]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select
@@ -114,6 +118,15 @@
     (when-let [^AlterExpression$ColumnDropDefault drop-default
                (first (.getColumnDropDefaultList expression))]
       {:op :alter-default :name (unquote-ident (.getColumnName drop-default))})))
+
+(defn- alter-column-type [^AlterExpression expression using-expressions]
+  (when-let [^AlterExpression$ColumnDataType column (first (.getColDataTypeList expression))]
+    (when (and (.getColDataType column) (re-find #"(?i)\sTYPE\s" (str expression)))
+      (let [name (unquote-ident (.getColumnName column))]
+        {:op :alter-type
+         :name name
+         :type (str (.getColDataType column))
+         :using (get using-expressions name)}))))
 
 (defn- create-index-options
   "Normalize JSqlParser's `WITH (...)` tail into a keyword map.  PostgreSQL's
@@ -369,6 +382,7 @@
    to miss the cache and looked correct."
   []
   [params/*declared-param-oids* params/*temp-table-map* params/*nested-parse?*
+   ctx/*physical-table-names?*
    params/*analysis-only?*
    (when params/*session-state*
      (select-keys @params/*session-state*
@@ -377,7 +391,7 @@
                   ;; in the session zone and FOLDED while translating,
                   ;; so without it in the key the first execution's
                   ;; value is served to a session in another zone.
-                  [:search-path :db-name :date-style :time-zone]))])
+                  [:search-path :db-name :date-style :time-zone :private-storage]))])
 
 (defn- translation-cache-key [sql schema db]
   ;; Keep exact values, not their hashes: native catalog transactions do not
@@ -418,8 +432,8 @@
                                   (cache-put! cache cache-key (vec (mapcat identity fragments))))
               combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
                                          sorted-names))
-              spec-db (d/db-with db combined-schema)]
-          (if (seq combined-data) (d/db-with spec-db combined-data) spec-db))))))
+              spec-db (virtual-db/with-data db combined-schema)]
+          (if (seq combined-data) (virtual-db/with-data spec-db combined-data) spec-db))))))
 
 ;; ============================================================================
 ;; parse-sql result cache
@@ -700,8 +714,9 @@
                                                  first
                                                  types/infer-oid-from-value)
                                         types/oid-text)
-                                vtype (or (types/dh-type-for-oid oid)
-                                          :db.type/string)
+                                vtype (if (contains? #{types/oid-timestamp types/oid-timestamptz} oid)
+                                        :db.type/string
+                                        (or (types/dh-type-for-oid oid) :db.type/string))
                                 attr (keyword table-name alias)
                                 pg-type (get types/oid->pg-type-marker oid)
                                 typmod (nth ctas-column-typmods idx nil)]
@@ -1044,6 +1059,12 @@
    parse-sql wraps this with the LRU result cache."
   [^String sql schema db]
   (binding [params/*parse-db* db
+            params/*only-table-marker* (params/only-table-marker sql)
+            ctx/*table-name-overrides*
+            (when-not ctx/*physical-table-names?*
+              (let [names (catalog-objects/table-name-overrides db)]
+                (when (seq names)
+                  {:storage->logical names :logical->storage (set/map-invert names)})))
             regoid/*db* db
             regoid/*relation-provider* catalog/relation-identity
             regoid/*relation-db* (or regoid/*relation-db* db)
@@ -1788,7 +1809,7 @@
                                         (not-any? (fn [^SelectItem item]
                                                     (let [expression (.getExpression item)]
                                                       (or (expr/contains-subquery? expression)
-                                                          (expr/time-now-cast? expression))))
+                                                          (expr/runtime-datetime-cast? expression))))
                                                   (.getSelectItems ^PlainSelect stmt))
                                         (identical? db pre-cte-db))
                          ;; Evaluate each SELECT expression as a Clojure expression
@@ -2489,6 +2510,7 @@
                     (let [^Alter alter-stmt stmt
                           table-name (unquote-ident (.getName (.getTable alter-stmt)))
                           expressions (.getAlterExpressions alter-stmt)
+                          using-expressions (rw/alter-type-using-expressions sql)
                           ops (mapv (fn [^AlterExpression exp]
                                       (let [op (str (.getOperation exp))]
                                         (cond
@@ -2582,6 +2604,7 @@
                                           (= op "ALTER")
                                           (or (alter-column-nullability exp)
                                               (alter-column-default exp)
+                                              (alter-column-type exp using-expressions)
                                               {:op :other :raw (str exp)})
                                           :else {:op :other :raw (str exp)})))
                                     expressions)]
@@ -2654,7 +2677,7 @@
        param indices),
      - empty literal capture (no win),
      - any literal token the parser can't safely reduce."
-  [^String sql schema db]
+  [^String sql schema db clock-read?]
   (when (nil? params/*bound-params*)
     (when-not (params/has-param-marker? sql)
       (when-let [tem (template/template-insert-sql sql)]
@@ -2668,7 +2691,7 @@
                       placeholder-parsed
                       (or (when cache (cache-get cache cache-key))
                           (let [p (parse-sql* tem-sql schema db)]
-                            (when (and cache (cacheable-parse? p))
+                            (when (and cache (not @clock-read?) (cacheable-parse? p))
                               (cache-put! cache cache-key p))
                             p))]
                   (when (and placeholder-parsed
@@ -2851,27 +2874,32 @@
        hits JSqlParser, repeated or not."
   ([^String sql schema] (parse-sql sql schema nil))
   ([^String sql schema db]
+   (let [clock-read? (volatile! false)
+         outer-clock-read datetime-in/*on-clock-read*]
    ;; A row scope (row-eval) belongs to this statement only: a subquery
    ;; parsed from here on sees the row as an outer relation.
-   (binding [params/*statement-row-scope-tables* params/*row-scope-tables*
-             params/*row-scope-tables* nil
+     (binding [datetime-in/*on-clock-read* (fn []
+                                             (vreset! clock-read? true)
+                                             (when outer-clock-read (outer-clock-read)))
+               params/*statement-row-scope-tables* params/*row-scope-tables*
+               params/*row-scope-tables* nil
              ;; Enter before catalog/WITH/derived lowering, and inherit the
              ;; mode through every nested parse. Cache identity includes it.
-             params/*analysis-only?* (boolean
-                                      (or params/*analysis-only?*
-                                          (when-let [explain (explain-prefix sql)]
-                                            (not (:analyze? explain)))))]
-     (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
+               params/*analysis-only?* (boolean
+                                        (or params/*analysis-only?*
+                                            (when-let [explain (explain-prefix sql)]
+                                              (not (:analyze? explain)))))]
+       (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
          ;; per-row eval) resolves outer column refs to ROW-SPECIFIC constants,
          ;; so it must neither be served from nor written to the shared result
          ;; cache. Bypass caching entirely in
          ;; that case — otherwise the binding-free version (e.g. the parse done
          ;; for result-OID inference) poisons the entry and the correlated ref
          ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
-           cache (when (and (empty? params/*from-bindings*)
-                            (nil? params/*bound-params*)
-                            (cacheable-sql-size? sql))
-                   *parse-cache*)
+             cache (when (and (empty? params/*from-bindings*)
+                              (nil? params/*bound-params*)
+                              (cacheable-sql-size? sql))
+                     *parse-cache*)
          ;; Schema-flexibility is part of the key because it changes the
          ;; TRANSLATION, not just the data: under :write an unknown
          ;; column is 42703, under :read it reads as NULL (a real column
@@ -2891,45 +2919,46 @@
          ;;
          ;; PostgreSQL keys a prepared plan on its declared parameter
          ;; types for the same reason.
-           cache-key (when cache (translation-cache-key sql schema db))
-           cached (when cache (cache-get cache cache-key))]
-       (cond
-         cached cached
+             cache-key (when cache (translation-cache-key sql schema db))
+             cached (when cache (cache-get cache cache-key))]
+         (cond
+           cached cached
 
-         :else
+           :else
        ;; Lexical validation runs BEFORE templating: parameterize-numbers
        ;; would rewrite `SELECT 42#` to `SELECT $1#` and hand JSqlParser
        ;; a shape whose `#` is even harder to see.
-         (or (unsupported-operator-error sql)
-             (templated-parse sql schema db)
-             (let [session? (atom false)
-                   mat-params? (atom false)
+           (let [result (or (unsupported-operator-error sql)
+                            (templated-parse sql schema db clock-read?)
+                            (let [session? (atom false)
+                                  mat-params? (atom false)
                    ;; `FROM ONLY t` excludes the tables that inherit from
                    ;; t. JSqlParser drops the word, so it is read here,
                    ;; before the parser, and the translator consults it.
-                   only-tables (params/only-tables-in (cls/tokenize-all sql))
-                   parsed (binding [params/*session-dependent?* session?
-                                    params/*materialisation-params?* mat-params?
-                                    params/*only-tables* only-tables]
-                            (parse-sql* sql schema db))
+                                  only-tables (params/only-tables-in (cls/tokenize-all sql))
+                                  parsed (binding [params/*session-dependent?* session?
+                                                   params/*materialisation-params?* mat-params?
+                                                   params/*only-tables* only-tables]
+                                           (parse-sql* sql schema db))
                    ;; A translation that reads a session value belongs to
                    ;; the session it was translated for.
                    ;; Also carried ON the parsed map, not only in the
                    ;; dynamic binding: UPDATE and DELETE build their
                    ;; row-matching query at EXECUTE time, when the
                    ;; binding is long gone.
-                   parsed (cond-> parsed
-                            (and (seq only-tables) (map? parsed))
-                            (assoc :only-tables only-tables)
-                            (and @session? (map? parsed))
-                            (assoc :session-dependent? true)
+                                  parsed (cond-> parsed
+                                           (and (seq only-tables) (map? parsed))
+                                           (assoc :only-tables only-tables)
+                                           (and @session? (map? parsed))
+                                           (assoc :session-dependent? true)
                             ;; A derived table or CTE whose body reads a
                             ;; `$n` was materialised EMPTY here, before
                             ;; Bind. The server re-parses at Execute with
                             ;; the values in scope; such a plan must not
                             ;; be cached, since it holds no rows.
-                            (and @mat-params? (map? parsed))
-                            (assoc :materialisation-params? true))]
-               (when (and cache (cacheable-parse? parsed))
-                 (cache-put! cache cache-key parsed))
-               parsed)))))))
+                                           (and @mat-params? (map? parsed))
+                                           (assoc :materialisation-params? true))]
+                              (when (and cache (not @clock-read?) (cacheable-parse? parsed))
+                                (cache-put! cache cache-key parsed))
+                              parsed))]
+             (cond-> result @clock-read? (assoc :uses-input-clock? true)))))))))

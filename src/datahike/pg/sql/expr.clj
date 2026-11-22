@@ -124,7 +124,8 @@
 ;; Forward declarations for the mutually-recursive translate-* family.
 
 (declare jsonb-column? json-column? reject-json-operator!)
-(declare coerce-unknown-literal coerce-comparison-operands catalog-def-lookup! statement-clock)
+(declare coerce-unknown-literal coerce-comparison-operands catalog-def-lookup! statement-clock
+         column-vtype column-pg-type)
 
 (def ^:private ^:const max-inline-numeric-precision
   "BigDecimals wider than this travel as Datalog inputs instead of query-form
@@ -1058,6 +1059,19 @@
 
     :else nil))
 
+(defn- user-type-oid [ctx expr]
+  (let [db (:db ctx)
+        type (cond
+               (instance? CastExpression expr) (some-> ^CastExpression expr .getColDataType str)
+               (and db (instance? Column expr))
+               (let [resolved (ctx/resolve-column expr (:table-aliases ctx) (:default-table ctx)
+                                                  (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+                     attr (ctx/attr-of ctx resolved)
+                     entity (when attr (d/entity db attr))]
+                 (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))))]
+    (when type
+      (:datahike.pg.object/oid (pgs/user-type-object db type)))))
+
 (defn enum-spec-for-exprs [ctx exprs]
   "Return the registry spec for the first enum-typed SQL expression. Public
    for statement lowering, which must use the same type recovery for ORDER BY
@@ -1281,6 +1295,62 @@
                      (for [[n default] (drop (count positional) spec)]
                        (get by-name n (net.sf.jsqlparser.expression.LongValue. (long default))))))))))
 
+(defn- session-temporal-context! [ctx]
+  (let [state params/*session-state*
+        defaults {:time-zone (or types/*time-zone* types/utc-zone)
+                  :date-style types/*date-style*}
+        session-fn (fn []
+                     (if state
+                       (let [{:keys [time-zone date-style]} @state]
+                         {:time-zone (or time-zone types/utc-zone)
+                          :date-style (or date-style [:iso :mdy])})
+                       defaults))
+        fn-param (ctx/fresh-var! ctx)]
+    (params/session-dependent!)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj session-fn)
+    (ctx/materialize-arg! ctx (list fn-param))))
+
+(defn- timezone-operand-oid [ctx operand]
+  (first (call-arg-oids ctx [(params/unwrap-scalar-parens operand)])))
+
+(def ^:private timezone-value-oids
+  #{nil types/oid-time types/oid-timetz types/oid-date types/oid-timestamp types/oid-timestamptz})
+
+(defn- timezone-kind! [fname zone-oid value-oid]
+  (when-not (and (contains? timezone-value-oids value-oid)
+                 (or (nil? zone-oid)
+                     (#{types/oid-time types/oid-interval} zone-oid)
+                     (types/implicit-coercible? zone-oid types/oid-text)))
+    (throw (no-such-function fname [zone-oid value-oid])))
+  (cond
+    (= value-oid types/oid-timestamp) :timestamp
+    (#{types/oid-time types/oid-timetz} value-oid) :timetz
+    :else :timestamptz))
+
+(defn- timezone-interval-kind [zone-oid]
+  (cond
+    (= zone-oid types/oid-time) :time
+    (= zone-oid types/oid-interval) true
+    :else false))
+
+(defn- timezone-value! [ctx v value-oid]
+  (cond
+    (#{types/oid-date types/oid-time} value-oid)
+    ;; DATE uses the preferred timestamptz overload. Place its midnight in
+    ;; the session zone before applying the zone supplied by the query.
+    ;; TIME has a single implicit candidate, timetz, in the same session.
+    (ctx/materialize-arg!
+     ctx (list 'datahike.pg.query-fns/sql-timezone-local
+               (ctx/materialize-arg! ctx v)
+               (if (= value-oid types/oid-date) types/oid-timestamp value-oid)
+               (session-temporal-context! ctx)))
+
+    (and (nil? value-oid) (string? v))
+    (sql-cast/cast-scalar v "timestamptz" {:explicit? true :prefer-local-datetime? true})
+
+    :else (ctx/materialize-arg! ctx v)))
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -1411,15 +1481,25 @@
                   result-var])
           result-var)
 
+      (and (= fname "timezone") (= 1 (count args)))
+      (let [value-oid (timezone-operand-oid ctx (first arg-exprs))]
+        (when-not (contains? timezone-value-oids value-oid)
+          (throw (no-such-function fname [value-oid])))
+        (let [session (session-temporal-context! ctx)]
+          (swap! (:where-clauses ctx) conj
+                 [(list 'datahike.pg.query-fns/sql-timezone-local (first args) (or value-oid 0) session)
+                  result-var]))
+        result-var)
+
       ;; timezone(zone, value) is `value AT TIME ZONE zone`.
       (and (= fname "timezone") (= 2 (count args)))
-      (let [value-oid (source-oid ctx (second params))
-            kind (condp contains? value-oid
-                   #{types/oid-timestamp} :timestamp
-                   #{types/oid-time types/oid-timetz} :timetz
-                   :timestamptz)]
+      (let [zone-oid (timezone-operand-oid ctx (first arg-exprs))
+            value-oid (timezone-operand-oid ctx (second arg-exprs))
+            kind (timezone-kind! fname zone-oid value-oid)]
         (swap! (:where-clauses ctx) conj
-               [(list 'datahike.pg.query-fns/sql-at-time-zone (second args) (first args) kind)
+               [(list 'datahike.pg.query-fns/sql-at-time-zone
+                      (timezone-value! ctx (second args) value-oid) (first args) kind
+                      (timezone-interval-kind zone-oid))
                 result-var])
         result-var)
 
@@ -1671,7 +1751,7 @@
       ;; NOW() → current timestamp as java.util.Date
       (= fname "now")
       (let [fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))
-            now-fn (fn [] (or params/*statement-time* (java.util.Date.)))]
+            now-fn params/transaction-time]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj now-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -1883,11 +1963,12 @@
       ;; the surrounding SELECT composes correctly with WHERE / JOIN /
       ;; ORDER BY. Two-arg `column` form returns a single column name;
       ;; we don't model that yet — return the full def.
-      (contains? #{"pg_get_indexdef" "pg_get_constraintdef" "pg_get_triggerdef"} fname)
+      (contains? #{"pg_get_indexdef" "pg_get_constraintdef" "pg_get_triggerdef" "pg_get_partkeydef"} fname)
       (let [[key-attr def-attr] (case fname
                                   "pg_get_indexdef" [:pg_index/indexrelid :pg_index/indexdef]
                                   "pg_get_constraintdef" [:pg_constraint/oid :pg_constraint/condef]
-                                  "pg_get_triggerdef" [:pg_trigger/oid :pg_trigger/tgdef])]
+                                  "pg_get_triggerdef" [:pg_trigger/oid :pg_trigger/tgdef]
+                                  "pg_get_partkeydef" [:datahike.pg.object/oid :datahike.pg.partition/key-definition])]
         (catalog-def-lookup! ctx (or (first args) :__null__) key-attr def-attr result-var))
 
       (and (= fname "isfinite")
@@ -1957,7 +2038,8 @@
             arg-oid (try
                       (if (and (oid-infer/untyped-literal? arg-expr)
                                (not (pg-bits/bit-string-literal? arg-expr))) 705
-                          (oid-infer/expr-oid arg-expr oid-env))
+                          (or (user-type-oid ctx arg-expr)
+                              (oid-infer/expr-oid arg-expr oid-env)))
                       (catch Throwable _ nil))
             type-oid (or arg-oid types/oid-text)
             fn-param (symbol (str "?pg-typeof" (swap! (:var-counter ctx) inc)))
@@ -2037,6 +2119,32 @@
         result-var)
 
       ;; --- Array meta functions -----------------------------------------
+      (#{"array_dims" "array_ndims"} fname)
+      (let [[oid :as oids] (call-arg-oids ctx arg-exprs)
+            element-oid (or (types/array-oid->element-oid oid)
+                            (let [{:keys [typelem typcategory]} (types/catalog-type oid)]
+                              (when (and (= "A" typcategory) (pos? typelem)) typelem)))
+            _ (when (or (not= 1 (count oids)) (and oid (nil? element-oid)))
+                (throw (no-such-function fname oids)))
+            _ (when-not element-oid
+                (throw (ex-info "could not determine polymorphic type because input has type unknown"
+                                {:sqlstate "42804"})))
+            element-type (types/oid->elem-kw element-oid)
+            fn-param (symbol (str "?arr-shape" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [arr]
+                      (let [a (coerce-pg-array arr element-type)]
+                        (if (and a (pos? (pg-arr/length a)))
+                          (if (= fname "array_ndims")
+                            (pg-arr/ndim a)
+                            (apply str
+                                   (for [d (range 1 (inc (pg-arr/ndim a)))]
+                                     (str "[" (pg-arr/lbound a d) ":" (pg-arr/ubound a d) "]"))))
+                          :__null__)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
+        result-var)
+
       ;; array_length(arr, dim) — NULL for empty or out-of-range dim,
       ;; per-dim count otherwise. Note PG returns NULL for length-0
       ;; even when dim is in range, so we check positivity.
@@ -4589,7 +4697,7 @@
 
    Text is left alone -- it is parsed in the session zone already."
   [src-oid target-oid zone]
-  (let [zone (or zone java.time.ZoneOffset/UTC)
+  (let [^java.time.ZoneId zone (or zone java.time.ZoneOffset/UTC)
         instant (fn [v]
                   (cond (instance? java.util.Date v) (.toInstant ^java.util.Date v)
                         (instance? java.time.Instant v) v
@@ -4620,20 +4728,29 @@
            (= target-oid types/oid-timestamptz))
       (fn [v]
         (if-let [w (when-not (types/infinite-datetime v) (wall v))]
-          (java.util.Date/from (.toInstant (.atZone ^java.time.LocalDateTime w zone)))
+          (.toOffsetDateTime (.atZone ^java.time.LocalDateTime w zone))
           v))
 
       :else identity)))
 
-(defn time-now-cast?
-  "A time literal whose constant depends on when the statement is parsed."
+(defn- cast-operand [^CastExpression cast]
+  (let [inner (.getLeftExpression cast)]
+    (if (and (instance? ParenthesedExpressionList inner) (= 1 (count inner)))
+      (first inner)
+      inner)))
+
+(defn- text-to-datetime-cast? [^CastExpression cast]
+  (let [inner (cast-operand cast)]
+    (and (#{:date :time :timestamp} (types/cast-category (str (.getColDataType cast))))
+         (instance? CastExpression inner)
+         (= :text (types/cast-category (str (.getColDataType ^CastExpression inner)))))))
+
+(defn runtime-datetime-cast?
+  "A cast from already typed text requires execution-time conversion."
   [node]
   (when (instance? CastExpression node)
-    (let [^CastExpression cast node
-          inner (.getLeftExpression cast)]
-      (and (= :time (types/cast-category (str (.getColDataType cast))))
-           (instance? StringValue inner)
-           (= "now" (str/lower-case (str/trim (string-value-text inner))))))))
+    (or (text-to-datetime-cast? node)
+        (runtime-datetime-cast? (cast-operand node)))))
 
 (defn translate-cast-expr
   "Translate a CAST expression to a Datalog function binding.
@@ -4724,14 +4841,6 @@
         zone-shift (zone-crossing src-oid target-oid types/*time-zone*)
         inner-raw (zone-shift inner-raw)]
     (cond
-      (time-now-cast? cast-expr)
-      (let [precision (some-> (re-find #"\(\s*(\d+)\s*\)" type-str) second parse-long)
-            kind (if (= target-oid types/oid-timetz) "current_time" "localtime")]
-        ;; PostgreSQL reads the special text literal during parse. Keep it
-        ;; in this prepared plan and out of the shared translation cache.
-        (params/session-dependent!)
-        (statement-clock kind precision types/*time-zone*))
-
       is-vector?
       (let [cast1 #(sql-cast/cast-scalar % type-str {:explicit? true})]
         (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
@@ -4912,7 +5021,8 @@
         (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
         result-var)
       :else
-      (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
+      (if (and (not (symbol? inner-raw)) (not (seq? inner-raw))
+               (not (and any-ts? (text-to-datetime-cast? cast-expr))))
       ;; Constant value — cast at translation time
         (cond
           ;; Casting NULL yields NULL for every target type. Without this
@@ -4949,27 +5059,7 @@
                      (if inner-raw "true" "false")
                      (types/->pg-text inner-raw src-oid))
           is-bool? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
-        ;; ::date — extract the LocalDate so serialization can omit the
-        ;; time part ("2017-03-13" instead of "2017-03-13 00:00:00").
-          ;; A value that is already temporal (a bound parameter, a
-          ;; folded expression) is converted, not stringified: `str` of a
-          ;; java.util.Date is its toString, which no parser reads, and the
-          ;; cast silently became NULL.
-          (and (or is-date? is-ts?) (not (string? inner-raw)))
-          (sql-cast/cast-scalar inner-raw type-str
-                                {:explicit? true
-                                 :parse-timestamp parse-timestamp-string})
-          ;; Delegate, like every other branch of this fold. Keeping a
-          ;; private copy of what `cast-scalar` does meant keeping its
-          ;; own idea of FAILURE too, and this one answered nil -- so a
-          ;; fold of `'nonsense'::date::text` produced NULL where
-          ;; PostgreSQL raises. The bare `'nonsense'::date` was right
-          ;; the whole time; only a cast reaching this fold, which is a
-          ;; NESTED one, took the private path.
-          is-date? (sql-cast/cast-scalar
-                    inner-raw type-str
-                    {:explicit? true
-                     :parse-timestamp parse-timestamp-string})
+          is-date? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::time — extract the LocalTime so serialization emits only
         ;; "HH:MM:SS[.fff]" and drops any date component the input had.
           is-time? (sql-cast/cast-scalar
@@ -5046,7 +5136,8 @@
                             (sql-cast/cast-scalar
                              (zone-shift v) type-str
                              {:explicit? true
-                              :parse-timestamp parse-timestamp-string})))]
+                              :parse-timestamp parse-timestamp-string
+                              :prefer-local-datetime? true})))]
               (swap! (:in-params ctx) conj ts-fn-param)
               (swap! (:in-args ctx) conj (null-preserving ts-fn))
               (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
@@ -5124,8 +5215,7 @@
             (let [fn-param (symbol (str "?cast-s" (swap! (:var-counter ctx) inc)))
                   cast-fn  (fn [v]
                              (cond
-                               (nil? v)           nil
-                               (= :__null__ v)    :__null__
+                               (fns/sql-null? v)  :__null__
                                (pg-rec/record? v)
                                (if composite-type
                                  (pg-rec/with-layout
@@ -5294,6 +5384,16 @@
       'datahike.pg.query-fns/sql-date+time
       (and (= op-sym '-) (timestamp? loid) (timestamp? roid))
       'datahike.pg.query-fns/sql-timestamp-
+      (and (= op-sym '+) (= types/oid-time loid) (= types/oid-time roid))
+      (throw (errors/pg-error
+              :ambiguous-function
+              {:message "operator is not unique: time without time zone + time without time zone"
+               :hint "Could not choose a best candidate operator. You might need to add explicit type casts."}))
+      (and (= op-sym '+) (= types/oid-timetz loid) (= types/oid-timetz roid))
+      (throw (errors/pg-error
+              :undefined-function
+              {:message "operator does not exist: time with time zone + time with time zone"
+               :hint "No operator matches the given name and argument types. You might need to add explicit type casts."}))
       (and (= op-sym '-) (= types/oid-time loid) (= types/oid-time roid))
       'datahike.pg.query-fns/sql-time-
 
@@ -6824,7 +6924,7 @@
     array-oid))
 
 (defn- statement-clock
-  "The SQL value functions over the statement's time, read in the session
+  "The SQL value functions over the transaction's time, read in the session
    zone `zone` (captured at translation, and part of the plan-cache key):
    current_timestamp is the instant; current_time the wall clock with the
    zone's offset at that instant; localtimestamp and localtime the wall
@@ -6837,7 +6937,7 @@
    -- the regression suite's own check that the two agree -- was false
    once the cast honoured the zone and the value functions did not."
   [kind precision zone]
-  (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))
+  (let [^java.util.Date st (params/transaction-time)
         instant (.toInstant st)
         p (long (min 6 (max 0 (or precision 6))))
         factor (long (Math/pow 10 (- 9 p)))
@@ -6849,7 +6949,7 @@
                          (* (quot (.getNano i) factor) factor)))
         zdt (.atZone instant ^java.time.ZoneId (or zone java.time.ZoneOffset/UTC))]
     (case kind
-      "current_timestamp" (java.util.Date/from instant)
+      "current_timestamp" (java.sql.Timestamp/from instant)
       "current_time" (.toOffsetTime (.toOffsetDateTime zdt))
       "localtimestamp" (.toLocalDateTime zdt)
       "localtime" (.toLocalTime zdt)
@@ -6878,7 +6978,7 @@
     (swap! (:where-clauses ctx) conj
            (list 'or-join [a result-var]
                  (list 'and [e key-attr a] [e def-attr result-var])
-                 (list 'and (list 'not-join [a] [e2 key-attr a])
+                 (list 'and (list 'not-join [a] [e2 key-attr a] [e2 def-attr '_])
                        [(list 'ground :__null__) result-var])))
     result-var))
 
@@ -7086,7 +7186,8 @@
 
 (defn- translate-tableoid
   "The `tableoid` system column: the pg_class OID of the relation a row
-   comes from, a constant per relation. Every table has it and no user
+   comes from. Partition parents read the OID from each projected leaf row.
+   Every table has it and no user
    column may take the name, so it never competes with ordinary resolution.
    Unqualified, it needs exactly one relation in scope (42702 otherwise).
    Derived relations, CTEs and views have none (42703)."
@@ -7102,14 +7203,17 @@
                     (params/ambiguous-column! "tableoid"))
                   (first occurrences)))
         relation (if tbl (get aliases alias) (get aliases alias alias))
+        partition-scan? (contains? (:partition-scan-aliases ctx) alias)
         oid (when (and relation (not (contains? (set (:derived-aliases ctx)) relation)))
               (or (get catalog-objects/catalog-relation-oids relation)
-                  (some-> (:db ctx) (pgs/table-oid relation))))
+                  (some-> (:db ctx) (pgs/storage-table-oid relation))))
         evar (get @(:entity-vars ctx) alias)]
-    (when-not oid
+    (when-not (or oid partition-scan?)
       (throw (errors/pg-error :undefined-column {:column "tableoid"})))
-    (if (and (contains? @(:left-join-evars ctx) evar)
-             (not= alias (:join-condition-right-alias ctx)))
+    (cond
+      partition-scan? (ctx/col-var! ctx [:aliased alias pgs/partition-scan-tableoid])
+      (and (contains? @(:left-join-evars ctx) evar)
+           (not= alias (:join-condition-right-alias ctx)))
       ;; A null-extended row has no tableoid. The current ON condition
       ;; considers only actual rows of its right relation.
       (let [arg (symbol (str "?tableoid-" (swap! (:var-counter ctx) inc)))
@@ -7119,7 +7223,7 @@
         (swap! (:nullable-vars ctx) conj result)
         (ctx/add-clause! ctx [(list arg evar) result])
         result)
-      oid)))
+      :else oid)))
 
 (defn column-value!
   "Return a column's SQL value variable. Most Datahike scalar values are
@@ -7137,6 +7241,9 @@
                     (= :db.type/bigdec (:db/valueType attr-schema))
                     types/numeric-storage->value
 
+                    (types/precise-timestamp-column? (:db/valueType attr-schema) pg-type)
+                    (partial sql-cast/timestamp-storage->value pg-type)
+
                     (contains? #{"bit" "varbit"} pg-type)
                     (fn [v]
                       (if (string? v)
@@ -7153,13 +7260,26 @@
         decoded)
       raw)))
 
+(defn- precise-timestamp-column? [ctx expr]
+  (and (instance? Column expr)
+       (types/precise-timestamp-column? (column-vtype ctx expr) (column-pg-type ctx expr))))
+
+(defn- time-of-day-oid? [oid]
+  (contains? #{types/oid-time types/oid-timetz} oid))
+
 (defn- column-storage-value
   "Encode a typed SQL value for direct binding against a stored datom."
   [ctx resolved v]
-  (let [attr (ctx/attr-of ctx resolved)]
-    (if (= :db.type/bigdec (get-in (:schema ctx) [attr :db/valueType]))
-      (types/numeric-value->storage v)
-      v)))
+  (let [attr (ctx/attr-of ctx resolved)
+        attr-schema (get (:schema ctx) attr)
+        pg-type (or (:pg/type attr-schema) (params/pg-type-of-attr (:db ctx) attr))]
+    (cond
+      (= :db.type/bigdec (:db/valueType attr-schema)) (types/numeric-value->storage v)
+      (types/precise-timestamp-column? (:db/valueType attr-schema) pg-type)
+      (sql-cast/timestamp-value->storage pg-type nil v)
+      (and (some? v) (not= :__null__ v) (#{"time" "timetz"} pg-type))
+      (types/->pg-text (sql-cast/cast-scalar v pg-type {}) (types/pg-name->oid pg-type))
+      :else v)))
 
 (defn- session-value-expr!
   "Lower a bare SQL session value to a zero-argument Datalog input fn.
@@ -8007,14 +8127,14 @@
           now-fn (cond
                    (or (= key-str "current_timestamp")
                        (= key-str "now()"))
-                   (fn [] (or params/*statement-time* (java.util.Date.)))
+                   params/transaction-time
                    ;; LocalDate (not a midnight java.util.Date) so the
                    ;; result renders as "yyyy-MM-dd" with OID 1082, like
                    ;; PG's date type.
                    (contains? #{"current_date" "current_time"} key-str)
                    (let [zone types/*time-zone*]
                      (fn [] (statement-clock key-str nil zone)))
-                   :else (fn [] (or params/*statement-time* (java.util.Date.))))
+                   :else params/transaction-time)
           fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))]
       (swap! (:in-params ctx) conj fn-param)
       (swap! (:in-args ctx) conj now-fn)
@@ -8066,33 +8186,23 @@
     ;; timestamptz. JSqlParser nests a chain to the RIGHT (`ts AT ('UTC' AT
     ;; 'EST')`); PostgreSQL is left-associative, so flatten the zones first.
     (instance? TimezoneExpression expr)
-    (let [left (.getLeftExpression ^TimezoneExpression expr)
-          zones (letfn [(flat [z]
-                          (if (instance? TimezoneExpression z)
-                            (cons (.getLeftExpression ^TimezoneExpression z)
-                                  (mapcat flat (.getTimezoneExpressions ^TimezoneExpression z)))
-                            [z]))]
-                  (vec (mapcat flat (.getTimezoneExpressions ^TimezoneExpression expr))))
+    (let [[left zones] (params/timezone-operands expr)
           apply-zone
           (fn [value-var value-oid zone-expr]
-            (let [kind (condp contains? value-oid
-                         #{types/oid-timestamp} :timestamp
-                         #{types/oid-time types/oid-timetz} :timetz
-                         ;; timestamptz, date (implicitly cast to
-                         ;; timestamptz) and an untyped literal (datetime's
-                         ;; preferred type is timestamptz)
-                         :timestamptz)
+            (let [zone-oid (timezone-operand-oid ctx zone-expr)
+                  kind (timezone-kind! "pg_catalog.timezone" zone-oid value-oid)
                   zone-var (let [z (translate-expr ctx zone-expr)]
                              (if (seq? z) (ctx/materialize-arg! ctx z) z))
-                  value-var (if (seq? value-var) (ctx/materialize-arg! ctx value-var) value-var)]
-              [(list 'datahike.pg.query-fns/sql-at-time-zone value-var zone-var kind)
+                  value-var (timezone-value! ctx value-var value-oid)]
+              [(list 'datahike.pg.query-fns/sql-at-time-zone value-var zone-var kind
+                     (timezone-interval-kind zone-oid))
                (case kind :timestamp types/oid-timestamptz
                      :timestamptz types/oid-timestamp
                      :timetz types/oid-timetz)]))
           left-oid (if (and (instance? Function left)
                             (= "now" (str/lower-case (.getName ^Function left))))
                      types/oid-timestamptz
-                     (source-oid ctx left))]
+                     (timezone-operand-oid ctx left))]
       (first (reduce (fn [[v oid] z] (apply-zone v oid z))
                      [(translate-expr ctx left) left-oid]
                      zones)))
@@ -8489,10 +8599,10 @@
    (or
     ;; An explicit `::jsonb` cast is a jsonb operand even though it is
     ;; not a column — `'[1,2,3]'::jsonb - 1`.
-    (and (instance? CastExpression expr)
-         (contains? #{"json" "jsonb"}
-                    (some-> ^CastExpression expr .getColDataType .getDataType
-                            str/lower-case)))
+    (when (instance? CastExpression expr)
+      (let [target (.getColDataType ^CastExpression expr)]
+        (and (empty? (.getArrayData target))
+             (contains? #{"json" "jsonb"} (some-> target .getDataType str/lower-case)))))
     ;; UPDATE ... FROM rows are runtime constant bindings rather than
     ;; relations in ctx.  Type probing must therefore be tolerant of an
     ;; otherwise-unresolvable qualified binding (`v.j`), just as
@@ -8620,6 +8730,8 @@
       (and (#{types/oid-time types/oid-timetz} oid)
            (not (instance? Column typed)))
       [(sql-cast/cast-scalar s (types/oid->pg-name oid) {:explicit? true})]
+      (and (= :db.type/string vt) (contains? #{types/oid-timestamp types/oid-timestamptz} oid))
+      [(sql-cast/cast-scalar s (types/oid->pg-name oid) {:prefer-local-datetime? true})]
       ;; Text needs no input function.
       (= :db.type/string vt) nil
       :else
@@ -8920,6 +9032,8 @@
                                (jsonb-column? ctx right)))
            vector-cmp? (or (= types/oid-vector (source-oid ctx left))
                            (= types/oid-vector (source-oid ctx right)))
+           time-oid (some #(when (time-of-day-oid? %) %)
+                          [(source-oid ctx left) (source-oid ctx right)])
            ;; timestamptz against a timestamp or date: PostgreSQL casts
            ;; the wall clock to timestamptz, i.e. places it in the session
            ;; zone, before comparing. Comparing the wall clock's UTC
@@ -8951,21 +9065,26 @@
                         (cmp (get rank (str a) Long/MAX_VALUE)
                              (get rank (str b) Long/MAX_VALUE))))
                p))
-           vector-cmp-param
-           (when vector-cmp?
+           typed-cmp-param
+           (when (or vector-cmp? time-oid)
              (let [cmp (case op = zero? not= (complement zero?)
                              < neg? > pos? <= #(not (pos? %)) >= #(not (neg? %)))
-                   p (symbol (str "?vector-cmp-" (swap! (:var-counter ctx) inc)))]
+                   p (symbol (str "?typed-cmp-" (swap! (:var-counter ctx) inc)))
+                   compare-values (if time-oid
+                                    (let [timetz? (= types/oid-timetz time-oid)]
+                                      (fn [a b] (compare (sql-cast/time-order-key a timetz?)
+                                                         (sql-cast/time-order-key b timetz?))))
+                                    pg-vector/compare-values)]
                (swap! (:in-params ctx) conj p)
                (swap! (:in-args ctx) conj
-                      (fn [a b] (cmp (pg-vector/compare-values a b))))
+                      (fn [a b] (cmp (compare-values a b))))
                p))]
        (conj guards
              (cond
                enum-cmp-param
                [(list enum-cmp-param l r)]
-               vector-cmp-param
-               [(list vector-cmp-param l r)]
+               typed-cmp-param
+               [(list typed-cmp-param l r)]
                (and jsonb-cmp? (= op '=))
                [(list 'datahike.pg.query-fns/jsonb-eq? l r)]
                jsonb-cmp?
@@ -9462,6 +9581,8 @@
                  (not= types/oid-vector (source-oid ctx left))
                  (nil? (.getArrayConstructor ^Column left))
                  (instance? JdbcParameter right)
+                 (not (precise-timestamp-column? ctx left))
+                 (not (time-of-day-oid? (source-oid ctx left)))
                  ;; A column that is really an OUTER row's value is a
                  ;; constant, not a relation to seek -- see column-binding.
                  (not (column-binding ctx left)))

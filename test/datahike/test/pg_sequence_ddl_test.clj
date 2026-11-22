@@ -161,11 +161,12 @@
 ;; Stored entity
 ;; ============================================================================
 
-(deftest test-sequence-entity-offsets-the-counter
-  (testing "the stored value is start - increment so nextval lands on start"
+(deftest test-sequence-entity-stores-the-uncalled-start
+  (testing "the initial sequence position is visible without advancing it"
     (let [params (params-of "CREATE SEQUENCE s INCREMENT 20 START WITH 400")
           e (ddl/sequence-entity "s" params)]
-      (is (= 380 (:__seq__/value e)))
+      (is (= 400 (:__seq__/value e)))
+      (is (false? (:__seq__/is-called e)))
       (is (= 20 (:__seq__/increment e)))
       (is (= 400 (:__seq__/start e)))
       (is (= 9223372036854775807 (:__seq__/maxvalue e)))

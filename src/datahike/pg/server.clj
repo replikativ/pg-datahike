@@ -36,6 +36,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.resolve :as pg-resolve]
             [datahike.pg.secondary :as pg-secondary]
             [datahike.pg.sql :as sql]
@@ -321,7 +322,7 @@
      ;; keyword branch, which would otherwise print the sentinel's name.
      (= jb/json-null v) "null"
      (or (contains? regoid/alias-oids oid)
-         (contains? regoid/alias-oids (types/array-oid->element-oid oid)))
+         (types/session-formatted-array-oids oid))
      (types/->pg-text v oid)
      ;; Keep the scalar cases before the structured wrapper predicates below.
      ;; Result sets are dominated by strings, booleans and integer identifiers;
@@ -475,7 +476,7 @@
               attr (when (symbol? fvar) (get var->attr fvar))
               tname (when attr (namespace attr))
               cname (when attr (name attr))
-              toid (when tname (pgs/table-oid db tname))
+              toid (when tname (pgs/storage-table-oid db tname))
               ;; Pass hints: they carry the CREATE TABLE column order,
               ;; and RowDescription's attnum must agree with
               ;; pg_attribute's or pgjdbc's updatable ResultSet maps
@@ -1416,6 +1417,12 @@
 
 (declare direct-sequence-value-write?)
 
+(def ^:dynamic ^:private *database-read-only?* false)
+
+(defn- assert-database-writable! [operation]
+  (when *database-read-only?*
+    (throw (errors/pg-error :read-only-sql-transaction {:operation operation}))))
+
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
    recent-commit ring. EVERY server-side transact must go through this
@@ -1425,6 +1432,7 @@
   ([conn tx-data]
    (transact-recorded! conn tx-data nil))
   ([conn tx-data tx-options]
+   (assert-database-writable! "write")
    (let [db-before @conn
          report (d/transact conn (cond-> {:tx-data (guard-catalog-tx tx-data)}
                                    (seq tx-options)
@@ -1449,6 +1457,7 @@
    expanded from; a concurrent advance returns 40001 instead of applying EIDs
    or uniqueness decisions derived from a stale database."
   [conn db-before spec-report]
+  (assert-database-writable! "write")
   (let [expected-max-tx (:max-tx db-before)
         ;; A history-enabled `dc/with` includes its speculative transaction's
         ;; txInstant datom. The real transact creates its own metadata; replaying
@@ -1570,13 +1579,14 @@
 
       (= setting-name "default_transaction_read_only")
       (show-setting "default_transaction_read_only"
-                    (if (:read-only? @session-state) "on" "off"))
+                    (if (or *database-read-only?* (:read-only? @session-state)) "on" "off"))
 
       (= setting-name "transaction_read_only")
       (show-setting "transaction_read_only"
-                    (if (if (:in-tx? @tx-state)
-                          (:read-only? @tx-state)
-                          (:read-only? @session-state))
+                    (if (or *database-read-only?*
+                            (if (:in-tx? @tx-state)
+                              (:read-only? @tx-state)
+                              (:read-only? @session-state)))
                       "on" "off"))
 
       ;; `SHOW transaction_isolation` and `SHOW TRANSACTION ISOLATION
@@ -4531,6 +4541,7 @@
               ;; reads.
               [:pg/generated str1]
               [:pg/generated-expr str1]
+              [:pg/publisher-generated? bool1]
               ;; Constraint identity: table + name (ddl/constraint-key).
               ;; PostgreSQL names are unique per table, so CHECK and FK
               ;; entities are keyed by both; :pg/check-conname and
@@ -4564,6 +4575,7 @@
                 :db/index true}]
               [:datahike.pg.index/keys str1]
               [:datahike.pg.index/unique? bool1]
+              [:datahike.pg.index/primary? bool1]
               [:datahike.pg.index/legacy-incomplete? bool1]]
         missing (into []
                       (keep (fn [[ident tmpl]]
@@ -5729,12 +5741,14 @@
 (defn- statement-read-db
   "Select a live or active transaction snapshot for alias input/output.
    A completed transaction may retain bookkeeping but no longer owns reads."
-  [conn tx-state session-state]
-  (or *snapshot-db*
-      (let [ts @tx-state]
-        (if (:in-tx? ts)
-          (or (:speculative-db ts) (apply-temporal (d/db conn) session-state))
-          (apply-temporal (d/db conn) session-state)))))
+  ([conn tx-state session-state]
+   (statement-read-db conn tx-state session-state nil))
+  ([conn tx-state session-state override]
+   (or *snapshot-db*
+       (let [ts @tx-state]
+         (if-let [speculative (when (:in-tx? ts) (:speculative-db ts))]
+           (if override (apply-temporal speculative session-state override) speculative)
+           (apply-temporal (d/db conn) session-state override))))))
 
 (def ^:private ^:dynamic *nested-statement?*
   "True while a routine body runs one of its own statements. A `$n` in
@@ -6217,17 +6231,7 @@
 
 (defn- execute-arg-untyped?
   [sql]
-  (loop [expression (CCJSqlParserUtil/parseExpression sql)]
-    (cond
-      (instance? net.sf.jsqlparser.expression.Parenthesis expression)
-      (recur (.getExpression ^net.sf.jsqlparser.expression.Parenthesis expression))
-
-      (and (instance? net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList
-                      expression)
-           (= 1 (.size ^java.util.List expression)))
-      (recur (.get ^java.util.List expression 0))
-
-      :else (oid/untyped-literal? expression))))
+  (oid/untyped-literal? (params/unwrap-scalar-parens (CCJSqlParserUtil/parseExpression sql))))
 
 (defn- prepared-arg-shape
   [parsed arg]
@@ -6308,6 +6312,9 @@
                                unknown? (inc i))]
                   (recur (inc i) (conj values coerced)))))))))))
 
+(defn- parse-timestamp-param [text oid]
+  (sql-cast/cast-scalar text (types/oid->pg-name oid) {:prefer-local-datetime? true}))
+
 (defn- coerce-prepared-arg
   "Read one evaluated EXECUTE argument through its prepared parameter type's
    text input function after checking PostgreSQL assignment compatibility."
@@ -6315,9 +6322,12 @@
   (when (some? value)
     (check-prepared-arg-cast! source-oid target-oid untyped? index))
   (letfn [(input-value [text oid]
-            (if-let [element-oid (types/array-oid->element-oid oid)]
-              (pg-arr/from-pg-text text (types/oid->elem-kw element-oid))
-              (if (input/parser oid) (input/parse oid text) text)))
+            (cond
+              (#{types/oid-timestamp types/oid-timestamptz} oid) (parse-timestamp-param text oid)
+              (types/array-oid->element-oid oid)
+              (pg-arr/from-pg-text text (types/oid->elem-kw (types/array-oid->element-oid oid)))
+              (input/parser oid) (input/parse oid text)
+              :else text))
           (cast-leaves [tree source-element-oid target-element-oid]
             (mapv (fn [item]
                     (if (sequential? item)
@@ -6340,7 +6350,7 @@
       :else
       (let [source-value (input-value value source-oid)]
         (sql-cast/cast-scalar source-value (types/oid->pg-name target-oid)
-                              {:explicit? false :src-oid source-oid})))))
+                              {:explicit? false :src-oid source-oid :prefer-local-datetime? true})))))
 
 (defn- invoke-sql-prepared
   "Find and revalidate a session plan, then evaluate each SQL EXECUTE argument
@@ -6747,6 +6757,7 @@
     (let [real-db (d/db conn)]
       (swap! tx-state assoc
              :in-tx? true :aborted? false :tx-buffer []
+             :transaction-time datetime-in/*transaction-time*
              :tx-options {}
              :ddl-version 0
              ;; `BEGIN ISOLATION LEVEL X` pins the tx's level (classify
@@ -6780,6 +6791,7 @@
   (let [real-db (d/db conn)]
     (swap! tx-state assoc
            :in-tx? true :implicit? true :aborted? false :tx-buffer []
+           :transaction-time datetime-in/*transaction-time*
            :tx-options {}
            :ddl-version 0
            :read-only? (boolean (:read-only? @session-state))
@@ -6912,10 +6924,10 @@
 (defn- direct-sequence-value-write?
   "True when a buffered operation itself mutates sequence storage."
   [op]
-  (or (and (map? op) (contains? op :__seq__/value))
+  (or (and (map? op) (some #(contains? op %) sequence/position-attributes))
       (and (vector? op)
            (contains? #{:db/add :db/retract :db/cas :db.fn/cas} (first op))
-           (= :__seq__/value (nth op 2 nil)))))
+           (contains? sequence/position-attributes (nth op 2 nil)))))
 
 (defn- durable-replay-buffer [buffer]
   ;; Only preceding marker adds owned by this buffer may be absent on replay.
@@ -7020,6 +7032,7 @@
                       :ddl-version 0
                       :owned-locks #{})
                (dissoc :speculative-db
+                       :transaction-time
                        :temp-tables-before
                        :local-sequence-reservations
                        :local-sequence-generations
@@ -7057,6 +7070,17 @@
   (let [write-type (if (copy-from? parsed)
                      :copy-from-stdin
                      (:type parsed))]
+    (when (and *database-read-only?*
+               (or (str/starts-with? (name (or write-type :unknown)) "ddl-")
+                   (contains? #{:insert :update :delete :truncate :copy-from-stdin} write-type)
+                   (and (= :copy-from-stdin (:kind parsed)) (:file (:target parsed)))
+                   (contains? #{:create-database :drop-database :dh-create-branch
+                                :dh-delete-branch :nextval :setval :schema-noop :privilege-noop
+                                :comment :create-extension} (:system-type parsed))
+                   (and (contains? #{:begin :set-session-access :set-transaction-access}
+                                   (or (:system-type parsed) write-type))
+                        (false? (:read-only? parsed)))))
+      (assert-database-writable! (str/upper-case (name (or (:system-type parsed) write-type)))))
     (when (and (or (contains? write-parse-types write-type)
                    (= :copy-from-stdin write-type))
                (if (:in-tx? @tx-state)
@@ -7279,7 +7303,7 @@
 (defn- handle-now [_ctx _parsed]
   (single-row-result "now"
                      types/oid-timestamptz
-                     (value->string (java.util.Date.))))
+                     (types/->pg-text (params/transaction-time) types/oid-timestamptz)))
 
 (defn- handle-pg-keywords [_ctx _parsed]
   (single-row-result "string_agg" PgWireServer/OID_TEXT ""))
@@ -7416,111 +7440,55 @@
 
 (defn- sequence-descriptor [db seq-name]
   (when (and (string? seq-name) (get (dbi/-schema db) :__seq__/name))
-    (let [lookup (fn [name]
-                   (when-let [eid (ffirst (d/q '{:find [?e]
-                                                 :where [[?e :__seq__/name ?n]]
-                                                 :in [$ ?n]}
-                                               db name))]
-                     [name eid]))
+    (let [lookup #(sequence/entity-by-name db %)
           bare-name (bare-sequence-name seq-name)
-          [name eid] (or (lookup seq-name)
-                         (when (not= bare-name seq-name)
-                           (lookup bare-name))
+          entity (or (lookup seq-name)
+                     (when (not= bare-name seq-name)
+                       (lookup bare-name))
                          ;; Defaults and deferred projections may still
                          ;; carry the spelling from a SQL regclass literal.
                          ;; Preserve physical names and legacy stored names
                          ;; before resolving the literal's canonical form.
-                         (let [canonical (peek (regoid/parse-qualified-name seq-name))]
-                           (when (and (not= canonical seq-name) (not= canonical bare-name))
-                             (lookup canonical))))]
-      (when eid
-        (let [attr (fn [a default]
-                     (let [v (ffirst (d/q {:find '[?v]
-                                           :where [['?e a '?v]]
-                                           :in '[$ ?e]}
-                                          db eid))]
-                       (if (some? v) v default)))
-              increment (attr :__seq__/increment 1)]
-          {:eid eid
-           :name name
+                     (let [canonical (peek (regoid/parse-qualified-name seq-name))]
+                       (when (and (not= canonical seq-name) (not= canonical bare-name))
+                         (lookup canonical))))]
+      (when entity
+        (let [increment (get entity :__seq__/increment 1)]
+          {:eid (:db/id entity)
+           :name (:__seq__/name entity)
            :increment increment
-           :current (attr :__seq__/value 0)
-           :maximum (attr :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
-           :minimum (attr :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
-           :cycle? (boolean (attr :__seq__/cycle false))})))))
+           :stored-value (:__seq__/value entity)
+           :stored-called? (:__seq__/is-called entity)
+           :position (sequence/position entity)
+           :maximum (get entity :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
+           :minimum (get entity :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
+           :cycle? (get entity :__seq__/cycle false)})))))
 
 (defn- advance-sequence-value
-  [{:keys [increment maximum minimum cycle?]} seq-name ^long current]
-  (if (pos? increment)
-    (if (if (>= maximum 0)
-          (> current (- maximum increment))
-          (> (+ current increment) maximum))
-      (if cycle?
-        minimum
-        (throw (errors/pg-error
-                :sequence-generator-limit-exceeded
-                {:detail (str "nextval: reached maximum value of sequence \""
-                              seq-name "\" (" maximum ")")})))
-      (+ current increment))
-    (if (if (< minimum 0)
-          (< current (- minimum increment))
-          (< (+ current increment) minimum))
-      (if cycle?
-        maximum
-        (throw (errors/pg-error
-                :sequence-generator-limit-exceeded
-                {:detail (str "nextval: reached minimum value of sequence \""
-                              seq-name "\" (" minimum ")")})))
-      (+ current increment))))
+  [{:keys [position increment maximum minimum cycle?]} seq-name]
+  (let [[value called?] position]
+    (if-not called?
+      value
+      (let [next (+' value increment)
+            ascending? (pos? increment)
+            exceeds? (if ascending? (> next maximum) (< next minimum))]
+        (cond
+          (not exceeds?) next
+          cycle? (if ascending? minimum maximum)
+          :else
+          (throw (errors/pg-error
+                  :sequence-generator-limit-exceeded
+                  {:detail (str "nextval: reached " (if ascending? "maximum" "minimum")
+                                " value of sequence \"" seq-name "\" ("
+                                (if ascending? maximum minimum) ")")})))))))
 
 (defn nextval!
-  "Atomically advance the named sequence on `conn` and return the new
-   long. Shared core of `SELECT nextval(...)` and INSERT-VALUES nextval
-   resolution.
-
-   PG semantics: a `nextval` advance is never rolled back, even by
-   ROLLBACK on the surrounding transaction. We match that by always
-   committing to the live conn, regardless of any session's `:in-tx?`
-   state.
-
-   Atomicity: optimistic CAS-retry. Each iteration reads the current
-   :__seq__/value, computes the new value, and submits
-
-       [[:db/cas seq-eid :__seq__/value curr new]]
-
-   to `d/transact`. Datahike's transactor serialises tx applications
-   per conn, so two concurrent CAS submissions see each other: the
-   first wins, the second's old-val no longer matches the
-   transactor's current value and the CAS raises `:transact/cas`. We
-   re-read and retry. The loser thread will see the winner's new
-   value, compute the next slot, and commit cleanly.
-
-   Why CAS instead of the simpler `:db.fn/call` pattern: Datahike's
-   writer batches multiple in-flight transactions for a single
-   commit, then writes the SAME `:db-after` (the batch's final db)
-   into every tx-report in the batch. So reading `(:db-after report)`
-   to recover the value this call assigned doesn't work — it returns
-   the LAST tx in the batch. CAS sidesteps that: the value we
-   intended is the literal `new` slot of the op-vec, available
-   without reading `:db-after`.
-
-   Throws ex-info `:undefined-sequence` if the named sequence does
-   not exist, and `:serialization-failure` if the contention retry
-   budget is exhausted."
+  "Reserve a committed sequence value outside the surrounding SQL transaction.
+   CAS both fields because SETVAL can change is_called at the same value.
+   Return the reserved value directly since batched writer reports can
+   share the batch's final database."
   [conn ^String seq-name]
-  (let [q-fn d/q
-        descriptor (sequence-descriptor (d/db conn) seq-name)
-        _ (when-not descriptor
-            (throw (ex-info "sequence does not exist"
-                            {:error :undefined-sequence
-                             :sequence seq-name})))
-        eid (:eid descriptor)
-        read-curr (fn []
-                    (ffirst (q-fn '{:find [?v]
-                                    :where [[?e :__seq__/value ?v]]
-                                    :in [$ ?e]}
-                                  (d/db conn) eid)))
-        ;; CAS failure detection: Datahike's transactor raises an
+  (let [;; CAS failure detection: Datahike's transactor raises an
         ;; ex-info with `{:error :transact/cas}`, but the writer's
         ;; throwable-promise + CompletableFuture wrapping strips
         ;; the structured ex-data by the time we see the throw on
@@ -7534,10 +7502,18 @@
     ;; capped at 100ms. Datahike's commit-loop waits up to 50ms
     ;; (commit-wait-time) between batches before flushing.
     (loop [attempt 0]
-      (let [curr (or (read-curr) 0)
-            next (advance-sequence-value descriptor seq-name curr)
+      (let [db (d/db conn)
+            {:keys [eid stored-value stored-called?] :as descriptor}
+            (sequence-descriptor db seq-name)
+            _ (when-not descriptor
+                (throw (ex-info "sequence does not exist"
+                                {:error :undefined-sequence :sequence seq-name})))
+            next (advance-sequence-value descriptor seq-name)
+            tx-data (conj (sequence/install-called-attribute db)
+                          [:db/cas eid :__seq__/value stored-value next]
+                          [:db/cas eid :__seq__/is-called stored-called? true])
             cas-ok?
-            (try (transact-recorded! conn [[:db/cas eid :__seq__/value curr next]])
+            (try (transact-recorded! conn tx-data)
                  true
                  (catch Throwable e
                    (if (cas-failure? e) false (throw e))))]
@@ -7574,18 +7550,18 @@
                               snapshots)))
           [db buffer retained]
           (reduce-kv
-           (fn [[db buffer retained] [name eid storage-generation :as generation] value]
+           (fn [[db buffer retained] [name eid storage-generation :as generation] position]
              (let [descriptor (sequence-descriptor db name)
                    current-generation (get local-sequence-generations [name eid] 0)
                    current? (and (= eid (:eid descriptor))
                                  (= storage-generation current-generation))
                    retained (if (reachable? generation)
-                              (assoc retained generation value)
+                              (assoc retained generation position)
                               retained)]
-               (if (and current? (not= value (:current descriptor)))
-                 (let [op [:db/add [:__seq__/name name] :__seq__/value value]
-                       report (dc/with db [op])]
-                   [(:db-after report) (conj buffer op) retained])
+               (if (and current? (not= position (:position descriptor)))
+                 (let [ops (sequence/position-tx db [:__seq__/name name] position)
+                       report (dc/with db ops)]
+                   [(:db-after report) (into buffer ops) retained])
                  [db buffer retained])))
            [speculative-db tx-buffer {}]
            (or local-sequence-reservations {}))]
@@ -7683,14 +7659,15 @@
               ;; are overlaid into it when a savepoint is restored; consulting
               ;; the side journal directly here would ignore a later SETVAL or
               ;; transactional ALTER SEQUENCE RESTART.
-                next (advance-sequence-value descriptor seq-name (:current descriptor))
-                op [:db/add [:__seq__/name (:name descriptor)] :__seq__/value next]
-                report (dc/with db [op])]
+                next (advance-sequence-value descriptor seq-name)
+                position [next true]
+                ops (sequence/position-tx db [:__seq__/name (:name descriptor)] position)
+                report (dc/with db ops)]
             (swap! tx-state (fn [current]
                               (-> current
                                   (assoc :speculative-db (:db-after report))
-                                  (update :tx-buffer conj op)
-                                  (assoc-in [:local-sequence-reservations generation] next))))
+                                  (update :tx-buffer into ops)
+                                  (assoc-in [:local-sequence-reservations generation] position))))
             next))))))
 
 (defn- handle-nextval
@@ -7778,17 +7755,7 @@
       (classified-error "" e))))
 
 (defn- handle-setval
-  "SELECT setval('seq_name', N[, is_called]) — force the sequence to N.
-
-   Returns N. The 3-arg form's `is_called` decides what the NEXT
-   nextval produces: with true (and for the 2-arg form) it is
-   N + increment, with false it is N itself. We store the last value
-   HANDED OUT, so `is_called false` persists `N - increment` — ignoring
-   the flag, as this used to, made `setval(s,10,false)` followed by
-   `nextval(s)` answer 11 where PG answers 10.
-
-   Also range-checks N against the sequence's MINVALUE/MAXVALUE (PG:
-   22003) instead of silently storing an out-of-range position."
+  "Store both fields of the SQL sequence position and return the given value."
   [{:keys [conn tx-state session-state]} parsed]
   (try
     (let [new-val (:new-value parsed)
@@ -7805,7 +7772,6 @@
           committed-generation? (and (= seq-eid (:eid committed-descriptor))
                                      (not (contains? (:local-sequence-identities @tx-state #{})
                                                      sequence-identity)))
-          increment (get seq-ent :__seq__/increment 1)
           minv (get seq-ent :__seq__/minvalue Long/MIN_VALUE)
           maxv (get seq-ent :__seq__/maxvalue Long/MAX_VALUE)]
       (when (and seq-eid (or (< new-val minv) (> new-val maxv)))
@@ -7814,8 +7780,8 @@
                              "\" (" minv ".." maxv ")")
                         {:sqlstate "22003"})))
       (if seq-eid
-        (let [stored (if is-called? new-val (- new-val increment))
-              setval-tx [[:db/add seq-eid :__seq__/value stored]]]
+        (let [position [new-val is-called?]
+              setval-tx (sequence/position-tx lookup-db seq-eid position)]
           ;; setval(…, true) defines currval for this session, exactly
           ;; as a nextval would; setval(…, false) does not.
           (when (and session-state is-called?)
@@ -7838,7 +7804,7 @@
                                   (not committed-generation?)
                                   (assoc-in [:local-sequence-reservations
                                              (conj generation-id storage-generation)]
-                                            stored)))))
+                                            position)))))
             (transact-recorded! conn setval-tx))
           (single-row-result "setval" PgWireServer/OID_INT8 (str new-val)))
         (error-result (str "Sequence not found: " seq-name))))
@@ -8260,8 +8226,7 @@
              (nil? (:sql-limit parsed)) (nil? (:sql-offset parsed))
              (nil? (:sql-order-by parsed))
              (nil? (:sub-results parsed))
-             (not (re-find #"(?i)for\s+(valid_time|system_time)"
-                           (or (:sql parsed) ""))))
+             (nil? (::temporal-override parsed)))
     (let [query (:query parsed)
           in-args (vec (:in-args parsed))
           aliases (:find-aliases parsed)
@@ -8329,10 +8294,8 @@
    something happened to cast it. PostgreSQL reads a typed parameter
    when it is bound.
 
-   The value is whatever the input function returns -- a timestamp's
-   LocalDateTime keeps its microseconds, which a java.util.Date (the
-   binary path's carrier) would round away. `bound` is the 1-indexed
-   vector."
+   Text and binary timestamps use the same microsecond-precision
+   carriers. `bound` is the 1-indexed vector."
   [bound declared]
   (if (empty? declared)
     bound
@@ -8342,9 +8305,14 @@
                                             (contains? regoid/alias-oids oid)
                                             (contains? regoid/alias-oids (types/array-oid->element-oid oid))))
                      (assoc acc idx
-                            (try (if (contains? regoid/alias-oids (types/array-oid->element-oid oid))
+                            (try (cond
+                                   (contains? regoid/alias-oids (types/array-oid->element-oid oid))
                                    (pg-arr/from-pg-text v (types/oid->elem-kw (types/array-oid->element-oid oid)))
-                                   (input/parse oid v))
+
+                                   (contains? #{types/oid-timestamp types/oid-timestamptz} oid)
+                                   (parse-timestamp-param v oid)
+
+                                   :else (input/parse oid v))
                                  (catch clojure.lang.ExceptionInfo e
                                    (let [[code message fields] (errors/classify-exception e)]
                                      (throw (PgWireServer$PgProtocolException.
@@ -9778,35 +9746,19 @@
         (distinct names)))
 
 (defn- restart-identity-tx-data
-  "TRUNCATE … RESTART IDENTITY: reset every IDENTITY-backing sequence
-   of `tables` to its pristine post-CREATE state. Identity sequences
-   (translate-create-table) initialise :__seq__/value to 0 = start(1) -
-   increment(1); handle-nextval is advance-then-return, so resetting to
-   `- 1 increment` makes the next nextval return 1 again. Sequences
-   with a non-default START WITH aren't reachable here — IDENTITY
-   columns always start at 1."
+  "TRUNCATE … RESTART IDENTITY resets each owned sequence to its START."
   [db tables]
   (when (get (dbi/-schema db) :__seq__/name)
-    (vec
-     (mapcat
-      (fn [[seq-name increment]]
-        (into [[:db/add [:__seq__/name seq-name] :__seq__/value (- 1 increment)]]
-              (relation-definition-revision-tx db [seq-name])))
-      (distinct
-       (for [table tables
-             {:keys [seq-name]} (compute-identity-cols db table)
-             :let [seq-eid (ffirst (d/q '{:find [?e]
-                                          :where [[?e :__seq__/name ?n]]
-                                          :in [$ ?n]}
-                                        db seq-name))
-                   increment (or (when seq-eid
-                                   (ffirst (d/q '{:find [?i]
-                                                  :where [[?e :__seq__/increment ?i]]
-                                                  :in [$ ?e]}
-                                                db seq-eid)))
-                                 1)]
-             :when seq-eid]
-         [seq-name increment]))))))
+    (let [names (distinct (mapcat #(map :seq-name (compute-identity-cols db %)) tables))]
+      (into (sequence/install-called-attribute db)
+            (mapcat (fn [seq-name]
+                      (let [ref [:__seq__/name seq-name]
+                            entity (sequence/entity-by-name db seq-name)]
+                        (when entity
+                          (into [[:db/add ref :__seq__/value (:__seq__/start entity 1)]
+                                 [:db/add ref :__seq__/is-called false]]
+                                (relation-definition-revision-tx db [seq-name]))))))
+            names))))
 
 (defn- exec-truncate
   "TRUNCATE [TABLE] t1, t2, … — retract every row of every listed
@@ -9930,25 +9882,18 @@
    ddl/sequence-params expects as `:existing`, so ALTER validates the
    merge of old and new the way PG's init_params does."
   [db seq-name]
-  (when-let [eid (ffirst (d/q '{:find [?e]
-                                :where [[?e :__seq__/name ?n]]
-                                :in [$ ?n]}
-                              db seq-name))]
-    (let [attr (fn [a default]
-                 (let [v (ffirst (d/q {:find '[?v]
-                                       :where [['?e a '?v]]
-                                       :in '[$ ?e]}
-                                      db eid))]
-                   (if (some? v) v default)))
-          incr (attr :__seq__/increment 1)]
-      {:eid eid
-       :type (attr :__seq__/type "bigint")
+  (when-let [entity (sequence/entity-by-name db seq-name)]
+    (let [incr (get entity :__seq__/increment 1)]
+      {:type (get entity :__seq__/type "bigint")
        :increment incr
-       :minvalue (attr :__seq__/minvalue (if (pos? incr) 1 Long/MIN_VALUE))
-       :maxvalue (attr :__seq__/maxvalue (if (pos? incr) Long/MAX_VALUE -1))
-       :start (attr :__seq__/start 1)
-       :cache (attr :__seq__/cache 1)
-       :cycle? (boolean (attr :__seq__/cycle false))})))
+       :minvalue (get entity :__seq__/minvalue (if (pos? incr) 1 Long/MIN_VALUE))
+       :maxvalue (get entity :__seq__/maxvalue (if (pos? incr) Long/MAX_VALUE -1))
+       :start (get entity :__seq__/start 1)
+       :cache (get entity :__seq__/cache 1)
+       :cycle? (get entity :__seq__/cycle false)
+       :legacy-position (when (nil? (:__seq__/is-called entity))
+                          (sequence/position entity))
+       :stored-value (:__seq__/value entity)})))
 
 (defn- exec-ddl-alter-sequence
   "ALTER SEQUENCE [IF EXISTS] name options…
@@ -9979,9 +9924,12 @@
         (let [params (ddl/sequence-params seq-opts {:existing existing})
               sequence-ref [:__seq__/name seq-name]
               rewrite? (some #(not= :owned-by (first %)) seq-opts)
-              ;; The stored counter is the last value handed out, so a
-              ;; RESTART to N is stored as N - increment for the next
-              ;; advance to land exactly on N.
+              position-tx (if-let [restart (:restart params)]
+                            (sequence/position-tx current-db sequence-ref [restart false])
+                            (when-let [[value called?] (:legacy-position existing)]
+                              (conj (sequence/install-called-attribute current-db)
+                                    [:db/cas sequence-ref :__seq__/value (:stored-value existing) value]
+                                    [:db/cas sequence-ref :__seq__/is-called nil called?])))
               tx-data (cond-> [[:db/add sequence-ref :__seq__/increment (:increment params)]
                                [:db/add sequence-ref :__seq__/minvalue (:minvalue params)]
                                [:db/add sequence-ref :__seq__/maxvalue (:maxvalue params)]
@@ -9989,9 +9937,8 @@
                                [:db/add sequence-ref :__seq__/cycle (:cycle? params)]
                                [:db/add sequence-ref :__seq__/start (:start params)]
                                [:db/add sequence-ref :__seq__/type (:type params)]]
-                        (:restart params)
-                        (conj [:db/add sequence-ref :__seq__/value
-                               (- (:restart params) (:increment params))])
+                        (seq position-tx)
+                        (into position-tx)
                         rewrite?
                         (into (relation-definition-revision-tx current-db [seq-name])))]
           (if (:in-tx? @tx-state)
@@ -11145,25 +11092,7 @@
         (when (regoid/type-identity db {:namespace-oid 2200 :name new-name})
           (throw (ex-info (str "type " (pr-str new-name) " already exists")
                           {:error :duplicate-object :sqlstate "42710"})))
-        (let [column-eids (map first
-                               (d/q '{:find [?col]
-                                      :in [$ ?name]
-                                      :where [[?col :datahike.pg/enum-of ?name]]}
-                                    db type-name))
-              oid (:datahike.pg.object/oid
-                   (catalog-objects/object-by-identity
-                    db catalog-objects/pg-type-oid
-                    catalog-objects/public-namespace-oid type-name))
-              tx-data (into
-                       [[:db/retract eid :datahike.pg.enum/name type-name]
-                        [:db/add eid :datahike.pg.enum/name new-name]]
-                       (concat
-                        (mapcat (fn [col]
-                                  [[:db/retract col :datahike.pg/enum-of type-name]
-                                   [:db/add col :datahike.pg/enum-of new-name]])
-                                column-eids)
-                        (catalog-objects/rename-object-tx
-                         db catalog-objects/pg-type-oid oid new-name nil)))]
+        (let [tx-data (pgs/registered-type-name-tx db :enum type-name new-name)]
           (if (:in-tx? @tx-state)
             (execute-ddl-in-tx tx-state tx-data "ALTER TYPE")
             (do (transact-recorded! conn tx-data) (empty-result "ALTER TYPE")))))
@@ -11731,9 +11660,12 @@
                   (throw (errors/pg-error
                           :feature-not-supported
                           {:message "partial and extended unique indexes are not supported"})))))
-          table-object (catalog-objects/object-by-identity
-                        db catalog-objects/pg-class-oid
-                        catalog-objects/public-namespace-oid (:table parsed))
+          table-object (if sql-ctx/*physical-table-names?*
+                         (when-let [oid (pgs/storage-table-oid db (:table parsed))]
+                           (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid))
+                         (catalog-objects/object-by-identity
+                          db catalog-objects/pg-class-oid
+                          catalog-objects/public-namespace-oid (:table parsed)))
           _ (when-not (= :table (:datahike.pg.object/kind table-object))
               (throw (errors/pg-error :undefined-table
                                       {:table (:table parsed)})))
@@ -12023,11 +11955,15 @@
                 (let [keys (try
                              (edn/read-string keys-edn)
                              (catch Exception _ []))]
-                  (when (some #(or (= column (:name %))
+                  (when (some #(or (= (:datahike.pg.column/name column) (:name %))
                                    (= (:datahike.pg.column/storage-ident column)
                                       (:storage-ident %)))
                               keys)
-                    {:entity entity :name index-name :keys keys}))))
+                    (let [index (d/entity db entity)]
+                      {:entity entity :name index-name :keys keys
+                       :method (:datahike.pg.index/method index)
+                       :unique? (:datahike.pg.index/unique? index)
+                       :materialized? (some? (:db.secondary/type index))})))))
         (d/q '{:find [?index ?name ?keys]
                :in [$ ?table]
                :where [[?index :datahike.pg.index/table ?table]
@@ -12219,6 +12155,11 @@
                   (stmt/coerce-insert-value
                    (row-constraints/eval-default kind (:pg/default-value entity))
                    attr (dbi/-schema db) db))]
+      (when (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))
+        (when-let [spec (get-in (row-constraints/constraint-plan db table) [:domain-enum name])]
+          (when (if (= :enum (:kind spec)) (some? value) (seq rows))
+            (row-constraints/validate-pre-arbiter!
+             db table {attr value} {:domain-enum {name spec}} (row-eval/check-fn db) nil))))
       (when (and not-null? (seq rows) (nil? value))
         (throw (ex-info (str "column \"" name "\" of relation \"" table
                              "\" contains null values")
@@ -12227,6 +12168,235 @@
                 (mapv (fn [eid] [:db/add eid attr value]) rows)
                 [])
         not-null? (conj [:db/add (:db/id entity) :pg/not-null true])))))
+
+(defn- available-column-storage-ident [occupied table name attnum]
+  (let [logical (keyword table name)]
+    (if (contains? occupied logical)
+      (first (remove occupied
+                     (map (fn [suffix]
+                            (keyword table (str "pg$att" attnum
+                                                (when (pos? suffix) (str "_" suffix)))))
+                          (range))))
+      logical)))
+
+(defn- alter-type-column-spec [db type]
+  (let [normalized (types/normalize-sql-type-name type)
+        base (types/base-type-name-of normalized)
+        array-spec (types/parse-array-type-name normalized)
+        vtype (if array-spec :db.type/string (get types/sql-name->dh-type base))
+        oid (pgs/resolve-type-oid db type)
+        typmod (or (when (or (= :numeric (:elem array-spec)) (= :numeric (types/cast-category base)))
+                     (when-let [[precision scale] (types/parse-numeric-args normalized)]
+                       (when precision (types/encode-numeric-typmod precision scale))))
+                   (some-> (types/parse-char-length normalized) (+ types/var-hdr-sz))
+                   (types/parse-timestamp-precision normalized)
+                   (types/parse-time-precision normalized)
+                   (types/parse-bit-length normalized))]
+    (when-not (and vtype (types/catalog-type oid)
+                   (not (types/unsupported-input-type? base))
+                   (not (re-find #"^(?:smallserial|bigserial|serial)" base))
+                   (not (pgs/user-type-object db type)))
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "ALTER COLUMN TYPE to " type " is not supported")})))
+    {:base base :oid oid :typmod typmod :vtype vtype :array-spec array-spec}))
+
+(defn- assert-rewritable-column! [db table column indexes]
+  (let [attr (:datahike.pg.column/storage-ident column)
+        name (:datahike.pg.column/name column)
+        schema (dbi/-schema db)
+        attr-schema (get schema attr)
+        metadata (row-constraints/constraint-metadata db table)
+        inbound-fk? (and (get schema :pg/fk-parent-table)
+                         (some (fn [[columns]]
+                                 (some #{name} (jb/parse-jsonb columns)))
+                               (d/q '{:find [?columns]
+                                      :in [$ ?table]
+                                      :where [[?fk :pg/fk-parent-table ?table]
+                                              [?fk :pg/fk-parent-cols ?columns]]}
+                                    db table)))]
+    (when (or (:db/unique attr-schema)
+              (not= :db.cardinality/one (:db/cardinality attr-schema))
+              (= :db.type/ref (:db/valueType attr-schema))
+              (identity-storage-column? db table attr)
+              (some (fn [{:keys [method unique? materialized?]}]
+                      (or unique? materialized? (not (contains? #{"btree" "hash"} method))))
+                    indexes)
+              (some (fn [entry] (some #{attr} (:db/tupleAttrs (val entry)))) schema)
+              (some (fn [entry] (:generated-expr entry)) (:columns metadata))
+              (get (:domain-enum metadata) name)
+              (seq (:checks metadata))
+              (some (fn [fk] (some #{attr} (:child-attrs fk))) (:fks metadata))
+              inbound-fk?)
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "ALTER COLUMN TYPE with dependencies on column "
+                                             (dump/quote-ident name) " is not supported")})))))
+
+(defn- require-alter-assignment! [source target name type]
+  (when-not (types/assignment-cast-exists? source target)
+    (throw (ex-info (str "column " (dump/quote-ident name)
+                         " cannot be cast automatically to type " type)
+                    {:error :datatype-mismatch :sqlstate "42804"}))))
+
+(defn- alter-type-using-ast [using name]
+  (let [sql (or using (dump/quote-ident name))]
+    (when (or (str/blank? sql)
+              (some (fn [[{:keys [type text]} following]]
+                      (or (= :param type)
+                          (and (= :ident type)
+                               (let [word (str/lower-case text)]
+                                 (or (= "select" word)
+                                     (and (= "(" (:text following))
+                                          (contains? types/volatile-proc-names word)))))))
+                    (partition-all 2 1 (cls/tokenize sql))))
+      (throw (errors/pg-error :feature-not-supported
+                              {:message "ALTER COLUMN TYPE USING requires a scalar row expression"})))
+    (row-constraints/parse-constraint-expression sql)))
+
+(defn- readdress-column-tx [db column definition indexes oid typmod]
+  (let [name (:datahike.pg.column/name column)
+        old-attr (:datahike.pg.column/storage-ident column)
+        old-typmod (:datahike.pg.column/typmod column)
+        new-attr (:db/ident definition)
+        addr [:datahike.pg.column/address-key (:datahike.pg.column/address-key column)]
+        hint (column-hint-eid db old-attr)
+        new-hint (cond-> {:datahike.pg/for-ident new-attr :datahike.pg/column name}
+                   (and hint (:datahike.pg/internal-index (d/entity db hint)))
+                   (assoc :datahike.pg/internal-index true))
+        index-tx (mapv (fn [{:keys [entity keys]}]
+                         [:db/add entity :datahike.pg.index/keys
+                          (pr-str (mapv (fn [key]
+                                          (if (= name (:name key))
+                                            (assoc key :storage-ident new-attr)
+                                            key))
+                                        keys))])
+                       indexes)]
+    (cond-> (into [definition
+                   new-hint
+                   (if hint
+                     [:db/add hint :datahike.pg/hidden true]
+                     {:datahike.pg/for-ident old-attr :datahike.pg/hidden true})
+                   [:db/add addr :datahike.pg.column/storage-ident new-attr]
+                   [:db/add addr :datahike.pg.column/type-oid (long oid)]]
+                  index-tx)
+      typmod (conj [:db/add addr :datahike.pg.column/typmod (long typmod)])
+      (and (nil? typmod) (some? old-typmod))
+      (conj [:db/retract addr :datahike.pg.column/typmod old-typmod]))))
+
+(defn mirror-column-rewrite-tx
+  "Prepare an attribute for values already converted by the publisher.
+   The staging table supplies the storage definition of the new SQL type."
+  [db table name type-oid typmod staged-column]
+  (let [relation-oid (pgs/storage-table-oid db table)
+        column (alterable-column db table relation-oid name "TYPE")
+        indexes (column-index-dependents db table column)
+        old-attr (:datahike.pg.column/storage-ident column)
+        schema (dbi/-schema db)
+        old (get schema old-attr)
+        new-attr (available-column-storage-ident (conj (set (keys schema)) (keyword table name))
+                                                 table name (:datahike.pg.column/attnum column))
+        definition (merge (select-keys old [:db/index :db/noHistory])
+                          (select-keys staged-column [:db/valueType :db/cardinality
+                                                      :pg/type :pg/typmod :pg/array-elem :pg/array-ndim
+                                                      :datahike.pg/enum-of :datahike.pg/domain-of])
+                          {:db/ident new-attr})]
+    (when (or (:db/unique old) (some :unique? indexes))
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "Cannot rewrite a mirror column with a live unique constraint: " name)})))
+    (into (readdress-column-tx db column definition indexes type-oid typmod)
+          (keep (fn [eid]
+                  (let [value (get (d/entity db eid) old-attr)]
+                    (when (some? value) [:db/retract eid old-attr value]))))
+          (table-row-eids db table))))
+
+(defn- type-rewrite-tx
+  "Rewrite one column's row values and catalog address atomically. A fresh
+   physical attribute keeps old values and type metadata addressable as of the
+   transaction before the rewrite."
+  [db table relation-oid {:keys [name type using]}]
+  (let [column (alterable-column db table relation-oid name "TYPE")
+        indexes (column-index-dependents db table column)
+        _ (assert-rewritable-column! db table column indexes)
+        old-attr (:datahike.pg.column/storage-ident column)
+        source-oid (:datahike.pg.column/type-oid column)
+        old-entity (d/entity db old-attr)
+        schema (dbi/-schema db)
+        attnum (:datahike.pg.column/attnum column)
+        {:keys [base oid typmod vtype array-spec]} (alter-type-column-spec db type)
+        new-attr (available-column-storage-ident (conj (set (keys schema)) (keyword table name))
+                                                 table name attnum)
+        definition (merge (select-keys (get schema old-attr) [:db/index :db/noHistory])
+                          (select-keys old-entity [:pg/not-null :pg/default-kind
+                                                   :pg/default-value :pg/default-arg])
+                          {:db/ident new-attr :db/valueType vtype
+                           :db/cardinality :db.cardinality/one
+                           :pg/type (or (types/oid->pg-type-marker oid) base)}
+                          (when typmod {:pg/typmod (long typmod)})
+                          (when array-spec
+                            {:pg/type (:pg-name array-spec)
+                             :pg/array-elem (:elem array-spec)
+                             :pg/array-ndim (long (:ndim array-spec))}))
+        using-ast (alter-type-using-ast using name)
+        using-oid (if using
+                    (first (row-eval/row-oids [using-ast] table schema db))
+                    source-oid)
+        using-oid (when-not (oid/untyped-literal? using-ast)
+                    using-oid)
+        _ (require-alter-assignment! using-oid oid name type)
+        ;; The base cast handles conversions such as numeric to integer or
+        ;; timestamps crossing TimeZone. The column assignment handles typmods,
+        ;; including rejecting strings that would need truncation.
+        conversion (if (= oid using-oid)
+                     using-ast
+                     (CCJSqlParserUtil/parseExpression
+                      (str "CAST(" using-ast " AS " base ")")))
+        default-kind (:pg/default-kind old-entity)
+        _ (when (and default-kind (not= source-oid oid))
+            (require-alter-assignment! source-oid oid name type)
+            (when-not (#{:literal :bit :bit-coerced} default-kind)
+              (throw (errors/pg-error :feature-not-supported
+                                      {:message "ALTER COLUMN TYPE with an expression DEFAULT is not supported"}))))
+        definition (if (and default-kind (not= source-oid oid))
+                     (let [source-type (types/oid->pg-name source-oid)
+                           raw (:pg/default-value old-entity)
+                           cast (CCJSqlParserUtil/parseExpression
+                                 (str "CAST(CAST('" (str/replace raw "'" "''") "' AS "
+                                      source-type ") AS " base ")"))
+                           value (row-eval/default-value cast schema db)]
+                       (assoc definition
+                              :pg/default-kind :literal
+                              :pg/default-value (types/->pg-text value oid)))
+                     definition)
+        convert (fn [value]
+                  (stmt/coerce-insert-value value new-attr {new-attr definition} db))
+        _ (when (#{:literal :bit :bit-coerced} (:pg/default-kind definition))
+            (convert (:pg/default-value definition)))]
+    (into (readdress-column-tx db column definition indexes oid typmod)
+          (mapcat (fn [eid]
+                    (let [row (d/entity db eid)
+                          previous (get row old-attr)
+                          updated (convert (first (:values
+                                                   (row-eval/row-values
+                                                    [conversion] row table schema db))))]
+                      (when (and (nil? updated) (:pg/not-null old-entity))
+                        (throw (ex-info (str "column " (dump/quote-ident name) " contains null values")
+                                        {:sqlstate "23502" :table table :column name})))
+                      (cond-> []
+                        (some? previous) (conj [:db/retract eid old-attr previous])
+                        (some? updated) (conj [:db/add eid new-attr updated])))))
+          (table-row-eids db table))))
+
+(defn- type-rewrite-op [table relation-oid changes]
+  (let [time-zone types/*time-zone*
+        date-style types/*date-style*
+        transaction-time datetime-in/*transaction-time*
+        statement-time params/*statement-time*]
+    [:db.fn/call
+     (fn [db]
+       (binding [types/*time-zone* time-zone
+                 types/*date-style* date-style
+                 datetime-in/*transaction-time* transaction-time
+                 params/*statement-time* statement-time]
+         (into [] (mapcat #(type-rewrite-tx db table relation-oid %)) changes)))]))
 
 (defn- inherited-add-column-tx-data
   "Propagate newly added parent columns through the inheritance tree.
@@ -12346,7 +12516,9 @@
       (let [{:keys [table operations]} parsed
             db (or (:speculative-db @tx-state) (d/db conn))
             schema (dbi/-schema db)
-            relation-oid (pgs/table-oid db table)
+            relation-oid (if sql-ctx/*physical-table-names?*
+                           (pgs/storage-table-oid db table)
+                           (pgs/table-oid db table))
             _ (when-not relation-oid
                 (throw (errors/pg-error :undefined-table {:table table})))
             added-columns
@@ -12370,18 +12542,7 @@
                         known-columns))
             fresh-storage-ident!
             (fn [name attnum]
-              (let [logical-ident (keyword table name)
-                    ident (if-not (contains? @occupied-storage logical-ident)
-                            logical-ident
-                            (loop [suffix 0]
-                              (let [candidate
-                                    (keyword table
-                                             (str "pg$att" attnum
-                                                  (when (pos? suffix)
-                                                    (str "_" suffix))))]
-                                (if (contains? @occupied-storage candidate)
-                                  (recur (inc suffix))
-                                  candidate))))]
+              (let [ident (available-column-storage-ident @occupied-storage table name attnum)]
                 (swap! occupied-storage conj ident)
                 ident))
             added-column-specs
@@ -12393,28 +12554,34 @@
                                  {:error :duplicate-column :sqlstate "42701"})))
                (let [attnum (+ first-attnum idx)
                      storage-ident (fresh-storage-ident! name attnum)
-                     normalized (types/normalize-sql-type-name type)
-                     base-type (str/replace normalized #"\s*\([^)]*\)" "")
                      user-type (pgs/user-type-object db type)
+                     domain (when (= :domain (:datahike.pg.object/kind user-type))
+                              (params/registered-domain-spec db (:datahike.pg.object/name user-type)))
+                     normalized (types/normalize-sql-type-name (or (:base-type domain) type))
+                     base-type (str/replace normalized #"\s*\([^)]*\)" "")
+                     array-spec (types/parse-array-type-name normalized)
                      vector-typmod (when (= "vector" base-type)
                                      (pg-vector/parse-typmod normalized))
                      numeric-typmod
-                     (when (= :numeric (types/cast-category base-type))
+                     (when (or (= :numeric (:elem array-spec)) (= :numeric (types/cast-category base-type)))
                        (let [[precision scale] (types/parse-numeric-args normalized)]
                          (when (or precision scale)
                            (types/encode-numeric-typmod precision scale))))
                      char-typmod (when-let [length (types/parse-char-length normalized)]
                                    (+ length 4))
+                     temporal-typmod (or (types/parse-timestamp-precision normalized)
+                                         (types/parse-time-precision normalized))
                      bit-typmod (some-> (types/parse-bit-length normalized) long)]
                  (assoc column
                         :attnum attnum
                         :storage-ident storage-ident
                         :normalized-type normalized
                         :base-type base-type
+                        :array-spec array-spec
                         :type-object user-type
                         :type-oid (pgs/resolve-type-oid db type)
                         :typmod (or vector-typmod numeric-typmod
-                                    char-typmod bit-typmod))))
+                                    char-typmod temporal-typmod bit-typmod))))
              (range) added-columns)
             add-spec-by-name (into {} (map (juxt :name identity)) added-column-specs)
             _ (doseq [{:keys [op columns]} operations]
@@ -12458,7 +12625,7 @@
                                                  :add-column
                                                  (for [{:keys [name]} columns
                                                        :let [{:keys [type storage-ident base-type typmod default
-                                                                     type-object normalized-type]}
+                                                                     type-object normalized-type array-spec]}
                                                              (get add-spec-by-name name)
                                                              metadata (alter-default-metadata default base-type name)
                                                              raw-type type
@@ -12470,9 +12637,13 @@
                                                                          {:error :feature-not-supported
                                                                           :sqlstate "0A000"
                                                                           :type unsupported-base})))
-                                                             dh-type (or (get types/sql-name->dh-type normalized-type)
-                                                                         (get types/sql-name->dh-type base-type)
-                                                                         :db.type/string)
+                                                             dh-type (if array-spec
+                                                                       :db.type/string
+                                                                       (or (get types/sql-name->dh-type normalized-type)
+                                                                           (get types/sql-name->dh-type base-type)
+                                                                           :db.type/string))
+                                                             pg-type (or (:pg-name array-spec)
+                                                                         (ddl/pg-type-hint base-type false))
                                                              type-kind (:datahike.pg.object/kind type-object)
                                                              type-name (:datahike.pg.object/name type-object)]]
                                                    (cond-> (merge {:db/ident storage-ident
@@ -12484,9 +12655,11 @@
                                   ;; so a column added by ALTER as `date`
                                   ;; or `smallint` reported its storage
                                   ;; type (timestamp / int8) forever.
-                                                     (ddl/pg-type-hint base-type false)
-                                                     (assoc :pg/type
-                                                            (ddl/pg-type-hint base-type false))
+                                                     pg-type
+                                                     (assoc :pg/type pg-type)
+                                                     array-spec
+                                                     (assoc :pg/array-elem (:elem array-spec)
+                                                            :pg/array-ndim (long (:ndim array-spec)))
                                                      (= :enum type-kind)
                                                      (assoc :datahike.pg/enum-of type-name)
                                                      (= :domain type-kind)
@@ -12586,12 +12759,21 @@
                              (mapv (fn [change]
                                      [:db.fn/call alter-column-nullability-tx table relation-oid change])
                                    (get nullability-ops op)))
+            type-ops (filterv #(= :alter-type (:op %)) operations)
+            _ (when-not (= (count type-ops) (count (distinct (map :name type-ops))))
+                (throw (ex-info "cannot alter type of a column twice" {:sqlstate "0A000"})))
+            rewritten-columns (set (map :name type-ops))
             default-ops (filter #(= :alter-default (:op %)) operations)
-            default-tx (map (fn [change]
-                              [:db.fn/call alter-column-default-tx table relation-oid change])
-                            default-ops)
-            backfill-tx (for [{:keys [not-null? default] :as column} added-column-specs
-                              :when (or not-null? (some? (:value default)))]
+            default-groups (group-by (fn [{:keys [name default]}]
+                                       (and (nil? default) (contains? rewritten-columns name)))
+                                     default-ops)
+            default-tx (fn [before-rewrite?]
+                         (map (fn [change]
+                                [:db.fn/call alter-column-default-tx table relation-oid change])
+                              (get default-groups before-rewrite?)))
+            backfill-tx (for [{:keys [not-null? default type-object] :as column} added-column-specs
+                              :when (or not-null? (some? (:value default))
+                                        (= :domain (:datahike.pg.object/kind type-object)))]
                           [:db.fn/call backfill-added-column-tx table relation-oid column])
             ;; PostgreSQL drops nullability before adding columns, then
             ;; validates SET NOT NULL against the resulting table. Run the
@@ -12599,7 +12781,9 @@
             tx-data (into (nullability-tx :drop-not-null)
                           (concat schema-and-constraint-data added-constraint-data
                                   attnum-data inherited-column-data hint-data backfill-tx
-                                  lifecycle-data default-tx
+                                  lifecycle-data (default-tx true)
+                                  (when (seq type-ops) [(type-rewrite-op table relation-oid type-ops)])
+                                  (default-tx false)
                                   (nullability-tx :set-not-null)))
             tx-data (if (and relation-oid (seq tx-data))
                       (into tx-data
@@ -12624,6 +12808,7 @@
               ;; instead of failing statements that used to succeed.
               (if (and (empty? nullability-ops)
                        (empty? default-ops)
+                       (empty? type-ops)
                        (not-any? #(= :add-column (:op %)) operations)
                        (re-find #"Update not supported"
                                 (str (.getMessage e))))
@@ -13285,6 +13470,7 @@
                  ;; us once per CopyData frame. Preserve stable-expression,
                  ;; cancellation, and timeout context across those callbacks.
                  :statement-time  params/*statement-time*
+                 :transaction-time datetime-in/*transaction-time*
                  :regoid-search-path (effective-search-path (:session-state ctx))
                  :regoid-database-name (:db-name @(:session-state ctx))
                  :regoid-temp-tables (:temp-tables ctx)
@@ -13529,6 +13715,7 @@
             regoid/*database-name* (or (:regoid-database-name copy-session) "datahike")
             regoid/*temp-tables* (:regoid-temp-tables copy-session)
             params/*statement-time* (:statement-time copy-session)
+            datetime-in/*transaction-time* (:transaction-time copy-session)
             params/*scalar-subquery-cache* (:scalar-subquery-cache copy-session)
             params/*cancel* (:cancel copy-session)]
     (f)))
@@ -13798,7 +13985,7 @@
                    (let [db (if (:in-tx? @(:tx-state ctx))
                               (:speculative-db @(:tx-state ctx))
                               (d/db (:conn ctx)))]
-                     (into #{} (comp (filter :generated) (map :name))
+                     (into #{} (comp (filter #(or (:generated %) (:publisher-generated? %))) (map :name))
                            (:columns (row-constraint-plan db table)))))
         _ (when-let [gen (first (filter gen-cols columns))]
             (throw (ex-info (str "column \"" gen "\" is a generated column")
@@ -13809,7 +13996,7 @@
                   (let [db (if (:in-tx? @(:tx-state ctx))
                              (:speculative-db @(:tx-state ctx))
                              (d/db (:conn ctx)))]
-                    (into [] (comp (remove :generated) (map :name))
+                    (into [] (comp (map :name) (remove gen-cols))
                           (:columns (row-constraint-plan db table))))
                   columns)
         sql (or query
@@ -14087,9 +14274,13 @@
 
 (defn- parse-prepared-session-sql
   [sql schema db temp-tables session-id session-state analyses previous]
-  (binding [params/*session-state* session-state]
+  (binding [params/*session-state* session-state
+            datetime-in/*transaction-time* (or (get-in previous [:input-clock-context :time])
+                                               datetime-in/*transaction-time*)
+            datetime-in/*analysis-zone* (get-in previous [:input-clock-context :zone])]
     (let [context (prepared-analysis-context session-state temp-tables)
-          old (when (= sql (:sql previous)) (:prepared-analysis previous))
+          old (when (= sql (or (::temporal-source previous) (:sql previous)))
+                (:prepared-analysis previous))
           token (:prepared-analysis-token previous)
           valid? (and old token
                       (locking analyses (.get ^java.util.WeakHashMap analyses token))
@@ -14115,6 +14306,9 @@
                           (.put ^java.util.WeakHashMap analyses token analysis))
                         token)))]
       (cond-> (assoc parsed :sql sql)
+        (:uses-input-clock? parsed)
+        (assoc :input-clock-context {:time datetime-in/*transaction-time*
+                                     :zone (or datetime-in/*analysis-zone* types/*time-zone*)})
         analysis (assoc :prepared-analysis analysis :prepared-analysis-token token)))))
 
 (defn- invalidate-changed-prepared-analyses!
@@ -14207,6 +14401,10 @@
           (when error (throw error))
           true)))))
 
+(defprotocol EmbeddedTransaction
+  (stage-tx! [handler tx-data]
+    "Add trusted embedded transaction data to the handler's active SQL transaction."))
+
 (defn- make-query-handler*
   "The handler `make-query-handler` scopes; see there."
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
@@ -14222,6 +14420,12 @@
                                        :as opts}]]
   (admit-unique-index-enforcement!
    conn (or (:unique-admissions opts) fallback-unique-admissions))
+  ;; Install the flag before a legacy database takes a statement or
+  ;; transaction snapshot. A reservation must then change only positions.
+  (let [db (d/db conn)]
+    (when (contains? (dbi/-schema db) :__seq__/name)
+      (when-let [schema-tx (seq (sequence/install-called-attribute db))]
+        (transact-recorded! conn schema-tx))))
   (let [prepared-analyses (java.util.WeakHashMap.)
         silently-accept (resolve-silently-accept opts)
         max-result-rows (normalize-max-result-rows
@@ -14236,7 +14440,9 @@
                                           :fast-path-count
                                           :full-parse-count)]
                              (swap! dispatch-stats update bucket (fnil inc 0)))))
+        private-storage (when (:database-read-only? opts) (pgs/mirror-private-storage (d/db conn)))
         session-state (atom (cond-> {:db-name (or db-name "datahike")}
+                              (seq private-storage) (assoc :private-storage private-storage)
                               ;; When the factory saw `database=X:feature`
                               ;; in the StartupMessage, pin the branch so
                               ;; every query on this session reads/writes-
@@ -14319,11 +14525,28 @@
         ;; only need the running spec-db so the next dc/with sees prior
         ;; rows in the same scope.
         batch-state (atom nil)
+        group-time (volatile! nil)
+        transaction-time (fn []
+                           (or (:transaction-time @tx-state)
+                               datetime-in/*transaction-time*
+                               @group-time
+                               (let [instant (.truncatedTo (java.time.Instant/now) java.time.temporal.ChronoUnit/MICROS)
+                                     time (java.sql.Timestamp/from instant)]
+                                 (when @batch-state (vreset! group-time time))
+                                 time)))
         ;; A URL-pinned branch handler owns one reference acquired through
         ;; d/connect. Datahike may return the same cached connection to several
         ;; wire sessions, so each handler must release exactly its own reference.
         conn-released? (atom false)]
     (reify PgWireServer$QueryHandler
+      EmbeddedTransaction
+      (stage-tx! [_ tx-data]
+        (assert-database-writable! "embedded transaction")
+        (let [{:keys [in-tx? aborted? read-only?]} @tx-state]
+          (when-not (and in-tx? (not aborted?) (not read-only?))
+            (throw (IllegalStateException. "Expected an active writable SQL transaction")))
+          (execute-ddl-in-tx tx-state tx-data "EMBEDDED TRANSACTION")))
+
       (close [_]
         ;; pgwire client disconnected — equivalent to a PG backend
         ;; terminating. Release all row locks, advisory locks held by this
@@ -14522,6 +14745,7 @@
                     params/*session-prepared* sql-prepared
                     params/*session-cursors* cursors
                     params/*query-string* @query-string
+                    datetime-in/*transaction-time* (transaction-time)
                     ;; The date/timestamp OUTPUT format is this session's
                     ;; setting, and the renderer runs on this thread.
                     types/*date-style* (or (:date-style @session-state) [:iso :mdy])
@@ -14545,16 +14769,9 @@
                     ;; uses the extended protocol, which is every
                     ;; pgjdbc client by default.
                     params/*statement-handler* (or params/*statement-handler* (nested-executor this))]
-            (let [base-db (apply-temporal (d/db conn) session-state)
-                ;; In an open transaction, parse/validate against the
-                ;; speculative-db so a statement referencing a table
-                ;; created earlier in the SAME uncommitted transaction
-                ;; (e.g. `BEGIN; CREATE TABLE t; PREPARE … SELECT FROM t`)
-                ;; resolves it. Mirrors the dispatch's db selection.
-                  db (if (:in-tx? @tx-state)
-                       (or (:speculative-db @tx-state) base-db)
-                       base-db)
-                  parsed (parse-prepared-session-sql sql (dbi/-schema db) db
+            (let [{source :sql override :override} (sql-temporal/preprocess sql)
+                  db (statement-read-db conn tx-state session-state override)
+                  parsed (parse-prepared-session-sql source (dbi/-schema db) db
                                                      temp-tables session-id session-state
                                                      prepared-analyses *previous-prepared*)]
             ;; Surface parse-time errors (undefined relation/column,
@@ -14580,8 +14797,10 @@
                   ;; type declarations (1-indexed to match `$N`; 0 = "you
                   ;; infer it"). describeParams and describeResult read the
                   ;; same map that was bound during translation above.
-                    parsed (assoc parsed :sql sql
-                                  :declared-param-oids declared-param-oids)]
+                    parsed (cond-> (assoc parsed :sql sql
+                                          :declared-param-oids declared-param-oids)
+                             override (assoc ::temporal-source source
+                                             ::temporal-override override))]
                 (when bump-dispatch! (bump-dispatch! parsed))
             ;; Pre-compute result metadata for row-producing system
             ;; queries so describeResult emits a proper RowDescription
@@ -14713,9 +14932,7 @@
                 ;; (or the alias-name fallback), which can disagree with
                 ;; the int4/int8 width the Execute path actually sends,
                 ;; corrupting binary-format decoding on the client.
-                db (if (:in-tx? @tx-state)
-                     (or (:speculative-db @tx-state) (d/db conn))
-                     (d/db conn))
+                db (statement-read-db conn tx-state session-state (::temporal-override parsed))
                 ;; Bare `$N` output columns are typed from the Parse
                 ;; message's declared OID — see effective-item-oids
                 ;; (issue #27). Statically unknown columns go out as text.
@@ -14746,9 +14963,7 @@
           ;; arity + column types, so the first branch is canonical.
           (= :set-operation (:type parsed))
           (when-let [sub (first (:sub-results parsed))]
-            (let [db (if (:in-tx? @tx-state)
-                       (or (:speculative-db @tx-state) (d/db conn))
-                       (d/db conn))
+            (let [db (statement-read-db conn tx-state session-state (::temporal-override parsed))
                   aliases (first (select-output-shape
                                   sub (or (:enriched-db sub) db) nil))
                   oids (int-array
@@ -14769,9 +14984,7 @@
           ;; columns, so the left one describes the result.
           (= :full-join (:type parsed))
           (when-let [sub (:left-query parsed)]
-            (let [db (if (:in-tx? @tx-state)
-                       (or (:speculative-db @tx-state) (d/db conn))
-                       (d/db conn))
+            (let [db (statement-read-db conn tx-state session-state (::temporal-override parsed))
                   db (or (:enriched-db sub) db)
                   [aliases oids] (select-output-shape sub db (effective-item-oids sub))
                   oids (int-array (map #(types/oid->wire-int (or % PgWireServer/OID_TEXT)) oids))]
@@ -14799,7 +15012,8 @@
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
-        (let [bound (binding [regoid/*db* (statement-read-db conn tx-state session-state)
+        (let [db (statement-read-db conn tx-state session-state (::temporal-override parsed))
+              bound (binding [regoid/*db* db
                               regoid/*relation-db* nil
                               regoid/*search-path* (effective-search-path session-state)
                               regoid/*relation-provider* catalog/relation-identity
@@ -14816,7 +15030,7 @@
                           (throw e))))]
           (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
                                                       (java.util.IdentityHashMap.))
-                    regoid/*db* (statement-read-db conn tx-state session-state)
+                    regoid/*db* db
                     regoid/*relation-db* nil
                     regoid/*search-path* (effective-search-path session-state)
                     regoid/*relation-provider* catalog/relation-identity
@@ -14824,6 +15038,7 @@
                     regoid/*database-name* (or (:db-name @session-state) "datahike")
                     regoid/*temp-tables* temp-tables
                     params/*statement-time* (java.util.Date.)
+                    datetime-in/*transaction-time* (transaction-time)
                     params/*scalar-subquery-cache* (atom {})
                     ;; The extended protocol renders its rows here, so the
                     ;; session's date style has to be in scope on this
@@ -14852,6 +15067,10 @@
       (executeInGroup [this sql]
         (.executeInGroup this sql false))
 
+      (endQueryGroup [_]
+        (vreset! group-time nil)
+        nil)
+
       (executeInGroup [this sql multi-statement?]
         ;; Simple-query group member: a write opens/joins the 'Q''s
         ;; implicit transaction (committed at end-of-'Q' via
@@ -14879,6 +15098,7 @@
                   regoid/*database-name* (or (:db-name @session-state) "datahike")
                   regoid/*temp-tables* temp-tables
                   params/*statement-time* (java.util.Date.)
+                  datetime-in/*transaction-time* (transaction-time)
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
                   ;; pg_prepared_statements and pg_cursors are views over
@@ -14968,34 +15188,7 @@
                             {stripped-sql :sql per-stmt-override :override}
                             (sql-temporal/preprocess sql)
                             sql stripped-sql
-                            ;; FETCH from a cursor binds *snapshot-db* so the
-                      ;; SELECT sees the state captured at DECLARE, not
-                      ;; whatever committed since. Non-cursor paths get
-                      ;; the normal live db.
-                            real-db (or *snapshot-db*
-                                        (apply-temporal (d/db conn) session-state per-stmt-override))
-                            db (if (and (not *snapshot-db*) (:in-tx? @tx-state))
-                                 (or (:speculative-db @tx-state) real-db)
-                                 real-db)
-                            ;; Use the IDB protocol method, not keyword
-                            ;; access. AsOfDB / SinceDB / HistoricalDB are
-                            ;; defrecords with only [origin-db time-point]
-                            ;; fields; `(:schema wrapper)` returns nil
-                            ;; because defrecord ILookup never reaches the
-                            ;; protocol. `(dbi/-schema wrapper)` correctly
-                            ;; delegates to origin-db's schema (datahike's
-                            ;; `db.cljc:553`). Without this, SELECT under
-                            ;; `SET datahike.as_of = …` collapses to errors
-                            ;; like \"Query for unknown vars\" because
-                            ;; column-info / derive-virtual-tables receive
-                            ;; an empty schema map. Note: the schema
-                            ;; returned is the *current* schema cached on
-                            ;; the origin-db, not a true historical schema —
-                            ;; columns added after the as-of timestamp are
-                            ;; visible to the translator but contain no
-                            ;; data at that time. A real historical schema
-                            ;; would require a `schema-as-of` upstream in
-                            ;; datahike (see TODO).
+                            db (statement-read-db conn tx-state session-state per-stmt-override)
                             schema (dbi/-schema db)
                             statement-basis (catalog-basis/capture db)
                       ;; Prepared-statement path: reuse the Parse-time result
@@ -15398,29 +15591,38 @@
   "`handler`, every call made with Datahike resolving query symbols through
    `datahike.pg.resolve/symbol-resolver`, and every statement run with a
    notice collector in scope."
-  ^PgWireServer$QueryHandler [^PgWireServer$QueryHandler h]
-  (reify PgWireServer$QueryHandler
-    (execute [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.execute h sql))))
-    (executeInGroup [_ sql] (collecting-notices #(pg-resolve/with-symbol-resolver (.executeInGroup h sql))))
-    (executeInGroup [_ sql multi-statement?]
-      (collecting-notices #(pg-resolve/with-symbol-resolver (.executeInGroup h sql multi-statement?))))
-    (parse [_ sql oids] (pg-resolve/with-symbol-resolver (.parse h sql oids)))
-    (reparse [_ sql oids previous] (pg-resolve/with-symbol-resolver (.reparse h sql oids previous)))
-    (describeParams [_ parsed] (pg-resolve/with-symbol-resolver (.describeParams h parsed)))
-    (describeResult [_ parsed] (pg-resolve/with-symbol-resolver (.describeResult h parsed)))
-    (executePrepared [_ parsed params] (collecting-notices #(pg-resolve/with-symbol-resolver (.executePrepared h parsed params))))
-    (planCacheToken [_] (pg-resolve/with-symbol-resolver (.planCacheToken h)))
-    (setQueryString [_ sql] (.setQueryString h sql))
-    (markTransactionFailed [_] (pg-resolve/with-symbol-resolver (.markTransactionFailed h)))
-    (close [_] (pg-resolve/with-symbol-resolver (.close h)))
-    (copyChunk [_ chunk] (pg-resolve/with-symbol-resolver (.copyChunk h chunk)))
-    (copyComplete [_] (pg-resolve/with-symbol-resolver (.copyComplete h)))
-    (copyAbort [_ reason] (pg-resolve/with-symbol-resolver (.copyAbort h reason)))
-    (beginBatchScope [_] (pg-resolve/with-symbol-resolver (.beginBatchScope h)))
-    (flushBatch [_ tx-data] (pg-resolve/with-symbol-resolver (.flushBatch h tx-data)))
-    (discardBatch [_] (pg-resolve/with-symbol-resolver (.discardBatch h)))
-    (commitImplicit [_] (pg-resolve/with-symbol-resolver (.commitImplicit h)))
-    (rollbackImplicit [_] (pg-resolve/with-symbol-resolver (.rollbackImplicit h)))))
+  ^PgWireServer$QueryHandler [^PgWireServer$QueryHandler h database-read-only?]
+  (let [run (if database-read-only?
+              (fn [f]
+                (binding [*database-read-only?* true]
+                  (pg-resolve/with-symbol-resolver (f))))
+              (fn [f] (pg-resolve/with-symbol-resolver (f))))
+        statement (fn [f] (collecting-notices #(run f)))]
+    (reify PgWireServer$QueryHandler
+      EmbeddedTransaction
+      (stage-tx! [_ tx-data] (run #(stage-tx! h tx-data)))
+      (execute [_ sql] (statement #(.execute h sql)))
+      (executeInGroup [_ sql] (statement #(.executeInGroup h sql)))
+      (executeInGroup [_ sql multi-statement?]
+        (statement #(.executeInGroup h sql multi-statement?)))
+      (endQueryGroup [_] (run #(.endQueryGroup h)))
+      (parse [_ sql oids] (run #(.parse h sql oids)))
+      (reparse [_ sql oids previous] (run #(.reparse h sql oids previous)))
+      (describeParams [_ parsed] (run #(.describeParams h parsed)))
+      (describeResult [_ parsed] (run #(.describeResult h parsed)))
+      (executePrepared [_ parsed params] (statement #(.executePrepared h parsed params)))
+      (planCacheToken [_] (run #(.planCacheToken h)))
+      (setQueryString [_ sql] (.setQueryString h sql))
+      (markTransactionFailed [_] (run #(.markTransactionFailed h)))
+      (close [_] (run #(.close h)))
+      (copyChunk [_ chunk] (run #(.copyChunk h chunk)))
+      (copyComplete [_] (run #(.copyComplete h)))
+      (copyAbort [_ reason] (run #(.copyAbort h reason)))
+      (beginBatchScope [_] (run #(.beginBatchScope h)))
+      (flushBatch [_ tx-data] (run #(.flushBatch h tx-data)))
+      (discardBatch [_] (run #(.discardBatch h)))
+      (commitImplicit [_] (run #(.commitImplicit h)))
+      (rollbackImplicit [_] (run #(.rollbackImplicit h))))))
 
 (defn make-query-handler
   "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
@@ -15469,7 +15671,8 @@
   ;; resolver.
   (scoped-handler
    (pg-resolve/with-symbol-resolver
-     (make-query-handler* conn opts))))
+     (make-query-handler* conn opts))
+   (:database-read-only? opts)))
 
 (defn- reject-unknown-db-handler
   "QueryHandler that rejects every query with SQLSTATE 3D000. Returned
@@ -15558,7 +15761,8 @@
               raw (or (.get ^java.util.Map startup-params "database")
                       (first (keys registry)))
               [requested _] (parse-db-name raw)]
-          (when-not (contains? registry requested)
+          (when-not (and (contains? registry requested)
+                         (or (not (:database-read-only? opts)) (not (str/includes? raw ":"))))
             (throw (PgWireServer$PgProtocolException.
                     "3D000"
                     (str "database \"" requested "\" does not exist"))))))
@@ -15745,6 +15949,8 @@
                 — Reject plaintext startup before requesting a password.
                   Automatically true for every non-loopback bind.
      :on-query  — Callback (fn [sql-string]) for logging
+     :database-read-only?
+                — Reject SQL writes for every database on this listener.
      :max-result-rows
                 — Maximum rows returned by one SELECT before SQLSTATE 54000
                   (default 100000). Set false to disable the guard.
@@ -15818,7 +16024,7 @@
         unique-admissions (atom {})
         factory-opts (-> (select-keys opts [:on-query :compat :silently-accept
                                             :dispatch-stats :tx-wrap
-                                            :max-result-rows
+                                            :max-result-rows :database-read-only?
                                             :secondary-index-config
                                             :secondary-index-build-timeout-ms])
                          (assoc :unique-admissions unique-admissions)

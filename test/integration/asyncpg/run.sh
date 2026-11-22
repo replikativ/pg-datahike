@@ -96,35 +96,40 @@ echo "[run] full output -> ${LOG}"
 # module a clean interpreter (less cross-module state bleed).
 PER_MODULE_TIMEOUT="${ASYNCPG_MODULE_TIMEOUT:-120}"
 
-P=0; F=0; S=0; E=0; TIMED_OUT=()
-set +e
+P=0; F=0; S=0; E=0; INCOMPLETE=()
+SCRATCH="$(mktemp -d)" || exit 2
+trap 'rm -rf "${SCRATCH}"' EXIT
+MODULE_LOG="${SCRATCH}/module.log"
+FAILURE_PATTERN='^(tests/[^ ]+) (FAILED|ERROR|SUBFAILED)(\(.*\))?$'
 : > "${LOG}"
 for m in "${MODULES[@]}"; do
   echo "[run] ${m} (timeout ${PER_MODULE_TIMEOUT}s)"
   echo "==================== ${m} ====================" >> "${LOG}"
+  rc=0
   timeout --signal=KILL "${PER_MODULE_TIMEOUT}" \
     "${PYTHON}" -m pytest -v --tb=short -p no:cacheprovider \
-    "${DESELECTS[@]}" "${m}" >> "${LOG}" 2>&1
-  rc=$?
-  if [[ ${rc} -eq 137 ]]; then
-    # SIGKILL from `timeout` — the module hung.
-    echo "[run] TIMEOUT ${m}" | tee -a "${LOG}"
-    TIMED_OUT+=("${m}")
-    F=$(( F + 1 ))   # count a hung module as one failure
+    "${DESELECTS[@]}" "${m}" > "${MODULE_LOG}" 2>&1 || rc=$?
+  cat "${MODULE_LOG}" >> "${LOG}"
+
+  if [[ ${rc} -ne 0 && ${rc} -ne 1 ]]; then
+    INCOMPLETE+=("${m} (pytest exit ${rc})")
     continue
   fi
-  # Parse this module's per-run summary line.
-  ms="$(grep -E '^=+ .* (passed|failed|error|skipped).* =+$' "${LOG}" | tail -1)"
-  if [[ -n "${ms}" ]]; then
-    # Require a digit: a trailing "subtests passed" otherwise matches an
-    # empty count and hides the module's ordinary passed-test count.
-    mp=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) passed.*/\1/p'  <<<"${ms}" | head -1)
-    mf=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) failed.*/\1/p'  <<<"${ms}" | head -1)
-    msk=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) skipped.*/\1/p' <<<"${ms}" | head -1)
-    me=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) error.*/\1/p'   <<<"${ms}" | head -1)
-    P=$(( P + ${mp:-0} )); F=$(( F + ${mf:-0} )); S=$(( S + ${msk:-0} )); E=$(( E + ${me:-0} ))
+  # Pytest exit 1 is an ordinary test failure only when we can identify it
+  # in this module's output. A prior module's log cannot prove completion.
+  ms="$(grep -E '^=+ .*[0-9]+ (passed|failed|errors?|skipped).* =+$' "${MODULE_LOG}" | tail -1)"
+  if [[ -z "${ms}" ]] || { [[ ${rc} -eq 1 ]] && ! grep -qE "${FAILURE_PATTERN}" "${MODULE_LOG}"; }; then
+    INCOMPLETE+=("${m} (missing pytest summary or failure IDs)")
+    continue
   fi
+
+  mp=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) passed.*/\1/p' <<<"${ms}")
+  mf=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) failed.*/\1/p' <<<"${ms}")
+  msk=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) skipped.*/\1/p' <<<"${ms}")
+  me=$(sed -n 's/.*[^0-9]\([0-9][0-9]*\) error.*/\1/p' <<<"${ms}")
+  P=$(( P + ${mp:-0} )); F=$(( F + ${mf:-0} )); S=$(( S + ${msk:-0} )); E=$(( E + ${me:-0} ))
 done
+F=$(( F + ${#INCOMPLETE[@]} ))
 set -e
 FAIL_TOTAL=$(( F + E ))
 
@@ -139,38 +144,37 @@ echo "SUMMARY: ${P} passed, ${FAIL_TOTAL} failed, ${S} skipped"
 # listed test that passes is baseline drift; one that disappears is a coverage
 # hole. All three fail the gate.
 MANIFEST="${HERE}/expected-failures.txt"
-ACTUAL_TMP="$(mktemp)"; EXPECTED_TMP="$(mktemp)"
-trap 'rm -f "${ACTUAL_TMP}" "${EXPECTED_TMP}" "${RAN_TMP:-}"' EXIT
+ACTUAL_TMP="${SCRATCH}/actual"
+EXPECTED_TMP="${SCRATCH}/expected"
+RAN_TMP="${SCRATCH}/ran"
 
 # Live failures: pytest -v prints "tests/x.py::Class::test FAILED|ERROR" (no
 # percentage suffix when stdout is not a TTY, as here under redirection).
-grep -hoE '^tests/[^ ]+ (FAILED|ERROR|SUBFAILED)(\([^)]*\))?$' "${LOG}" \
-  | sed -E 's/ (FAILED|ERROR|SUBFAILED).*//' | sort -u > "${ACTUAL_TMP}"
+sed -En "s@${FAILURE_PATTERN}@\\1@p" "${LOG}" | LC_ALL=C sort -u > "${ACTUAL_TMP}"
 # Manifest test-IDs only (lines beginning `tests/` — skips comments/blanks).
 # Test IDs carry no internal whitespace, so a plain line grep is exact.
-grep -E '^tests/' "${MANIFEST}" | sort -u > "${EXPECTED_TMP}"
+sed -n '/^tests\//p' "${MANIFEST}" | LC_ALL=C sort -u > "${EXPECTED_TMP}"
 
-NEW="$(comm -23 "${ACTUAL_TMP}" "${EXPECTED_TMP}")"
+NEW="$(LC_ALL=C comm --check-order -23 "${ACTUAL_TMP}" "${EXPECTED_TMP}")"
 
 # A manifest entry that is absent from the live FAILED set has two very
 # different explanations, and collapsing them made the nudge unusable:
 # the test now PASSES (prune it), or the test NEVER RAN (a coverage hole
 # — the gate silently stopped checking it). Separate them by first
 # collecting every test that produced ANY verdict this run.
-RAN_TMP="$(mktemp)"
-grep -hoE '^tests/[^ ]+ (PASSED|FAILED|ERROR|SKIPPED|SUBPASSED|SUBFAILED)(\([^)]*\))?$' "${LOG}" \
-  | sed -E 's/ (PASSED|FAILED|ERROR|SKIPPED|SUBPASSED|SUBFAILED).*//' | sort -u > "${RAN_TMP}"
+sed -En 's/^(tests\/[^ ]+) (PASSED|FAILED|ERROR|SKIPPED|SUBPASSED|SUBFAILED)(\(.*\))?$/\1/p' "${LOG}" \
+  | LC_ALL=C sort -u > "${RAN_TMP}"
 
 # In the manifest, ran, but not failing -> genuinely resolved.
-RESOLVED="$(comm -13 "${ACTUAL_TMP}" "${EXPECTED_TMP}" | comm -12 - "${RAN_TMP}")"
+RESOLVED="$(LC_ALL=C comm --check-order -13 "${ACTUAL_TMP}" "${EXPECTED_TMP}" | LC_ALL=C comm --check-order -12 - "${RAN_TMP}")"
 # In the manifest and never ran -> not covered any more.
-MISSING="$(comm -13 "${RAN_TMP}" "${EXPECTED_TMP}")"
+MISSING="$(LC_ALL=C comm --check-order -13 "${RAN_TMP}" "${EXPECTED_TMP}")"
 
 rc=0
-if [[ ${#TIMED_OUT[@]} -gt 0 ]]; then
+if [[ ${#INCOMPLETE[@]} -gt 0 ]]; then
   echo
-  echo "REGRESSION: module(s) hung and were SIGKILLed:"
-  printf '  %s\n' "${TIMED_OUT[@]}"
+  echo "INCOMPLETE: module(s) did not report a complete test run:"
+  printf '  %s\n' "${INCOMPLETE[@]}"
   rc=1
 fi
 if [[ -n "${NEW}" ]]; then

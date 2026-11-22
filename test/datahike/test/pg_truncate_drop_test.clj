@@ -81,6 +81,7 @@
   (testing "TABLE keyword optional; ONLY and * accepted and ignored"
     (is (= {:kind :truncate :tables ["a"] :restart-identity? false :cascade? false}
            (c/classify "TRUNCATE a")))
+    (is (= ["a" "MiXed"] (:tables (c/classify "TRUNCATE A, public.\"MiXed\""))))
     (is (= ["a" "b"] (:tables (c/classify "TRUNCATE ONLY a *, ONLY b")))))
   (testing "RESTART / CONTINUE IDENTITY"
     (is (true?  (:restart-identity? (c/classify "TRUNCATE t RESTART IDENTITY"))))
@@ -126,7 +127,7 @@
       (is (nil? (.error (exec h "INSERT INTO pgbench_accounts(aid,bid,abalance) VALUES (1,1,0),(2,1,0)"))))
       (is (nil? (.error (exec h "INSERT INTO pgbench_branches(bid,bbalance) VALUES (1,0)"))))
       (testing "single table"
-        (let [r (exec h "TRUNCATE pgbench_branches")]
+        (let [r (exec h "TRUNCATE PGBENCH_BRANCHES")]
           (is (nil? (.error r)))
           (is (= "TRUNCATE TABLE" (.commandTag r))))
         (is (= [["0"]] (rows (exec h "SELECT count(*) FROM pgbench_branches"))))

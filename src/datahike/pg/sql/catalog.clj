@@ -30,6 +30,7 @@
             [datahike.pg.locks :as locks]
             [datahike.pg.pg-catalog :as pg-cat]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.fns :as fns]
@@ -253,7 +254,7 @@
         by-table (group-by :pg_constraint/conrelid rows)]
     (mapcat
      (fn [[table {:keys [columns]}]]
-       (let [relid (long (or (pgs/table-oid db table) (Math/abs (.hashCode ^String table))))
+       (let [relid (long (or (pgs/storage-table-oid db table) (Math/abs (.hashCode ^String table))))
              names (into #{} (map :pg_constraint/conname) (get by-table relid))]
          (:rows
           (reduce
@@ -361,7 +362,8 @@
         (let [rows (if (>= (parse-long PgWireServer/SERVER_VERSION_NUM) 180000)
                      (into rows (not-null-constraint-rows rows user-schema cte-db))
                      rows)]
-          (mapv #(assoc % :pg_constraint/conenforced true
+          (mapv #(assoc % :pg_constraint/contypid (get % :pg_constraint/contypid 0)
+                        :pg_constraint/conenforced true
                         :pg_constraint/conislocal true
                         :pg_constraint/coninhcount 0
                         :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
@@ -427,6 +429,8 @@
      {:db/ident :pg_type/typrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typbasetype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typnotnull :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_type/typdefault :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_type/typdefaultbin :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_node_tree"}
      {:db/ident :pg_type/typcollation :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      ;; The I/O and support functions and the storage properties, from
      ;; the generated registry (pg_type.dat, verified against PostgreSQL
@@ -1054,19 +1058,15 @@
      {:db/ident :pg_depend/deptype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_depend") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_inherits"
-    ;; Always empty — we don't model table inheritance.
     [{:db/ident :pg_inherits/inhrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_inherits/inhparent :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_inherits/inhseqno :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_inherits/inhdetachpending :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_inherits") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_enum"
-    ;; Always empty — we don't model PG enum types. Metabase's
-    ;; describe-database probes `SELECT enumtypid FROM pg_enum`
-    ;; before sync-fields; without this catalog, the query errors
-    ;; out and sync-fields aborts.
     [{:db/ident :pg_enum/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_enum/enumtypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_enum/enumsortorder :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_enum/enumsortorder :db/valueType :db.type/double :db/cardinality :db.cardinality/one :pg/type "float4"}
      {:db/ident :pg_enum/enumlabel :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_enum") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_collation"
@@ -1303,6 +1303,7 @@
      {:db/ident :pg_constraint/conindid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/conparentid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/conrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/contypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/connamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/confrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condeferrable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
@@ -1394,6 +1395,9 @@
      {:db/ident :information_schema_columns/numeric_precision_radix :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/numeric_scale :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/datetime_precision :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/domain_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/domain_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/domain_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/udt_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/udt_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/udt_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -1499,16 +1503,28 @@
              db)))
 
 (defn sequence-last-value
-  "PG's `last_value`: the value most recently handed out, or nil when
-   the sequence has never been advanced.
+  "The value shown by pg_sequences when the sequence has been called."
+  [entity]
+  (let [[value called?] (sequence/position entity)]
+    (when called? value)))
 
-   We store the last value handed out, so a never-called sequence holds
-   `start - increment` (see ddl/sequence-entity). PG models the same
-   state as last_value + is_called=false and reports last_value as NULL
-   in pg_sequences until the first nextval."
-  [{:__seq__/keys [value start increment]}]
-  (when-not (= value (- start increment))
-    value))
+(defn- sequence-oid [db name]
+  (or (pgs/table-oid db name) (Math/abs (long (.hashCode ^String name)))))
+
+(defn sequence-position-by-oid
+  "The two fields exposed by pg_get_sequence_data. Missing relations and
+   relations of other kinds have a row with two NULLs."
+  [db oid]
+  (let [object (when oid
+                 (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid))
+        entity (cond
+                 (= :sequence (:datahike.pg.object/kind object))
+                 (sequence/entity-by-name db (:datahike.pg.object/name object))
+
+                 (and oid (nil? object))
+                 (some #(when (= oid (sequence-oid db (:__seq__/name %))) %)
+                       (sequence-entities db)))]
+    (if entity (sequence/position entity) [nil nil])))
 
 (defn- view-entities [db]
   (if db
@@ -1645,9 +1661,10 @@
                             (assoc key :name (:datahike.pg.column/name column))
                             key))
                         keys)
-             ident (:db/ident (d/entity db entity))
-             legacy-incomplete? (:datahike.pg.index/legacy-incomplete?
-                                 (d/entity db entity))
+             index (d/entity db entity)
+             ident (:db/ident index)
+             legacy-incomplete? (:datahike.pg.index/legacy-incomplete? index)
+             primary? (true? (:datahike.pg.index/primary? index))
              status (get-in db [:schema ident :db.secondary/status])
              indexdef (str "CREATE " (when unique? "UNIQUE ")
                            "INDEX " name " ON public." table
@@ -1657,7 +1674,7 @@
                              (str/join ", " (map :name keys))) ")")]
          {:oid (long oid) :name name :table table :method method
           :relation-oid (long relation-oid) :keys keys
-          :unique? (boolean unique?)
+          :unique? (boolean unique?) :primary? primary?
           :ready? (not= :building status)
           :valid? (and (not legacy-incomplete?) (not= :building status))
           :indexdef indexdef}))
@@ -1673,6 +1690,10 @@
                     [?relation :datahike.pg.object/oid ?relation-oid]]}
           db))))
 
+(defn- explicit-primary-keys [db]
+  (into {} (comp (filter :primary?) (map (juxt :table identity)))
+        (explicit-index-descriptors db)))
+
 (defn- native-index-descriptors
   "The indexes PostgreSQL would have created implicitly -- one per UNIQUE
    or PRIMARY KEY column, plus the plain indexed ones -- as
@@ -1687,7 +1708,7 @@
    pgjdbc's getPrimaryKeys makes, matched nothing."
   [db user-schema hints]
   (let [tables (pgs/derive-virtual-tables user-schema hints)
-        oid-of (fn [tname] (long (or (pgs/table-oid db tname)
+        oid-of (fn [tname] (long (or (pgs/storage-table-oid db tname)
                                      (Math/abs (.hashCode ^String tname)))))]
     (vec
      (for [[tname {:keys [columns]}] (sort-by key tables)
@@ -1741,7 +1762,7 @@
                                 (mapcat :columns (vals tables)))]
     (mapv
      (fn [[table-name {:keys [columns]}]]
-       (let [relation-oid (pgs/table-oid db table-name)
+       (let [relation-oid (pgs/storage-table-oid db table-name)
              registered (when relation-oid
                           (catalog-objects/columns-by-relation
                            db relation-oid true))]
@@ -1762,6 +1783,42 @@
                   registered)
             columns)]))
      (sort-by key tables))))
+
+(defn- default-oid [db column]
+  (or (:column-eid column) (:db/id (d/entity db (:attr column)))))
+
+(defn- sequence-name [sequences spelling]
+  (when (string? spelling)
+    (if (contains? sequences spelling)
+      spelling
+      (let [canonical (peek (regoid/parse-qualified-name spelling))]
+        (when (contains? sequences canonical) canonical)))))
+
+(defn- sequence-dependencies [db schema]
+  (when-let [seqs (seq (sequence-entities db))]
+    (let [sequences (into {} (map (juxt :__seq__/name identity)) seqs)
+          tables (into {} (catalog-table-columns db (pgs/derive-virtual-tables schema (pgs/schema-hints db))))
+          class-id catalog-objects/pg-class-oid
+          attribute-default-id (catalog-objects/catalog-relation-oids "pg_attrdef")
+          dependency (fn [from-class from to to-column kind]
+                       {:pg_depend/classid from-class :pg_depend/objid from :pg_depend/objsubid 0
+                        :pg_depend/refclassid class-id :pg_depend/refobjid to :pg_depend/refobjsubid to-column
+                        :pg_depend/deptype kind (pgs/row-marker-attr "pg_depend") true})]
+      (concat
+       (for [{:__seq__/keys [name owned-by-table identity-generation]} seqs
+             [idx column] (map-indexed vector (get tables owned-by-table))
+             :when (= name (str owned-by-table "_" (clojure.core/name (:attr column)) "_seq"))
+             :let [relation-oid (pgs/table-oid db owned-by-table)]
+             :when relation-oid]
+         (dependency class-id (sequence-oid db name) relation-oid
+                     (or (:attnum column) (inc idx)) (if identity-generation "i" "a")))
+       (for [[_ columns] tables
+             column columns
+             :let [entity (d/entity db (:attr column))]
+             :when (= :nextval (:pg/default-kind entity))
+             :let [name (sequence-name sequences (or (:pg/default-arg entity) (:pg/default-value entity)))]
+             :when name]
+         (dependency attribute-default-id (default-oid db column) (sequence-oid db name) 0 "n"))))))
 
 (def ^:private type-io-keys
   [:typinput :typoutput :typreceive :typsend :typmodin :typmodout
@@ -1904,7 +1961,22 @@
      ;; in table-names like any other -- but it is relkind 'm', which
      ;; is how psql's \\dm and every tool that distinguishes the two
      ;; tell them apart.
-         (let [matviews (into {}
+         (let [partitions (into {}
+                                (d/q '{:find [?oid ?parent]
+                                       :where [[?e :datahike.pg.partition/parent-oid ?parent]
+                                               [?e :datahike.pg.object/oid ?oid]]}
+                                     cte-db))
+               parents (into #{} (map first)
+                             (d/q '{:find [?oid]
+                                    :where [[?e :datahike.pg.partition/definition _]
+                                            [?e :datahike.pg.object/oid ?oid]]}
+                                  cte-db))
+               bounds (into {} (d/q '[:find ?oid ?bound
+                                      :where [?e :datahike.pg.partition/bound ?bound]
+                                      [?e :datahike.pg.object/oid ?oid]]
+                                    cte-db))
+               has-partitions (set (vals partitions))
+               matviews (into {}
                               (d/q '{:find [?n ?populated]
                                      :where [[?e :datahike.pg.matview/name ?n]
                                              [(get-else $ ?e :datahike.pg.matview/populated? true)
@@ -1912,24 +1984,30 @@
                                    cte-db))]
            (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
              (mapv (fn [t]
-                     (let [tbl-oid (or (pgs/table-oid cte-db t)
+                     (let [tbl-oid (or (pgs/storage-table-oid cte-db t)
                                        (Math/abs (.hashCode ^String t)))
                            identity (regoid/registry-relation cte-db {:oid tbl-oid})
+                           logical-name (or (:name identity) t)
                            row-type (catalog-objects/object-by-identity
                                      cte-db catalog-objects/pg-type-oid
-                                     catalog-objects/public-namespace-oid t)]
-                       {:pg_class/oid (long tbl-oid)
-                        :pg_class/relname (or (:name identity) t)
-                        :pg_class/relnamespace (or (:namespace-oid identity) 2200)
-                        :pg_class/relispartition false
-                        :pg_class/relkind (if (contains? matviews t) "m" "r")
-                        :pg_class/relispopulated (get matviews t true)
-                        :pg_class/reltype
-                        (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                                (:datahike.pg.object/oid row-type) 0))
-                        :pg_class/relhastriggers (contains? triggered t)
-                        (pgs/row-marker-attr "pg_class") true}))
-                   (pgs/table-names user-schema))))
+                                     catalog-objects/public-namespace-oid logical-name)]
+                       (cond-> {:pg_class/oid (long tbl-oid)
+                                :pg_class/relname logical-name
+                                :pg_class/relnamespace (or (:namespace-oid identity) 2200)
+                                :pg_class/relispartition (contains? partitions tbl-oid)
+                                :pg_class/relhassubclass (contains? has-partitions tbl-oid)
+                                :pg_class/relkind (cond
+                                                    (contains? parents tbl-oid) "p"
+                                                    (contains? matviews t) "m"
+                                                    :else "r")
+                                :pg_class/relispopulated (get matviews t true)
+                                :pg_class/reltype
+                                (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                                        (:datahike.pg.object/oid row-type) 0))
+                                :pg_class/relhastriggers (contains? triggered t)
+                                (pgs/row-marker-attr "pg_class") true}
+                         (contains? bounds tbl-oid) (assoc :pg_class/relpartbound (get bounds tbl-oid)))))
+                   (pgs/table-names user-schema cte-db))))
      ;; Composite types get a distinct backing pg_class row (relkind 'c');
      ;; pg_type.typrelid and pg_class.reltype link the two identities.
          (into
@@ -1953,11 +2031,7 @@
            (mapv (fn [s]
                    (let [nm (:__seq__/name s)]
                      {:pg_class/oid
-                      (long (or (:datahike.pg.object/oid
-                                 (catalog-objects/object-by-identity
-                                  cte-db catalog-objects/pg-class-oid
-                                  catalog-objects/public-namespace-oid nm))
-                                (Math/abs (.hashCode ^String nm))))
+                      (sequence-oid cte-db nm)
                       :pg_class/relname nm
                       :pg_class/relnamespace 2200
                       :pg_class/relispartition false
@@ -2116,20 +2190,22 @@
           (when (and cte-db
                      (get (dbi/-schema cte-db) :datahike.pg.domain/name))
             (mapv
-             (fn [[name base-type not-null]]
+             (fn [[eid name base-type not-null]]
                (let [object (catalog-objects/object-by-identity
                              cte-db catalog-objects/pg-type-oid
-                             catalog-objects/public-namespace-oid name)]
-                 {:pg_type/oid (:datahike.pg.object/oid object)
-                  :pg_type/typname name
-                  :pg_type/typlen -1 :pg_type/typtype "d"
-                  :pg_type/typcategory "U" :pg_type/typispreferred false
-                  :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
-                  :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
-                  :pg_type/typnotnull (boolean not-null)
-                  :pg_type/typdelim "," :pg_type/typnamespace 2200
-                  (pgs/row-marker-attr "pg_type") true}))
-             (d/q '{:find [?name ?base ?not-null]
+                             catalog-objects/public-namespace-oid name)
+                     default (:datahike.pg.domain/default-raw (d/entity cte-db eid))]
+                 (cond-> {:pg_type/oid (:datahike.pg.object/oid object)
+                          :pg_type/typname name
+                          :pg_type/typlen -1 :pg_type/typtype "d"
+                          :pg_type/typcategory "U" :pg_type/typispreferred false
+                          :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
+                          :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
+                          :pg_type/typnotnull (boolean not-null)
+                          :pg_type/typdelim "," :pg_type/typnamespace 2200
+                          (pgs/row-marker-attr "pg_type") true}
+                   default (assoc :pg_type/typdefault default :pg_type/typdefaultbin default))))
+             (d/q '{:find [?e ?name ?base ?not-null]
                     :where [[?e :datahike.pg.domain/name ?name]
                             [?e :datahike.pg.domain/base-type ?base]
                             [?e :datahike.pg.domain/not-null ?not-null]]}
@@ -2198,7 +2274,7 @@
        (concat
         (for [[tname columns] table-columns
               [idx col] (map-indexed vector columns)
-              :let [tbl-oid (or (pgs/table-oid cte-db tname)
+              :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
                                    ;; Pre-existing tables from before we
                                    ;; started tracking :pg/table-oid — fall
                                    ;; back to the attnum-derived composite
@@ -2418,10 +2494,11 @@
     "pg_tables"
     ;; `hastriggers` was hard-coded false, which is what a client reads
     ;; to decide whether to look in pg_trigger at all.
-    (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
+    (let [triggered (into #{} (map :table) (trigger-entities cte-db))
+          names (catalog-objects/table-name-overrides cte-db)]
       (mapv (fn [t]
               {:pg_tables/schemaname "public"
-               :pg_tables/tablename t
+               :pg_tables/tablename (get names t t)
                :pg_tables/tableowner "datahike"
                :pg_tables/tablespace "pg_default"
                :pg_tables/hasindexes true
@@ -2429,7 +2506,7 @@
                :pg_tables/hastriggers (contains? triggered t)
                :pg_tables/rowsecurity false
                (pgs/row-marker-attr "pg_tables") true})
-            (pgs/table-names user-schema)))
+            (pgs/table-names user-schema cte-db)))
     "pg_trigger"
     ;; Populated from the trigger registry. The relation existed with
     ;; PostgreSQL 17's columns but no rows, so `\d t` listed no triggers
@@ -2485,8 +2562,8 @@
 
     "pg_sequence"
     (mapv (fn [s]
-            {:pg_sequence/seqrelid (or (pgs/table-oid cte-db (:__seq__/name s)) 0)
-             :pg_sequence/seqtypid (or (types/pg-name->oid (:__seq__/type s))
+            {:pg_sequence/seqrelid (sequence-oid cte-db (:__seq__/name s))
+             :pg_sequence/seqtypid (or (pgs/resolve-type-oid cte-db (:__seq__/type s))
                                        types/oid-int8)
              :pg_sequence/seqstart (:__seq__/start s)
              :pg_sequence/seqincrement (:__seq__/increment s)
@@ -2658,7 +2735,19 @@
           (view-entities cte-db))
     "information_schema_columns"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          names (catalog-objects/table-name-overrides cte-db)
           table-columns (catalog-table-columns cte-db tables)
+          types-by-oid (into {}
+                             (map (juxt :datahike.pg.object/oid identity))
+                             (mapcat #(catalog-objects/objects-by-kind cte-db %) [:domain :enum :composite-type]))
+          domain-bases (into {}
+                             (map (fn [[name base not-null]]
+                                    [name {:oid (pgs/resolve-type-oid cte-db base) :not-null? not-null}]))
+                             (d/q '{:find [?name ?base ?not-null]
+                                    :where [[?e :datahike.pg.domain/name ?name]
+                                            [?e :datahike.pg.domain/base-type ?base]
+                                            [?e :datahike.pg.domain/not-null ?not-null]]}
+                                  cte-db))
           identity-sequences (into {}
                                    (comp (filter :__seq__/identity-generation)
                                          (map (juxt :__seq__/name identity)))
@@ -2724,10 +2813,13 @@
                                   :db.type/bigdec  s
                                   :db.type/bigint  0
                                   nil)))
-          datetime-precision (fn [vtype]
-                               (case vtype
-                                 :db.type/instant 6
-                                 nil))
+          publisher-defaults (when cte-db
+                               (into {}
+                                     (q-fn '{:find [?ident ?value]
+                                             :where [[?e :db/ident ?ident]
+                                                     [?e :pg/default-kind :publisher]
+                                                     [?e :pg/default-value ?value]]}
+                                           cte-db)))
           ;; Drop nil-valued keys per PG's information_schema convention —
           ;; columns that don't apply to the type are simply absent (the
           ;; wire layer surfaces them as SQL NULL).
@@ -2745,6 +2837,20 @@
                  [idx col] (map-indexed vector
                                         (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
                  :let [vtype     (:valuetype col)
+                       declared-oid (or (:type-oid col) (:oid col))
+                       type-name (:datahike.pg.object/name (get types-by-oid declared-oid))
+                       domain    (get domain-bases type-name)
+                       oid       (or (:oid domain) declared-oid)
+                       user-type (get types-by-oid oid)
+                       typmod    (get typmods (:attr col))
+                       char-length (when (and (#{types/oid-bpchar types/oid-varchar} oid)
+                                              typmod (> typmod types/var-hdr-sz))
+                                     (- typmod types/var-hdr-sz))
+                       datetime-precision (cond
+                                            (= types/oid-date oid) 0
+                                            (#{types/oid-time types/oid-timetz
+                                               types/oid-timestamp types/oid-timestamptz} oid)
+                                            (if (and typmod (>= typmod 0)) typmod 6))
                        pos       (long (if (zero? idx)
                                          1
                                          (inc (or (:attnum col) idx))))
@@ -2757,12 +2863,13 @@
              (drop-nils
               {:information_schema_columns/table_catalog          "datahike"
                :information_schema_columns/table_schema           "public"
-               :information_schema_columns/table_name             tname
+               :information_schema_columns/table_name             (get names tname tname)
                :information_schema_columns/column_name            (:name col)
                :information_schema_columns/ordinal_position       pos
-               :information_schema_columns/column_default         nil
+               :information_schema_columns/column_default         (get publisher-defaults (:attr col))
                :information_schema_columns/is_nullable            (if (or identity?
                                                                           (:not-null? col)
+                                                                          (:not-null? domain)
                                                                           (= :db.unique/identity (:unique col)))
                                                                     "NO" "YES")
                ;; From the column's DECLARED OID, not its storage
@@ -2771,16 +2878,24 @@
                ;; timestamp alike, so a `date` column reported
                ;; `timestamp without time zone` here.
                :information_schema_columns/data_type
-               (or (get types/oid->pg-name (:oid col)) (pgs/pg-type-name vtype))
-               :information_schema_columns/character_maximum_length nil
-               :information_schema_columns/character_octet_length nil
+               (cond
+                 user-type "USER-DEFINED"
+                 (contains? types/array-oid->element-oid oid) "ARRAY"
+                 :else (or (get types/oid->pg-name oid) (pgs/pg-type-name vtype)))
+               :information_schema_columns/character_maximum_length char-length
+               :information_schema_columns/character_octet_length (when char-length (* 4 char-length))
                :information_schema_columns/numeric_precision      (numeric-precision vtype (:attr col))
                :information_schema_columns/numeric_precision_radix (numeric-radix vtype)
                :information_schema_columns/numeric_scale          (numeric-scale vtype (:attr col))
-               :information_schema_columns/datetime_precision     (datetime-precision vtype)
+               :information_schema_columns/datetime_precision     datetime-precision
+               :information_schema_columns/domain_catalog         (when domain "datahike")
+               :information_schema_columns/domain_schema          (when domain "public")
+               :information_schema_columns/domain_name            (when domain type-name)
                :information_schema_columns/udt_catalog            "datahike"
-               :information_schema_columns/udt_schema             "pg_catalog"
-               :information_schema_columns/udt_name               (udt-name vtype)
+               :information_schema_columns/udt_schema             (if user-type "public" "pg_catalog")
+               :information_schema_columns/udt_name               (or (:datahike.pg.object/name user-type)
+                                                                      (:typname (types/catalog-type oid))
+                                                                      (udt-name vtype))
                :information_schema_columns/dtd_identifier         (str pos)
                :information_schema_columns/is_self_referencing    "NO"
                :information_schema_columns/is_identity            (if identity? "YES" "NO")
@@ -2791,17 +2906,18 @@
                :information_schema_columns/is_generated
                (if (:generated col) "ALWAYS" "NEVER")
                :information_schema_columns/generation_expression
-               (or (:generated-expr col) "")
+               (:generated-expr col)
                :information_schema_columns/is_updatable           "YES"
                (pgs/row-marker-attr "information_schema_columns") true}))))
     "information_schema_tables"
-    (mapv (fn [t]
-            {:information_schema_tables/table_catalog "datahike"
-             :information_schema_tables/table_schema "public"
-             :information_schema_tables/table_name t
-             :information_schema_tables/table_type "BASE TABLE"
-             (pgs/row-marker-attr "information_schema_tables") true})
-          (pgs/table-names user-schema))
+    (let [names (catalog-objects/table-name-overrides cte-db)]
+      (mapv (fn [t]
+              {:information_schema_tables/table_catalog "datahike"
+               :information_schema_tables/table_schema "public"
+               :information_schema_tables/table_name (get names t t)
+               :information_schema_tables/table_type "BASE TABLE"
+               (pgs/row-marker-attr "information_schema_tables") true})
+            (pgs/table-names user-schema cte-db)))
     "pg_sequences"
     (mapv (fn [s]
             (cond-> {:pg_sequences/schemaname "public"
@@ -2881,14 +2997,14 @@
              :pg_index/indexdef indexdef
              (pgs/row-marker-attr "pg_index") true})
           explicit
-          (for [{:keys [oid relation-oid keys unique? valid? ready? indexdef]}
+          (for [{:keys [oid relation-oid keys primary? unique? valid? ready? indexdef]}
                 (explicit-index-descriptors cte-db)]
             {:pg_index/indrelid relation-oid
              :pg_index/indexrelid oid
              :pg_index/indkey (str/join " " (map :attnum keys))
              :pg_index/indnatts (long (count keys))
              :pg_index/indnkeyatts (long (count keys))
-             :pg_index/indisprimary false
+             :pg_index/indisprimary primary?
              :pg_index/indisunique unique?
              :pg_index/indisvalid valid?
              :pg_index/indisready ready?
@@ -2902,6 +3018,7 @@
     "pg_attrdef"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           table-columns (catalog-table-columns cte-db tables)
+          sequences (delay (into #{} (map :__seq__/name) (sequence-entities cte-db)))
           defaults
           (when cte-db
             (into {}
@@ -2944,7 +3061,19 @@
                           (if (= (:oid col) types/oid-varbit)
                             "bit varying"
                             "\"bit\""))
-                     :nextval (str "nextval('" (or arg value) "'::regclass)")
+                     :nextval
+                     (let [spelling (or arg value)
+                           name (sequence-name @sequences spelling)
+                           path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+                           reference (if name
+                                       (binding [regoid/*db* cte-db
+                                                 regoid/*relation-db* cte-db
+                                                 regoid/*relation-provider* relation-identity
+                                                 regoid/*search-path* path]
+                                         (regoid/output types/oid-regclass (sequence-oid cte-db name)
+                                                        types/format-type))
+                                       spelling)]
+                       (str "nextval('" (str/replace reference "'" "''") "'::regclass)"))
                      :fn (str value "()")
                      :literal
                      (cond
@@ -2963,8 +3092,7 @@
                    attnum (or (:attnum col) (inc idx))
                    ;; Use the durable column subobject rather than a name
                    ;; or the shared storage attribute on inherited columns.
-                   oid (or (:column-eid col)
-                           (:db/id (d/entity cte-db (:attr col))))]]
+                   oid (default-oid cte-db col)]]
          {:pg_attrdef/oid (long oid)
           :pg_attrdef/adrelid (long tbl-oid)
           :pg_attrdef/adnum (long attnum)
@@ -2992,27 +3120,37 @@
     "pg_foreign_table"
     []
     "pg_depend"
-    (mapv (fn [[class-id object-id]]
-            {:pg_depend/classid class-id :pg_depend/objid object-id :pg_depend/objsubid 0
-             :pg_depend/refclassid catalog-objects/pg-extension-oid
-             :pg_depend/refobjid vector-extension-oid :pg_depend/refobjsubid 0
-             :pg_depend/deptype "e" (pgs/row-marker-attr "pg_depend") true})
-          (into [[catalog-objects/pg-type-oid types/oid-vector]]
-                (map (fn [routine] [catalog-objects/pg-proc-oid (:oid routine)]))
-                regoid/vector-extension-routines))
+    (into (mapv (fn [[class-id object-id]]
+                  {:pg_depend/classid class-id :pg_depend/objid object-id :pg_depend/objsubid 0
+                   :pg_depend/refclassid catalog-objects/pg-extension-oid
+                   :pg_depend/refobjid vector-extension-oid :pg_depend/refobjsubid 0
+                   :pg_depend/deptype "e" (pgs/row-marker-attr "pg_depend") true})
+                (into [[catalog-objects/pg-type-oid types/oid-vector]]
+                      (map (fn [routine] [catalog-objects/pg-proc-oid (:oid routine)]))
+                      regoid/vector-extension-routines))
+          (sequence-dependencies cte-db user-schema))
     "pg_inherits"
-    []
+    (mapv (fn [[oid parent]]
+            {:pg_inherits/inhrelid oid
+             :pg_inherits/inhparent parent
+             :pg_inherits/inhseqno 1
+             :pg_inherits/inhdetachpending false
+             (pgs/row-marker-attr "pg_inherits") true})
+          (d/q '{:find [?oid ?parent]
+                 :where [[?e :datahike.pg.partition/parent-oid ?parent]
+                         [?e :datahike.pg.object/oid ?oid]]}
+               cte-db))
     "pg_enum"
     (vec
-     (for [{:keys [oid values]} (pgs/enum-types cte-db)
-           [idx label] (map-indexed vector values)]
-       {:pg_enum/oid
-        ;; pg_enum rows have their own OIDs. A stable hash is sufficient for
-        ;; catalog identity; enum ordering is represented separately below.
-        (long (bit-and 0x7fffffff
-                       (.hashCode ^String (str oid ":" idx ":" label))))
+     (for [{:keys [name oid values]} (pgs/enum-types cte-db)
+           :let [members (some-> (d/entity cte-db [:datahike.pg.enum/name name])
+                                 :datahike.pg.enum/publisher-members edn/read-string)]
+           [idx label] (map-indexed vector values)
+           :let [[member-oid sort-order] (get members idx)]]
+       {:pg_enum/oid (or member-oid (long (bit-and 0x7fffffff
+                                                   (.hashCode ^String (str oid ":" idx ":" label)))))
         :pg_enum/enumtypid oid
-        :pg_enum/enumsortorder (double (inc idx))
+        :pg_enum/enumsortorder (or sort-order (double (inc idx)))
         :pg_enum/enumlabel label
         (pgs/row-marker-attr "pg_enum") true}))
     "pg_policy"
@@ -3057,10 +3195,27 @@
     "pg_stat_activity" []
     "pg_statistic_ext"
     []
+    "pg_partitioned_table"
+    (mapv (fn [[oid key-text]]
+            (let [{:keys [strategy attnums default-oid opclasses collations expressions]}
+                  (edn/read-string key-text)]
+              (cond-> {:pg_partitioned_table/partrelid oid
+                       :pg_partitioned_table/partstrat strategy
+                       :pg_partitioned_table/partnatts (long (count attnums))
+                       :pg_partitioned_table/partdefid default-oid
+                       :pg_partitioned_table/partattrs (str/join " " attnums)
+                       :pg_partitioned_table/partclass opclasses
+                       :pg_partitioned_table/partcollation collations
+                       (pgs/row-marker-attr "pg_partitioned_table") true}
+                expressions (assoc :pg_partitioned_table/partexprs expressions))))
+          (d/q '[:find ?oid ?key-text
+                 :where [?e :datahike.pg.partition/key ?key-text]
+                 [?e :datahike.pg.object/oid ?oid]]
+               cte-db))
     ;; The server has no foreign-data objects, default grants, event
     ;; triggers, subscriptions, or security label providers.
     ("pg_foreign_data_wrapper" "pg_foreign_server" "pg_default_acl"
-                               "pg_partitioned_table" "pg_largeobject_metadata"
+                               "pg_largeobject_metadata"
                                "pg_event_trigger" "pg_subscription" "pg_seclabels")
     []
     "pg_publication"
@@ -3078,6 +3233,11 @@
     (let [hints (pgs/schema-hints cte-db)
           tables  (pgs/derive-virtual-tables user-schema hints)
           q-fn    d/q
+          domains (q-fn '{:find [?type ?name ?expr]
+                          :where [[?e :datahike.pg.domain/name ?type]
+                                  [?e :datahike.pg.domain/check-name ?name]
+                                  [?e :datahike.pg.domain/check-expr ?expr]]}
+                        cte-db)
           ;; CHECK constraints persisted via :pg/check-* attrs.
           checks  (try
                     (q-fn '{:find  [?n ?t ?x]
@@ -3113,11 +3273,24 @@
                        (str "{" (str/join "," attnums) "}"))]
       (vec
        (concat
+        (for [[type-name cname cexpr] domains]
+          {:pg_constraint/oid (long (constraint-oid "c" cname type-name))
+           :pg_constraint/conname cname
+           :pg_constraint/contype "c"
+           :pg_constraint/conrelid 0
+           :pg_constraint/contypid (long (pgs/resolve-type-oid cte-db type-name))
+           :pg_constraint/connamespace 2200
+           :pg_constraint/confrelid 0
+           :pg_constraint/condeferrable false
+           :pg_constraint/condeferred false
+           :pg_constraint/convalidated true
+           :pg_constraint/condef (str "CHECK (" cexpr ")")
+           (pgs/row-marker-attr "pg_constraint") true})
         ;; UNIQUE / PRIMARY KEY rows — one per unique column.
         (for [[tname {:keys [columns]}] (sort-by key tables)
               col columns
               :when (:unique col)
-              :let [tbl-oid  (or (pgs/table-oid cte-db tname)
+              :let [tbl-oid  (or (pgs/storage-table-oid cte-db tname)
                                  (Math/abs (.hashCode ^String tname)))
                     primary? (= :db.unique/identity (:unique col))
                     contype  (if primary? "p" "u")
@@ -3154,17 +3327,18 @@
         ;; does not persist it, so an EXPLICITLY named composite
         ;; constraint still reports the default name.
         (for [[a props] (sort-by (comp str key) user-schema)
+              :let [unique (pgs/schema-unique hints a props)]
               :when (and (keyword? a)
                          (seq (:db/tupleAttrs props))
-                         (:db/unique props))
+                         unique)
               :let [tname (namespace a)
-                    cols (mapv name (:db/tupleAttrs props))
-                    primary? (= :db.unique/identity (:db/unique props))
+                    cols (mapv #(or (get-in hints [% :column]) (name %)) (:db/tupleAttrs props))
+                    primary? (= :db.unique/identity unique)
                     contype (if primary? "p" "u")
                     cname (if primary?
                             (str tname "_pkey")
                             (str tname "_" (str/join "_" cols) "_key"))
-                    tbl-oid (or (pgs/table-oid cte-db tname)
+                    tbl-oid (or (pgs/storage-table-oid cte-db tname)
                                 (Math/abs (.hashCode ^String tname)))
                     attnums (keep #(attnum-for tname %) cols)]]
           {:pg_constraint/oid           (long (constraint-oid contype cname tname))
@@ -3181,6 +3355,24 @@
            :pg_constraint/confkey       "{}"
            :pg_constraint/condef        (str (if primary? "PRIMARY KEY (" "UNIQUE (")
                                              (str/join ", " cols) ")")
+           (pgs/row-marker-attr "pg_constraint") true})
+        (for [{:keys [table name oid relation-oid keys valid?]}
+              (vals (explicit-primary-keys cte-db))]
+          {:pg_constraint/oid           (long (constraint-oid "p" name table))
+           :pg_constraint/conname       name
+           :pg_constraint/contype       "p"
+           :pg_constraint/conindid      oid
+           :pg_constraint/conrelid      relation-oid
+           :pg_constraint/connamespace  2200
+           :pg_constraint/confrelid     0
+           :pg_constraint/condeferrable false
+           :pg_constraint/condeferred   false
+           :pg_constraint/convalidated  valid?
+           :pg_constraint/conkey        (->conkey (map :attnum keys))
+           :pg_constraint/confkey       "{}"
+           :pg_constraint/condef        (str "PRIMARY KEY ("
+                                             (str/join ", " (map (comp fns/quote-identifier :name) keys))
+                                             ")")
            (pgs/row-marker-attr "pg_constraint") true})
         ;; CHECK constraints — one row per persisted :pg/check-*.
         (for [{cname :name tname :table cexpr :expr} checks
@@ -3249,16 +3441,19 @@
                   " (" (str/join ", " (map fns/quote-identifier ps)) ")"))
            (pgs/row-marker-attr "pg_constraint") true}))))
     "information_schema_table_constraints"
-    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))]
+    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          primary-keys (explicit-primary-keys cte-db)
+          logical-names (catalog-objects/table-name-overrides cte-db)]
       (vec
        (concat
-        (for [[tname _] (sort-by key tables)]
+        (for [[tname _] (sort-by key tables)
+              :let [pk (get primary-keys tname)]]
           {:information_schema_table_constraints/constraint_catalog "datahike"
            :information_schema_table_constraints/constraint_schema "public"
-           :information_schema_table_constraints/constraint_name (str tname "_pkey")
+           :information_schema_table_constraints/constraint_name (or (:name pk) (str tname "_pkey"))
            :information_schema_table_constraints/table_catalog "datahike"
            :information_schema_table_constraints/table_schema "public"
-           :information_schema_table_constraints/table_name tname
+           :information_schema_table_constraints/table_name (get logical-names tname tname)
            :information_schema_table_constraints/constraint_type "PRIMARY KEY"
            :information_schema_table_constraints/is_deferrable "NO"
            :information_schema_table_constraints/initially_deferred "NO"
@@ -3279,18 +3474,22 @@
            :information_schema_table_constraints/enforced "YES"
            (pgs/row-marker-attr "information_schema_table_constraints") true}))))
     "information_schema_key_column_usage"
-    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))]
+    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          primary-keys (explicit-primary-keys cte-db)
+          logical-names (catalog-objects/table-name-overrides cte-db)]
       (vec
        (concat
-        (for [[tname _] (sort-by key tables)]
+        (for [[tname _] (sort-by key tables)
+              :let [pk (get primary-keys tname)]
+              [position col] (map-indexed vector (or (:keys pk) [{:name "db_id"}]))]
           {:information_schema_key_column_usage/constraint_catalog "datahike"
            :information_schema_key_column_usage/constraint_schema "public"
-           :information_schema_key_column_usage/constraint_name (str tname "_pkey")
+           :information_schema_key_column_usage/constraint_name (or (:name pk) (str tname "_pkey"))
            :information_schema_key_column_usage/table_catalog "datahike"
            :information_schema_key_column_usage/table_schema "public"
-           :information_schema_key_column_usage/table_name tname
-           :information_schema_key_column_usage/column_name "db_id"
-           :information_schema_key_column_usage/ordinal_position 1
+           :information_schema_key_column_usage/table_name (get logical-names tname tname)
+           :information_schema_key_column_usage/column_name (:name col)
+           :information_schema_key_column_usage/ordinal_position (long (inc position))
            (pgs/row-marker-attr "information_schema_key_column_usage") true})
         (for [[tname {:keys [columns]}] (sort-by key tables)
               col columns

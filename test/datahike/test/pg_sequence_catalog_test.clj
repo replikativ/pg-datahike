@@ -18,10 +18,12 @@
    Expectations captured from PostgreSQL 17 by differential testing."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.sql.ddl :as ddl])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
 (def ^:dynamic *handler* nil)
+(def ^:dynamic *conn* nil)
 
 (defn- fixture [f]
   (pg/reset-lock-registry!)
@@ -31,7 +33,8 @@
     (d/create-database cfg)
     (let [conn (d/connect cfg)]
       (try
-        (binding [*handler* (pg/make-query-handler conn)]
+        (binding [*handler* (pg/make-query-handler conn)
+                  *conn* conn]
           (f))
         (finally
           (d/release conn)
@@ -150,6 +153,41 @@
   (is (= [["5" "f"]] (rows "SELECT last_value, is_called FROM s9")))
   (run "SELECT nextval('s9')")
   (is (= [["5" "t"]] (rows "SELECT last_value, is_called FROM s9"))))
+
+(deftest dump-sequence-query-reflects-the-current-position
+  (is (nil? (err "CREATE SEQUENCE s AS integer START 10 INCREMENT 3")))
+  (is (= [] (rows "SELECT relname FROM pg_class WHERE relname = '__seq__'")))
+  (let [query (str "SELECT format_type(seqtypid, NULL), last_value, is_called "
+                   "FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid)")]
+    (is (= [["integer" "10" "f"]] (rows query)))
+    (is (nil? (err (str "PREPARE seq_state AS " query))))
+    (is (= [["integer" "10" "f"]] (rows "EXECUTE seq_state")))
+    (is (= [["42"]] (rows "SELECT setval('s', 42, false)")))
+    (is (= [["integer" "42" "f"]] (rows "EXECUTE seq_state")))
+    (is (= [["42" "f"]] (rows "SELECT * FROM pg_catalog.pg_get_sequence_data('s')")))
+    (is (= [[nil nil]] (rows "SELECT * FROM pg_get_sequence_data(0::oid)")))
+    (is (= [["42"]] (rows "SELECT nextval('s')")))
+    (is (= [["42" "t"]] (rows "SELECT last_value, is_called FROM s")))
+    (is (nil? (err "ALTER SEQUENCE s RESTART WITH 99")))
+    (is (= [["integer" "99" "f"]] (rows query)))
+    (is (= [["99"]] (rows "SELECT nextval('s')")))))
+
+(deftest legacy-sequence-initial-state-survives-the-first-reservation
+  (d/transact *conn*
+              (into (vec (remove #(= :__seq__/is-called (:db/ident %)) ddl/sequence-schema))
+                    [{:__seq__/name "old_seq" :__seq__/value 7
+                      :__seq__/start 10 :__seq__/increment 3}]))
+  (binding [*handler* (pg/make-query-handler *conn*)]
+    (is (= [["10" "f"]] (rows "SELECT last_value, is_called FROM old_seq")))
+    (is (= [["10" "f"]]
+           (rows "SELECT last_value, is_called FROM pg_sequence, pg_get_sequence_data(seqrelid)")))
+    (is (nil? (err "CREATE TABLE migration (id int DEFAULT nextval('old_seq'))")))
+    (is (nil? (err "BEGIN")))
+    (is (nil? (err "INSERT INTO migration DEFAULT VALUES")))
+    (is (nil? (err "COMMIT")))
+    (is (= [["10"]] (rows "SELECT id FROM migration")))
+    (is (= [["10" "t"]] (rows "SELECT last_value, is_called FROM old_seq")))
+    (is (= [["13"]] (rows "SELECT nextval('old_seq')")))))
 
 (deftest information-schema-sequences-honours-create-options
   (testing "was hardcoded to the bigint defaults, so a sequence created

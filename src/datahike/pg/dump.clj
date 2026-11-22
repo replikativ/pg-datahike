@@ -69,7 +69,9 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
-            [datahike.pg.schema :as pgs]))
+            [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
+            [datahike.pg.sql.catalog :as pcat]))
 
 ;; ----------------------------------------------------------------------------
 ;; Schema introspection
@@ -289,29 +291,18 @@
 ;; Sequences
 ;; ----------------------------------------------------------------------------
 
-(defn- collect-sequences
-  "Find every named sequence and its current value. pg-datahike
-   stores each sequence as an entity with :__seq__/name +
-   :__seq__/value + :__seq__/increment."
-  [db]
-  (->> (d/q '{:find [?n ?v ?inc]
-              :where [[?e :__seq__/name ?n]
-                      [?e :__seq__/value ?v]
-                      [?e :__seq__/increment ?inc]]}
-            db)
-       sort
-       (mapv (fn [[n v inc]]
-               {:name n :value v :increment inc}))))
-
-(defn- emit-create-sequence [{:keys [name increment]}]
+(defn- emit-create-sequence
+  [{:__seq__/keys [name type increment minvalue maxvalue start cache cycle]}]
   (str "CREATE SEQUENCE " (quote-ident name)
-       (when (and increment (not= 1 increment))
-         (str " INCREMENT BY " increment))
-       ";"))
+       " AS " type " INCREMENT BY " increment " MINVALUE " minvalue
+       " MAXVALUE " maxvalue " START WITH " start " CACHE " cache
+       (when cycle " CYCLE") ";"))
 
-(defn- emit-setval [{:keys [name value]}]
-  ;; `is_called = true` → next nextval returns value+increment.
-  (str "SELECT pg_catalog.setval('" name "', " value ", true);"))
+(defn- emit-setval [{:__seq__/keys [name] :as entity}]
+  (let [[value called?] (sequence/position entity)
+        regclass-name (if (re-matches #"[a-z_][a-z0-9_$]*" name) name (quote-ident name))]
+    (str "SELECT pg_catalog.setval('" (str/replace regclass-name "'" "''")
+         "', " value ", " called? ");")))
 
 ;; ----------------------------------------------------------------------------
 ;; ENUMs and DOMAINs (registry entities under :datahike.pg.enum/* and
@@ -568,7 +559,7 @@
          tables (cond->> (collect-tables db)
                   (seq exclude-tables)
                   (remove #(contains? exclude-tables (:table %))))
-         seqs (collect-sequences db)
+         seqs (pcat/sequence-entities db)
          fks (collect-fks tables)
          schema? (contains? sections :schema)
          data?   (contains? sections :data)]

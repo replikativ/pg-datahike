@@ -25,6 +25,7 @@
   (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
+(def ^:dynamic *conn* nil)
 
 (defn text-fixture [f]
   (pg/reset-lock-registry!)
@@ -35,7 +36,7 @@
     (let [conn (d/connect cfg)
           {:keys [server]} (pg/start-server {"txt" conn} {:port 0})]
       (try
-        (binding [*port* (.getPort server)]
+        (binding [*port* (.getPort server) *conn* conn]
           (f))
         (finally
           (.stop server)
@@ -330,6 +331,66 @@
 ;; ============================================================================
 ;; Reading a temporal value FROM text
 ;; ============================================================================
+
+(deftest relative-datetime-input-uses-transaction-time
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'America/Los_Angeles'")
+    (let [query "SELECT timestamp 'now'::text"
+          before (one c query)]
+      (one c "SELECT pg_sleep(0.03)")
+      (is (not= before (one c query))))
+    (doseq [[table zone-clause days]
+            [["clock_local" "without time zone" [["today" "1"] ["yesterday" "1"] ["tomorrow" "3"]]]
+             ["clock_zoned" "with time zone" [["today" "1"] ["yesterday" "1"] ["tomorrow" "1"]
+                                              ["tomorrow EST" "1"] ["tomorrow zulu" "1"]]]]]
+      (let [type-name (str "timestamp(3) " zone-clause)
+            insert (str "INSERT INTO " table " VALUES ")
+            count-rows (str "SELECT count(*) FROM " table " WHERE value = " type-name " ")]
+        (exec! c (str "CREATE TABLE " table " (value " type-name ")"))
+        (exec! c "BEGIN")
+        (exec! c (str insert "('today'), ('yesterday'), ('tomorrow'), ('tomorrow EST'), ('tomorrow zulu')"))
+        (doseq [[day n] days]
+          (is (= n (one c (str count-rows "'" day "'")))))
+        (exec! c "COMMIT")
+        (exec! c (str "DELETE FROM " table))
+        (exec! c (str insert "('now')"))
+        (one c "SELECT pg_sleep(0.03)")
+        (exec! c "BEGIN")
+        (exec! c (str insert "('now')"))
+        (one c "SELECT pg_sleep(0.03)")
+        (exec! c (str insert "('now')"))
+        (is (= "2" (one c (str count-rows "'now'"))))
+        (is (= "2" (one c (str "SELECT count(DISTINCT value) FROM " table))))
+        (is (= "t" (one c "SELECT localtimestamp(3) = timestamp(3) 'now'")))
+        (exec! c "COMMIT")
+        (exec! c (str "TRUNCATE " (.toUpperCase ^String table java.util.Locale/ROOT)))
+        (is (= "0" (one c (str "SELECT count(*) FROM " table))))))
+    (is (= "t" (one c "SELECT pg_input_is_valid('now', 'timestamptz')")))))
+
+(deftest relative-datetime-literals-belong-to-prepared-analysis
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 14")
+    (exec! c "CREATE TABLE clock_rows (origin timestamp, result timestamp)")
+    (exec! c "INSERT INTO clock_rows VALUES ('today', NULL)")
+    (exec! c (str "PREPARE clock_update AS UPDATE clock_rows SET result = 'today' "
+                  "WHERE origin = timestamp 'today'"))
+    (exec! c (str "PREPARE clock_input AS SELECT "
+                  "(timestamptz 'today' AT TIME ZONE 'UTC')::text AS fixed, "
+                  "('today'::text)::timestamp::text AS late"))
+    (let [result (fn []
+                   (with-open [stmt (.createStatement c)
+                               rs (.executeQuery stmt "EXECUTE clock_input")]
+                     (.next rs)
+                     [(.getString rs 1) (.getString rs 2)]))
+          [fixed late] (result)]
+      (exec! c "SET TIME ZONE -14")
+      (let [[fixed-after late-after] (result)]
+        (is (= fixed fixed-after))
+        (is (not= late late-after))
+        (is (= late-after (one c "SELECT timestamp 'today'::text")))
+        (is (not= fixed (one c "SELECT (timestamptz 'today' AT TIME ZONE 'UTC')::text")))
+        (exec! c "EXECUTE clock_update")
+        (is (= "1" (one c "SELECT count(*) FROM clock_rows WHERE origin = result")))))))
 
 (deftest a-month-name-names-a-month-wherever-it-falls
   ;; PostgreSQL's datetime input tokenises before it interprets
@@ -675,6 +736,23 @@
     (is (= "22007" (first (err-of c "SELECT '2001-02-03T04:05:06'::time"))))
     (is (= "22007" (first (err-of c "SELECT '2001-02-03'::time"))))))
 
+(deftest postgres-time-input-needs-a-date-for-variable-zone-offsets
+  (with-open [c (jdbc)]
+    (is (= "15:36:39" (one c "SELECT '2003-03-07 15:36:39 America/New_York'::time")))
+    (is (= "15:36:39-05" (one c "SELECT '2003-03-07 15:36:39 America/New_York'::timetz")))
+    (is (= "15:36:39-04" (one c "SELECT '2003-07-07 15:36:39 America/New_York'::timetz")))
+    (is (= "15:36:39+00" (one c "SELECT '15:36:39 Etc/UTC'::timetz")))
+    (exec! c "CREATE TABLE time_zone_input (v time(2))")
+    (exec! c "INSERT INTO time_zone_input VALUES ('2003-03-07 15:36:39 America/New_York')")
+    (exec! c "INSERT INTO time_zone_input VALUES ('2003-07-07 15:36:39 America/New_York')")
+    (is (= "22007" (first (err-of c "INSERT INTO time_zone_input VALUES ('15:36:39 America/New_York')"))))
+    (is (= "2" (one c "SELECT count(*) FROM time_zone_input")))
+    (doseq [sql-type ["time" "timetz"]]
+      (is (= "22007" (first (err-of c (str "SELECT '15:36:39 America/New_York'::" sql-type)))))
+      (is (= "f" (one c (str "SELECT pg_input_is_valid('15:36:39 America/New_York', '" sql-type "')"))))
+      (is (= "22007" (one c (str "SELECT sql_error_code FROM "
+                                 "pg_input_error_info('15:36:39 America/New_York', '" sql-type "')")))))))
+
 (deftest reserved-datetime-inputs
   (with-open [c (jdbc)]
     (testing "epoch and allballs"
@@ -685,13 +763,9 @@
       (is (= "00:00:00+00" (one c "SELECT ('allballs'::timetz)::text")))
       (is (= "00:00:00" (one c "SELECT ('ALLBALLS'::time)::text"))
           "datetime.c folds the token"))
-    (testing "the volatile ones are still refused, deliberately"
-      ;; `now` / `today` / `tomorrow` / `yesterday` take the statement's
-      ;; time, and a cast is constant-folded into a cached plan, so
-      ;; answering one here would freeze it. They need the deferred
-      ;; treatment `now()` gets.
-      (is (= "22007" (first (err-of c "SELECT 'now'::timestamp"))))
-      (is (= "22007" (first (err-of c "SELECT 'today'::date")))))))
+    (testing "relative inputs respect the target type"
+      (is (= "t" (one c "SELECT DATE 'today' = current_date")))
+      (is (= "22007" (first (err-of c "SELECT TIME 'today'")))))))
 
 (deftest the-bc-era-on-a-timestamp
   (with-open [c (jdbc)]
@@ -808,3 +882,52 @@
     (testing "and the whole-number fields carry no scale at all"
       (is (= "2000" (one c "SELECT extract(year from '2000-01-01'::timestamp)::text")))
       (is (= "6" (one c "SELECT extract(dow from '2000-01-01'::timestamp)::text"))))))
+
+(deftest timestamp-columns-keep-microseconds
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (exec! c "CREATE TABLE precise (id integer PRIMARY KEY, ts timestamp(6), tz timestamptz, rounded timestamp(3))")
+    (exec! c (str "INSERT INTO precise VALUES "
+                  "(1, '2024-02-29 13:55:19.123456', '2024-02-29 19:25:19.123456+05:30', '1999-12-31 23:59:59.999500'), "
+                  "(2, '2024-02-29 13:55:19.123457', '2024-02-29 19:25:19.123457+05:30', '2024-02-29 13:55:19.123500')"))
+    (is (= "2024-02-29 13:55:19.123456" (one c "SELECT ts FROM precise WHERE id = 1")))
+    (is (= "2024-02-29 13:55:19.123457+00" (one c "SELECT tz FROM precise WHERE id = 2")))
+    (is (= "1999-12-31 23:59:59.999" (one c "SELECT rounded FROM precise WHERE id = 1")))
+    (is (= "2024-02-29 13:55:19.124" (one c "SELECT rounded FROM precise WHERE id = 2")))
+    (is (= "1" (one c "SELECT id FROM precise WHERE ts = '2024-02-29 13:55:19.123456'")))
+    (is (= "2" (one c "SELECT id FROM precise WHERE ts > '2024-02-29 13:55:19.123456'")))
+    (is (= "2024-02-29 13:55:19.123457"
+           (one c (str "SELECT ts FROM (SELECT ts FROM precise WHERE id = 1 UNION ALL "
+                       "SELECT ts FROM precise WHERE id = 2) p WHERE ts > '2024-02-29 13:55:19.123456'"))))
+    (is (= "2024-02-29 13:55:19.123457+00"
+           (one c "WITH p AS (SELECT tz FROM precise) SELECT tz FROM p ORDER BY tz DESC LIMIT 1")))
+    (with-open [st (.prepareStatement c "SELECT id FROM precise WHERE ts = ?")]
+      (.setObject st 1 (java.time.LocalDateTime/parse "2024-02-29T13:55:19.123457"))
+      (with-open [rs (.executeQuery st)]
+        (is (.next rs))
+        (is (= 2 (.getInt rs 1)))
+        (is (not (.next rs)))))
+    (is (= "2024-02-29 13:55:19.123458"
+           (one c "UPDATE precise SET ts = '2024-02-29 13:55:19.123458' WHERE id = 2 RETURNING ts")))
+    (exec! c "ALTER TABLE precise ADD COLUMN added timestamp(4)")
+    (is (= "2024-02-29 13:55:19.1235"
+           (one c "UPDATE precise SET added = ts WHERE id = 2 RETURNING added")))
+    (exec! c "CREATE TABLE precise_copy AS SELECT ts, tz FROM precise WHERE id = 2")
+    (is (= "2024-02-29 13:55:19.123458" (one c "SELECT ts FROM precise_copy")))
+    (is (= "2024-02-29 13:55:19.123457+00" (one c "SELECT tz FROM precise_copy")))
+    (exec! c "SET TIME ZONE 'Asia/Kathmandu'")
+    (is (= "2024-02-29 19:40:19.123457+05:45" (one c "SELECT tz FROM precise WHERE id = 2")))
+    (is (= "2024-02-29 13:55:19.123458+05:45"
+           (one c "SELECT ts::timestamptz FROM precise WHERE id = 2")))
+    (is (= "2024-02-29 13:55:19.1235"
+           (one c "SELECT ts::timestamp(4) FROM precise WHERE id = 2")))))
+
+(deftest instant-backed-timestamp-columns-remain-readable
+  (d/transact *conn* [{:db/ident :legacy/ts
+                       :db/valueType :db.type/instant
+                       :db/cardinality :db.cardinality/one}])
+  (d/transact *conn* [{:legacy/ts #inst "2024-02-29T13:55:19.123Z"}])
+  (with-open [c (jdbc)]
+    (is (= "2024-02-29 13:55:19.123" (one c "SELECT ts FROM legacy")))
+    (exec! c "INSERT INTO legacy (ts) VALUES ('2024-03-01 13:55:19.124'::timestamp)")
+    (is (= "2024-03-01 13:55:19.124" (one c "SELECT max(ts) FROM legacy")))))

@@ -11,10 +11,12 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
 import java.time.OffsetTime;
 import java.time.ZoneOffset;
 import java.util.ArrayDeque;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 /**
  * Decodes bound parameter values from the PostgreSQL wire Bind message.
@@ -587,7 +589,30 @@ public final class PgParamCodec {
     /** Days between the Unix epoch (1970-01-01) and the PG epoch (2000-01-01). */
     private static final long PG_EPOCH_DAYS = 10957L;
     /** Microseconds between the Unix epoch and the PG epoch. */
-    private static final long PG_EPOCH_MICROS = PG_EPOCH_DAYS * 86_400_000_000L;
+    private static final long PG_EPOCH_SECONDS = PG_EPOCH_DAYS * 86_400L;
+
+    // ISO PostgreSQL output may have an unsigned five-digit year or a BC era.
+    private static final Pattern PG_TIMESTAMP_TEXT = Pattern.compile(
+        "(\\d{4,})-(\\d{2})-(\\d{2})[ T](\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?)(Z|[+-]\\d{2}(?::\\d{2}(?::\\d{2})?)?)?( BC)?"
+    );
+
+    private static Instant timestampInstant(Object value) {
+        if (value instanceof Instant instant) return instant;
+        if (value instanceof LocalDateTime wall) return wall.toInstant(ZoneOffset.UTC);
+        if (value instanceof OffsetDateTime zoned) return zoned.toInstant();
+        if (value instanceof java.util.Date date) return date.toInstant();
+
+        String text = value.toString().trim();
+        var fields = PG_TIMESTAMP_TEXT.matcher(text);
+        if (!fields.matches()) return Instant.parse(text);
+
+        int year = Integer.parseInt(fields.group(1));
+        if (fields.group(6) != null) year = 1 - year;
+        LocalDate date = LocalDate.of(year, Integer.parseInt(fields.group(2)), Integer.parseInt(fields.group(3)));
+        LocalTime time = LocalTime.parse(fields.group(4));
+        String offset = fields.group(5);
+        return date.atTime(time).toInstant(offset == null ? ZoneOffset.UTC : ZoneOffset.of(offset));
+    }
 
     /**
      * Decode a parameter value given its type OID, wire format, and raw
@@ -1013,22 +1038,9 @@ public final class PgParamCodec {
                         yield ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
                                         .putLong(infMicros).array();
                     }
-                    // value->string produces "2024-01-15 10:30:00" (no 'T', no 'Z').
-                    Instant inst;
-                    if (value instanceof Instant i) {
-                        inst = i;
-                    } else if (value instanceof java.util.Date jd) {
-                        inst = jd.toInstant();
-                    } else {
-                        String s = value.toString().trim();
-                        // Normalize "YYYY-MM-DD hh:mm:ss[.fff]" → ISO form for Instant.parse.
-                        if (!s.endsWith("Z") && !s.contains("T")) {
-                            s = s.replace(' ', 'T') + "Z";
-                        }
-                        inst = Instant.parse(s);
-                    }
-                    long unixMicros = inst.getEpochSecond() * 1_000_000L + inst.getNano() / 1_000L;
-                    long pgMicros   = unixMicros - PG_EPOCH_MICROS;
+                    Instant instant = timestampInstant(value);
+                    long pgMicros = (instant.getEpochSecond() - PG_EPOCH_SECONDS) * 1_000_000L
+                                    + instant.getNano() / 1_000L;
                     yield ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(pgMicros).array();
                 }
 
@@ -1252,23 +1264,19 @@ public final class PgParamCodec {
             }
 
             // timestamp_recv / timestamptz_recv — int64 microseconds since
-            // 2000-01-01 00:00:00 UTC. Return java.util.Date to match
-            // existing conventions elsewhere in sql.clj / value->string.
+            // 2000-01-01 00:00:00 UTC. Decode without rounding to milliseconds.
             case PgWireServer.OID_TIMESTAMP,
                  PgWireServer.OID_TIMESTAMPTZ -> {
                 long pgMicros = buf.getLong();
-                // INT64_MAX/MIN are the infinities. Adding PG_EPOCH_MICROS
-                // to INT64_MAX WRAPS, so this produced roughly year
-                // -290272 -- a plausible timestamp, from the one input
-                // that cannot be one.
                 if (pgMicros == Long.MAX_VALUE) yield PG_POS_INFINITY;
                 if (pgMicros == Long.MIN_VALUE) yield PG_NEG_INFINITY;
-                long unixMicros = pgMicros + PG_EPOCH_MICROS;
-                long millis = Math.floorDiv(unixMicros, 1000L);
-                int  nanos  = (int) Math.floorMod(unixMicros, 1000L) * 1000;
-                yield java.util.Date.from(Instant.ofEpochSecond(
-                    Math.floorDiv(millis, 1000L),
-                    (millis % 1000L) * 1_000_000L + nanos));
+                long seconds = PG_EPOCH_SECONDS + Math.floorDiv(pgMicros, 1_000_000L);
+                long nanos = Math.floorMod(pgMicros, 1_000_000L) * 1_000L;
+                Instant instant = Instant.ofEpochSecond(seconds, nanos);
+                if (oid == PgWireServer.OID_TIMESTAMP) {
+                    yield LocalDateTime.ofInstant(instant, ZoneOffset.UTC);
+                }
+                yield instant.atOffset(ZoneOffset.UTC);
             }
 
             // time_recv — int64 microseconds since midnight.

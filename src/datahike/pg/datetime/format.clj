@@ -491,7 +491,7 @@
                         (when letters
                           (some (fn [l] (let [ab (subs (str/lower-case letters) 0 l)]
                                           (when-let [e (get @(requiring-resolve 'datahike.pg.datetime.tokens/zone-abbrevs) ab)]
-                                            [l e])))
+                                            [l (assoc e :abbrev ab)])))
                                 (range (count letters) 0 -1)))))]
         (cond
           tz-word
@@ -737,7 +737,7 @@
                (:has-tz tmfc)
                (let [e (:tz-abbrev tmfc)]
                  (if (= :dyntz (:type e))
-                   ((requiring-resolve 'datahike.pg.datetime.zone/determine-abbrev-offset) tm (:zone e))
+                   ((requiring-resolve 'datahike.pg.datetime.zone/determine-abbrev-offset) tm (:zone e) (:abbrev e))
                    (- (long (:offset e))))))]
       (assoc tm :fsec fsec :tz tz :ff (g :ff)))))
 

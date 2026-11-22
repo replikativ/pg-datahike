@@ -27,6 +27,7 @@
    (:schema db) doesn't surface."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.cast :as sql-cast]
@@ -38,9 +39,9 @@
            [net.sf.jsqlparser.expression
             AnalyticExpression CastExpression Function JdbcParameter Parenthesis NotExpression
             LongValue StringValue DoubleValue DateValue TimestampValue
-            SignedExpression BinaryExpression]
+            SignedExpression BinaryExpression TimezoneExpression]
            [net.sf.jsqlparser.expression.operators.relational
-            Between InExpression ExpressionList]
+            Between InExpression ExpressionList ParenthesedExpressionList]
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression]
            [net.sf.jsqlparser.statement.insert Insert]
@@ -195,11 +196,11 @@
   nil)
 
 (def ^:dynamic *statement-time*
-  "The wall-clock instant captured once at statement execution. SQL stable
-   value functions (now/current_timestamp/current_date/current_time and
-   their local variants) derive from this value so sibling calls agree.
-   Nil during parsing and non-server use."
+  "The wall-clock instant captured at statement execution."
   nil)
+
+(defn transaction-time []
+  (or datetime-in/*transaction-time* *statement-time* (java.util.Date.)))
 
 (def ^:dynamic *analysis-only?*
   "Internal lowering mode for plain EXPLAIN. Catalog/schema reads are allowed;
@@ -554,18 +555,40 @@
    reads it here."
   #{})
 
+(def ^:dynamic *only-table-marker* nil)
+
+(defn only-table-marker [sql]
+  (loop [marker "__pgdh_only__"]
+    (let [comment (str "/*" marker "*/")]
+      (if (str/includes? sql comment)
+        (recur (str marker "_"))
+        comment))))
+
+(defn only-table-reference? [^Table table]
+  (when *only-table-marker*
+    (loop [token (some-> table .getASTNode .jjtGetFirstToken .specialToken)]
+      (when token
+        (or (= *only-table-marker* (.-image ^net.sf.jsqlparser.parser.Token token))
+            (recur (.-specialToken ^net.sf.jsqlparser.parser.Token token)))))))
+
 (defn only-tables-in
-  "The tables `sql` names with ONLY. Token-driven, so the word inside a
-   string or a comment is not the keyword, and a column called `only`
-   is not a modifier."
+  "Return the target names of ONLY modifiers for UPDATE and DELETE."
   [toks]
-  (into #{}
-        (keep (fn [[a b]]
-                (when (and (= :ident (:type a))
-                           (= "only" (str/lower-case (:text a)))
-                           (contains? #{:ident :quoted} (:type b)))
-                  (str/lower-case (:text b)))))
-        (partition 2 1 (remove #(= :comment (:type %)) toks))))
+  (let [signature (vec (remove #(= :comment (:type %)) toks))]
+    (into #{}
+          (keep (fn [i]
+                  (let [previous (get signature (dec i))
+                        modifier (get signature i)
+                        first-name (get signature (inc i))
+                        table (if (= "." (:text (get signature (+ i 2))))
+                                (get signature (+ i 3)) first-name)]
+                    (when (and (= :ident (:type previous))
+                               (#{"from" "join" "update"} (str/lower-case (:text previous)))
+                               (= :ident (:type modifier))
+                               (= "only" (str/lower-case (:text modifier)))
+                               (#{:ident :quoted} (:type table)))
+                      (str/lower-case (unquote-ident (:text table)))))))
+          (range 1 (count signature)))))
 
 (def routine-error-key
   "Marks an exception as having escaped a ROUTINE BODY -- a plpgsql
@@ -859,7 +882,10 @@
                (let [resolved
                      (case (:fn v)
                        :nextval (nextval-fn (:seq-name v))
-                       :now     (java.util.Date.)
+                       :now (case (:clock v)
+                              :wall (java.util.Date.)
+                              :statement (or *statement-time* (java.util.Date.))
+                              (transaction-time))
                        :random-uuid (java.util.UUID/randomUUID)
                        :uuid-v7 (coerce/generate-uuid-v7)
                        :raise   (throw (ex-info (:message v) (:data v)))
@@ -1230,7 +1256,10 @@
   ([schema table-ns col-name] (infer-param-oid-for-column schema table-ns col-name nil))
   ([schema table-ns col-name db]
    (when (and table-ns col-name schema)
-     (let [attr (keyword table-ns col-name)
+     (let [db (or db *parse-db*)
+           attr (if (map? schema)
+                  (pgs/column-storage-ident schema (pgs/schema-hints db) table-ns col-name)
+                  (keyword table-ns col-name))
            vt   (or (when (map? schema)
                       (:db/valueType (get schema attr)))
                     (when (coll? schema)
@@ -1243,7 +1272,7 @@
                        (when (coll? schema)
                          (some (fn [a] (when (= (:db/ident a) attr) (:pg/type a)))
                                schema))
-                       (pg-type-of-attr db attr))]
+                       (when attr (pg-type-of-attr db attr)))]
        (or (get types/pg-name->oid pg-type)
            (get types/dh-type->oid vt))))))
 
@@ -1393,6 +1422,29 @@
                           acc)))
                     m joins)))))
 
+(defn unwrap-scalar-parens
+  "Remove parentheses around a single expression while preserving row expressions."
+  [expression]
+  (cond
+    (instance? Parenthesis expression)
+    (recur (.getExpression ^Parenthesis expression))
+
+    (and (instance? ParenthesedExpressionList expression)
+         (= 1 (.size ^ParenthesedExpressionList expression)))
+    (recur (.get ^ParenthesedExpressionList expression 0))
+
+    :else expression))
+
+(defn timezone-operands
+  "Return the value and zone operands in PostgreSQL's left-to-right order."
+  [^TimezoneExpression expression]
+  (letfn [(zones [zone]
+            (if (instance? TimezoneExpression zone)
+              (cons (.getLeftExpression ^TimezoneExpression zone)
+                    (mapcat zones (.getTimezoneExpressions ^TimezoneExpression zone)))
+              [zone]))]
+    [(.getLeftExpression expression) (vec (mapcat zones (.getTimezoneExpressions expression)))]))
+
 (defn where-param-oids
   "Walk an expression tree (a WHERE clause) and for each comparison
    `col = ?` / `? = col` / `col IN (?,?)` / `col BETWEEN ? AND ?`,
@@ -1424,6 +1476,10 @@
                            (let [[tns cn] (col-ns-name c)]
                              (when-let [oid (infer-param-oid-for-column schema tns cn)]
                                (.put result (.getIndex p) oid))))
+           record-timezone-param! (fn [operand oid]
+                                    (let [base (unwrap-scalar-parens operand)]
+                                      (when (instance? JdbcParameter base)
+                                        (.putIfAbsent result (.getIndex ^JdbcParameter base) oid))))
            ;; OID of a literal comparand, so `? OP <literal>` (e.g.
            ;; `$1 = 1`, with no column to borrow a type from) still
            ;; resolves the param's type. SignedExpression wraps a
@@ -1620,6 +1676,13 @@
                                 (when-let [oid (cast-target-oid n)]
                                   (.put result (.getIndex ^JdbcParameter inner) oid))))
                             (walk (.getLeftExpression ^CastExpression n)))
+                          (instance? TimezoneExpression n)
+                          (let [[value zones] (timezone-operands n)]
+                            (record-timezone-param! value types/oid-timestamptz)
+                            (walk value)
+                            (doseq [zone zones]
+                              (record-timezone-param! zone types/oid-text)
+                              (walk zone)))
                          ;; COALESCE/GREATEST/LEAST/NULLIF use PostgreSQL's
                          ;; common-type selection. An unknown parameter can
                          ;; therefore borrow a concrete sibling's type, just
@@ -1632,6 +1695,12 @@
                                 name (some-> (.getName f) str/lower-case)
                                 args (vec (or (some-> (.getParameters f) .getExpressions)
                                               []))]
+                            (when (= name "timezone")
+                              (case (count args)
+                                1 (record-timezone-param! (first args) types/oid-timestamptz)
+                                2 (do (record-timezone-param! (first args) types/oid-text)
+                                      (record-timezone-param! (second args) types/oid-timestamptz))
+                                nil))
                             (when (#{"coalesce" "greatest" "least" "nullif"} name)
                               (when-let [comparand
                                          (some (fn [arg]

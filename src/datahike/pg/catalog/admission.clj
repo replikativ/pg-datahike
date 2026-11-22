@@ -58,8 +58,9 @@
         entities (into {} (map (fn [attr]
                                  [attr (d/q '[:find ?e . :in $ ?a :where [?e :db/ident ?a]] db attr)])) attrs)
         raw-columns (into {} (map (fn [[attr eid]] [attr (raw-entity db eid)])) entities)
-        relation (objects/object-by-identity db objects/pg-class-oid
-                                             objects/public-namespace-oid table)
+        relation-oid (pgs/storage-table-oid db table)
+        relation (when relation-oid
+                   (objects/object-by-address db objects/pg-class-oid relation-oid))
         registered-columns (when-let [oid (:datahike.pg.object/oid relation)]
                              (bounded-vector (objects/columns-by-relation db oid) 256))
         constraints (or raw-constraint-metadata (row/constraint-metadata db table))
@@ -120,7 +121,7 @@
                                    [(:datahike.pg.column/attnum column)
                                     (raw-entity db (:db/id column))])
                                  registered-columns)
-       :table-oid (pgs/table-oid db table)
+       :table-oid relation-oid
        :constraints constraints :inheritance parents :children children
        :incoming-fks incoming-fks :views views
        :reverse-tuples reverse-tuples :sequences sequences})))

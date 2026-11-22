@@ -91,7 +91,202 @@
     (testing "a chain is left-associative"
       (is (= [["2020-01-01 11:00:00.12"]]
              (rows c "SELECT ts AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Berlin' FROM tv WHERE id = 1"))))
+    (testing "converting either timestamp kind preserves microseconds"
+      (is (= [["2024-03-01 00:30:00.654321+00" "2024-03-01 01:30:00.654321"]]
+             (rows c (str "SELECT timestamp '2024-03-01 00:30:00.654321' AT TIME ZONE 'UTC', "
+                          "timestamptz '2024-03-01 00:30:00.654321+00' AT TIME ZONE 'Europe/Berlin'")))))
+    (testing "named zones use the PostgreSQL gap and overlap offsets"
+      (is (= [["2024-11-03 06:30:00.123456+00" "2024-03-10 07:30:00.123456+00"]]
+             (rows c (str "SELECT TIMESTAMP '2024-11-03 01:30:00.123456' AT TIME ZONE 'America/New_York', "
+                          "TIMESTAMP '2024-03-10 02:30:00.123456' AT TIME ZONE 'america/new_york'")))))
+    (testing "fixed abbreviations do not acquire a region's summer offset"
+      (is (= [["2024-07-01 20:00:00+00" "2024-07-01 19:00:00+00" "08:00:00-04"]]
+             (rows c (str "SELECT TIMESTAMP '2024-07-01 12:00' AT TIME ZONE 'PST', "
+                          "TIMESTAMP '2024-07-01 12:00' AT TIME ZONE 'America/Los_Angeles', "
+                          "TIMETZ '12:00+00' AT TIME ZONE 'EDT'")))))
+    (testing "the session offset reported by PostgreSQL is a valid zone"
+      (exec! c "SET TIME ZONE 2.5")
+      (is (= [["<+02:30>-02:30" "10:30:00+02:30" "2020-01-01 12:30:00.5"]]
+             (rows c (str "SELECT current_setting('TimeZone'), "
+                          "ttz AT TIME ZONE current_setting('TimeZone'), "
+                          "tz AT TIME ZONE current_setting('TimeZone') FROM tv WHERE id = 1"))))
+      (exec! c "SET TIME ZONE '<-07:30>+07:30'")
+      (is (= [["<-07:30>+07:30" "00:30:00-07:30"]]
+             (rows c (str "SELECT current_setting('TimeZone'), "
+                          "ttz AT TIME ZONE current_setting('TimeZone') FROM tv WHERE id = 1")))))
+    (is (= "22023" (state c "SELECT ts AT TIME ZONE '<EAST>-02:60' FROM tv")))
     (is (= "22023" (state c "SELECT ts AT TIME ZONE 'Mars/Olympus' FROM tv")))))
+
+(deftest timezone-coerces-date-and-untyped-timestamp-operands
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'America/New_York'")
+    (is (= [["2024-03-10 05:00:00" "2024-03-10 05:00:00"]]
+           (rows c (str "SELECT date '2024-03-10' AT TIME ZONE 'UTC', "
+                        "timezone('UTC', date '2024-03-10')"))))
+    (is (= [["2024-03-10 01:30:00.123456" "2024-03-10 01:30:00.123456"]]
+           (rows c (str "SELECT ('2024-03-10 03:30:00.123456+02') AT TIME ZONE 'UTC', "
+                        "timezone('UTC', '2024-03-10 03:30:00.123456+02')"))))
+    (exec! c "CREATE TABLE timezone_days (d date)")
+    (exec! c "INSERT INTO timezone_days VALUES ('2024-03-10'), (NULL)")
+    (exec! c "PREPARE zone_days AS SELECT d AT TIME ZONE 'UTC' FROM timezone_days ORDER BY d")
+    (is (= [["2024-03-10 05:00:00"] [nil]] (rows c "EXECUTE zone_days")))
+    (exec! c "BEGIN")
+    (exec! c "SET LOCAL TIME ZONE 'Europe/Paris'")
+    (is (= [["2024-03-09 23:00:00"] [nil]] (rows c "EXECUTE zone_days")))
+    (exec! c "ROLLBACK")
+    (is (= [["2024-03-10 05:00:00"] [nil]] (rows c "EXECUTE zone_days")))))
+
+(deftest historical-time-zone-abbreviations
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (testing "wall-clock conversion at a gap and an overlap"
+      (doseq [[day cases]
+              [["2011-03-27" [["00:00:00" 3] ["01:00:00" 3] ["01:59:59" 3]
+                              ["02:00:00" 4] ["02:00:01" 4] ["02:59:59" 4]
+                              ["03:00:00" 4] ["03:00:01" 4] ["04:00:00" 4]]]
+               ["2014-10-26" [["00:00:00" 4] ["00:59:59" 4] ["01:00:00" 3]
+                              ["01:00:01" 3] ["02:00:00" 3]]]]
+              [time hours] cases]
+        (let [local (str day " " time)
+              result (-> (java.time.LocalDateTime/parse (str day "T" time))
+                         (.minusHours hours)
+                         (.format (java.time.format.DateTimeFormatter/ofPattern "uuuu-MM-dd HH:mm:ss")))]
+          (is (= [[(str result "+00")]]
+                 (rows c (str "SELECT timestamp '" local "' AT TIME ZONE 'MSK'"))) local))))
+    (testing "instant conversion uses the offset on the correct side of the transition"
+      (doseq [[day cases]
+              [["2011-03-26" [["21:00:00" 3] ["22:00:00" 3] ["22:59:59" 3]
+                              ["23:00:00" 4] ["23:00:01" 4] ["23:59:59" 4]]]
+               ["2011-03-27" [["00:00:00" 4]]]
+               ["2014-10-25" [["21:00:00" 4] ["21:59:59" 4] ["22:00:00" 3]
+                              ["22:00:01" 3] ["23:00:00" 3]]]]
+              [time hours] cases]
+        (let [utc (str day " " time)
+              result (-> (java.time.LocalDateTime/parse (str day "T" time))
+                         (.plusHours hours)
+                         (.format (java.time.format.DateTimeFormatter/ofPattern "uuuu-MM-dd HH:mm:ss")))]
+          (is (= [[result]]
+                 (rows c (str "SELECT timestamptz '" utc " UTC' AT TIME ZONE 'MSK'"))) utc))))
+    (is (= [["2014-10-25 20:00:00+00" "2014-10-25 22:00:00+00"]]
+           (rows c "SELECT make_timestamptz(2014, 10, 26, 0, 0, 0, 'MSK'), make_timestamptz(2014, 10, 26, 1, 0, 0, 'MSK')")))
+    (testing "the first recorded meaning and the most recent one precede the zone's own offset"
+      (is (= [["1899-12-31 21:00:00.123456+00" "1899-12-31 21:29:43.123456+00"
+               "2010-06-30 21:00:00+00" "2010-06-30 20:00:00+00"]]
+             (rows c (str "SELECT timestamp '1900-01-01 00:00:00.123456' AT TIME ZONE 'msk', "
+                          "timestamp '1900-01-01 00:00:00.123456' AT TIME ZONE 'Europe/Moscow', "
+                          "timestamptz '2010-07-01 00:00 MSK', "
+                          "date_trunc('day', timestamptz '2010-07-01 12:00 UTC', 'MSK')"))))
+      (is (= [["2010-06-30 21:00:00+00" "2024-01-01 04:00:00+00"]]
+             (rows c (str "SELECT to_timestamp('2010-07-01 00:00:00 MSK', 'YYYY-MM-DD HH24:MI:SS TZ'), "
+                          "timestamp '2024-01-01' AT TIME ZONE 'VET'"))))
+      (with-open [stmt (.createStatement c)
+                  rs (.executeQuery stmt "SELECT timestamp '2010-07-01' AT TIME ZONE 'MSK'")]
+        (is (= "timezone" (.getColumnLabel (.getMetaData rs) 1)))))))
+
+(deftest at-time-zone-with-interval
+  (with-open [c (jdbc)]
+    (is (= [["11:45:03.123456+00" "01:45:03.123456-10"
+             "2024-02-29 22:00:00.654321+00" "2024-03-01 03:00:00.654321"]]
+           (rows c (str "SELECT TIMETZ '17:15:03.123456+05:30' AT TIME ZONE INTERVAL '00:00', "
+                        "TIMETZ '17:15:03.123456+05:30' AT TIME ZONE INTERVAL '-10:00', "
+                        "TIMESTAMP '2024-03-01 00:30:00.654321' AT TIME ZONE INTERVAL '+02:30', "
+                        "TIMESTAMPTZ '2024-03-01 00:30:00.654321+00' AT TIME ZONE INTERVAL '+02:30'"))))
+    (testing "a seconds offset truncates its fraction and can exceed the Java zone range"
+      (is (= [["14:31:02+20:01:02" "18:30:00+00"]]
+             (rows c (str "SELECT TIMETZ '24:00+05:30' AT TIME ZONE INTERVAL '+20:01:02.5', "
+                          "(TIMETZ '24:00+05:30' AT TIME ZONE INTERVAL '+20:01:02.5') AT TIME ZONE 'UTC'")))))
+    (testing "a stored interval resolves to the same overload"
+      (exec! c "CREATE TABLE intervals (z interval, t timetz)")
+      (exec! c "INSERT INTO intervals VALUES ('-10:00', '10:00:00.123456+02')")
+      (is (= [["22:00:00.123456-10" "22:00:00.123456-10" "22:00:00.123456-10" "22:00:00.123456-10"]]
+             (rows c (str "SELECT t AT TIME ZONE 'UTC+10', t AT TIME ZONE INTERVAL '-10:00', "
+                          "t AT TIME ZONE z, timezone(z, t) FROM intervals ORDER BY t")))))
+    (is (= [[nil "infinity"]]
+           (rows c (str "SELECT TIMETZ '00:00+00' AT TIME ZONE NULL::interval, "
+                        "TIMESTAMP 'infinity' AT TIME ZONE INTERVAL '1 day'"))))
+    (doseq [zone ["1 day" "1 month" "infinity"]]
+      (is (= "22023" (state c (str "SELECT TIMETZ '00:00+00' AT TIME ZONE INTERVAL '" zone "'")))))))
+
+(deftest timezone-uses-the-current-session-setting
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 2.5")
+    (is (= [["2024-03-01 00:30:00.654321+02:30" "2024-03-01 03:00:00.654321"
+             "14:15:03.123456+02:30" "12:00:00+02:30" "2024-07-01 00:00:00"
+             "2024-07-01 03:00:00" nil "timestamp with time zone"]]
+           (rows c (str "SELECT timezone(TIMESTAMP '2024-03-01 00:30:00.654321'), "
+                        "timezone(TIMESTAMPTZ '2024-03-01 00:30:00.654321+00'), "
+                        "timezone(TIMETZ '17:15:03.123456+05:30'), timezone(TIME '12:00'), "
+                        "timezone(DATE '2024-07-01'), timezone('2024-07-01 01:30+01'), "
+                        "timezone(NULL::timestamp), pg_typeof(timezone(TIMESTAMP '2024-03-01 00:30'))"))))
+    (exec! c "PREPARE local_tz AS SELECT timezone(TIMETZ '17:15:03.123456+05:30')")
+    (is (= [["14:15:03.123456+02:30"]] (rows c "EXECUTE local_tz")))
+    (exec! c "SET TIME ZONE '-7.5'")
+    (is (= [["04:15:03.123456-07:30"]] (rows c "EXECUTE local_tz")))
+    (exec! c "RESET TIME ZONE")
+    (is (= [["11:45:03.123456+00"]] (rows c "EXECUTE local_tz")))
+    (is (= "42883" (state c "SELECT timezone(42)")))
+    (is (= "42883" (state c "SELECT timezone('12:00'::text)")))))
+
+(deftest timezone-coerces-plain-time-in-the-current-session-zone
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE local_times (t time)")
+    (exec! c "INSERT INTO local_times VALUES ('12:00:00.123456')")
+    (exec! c (str "PREPARE t_conv AS SELECT t AT TIME ZONE INTERVAL '00:00', "
+                  "timezone('UTC', t), pg_typeof(t AT TIME ZONE 'UTC') FROM local_times"))
+    (exec! c "SET TIME ZONE 2.5")
+    (is (= [["09:30:00.123456+00" "09:30:00.123456+00" "time with time zone"]]
+           (rows c "EXECUTE t_conv")))
+    (exec! c "SET TIME ZONE '-7.5'")
+    (is (= [["19:30:00.123456+00" "19:30:00.123456+00" "time with time zone"]]
+           (rows c "EXECUTE t_conv")))
+    (is (= [[nil]] (rows c "SELECT NULL::time AT TIME ZONE INTERVAL '00:00'")))))
+
+(deftest prepared-timezone-overloads
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'America/New_York'")
+    (doseq [[sql expected] [["SELECT timezone((?))" ["timestamptz"]]
+                            ["SELECT timezone((?), (?))" ["text" "timestamptz"]]
+                            ["SELECT (?) AT TIME ZONE (?) AT TIME ZONE (?)" ["timestamptz" "text" "text"]]]]
+      (with-open [st (.prepareStatement c sql)]
+        (let [meta (.getParameterMetaData st)]
+          (is (= expected (mapv #(.getParameterTypeName meta (int %))
+                                (range 1 (inc (.getParameterCount meta)))))))))
+    (exec! c "PREPARE tz_session AS SELECT timezone(($1))")
+    (exec! c "PREPARE tz_named AS SELECT timezone(($1), ($2))")
+    (exec! c "PREPARE tz_chain AS SELECT ($1) AT TIME ZONE ($2) AT TIME ZONE ($3)")
+    (is (= [["2024-03-09 20:30:00.123456"]]
+           (rows c "EXECUTE tz_session ('2024-03-10 03:30:00.123456+02')")))
+    (is (= [["2024-03-10 01:30:00.123456"]]
+           (rows c "EXECUTE tz_named ('UTC', '2024-03-10 03:30:00.123456+02')")))
+    (is (= [["2024-03-09 19:30:00.123456-05"]]
+           (rows c "EXECUTE tz_chain ('2024-03-10 03:30:00.123456+02', 'UTC', 'Europe/Berlin')")))
+    (exec! c "BEGIN")
+    (exec! c "SET LOCAL TIME ZONE 'Asia/Tokyo'")
+    (is (= [["2024-03-10 10:30:00.123456"]]
+           (rows c "EXECUTE tz_session ('2024-03-10 03:30:00.123456+02')")))
+    (exec! c "ROLLBACK")
+    (is (= [["2024-03-09 20:30:00.123456"]]
+           (rows c "EXECUTE tz_session ('2024-03-10 03:30:00.123456+02')")))
+    (is (= [["2023-12-31 17:30:00-05" "2023-12-31 17:30:00-05"]]
+           (rows c (str "SELECT timezone(TIME '01:30', TIMESTAMP '2024-01-01'), "
+                        "TIMESTAMP '2024-01-01' AT TIME ZONE TIME '01:30'"))))
+    (doseq [sql ["SELECT timezone(12, TIMESTAMP '2024-01-01')"
+                 "SELECT timezone('UTC', '2024-01-01'::text)"
+                 "SELECT '2024-01-01'::text AT TIME ZONE 'UTC'"
+                 "SELECT TIMESTAMP '2024-01-01' AT TIME ZONE 12"]]
+      (is (= "42883" (state c sql)) sql))))
+
+(deftest time-expression-metadata
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE empty_times (t time)")
+    (is (= "42725" (state c "SELECT t + time '00:01' FROM empty_times")))
+    (exec! c "CREATE TABLE empty_zoned_times (t timetz)")
+    (is (= "42883" (state c "SELECT t + time with time zone '00:01' FROM empty_zoned_times")))
+    (with-open [st (.createStatement c)
+                rs (.executeQuery st "SELECT EXTRACT(SECOND FROM TIME '13:30:25.575401')")]
+      (is (= "extract" (.getColumnLabel (.getMetaData rs) 1)))
+      (is (.next rs))
+      (is (= "25.575401" (.getString rs 1))))))
 
 (deftest time-and-money-input
   (with-open [c (jdbc)]
@@ -127,6 +322,29 @@
       (is (.next rs))
       (is (= java.time.LocalTime/MAX (.getObject rs 1 java.time.LocalTime))))
     (is (= "22008" (state c "SELECT '24:00:01'::time")))))
+
+(deftest time-precision-comparison-and-fixed-width-text
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE typed (id int, t time(3), tz timetz(6), fixed char(4))")
+    (exec! c (str "INSERT INTO typed VALUES "
+                  "(1, '23:59:59.999500', '14:00:00.123456+04', 'a'), "
+                  "(2, '00:00:00', '24:00:00+02', 'b'), "
+                  "(3, '00:00:00.000500', '00:00:00+02', 'c')"))
+    (is (= [["24:00:00" "14:00:00.123456+04" "a   " "a"]
+            ["00:00:00" "24:00:00+02" "b   " "b"]
+            ["00:00:00.001" "00:00:00+02" "c   " "c"]]
+           (rows c "SELECT t, tz, fixed, fixed::text FROM typed ORDER BY id")))
+    (is (= [["2"]] (rows c "SELECT id FROM typed WHERE tz = '24:00+02'")))
+    (is (= [["1"]] (rows c "SELECT id FROM typed WHERE t = CAST('24:00' AS time)")))
+    (is (= [["1"] ["3"]]
+           (rows c "SELECT id FROM typed WHERE tz < CAST('12:00:00+00' AS timetz) ORDER BY id")))
+    (is (= "42883" (state c "SELECT id FROM typed WHERE tz = CAST('24:00+02' AS text)")))
+    (with-open [ps (.prepareStatement c "SELECT id FROM typed WHERE tz = CAST(? AS timetz)")]
+      (.setString ps 1 "14:00:00.123456+04")
+      (with-open [rs (.executeQuery ps)]
+        (is (.next rs))
+        (is (= 1 (.getInt rs 1)))
+        (is (false? (.next rs)))))))
 
 (deftest bytea-survives-a-derived-relation
   ;; A derived relation re-infers each column's type from the VALUES it

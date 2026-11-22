@@ -39,7 +39,7 @@
            [net.sf.jsqlparser.expression.operators.relational
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
             InExpression IsBooleanExpression IsNullExpression JsonOperator LikeExpression
-            MinorThan MinorThanEquals NotEqualsTo ParenthesedExpressionList
+            MinorThan MinorThanEquals NotEqualsTo
             RegExpMatchOperator Matches GeometryDistance CosineSimilarity]))
 
 ;; ---------------------------------------------------------------------------
@@ -260,6 +260,7 @@
    ;; pg_get_*def synthesizers — return SQL text
    "pg_get_indexdef"      types/oid-text
    "pg_get_constraintdef" types/oid-text
+   "pg_get_partkeydef"    types/oid-text
    "pg_get_userbyid"      types/oid-name
    "obj_description"      types/oid-text
    "col_description"      types/oid-text
@@ -268,7 +269,9 @@
    "current_schemas"       types/oid-name-array
    "string_to_array"       types/oid-text-array
    "regexp_split_to_array" types/oid-text-array
-   ;; Array meta — all return INT4 or NULL
+   ;; Array metadata
+   "array_dims"    types/oid-text
+   "array_ndims"   types/oid-int4
    "array_length"  types/oid-int4
    "array_upper"   types/oid-int4
    "array_lower"   types/oid-int4
@@ -509,8 +512,8 @@
    if we can't find the attribute (derived tables, catalog views, etc.);
    caller falls back to TEXT.
 
-   `table-aliases` maps SQL aliases → real table names; we synthesise
-   the attribute keyword as `:<table>/<col>` and probe `db`'s schema.
+   `table-aliases` maps SQL aliases to table names. Column hints map
+   aliases for renamed or rewritten columns to their live attribute.
 
    `:db.cardinality/many` columns project as PG arrays (`int8[]`,
    `text[]`, etc.) — see `col-var!`'s emit-many-ref-array branch. The
@@ -541,15 +544,7 @@
                          ;; nil/text.
                          (get table-aliases default-table default-table)
                          default-table)
-          hint-attr (when (and hints col-table)
-                      (some (fn [[attr h]]
-                              (when (and (= (:column h) col-name)
-                                         (= (namespace attr) table-real))
-                                attr))
-                            hints))
-          attr (or hint-attr
-                   (when table-real
-                     (keyword table-real col-name)))
+          attr (pgs/column-storage-ident schema hints table-real col-name)
           props (when attr (get schema attr))
           ;; FROM-function arguments can read a bound outer column by name.
           ;; A local column still owns the unqualified reference when present.
@@ -576,6 +571,7 @@
         ;; runtime, but retains the outer column's declared SQL type here.
         bound-oid bound-oid
         outer-oid outer-oid
+        (= "tableoid" (str/lower-case col-name)) types/oid-oid
         ;; Native PG array column wins over the storage-type fallback.
         pg-name-oid pg-name-oid
         (nil? base-oid) nil
@@ -855,9 +851,10 @@
       (when-let [element-oid (some-> first-arg (expr-oid env))]
         (get types/element-oid->array-oid element-oid types/oid-text-array))
       ;; `timezone(zone, v)` is `v AT TIME ZONE zone`, which swaps the
-      ;; two timestamp types; a time stays a timetz.
+      ;; two timestamp types; a time becomes timetz. The one-argument
+      ;; overload uses the session zone and has the same return rules.
       (= rule :at-time-zone)
-      (let [o (some-> (second args) (expr-oid env))]
+      (let [o (some-> (last args) (expr-oid env))]
         (condp contains? o
           #{types/oid-timestamp} types/oid-timestamptz
           #{types/oid-time types/oid-timetz} types/oid-timetz
@@ -1291,18 +1288,13 @@
       ;; timestamp_zone / timestamptz_zone); a time becomes timetz. Each
       ;; zone in a chain applies to the previous result.
       (instance? net.sf.jsqlparser.expression.TimezoneExpression expr)
-      (let [^net.sf.jsqlparser.expression.TimezoneExpression e expr
-            zones (letfn [(n [z] (if (instance? net.sf.jsqlparser.expression.TimezoneExpression z)
-                                   (+ 1 (reduce + (map n (.getTimezoneExpressions
-                                                          ^net.sf.jsqlparser.expression.TimezoneExpression z))))
-                                   1))]
-                    (reduce + (map n (.getTimezoneExpressions e))))
+      (let [[value zones] (params/timezone-operands expr)
             step (fn [oid]
                    (cond
                      (= oid types/oid-timestamp) types/oid-timestamptz
                      (#{types/oid-time types/oid-timetz} oid) types/oid-timetz
                      :else types/oid-timestamp))]
-        (nth (iterate step (expr-oid (.getLeftExpression e) env)) zones))
+        (nth (iterate step (expr-oid value env)) (count zones)))
 
       (instance? net.sf.jsqlparser.expression.IntervalExpression expr) types/oid-interval
       (instance? net.sf.jsqlparser.expression.OverlapsCondition expr) types/oid-bool
@@ -1349,14 +1341,6 @@
    `ParenthesedExpressionList` (a one-element list) for a select item —
    so both are unwrapped, repeatedly for `SELECT (($1))`."
   [expr]
-  (loop [expr expr]
-    (cond
-      (instance? Parenthesis expr)
-      (recur (.getExpression ^Parenthesis expr))
-
-      (and (instance? ParenthesedExpressionList expr)
-           (= 1 (.size ^ParenthesedExpressionList expr)))
-      (recur (.get ^ParenthesedExpressionList expr 0))
-
-      (instance? JdbcParameter expr)
+  (let [expr (params/unwrap-scalar-parens expr)]
+    (when (instance? JdbcParameter expr)
       (.getIndex ^JdbcParameter expr))))

@@ -86,11 +86,54 @@
      :requires ["test_setup"],
      :mode :unmeasured}
     {:name "date", :boundaries #{:casts :operators :temporal}, :mode :unmeasured}
-    {:name "time", :boundaries #{:typmods :casts :operators :temporal}, :mode :unmeasured}
-    {:name "timestamp", :boundaries #{:functions :casts :operators :temporal}, :mode :unmeasured}
+    {:name "time", :boundaries #{:typmods :casts :operators :temporal}, :mode :strict
+     :strict-slices
+     [{:id :time-variable-zone-requires-date
+       :source-lines [17 20]
+       :gate "test/datahike/test/pg_temporal_text_test.clj"
+       :test-var "postgres-time-input-needs-a-date-for-variable-zone-offsets"}
+      {:id :time-variable-zone-input-api
+       :source-lines [46 48]
+       :gate "test/datahike/test/pg_temporal_text_test.clj"
+       :test-var "postgres-time-input-needs-a-date-for-variable-zone-offsets"}]}
+    {:name "timetz", :boundaries #{:typmods :casts :time-zones :temporal}, :mode :discovery
+     :blockers #{:at-local :temporal-operator-diagnostics}
+     :strict-slices
+     [{:id :timetz-addition-diagnostic
+       :source-lines [64 64]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "time-expression-metadata"}
+      {:id :timetz-interval-offset
+       :source-lines [103 107]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "at-time-zone-with-interval"}]}
+    {:name "timestamp", :boundaries #{:functions :casts :operators :temporal}, :mode :discovery
+     :blockers #{:temporal-overflow :temporal-diagnostics}
+     :strict-slices
+     [{:id :timestamp-relative-input
+       :source-lines [13 45]
+       :gate "test/datahike/test/pg_temporal_text_test.clj"
+       :test-var "relative-datetime-input-uses-transaction-time"}]}
     {:name "timestamptz",
-     :boundaries #{:time-zones :functions :casts :operators :temporal},
-     :mode :unmeasured}
+     :boundaries #{:time-zones :functions :casts :operators :temporal}, :mode :discovery
+     :blockers #{:at-local :timezone-abbreviations :temporal-overflow :temporal-diagnostics}
+     :strict-slices
+     [{:id :timestamptz-relative-input
+       :source-lines [13 46]
+       :gate "test/datahike/test/pg_temporal_text_test.clj"
+       :test-var "relative-datetime-input-uses-transaction-time"}
+      {:id :timestamptz-dynamic-zone-abbreviation
+       :source-lines [569 577]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "historical-time-zone-abbreviations"}
+      {:id :timestamptz-dynamic-zone-overlap
+       :source-lines [585 592]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "historical-time-zone-abbreviations"}
+      {:id :timestamptz-dynamic-zone-from-instant
+       :source-lines [638 650]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "historical-time-zone-abbreviations"}]}
     {:name "interval", :boundaries #{:functions :casts :operators :temporal}, :mode :discovery
      :blockers #{:interval-window-aggregates}
      :accepted-differences #{:interval-output-style}
@@ -133,13 +176,15 @@
        :gate "test/datahike/test/pg_expression_default_test.clj"
        :test-var "compound-arithmetic-defaults"}]}
     {:name "insert", :boundaries #{:constraints :defaults :insert-select :dml}, :mode :unmeasured}
-    {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :unmeasured}
+    {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :discovery
+     :blockers #{:conflict-operator-class-index :explain-insert}}
     {:name "update", :boundaries #{:update-from :dml :row-assignment}, :mode :unmeasured}
     {:name "delete", :boundaries #{:name-resolution :dml}, :mode :strict}
     {:name "returning",
      :boundaries #{:defaults :result-metadata :expressions :dml},
      :requires ["test_setup"],
-     :mode :unmeasured}
+     :mode :discovery
+     :blockers #{:returning-update-source-binding}}
     {:name "transactions",
      :boundaries #{:error-recovery :transactions :savepoints},
      :requires ["test_setup"],
@@ -216,7 +261,8 @@
        :gate "test/datahike/test/pg_constraints_test.clj"
        :test-var "postgres-rejects-invalid-foreign-key-definitions"}]}
     {:name "create_view", :boundaries #{:ddl :relational :views}, :mode :unmeasured}
-    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :unmeasured
+    {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :discovery
+     :blockers #{:alter-reserved-system-column :alter-comment-missing-relation}
      :strict-slices
      [{:id :alter-column-nullability
        :source-lines [876 908]
@@ -273,8 +319,11 @@
        :gate "test/datahike/test/pg_expression_default_test.clj"
        :test-var "fast-default-keeps-old-row-values"}]}
     {:name "generated_stored", :boundaries #{:copy :ddl :generated-columns :dml}, :mode :unmeasured}
-    {:name "identity", :boundaries #{:identity-columns :sequences :ddl :dml}, :mode :unmeasured}
-    {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :unmeasured}
+    {:name "identity", :boundaries #{:identity-columns :sequences :ddl :dml}, :mode :discovery
+     :blockers #{:identity-sequence-options :alter-identity}}
+    {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :discovery
+     :requires ["test_setup"]
+     :blockers #{:sequence-ownership-validation :cached-sequence-position :sequence-privileges}}
     {:name "create_schema", :boundaries #{:name-resolution :schemas :ddl}, :mode :unmeasured}
     {:name "drop_if_exists", :boundaries #{:conditional-ddl :errors :ddl}, :mode :unmeasured}
     {:name "create_table_like", :boundaries #{:constraints :ddl :schema-copy}, :mode :discovery

@@ -1,6 +1,7 @@
 (ns datahike.test.pg-explain-metadata-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.server :as pg]
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.params :as params]
@@ -144,13 +145,14 @@
 (deftest explain-sequence-relations-use-only-identity-metadata
   (with-open [c (jdbc)]
     (exec! c "CREATE SEQUENCE explain_sequence")
-    (let [q d/q state-reads (atom 0)]
-      (with-redefs [d/q (fn [query & args]
-                          (when (some #(and (vector? %) (= :__seq__/value (second %)))
-                                      (tree-seq coll? seq query))
-                            (swap! state-reads inc)
-                            (throw (ex-info "sequence state rows were read" {})))
-                          (apply q query args))]
+    (let [eid (sequence/id-by-name (d/db *conn*) "explain_sequence")
+          pull d/pull
+          state-reads (atom 0)]
+      (with-redefs [d/pull (fn [db pattern id & options]
+                             (when (= eid id)
+                               (swap! state-reads inc)
+                               (throw (ex-info "sequence state rows were read" {})))
+                             (apply pull db pattern id options))]
         (is (re-find #"^Datahike Query"
                      (ffirst (rows c "EXPLAIN SELECT last_value,is_called FROM explain_sequence"))))
         (is (zero? @state-reads))

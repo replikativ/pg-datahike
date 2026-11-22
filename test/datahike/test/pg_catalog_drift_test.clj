@@ -3,6 +3,7 @@
             [datahike.api :as d]
             [datahike.dependency-tracking :as deps]
             [datahike.pg.catalog.basis :as basis]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryHandler PgWireServer$QueryResult]))
 
@@ -229,18 +230,16 @@
   (is (nil? (state (execute
                     "CREATE TABLE drift_rows(a int DEFAULT nextval('drift_seq'), b int)")))))
 
-(defn- sequence-value []
-  (d/q '[:find ?v . :where [?e :__seq__/name "drift_seq"]
-         [?e :__seq__/value ?v]] @*conn*))
+(defn- sequence-position []
+  (sequence/position (sequence/entity-by-name @*conn* "drift_seq")))
 
 (deftest rejected-catalog-plan-does-not-repeat-sequence-reservation
   (create-sequence-table!)
-  (let [before (sequence-value)
-        result (after-planning
+  (let [result (after-planning
                 #(execute "INSERT INTO drift_rows(a) VALUES(nextval('drift_seq'))")
                 #(do (require-b!) (pg/invalidate-schema-cache!)))]
     (is (= "40001" (state result)))
-    (is (= (inc before) (sequence-value)) "One attempted nextval consumes one value")
+    (is (= [1 true] (sequence-position)) "One attempted nextval consumes one value")
     (is (= [] (rows (execute "SELECT a,b FROM drift_rows"))))))
 
 (defn- start-copy-mode! []
@@ -254,25 +253,25 @@
 
 (deftest copy-start-basis-is-checked-before-reserving-defaults
   (create-sequence-table!)
-  (let [before (sequence-value)]
+  (let [before (sequence-position)]
     (start-copy-mode!)
     (require-b!)
     (.copyChunk ^PgWireServer$QueryHandler *handler* (.getBytes "1\n" "UTF-8"))
     (let [result (.copyComplete ^PgWireServer$QueryHandler *handler*)]
       (is (= "40001" (state result)))
-      (is (= before (sequence-value)) "Already-stale COPY must not reserve a default")
+      (is (= before (sequence-position)) "Already-stale COPY must not reserve a default")
       (is (= [] (rows (execute "SELECT a,b FROM drift_rows")))))))
 
 (deftest copy-writer-guard-rechecks-after-default-reservation
   (create-sequence-table!)
-  (let [before (sequence-value)]
-    (start-copy!)
-    (let [result (after-planning
-                  #(.copyComplete ^PgWireServer$QueryHandler *handler*)
-                  #(do (require-b!) (pg/invalidate-schema-cache!)))]
-      (is (= "40001" (state result)))
-      (is (= (inc before) (sequence-value)) "COPY does not reevaluate its reserved default")
-      (is (= [] (rows (execute "SELECT a,b FROM drift_rows")))))))
+  (is (= [1 false] (sequence-position)))
+  (start-copy!)
+  (let [result (after-planning
+                #(.copyComplete ^PgWireServer$QueryHandler *handler*)
+                #(do (require-b!) (pg/invalidate-schema-cache!)))]
+    (is (= "40001" (state result)))
+    (is (= [1 true] (sequence-position)) "COPY does not reevaluate its reserved default")
+    (is (= [] (rows (execute "SELECT a,b FROM drift_rows"))))))
 
 (deftest a-new-relation-does-not-abort-an-open-transaction
   ;; The guard compares the catalog a statement was lowered against with

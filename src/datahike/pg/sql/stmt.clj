@@ -48,6 +48,7 @@
             [datahike.pg.cache :as pg-cache]
             [datahike.db.interface :as dbi]
             [datahike.pg.catalog.basis :as catalog-basis]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.errors :as errors]
             [datahike.pg.input :as input]
@@ -59,8 +60,10 @@
             [datahike.pg.jsonb :as jb]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.keywords :as pg-kw]
             [datahike.pg.sql.cast :as sql-cast]
+            [datahike.pg.sql.catalog :as pcat]
             [datahike.pg.sql.analysis :as analysis]
             [datahike.pg.sql.derived :as derived]
             [datahike.pg.sql.grouping-validation :as grouping-validation]
@@ -73,6 +76,7 @@
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.assignment-target :as assignment-target]
             [datahike.pg.arrays.assign :as array-assign]
+            [datahike.pg.sql.virtual-db :as virtual-db]
             [datahike.pg.types :as types]
             [datahike.pg.tsearch :as tsearch]
             [datahike.pg.vector :as pg-vector]
@@ -351,9 +355,8 @@
    For LEFT joins, records the ref-attr and right-table alias for later
    or-join wrapping in translate-select.
    Returns {:name str :alias str :join-type keyword :ref-attr kw :left-entity-var sym}."
-  [ctx ^Join join _default-table]
-  (let [right-table (.getRightItem join)
-        ;; A LEFT JOIN LATERAL is INNER as far as the or-join pass is
+  [ctx ^Join join right-table]
+  (let [;; A LEFT JOIN LATERAL is INNER as far as the or-join pass is
         ;; concerned: its NULL-extended row is produced by the row
         ;; producer itself (see the `:outer?` spec), and letting the
         ;; or-join construction wrap the function-binding clause instead
@@ -910,6 +913,9 @@
     (instance? Function expr)
     [(expr/resolution-name (.getName ^Function expr)) 2]
 
+    (instance? TimezoneExpression expr)
+    ["timezone" 2]
+
     (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
     [(expr/resolution-name (.getName ^net.sf.jsqlparser.expression.AnalyticExpression expr)) 2]
 
@@ -965,6 +971,7 @@
     (instance? net.sf.jsqlparser.expression.operators.relational.ExistsExpression expr)
     ["exists" 2]
     (instance? ArrayConstructor expr) ["array" 2]
+    (instance? ExtractExpression expr) ["extract" 2]
     (instance? net.sf.jsqlparser.expression.RowConstructor expr) ["row" 2]
 
     ;; CURRENT_DATE / CURRENT_TIMESTAMP / USER / … — JSqlParser surfaces
@@ -1328,7 +1335,7 @@
    known one whose arguments we could not evaluate (a correlated LATERAL
    argument): the first is 42883, the second is not."
   #{"unnest" "generate_series" "pg_get_keywords"
-    "pg_input_error_info" "pg_partition_ancestors" "pg_options_to_table" expandarray-name
+    "pg_input_error_info" "pg_partition_ancestors" "pg_get_sequence_data" "pg_options_to_table" expandarray-name
     "jsonb_array_elements" "json_array_elements"
     "jsonb_array_elements_text" "json_array_elements_text"
     "jsonb_each" "json_each" "jsonb_each_text" "json_each_text"
@@ -1364,7 +1371,7 @@
 
 (defn- checked-db-with [db tx]
   (params/check-cancel!)
-  (let [result (d/db-with db tx)]
+  (let [result (virtual-db/with-data db tx)]
     (params/check-cancel!)
     result))
 
@@ -1518,6 +1525,10 @@
               :feature-not-supported
               {:message "set-returning functions are not allowed in OFFSET"})))))
 
+(defn- sequence-data-row [db value]
+  (binding [regoid/*db* db]
+    (pcat/sequence-position-by-oid db (regoid/input "regclass" value))))
+
 (defn materialize-table-function
   "Produce rows for a `TableFunction` FROM item. Supports the common
    constant-arg set-returning functions:
@@ -1603,6 +1614,20 @@
                                 (checked-rows options))]
                  (with-ordinality ["option_name" "option_value"] rows
                    [:db.type/string :db.type/string] ["text" "text"])))))
+
+         (= fname "pg_get_sequence_data")
+         (let [db (or (:db scope) params/*parse-db*)
+               arg (first params)
+               arg-oid (some-> arg (oid/resolution-oid {:schema (:schema db) :db db
+                                                        :from-binding-oids params/*from-binding-oids*}))]
+           (when (or (not= 1 (count params))
+                     (not (analysis/implicit-regclass-argument? arg-oid)))
+             (throw (errors/pg-error :undefined-function {:function (str f)})))
+           (let [value (eval-fn arg)]
+             (when-not (= ::corr value)
+               (with-ordinality ["last_value" "is_called"]
+                 [(sequence-data-row db value)]
+                 [:db.type/long :db.type/boolean] [nil nil]))))
 
          (= fname "pg_partition_ancestors")
          (let [db (or (:db scope) params/*parse-db*)
@@ -2029,7 +2054,7 @@
                                 {:db/ident       marker
                                  :db/valueType   :db.type/boolean
                                  :db/cardinality :db.cardinality/one})
-                spec-db (d/db-with db schema-tx)
+                spec-db (virtual-db/with-data db schema-tx)
                 data-tx (mapv (fn [row]
                                 (into {marker true}
                                       (keep-indexed
@@ -2038,7 +2063,7 @@
                                            (when (some? v) [(keyword sub-name a) v])))
                                        aliases)))
                               rows)
-                spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
+                spec-db2 (if (seq data-tx) (virtual-db/with-data spec-db data-tx) spec-db)]
             {:db spec-db2 :schema (:schema spec-db2)
              :name sub-name :alias (or talias sub-name) :aliases aliases}))))))
 
@@ -2057,6 +2082,8 @@
    materialise-once path and a correlated use of it still raises."
   {"generate_series" {:cols ["generate_series"] :vtypes [:db.type/long]
                       :pg-types ["int4"]}
+   "pg_get_sequence_data" {:cols ["last_value" "is_called"]
+                           :vtypes [:db.type/long :db.type/boolean]}
    "regexp_split_to_table" {:cols ["regexp_split_to_table"] :vtypes [:db.type/string]
                             :pg-types ["text"]}
    "string_to_table" {:cols ["string_to_table"] :vtypes [:db.type/string]
@@ -2071,8 +2098,12 @@
    indistinguishable from an empty result for an inner LATERAL but would
    be wrong for an outer one — and a nil here would silently swallow
    rows rather than raise."
-  [fname]
+  [fname db]
   (case fname
+    "pg_get_sequence_data"
+    (fn [value]
+      [(mapv #(if (nil? %) :__null__ %) (sequence-data-row db value))])
+
     "generate_series"
     (fn [& args]
       (let [[start stop step] (map #(when (number? %) (long %)) args)
@@ -2129,7 +2160,9 @@
         ;; than materialised as constants.
         corr? (some #(instance? Column %) params)]
     (when (and shape corr? (seq params))
-      (let [talias (when-let [a (.getAlias tf)]
+      (let [_ (when (and (= fname "pg_get_sequence_data") (not= 1 (count params)))
+                (throw (errors/pg-error :undefined-function {:function (str f)})))
+            talias (when-let [a (.getAlias tf)]
                      (unquote-ident (.getName ^Alias a)))
             alias-cols (when-let [a (.getAlias tf)]
                          (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
@@ -2156,7 +2189,7 @@
                             {:db/ident marker
                              :db/valueType :db.type/boolean
                              :db/cardinality :db.cardinality/one})
-            spec-db (d/db-with db schema-tx)
+            spec-db (virtual-db/with-data db schema-tx)
             vars (mapv (fn [c] (symbol (str "?" sub-name "_" c))) cols)
             ;; Ordinality is NOT a column here: it exists so Datalog's SET
             ;; semantics cannot collapse duplicate rows. `unnest(ARRAY[1,1,1])`
@@ -2303,7 +2336,7 @@
   (let [table (some-> (.getTable c) .getName unquote-ident str/lower-case)
         col (str/lower-case (unquote-ident (.getColumnName c)))
         matches (keep (fn [[k attr]]
-                        (when (and (keyword? k)
+                        (when (and (qualified-keyword? k)
                                    (= col (str/lower-case (name k)))
                                    (or (nil? table)
                                        (= table (str/lower-case (namespace k)))
@@ -2360,14 +2393,14 @@
                         (let [a (str/lower-case alias)
                               c (str/lower-case col)]
                           (or (some (fn [k]
-                                      (let [ns (when (keyword? k)
+                                      (let [ns (when (qualified-keyword? k)
                                                  (str/lower-case (namespace k)))]
                                         (when (and ns (= c (str/lower-case (name k)))
                                                    (= ns a))
                                           ns)))
                                     (keys schema))
                               (some (fn [k]
-                                      (let [ns (when (keyword? k)
+                                      (let [ns (when (qualified-keyword? k)
                                                  (str/lower-case (namespace k)))]
                                         (when (and ns (= c (str/lower-case (name k)))
                                                    (str/ends-with? ns (str "__" a))
@@ -2385,7 +2418,7 @@
                                                 ns (str "__" (str/lower-case a))))
                                              outer-aliases)))))
         candidates (reduce (fn [m k]
-                             (if (and (keyword? k)
+                             (if (and (qualified-keyword? k)
                                       (not= "db-row-exists" (name k)))
                                (let [ns (str/lower-case (namespace k))]
                                  (if-let [a (alias-for-ns ns)]
@@ -2507,7 +2540,7 @@
                                :db/valueType vt
                                :db/cardinality :db.cardinality/one})
                             cols vtypes)
-            spec-db (d/db-with db schema-tx)]
+            spec-db (virtual-db/with-data db schema-tx)]
         {:db spec-db :schema (:schema spec-db)
          :name sub-name :alias (or talias sub-name)
          :cols cols
@@ -2518,66 +2551,34 @@
          :n-cols (count cols)}))))
 
 (defn- sequence->virtual-table
-  "Materialise `FROM <sequence-name>` into a one-row virtual table.
-
-   PostgreSQL exposes every sequence as a relation with three columns —
-   last_value, log_cnt, is_called — and `SELECT * FROM myseq` is the
-   classic way to read a sequence's position. We store the last value
-   HANDED OUT, so a never-advanced sequence holds `start - increment`;
-   PG's equivalent encoding is last_value=start with is_called=false,
-   which is what this reconstructs.
-
-   log_cnt is PG's count of WAL-preallocated values — an internal
-   recovery detail with no analogue here, reported as 0.
-
-   Returns {:db :schema :name :alias} or nil when `tbl` is not a
-   sequence, in which case the caller treats it as an ordinary table."
+  "Expose a sequence's current position as a one-row relation. log_cnt
+   describes PostgreSQL WAL preallocation and is zero in this store."
   [^Table tbl db]
   (let [tname (unquote-ident (.getName tbl))
         talias (when-let [a (.getAlias tbl)]
                  (unquote-ident (str/trim (.getName ^Alias a))))]
-    (if params/*analysis-only?*
-      (when (d/q '{:find [?e .] :in [$ ?name]
-                   :where [[?e :__seq__/name ?name]]} db tname)
+    (when-let [eid (sequence/id-by-name db tname)]
+      (if params/*analysis-only?*
         (materialize-output-schema!
          db tname talias [{:name "last_value" :oid types/oid-int8}
                           {:name "log_cnt" :oid types/oid-int8}
-                          {:name "is_called" :oid types/oid-bool}]))
-      (let [row (first (d/q '{:find [?v ?s ?i]
-                              :in [$ ?n]
-                              :where [[?e :__seq__/name ?n]
-                                      [?e :__seq__/value ?v]
-                                      [?e :__seq__/start ?s]
-                                      [?e :__seq__/increment ?i]]}
-                            db tname))]
-        (when row
-          (let [[value start increment] row
-                called? (not= value (- start increment))
-            ;; The row-marker attr is what anchors entity enumeration for
-            ;; a table whose columns are all read through get-else (the
-            ;; same idiom the pg_* catalog tables use). Without it the
-            ;; projection has nothing to iterate and the scan returns
-            ;; zero rows even though the row is there.
-                schema-tx [{:db/ident (keyword tname "last_value")
-                            :db/valueType :db.type/long
-                            :db/cardinality :db.cardinality/one}
-                           {:db/ident (keyword tname "log_cnt")
-                            :db/valueType :db.type/long
-                            :db/cardinality :db.cardinality/one}
-                           {:db/ident (keyword tname "is_called")
-                            :db/valueType :db.type/boolean
-                            :db/cardinality :db.cardinality/one}
-                           {:db/ident (pgs/row-marker-attr tname)
-                            :db/valueType :db.type/boolean
-                            :db/cardinality :db.cardinality/one}]
-                spec-db (d/db-with db schema-tx)
-                spec-db2 (d/db-with spec-db
-                                    [{(keyword tname "last_value") (if called? value start)
-                                      (keyword tname "log_cnt") 0
-                                      (keyword tname "is_called") called?
-                                      (pgs/row-marker-attr tname) true}])]
-            {:db spec-db2 :schema (:schema spec-db2)
-             :name tname :alias (or talias tname)}))))))
+                          {:name "is_called" :oid types/oid-bool}])
+        (let [[value called?] (sequence/position (d/pull db '[*] eid))
+              value-attr (keyword tname "last_value")
+              log-attr (keyword tname "log_cnt")
+              called-attr (keyword tname "is_called")
+              marker (pgs/row-marker-attr tname)
+              spec-db (virtual-db/with-data db
+                        [{:db/ident value-attr :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident log-attr :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident called-attr :db/valueType :db.type/boolean
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident marker :db/valueType :db.type/boolean
+                          :db/cardinality :db.cardinality/one}])
+              result (virtual-db/with-data spec-db [{value-attr value log-attr 0 called-attr called? marker true}])]
+          {:db result :schema (:schema result) :name tname :alias (or talias tname)})))))
 
 (defn materialize-derived-select!
   "Given a ParenthesedSelect in FROM/JOIN position, return an enriched db
@@ -2850,10 +2851,12 @@
   [target-name columns db]
   (let [column-tx
         (conj
-         (mapv (fn [{:keys [name oid typmod vtype pg-type array-elem record-fields]}]
+         (mapv (fn [{:keys [name oid typmod vtype pg-type array-elem record-fields enum-name domain-name]}]
                  (let [element (or array-elem (some-> oid types/array-oid->element-oid types/oid->elem-kw))
                        pg-type (or pg-type (get types/oid->pg-type-marker oid))
-                       vtype (or vtype (when element :db.type/string) (types/dh-type-for-oid oid))]
+                       vtype (or vtype
+                                 (when (or element (types/timestamp-type? pg-type)) :db.type/string)
+                                 (types/dh-type-for-oid oid))]
                    (when-not (and vtype pg-type)
                      (throw (errors/pg-error :feature-not-supported
                                              {:feature "analysis of this output type"})))
@@ -2862,7 +2865,9 @@
                             :pg/type pg-type}
                      element (assoc :pg/array-elem element)
                      (and typmod (not= -1 typmod)) (assoc :pg/typmod typmod)
-                     record-fields (assoc :pg/record-fields record-fields))))
+                     record-fields (assoc :pg/record-fields record-fields)
+                     enum-name (assoc :datahike.pg/enum-of enum-name)
+                     domain-name (assoc :datahike.pg/domain-of domain-name))))
                columns)
          {:db/ident (pgs/row-marker-attr target-name)
           :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one})
@@ -2891,7 +2896,7 @@
             (throw (errors/pg-error :feature-not-supported
                                     {:feature "analysis of unresolved virtual column types"})))
         tx (output-schema-tx target-name columns db)
-        spec-db (d/db-with db tx)]
+        spec-db (virtual-db/with-data db tx)]
     {:db spec-db :schema (:schema spec-db) :name target-name
      :alias (or alias target-name) :aliases (mapv :name columns)
      :output-columns columns}))
@@ -2933,6 +2938,27 @@
     (throw (errors/pg-error :feature-not-supported
                             {:feature "analysis of this derived relation"}))))
 
+(defn- partition-output-columns [db relation-oid]
+  (when relation-oid
+    (mapv (fn [column]
+            (let [attr (d/entity db (:datahike.pg.column/storage-ident column))
+                  oid (:datahike.pg.column/type-oid column)
+                  vtype (:db/valueType attr)]
+              {:name (:datahike.pg.column/name column)
+               :oid oid :typmod (:datahike.pg.column/typmod column)
+               :vtype vtype
+               :pg-type (or (:pg/type attr) (types/oid->pg-type-marker oid)
+                            (types/pg-name-for-dh-type vtype))
+               :array-elem (:pg/array-elem attr)
+               :enum-name (:datahike.pg/enum-of attr)
+               :domain-name (:datahike.pg/domain-of attr)}))
+          (catalog-objects/columns-by-relation db relation-oid true))))
+
+(defn- partition-scan-schema [db options]
+  (when (and (:partition-scan? options) (not (get (dbi/-schema db) pgs/partition-scan-tableoid)))
+    [{:db/ident pgs/partition-scan-tableoid
+      :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]))
+
 (defn materialize-set-op!
   "Run a SELECT (PlainSelect, SetOperationList, or VALUES) and persist its rows
    under `target-name/<col>` in a speculative db. Returns the same
@@ -2957,14 +2983,26 @@
   ([inner target-name db schema alias explicit-aliases options]
    (params/check-cancel!)
    (if params/*analysis-only?*
-     (materialize-output-schema!
-      db target-name alias
-      (name-output-columns (analyze-select-body-columns inner schema db)
-                           explicit-aliases (or alias target-name)))
-     (let [tick! (params/cancellation-ticker)
+     (let [result (materialize-output-schema!
+                   db target-name alias
+                   (name-output-columns (or (not-empty (partition-output-columns db (:partition-oid options)))
+                                            (analyze-select-body-columns inner schema db))
+                                        explicit-aliases (or alias target-name)))]
+       (if-let [tx (partition-scan-schema (:db result) options)]
+         (let [analysis-db (virtual-db/with-data (:db result) tx)]
+           (assoc result :db analysis-db :schema (:schema analysis-db)))
+         result))
+     (let [declared (partition-output-columns db (:partition-oid options))
+           tick! (params/cancellation-ticker)
            with-fn checked-db-with
            is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
            values? (instance? Values inner)
+           parse-branch (fn [^PlainSelect select]
+                          (let [parsed (translate-select select schema db options)]
+                            (if (:partition-scan? options)
+                              (let [leaf (:name (ctx/extract-table-info ^Table (.getFromItem select)))]
+                                (assoc parsed :partition-leaf-oid (pgs/storage-table-oid db leaf)))
+                              parsed)))
            branch-parsed
            (cond
              values?
@@ -3002,12 +3040,12 @@
                                  :else :union)))
                    parsed (mapv (fn [s]
                                   (when (instance? PlainSelect s)
-                                    (translate-select ^PlainSelect s schema db)))
+                                    (parse-branch s)))
                                 branches)]
                {:op op-kind :branches parsed})
 
              :else
-             {:op nil :branches [(translate-select ^PlainSelect inner schema db options)]})
+             {:op nil :branches [(parse-branch inner)]})
            _ (when (and (some? (:op branch-parsed))
                         (not= :union-all (:op branch-parsed))
                         (some #{types/oid-vector}
@@ -3131,7 +3169,15 @@
                                                               query in-args
                                                               (:compound-exprs p))]
                               rows))))
-           branch-rows (mapv #(checked-rows (run-branch %)) (:branches branch-parsed))
+           ;; The standard set-operation rows carry only projected columns.
+           ;; Keep the leaf OID in row metadata until we build the scan's
+           ;; private datom, so SELECT * sees the declared columns only.
+           branch-rows (mapv (fn [branch]
+                               (let [rows (checked-rows (run-branch branch))]
+                                 (if-let [oid (:partition-leaf-oid branch)]
+                                   (mapv #(with-meta (vec %) {::partition-leaf-oid oid}) rows)
+                                   rows)))
+                             (:branches branch-parsed))
          ;; Apply the same logical projection to the first branch's aliases.
          ;; Set-operation branches must agree in width; SQL takes the exposed
          ;; column names from this branch.
@@ -3442,16 +3488,26 @@
         ;; table.
            col-record (mapv (fn [i] (first (filter pg-rec/record? (sample-rows i))))
                             (range (count sub-aliases)))
+           col-timestamp (mapv (fn [i]
+                                 (let [oid (nth sub-oids i nil)
+                                       pg-type (get-in declared [i :pg-type])]
+                                   (cond
+                                     (types/timestamp-type? pg-type) pg-type
+                                     (#{types/oid-timestamp types/oid-timestamptz} oid)
+                                     (types/oid->pg-type-marker oid))))
+                               (range (count sub-aliases)))
            col-pg-type (mapv (fn [i]
                                (cond
                                  (nth col-array-elem i) (str "_" (name (nth col-array-elem i)))
                                  (nth col-record i)     "record"
+                                 (nth col-timestamp i)  (nth col-timestamp i)
                                  :else (get types/oid-preserving-pg-name (nth sub-oids i nil))))
                              (range (count sub-aliases)))
         ;; Per-column inferred type + coercion fn, computed once.
-           col-types (mapv (fn [i] (if (or (nth col-array-elem i) (nth col-record i))
+           col-types (mapv (fn [i] (if (or (nth col-array-elem i) (nth col-record i)
+                                           (nth col-timestamp i))
                                      :db.type/string
-                                     (col-vtype i)))
+                                     (or (get-in declared [i :vtype]) (col-vtype i))))
                            (range (count sub-aliases)))
            col-coercions (mapv (fn [i]
                                  (cond
@@ -3467,20 +3523,24 @@
                                              (string? v)        v
                                              :else              (str v)))
 
+                                   (nth col-timestamp i)
+                                   (partial sql-cast/timestamp-value->storage (nth col-timestamp i) nil)
+
                                    :else (col-coerce (nth col-types i))))
                                (range (count sub-aliases)))
            schema-tx
-           (output-schema-tx
-            target-name
-            (mapv (fn [i a]
-                    {:name a :oid (nth sub-oids i nil) :vtype (nth col-types i)
-                     :pg-type (or (nth col-pg-type i)
-                                  (types/pg-name-for-dh-type (nth col-types i)))
-                     :array-elem (nth col-array-elem i)
-                     :record-fields (when-let [record (nth col-record i)]
-                                      (pg-rec/layout->text (pg-rec/layout record)))})
-                  (range) sub-aliases)
-            db)
+           (into (output-schema-tx
+                  target-name
+                  (mapv (fn [i a]
+                          (merge {:oid (nth sub-oids i nil) :vtype (nth col-types i)
+                                  :pg-type (or (nth col-pg-type i)
+                                               (types/pg-name-for-dh-type (nth col-types i)))
+                                  :array-elem (nth col-array-elem i)
+                                  :record-fields (when-let [record (nth col-record i)]
+                                                   (pg-rec/layout->text (pg-rec/layout record)))}
+                                 (nth declared i nil) {:name a}))
+                        (range) sub-aliases)
+                  db) (partition-scan-schema db options))
            spec-db (with-fn db schema-tx)
            data-tx (vec (for [row sub-results]
                           (let [vals (if (sequential? row) (vec row) [row])
@@ -3495,7 +3555,9 @@
                          ;; Always include the row marker so the
                          ;; entity exists even if every projected
                          ;; column was NULL.
-                            (assoc cols row-marker true))))
+                            (cond-> (assoc cols row-marker true)
+                              (::partition-leaf-oid (meta row))
+                              (assoc pgs/partition-scan-tableoid (::partition-leaf-oid (meta row)))))))
            spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
        {:db      spec-db2
       ;; `:pg/record-fields` is transacted onto the attribute entity, and
@@ -3635,7 +3697,7 @@
             ;; stores `:MixedCase/...`. This also fixes a latent
             ;; inconsistency: `t` was lowercased above and then compared
             ;; against the RAW `tname`.
-            (some (fn [[k _]] (and (keyword? k)
+            (some (fn [[k _]] (and (qualified-keyword? k)
                                    (= (str/lower-case (namespace k)) t)))
                   schema)))))
 
@@ -3650,7 +3712,7 @@
     (boolean
      (and t
           (some (fn [[k _]]
-                  (and (keyword? k)
+                  (and (qualified-keyword? k)
                        (= (str/lower-case (namespace k)) t)))
                 schema)))))
 
@@ -4077,21 +4139,34 @@
           (if (and db (instance? Table item))
             (let [^Table table item
                   view-name (unquote-ident (.getName table))
-                  [definition columns-str]
+                  [definition columns-str partition?]
                   ;; Resolve an unqualified owning temp relation before a
                   ;; persisted view of the same name, as for ordinary tables.
                   (when-not (and (contains? params/*temp-table-map* view-name)
                                  (or (nil? (.getSchemaName table))
                                      (= "pg_temp" (.getSchemaName table))))
-                    (first
-                     (d/q '{:find [?definition ?columns]
-                            :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
-                            :where [[?e ?name-attr ?view-name]
-                                    [?e ?definition-attr ?definition]
-                                    [?e ?columns-attr ?columns]]}
-                          db :datahike.pg/view-name
-                          :datahike.pg/view-definition
-                          :datahike.pg/view-columns view-name)))]
+                    (or
+                     (when (and (contains? schema :datahike.pg.partition/definition)
+                                (not (params/only-table-reference? table))
+                                (not (contains? *cte-namespaces* view-name))
+                                (or (nil? (.getSchemaName table))
+                                    (= "public" (unquote-ident (.getSchemaName table)))))
+                       (when-let [oid (pgs/table-oid db view-name)]
+                         (let [query (d/q '[:find ?definition .
+                                            :in $ ?oid
+                                            :where [?e :datahike.pg.object/oid ?oid]
+                                            [?e :datahike.pg.partition/definition ?definition]]
+                                          db oid)]
+                           (when (seq query) [query nil oid]))))
+                     (first
+                      (d/q '{:find [?definition ?columns]
+                             :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
+                             :where [[?e ?name-attr ?view-name]
+                                     [?e ?definition-attr ?definition]
+                                     [?e ?columns-attr ?columns]]}
+                           db :datahike.pg/view-name
+                           :datahike.pg/view-definition
+                           :datahike.pg/view-columns view-name))))]
               (if definition
                 (let [columns (try (edn/read-string columns-str)
                                    (catch Exception _ nil))
@@ -4107,17 +4182,27 @@
                                    "*")
                       ^net.sf.jsqlparser.statement.select.Select wrapper
                       (CCJSqlParserUtil/parse
-                       (str "SELECT * FROM (SELECT " projection
-                            " FROM (" definition ") AS __view_source) AS __view"))
+                       (if partition?
+                         (str "SELECT * FROM (" definition ") AS __partition")
+                         (str "SELECT * FROM (SELECT " projection
+                              " FROM (" definition ") AS __view_source) AS __view")))
                       ^PlainSelect wrapper-select (.getPlainSelect wrapper)
                       ^ParenthesedSelect derived (.getFromItem wrapper-select)]
                   (.setAlias derived (or (.getAlias table) (Alias. view-name)))
-                  derived)
-                item))
-            item))
+                  [derived partition?])
+                [item]))
+            [item]))
         ;; FROM clause — may be a Table, view, or derived table (subquery)
         explicit-from (unwrap-derived-parentheses (.getFromItem select))
-        from-item (-> explicit-from expand-view name-anonymous-derived)
+        only-aliases (into #{}
+                           (keep (fn [item]
+                                   (when (and (instance? Table item)
+                                              (params/only-table-reference? item))
+                                     (let [{:keys [name alias]} (ctx/extract-table-info ^Table item)]
+                                       (or alias name)))))
+                           (cons explicit-from (map #(.getRightItem ^Join %) (.getJoins select))))
+        [expanded-from partition-scan?] (expand-view explicit-from)
+        from-item (name-anonymous-derived expanded-from)
         ;; A child's restriction must reach its translator before the child
         ;; materializes. Views and join-position children keep their own scope.
         derived-where (when (instance? ParenthesedSelect explicit-from)
@@ -4155,7 +4240,9 @@
                     sub-name :name sub-alias :alias}
                    (materialize-derived-select!
                     ^ParenthesedSelect from-item db schema
-                    (when derived-where {:additional-where derived-where}))]
+                    (cond-> {}
+                      derived-where (assoc :additional-where derived-where)
+                      partition-scan? (assoc :partition-scan? true :partition-oid partition-scan?)))]
             [sub-db sub-schema sub-name sub-alias]
             [db schema nil nil])
 
@@ -4234,6 +4321,13 @@
         ;; materialize it into the db and register its alias. The JOIN
         ;; is then handled as an ordinary table join in translate-join.
         joins (.getJoins select)
+        ;; Keep expansion local to this translation. Parse and Bind can
+        ;; revisit the same cached AST with another database snapshot.
+        join-items (into {} (map (fn [^Join join]
+                                   (let [[item partition?] (expand-view
+                                                            (unwrap-derived-parentheses (.getRightItem join)))]
+                                     [join [(name-anonymous-derived item) partition?]]))) joins)
+        right-item #(first (join-items %))
         ;; Aliases a LATERAL inner can correlate WITH. Only the FROM
         ;; item is in scope here; PostgreSQL also allows correlating to
         ;; an EARLIER join item, which would need this to grow as the
@@ -4267,7 +4361,7 @@
                                     (unquote-ident (.getName ^Alias a))
                                     (when (instance? Table item)
                                       (unquote-ident (.getName ^Table item))))))
-                              (cons from-item (map #(.getRightItem ^Join %) (or joins []))))]
+                              (cons from-item (map right-item joins)))]
             (when-let [dup (first (for [[n c] (frequencies visible) :when (> c 1)] n))]
               (throw (ex-info (str "table name \"" dup "\" specified more than once")
                               {:error :duplicate-alias :sqlstate "42712" :table dup}))))
@@ -4281,12 +4375,7 @@
         [db schema join-aliases derived-joins lsrf-specs]
         (reduce
          (fn [[db schema aliases derived lsrfs] ^Join j]
-           (let [raw-rt (.getRightItem j)
-                 rt (-> raw-rt
-                        unwrap-derived-parentheses
-                        expand-view
-                        name-anonymous-derived)
-                 _ (when-not (identical? raw-rt rt) (.setRightItem j rt))
+           (let [[rt partition-join?] (join-items j)
                  ;; A joined relation is checked like the FROM item
                  ;; above: absent, it used to surface as "missing
                  ;; FROM-clause entry" for the first column that named
@@ -4421,7 +4510,8 @@
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
                          sub-name :name sub-alias :alias}
-                        (materialize-derived-select! ^ParenthesedSelect rt db schema)]
+                        (materialize-derived-select! ^ParenthesedSelect rt db schema
+                                                     (when partition-join? {:partition-scan? true :partition-oid partition-join?}))]
                  [spec-db spec-schema
                   ;; Register the USER'S alias too, not just the storage
                   ;; namespace. Only `sub-name` was registered, so
@@ -4434,7 +4524,7 @@
                   (cond-> (assoc aliases sub-name sub-name)
                     (and sub-alias (not= sub-alias sub-name))
                     (assoc sub-alias sub-name))
-                  (conj derived {:join j :alias (or sub-alias sub-name)})
+                  (conj derived {:join j :alias (or sub-alias sub-name) :partition-scan? partition-join?})
                   lsrfs]
                  [db schema aliases derived lsrfs])
 
@@ -4484,7 +4574,7 @@
                out)))
          {}
          (cond-> (into [] (keep (fn [^Join j]
-                                  (let [rt (.getRightItem j)]
+                                  (let [rt (right-item j)]
                                     (when (instance? Table rt) rt)))
                                 (or joins [])))
            (instance? Table from-item) (conj from-item)))
@@ -4507,7 +4597,7 @@
                 [[default-table (get table-aliases default-table default-table)]]
                 [])
               (keep (fn [^Join j]
-                      (let [rt (.getRightItem j)]
+                      (let [rt (right-item j)]
                         (cond
                           (instance? Table rt)
                           (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]
@@ -4538,7 +4628,7 @@
         merged-joins
         (:merged
          (reduce (fn [{:keys [left] :as acc} ^Join j]
-                   (let [rt (.getRightItem j)]
+                   (let [rt (right-item j)]
                      (if-not (instance? Table rt)
                        acc
                        (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)
@@ -4583,6 +4673,9 @@
                            :parse-sql params/*parse-sql*
                            :hints hints
                            :derived-aliases derived-alias-set
+                           :partition-scan-aliases (into (cond-> #{} partition-scan? (conj default-table))
+                                                         (comp (filter :partition-scan?) (map :alias))
+                                                         derived-joins)
                            :computed-aliases (into #{} (map :alias)
                                                    (cond-> (vec lsrf-specs)
                                                      lsrf-spec (conj lsrf-spec)))
@@ -4604,11 +4697,15 @@
         _ (doseq [lsrf-spec (cond-> (vec lsrf-specs) lsrf-spec (conj lsrf-spec))]
             (let [{:keys [cols vars ord-var fname params name marker
                           inner-sql corr-refs]} lsrf-spec
+                  _ (when (= fname "pg_get_sequence_data")
+                      (let [arg-oid (oid/resolution-oid (first params) ctx)]
+                        (when-not (analysis/implicit-regclass-argument? arg-oid)
+                          (throw (errors/pg-error :undefined-function {:function fname})))))
                   subquery? (some? inner-sql)
                   rows-fn (if subquery?
                             (lateral-rows-fn inner-sql corr-refs schema db
                                              (:n-cols lsrf-spec))
-                            (srf-rows-fn fname))
+                            (srf-rows-fn fname db))
                   arg-vals (if subquery?
                              ;; The outer columns the inner correlates
                              ;; with, in the order lateral-rows-fn
@@ -4681,7 +4778,7 @@
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins
                      (mapv (fn [^Join j]
-                             (translate-join ctx j default-table))
+                             (translate-join ctx j (right-item j)))
                            joins))
 
         ;; WHERE clause
@@ -4733,7 +4830,7 @@
                     keyed-preds (when (and (= 1 (count joins))
                                            (or (.isSimple join) (.isCross join))
                                            (instance? Table from-item)
-                                           (instance? Table (.getRightItem join))
+                                           (instance? Table (right-item join))
                                            (empty? derived-alias-set)
                                            (empty? params/*from-bindings*)
                                            (empty? params/*statement-row-scope-tables*))
@@ -6194,7 +6291,7 @@
           ;; base-name entries, which must not manufacture a second eid.
           (doseq [[alias-key evar] @(:entity-vars ctx)
                   :let [tname (get (:table-aliases ctx) alias-key alias-key)]
-                  :when (contains? params/*only-tables* (str/lower-case (str tname)))
+                  :when (contains? only-aliases alias-key)
                   child (ctx/inheritance-descendants db tname)]
             (ctx/add-clause!
              ctx (list 'not [evar (pgs/row-marker-attr child) true])))
@@ -7982,7 +8079,9 @@
                           ;; the DB used to translate this plan. Re-lowering
                           ;; per prepared execution gives the closure the same
                           ;; effective snapshot as the outer query.
-                          (some :inner-sql lsrf-specs)))
+                          (some #(or (:inner-sql %)
+                                     (= "pg_get_sequence_data" (:fname %)))
+                                lsrf-specs)))
              ;; Server-side sort for nullable ORDER BY columns
              :sql-order-by    sql-order-by
              :sql-limit       (when (and (empty? project-set-specs) sql-order-by)
@@ -8091,7 +8190,8 @@
         (sql-cast/cast-scalar
          inner type-str
          {:explicit? true
-          :parse-timestamp expr/parse-timestamp-string})))))
+          :parse-timestamp expr/parse-timestamp-string
+          :prefer-local-datetime? true})))))
 
 (defn- widen-integral
   "Widen a narrow integral result to Long. `length()` answers an
@@ -8380,7 +8480,10 @@
          (#{"now" "current_timestamp" "transaction_timestamp"
             "statement_timestamp" "clock_timestamp"
             "localtimestamp" "localtime" "current_date" "current_time"} fname)
-         {:fn :now}
+         {:fn :now :clock (case fname
+                            "clock_timestamp" :wall
+                            "statement_timestamp" :statement
+                            :transaction)}
 
          ;; UUID generators are volatile too. A concrete UUID folded into
          ;; the parse cache would be reused by every execution of the same
@@ -8498,7 +8601,7 @@
       (when-not (types/cast-category target)
         (throw (errors/pg-error :feature-not-supported
                                 {:feature "assignment to this array element type"})))
-      (sql-cast/cast-scalar value target {:explicit? false}))))
+      (sql-cast/cast-scalar value target {:explicit? false :prefer-local-datetime? true}))))
 
 (defn coerce-array-value
   "Canonicalize every array leaf through its assignment codec, retaining
@@ -8668,6 +8771,9 @@
         ;; jsonb `?` param would be serialized as its placeholder record.)
           (params/param-ref? val) val
 
+          (types/precise-timestamp-column? vtype pg-type)
+          (sql-cast/timestamp-value->storage pg-type typmod val)
+
         ;; jsonb columns are :db.type/string, so a `'{…}'::jsonb` STRING literal would
         ;; otherwise be stored verbatim (non-canonical → equality/DISTINCT wrong,
         ;; behaving like PG `json`). Canonicalize every jsonb write here — string
@@ -8699,8 +8805,9 @@
         ;; 22008, 'garbage' 22007) and canonicalises ('1:2:3 PM' is stored
         ;; as 13:02:03). The raw input string used to be stored verbatim.
           (and (#{"time" "timetz"} pg-type) (some? val) (not= :__null__ val))
-          (types/->pg-text (sql-cast/cast-scalar val pg-type {:explicit? true})
-                           (if (= "time" pg-type) types/oid-time types/oid-timetz))
+          (let [declared (if (and typmod (>= typmod 0)) (str pg-type "(" typmod ")") pg-type)]
+            (types/->pg-text (sql-cast/cast-scalar val declared {:explicit? true})
+                             (if (= "time" pg-type) types/oid-time types/oid-timetz)))
 
         ;; interval columns keep their text form too, and so did the raw
         ;; input: '24 hours' read back as `24 hours` where PostgreSQL

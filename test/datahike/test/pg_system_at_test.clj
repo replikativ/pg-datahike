@@ -17,6 +17,8 @@
      completes without error."
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as objects]
+            [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
@@ -128,3 +130,154 @@
   (testing "RESET datahike.system_at clears"
     (let [r (.execute *handler* "RESET datahike.system_at")]
       (is (nil? (err r))))))
+
+(deftest column-type-rewrites-preserve-rows-and-catalog-addresses
+  (let [run #(.execute *handler* %)
+        rows (fn [sql]
+               (let [result (run sql)]
+                 (is (nil? (err result)) sql)
+                 (mapv vec (.rows result))))]
+    (doseq [sql ["SET TIME ZONE 'UTC'"
+                 (str "CREATE TABLE audit_events (id bigint PRIMARY KEY, raw varchar, "
+                      "created_at timestamp DEFAULT '2024-02-29 13:55:19.123456')")
+                 "INSERT INTO audit_events (id, raw) VALUES (1, ' 23 ')"
+                 "CREATE INDEX audit_raw_idx ON audit_events (raw)"]]
+      (is (nil? (err (run sql))) sql))
+    (let [before (d/db *conn*)
+          snapshot (.toInstant ^java.util.Date (:db/txInstant (d/entity before (:max-tx before))))]
+      (is (= "42804" (.sqlstate (run "ALTER TABLE audit_events ALTER raw TYPE integer"))))
+      (is (= "22001" (.sqlstate (run "ALTER TABLE audit_events ALTER raw TYPE varchar(2)"))))
+      (is (= [["1" " 23 " "2024-02-29 13:55:19.123456"]]
+             (rows "SELECT * FROM audit_events")))
+      (is (nil? (err (run "ALTER TABLE audit_events ALTER created_at TYPE timestamp(3)"))))
+      (is (nil? (err (run (str "ALTER TABLE audit_events ALTER COLUMN raw SET DATA TYPE integer "
+                               "USING trim(raw)::int + 1, ALTER COLUMN raw SET NOT NULL")))))
+      (is (= [["1" "24" "2024-02-29 13:55:19.123"]]
+             (rows "SELECT * FROM audit_events")))
+      (is (= [["id" "20" "-1"] ["raw" "23" "-1"] ["created_at" "1114" "3"]]
+             (rows (str "SELECT attname, atttypid, atttypmod FROM pg_attribute "
+                        "WHERE attrelid = 'audit_events'::regclass AND attnum > 0 ORDER BY attnum"))))
+      (is (= [["1" "24"]]
+             (rows "SELECT id, raw FROM audit_events WHERE raw = 24")))
+      (let [parsed (.parse *handler* "SELECT id FROM audit_events WHERE raw = $1" (int-array 0))]
+        (is (= [23] (vec (.describeParams *handler* parsed)))))
+      (is (= [["2"]]
+             (rows "SELECT indkey::text FROM pg_index WHERE indexrelid = 'audit_raw_idx'::regclass")))
+      (is (= [["2" "26" "2024-02-29 13:55:19.123"]]
+             (rows "INSERT INTO audit_events (id, raw) VALUES (2, 26) RETURNING id, raw, created_at")))
+      (is (= "23502" (.sqlstate (run "INSERT INTO audit_events (id) VALUES (3)"))))
+      (is (nil? (err (run (str "SET datahike.as_of = '" snapshot "'")))))
+      (is (= [["1" " 23 " "2024-02-29 13:55:19.123456"]]
+             (rows "SELECT * FROM audit_events"))))))
+
+(deftest column-type-rewrite-rolls-back-and-allows-dropping-an-old-default
+  (let [run #(.execute *handler* %)]
+    (doseq [sql ["CREATE TABLE tasks (key integer PRIMARY KEY, detail text DEFAULT 'old')"
+                 "INSERT INTO tasks (key) VALUES (1)"
+                 "BEGIN"
+                 (str "ALTER TABLE tasks ALTER COLUMN detail DROP DEFAULT, "
+                      "ALTER COLUMN detail TYPE integer USING length(detail)")]]
+      (is (nil? (err (run sql))) sql))
+    (is (= [["3"]] (mapv vec (.rows (run "SELECT detail FROM tasks")))))
+    (is (nil? (err (run "ROLLBACK"))))
+    (is (= [["old"]] (mapv vec (.rows (run "SELECT detail FROM tasks")))))
+    (is (= [["old"]]
+           (mapv vec (.rows (run "INSERT INTO tasks (key) VALUES (2) RETURNING detail")))))
+    (doseq [sql ["BEGIN"
+                 (str "ALTER TABLE tasks ALTER COLUMN detail DROP DEFAULT, "
+                      "ALTER COLUMN detail TYPE integer USING length(detail)")
+                 "UPDATE tasks SET detail = detail + 1 WHERE key = 2"
+                 "COMMIT"]]
+      (is (nil? (err (run sql))) sql))
+    (is (= [["3"] ["4"]] (mapv vec (.rows (run "SELECT detail FROM tasks ORDER BY key")))))))
+
+(deftest historical-catalogs-and-user-data-share-the-statement-snapshot
+  (let [run #(.execute *handler* %)
+        rows (fn [query]
+               (let [result (run query)]
+                 (is (nil? (err result)) (str query " " (err result)))
+                 (mapv vec (.rows result))))
+        columns (str "SELECT column_name, data_type, datetime_precision FROM information_schema.columns "
+                     "WHERE table_name = 'temporal_example' AND column_name <> 'db_id' ORDER BY ordinal_position")]
+    (doseq [query ["CREATE TABLE temporal_example (id integer PRIMARY KEY, label text, obsolete text, stamp timestamp(6))"
+                   "INSERT INTO temporal_example VALUES (1, 'before', 'old', '2024-02-29 12:00:00.123456')"]]
+      (is (nil? (err (run query))) query))
+    (let [before (d/db *conn*)
+          snapshot (.toInstant ^java.util.Date (:db/txInstant (d/entity before (:max-tx before))))]
+      (doseq [query ["ALTER TABLE temporal_example RENAME COLUMN label TO title"
+                     "ALTER TABLE temporal_example DROP COLUMN obsolete, ADD COLUMN extra bigint"
+                     "ALTER TABLE temporal_example ALTER COLUMN stamp TYPE timestamp(3)"
+                     "UPDATE temporal_example SET title = 'after'"
+                     "CREATE TABLE future_example (id integer PRIMARY KEY)"
+                     (str "SET datahike.as_of = " (:max-tx before))]]
+        (is (nil? (err (run query))) query))
+      (is (= [["id" "integer" nil] ["label" "text" nil] ["obsolete" "text" nil]
+              ["stamp" "timestamp without time zone" "6"]]
+             (rows columns)))
+      (is (= [["label"] ["obsolete"]]
+             (rows (str "SELECT a.attname FROM pg_attribute a JOIN pg_class r ON a.attrelid = r.oid "
+                        "WHERE r.relname = 'temporal_example' AND a.attname IN ('label', 'obsolete') ORDER BY a.attnum"))))
+      (is (empty? (rows "SELECT relname FROM pg_class WHERE relname = 'future_example'")))
+      (is (empty? (rows "SELECT table_name FROM information_schema.tables WHERE table_name = 'future_example'")))
+      (is (= [["before" "label"]]
+             (rows (str "SELECT t.label, c.column_name FROM temporal_example t "
+                        "JOIN information_schema.columns c ON c.table_name = 'temporal_example' "
+                        "AND c.column_name = 'label' WHERE t.id = 1"))))
+      (is (= [["before" "label"]]
+             (rows (str "WITH cols AS (SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'temporal_example' AND column_name = 'label') "
+                        "SELECT t.label, c.column_name FROM temporal_example t CROSS JOIN cols c WHERE t.id = 1"))))
+      (is (nil? (err (run "RESET datahike.as_of"))))
+      (is (= [["id" "integer" nil] ["title" "text" nil] ["stamp" "timestamp without time zone" "3"]
+              ["extra" "bigint" nil]]
+             (rows columns)))
+      (let [parsed (.parse *handler*
+                           (str "SELECT label, stamp FROM temporal_example FOR SYSTEM_TIME AS OF '"
+                                snapshot "' WHERE id = $1")
+                           (int-array 0))
+            described (.describeResult *handler* parsed)
+            result (.executePrepared *handler* parsed (object-array [nil 1]))]
+        (is (= [23] (vec (.describeParams *handler* parsed))))
+        (is (= [25 1114] (vec (.-columnOids described))))
+        (is (nil? (err result)))
+        (is (= [["before" "2024-02-29 12:00:00.123456"]] (mapv vec (.rows result)))))
+      (is (= [["after"]] (rows "SELECT title FROM temporal_example WHERE id = 1"))))))
+
+(deftest renamed-relations-resolve-against-the-statement-snapshot
+  (let [run #(.execute *handler* %)
+        rows (fn [query]
+               (let [result (run query)]
+                 (is (nil? (err result)) (str query " " (err result)))
+                 (mapv vec (.rows result))))
+        rename! (fn [old new]
+                  (let [db (d/db *conn*)]
+                    (d/transact *conn* (objects/rename-table-tx db (pgs/table-oid db old) new))))]
+    (doseq [query ["CREATE TABLE rename_original (id integer PRIMARY KEY, caption text)"
+                   "INSERT INTO rename_original VALUES (1, 'old row'), (2, 'second row')"]]
+      (is (nil? (err (run query))) query))
+    (let [old-db (d/db *conn*)
+          oid (str (pgs/table-oid old-db "rename_original"))]
+      (is (nil? (err (run "ALTER TABLE rename_original RENAME COLUMN caption TO label"))))
+      (rename! "rename_original" "rename_archive")
+      (is (= "42P01" (.sqlstate (run "SELECT * FROM rename_original"))))
+      (is (= [["1" "old row"] ["2" "second row"]]
+             (rows "SELECT id, label FROM public.rename_archive ORDER BY id")))
+      (doseq [query ["CREATE TABLE rename_replacement (id integer PRIMARY KEY, code bigint)"
+                     "INSERT INTO rename_replacement VALUES (1, 42)"]]
+        (is (nil? (err (run query))) query))
+      (rename! "rename_replacement" "rename_original")
+      (is (= [["old row" "42"]]
+             (rows (str "SELECT a.label, r.code FROM rename_archive a "
+                        "JOIN rename_original r ON a.id = r.id"))))
+      (is (= [[oid "rename_archive" "rename_archive"]]
+             (rows (str "SELECT c.oid, c.relname, t.typname FROM pg_class c "
+                        "JOIN pg_type t ON c.reltype = t.oid WHERE c.oid = 'rename_archive'::regclass"))))
+      (is (= [["rename_archive" "label"] ["rename_original" "code"]]
+             (rows (str "SELECT table_name, column_name FROM information_schema.columns "
+                        "WHERE table_name IN ('rename_archive', 'rename_original') "
+                        "AND column_name IN ('label', 'code') ORDER BY table_name"))))
+      (is (nil? (err (run (str "SET datahike.as_of = " (:max-tx old-db))))))
+      (is (= [["1" "old row"] ["2" "second row"]] (rows "SELECT * FROM rename_original ORDER BY id")))
+      (is (= "42P01" (.sqlstate (run "SELECT * FROM rename_archive"))))
+      (is (= [[oid "rename_original"]]
+             (rows "SELECT oid, relname FROM pg_class WHERE oid = 'rename_original'::regclass"))))))

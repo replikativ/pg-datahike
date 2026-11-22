@@ -17,6 +17,8 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [datahike.pg.catalog.regoid :as regoid]
+            [datahike.pg.datetime.tokens :as datetime-tokens]
+            [datahike.pg.datetime.zone :as datetime-zone]
             [datahike.pg.errors :as errors]
             [datahike.pg.pg-catalog :as pg-catalog])
   (:import [datahike.pg PgWireServer]))
@@ -196,6 +198,7 @@
    :json        oid-json
    :money       oid-money
    :jsonb       oid-jsonb
+   :tsvector    oid-tsvector
    :point       oid-point
    :lseg        oid-lseg
    :path        oid-path
@@ -309,10 +312,10 @@
    "boolean"           :db.type/boolean
    "bool"              :db.type/boolean
    ;; Date/time
-   "timestamp"         :db.type/instant
-   "timestamp without time zone" :db.type/instant
-   "timestamp with time zone"    :db.type/instant
-   "timestamptz"       :db.type/instant
+   "timestamp"         :db.type/string
+   "timestamp without time zone" :db.type/string
+   "timestamp with time zone"    :db.type/string
+   "timestamptz"       :db.type/string
    "date"              :db.type/instant
    ;; time-of-day: store the normalized text (a bare time can't be a
    ;; java.util.Date/Instant, and parse-timestamp-string rejects it).
@@ -402,6 +405,7 @@
    "uuid"              :uuid
    "json"              :json
    "jsonb"             :jsonb
+   "tsvector"          :tsvector
    "bytea"             :bytea
    "oid"               :oid
    ;; The geometric and MAC families. Omitting them did not make
@@ -1308,6 +1312,32 @@
       unquote-type-name
       str/lower-case))
 
+(defn timestamp-type?
+  "Whether a SQL type names a scalar timestamp, with or without a time zone."
+  [type-name]
+  (contains? #{"timestamp" "timestamptz" "timestamp without time zone" "timestamp with time zone"}
+             (base-type-name-of type-name)))
+
+(defn precise-timestamp-column?
+  "SQL timestamp columns that store lossless text. Legacy instant attributes
+   keep their original Datahike value type."
+  [value-type pg-type]
+  (and (= :db.type/string value-type) (timestamp-type? pg-type)))
+
+(defn parse-timestamp-precision
+  "Return the declared precision of a timestamp type, if it has one."
+  [type-name]
+  (when (timestamp-type? type-name)
+    (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-name))
+            second parse-long (min 6))))
+
+(defn parse-time-precision
+  "Return the declared precision of TIME or TIME WITH TIME ZONE."
+  [type-name]
+  (when (contains? cast-time-types (base-type-name-of type-name))
+    (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-name))
+            second parse-long (min 6))))
+
 (defn parse-char-length
   "The `n` of `varchar(n)` / `char(n)`, or nil for an unmodified text
    type. Only the length-carrying names qualify -- `text` has no limit."
@@ -1377,6 +1407,9 @@
     (if (neg? tm)
       base
       (cond
+        (array-oid->element-oid oid)
+        (str (format-type (array-oid->element-oid oid) tm) "[]")
+
         (= oid oid-numeric)
         (let [[precision scale] (decode-numeric-typmod tm)]
           (if precision (format "numeric(%d,%d)" precision scale) base))
@@ -1459,9 +1492,22 @@
       (when (clojure.string/ends-with? base "[]")
         (or (:elem (parse-array-type-name sql-type-name)) :text)))))
 
+(defn- quoted-posix-zone-offset
+  "Fixed offset from a POSIX TZ string with a quoted abbreviation, such as
+   the <+02:30>-02:30 returned by SHOW after SET TIME ZONE 2.5."
+  [zone]
+  (when-let [[_ sign hour minute second]
+             (re-matches #"<[^>]*>([+-]?)(\d{1,2})(?::(\d{1,2})(?::(\d{1,2}))?)?" zone)]
+    (let [minute (parse-long (or minute "0"))
+          second (parse-long (or second "0"))
+          west (+ (* 3600 (parse-long hour)) (* 60 minute) second)]
+      (when (and (< minute 60) (<= second 60) (<= west (* 18 3600)))
+        (java.time.ZoneOffset/ofTotalSeconds (int (if (= "-" sign) west (- west))))))))
+
 (defn resolve-time-zone
-  "A PostgreSQL time-zone spec as a java.time ZoneId. Names and
-   abbreviations resolve through the tz database. A NUMERIC spec -- `+05`,
+  "A PostgreSQL time-zone spec as a java.time ZoneId. A dynamic
+   abbreviation names the zone used for calendar operations.
+   A NUMERIC spec -- `+05`,
    `-03:30`, `UTC+3` -- is POSIX-style, so its sign is INVERTED: `+05` is
    five hours WEST of UTC (datetime.c DecodePosixTimezone). Unknown names
    raise 22023, as in PostgreSQL."
@@ -1473,17 +1519,17 @@
                                (Long/parseLong (or sec "0")))]
                   (java.time.ZoneOffset/ofTotalSeconds
                    (int (if (= "-" sign) total (- total))))))]
-    (if-let [[_ sign h m sec] (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
-      (posix sign h m sec)
-      (try
-        (java.time.ZoneId/of z java.time.ZoneId/SHORT_IDS)
-        (catch Exception _
-          (try (java.time.ZoneId/of (clojure.string/upper-case z) java.time.ZoneId/SHORT_IDS)
-               (catch Exception _
-                 (throw (ex-info (str "time zone \"" z "\" not recognized")
-                                 {:error :invalid-parameter-value
-                                  :sqlstate "22023"
-                                  :message (str "time zone \"" z "\" not recognized")})))))))))
+    (or (when-let [offset (:offset (datetime-tokens/zone-abbrev (str/lower-case z)))]
+          (java.time.ZoneOffset/ofTotalSeconds (int offset)))
+        (quoted-posix-zone-offset z)
+        (when-let [[_ sign h m sec]
+                   (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
+          (posix sign h m sec))
+        (some-> (datetime-zone/dynamic-abbreviation z) :zone datetime-zone/resolve-zone-name)
+        (datetime-zone/zone-id z)
+        (throw (errors/pg-error
+                :invalid-parameter-value
+                {:message (str "time zone \"" z "\" not recognized")})))))
 
 (defrecord PgLsn [^java.math.BigInteger value]
   Object
@@ -1714,15 +1760,18 @@
 (def ^:private interval->text
   (delay @(requiring-resolve 'datahike.pg.interval.core/->pg-text-postgres)))
 
-(defn offset-text
-  "EncodeTimezone: +HH, then :MM and :SS only when non-zero."
-  [^java.time.ZoneOffset o]
-  (let [total (.getTotalSeconds o)
-        a (Math/abs total)
+(defn offset-seconds-text
+  "Encode seconds east of Greenwich as +HH, adding minutes and seconds
+   when needed."
+  [^long total]
+  (let [a (Math/abs total)
         h (quot a 3600) m (quot (rem a 3600) 60) sec (rem a 60)]
     (str (if (neg? total) "-" "+") (format "%02d" h)
          (when (or (pos? m) (pos? sec)) (format ":%02d" m))
          (when (pos? sec) (format ":%02d" sec)))))
+
+(defn offset-text [^java.time.ZoneOffset offset]
+  (offset-seconds-text (.getTotalSeconds offset)))
 
 (defn- timestamp-text [^java.time.LocalDateTime ldt]
   (str (.toLocalDate ldt) " " (time-text (.toLocalTime ldt))))
@@ -1805,16 +1854,6 @@
           (map (fn [^String id] [(str/lower-case id) [id (java.time.ZoneId/of id)]]))
           (java.time.ZoneId/getAvailableZoneIds))))
 
-(defn- tz-offset-text
-  "Seconds east of Greenwich as `+HH[:MM[:SS]]`, as a TimeZone's `SHOW`
-   text writes it."
-  [^long secs]
-  (let [a (Math/abs secs)
-        h (quot a 3600) m (quot (rem a 3600) 60) sec (rem a 60)]
-    (str (if (neg? secs) "-" "+") (format "%02d" h)
-         (when (or (pos? m) (pos? sec)) (format ":%02d" m))
-         (when (pos? sec) (format ":%02d" sec)))))
-
 (defn- invalid-time-zone [raw]
   (errors/pg-error
    :invalid-parameter-value
@@ -1857,10 +1896,12 @@
       (let [secs (Math/round (* 3600.0 (Double/parseDouble raw)))]
         (when (> (Math/abs secs) (* 18 3600)) (throw (invalid-time-zone raw)))
         {:zone (java.time.ZoneOffset/ofTotalSeconds (int secs))
-         :text (str "<" (tz-offset-text secs) ">" (tz-offset-text (- secs)))})
+         :text (str "<" (offset-seconds-text secs) ">" (offset-seconds-text (- secs)))})
 
       :else
-      (if-let [[canonical zone] (get @tz-names low)]
+      (if-let [[canonical zone] (or (get @tz-names low)
+                                    (when-let [zone (quoted-posix-zone-offset raw)]
+                                      [raw zone]))]
         {:zone zone :text canonical}
         ;; POSIX `[STD]offset`, no DST part: positive is west.
         (if-let [[_ sign h m] (re-matches #"(?:[A-Za-z]{3,})?([+-]?)(\d{1,2})(?::(\d{2}))?" raw)]
@@ -1995,10 +2036,9 @@
    in the JVM's default time zone and locale -- all of which reached
    clients at one time or another.
 
-   `src-oid` disambiguates what the value's class cannot: Datahike has only
-   :db.type/instant, so `date`, `timestamp` and `timestamptz` columns all
-   arrive as java.util.Date at UTC. Absent a hint an instant renders as a
-   timestamp, the wider form that loses no information."
+   `src-oid` disambiguates legacy instant-backed columns. A java.util.Date
+   may represent a date, a wall-clock timestamp or an absolute instant.
+   Absent a hint, it renders as a wall-clock timestamp."
   ([v] (temporal->pg-text v nil))
   ([v src-oid]
    (cond
@@ -2065,11 +2105,15 @@
   [pred render]
   (register-typed-output-function! pred (fn [v _oid] (render v))))
 
-(def ^:private routine-array-output
+(def session-formatted-array-oids
+  "Array types whose stored text needs the reader's session settings."
+  (into #{} (keep element-oid->array-oid)
+        (into regoid/alias-oids [oid-date oid-timestamp oid-timestamptz])))
+
+(def ^:private array-output
   ;; Array input/output live above this registry. Resolve after its namespace
   ;; has loaded, as temporal carrier renderers do, without a load-time cycle.
-  (delay [(requiring-resolve 'datahike.pg.arrays/from-pg-text)
-          (requiring-resolve 'datahike.pg.arrays/to-pg-text)]))
+  (delay (requiring-resolve 'datahike.pg.arrays/render-stored-array)))
 
 (defn ->pg-text
   "PostgreSQL's output function for a value (its type's `typoutput`).
@@ -2088,9 +2132,8 @@
      ;; SQL NULL, including the internal sentinel: it must never render as
      ;; text (`concat(NULL, 'x')` answered ":__null__x").
      (or (nil? v) (= :__null__ v)) nil
-     (and (string? v) (contains? regoid/alias-oids (array-oid->element-oid src-oid)))
-     (let [[read-array render-array] @routine-array-output]
-       (render-array (read-array v (oid->elem-kw (array-oid->element-oid src-oid))) src-oid))
+     (and (string? v) (session-formatted-array-oids src-oid))
+     (@array-output v src-oid)
      (and (contains? regoid/alias-oids src-oid) (number? v))
      (regoid/output src-oid v #(or (get oid->pg-name %)
                                    (:typname (pg-catalog/type-by-oid %))

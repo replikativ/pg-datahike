@@ -24,7 +24,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager Types]))
 
 (def ^:dynamic *port* nil)
 
@@ -84,6 +84,26 @@
   (exec! c (str "INSERT INTO bt VALUES (1,true,true),(2,true,false),(3,true,NULL),"
                 "(4,false,true),(5,false,false),(6,false,NULL),"
                 "(7,NULL,true),(8,NULL,false),(9,NULL,NULL)")))
+
+(deftest prepared-null-text-cast-preserves-the-row
+  (with-open [c (jdbc)]
+    (seed! c)
+    (with-open [select (.prepareStatement c
+                                          "SELECT id, CAST(? AS text) FROM tvl WHERE id = CAST(? AS int)")]
+      (.setNull select 1 Types/VARCHAR)
+      (.setString select 2 "1")
+      (with-open [result (.executeQuery select)]
+        (is (.next result))
+        (is (= 1 (.getInt result 1)))
+        (is (nil? (.getString result 2)))
+        (is (not (.next result)))))
+    (with-open [update (.prepareStatement c
+                                          "UPDATE tvl SET s = CAST(? AS text), a = ? WHERE id = CAST(? AS int)")]
+      (.setNull update 1 Types/VARCHAR)
+      (.setInt update 2 99)
+      (.setString update 3 "1")
+      (is (= 1 (.executeUpdate update))))
+    (is (= "99" (one c "SELECT a FROM tvl WHERE id = 1 AND s IS NULL")))))
 
 (deftest null-literal-casts-to-null-not-to-its-own-name
   (with-open [c (jdbc)]

@@ -3,6 +3,7 @@
  :deps
  {org.clojure/clojure               {:mvn/version "1.12.4"}
   org.replikativ/datahike           {:mvn/version "0.8.1937"}
+  org.postgresql/postgresql        {:mvn/version "42.7.3"}
   ;; SQL parser. Main workhorse downstream of classify/rewrite/shape.
   com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}
   ;; JSON codec for the json/jsonb types. Declared rather than inherited
@@ -34,8 +35,7 @@
 
   ;; Unit tests — ns-based, run against the released Datahike dependency.
   :test {:extra-paths ["test"]
-         :extra-deps  {lambdaisland/kaocha  {:mvn/version "1.91.1392"}
-                       org.postgresql/postgresql {:mvn/version "42.7.3"}}
+         :extra-deps  {lambdaisland/kaocha  {:mvn/version "1.91.1392"}}
          ;; pgjdbc sends the JVM's zone as the TimeZone startup
          ;; parameter, and the server honours it as PostgreSQL does, so
          ;; the suite's rendered timestamptz values depend on it. Pinned
@@ -46,8 +46,7 @@
   ;; Dev REPL with test code on the classpath + nREPL for editor hook-up.
   :dev {:extra-paths ["test"]
         :extra-deps  {nrepl/nrepl               {:mvn/version "1.0.0"}
-                      lambdaisland/kaocha       {:mvn/version "1.91.1392"}
-                      org.postgresql/postgresql {:mvn/version "42.7.3"}}}
+                      lambdaisland/kaocha       {:mvn/version "1.91.1392"}}}
 
   ;; Server launcher — pairs with test/integration/start_pgwire.clj.
   ;; Starts pgwire on :15432 + nREPL on :15433 for dual SQL + Datalog
@@ -57,8 +56,7 @@
   ;; in-process -- instead of paying a fresh JVM + server boot for each.
   :server {:extra-paths ["test"]
            :extra-deps  {nrepl/nrepl               {:mvn/version "1.0.0"}
-                         lambdaisland/kaocha       {:mvn/version "1.91.1392"}
-                         org.postgresql/postgresql {:mvn/version "42.7.3"}}
+                         lambdaisland/kaocha       {:mvn/version "1.91.1392"}}
            ;; clojure -M:server already goes through clojure.main; a
            ;; bare script path as the only main-opt = "load and run".
            ;; Adding `-m clojure.main` on top makes it try to resolve

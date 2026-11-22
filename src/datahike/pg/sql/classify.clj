@@ -746,12 +746,13 @@
    Returns [names remaining-toks], or nil on a malformed head — the
    caller falls back to :generic-sql and JSqlParser reports the real
    syntax error."
-  [toks]
-  (loop [names [] ts toks]
-    (when-let [[nm ts'] (read-relation-name ts)]
-      (if (= "," (:text (first ts')))
-        (recur (conj names nm) (rest ts'))
-        [(conj names nm) ts']))))
+  ([toks] (read-relation-list toks ident-text))
+  ([toks token-name]
+   (loop [names [] ts toks]
+     (when-let [[nm ts'] (read-relation-name ts token-name)]
+       (if (= "," (:text (first ts')))
+         (recur (conj names nm) (rest ts'))
+         [(conj names nm) ts'])))))
 
 (defn- classify-drop-table
   "DROP TABLE with MORE THAN ONE name. JSqlParser 5.2's Drop grammar
@@ -929,7 +930,7 @@
                               (recur (rest ts) (dec depth) (conj acc t)))
           :else (recur (rest ts) depth (conj acc t)))))))
 
-(defn- split-top-level-commas
+(defn split-top-level-commas
   "Split a token seq on commas that are not inside parens or brackets."
   [toks]
   (loop [ts toks, depth 0, cur [], out []]
@@ -1548,8 +1549,9 @@
    children to include/exclude); CASCADE is carried so parse-sql can
    reject it with 0A000."
   [toks]
-  (let [ts (if (kw=? (first toks) "table") (rest toks) toks)]
-    (or (when-let [[names ts1] (read-relation-list ts)]
+  (let [ts (if (kw=? (first toks) "table") (rest toks) toks)
+        table-name #(if (= :ident (:type %)) (str/lower-case (:text %)) (ident-text %))]
+    (or (when-let [[names ts1] (read-relation-list ts table-name)]
           (let [identity? (and (or (kw=? (first ts1) "restart")
                                    (kw=? (first ts1) "continue"))
                                (kw=? (second ts1) "identity"))

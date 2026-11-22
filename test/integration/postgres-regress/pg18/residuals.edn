@@ -86,9 +86,30 @@
   {:id :expression-default-backfill
    :file "fast_default" :lines [67 67] :state :open :impact :unsupported
    :detail "Adding a column with an expression default to a populated table requires backfill evaluation. The volatile default case needs a separate value per existing row."}
+  {:id :fast-default-rewrite-event
+   :file "fast_default" :lines [59 61] :state :boundary :impact :unsupported
+   :detail "The first difference is CREATE EVENT TRIGGER on table_rewrite. The volatile backfill fails separately because it needs per-row default evaluation."}
   {:id :sequence-data-discovery
-   :file "sequence" :lines [416 417] :state :open :impact :unsupported
-   :detail "PostgreSQL 18 pg_dump uses pg_get_sequence_data to read last_value and is_called in data-bearing dumps. Schema-only pg_dump and direct COPY pass the ordinary fixture."}
+   :file "sequence" :lines [416 417] :state :open :impact :wrong-result
+   :detail "pg_get_sequence_data now gives stock pg_dump both position fields. With CACHE 10 and three calls, native 18.6 reports the reserved upper value 10 and pg-datahike reports the handed-out value 3."}
+  {:id :sequence-ownership-validation
+   :file "sequence" :lines [14 20] :state :open :impact :wrong-result
+   :detail "The invalid OWNED BY clause creates the sequence. Subsequent ownership checks with that name fail as duplicate relations. Replay each ownership case with fresh names before comparing its SQLSTATE."}
+  {:id :identity-sequence-options
+   :file "identity" :lines [7 8] :state :open :impact :unsupported
+   :detail "CREATE TABLE rejects identity START and INCREMENT options, so later probes on itest3 are cascades. ALTER COLUMN ADD GENERATED has a separate parser gap."}
+  {:id :alter-comment-missing-relation
+   :file "alter_table" :lines [18 18] :state :open :impact :wrong-result
+   :detail "COMMENT ON a missing relation succeeds on the target. Native 18.6 rejects it before the ordinary-table migration statements."}
+  {:id :alter-reserved-system-column
+   :file "alter_table" :lines [22 22] :state :open :impact :wrong-result
+   :detail "ADD COLUMN xmin succeeds and adds a visible column. Native 18.6 rejects the reserved system attribute name."}
+  {:id :conflict-operator-class-index
+   :file "insert_conflict" :lines [13 16] :state :open :impact :unsupported
+   :detail "The first independent failure is CREATE UNIQUE INDEX with text_pattern_ops. Later ON CONFLICT arbiter differences depend on those indexes. EXPLAIN INSERT has a separate parser gap."}
+  {:id :returning-update-source-binding
+   :file "returning" :lines [41 44] :state :open :impact :unsupported
+   :detail "UPDATE FROM reaches RETURNING without the joined source alias in scope. The statement fails before the write and later SELECT output reflects the unchanged row."}
   {:id :reset-transaction-isolation
    :file "transactions" :lines [39 42] :state :covered :impact :wrong-result
    :detail "RESET of a current transaction characteristic now returns 0A000. The gate checks that the transaction then returns 25P02 until rollback."}
@@ -107,6 +128,39 @@
   {:id :create-table-as-execute
    :file "prepare" :lines [62 66] :state :covered :impact :unsupported
    :detail "Prepared SELECT results can populate a table in source column order. WITH NO DATA evaluates arguments and leaves the table empty. The upstream 10,000-row fixture matches PostgreSQL 18.6 for both forms."}
+  {:id :time-variable-zone-requires-date
+   :file "time" :lines [17 20] :state :covered :impact :wrong-result
+   :detail "Named zones with variable offsets require a date. The gate verifies SQLSTATE 22007 and a row count unaffected by a rejected insert."}
+  {:id :time-variable-zone-input-api
+   :file "time" :lines [46 48] :state :covered :impact :wrong-result
+   :detail "A missing date for America/New_York is reported through pg_input_is_valid and pg_input_error_info."}
+  {:id :timestamp-relative-input
+   :file "timestamp" :lines [13 45] :state :covered :impact :unsupported
+   :detail "Relative dates accept zone suffixes without changing the wall clock. Across transactions now changes, and within a transaction both inserts and queries use the same clock."}
+  {:id :timestamptz-relative-input
+   :file "timestamptz" :lines [13 46] :state :covered :impact :unsupported
+   :detail "Relative dates resolve in the session zone or an explicit offset. Consecutive transactions get distinct values for now, with matching values within a transaction."}
+  {:id :timestamptz-dynamic-zone-abbreviation
+   :file "timestamptz" :lines [569 577] :state :covered :impact :unsupported
+   :detail "AT TIME ZONE uses the historical offset attached to MSK across the 2011 Moscow spring gap."}
+  {:id :timestamptz-dynamic-zone-overlap
+   :file "timestamptz" :lines [585 592] :state :covered :impact :unsupported
+   :detail "AT TIME ZONE and make_timestamptz use the historical MSK offset across the 2014 Moscow overlap."}
+  {:id :timestamptz-dynamic-zone-from-instant
+   :file "timestamptz" :lines [638 650] :state :covered :impact :unsupported
+   :detail "Instant-to-wall-clock conversion uses the MSK offset on the correct side of each Moscow transition."}
+  {:id :timestamptz-at-local
+   :file "timestamptz" :lines [655 668] :state :open :impact :unsupported
+   :detail "AT LOCAL fails to parse, aborting the remaining session-zone comparisons."}
+  {:id :timetz-local-view
+   :file "timetz" :lines [91 102] :state :open :impact :unsupported
+   :detail "AT LOCAL fails to parse in the view definition, aborting the remaining conversion comparisons."}
+  {:id :timetz-addition-diagnostic
+   :file "timetz" :lines [64 64] :state :covered :impact :internal-error
+   :detail "Adding two timetz values raises SQLSTATE 42883 during analysis, including on an empty table."}
+  {:id :timetz-interval-offset
+   :file "timetz" :lines [103 107] :state :covered :impact :unsupported
+   :detail "Stored timetz values produce the same results with a POSIX name and an equivalent interval. The gate also checks stored intervals and timezone(interval, value)."}
   {:id :virtual-generated-columns
    :file "generated_virtual" :lines [8 9] :state :boundary :impact :unsupported
    :detail "VIRTUAL generated columns are explicitly rejected."}

@@ -175,7 +175,11 @@
 (defn- print-help []
   (println serve-help-text)
   (println)
-  (println dump-help-text))
+  (println dump-help-text)
+  (println)
+  (println "java -jar pg-datahike-VERSION-standalone.jar mirror [--check] CONFIG.edn")
+  (println "Start a read-only mirror of a PostgreSQL 18 publication.")
+  (println "Use --check to report incompatible publication tables before starting."))
 
 ;; ----------------------------------------------------------------------------
 ;; Template + pre-create
@@ -348,7 +352,7 @@
 
 (defn -main
   "Subcommand dispatch. First positional arg is the subcommand
-   (serve / dump). Everything else passes to the subcommand parser.
+   (serve / dump / mirror). Everything else passes to the subcommand parser.
    For backward-compat, an unrecognised first arg is treated as a
    serve flag (so existing `--port 5432` invocations still work)."
   [& args]
@@ -365,6 +369,9 @@
 
       (= "dump" head)
       (run-dump rest-args)
+
+      (= "mirror" head)
+      (apply (requiring-resolve 'datahike.pg.mirror/-main) rest-args)
 
       ;; Unrecognised first arg — assume legacy `serve` invocation.
       :else
