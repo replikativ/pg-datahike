@@ -502,6 +502,168 @@
           (when (= ["false"] (slot-query source native-slot "active::text"))
             (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")"))))))))
 
+(def ^:private schema-refresh-fixture
+  ["CREATE TABLE schema_account (id integer PRIMARY KEY, label text)"
+   (str "CREATE TABLE schema_items (id integer PRIMARY KEY, label varchar(32) NOT NULL DEFAULT 'original', "
+        "obsolete text, stamp timestamp(6) DEFAULT '2024-06-01 12:00:00.123456')")
+   "CREATE TABLE schema_meta (id integer PRIMARY KEY, tag text DEFAULT 'original')"])
+
+(def ^:private source-schema-changes
+  ["BEGIN"
+   "ALTER TABLE schema_items RENAME COLUMN label TO summary"
+   "ALTER TABLE schema_items DROP COLUMN obsolete"
+   (str "ALTER TABLE schema_items ALTER COLUMN stamp TYPE timestamptz(3) "
+        "USING stamp AT TIME ZONE 'America/Los_Angeles'")
+   "ALTER TABLE schema_items ALTER COLUMN summary SET DEFAULT concat('publ','isher')"
+   "ALTER TABLE schema_items ALTER COLUMN summary DROP NOT NULL"
+   "ALTER TABLE schema_items ADD COLUMN flag text DEFAULT 'fast' NOT NULL"
+   "ALTER TABLE schema_meta ALTER COLUMN tag SET DEFAULT 'changed'"
+   "COMMIT"])
+
+(defn- evolved-rows [conn]
+  [(rows conn "SELECT id, label FROM schema_account ORDER BY id")
+   (rows conn "SELECT id, summary, stamp::text, flag FROM schema_items ORDER BY id")
+   (rows conn "SELECT id, tag FROM schema_meta ORDER BY id")])
+
+(defn- evolved-column-metadata [conn]
+  (rows conn (str "SELECT column_name, data_type, datetime_precision, is_nullable, column_default "
+                  "FROM information_schema.columns "
+                  "WHERE table_name = 'schema_items' AND column_name <> 'db_id' "
+                  "ORDER BY ordinal_position")))
+
+(defn- item-eid [path]
+  (inspect-db path #(d/q '[:find ?eid . :where [?eid :schema_items/id 1]] %)))
+
+(defn run-schema-refresh-probe!
+  "Compare publisher schema refresh with a native subscriber given the same
+   DDL. Interrupt the handoff and revert a pending catalog change, then crash
+   again after the durable install and verify the recovered history."
+  [source-url reference-url source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-schema-" (make-array FileAttribute 0)))
+        path (str directory "/store")
+        log (str directory "/schema-crash.log")
+        native-slot (str "mirror_schema_ref_" (str/replace (str (random-uuid)) "-" ""))
+        config {:source-url source-url :publication "mirror_schema_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        old-query "SELECT id, label, obsolete, stamp::text FROM schema_items ORDER BY id"
+        old-rows [["1" "original" "keep history" "2024-06-01 12:00:00.123456"]]]
+    (prn {:artifacts directory})
+    (with-open [source (DriverManager/getConnection source-url)
+                reference (DriverManager/getConnection reference-url)]
+      (try
+        (doseq [c [source reference]]
+          (sql! c "SET TIME ZONE 'UTC'")
+          (apply sql! c schema-refresh-fixture))
+        (sql! source "INSERT INTO schema_account VALUES (1, 'original')"
+              "INSERT INTO schema_items (id, obsolete) VALUES (1, 'keep history')"
+              "INSERT INTO schema_meta (id) VALUES (1)"
+              "CREATE PUBLICATION mirror_schema_pub FOR TABLE schema_account, schema_items, schema_meta")
+        (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
+        (sql! reference (str "CREATE SUBSCRIPTION mirror_schema_native CONNECTION "
+                             (literal source-conninfo) " PUBLICATION mirror_schema_pub"
+                             " WITH (create_slot=false, slot_name=" (literal native-slot) ")"))
+        (await! "Native subscriber did not load the initial layout" #(= old-rows (rows reference old-query)))
+        (reset! subscriber (mirror/start! config))
+        (let [{:keys [slot]} (await-state! @subscriber :following)
+              old-id (item-eid path)
+              old-at (inspect-db path #(str (.toInstant ^java.util.Date
+                                             (:db/txInstant (d/entity % (:max-tx %))))))
+              ids (set (map parse-long
+                            (first (rows source (str "SELECT 'schema_items'::regclass::oid, "
+                                                     "'schema_meta'::regclass::oid")))))
+              started (promise)
+              release-copy (promise)
+              copy-var #'mirror/copy-table!
+              install-var #'mirror/install-staged-tables!
+              copy-original @copy-var
+              install-original @install-var]
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (check! (= old-rows (rows sink old-query)) "Mirror did not load the initial layout" {})
+            (with-redefs-fn
+              {copy-var (fn [publisher destination table on-bytes]
+                          (when (= "schema_items" (:name table))
+                            (deliver started true)
+                            (check! (deref release-copy 30000 false) "Probe did not release the schema snapshot" {}))
+                          (copy-original publisher destination table on-bytes))
+               install-var (fn [stage destination check-running! max-bytes]
+                             (install-original stage destination check-running! max-bytes)
+                             (throw (ex-info "Interrupted schema install" {})))}
+              (fn []
+                (try
+                  ;; PostgreSQL's native subscriber needs the same DDL on its
+                  ;; destination before it can consume rows with the new layout.
+                  (apply sql! reference source-schema-changes)
+                  (apply sql! source source-schema-changes)
+                  (check! (deref started 30000 false) "Schema refresh did not begin" (mirror/status @subscriber))
+                  (sql! source "BEGIN"
+                        "UPDATE schema_account SET label = 'during schema copy' WHERE id = 1"
+                        "UPDATE schema_items SET summary = NULL WHERE id = 1"
+                        "INSERT INTO schema_items (id) VALUES (2)"
+                        "INSERT INTO schema_meta (id) VALUES (2)"
+                        "COMMIT")
+                  (await! "Unchanged relation stopped applying during schema copy"
+                          #(= [["during schema copy"]] (rows sink "SELECT label FROM schema_account WHERE id = 1")))
+                  (let [[[manifest]] (rows sink "SELECT manifest FROM pgdh_mirror.checkpoint WHERE id = 1")]
+                    (check! (= ids (set (keys (:pending-schema (edn/read-string manifest)))))
+                            "Skipped relations were not recorded durably" {}))
+                  (check! (= old-rows (rows sink old-query)) "New layout escaped the staging store" {})
+                  (finally (deliver release-copy true)))
+                (let [paused (await-state! @subscriber :paused)]
+                  (check! (= "Interrupted schema install" (get-in paused [:last-error :message]))
+                          "The schema rollback test did not reach the end of installation" paused))
+                (check! (= old-rows (rows sink old-query)) "Rollback exposed the new schema" {}))))
+          (mirror/stop! @subscriber)
+          ;; This table has returned to its original catalog shape. The row
+          ;; inserted with its temporary default still needs to be resynced.
+          (doseq [c [source reference]]
+            (sql! c "ALTER TABLE schema_meta ALTER COLUMN tag SET DEFAULT 'original'"))
+          (child-crash! (assoc config :probe-crash-mode :refresh) log)
+          (await! "The crashed slot remained active" #(= ["false"] (slot-query source slot "active::text")))
+          (await! "Schema refresh left a temporary slot" #(empty? (sync-slots source)))
+          (let [cutover (durable-position path)
+                [confirmed] (slot-query source slot "confirmed_flush_lsn")]
+            (check! (= [["t"]]
+                       (rows source (str "SELECT " (literal confirmed) "::pg_lsn < " (literal cutover) "::pg_lsn")))
+                    "Schema cutover was acknowledged before the crash" {:confirmed confirmed :durable cutover})
+            (check! (= old-id (item-eid path)) "Existing primary key lost its Datahike entity" {})
+            (reset! subscriber (mirror/start! config))
+            (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+              (sql! sink "SET TIME ZONE 'UTC'")
+              (let [expected (evolved-rows source)]
+                (await! "Native subscriber did not converge on the new layout" #(= expected (evolved-rows reference)))
+                (check! (= expected (evolved-rows sink)) "Mirror rows differ after schema refresh"
+                        {:source expected :mirror (evolved-rows sink)}))
+              (check! (= (evolved-column-metadata source) (evolved-column-metadata sink))
+                      "Publisher defaults, types, or nullability changed"
+                      {:source (evolved-column-metadata source) :mirror (evolved-column-metadata sink)})
+              (check! (= ids (set (keys (get-in (mirror/status @subscriber) [:last-schema-refresh :from]))))
+                      "Restart lost the resnapshot positions" {})
+              (sql! sink (str "SET datahike.as_of = " (literal old-at)))
+              (check! (= old-rows (rows sink old-query)) "Historical schema or row was lost" {})
+              (sql! sink "RESET datahike.as_of")
+              (sql! source "INSERT INTO schema_items (id) VALUES (3)")
+              (await! "Mirror stopped following after schema refresh" #(= (evolved-rows source) (evolved-rows sink)))
+              ;; Dropping nullability and a default leaves the wire descriptor
+              ;; intact. A NULL can reach apply before the next catalog poll.
+              (let [ddl (str "ALTER TABLE schema_items ALTER COLUMN flag DROP NOT NULL, "
+                             "ALTER COLUMN flag DROP DEFAULT")]
+                (sql! reference ddl)
+                (sql! source ddl
+                      "UPDATE schema_items SET flag = NULL WHERE id = 2"
+                      "INSERT INTO schema_items (id) VALUES (4)"))
+              (await! "Mirror did not refresh a metadata-only change"
+                      #(and (= (evolved-rows source) (evolved-rows sink))
+                            (= (evolved-column-metadata source) (evolved-column-metadata sink))))))
+          (mirror/stop! @subscriber)
+          (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
+          {:status :passed :artifacts directory})
+        (finally
+          (when @subscriber (mirror/stop! @subscriber))
+          (sql! reference "DROP SUBSCRIPTION IF EXISTS mirror_schema_native")
+          (when (= ["false"] (slot-query source native-slot "active::text"))
+            (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")"))))))))
+
 (defn -main [& [argument]]
   (if (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
@@ -510,5 +672,8 @@
           conninfo (System/getenv "PG_MIRROR_SOURCE_CONNINFO")]
       (check! (every? seq [source reference conninfo])
               "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
-      (prn ((if (= "--refresh" argument) run-refresh-probe! run-probe!)
+      (prn ((case argument
+              "--schema-refresh" run-schema-refresh-probe!
+              "--refresh" run-refresh-probe!
+              run-probe!)
             source reference conninfo)))))

@@ -4,6 +4,9 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
+            [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg]
             [datahike.pg.sql.rewrite :as rewrite]
             [datahike.pg.types :as types])
@@ -69,7 +72,18 @@
       (.setProperty properties "replication" "database")
       (.setProperty properties "assumeMinServerVersion" "10")
       (.setProperty properties "preferQueryMode" "simple"))
-    (DriverManager/getConnection url properties)))
+    (let [connection (DriverManager/getConnection url properties)]
+      (try
+        (when-not replication?
+          ;; A default expression can contain timestamp literals or objects
+          ;; resolved through search_path. Keep catalog comparison stable.
+          (command! connection "SET DateStyle = 'ISO, YMD'")
+          (command! connection "SET TIME ZONE 'UTC'")
+          (command! connection "SET search_path = pg_catalog"))
+        connection
+        (catch Throwable error
+          (.close connection)
+          (throw error))))))
 
 (defn- source-identity [^Connection replication source]
   (with-open [stmt (.createStatement replication)
@@ -106,7 +120,9 @@
         column-name (.getString row "attname")
         column (when column-name
                  {:name column-name :oid (.getLong row "atttypid")
-                  :typmod (.getInt row "atttypmod") :key? (.getBoolean row "is_key")})]
+                  :typmod (.getInt row "atttypmod") :key? (.getBoolean row "is_key")
+                  :attnum (.getInt row "attnum") :not-null? (.getBoolean row "attnotnull")
+                  :default (.getString row "default_expr")})]
     {:publication-oid (.getLong row "publication_oid")
      :operations {:insert (.getBoolean row "pubinsert") :update (.getBoolean row "pubupdate")
                   :delete (.getBoolean row "pubdelete") :truncate (.getBoolean row "pubtruncate")}
@@ -145,7 +161,8 @@
                          "       pg_catalog.row_security_active(c.oid) AS has_row_security, "
                          "       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits "
                          "               WHERE inhrelid = c.oid OR inhparent = c.oid) AS has_inheritance, "
-                         "       a.attname, a.atttypid, a.atttypmod, a.attgenerated, "
+                         "       a.attname, a.atttypid, a.atttypmod, a.attgenerated, a.attnum, a.attnotnull, "
+                         "       pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS default_expr, "
                          "       pg_catalog.format_type(a.atttypid, a.atttypmod) AS source_type, "
                          "       a.attname = ANY(p.attnames) AS is_published, "
                          "       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') AS can_select, "
@@ -158,6 +175,7 @@
                          "LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname "
                          "LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename "
                          "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+                         "LEFT JOIN pg_catalog.pg_attrdef def ON def.adrelid = a.attrelid AND def.adnum = a.attnum "
                          "WHERE pub.pubname = ? ORDER BY p.schemaname, p.tablename, a.attnum")
                     [publication] read-publication-row)
         {:keys [publication-oid operations]} (first rows)
@@ -182,7 +200,7 @@
 (defn- publication-manifest [source publication]
   (let [{:keys [publication-oid tables compatible?] :as report} (scan-publication source publication)]
     (require! compatible? "Publication cannot be mirrored" {:report report})
-    {:publication-oid publication-oid :tables (mapv #(dissoc % :issues) tables)}))
+    {:publication-oid publication-oid :catalog-version 2 :tables (mapv #(dissoc % :issues) tables)}))
 
 (defn- validate-source-options! [source-url publication]
   (require! (and (string? source-url) (str/starts-with? source-url "jdbc:postgresql://")
@@ -300,12 +318,51 @@
                                       " (id, origin, slot_name, publication) VALUES (1, ?, ?, ?)")
                      [(pr-str origin) slot publication]))))
 
+(defn- local-column-attrs [db {:keys [name columns] :as table}]
+  (let [relation (pgs/table-oid db name)]
+    (require! relation "Missing local mirror relation" {:table (relation-name table)})
+    (mapv (fn [column]
+            (or (:datahike.pg.column/storage-ident
+                 (catalog-objects/column-by-name db relation (:name column)))
+                (throw (ex-info "Missing local mirror column"
+                                {:table (relation-name table) :column (:name column)}))))
+          columns)))
+
+(defn- stage-data! [destination f]
+  (checked-result (pg/stage-tx! destination [[:db.fn/call f]])))
+
+(defn- column-metadata-tx [db table]
+  (let [attrs (local-column-attrs db table)
+        tx (into []
+                 (mapcat (fn [attr {:keys [not-null? default]}]
+                           (let [entity (d/entity db attr)
+                                 eid (:db/id entity)
+                                 was-not-null? (true? (:pg/not-null entity))
+                                 kind (:pg/default-kind entity)
+                                 previous (:pg/default-value entity)]
+                             (cond-> []
+                               (and not-null? (not was-not-null?)) (conj [:db/add eid :pg/not-null true])
+                               (and (not not-null?) was-not-null?) (conj [:db/retract eid :pg/not-null true])
+                               (and (some? default) (not= kind :publisher)) (conj [:db/add eid :pg/default-kind :publisher])
+                               (and (some? default) (not= default previous)) (conj [:db/add eid :pg/default-value default])
+                               (and (nil? default) kind) (conj [:db/retract eid :pg/default-kind kind])
+                               (and (nil? default) previous) (conj [:db/retract eid :pg/default-value previous]))))
+                         attrs (:columns table)))]
+    (if (seq tx)
+      (into tx (catalog-objects/bump-revision-tx
+                db catalog-objects/pg-class-oid (pgs/table-oid db (:name table))))
+      tx)))
+
+(defn- set-column-metadata! [destination table]
+  (stage-data! destination #(column-metadata-tx % table)))
+
 (defn- create-table! [destination {:keys [columns] :as table}]
   (sink-execute!
    destination
    (str "CREATE TABLE " (relation-name table) " ("
         (comma-list (map (fn [{:keys [name] :as column}] (str (ident name) " " (column-ddl-type column))) columns))
-        ", PRIMARY KEY (" (comma-list (keep #(when (:key? %) (ident (:name %))) columns)) "))")))
+        ", PRIMARY KEY (" (comma-list (keep #(when (:key? %) (ident (:name %))) columns)) "))"))
+  (set-column-metadata! destination table))
 
 (defn- slot-info [source slot]
   (first (query source
@@ -338,8 +395,6 @@
     (try
       (command! source (str "SET TRANSACTION SNAPSHOT " (literal snapshot)))
       (command! source "SET LOCAL row_security = off")
-      (command! source "SET LOCAL DateStyle = 'ISO, YMD'")
-      (command! source "SET LOCAL TIME ZONE 'UTC'")
       (f (.asString (.getConsistentPoint created)))
       (finally (command! source "ROLLBACK")))))
 
@@ -613,20 +668,154 @@
 (defn- tables-by-id [manifest]
   (into {} (map (juxt :relation-id identity)) (:tables manifest)))
 
-(defn- added-tables!
-  "Require the publisher to retain each admitted relation and its wire layout."
-  [previous current]
+(defn- wire-table [table]
+  (update (select-keys table [:schema :name :relation-id :columns])
+          :columns #(mapv (fn [column] (select-keys column [:name :oid :typmod :key?])) %)))
+
+(defn- same-table? [previous current]
+  (if (every? :attnum (:columns previous))
+    (= previous current)
+    (and current (= (wire-table previous) (wire-table current)))))
+
+(defn- changed-tables! [previous current allow-schema-refresh?]
   (let [before (tables-by-id previous)
         after (tables-by-id current)
-        changed (into [] (keep (fn [[id table]] (when-not (= table (get after id)) table))) before)]
-    (require! (and (= (:publication-oid previous) (:publication-oid current)) (empty? changed))
+        missing (remove #(get after (:relation-id %)) (:tables previous))]
+    (require! (and (= (:publication-oid previous) (:publication-oid current)) (empty? missing))
               "Publication schema or membership changed"
-              {:changed (mapv #(select-keys % [:schema :name :relation-id]) changed)})
-    (into [] (remove #(contains? before (:relation-id %))) (:tables current))))
+              {:removed (mapv relation-name missing)})
+    (let [changes (filterv (fn [table]
+                             (let [prior (get before (:relation-id table))]
+                               (or (nil? prior)
+                                   (contains? (:pending-schema previous) (:relation-id table))
+                                   (not (same-table? prior table))
+                                   (and allow-schema-refresh? (not-every? :attnum (:columns prior))))))
+                           (:tables current))]
+      (mapv (fn [table]
+              (let [prior (get before (:relation-id table))]
+                (when prior
+                  (require! allow-schema-refresh?
+                            "Publication schema or membership changed" {:table (relation-name prior)})
+                  (require! (and (or (every? :attnum (:columns prior)) (same-table? prior table))
+                                 (= (select-keys prior [:name :schema]) (select-keys table [:name :schema])))
+                            "Schema refresh requires a known column layout and the same relation name"
+                            {:table (relation-name table)}))
+                ;; A legacy checkpoint knows the wire order. Identical wire
+                ;; layout lets us assign the current attnums before staging.
+                {:table table
+                 :previous (if (and prior (not-every? :attnum (:columns prior)))
+                             (update prior :columns
+                                     (fn [columns]
+                                       (mapv (fn [old new] (assoc old :attnum (:attnum new))) columns (:columns table))))
+                             prior)}))
+            changes))))
+
+(defn- require-stable-manifest! [target source]
+  (let [after (tables-by-id source)]
+    (require! (and (= (:publication-oid target) (:publication-oid source))
+                   (every? (fn [table] (same-table? table (get after (:relation-id table)))) (:tables target)))
+              "Publication changed during refresh" {})))
+
+(defn- typed-column [column]
+  (select-keys column [:oid :typmod]))
+
+(defn- require-stable-keys! [{:keys [table previous]}]
+  (when previous
+    (let [keys-of (fn [table]
+                    (mapv #(select-keys % [:attnum :oid :typmod])
+                          (filter :key? (:columns table))))]
+      (require! (= (keys-of previous) (keys-of table))
+                "Schema refresh requires a stable primary key" {:table (relation-name table)}))))
+
+(defn- adapt-layout! [destination previous table]
+  (let [before (into {} (map (juxt :attnum identity)) (:columns previous))
+        after (into {} (map (juxt :attnum identity)) (:columns table))
+        alter (str "ALTER TABLE " (relation-name table) " ")
+        renames (into []
+                      (keep (fn [{:keys [attnum name]}]
+                              (when-let [old (get before attnum)]
+                                (when (not= (:name old) name)
+                                  [(:name old) (new-slot-name "pgdh_col") name]))))
+                      (:columns table))
+        retypes (filterv (fn [{:keys [attnum] :as column}]
+                           (when-let [prior (get before attnum)]
+                             (not= (typed-column column) (typed-column prior))))
+                         (:columns table))]
+    (doseq [{:keys [attnum name]} (:columns previous) :when (not (contains? after attnum))]
+      (sink-execute! destination (str alter "DROP COLUMN " (ident name))))
+    ;; Use temporary names first so a source column-name swap is unambiguous.
+    (doseq [[old temporary _] renames]
+      (sink-execute! destination (str alter "RENAME COLUMN " (ident old) " TO " (ident temporary))))
+    (doseq [[_ temporary assigned] renames]
+      (sink-execute! destination (str alter "RENAME COLUMN " (ident temporary) " TO " (ident assigned))))
+    (when (seq retypes)
+      (set-column-metadata! destination
+                            (assoc table :columns (mapv #(assoc % :default nil :not-null? false) retypes))))
+    (doseq [{:keys [name] :as column} retypes]
+      ;; Publisher rows carried by the staging copy provide the new values.
+      ;; The old value is retracted through the normal historical ALTER path.
+      (sink-execute! destination
+                     (str alter "ALTER COLUMN " (ident name) " TYPE " (column-ddl-type column) " USING NULL")))
+    (doseq [{:keys [attnum name] :as column} (:columns table) :when (not (contains? before attnum))]
+      (sink-execute! destination
+                     (str alter "ADD COLUMN " (ident name) " " (column-ddl-type column))))))
+
+(defn- stored-rows [db table attrs]
+  (let [marker (pgs/row-marker-attr (:name table))]
+    (map (fn [eid]
+           (let [row (d/entity db eid)]
+             [eid (mapv #(get row %) attrs)]))
+         (d/q '[:find [?row ...] :in $ ?marker :where [?row ?marker true]] db marker))))
+
+(defn- replace-row-tx [eid attrs previous values]
+  (keep (fn [[attr old new]]
+          (cond
+            (= old new) nil
+            (nil? new) [:db/retract eid attr old]
+            :else [:db/add eid attr new]))
+        (map vector attrs previous values)))
+
+(defn- reconcile-table-tx [db table staged-schema staged-rows check-running!]
+  (let [attrs (local-column-attrs db table)
+        value-types (mapv #(get-in (dbi/-schema db) [% :db/valueType]) attrs)
+        _ (require! (= staged-schema value-types) "Staged storage types differ from live storage types"
+                    {:table (relation-name table)})
+        key-indexes (into [] (keep-indexed (fn [idx col] (when (:key? col) idx))) (:columns table))
+        row-key (fn [values] (mapv #(nth values %) key-indexes))
+        key-attrs (mapv #(nth attrs %) key-indexes)
+        live (into {} (map (fn [[eid key]] [key eid])) (stored-rows db table key-attrs))
+        outstanding (volatile! live)
+        marker (pgs/row-marker-attr (:name table))
+        result (reduce
+                (fn [tx [_ values]]
+                  (check-running!)
+                  (doseq [[column value] (map vector (:columns table) values)]
+                    (require! (or (some? value) (not (:not-null? column)))
+                              "Staged row violates publisher nullability"
+                              {:table (relation-name table) :column (:name column)}))
+                  (let [key (row-key values)
+                        eid (get @outstanding key)]
+                    (vswap! outstanding dissoc key)
+                    (if eid
+                      (let [row (d/entity db eid)
+                            previous (mapv #(get row %) attrs)]
+                        (into tx (replace-row-tx eid attrs previous values)))
+                      (conj tx (into {marker true}
+                                     (keep (fn [[attr value]] (when (some? value) [attr value])))
+                                     (map vector attrs values))))))
+                [] staged-rows)]
+    (into result
+          (map (fn [eid] (check-running!) [:db/retractEntity eid]))
+          (vals @outstanding))))
+
+(defn- reconcile-table! [destination stage-db table check-running!]
+  (let [attrs (local-column-attrs stage-db table)
+        staged-schema (mapv #(get-in (dbi/-schema stage-db) [% :db/valueType]) attrs)
+        staged-rows (vec (stored-rows stage-db table attrs))]
+    (stage-data! destination #(reconcile-table-tx % table staged-schema staged-rows check-running!))))
 
 (defn- matches-relation? [table message]
-  (and (= \d (:identity message))
-       (= table (select-keys message [:schema :name :relation-id :columns]))))
+  (and table (= \d (:identity message)) (= (wire-table table) (wire-table message))))
 
 (defn- select-change [included? {:keys [op relation-id relation-ids] :as message}]
   (if (= :truncate op)
@@ -722,7 +911,7 @@
           end-lsn (with-slot-snapshot!
                     replication source slot true
                     (fn [position]
-                      (added-tables! manifest (publication-manifest source publication))
+                      (require-stable-manifest! manifest (publication-manifest source publication))
                       (transaction!
                        destination
                        (fn []
@@ -750,14 +939,15 @@
                                            #(doseq [change changes] (apply-change! destination relations change))))
                            (contains? barriers barrier))}))))
 
-(defn- start-refresh! [config origin manifest tables check-running!]
-  (let [store {:store {:backend :memory :id (random-uuid)}
+(defn- start-refresh! [config origin manifest changes check-running!]
+  (let [tables (mapv :table changes)
+        store {:store {:backend :memory :id (random-uuid)}
                :schema-flexibility :write :keep-history? false :max-string-length 0}
         _ (d/create-database store)
         conn (d/connect store)
         stopped? (atom false)
         done (promise)
-        stage {:store store :conn conn :tables tables :manifest manifest
+        stage {:store store :conn conn :tables tables :changes changes :manifest manifest
                :phase (atom :copying) :barrier (str (UUID/randomUUID))
                :stopped? stopped? :done done}
         running! #(do (check-running!)
@@ -788,17 +978,40 @@
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
-      (doseq [table (:tables stage)]
+      (doseq [{:keys [table previous]} (:changes stage)]
         (check-running!)
-        (create-table! destination table)
-        (transfer-staged-table! staged destination table on-bytes)))))
+        (if previous
+          (do
+            (adapt-layout! destination previous table)
+            (reconcile-table! destination (d/db (:conn stage)) table check-running!)
+            (set-column-metadata! destination table))
+          (do
+            (create-table! destination table)
+            (transfer-staged-table! staged destination table on-bytes)))))))
+
+(defn- changed-relation-ids [changes]
+  (into #{} (mapcat #(if (= :truncate (:op %)) (:relation-ids %) [(:relation-id %)])) changes))
+
+(defn- installed-manifest [current previous changes]
+  ;; Legacy tables retain their stored definitions until they participate
+  ;; in a refresh. Observing their source metadata does not install it.
+  (let [installed (set (map (comp :relation-id :table) changes))
+        prior (tables-by-id previous)]
+    (cond-> (update current :tables (fn [tables]
+                                      (mapv (fn [table]
+                                              (let [id (:relation-id table)]
+                                                (if (installed id) table (get prior id table))))
+                                            tables)))
+      (:last-schema-refresh previous) (assoc :last-schema-refresh (:last-schema-refresh previous)))))
 
 (defn- consume! [copy source destination saved state confirmed-lsn check-running! ready! config]
   (let [{:keys [origin manifest end-lsn publication slot]} saved
-        {:keys [max-transaction-bytes max-snapshot-bytes]} config
+        {:keys [max-transaction-bytes max-snapshot-bytes schema-refresh?]} config
         applied (volatile! manifest)
-        live-ids (volatile! (set (keys (tables-by-id manifest))))
-        observed (volatile! (tables-by-id manifest))
+        durable (volatile! end-lsn)
+        pending-schema (volatile! (or (:pending-schema manifest) {}))
+        live (volatile! (tables-by-id manifest))
+        observed (volatile! @live)
         stage (volatile! nil)
         stage-signaled? (volatile! false)
         following? (volatile! false)
@@ -809,14 +1022,52 @@
         next-watermark (volatile! (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 30)))
         next-check (volatile! 0)
         refresh! (fn []
-                   (let [current (publication-manifest source publication)
-                         added (added-tables! @applied current)]
+                   (let [current (publication-manifest source publication)]
                      (vreset! observed (tables-by-id current))
                      (if-let [active @stage]
-                       (added-tables! (:manifest active) current)
-                       (when (seq added)
-                         (vreset! stage (start-refresh! config origin current added check-running!))
-                         (vreset! stage-signaled? false)))))]
+                       (require-stable-manifest! (:source-manifest active) current)
+                       (let [changes (changed-tables! @applied current schema-refresh?)]
+                         (when (seq changes)
+                           (doseq [change changes] (require-stable-keys! change))
+                           (let [new-pending (into {}
+                                                   (keep (fn [{:keys [table previous]}]
+                                                           (when previous [(:relation-id table) @durable])))
+                                                   changes)
+                                 manifest (installed-manifest current @applied changes)]
+                             (vswap! pending-schema #(merge new-pending %))
+                             (vreset! stage (assoc (start-refresh! config origin current changes check-running!)
+                                                   :installed-manifest manifest :source-manifest current))
+                             (vreset! stage-signaled? false)))))))
+        live? (fn [id] (and (contains? @live id) (not (contains? @pending-schema id))))
+        validate-transaction! (fn [relations changes]
+                                (let [ids (changed-relation-ids changes)
+                                      stale? (fn [id]
+                                               (or (not (contains? @observed id))
+                                                   (and (live? id)
+                                                        (not (matches-relation? (get @live id)
+                                                                                (get relations id))))))]
+                                  (when (some stale? ids) (refresh!))
+                                  (when-let [id (some #(when (stale? %) %) ids)]
+                                    (throw (ex-info "Publication relation changed"
+                                                    {:relation (get relations id)})))))
+        apply-live! (fn [relations previous transaction cutover? active]
+                      (let [candidate (cond
+                                        cutover?
+                                        (cond-> (:installed-manifest active)
+                                          (seq @pending-schema)
+                                          (assoc :last-schema-refresh
+                                                 {:from @pending-schema :cutover (:end-lsn transaction)}))
+
+                                        (not= @pending-schema (or (:pending-schema @applied) {}))
+                                        (assoc @applied :pending-schema @pending-schema))
+                            changes (into [] (keep #(select-change live? %)) (:changes transaction))]
+                        (apply-commit! destination relations previous
+                                       (cond-> (assoc transaction :changes changes)
+                                         candidate (assoc :manifest candidate)
+                                         cutover?
+                                         (assoc :install! #(install-staged-tables! active % check-running! max-snapshot-bytes))))
+                        (when candidate (vreset! applied candidate))))]
+    (swap! state assoc :last-schema-refresh (:last-schema-refresh manifest))
     (try
       (stream!
        copy end-lsn confirmed-lsn max-transaction-bytes
@@ -843,13 +1094,12 @@
                          (emit-barrier! source (:barrier active))
                          (vreset! stage-signaled? true))))))
         :barrier? (fn [payload] (or (= initial payload) (= (:barrier @stage) payload)))
-        :relation-frame! (fn [{:keys [relation-id] :as message}]
-                           (when-not (matches-relation? (get @observed relation-id) message)
-                             (refresh!))
-                           (require! (matches-relation? (get @observed relation-id) message)
-                                     "Publication relation changed" {:relation (dissoc message :op)}))
-        :select-change! #(select-change @live-ids %)
-        :commit! (fn [relations previous {:keys [end-lsn xid commit-micros barriers] :as transaction}]
+        :relation-frame! (constantly nil)
+        :select-change! identity
+        :commit! (fn [relations previous {:keys [end-lsn xid commit-micros barriers changes] :as transaction}]
+                   ;; A reconnect can decode old relation layouts below the
+                   ;; durable checkpoint. Validate only changes we will apply.
+                   (validate-transaction! relations changes)
                    (let [active @stage
                          cutover? (contains? barriers (:barrier active))
                          initial? (contains? barriers initial)]
@@ -858,18 +1108,26 @@
                        (require! (= end-lsn (refresh-result! active check-running!))
                                  "Table refresh reached a different cutover position" {:position end-lsn})
                        (refresh!))
-                     (apply-commit! destination relations previous
-                                    (cond-> transaction
-                                      cutover?
-                                      (assoc :manifest (:manifest active)
-                                             :install! #(install-staged-tables! active % check-running! max-snapshot-bytes))))
+                     (try
+                       (apply-live! relations previous transaction cutover? active)
+                       (catch clojure.lang.ExceptionInfo error
+                         ;; DROP NOT NULL preserves the wire layout. A NULL may
+                         ;; beat the periodic catalog scan to the mirror.
+                         (let [prior @pending-schema]
+                           (when-not (and schema-refresh? (not cutover?) (= "23502" (:sqlstate (ex-data error))))
+                             (throw error))
+                           (refresh!)
+                           (when (= prior @pending-schema) (throw error))
+                           (apply-live! relations previous transaction false nil))))
+                     (vreset! durable end-lsn)
                      (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros)
                      (when cutover?
-                       (vreset! applied (:manifest active))
-                       (vreset! live-ids (set (keys (tables-by-id @applied))))
+                       (vreset! live (tables-by-id @applied))
+                       (vreset! pending-schema {})
                        (vreset! stage nil)
                        (stop-refresh! active)
-                       (swap! state dissoc :refresh))
+                       (swap! state #(-> % (dissoc :refresh)
+                                         (assoc :last-schema-refresh (:last-schema-refresh @applied)))))
                      (when initial?
                        (ready!)
                        (vreset! following? true))
@@ -992,7 +1250,7 @@
   "Start a PostgreSQL 18 subscriber. Bootstrap and catch-up run asynchronously.
    The :server options are passed to the read-only pgwire listener after catch-up.
    Monitor with status and release resources with stop!. Use a dedicated :store-path."
-  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes]
+  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes schema-refresh?]
     :or {slot-prefix "pgdh_mirror"
          max-snapshot-bytes (* 128 1024 1024)
          max-transaction-bytes (* 64 1024 1024)}
@@ -1002,6 +1260,8 @@
                  (string? store-path) (seq store-path)
                  (pos-int? max-snapshot-bytes) (pos-int? max-transaction-bytes))
             "Expected a store path, slot prefix and positive byte limits" {})
+  (require! (or (nil? schema-refresh?) (boolean? schema-refresh?))
+            "Expected a boolean schema-refresh? option" {})
   (require! (and (or (nil? server) (map? server))
                  (not-any? #(get server %) [:database-template :on-create-database :on-delete-database]))
             "Mirror listeners do not support database provisioning" {})

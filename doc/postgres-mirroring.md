@@ -95,8 +95,34 @@ from a fresh snapshot. A restart after installation resumes from the durable
 checkpoint. The temporary slot is released when its connection closes.
 The snapshot byte limit also bounds staging input, including replayed data.
 
-Removing tables or changing their existing relation definitions pauses the
-mirror. Coordinated schema refresh remains follow-up work.
+Removing published tables pauses the mirror.
+
+## Refresh after a publisher schema change
+
+Set `:schema-refresh? true` in the mirror configuration to support adding,
+renaming, and dropping columns, changing supported types and precision, and
+changing defaults or nullability. Group related DDL in one PostgreSQL
+transaction and allow each refresh to finish before the next schema change.
+The table keeps its source name and primary key column identities and types.
+Keep this option enabled through restart while a refresh is pending.
+
+When upgrading an existing mirror that stored only the wire layout, enable
+this option while its publication still has the same layout. Let the mirror
+finish recording the source column numbers and definitions before migrating.
+
+The worker uses PostgreSQL's post-migration rows at the shared WAL boundary.
+The refreshed schema and rows become visible with the checkpoint. Existing
+Datahike entities keep their identity when their primary keys match, and
+historical SQL reads retain the old columns and values. Source default
+expressions are recorded as catalog metadata. PostgreSQL evaluates them
+when applications write to the publisher.
+
+The affected tables have a resnapshot window. Their publisher changes during
+that window are reflected in the cutover transaction. Status and the durable
+manifest report its start positions and cutover LSN under
+`:last-schema-refresh`. The manifest also records tables awaiting refresh,
+so a restart resnapshots them even when the source layout has changed back.
+With schema refresh disabled, schema drift pauses the mirror.
 
 ## Recovery and status
 
@@ -132,10 +158,11 @@ mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
 `PG_MIRROR_SOURCE_CONNINFO` to the source libpq connection string used by
 `CREATE SUBSCRIPTION`. The source server needs `wal_level=logical`. Run
 `clojure -M:dev -m datahike.pg.mirror-probe` after `bb prep`. Pass
-`--refresh` to exercise online table addition, interrupted installation,
-and crash recovery at the refresh checkpoint.
+`--refresh` to exercise online table addition and its recovery boundaries.
+Pass `--schema-refresh` to exercise publisher DDL, recovery, and historical
+reads.
 
-The next stages are coordinated schema evolution, streaming and spooling of
+The next stages are historical catalog queries, streaming and spooling of
 large transactions, and failover slots. See the [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 

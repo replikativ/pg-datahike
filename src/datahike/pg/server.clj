@@ -12288,7 +12288,7 @@
         using-oid (if using
                     (first (row-eval/row-oids [using-ast] table schema db))
                     source-oid)
-        using-oid (when-not (instance? net.sf.jsqlparser.expression.StringValue using-ast)
+        using-oid (when-not (oid/untyped-literal? using-ast)
                     using-oid)
         _ (require-alter-assignment! using-oid oid name type)
         ;; The base cast handles conversions such as numeric to integer or
@@ -14348,6 +14348,10 @@
           (when error (throw error))
           true)))))
 
+(defprotocol EmbeddedTransaction
+  (stage-tx! [handler tx-data]
+    "Add trusted embedded transaction data to the handler's active SQL transaction."))
+
 (defn- make-query-handler*
   "The handler `make-query-handler` scopes; see there."
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
@@ -14471,6 +14475,14 @@
         ;; wire sessions, so each handler must release exactly its own reference.
         conn-released? (atom false)]
     (reify PgWireServer$QueryHandler
+      EmbeddedTransaction
+      (stage-tx! [_ tx-data]
+        (assert-database-writable! "embedded transaction")
+        (let [{:keys [in-tx? aborted? read-only?]} @tx-state]
+          (when-not (and in-tx? (not aborted?) (not read-only?))
+            (throw (IllegalStateException. "Expected an active writable SQL transaction")))
+          (execute-ddl-in-tx tx-state tx-data "EMBEDDED TRANSACTION")))
+
       (close [_]
         ;; pgwire client disconnected — equivalent to a PG backend
         ;; terminating. Release all row locks, advisory locks held by this
@@ -15553,6 +15565,8 @@
               (fn [f] (pg-resolve/with-symbol-resolver (f))))
         statement (fn [f] (collecting-notices #(run f)))]
     (reify PgWireServer$QueryHandler
+      EmbeddedTransaction
+      (stage-tx! [_ tx-data] (run #(stage-tx! h tx-data)))
       (execute [_ sql] (statement #(.execute h sql)))
       (executeInGroup [_ sql] (statement #(.executeInGroup h sql)))
       (executeInGroup [_ sql multi-statement?]

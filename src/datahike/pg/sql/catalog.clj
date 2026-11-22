@@ -2769,6 +2769,13 @@
                                   :db.type/bigdec  s
                                   :db.type/bigint  0
                                   nil)))
+          publisher-defaults (when cte-db
+                               (into {}
+                                     (q-fn '{:find [?ident ?value]
+                                             :where [[?e :db/ident ?ident]
+                                                     [?e :pg/default-kind :publisher]
+                                                     [?e :pg/default-value ?value]]}
+                                           cte-db)))
           datetime-precision (fn [vtype]
                                (case vtype
                                  :db.type/instant 6
@@ -2808,7 +2815,7 @@
                :information_schema_columns/table_name             tname
                :information_schema_columns/column_name            (:name col)
                :information_schema_columns/ordinal_position       pos
-               :information_schema_columns/column_default         nil
+               :information_schema_columns/column_default         (get publisher-defaults (:attr col))
                :information_schema_columns/is_nullable            (if (or identity?
                                                                           (:not-null? col)
                                                                           (= :db.unique/identity (:unique col)))
