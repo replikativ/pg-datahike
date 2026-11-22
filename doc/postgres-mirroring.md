@@ -255,11 +255,15 @@ statement and works with prepared queries.
 
 ## Recovery and status
 
-The checkpoint in `pgdh_mirror.checkpoint` stores the publisher identity, end
+The internal Datahike checkpoint stores the publisher identity, end
 LSN, transaction ID, and publisher commit timestamp. Each source commit and its
 checkpoint reach durable storage together. Feedback reports committed positions
 only. After a disconnect, commits already in the checkpoint are acknowledged
 and skipped.
+The mirror upgrades an older SQL checkpoint in the same writer transaction
+that retires its storage and hides it from current and historical SQL.
+The publisher slot and applied position survive the upgrade.
+A publisher table named `public.checkpoint` uses its own storage.
 
 Status includes the applied and confirmed LSNs, retained WAL, and the most recent
 error. A paused worker that has already cut over serves the last committed

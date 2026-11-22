@@ -277,6 +277,7 @@
      :table-issues
      (when relation
        (cond-> []
+         (not (.getBoolean row "schema_usage")) (conj {:reason :missing-schema-usage})
          (= "pgdh_mirror" schema) (conj {:reason :reserved-schema})
          (.getBoolean row "has_filter") (conj {:reason :row-filter})
          (and (= "p" (.getString row "relkind")) (nil? leaves))
@@ -309,6 +310,7 @@
                       (not (and published? (:generated-expr column))))
                  (conj {:reason :generated-column :kind generated})
                  (not published?) (conj {:reason :unpublished-column})
+                 (= "db_id" column-name) (conj {:reason :reserved-column-name})
                  (nil? can-select) (conj {:reason :catalog-changed-during-scan})
                  (false? can-select) (conj {:reason :missing-select})
                  (and keyless-full? (.getBoolean row "nondeterministic_collation"))
@@ -382,6 +384,7 @@
                          "       pg_catalog.pg_get_expr(pt.partexprs, c.oid) AS partition_expressions, "
                          "       pt.partdefid AS partition_default, pg_catalog.pg_get_partkeydef(pt.partrelid) AS partition_key_definition, "
                          "       pg_catalog.row_security_active(c.oid) AS has_row_security, "
+                         "       pg_catalog.has_schema_privilege(c.relnamespace, 'USAGE') AS schema_usage, "
                          "       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits "
                          "               WHERE inhrelid = c.oid OR inhparent = c.oid) AS has_inheritance, "
                          "       a.attname, a.atttypid, a.atttypmod, a.attgenerated, a.attnum, a.attnotnull, "
@@ -633,7 +636,7 @@
   (let [source-api (.getCopyAPI (.unwrap source PGConnection))
         out (.copyOut source-api (copy-out-sql table))]
     (try
-      (let [written (load-copy! destination table
+      (let [written (load-copy! destination (storage-table table)
                                 (fn [write!]
                                   (loop []
                                     (when-let [^bytes chunk (.readFromCopy out)]
@@ -658,38 +661,82 @@
       (require! (= (count lines) written) "Staged COPY row counts differ"
                 {:table (relation-name table) :source (count lines) :destination written}))))
 
-(def ^:private checkpoint-table "pgdh_mirror.checkpoint")
+(def ^:private checkpoint-fields
+  {:origin :db.type/string
+   :slot :db.type/string
+   :publication :db.type/string
+   :manifest :db.type/string
+   :end-lsn :db.type/string
+   :legacy-checkpoint :db.type/boolean
+   :source-xid :db.type/long
+   :source-commit-micros :db.type/long})
 
-(defn- checkpoint [^PgWireServer$QueryHandler destination]
-  (let [reply (.execute destination (str "SELECT origin, slot_name, publication, manifest, end_lsn "
-                                         "FROM " checkpoint-table " WHERE id = 1"))]
-    (when-not (= "42P01" (.-sqlstate reply))
-      (when-let [row (first (.-rows (checked-result reply)))]
-        (let [[origin slot publication manifest end-lsn] row]
-          {:origin (edn/read-string origin) :slot slot :publication publication
-           :manifest (some-> manifest edn/read-string) :end-lsn end-lsn})))))
+(def ^:private checkpoint-id pgs/mirror-checkpoint-id)
+
+(defn- checkpoint-attr [field]
+  ;; SQL relations address attributes by namespace. These attributes
+  ;; have no namespace and can only be read through the embedded store.
+  (keyword (str "pgdh-mirror-" (name field))))
+
+(defn- checkpoint-entity [db]
+  (when (contains? (dbi/-schema db) (first checkpoint-id))
+    (d/entity db checkpoint-id)))
+
+(defn- checkpoint-value [entity field]
+  (let [value (get entity (checkpoint-attr field))]
+    (if (and value (#{:origin :manifest} field)) (edn/read-string value) value)))
+
+(defn- checkpoint [db]
+  (when-let [entity (checkpoint-entity db)]
+    (into {} (map (fn [field] [field (checkpoint-value entity field)])) (keys checkpoint-fields))))
+
+(defn- stage-data! [destination f]
+  (checked-result (pg/stage-tx! destination [[:db.fn/call f]])))
+
+(defn- store-checkpoint-value [field value]
+  (if (and value (#{:origin :manifest} field)) (pr-str value) value))
+
+(defn- create-checkpoint-tx [db saved]
+  (require! (nil? (checkpoint-entity db)) "Mirror checkpoint already exists" {})
+  (conj
+   (into [{:db/ident (first checkpoint-id) :db/valueType :db.type/keyword
+           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}]
+         (map (fn [[field value-type]]
+                {:db/ident (checkpoint-attr field) :db/valueType value-type
+                 :db/cardinality :db.cardinality/one}))
+         checkpoint-fields)
+   (into {(first checkpoint-id) (second checkpoint-id)}
+         (keep (fn [[field value]]
+                 (when (some? value)
+                   [(checkpoint-attr field) (store-checkpoint-value field value)])))
+         saved)))
+
+(defn- update-checkpoint! [destination expected changes]
+  (stage-data!
+   destination
+   (fn [db]
+     (let [entity (checkpoint-entity db)]
+       (require! (and entity (every? (fn [[field value]] (= value (checkpoint-value entity field))) expected))
+                 "Mirror checkpoint changed during its transaction" {:expected expected})
+       (into []
+             (keep (fn [[field value]]
+                     (let [attr (checkpoint-attr field)
+                           previous (get entity attr)
+                           stored (store-checkpoint-value field value)]
+                       (cond
+                         (= previous stored) nil
+                         (nil? stored) [:db/retract checkpoint-id attr previous]
+                         :else [:db/cas checkpoint-id attr previous stored]))))
+             changes)))))
 
 (defn- init-checkpoint! [destination origin slot publication]
-  (transaction!
-   destination
-   (fn []
-     (sink-execute! destination
-                    (str "CREATE TABLE " checkpoint-table " (id integer PRIMARY KEY, "
-                         "origin text NOT NULL, slot_name text NOT NULL, publication text NOT NULL, "
-                         "manifest text, end_lsn text, source_xid text, source_commit_micros text)"))
-     (sink-prepared! destination (str "INSERT INTO " checkpoint-table
-                                      " (id, origin, slot_name, publication) VALUES (1, ?, ?, ?)")
-                     [(pr-str origin) slot publication]))))
+  (let [saved {:origin origin :slot slot :publication publication}]
+    (transaction! destination #(stage-data! destination (fn [db] (create-checkpoint-tx db saved))))
+    saved))
 
-(defn- update-checkpoint-manifest! [destination {:keys [slot end-lsn] :as saved} manifest]
-  (transaction!
-   destination
-   (fn []
-     (let [result (sink-prepared! destination
-                                  (str "UPDATE " checkpoint-table " SET manifest = ? WHERE id = 1 AND slot_name = ? AND end_lsn = ?")
-                                  [(pr-str manifest) slot end-lsn])]
-       (require! (= 1 (affected-count result)) "Mirror checkpoint changed while recording its manifest"
-                 {:slot slot :checkpoint end-lsn}))))
+(defn- update-checkpoint-manifest! [destination saved manifest]
+  (transaction! destination #(update-checkpoint! destination (select-keys saved [:slot :end-lsn])
+                                                 {:manifest manifest}))
   (assoc saved :manifest manifest))
 
 (defn- local-column-attrs [db {:keys [name columns] :as table}]
@@ -701,9 +748,6 @@
                 (throw (ex-info "Missing local mirror column"
                                 {:table (relation-name table) :column (:name column)}))))
           columns)))
-
-(defn- stage-data! [destination f]
-  (checked-result (pg/stage-tx! destination [[:db.fn/call f]])))
 
 (defn- column-metadata-tx [db table]
   (let [attrs (local-column-attrs db table)
@@ -953,30 +997,50 @@
       (throw (SQLException. "The incomplete snapshot's slot is still active" "55006")))
     (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil))))
 
-(defn- bootstrap! [replication source destination {:keys [slot origin]} check-running!
+(defn- new-slot-name [prefix]
+  (str prefix "_" (str/replace (str (UUID/randomUUID)) "-" "")))
+
+(defn- set-table-name! [destination storage-name logical-name]
+  (stage-data! destination
+               (fn [db]
+                 (catalog-objects/rename-table-tx db (pgs/storage-table-oid db storage-name)
+                                                  logical-name))))
+
+(defn- bootstrap! [replication source destination {:keys [slot origin manifest]} check-running!
                    {:keys [failover? max-snapshot-bytes] :as config}]
   ;; The unique slot name was persisted locally before its first creation.
   (clear-incomplete-slot! source slot failover?)
-  (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)]
+  (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
+        retired (:retired-storage manifest)
+        place (fn [table]
+                (cond-> table
+                  (contains? retired (:name table))
+                  (assoc :storage-name (new-slot-name "pgdh_relation"))))]
     (with-slot-snapshot!
       replication source slot false failover?
       (fn [end-lsn]
-        (let [manifest (publication-manifest source config)]
+        (let [manifest (cond-> (-> (publication-manifest source config)
+                                   (update :tables #(mapv place %))
+                                   (update :partition-parents #(mapv place %)))
+                         (seq retired) (assoc :retired-storage retired))
+              tables (:tables manifest)
+              parents (:partition-parents manifest)]
           (transaction!
            destination
            (fn []
              (install-types! destination (:types manifest))
-             (doseq [table (:tables manifest)]
+             (doseq [table tables]
                (check-running!)
-               (create-table! destination table)
+               (create-table! destination (storage-table table))
                (copy-table! source destination table on-bytes))
-             (doseq [parent (:partition-parents manifest)]
-               (create-table! destination parent))
-             (when (seq (:partition-parents manifest))
+             (doseq [parent parents]
+               (create-table! destination (storage-table parent)))
+             (doseq [{:keys [name storage-name]} (concat tables parents) :when storage-name]
+               (set-table-name! destination storage-name name))
+             (when (seq parents)
                (install-partition-topology! destination manifest))
-             (sink-prepared! destination
-                             (str "UPDATE " checkpoint-table " SET manifest = ?, end_lsn = ?, origin = ? WHERE id = 1")
-                             [(pr-str manifest) end-lsn (pr-str origin)]))))))))
+             (update-checkpoint! destination {:slot slot :end-lsn nil}
+                                 {:manifest manifest :end-lsn end-lsn :origin origin}))))))))
 
 (defn- lsn [value] (LogSequenceNumber/valueOf (str value)))
 
@@ -1215,20 +1279,11 @@
    (fn []
      (run! #(apply-change! destination relations %) changes)
      (when install! (install! destination))
-     (let [result (sink-prepared! destination
-                                  (str "UPDATE " checkpoint-table
-                                       " SET end_lsn = ?, source_xid = ?, source_commit_micros = ?"
-                                       (when manifest ", manifest = ?")
-                                       (when origin ", origin = ?")
-                                       (when slot ", slot_name = ?")
-                                       " WHERE id = 1 AND end_lsn = ?")
-                                  (conj (cond-> [end-lsn (some-> xid str) (some-> commit-micros str)]
-                                          manifest (conj (pr-str manifest))
-                                          origin (conj (pr-str origin))
-                                          slot (conj slot))
-                                        previous))]
-       (require! (= 1 (affected-count result)) "Mirror checkpoint changed while applying a transaction"
-                 {:expected previous :next end-lsn})))))
+     (update-checkpoint! destination {:end-lsn previous}
+                         (cond-> {:end-lsn end-lsn :source-xid xid :source-commit-micros commit-micros}
+                           manifest (assoc :manifest manifest)
+                           origin (assoc :origin origin)
+                           slot (assoc :slot slot))))))
 
 (defn- replication-copy ^CopyDual [^Connection replication slot publication confirmed-lsn]
   (let [^BaseConnection base (.unwrap replication BaseConnection)
@@ -1346,9 +1401,6 @@
 
 (defn- checked-running-slot! [source slot state failover?]
   (publish-status! state (usable-slot! source slot failover?)))
-
-(defn- new-slot-name [prefix]
-  (str prefix "_" (str/replace (str (UUID/randomUUID)) "-" "")))
 
 (defn- tables-by-id [manifest]
   (into {} (map (juxt :relation-id identity)) (:tables manifest)))
@@ -1973,12 +2025,6 @@
         (if error (throw error) position)
         (recur)))))
 
-(defn- set-table-name! [destination storage-name logical-name]
-  (stage-data! destination
-               (fn [db]
-                 (catalog-objects/rename-table-tx db (pgs/storage-table-oid db storage-name)
-                                                  logical-name))))
-
 (defn- retire-table! [destination table]
   ;; Keep the old attributes and entities for AS OF. The catalog advances
   ;; to a fresh storage name if the publisher later reuses the SQL name.
@@ -2008,6 +2054,37 @@
                              [:datahike.pg.partition/definition :datahike.pg.partition/parent-oid
                               :datahike.pg.partition/key :datahike.pg.partition/key-definition
                               :datahike.pg.partition/bound]))))))))
+
+(def ^:private legacy-checkpoint-columns
+  ["id" "origin" "slot_name" "publication" "manifest" "end_lsn" "source_xid" "source_commit_micros"])
+
+(defn- upgrade-checkpoint! [conn destination]
+  (let [db (d/db conn)
+        columns (pgs/registered-columns db "checkpoint")]
+    (when (and (nil? (checkpoint-entity db)) (seq columns))
+      (require! (= legacy-checkpoint-columns (mapv :datahike.pg.column/name columns))
+                "Unexpected checkpoint relation in the mirror store" {})
+      (let [entity-id (d/q '[:find ?entity .
+                             :where [?entity :checkpoint/id 1]] db)
+            {:checkpoint/keys [origin slot_name publication manifest end_lsn source_xid source_commit_micros]}
+            (when entity-id (d/entity db entity-id))
+            saved {:origin (some-> origin edn/read-string) :slot slot_name :publication publication
+                   :manifest (some-> manifest edn/read-string) :end-lsn end_lsn
+                   :source-xid (some-> source_xid parse-long)
+                   :source-commit-micros (some-> source_commit_micros parse-long)}]
+        (require! (and entity-id (map? (:origin saved)) (seq slot_name) (seq publication)
+                       (or (nil? end_lsn) (map? (:manifest saved))))
+                  "Invalid legacy mirror checkpoint" {})
+        (transaction!
+         destination
+         (fn []
+           (stage-data! destination
+                        #(create-checkpoint-tx %
+                                               (-> saved
+                                                   (assoc :legacy-checkpoint true)
+                                                   (update-in [:manifest :retired-storage] (fnil conj #{}) "checkpoint"))))
+           (retire-table! destination {:schema "public" :name "checkpoint"})
+           (stage-data! destination (constantly [[:db/retractEntity entity-id]]))))))))
 
 (defn- update-type-names-tx [db removals edits]
   (let [rename-ops (into []
@@ -2193,7 +2270,7 @@
                       (:invalidation slot-status) (assoc :invalidation (:invalidation slot-status)))]
     (update-checkpoint-manifest! destination saved (assoc manifest :pending-recovery reservation))))
 
-(defn- recover-checkpoint! [replication source destination saved origin state check-running!
+(defn- recover-checkpoint! [replication source conn destination saved origin state check-running!
                             {:keys [failover? schema-refresh? max-snapshot-bytes resnapshot-on-slot-loss?] :as config}]
   (let [{old-slot :slot previous :manifest :keys [end-lsn]} saved
         {new-slot :slot :as pending} (:pending-recovery previous)
@@ -2232,12 +2309,12 @@
                 (apply-commit! destination {} end-lsn
                                {:end-lsn position :manifest manifest :origin origin :slot new-slot
                                 :install! #(install-staged-tables! (merge stage plan) % check-running! max-snapshot-bytes)})))))
-        (checkpoint destination)
+        (checkpoint (d/db conn))
         (finally
           (close-stage-store! stage)
           (swap! state dissoc :recovery))))))
 
-(defn- resumable-checkpoint! [replication source destination saved origin state check-running!
+(defn- resumable-checkpoint! [replication source conn destination saved origin state check-running!
                               {:keys [failover? resnapshot-on-slot-loss? slot-prefix] :as config}]
   (let [timeline-changed? (not= (:origin saved) origin)
         {:keys [info reserved]}
@@ -2249,7 +2326,7 @@
                    {:reserved (recovery-reservation! destination saved slot-prefix error)}
                    (throw error)))))
         saved (if reserved
-                (recover-checkpoint! replication source destination reserved origin state check-running! config)
+                (recover-checkpoint! replication source conn destination reserved origin state check-running! config)
                 saved)
         info (or info (validate-resume! source saved failover? false))]
     (swap! state assoc :last-recovery (peek (get-in saved [:manifest :recovery-gaps])))
@@ -2430,17 +2507,16 @@
         (swap! state dissoc :refresh)))))
 
 (defn- replicate! [{:keys [source-url publication leaf-publication slot-prefix failover?] :as config}
-                   destination state check-running! ready!]
+                   conn destination state check-running! ready!]
   (with-publisher
     source-url
     (fn [replication source]
       (let [origin (source-identity replication source)
-            saved (or (checkpoint destination)
+            saved (or (checkpoint (d/db conn))
                       (let [slot (new-slot-name slot-prefix)]
                       ;; Validate before creating a slot that pins WAL.
                         (poll-publication-manifest source config nil false)
-                        (init-checkpoint! destination origin slot publication)
-                        (checkpoint destination)))]
+                        (init-checkpoint! destination origin slot publication)))]
         (require! (= publication (:publication saved)) "The mirror belongs to a different publication"
                   {:reason :different-publication :saved-publication (:publication saved)})
         (when (:end-lsn saved)
@@ -2462,9 +2538,9 @@
                         (swap! state assoc :state :snapshot)
                         (bootstrap! replication source destination (assoc saved :origin origin)
                                     check-running! config)
-                        (checkpoint destination)))
+                        (checkpoint (d/db conn))))
               {{:keys [slot end-lsn] :as saved} :saved {:keys [confirmed-lsn] :as info} :info}
-              (resumable-checkpoint! replication source destination saved origin state check-running! config)]
+              (resumable-checkpoint! replication source conn destination saved origin state check-running! config)]
           (publish-status! state info)
           (swap! state assoc :state :catching-up :slot slot :applied-lsn end-lsn
                  :source-timeline (get-in saved [:origin :timeline]))
@@ -2522,10 +2598,11 @@
                    (swap! state assoc :state :following :port (.getPort server) :last-error nil)))]
     (try
       (with-open [destination (pg/make-query-handler conn)]
+        (upgrade-checkpoint! conn destination)
         (loop [retry-ms 250]
           (when-not @stopping?
             (let [error (try
-                          (replicate! config destination state check-running! ready!)
+                          (replicate! config conn destination state check-running! ready!)
                           (catch Exception e e))]
               (when-not @stopping?
                 (let [retry? (or (retryable? error)

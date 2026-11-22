@@ -2336,7 +2336,7 @@
   (let [table (some-> (.getTable c) .getName unquote-ident str/lower-case)
         col (str/lower-case (unquote-ident (.getColumnName c)))
         matches (keep (fn [[k attr]]
-                        (when (and (keyword? k)
+                        (when (and (qualified-keyword? k)
                                    (= col (str/lower-case (name k)))
                                    (or (nil? table)
                                        (= table (str/lower-case (namespace k)))
@@ -2393,14 +2393,14 @@
                         (let [a (str/lower-case alias)
                               c (str/lower-case col)]
                           (or (some (fn [k]
-                                      (let [ns (when (keyword? k)
+                                      (let [ns (when (qualified-keyword? k)
                                                  (str/lower-case (namespace k)))]
                                         (when (and ns (= c (str/lower-case (name k)))
                                                    (= ns a))
                                           ns)))
                                     (keys schema))
                               (some (fn [k]
-                                      (let [ns (when (keyword? k)
+                                      (let [ns (when (qualified-keyword? k)
                                                  (str/lower-case (namespace k)))]
                                         (when (and ns (= c (str/lower-case (name k)))
                                                    (str/ends-with? ns (str "__" a))
@@ -2418,7 +2418,7 @@
                                                 ns (str "__" (str/lower-case a))))
                                              outer-aliases)))))
         candidates (reduce (fn [m k]
-                             (if (and (keyword? k)
+                             (if (and (qualified-keyword? k)
                                       (not= "db-row-exists" (name k)))
                                (let [ns (str/lower-case (namespace k))]
                                  (if-let [a (alias-for-ns ns)]
@@ -3697,7 +3697,7 @@
             ;; stores `:MixedCase/...`. This also fixes a latent
             ;; inconsistency: `t` was lowercased above and then compared
             ;; against the RAW `tname`.
-            (some (fn [[k _]] (and (keyword? k)
+            (some (fn [[k _]] (and (qualified-keyword? k)
                                    (= (str/lower-case (namespace k)) t)))
                   schema)))))
 
@@ -3712,7 +3712,7 @@
     (boolean
      (and t
           (some (fn [[k _]]
-                  (and (keyword? k)
+                  (and (qualified-keyword? k)
                        (= (str/lower-case (namespace k)) t)))
                 schema)))))
 

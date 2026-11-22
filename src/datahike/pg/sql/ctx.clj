@@ -423,12 +423,17 @@
                         (when (contains? storage->logical name)
                           (throw (ex-info (str "relation \"" name "\" does not exist")
                                           {:sqlstate "42P01" :error :undefined-table :table name}))))))
+        storage-name (or cte storage name)
+        _ (when (and (not *physical-table-names?*)
+                     (contains? (some-> params/*session-state* deref :private-storage) storage-name))
+            (throw (ex-info (str "relation \"" name "\" does not exist")
+                            {:sqlstate "42P01" :error :undefined-table :table name})))
         alias (.getAlias table)
         alias-name (when alias (params/unquote-ident (.getName ^Alias alias)))]
     {;; A schema-qualified name never names a CTE (PostgreSQL's CTEs
      ;; live in no schema), which is how an UPDATE reaches its target
      ;; table while a CTE of the same name serves the subqueries.
-     :name (or cte storage name)
+     :name storage-name
      :alias (or alias-name name)}))
 
 (defn make-ctx
