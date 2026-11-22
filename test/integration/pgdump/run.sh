@@ -52,16 +52,22 @@ if ! (exec 3<>/dev/tcp/"${DH_HOST}"/"${DH_PORT}") 2>/dev/null; then
 fi
 exec 3<&-; exec 3>&-
 
-src()  { psql -h "${SRC_HOST}" -p "${SRC_PORT}" -U "${SRC_USER}" -d "${SRC_DB}" "$@"; }
-dh()   { PGPASSWORD="${PGWIRE_PASSWORD:-datahike}" psql -h "${DH_HOST}" -p "${DH_PORT}" \
+src()  { psql -X -h "${SRC_HOST}" -p "${SRC_PORT}" -U "${SRC_USER}" -d "${SRC_DB}" "$@"; }
+dh()   { PGPASSWORD="${PGWIRE_PASSWORD:-datahike}" psql -X -h "${DH_HOST}" -p "${DH_PORT}" \
              -U "${DH_USER}" -d "${DH_DB}" "$@"; }
 
 : > "${LOG}"
 
 echo "[1/4] seeding source PostgreSQL with pagila"
-src -q -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;" >>"${LOG}" 2>&1
-src -q -f "${FIXTURES}/pagila-schema.sql" >>"${LOG}" 2>&1
-src -q -f "${FIXTURES}/pagila-data.sql"   >>"${LOG}" 2>&1
+if ! {
+  src -v ON_ERROR_STOP=1 -q -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;" &&
+  src -v ON_ERROR_STOP=1 -q -f "${FIXTURES}/pagila-schema.sql" &&
+  src -v ON_ERROR_STOP=1 -q -f "${FIXTURES}/pagila-data.sql"
+} >>"${LOG}" 2>&1; then
+  echo "ERROR: could not seed PostgreSQL with Pagila" >&2
+  tail -40 "${LOG}" >&2
+  exit 1
+fi
 
 echo "[2/4] pg_dump (DEFAULT format — COPY, not --inserts)"
 dump_err="${HERE}/last-pgdump.err"
@@ -89,7 +95,11 @@ fi
 echo "[3/4] restoring into pg-datahike"
 # Its OWN log: the seeding steps above also write errors, and counting
 # them together made the restore look far worse than it is.
-dh -q -f "${DUMP}" > "${RESTORE_LOG}" 2>&1
+if ! dh -q -f "${DUMP}" > "${RESTORE_LOG}" 2>&1; then
+  echo "ERROR: psql could not finish loading the dump" >&2
+  tail -40 "${RESTORE_LOG}" >&2
+  exit 1
+fi
 cat "${RESTORE_LOG}" >> "${LOG}"
 ddl_errors=$(grep -c 'ERROR' "${RESTORE_LOG}")
 echo "      ${ddl_errors} statement errors (unsupported DDL is expected)"
@@ -107,26 +117,37 @@ echo "[4/4] comparing per-table row counts"
 # counterpart here: pg_dump emits each partition as a plain CREATE TABLE
 # plus ATTACH PARTITION, so the rows land in the partitions. Compare
 # every ordinary table, partitions included.
-tables=$(src -At -c "
+if ! tables=$(src -At -c "
   SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 'public' AND c.relkind = 'r'
      AND c.oid NOT IN (SELECT inhparent FROM pg_inherits)
-   ORDER BY 1")
+   ORDER BY 1" 2>>"${LOG}") || [[ -z "${tables}" ]]; then
+  echo "ERROR: no source tables were discovered for comparison" >&2
+  tail -40 "${LOG}" >&2
+  exit 1
+fi
 
 fail="${data_errors:-0}"; checked=0
-for t in ${tables}; do
-  s=$(src -At -c "SELECT count(*) FROM \"${t}\"" 2>/dev/null | head -1)
-  d=$(dh  -At -c "SELECT count(*) FROM \"${t}\"" 2>/dev/null | head -1)
+while IFS= read -r table; do
+  quoted="${table//\"/\"\"}"
+  query="SELECT count(*) FROM public.\"${quoted}\""
+  if ! source_count=$(src -At -c "${query}" 2>>"${LOG}") ||
+     ! mirror_count=$(dh -At -c "${query}" 2>>"${LOG}") ||
+     [[ ! "${source_count}" =~ ^[0-9]+$ || ! "${mirror_count}" =~ ^[0-9]+$ ]]; then
+    echo "  ERROR could not compare row counts for ${table}"
+    fail=$((fail + 1))
+    continue
+  fi
   checked=$((checked + 1))
-  if [[ "${s}" != "${d}" ]]; then
-    echo "  MISMATCH ${t}: source=${s} pg-datahike=${d}"
+  if [[ "${source_count}" != "${mirror_count}" ]]; then
+    echo "  MISMATCH ${table}: source=${source_count} pg-datahike=${mirror_count}"
     fail=$((fail + 1))
   fi
-done
+done <<<"${tables}"
 
 echo
-echo "SUMMARY: ${checked} tables compared, ${fail} mismatched"
-if [[ "${fail}" -ne 0 ]]; then
+echo "SUMMARY: ${checked} tables compared, ${fail} failures"
+if [[ "${fail}" -ne 0 || "${checked}" -eq 0 ]]; then
   echo "Full output in ${LOG}"
   exit 1
 fi

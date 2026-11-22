@@ -116,11 +116,11 @@ else
 fi
 # shellcheck disable=SC1091
 source "${ODOO_VENV}/bin/activate"
+ODOO_RC=0
 PYTHONPATH="${ODOO_ROOT}:${PYTHONPATH:-}" \
   python "${ODOO_ROOT}/odoo-bin" \
     "${ODOO_ARGS[@]}" \
-    >>"${LOG}" 2>&1 || true   # don't trip set -e — we parse the log
-ODOO_RC=$?
+    >>"${LOG}" 2>&1 || ODOO_RC=$?
 
 # ---- parse the log --------------------------------------------------------
 # Init-only mode: skip the test parser entirely. Success criterion is
