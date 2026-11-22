@@ -8,6 +8,7 @@
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.constraints.unique :as unique]
             [datahike.pg.jsonb :as jsonb]
+            [datahike.pg.mirror.spool :as spool]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg]
             [datahike.pg.sql.ctx :as ctx]
@@ -794,6 +795,7 @@
   (Long/compareUnsigned (.asLong (lsn a)) (.asLong (lsn b))))
 
 (defn- byte-char [^ByteBuffer buffer] (char (bit-and 0xff (.get buffer))))
+(defn- frame-tag [^ByteBuffer buffer] (char (bit-and 0xff (.get buffer (.position buffer)))))
 (defn- uint32 [^ByteBuffer buffer] (Integer/toUnsignedLong (.getInt buffer)))
 (defn- uint16 [^ByteBuffer buffer] (Short/toUnsignedInt (.getShort buffer)))
 (defn- read-lsn [^ByteBuffer buffer] (.asString (LogSequenceNumber/valueOf (.getLong buffer))))
@@ -823,19 +825,34 @@
   (require! (contains? permitted actual) "Unexpected pgoutput tuple kind" {:actual actual})
   (read-tuple buffer))
 
+(def ^:private streamed-tags #{\R \Y \I \U \D \T \M})
+
+(defn- decode-commit [^ByteBuffer buffer]
+  (let [flags (.get buffer)
+        commit-lsn (read-lsn buffer)
+        end-lsn (read-lsn buffer)]
+    (require! (and (zero? flags) (not (neg? (compare-lsn end-lsn commit-lsn))))
+              "Invalid pgoutput commit position or flags" {:flags flags :commit-lsn commit-lsn :end-lsn end-lsn})
+    {:commit-lsn commit-lsn :end-lsn end-lsn :commit-micros (.getLong buffer)}))
+
 (defn- decode
-  "Decode one unstreamed pgoutput v1 message. Text fields retain their SQL
-   input spelling. An unchanged TOAST field carries a distinct marker."
-  [^ByteBuffer buffer]
+  "Decode one pgoutput v2 message. Text fields retain their SQL spelling."
+  [^ByteBuffer buffer in-segment?]
   (let [tag (byte-char buffer)
+        _ (when (and in-segment? (streamed-tags tag)) (uint32 buffer))
         message
         (case tag
           \B {:op :begin :commit-lsn (read-lsn buffer)
               :commit-micros (.getLong buffer) :xid (uint32 buffer)}
-          \C (let [flags (.get buffer)]
-               (require! (zero? flags) "Unsupported commit flags" {:flags flags})
-               {:op :commit :commit-lsn (read-lsn buffer) :end-lsn (read-lsn buffer)
-                :commit-micros (.getLong buffer)})
+          \C (assoc (decode-commit buffer) :op :commit)
+          \S (let [xid (uint32 buffer)
+                   first-segment (.get buffer)]
+               (require! (and (pos? xid) (#{0 1} first-segment)) "Invalid pgoutput stream start" {:xid xid})
+               {:op :stream-start :xid xid :first? (= 1 first-segment)})
+          \E {:op :stream-stop}
+          \c (let [xid (uint32 buffer)]
+               (assoc (decode-commit buffer) :op :stream-commit :xid xid))
+          \A {:op :stream-abort :xid (uint32 buffer) :subxid (uint32 buffer)}
           \R (let [relation-id (uint32 buffer)
                    schema (read-cstr buffer)
                    name (read-cstr buffer)
@@ -955,8 +972,7 @@
   (transaction!
    destination
    (fn []
-     (doseq [change changes]
-       (apply-change! destination relations change))
+     (run! #(apply-change! destination relations %) changes)
      (when install! (install! destination))
      (let [result (sink-prepared! destination
                                   (str "UPDATE " checkpoint-table
@@ -976,7 +992,7 @@
 (defn- replication-copy ^CopyDual [^Connection replication slot publication confirmed-lsn]
   (let [^BaseConnection base (.unwrap replication BaseConnection)
         command (str "START_REPLICATION SLOT " (ident slot) " LOGICAL " (.asString (lsn confirmed-lsn))
-                     " (proto_version '1', publication_names " (literal publication) ", messages 'true')")
+                     " (proto_version '2', streaming 'on', publication_names " (literal publication) ", messages 'true')")
         copy (.startCopy (.getQueryExecutor base) command true)]
     (require! (instance? CopyDual copy) "Expected replication COPY BOTH response" {})
     copy))
@@ -1395,77 +1411,144 @@
       (assoc message :relation-ids (vec ids)))
     (when (included? relation-id) message)))
 
+(defn- change-relation-ids [{:keys [op relation-id relation-ids]}]
+  (if (= :truncate op) relation-ids [relation-id]))
+
+(def ^:private streamed-row-ops {\I :insert \U :update \D :delete})
+
+(defn- index-stream-frame [^ByteBuffer frame]
+  (if-let [op (streamed-row-ops (frame-tag frame))]
+    ;; Shape and selection only need the relation header on the first pass.
+    (do (.position frame (+ 5 (.position frame)))
+        {:op op :relation-id (uint32 frame)})
+    (decode frame true)))
+
+(defn- streamed-transaction [journal xid relations select-change! barrier? consume-frame!]
+  (let [frames (eduction (map (fn [frame] (consume-frame!) frame)) (spool/frames journal xid))
+        plan (reduce (fn [plan {:keys [op relation-id payload transactional?] :as message}]
+                       (case op
+                         :relation (assoc-in plan [:relations relation-id] message)
+                         :message (if (and transactional? payload (barrier? payload))
+                                    (update plan :barriers conj payload)
+                                    plan)
+                         (:origin :type) plan
+                         (if-let [change (select-change! message)]
+                           (update plan :relation-ids into (change-relation-ids change))
+                           plan)))
+                     {:relations relations :relation-ids #{} :barriers #{}}
+                     (eduction (map index-stream-frame) frames))
+        changes (eduction (keep (fn [frame]
+                                  (let [tag (frame-tag frame)]
+                                    (when (or (streamed-row-ops tag) (= \T tag))
+                                      (select-change! (decode frame true))))))
+                          frames)]
+    (assoc plan :changes changes :bytes (spool/byte-size journal xid))))
+
 (defn- stream!
-  "Read ordered protocol v1 transactions. A commit is acknowledged after its
+  "Read pgoutput v2 transactions. A commit is acknowledged after its
    callback succeeds. Returning true from commit! ends this stream."
-  [copy end-lsn confirmed-lsn max-transaction-bytes
-   {:keys [tick! relation-frame! select-change! barrier? commit!]}]
-  (let [last-packet (volatile! (System/nanoTime))
+  [copy end-lsn confirmed-lsn {:keys [max-transaction-bytes spool-store]}
+   {:keys [tick! check-running! select-change! barrier? commit!]}]
+  (let [journal (spool/session spool-store max-transaction-bytes)
+        last-packet (volatile! (System/nanoTime))
         next-feedback (volatile! 0)
         feedback-position (volatile! confirmed-lsn)
         reply! (fn [request-reply?]
                  (feedback! copy @feedback-position request-reply?)
-                 (vreset! next-feedback (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 1))))]
-    (loop [relations {} pending nil durable end-lsn]
-      (tick! (nil? pending))
-      (when (>= (System/nanoTime) @next-feedback)
-        (reply! true))
-      (let [{:keys [^ByteBuffer data reply?] :as packet} (read-packet copy)]
-        (when packet (vreset! last-packet (System/nanoTime)))
-        (when reply? (reply! false))
-        (if data
-          (let [size (.remaining data)
-                {:keys [op relation-id end-lsn transactional? payload] :as message} (decode data)]
-            (case op
-              :relation
-              (do
-                (relation-frame! message)
-                (recur (assoc relations relation-id message) pending durable))
+                 (vreset! next-feedback (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 1))))
+        heartbeat! (fn []
+                     (when (>= (System/nanoTime) @next-feedback) (reply! true)))
+        consume-frame! (fn [] (check-running!) (heartbeat!))
+        finish! (fn [relations durable {:keys [end-lsn] :as transaction}]
+                  (let [new? (pos? (compare-lsn end-lsn durable))
+                        stop? (when new? (commit! relations durable transaction))]
+                    (when (pos? (compare-lsn end-lsn @feedback-position))
+                      (vreset! feedback-position end-lsn))
+                    (reply! false)
+                    [stop? (if new? end-lsn durable)]))]
+    (try
+      (loop [relations {} pending nil segment nil durable end-lsn]
+        (tick! (and (nil? pending) (nil? segment)))
+        (heartbeat!)
+        (let [{:keys [^ByteBuffer data reply?] :as packet} (read-packet copy)]
+          (when packet (vreset! last-packet (System/nanoTime)))
+          (when reply? (reply! false))
+          (if data
+            (let [size (.remaining data)
+                  tag (frame-tag data)]
+              (if (and segment (streamed-tags tag))
+                (let [subxid (Integer/toUnsignedLong (.getInt data (inc (.position data))))]
+                  (require! (pos? subxid) "Invalid streamed change transaction ID" {:xid segment})
+                  (spool/append! journal segment subxid data)
+                  (recur relations pending segment durable))
+                (let [{:keys [op xid subxid first? relation-id end-lsn transactional? payload] :as message}
+                      (decode data false)]
+                  (require! (or (nil? segment) (#{:stream-stop :origin} op))
+                            "Unexpected message inside a streamed segment" {:operation op :xid segment})
+                  (case op
+                    :stream-start
+                    (do (require! (nil? pending) "Stream started inside an ordinary transaction" {:xid xid})
+                        (spool/begin-segment! journal xid first?)
+                        (recur relations nil xid durable))
 
-              :begin
-              (do
-                (require! (nil? pending) "Received BEGIN before the previous COMMIT" {})
-                (recur relations (assoc message :changes [] :bytes 0) durable))
+                    :stream-stop
+                    (do (require! segment "Stream stopped outside a streamed segment" {})
+                        (spool/end-segment! journal)
+                        (recur relations pending nil durable))
 
-              (:origin :type)
-              (recur relations pending durable)
+                    :stream-abort
+                    (do (require! (nil? pending) "Stream aborted inside an ordinary transaction" {:xid xid})
+                        (spool/abort! journal xid subxid)
+                        (recur relations nil nil durable))
 
-              :message
-              (recur relations (if (and transactional? payload (barrier? payload))
-                                 (do
-                                   (require! pending "Received a transactional message outside a transaction" {})
-                                   (update pending :barriers (fnil conj #{}) payload))
-                                 pending)
-                     durable)
+                    :stream-commit
+                    (do
+                      (require! (nil? pending) "Stream committed inside an ordinary transaction" {:xid xid})
+                      (let [{committed-relations :relations :as plan}
+                            (streamed-transaction journal xid relations select-change! barrier? consume-frame!)
+                            [stop? position] (finish! committed-relations durable (merge message (dissoc plan :relations)))]
+                        (spool/discard! journal xid)
+                        (if stop? position (recur committed-relations nil nil position))))
 
-              :commit
-              (do
-                (require! (and pending (= (:commit-lsn pending) (:commit-lsn message))
-                               (= (:commit-micros pending) (:commit-micros message))
-                               (not (neg? (compare-lsn end-lsn (:commit-lsn message)))))
-                          "pgoutput COMMIT did not match BEGIN" {:commit message})
-                (let [new? (pos? (compare-lsn end-lsn durable))
-                      stop? (when new? (commit! relations durable (assoc pending :end-lsn end-lsn)))]
-                  (when (pos? (compare-lsn end-lsn @feedback-position))
-                    (vreset! feedback-position end-lsn))
-                  (reply! false)
-                  (if stop? end-lsn (recur relations nil (if new? end-lsn durable)))))
+                    :relation (recur (assoc relations relation-id message) pending segment durable)
 
-              (let [bytes (+ (or (:bytes pending) 0) size)]
-                (require! pending "Received a change outside a pgoutput transaction" {:operation op})
-                (require! (<= bytes max-transaction-bytes) "Transaction exceeds the configured byte limit"
-                          {:xid (:xid pending) :limit max-transaction-bytes})
-                (recur relations
-                       (let [change (select-change! message)]
-                         (cond-> (assoc pending :bytes bytes)
-                           change (update :changes conj change)))
-                       durable))))
-          (do
-            (when-not packet
-              (when (> (- (System/nanoTime) @last-packet) (.toNanos TimeUnit/SECONDS 30))
-                (throw (SQLException. "Timed out waiting for publisher replication traffic" "08006")))
-              (Thread/sleep 20))
-            (recur relations pending durable)))))))
+                    :begin
+                    (do (require! (nil? pending) "Received BEGIN before the previous COMMIT" {})
+                        (recur relations (assoc message :changes [] :relation-ids #{} :bytes 0) nil durable))
+
+                    (:origin :type) (recur relations pending segment durable)
+
+                    :message
+                    (recur relations (if (and transactional? payload (barrier? payload))
+                                       (do (require! pending "Received a transactional message outside a transaction" {})
+                                           (update pending :barriers (fnil conj #{}) payload))
+                                       pending)
+                           nil durable)
+
+                    :commit
+                    (do (require! (and pending (= (:commit-lsn pending) (:commit-lsn message))
+                                       (= (:commit-micros pending) (:commit-micros message)))
+                                  "pgoutput COMMIT did not match BEGIN" {:commit message})
+                        (let [[stop? position] (finish! relations durable (assoc pending :end-lsn end-lsn))]
+                          (if stop? position (recur relations nil nil position))))
+
+                    (let [bytes (+ (or (:bytes pending) 0) size)]
+                      (require! pending "Received a change outside a pgoutput transaction" {:operation op})
+                      (require! (<= bytes max-transaction-bytes) "Transaction exceeds the configured byte limit"
+                                {:xid (:xid pending) :limit max-transaction-bytes})
+                      (recur relations
+                             (let [change (select-change! message)]
+                               (cond-> (assoc pending :bytes bytes)
+                                 change (update :changes conj change)
+                                 change (update :relation-ids into (change-relation-ids change))))
+                             nil durable))))))
+            (do
+              (when-not packet
+                (when (> (- (System/nanoTime) @last-packet) (.toNanos TimeUnit/SECONDS 30))
+                  (throw (SQLException. "Timed out waiting for publisher replication traffic" "08006")))
+                (Thread/sleep 20))
+              (recur relations pending segment durable)))))
+      (finally (spool/close! journal)))))
 
 (defn- set-copy-format! [destination]
   (sink-execute! destination "SET DateStyle = 'ISO, YMD'")
@@ -1484,7 +1567,7 @@
          (check-running!)
          (copy-table! source destination table on-bytes))))))
 
-(defn- stage-tables! [{:keys [source-url publication max-snapshot-bytes max-transaction-bytes]}
+(defn- stage-tables! [{:keys [source-url publication max-snapshot-bytes] :as config}
                       origin manifest {:keys [conn changes tables barrier phase]} check-running!]
   (with-publisher
     source-url
@@ -1505,19 +1588,19 @@
               included? (set (keys expected))]
           (reset! phase :catching-up)
           (stream! (replication-copy replication slot publication end-lsn)
-                   end-lsn end-lsn max-transaction-bytes
+                   end-lsn end-lsn config
                    {:tick! (fn [_] (check-running!))
+                    :check-running! check-running!
                     :barrier? #(= barrier %)
-                    :relation-frame! (fn [{:keys [relation-id] :as message}]
-                                       (when-let [table (get expected relation-id)]
-                                         (require! (matches-relation? table message)
-                                                   "Staged relation changed" {:relation relation-id})))
                     :select-change! #(select-change included? %)
-                    :commit! (fn [_ _ {:keys [changes bytes barriers]}]
-                               (when (seq changes)
+                    :commit! (fn [relations _ {:keys [changes relation-ids bytes barriers]}]
+                               (doseq [id relation-ids]
+                                 (require! (matches-relation? (get expected id) (get relations id))
+                                           "Staged relation changed" {:relation id}))
+                               (when (seq relation-ids)
                                  (on-bytes bytes)
                                  (transaction! destination
-                                               #(doseq [change changes] (apply-change! destination expected change))))
+                                               #(run! (fn [change] (apply-change! destination expected change)) changes)))
                                (contains? barriers barrier))}))))))
 
 (defn- open-stage-store []
@@ -1654,9 +1737,6 @@
       (when refresh-topology?
         (install-partition-topology! destination installed-manifest)))))
 
-(defn- changed-relation-ids [changes]
-  (into #{} (mapcat #(if (= :truncate (:op %)) (:relation-ids %) [(:relation-id %)])) changes))
-
 (defn- installed-manifest [current previous changes removed type-changes]
   ;; Legacy tables retain their stored definitions until they participate
   ;; in a refresh. Observing their source metadata does not install it.
@@ -1791,7 +1871,7 @@
 
 (defn- consume! [copy source destination saved origin state confirmed-lsn check-running! ready! config]
   (let [{:keys [manifest end-lsn publication slot]} saved
-        {:keys [max-transaction-bytes max-snapshot-bytes schema-refresh? failover?]} config
+        {:keys [max-snapshot-bytes schema-refresh? failover?]} config
         origin-update (volatile! (when (not= (:origin saved) origin) origin))
         applied (volatile! manifest)
         durable (volatile! end-lsn)
@@ -1830,9 +1910,8 @@
                              (vreset! stage (merge (start-refresh! config origin current changes check-running!) install))
                              (vreset! stage-signaled? false)))))))
         live? (fn [id] (and (contains? @live id) (not (contains? @pending-schema id))))
-        validate-transaction! (fn [relations changes]
-                                (let [ids (changed-relation-ids changes)
-                                      stale? (fn [id]
+        validate-transaction! (fn [relations ids]
+                                (let [stale? (fn [id]
                                                (or (and (not (contains? @observed id)) (not (contains? @live id)))
                                                    (and (live? id)
                                                         (not (matches-relation? (get @live id)
@@ -1864,11 +1943,11 @@
 
                                         (not= @pending-schema (or (:pending-schema @applied) {}))
                                         (assoc @applied :pending-schema @pending-schema))
-                            changes (into [] (keep #(select-change live? %)) (:changes transaction))
-                            relations (into {} (map (fn [id] [id (storage-table (get @live id))]))
-                                            (changed-relation-ids changes))]
+                            ids (into #{} (filter live?) (:relation-ids transaction))
+                            changes (eduction (keep #(select-change live? %)) (:changes transaction))
+                            relations (into {} (map (fn [id] [id (storage-table (get @live id))])) ids)]
                         (apply-commit! destination relations previous
-                                       (cond-> (assoc transaction :changes changes)
+                                       (cond-> (assoc transaction :changes changes :relation-ids ids)
                                          candidate (assoc :manifest candidate)
                                          @origin-update (assoc :origin @origin-update)
                                          cutover?
@@ -1880,7 +1959,7 @@
     (swap! state assoc :last-schema-refresh (:last-schema-refresh manifest))
     (try
       (stream!
-       copy end-lsn confirmed-lsn max-transaction-bytes
+       copy end-lsn confirmed-lsn config
        {:tick! (fn [between-transactions?]
                  (check-running!)
                  (let [now (System/nanoTime)]
@@ -1904,12 +1983,12 @@
                          (emit-barrier! source (:barrier active))
                          (vreset! stage-signaled? true))))))
         :barrier? (fn [payload] (or (= initial payload) (= (:barrier @stage) payload)))
-        :relation-frame! (constantly nil)
+        :check-running! check-running!
         :select-change! identity
-        :commit! (fn [relations previous {:keys [end-lsn xid commit-micros barriers changes] :as transaction}]
+        :commit! (fn [relations previous {:keys [end-lsn xid commit-micros barriers relation-ids] :as transaction}]
                    ;; A reconnect can decode old relation layouts below the
                    ;; durable checkpoint. Validate only changes we will apply.
-                   (validate-transaction! relations changes)
+                   (validate-transaction! relations relation-ids)
                    (let [active @stage
                          cutover? (contains? barriers (:barrier active))
                          initial? (contains? barriers initial)]
@@ -2074,16 +2153,17 @@
   "Start a PostgreSQL 18 subscriber. Bootstrap and catch-up run asynchronously.
    The :server options are passed to the read-only pgwire listener after catch-up.
    Monitor with status and release resources with stop!. Use a dedicated :store-path."
-  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes schema-refresh? failover?
+  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes max-stream-spool-bytes schema-refresh? failover?
            resnapshot-on-slot-loss?]
     :or {slot-prefix "pgdh_mirror"
          max-snapshot-bytes (* 128 1024 1024)
-         max-transaction-bytes (* 64 1024 1024)}
+         max-transaction-bytes (* 64 1024 1024)
+         max-stream-spool-bytes (* 1024 1024 1024)}
     :as config}]
   (validate-source-options! source-url publication)
   (require! (and (string? slot-prefix) (re-matches #"[a-z0-9_]{1,30}" slot-prefix)
                  (string? store-path) (seq store-path)
-                 (pos-int? max-snapshot-bytes) (pos-int? max-transaction-bytes))
+                 (pos-int? max-snapshot-bytes) (pos-int? max-transaction-bytes) (pos-int? max-stream-spool-bytes))
             "Expected a store path, slot prefix and positive byte limits" {})
   (require! (or (nil? schema-refresh?) (boolean? schema-refresh?))
             "Expected a boolean schema-refresh? option" {})
@@ -2094,8 +2174,9 @@
                  (not-any? #(get server %) [:database-template :on-create-database :on-delete-database]))
             "Mirror listeners do not support database provisioning" {})
   (let [directory (.getCanonicalPath (io/file store-path))
+        spool-store (spool/store directory max-stream-spool-bytes)
         config (assoc config :slot-prefix slot-prefix :max-snapshot-bytes max-snapshot-bytes
-                      :max-transaction-bytes max-transaction-bytes)
+                      :max-transaction-bytes max-transaction-bytes :spool-store spool-store)
         state (atom {:state :starting :publication publication})
         stopping? (atom false)]
     (io/make-parents (str directory ".mirror-lock"))
@@ -2104,6 +2185,7 @@
                   (fn []
                     (try
                       (with-open [_ lock]
+                        (spool/prepare! spool-store)
                         (let [conn (open-store directory)]
                           (try (serve! config conn state stopping?)
                                (finally (d/release conn)))))
@@ -2112,13 +2194,13 @@
                         (swap! state assoc :state :failed :port nil :last-error (mirror-error e)))))
                   "pg-datahike-logical-subscriber")]
       (.start worker)
-      {:state state :stopping? stopping? :worker worker})))
+      {:state state :stopping? stopping? :worker worker :spool-bytes (:bytes spool-store)})))
 
 (defn status
   "Return the mirror's current state and progress. The source timestamp is
    measured in microseconds since PostgreSQL's 2000-01-01 UTC epoch."
-  [{:keys [state]}]
-  @state)
+  [{:keys [state spool-bytes]}]
+  (assoc @state :spooled-bytes @spool-bytes))
 
 (defn stop!
   "Stop following and close the read-only listener. The durable checkpoint

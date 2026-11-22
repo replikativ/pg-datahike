@@ -198,11 +198,23 @@ state. When a connection drops, the worker reconnects with backoff and catches
 up from its durable checkpoint. A missing slot, an invalidated slot, or a
 confirmation ahead of the checkpoint pauses the mirror by default.
 
-Snapshot and transaction buffering are bounded by `:max-snapshot-bytes` and
+Snapshot and transaction sizes are bounded by `:max-snapshot-bytes` and
 `:max-transaction-bytes`. The defaults are 128 MiB and 64 MiB respectively.
 The worker pauses when it hits a limit. Stop the worker and adjust the limit to
 retry. Cutover and occasional idle WAL confirmation use transactional logical
 messages. Their checkpoint transactions can appear in Datahike history.
+
+The mirror uses pgoutput streaming for large transactions. It keeps their
+encoded changes in `<store-path>.mirror-spool` until commit or abort. Main
+and schema refresh streams share the `:max-stream-spool-bytes` allowance,
+which defaults to 1 GiB. Status reports the current buffered bytes under
+`:spooled-bytes`. The transaction limit also applies to each streamed
+transaction. Applying a committed stream uses one Datahike transaction,
+whose local write set still takes memory proportional to the changes.
+
+Savepoint rollbacks discard the affected portion of a spool. A restart
+clears stale spool files and replays from the durable checkpoint. WAL
+feedback advances only after the local commit is durable.
 
 Stopping a subscriber leaves its slot available for resume. After permanently
 retiring a mirror, drop its recorded slot on the publisher to release retained
@@ -284,9 +296,11 @@ forked before the checkpoint and verifies that the mirror pauses.
 Run `sh test/integration/postgres-regress/mirror-slot-recovery.sh` to check
 recovery from dropped and invalidated slots, recovery while serving reads,
 and the snapshot cutover before and after a crash.
+Run `sh test/integration/postgres-regress/mirror-publisher.sh --streaming`
+to verify interleaving, savepoint rollback, streamed schema catch-up,
+and replay after a spool limit or a crash.
 
-The next stages cover more publication types and relations and stream large
-transactions with spooling. See the
+The next stages cover more publication types and relations. See the
 [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 

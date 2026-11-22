@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.mirror :as mirror]
+            [datahike.pg.mirror.spool :as spool]
             [datahike.pg.server :as pg])
   (:import [java.io PushbackReader]
            [java.nio.file Files]
@@ -146,7 +147,7 @@
                                     (original destination relations previous transaction)
                                     (when (if refresh?
                                             (:install! transaction)
-                                            (seq (:changes transaction)))
+                                            (seq (:relation-ids transaction)))
                                       (.halt (Runtime/getRuntime) 86)))}
       (fn []
         (let [subscriber (mirror/start! config)]
@@ -1653,6 +1654,184 @@
         {:status :passed :probe :slot-recovery}
         (finally (when @subscriber (mirror/stop! @subscriber)))))))
 
+(defn- spool-files [path]
+  (filterv #(str/ends-with? (.getName ^java.io.File %) ".pgoutput")
+           (some-> (io/file (str path ".mirror-spool")) .listFiles)))
+
+(defn- stream-insert! [conn start]
+  (sql! conn (str "INSERT INTO stream_items SELECT id, payload FROM generate_series(" start "," (+ start 7)
+                  ") AS ids(id) CROSS JOIN (SELECT string_agg(md5(n::text),'') AS payload "
+                  "FROM generate_series(1,384) AS seed(n)) AS data")))
+
+(defn- flush-stream! [conn]
+  (sql! conn "SELECT pg_logical_emit_message(false, 'stream_probe', 'flush', true)"))
+
+(defn- stream-rows [conn]
+  (rows conn "SELECT id, length(payload), md5(payload) FROM stream_items ORDER BY id"))
+
+(defn- await-stream-rows! [source sink subscriber]
+  (let [expected (stream-rows source)]
+    (await! "Streamed rows did not converge"
+            #(let [status (mirror/status @subscriber)]
+               (check! (not (#{:paused :failed} (:state status))) "Mirror stopped applying streamed changes" status)
+               (and (= expected (stream-rows sink)) (zero? (:spooled-bytes status)))))))
+
+(defn- interleave-streams! [source tx-a tx-b sink subscriber path]
+  (sql! tx-a "BEGIN")
+  (stream-insert! tx-a 100)
+  (flush-stream! tx-a)
+  (await! "PostgreSQL did not send a streamed segment before commit"
+          #(pos? (:spooled-bytes (mirror/status @subscriber))))
+  (let [initial-bytes (:spooled-bytes (mirror/status @subscriber))]
+    (sql! tx-a "SAVEPOINT discard")
+    (stream-insert! tx-a 200)
+    (sql! tx-a "SAVEPOINT nested")
+    (stream-insert! tx-a 300)
+    (flush-stream! tx-a)
+    (await! "The streamed savepoint did not reach the spool"
+            #(> (:spooled-bytes (mirror/status @subscriber)) (+ initial-bytes 65536))))
+  (sql! tx-b "BEGIN")
+  (stream-insert! tx-b 400)
+  (flush-stream! tx-b)
+  (await! "Two streamed transactions were not buffered concurrently" #(= 2 (count (spool-files path))))
+  (sql! source "INSERT INTO stream_items VALUES (50,'ordinary commit')")
+  (await! "Ordinary commit was blocked behind streamed transactions"
+          #(= [["50"]] (rows sink "SELECT id FROM stream_items ORDER BY id")))
+  (sql! tx-b "COMMIT")
+  (await! "First streamed commit did not publish while the other was open"
+          #(and (= [["8"]] (rows sink "SELECT count(*) FROM stream_items WHERE id BETWEEN 400 AND 407"))
+                (= 1 (count (spool-files path)))))
+  (check! (= [["0"]] (rows sink "SELECT count(*) FROM stream_items WHERE id BETWEEN 100 AND 399"))
+          "An uncommitted streamed row was exposed" {})
+  (let [before-abort (:spooled-bytes (mirror/status @subscriber))]
+    (sql! tx-a "ROLLBACK TO SAVEPOINT discard")
+    (flush-stream! tx-a)
+    (await! "The spool did not truncate after rolling back a streamed savepoint"
+            #(< (:spooled-bytes (mirror/status @subscriber)) before-abort)))
+  (stream-insert! tx-a 500)
+  (sql! tx-a "COMMIT")
+  (await-stream-rows! source sink subscriber)
+  (check! (= [["0"]] (rows sink "SELECT count(*) FROM stream_items WHERE id BETWEEN 200 AND 399"))
+          "Nested savepoint rows survived their rollback" {})
+  (sql! tx-b "BEGIN")
+  (stream-insert! tx-b 600)
+  (flush-stream! tx-b)
+  (await! "Expected a spool for the transaction that will abort" #(seq (spool-files path)))
+  (sql! tx-b "ROLLBACK")
+  (await! "The top-level abort did not release its spool"
+          #(and (empty? (spool-files path)) (zero? (:spooled-bytes (mirror/status @subscriber)))))
+  (check! (= (stream-rows source) (stream-rows sink)) "Top-level abort changed the mirror rows" {}))
+
+(defn- streamed-history [path id]
+  (inspect-db path #(into #{} (map first)
+                          (d/q '[:find ?tx :in $ ?id :where [_ :stream_items/id ?id ?tx]] (d/history %) id))))
+
+(defn- refresh-with-streamed-catch-up! [source sink subscriber]
+  (let [copy-started (promise)
+        release-copy (promise)
+        stage-spooled (atom false)
+        copy-var #'mirror/copy-table!
+        copy-original @copy-var
+        append-var #'spool/append!
+        append-original @append-var]
+    (with-redefs-fn
+      {copy-var (fn [publisher destination table on-bytes]
+                  (when (= "stream_items" (:name table))
+                    (deliver copy-started true)
+                    (check! (deref release-copy 25000 false) "Probe did not release the refresh copy" {}))
+                  (copy-original publisher destination table on-bytes))
+       append-var (fn [& args]
+                    (when (= "pg-datahike-table-refresh" (.getName (Thread/currentThread)))
+                      (reset! stage-spooled true))
+                    (apply append-original args))}
+      (fn []
+        (try
+          (sql! source "ALTER TABLE stream_items ADD COLUMN refreshed stream_status DEFAULT 'new layout'")
+          (check! (deref copy-started 25000 false) "Schema refresh did not export its snapshot" (mirror/status @subscriber))
+          (stream-insert! source 900)
+          (check! (= [["0"]] (rows sink "SELECT count(*) FROM stream_items WHERE id >= 900"))
+                  "Streamed rows escaped the staged schema" {})
+          (finally (deliver release-copy true)))
+        (await! "Schema refresh did not apply the streamed catch-up transaction"
+                #(get-in (mirror/status @subscriber) [:last-schema-refresh :cutover]))
+        (check! @stage-spooled "The temporary slot did not exercise streamed catch-up" {})
+        (check! (= [["8"]] (rows sink "SELECT count(*) FROM stream_items WHERE id >= 900 AND refreshed='new layout'"))
+                "Cutover lost streamed changes or fast defaults" {})
+        (await-stream-rows! source sink subscriber)))))
+
+(defn- retry-stream-after-quota! [config source subscriber slot directory]
+  (let [path (:store-path config)]
+    (mirror/stop! @subscriber)
+    (reset! subscriber (mirror/start! (assoc config :max-stream-spool-bytes 32768)))
+    (let [{:keys [applied-lsn]} (await-state! @subscriber :following)]
+      (await! "The slot did not confirm the pre-limit checkpoint"
+              #(= [applied-lsn] (slot-query source slot "confirmed_flush_lsn")))
+      (stream-insert! source 800)
+      (let [{:keys [last-error spooled-bytes]} (await-state! @subscriber :paused)]
+        (check! (= :stream-spool-limit (:reason last-error)) "Expected a pause at the spool limit" last-error)
+        (check! (and (zero? spooled-bytes) (empty? (spool-files path))) "A spool remained after the limit error" {}))
+      (check! (= applied-lsn (durable-position path)) "Quota error advanced the durable checkpoint" {})
+      (check! (= [applied-lsn] (slot-query source slot "confirmed_flush_lsn")) "Quota error acknowledged the transaction" {})
+      (mirror/stop! @subscriber)
+      (child-crash! config (str directory "/stream-crash.log"))
+      (await! "Stream crash did not leave the upstream slot behind the new checkpoint"
+              #(= [applied-lsn "false"] (slot-query source slot "confirmed_flush_lsn,active::text")))
+      (check! (seq (spool-files path)) "Child applied the large transaction without using its spool" {})
+      (let [history (streamed-history path 800)]
+        (check! (= 1 (count history)) "Streamed commit was not recorded atomically" {:history history})
+        (check! (= history (streamed-history path 807)) "Rows from one streamed commit used different local transactions" {})
+        (reset! subscriber (mirror/start! config))
+        (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+          (await-stream-rows! source sink subscriber))
+        (check! (empty? (spool-files path)) "Restart retained a stale spool" {})
+        (check! (= history (streamed-history path 800)) "Crash replay duplicated a streamed commit" {})))))
+
+(defn run-streaming-probe! [source-url follower-url directory]
+  (let [path (str directory "/stream-store")
+        config {:source-url follower-url :publication "stream_pub" :store-path path :server {:port 0}
+                :schema-refresh? true}
+        subscriber (atom nil)]
+    (with-open [source (DriverManager/getConnection source-url)
+                tx-a (DriverManager/getConnection source-url)
+                tx-b (DriverManager/getConnection source-url)]
+      (try
+        (sql! source "CREATE TYPE stream_status AS ENUM ('new layout', 'other')"
+              "CREATE TABLE stream_items (id int PRIMARY KEY, payload text NOT NULL)"
+              "CREATE ROLE mirror_stream_reader LOGIN REPLICATION"
+              "ALTER ROLE mirror_stream_reader SET logical_decoding_work_mem='64kB'"
+              "GRANT SELECT ON stream_items TO mirror_stream_reader"
+              "GRANT EXECUTE ON FUNCTION pg_logical_emit_message(boolean, text, text, boolean) TO mirror_stream_reader"
+              "CREATE PUBLICATION stream_pub FOR TABLE stream_items")
+        (reset! subscriber (mirror/start! config))
+        (let [{:keys [slot]} (await-state! @subscriber :following)]
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (interleave-streams! source tx-a tx-b sink subscriber path))
+          (sql! tx-a "BEGIN")
+          (stream-insert! tx-a 700)
+          (flush-stream! tx-a)
+          (await! "Uncommitted stream did not reach disk" #(seq (spool-files path)))
+          (let [before (:applied-lsn (mirror/status @subscriber))]
+            (sql! source "INSERT INTO stream_items VALUES (51,'acknowledged while a stream is open')")
+            (await! "Publisher did not confirm the newer ordinary commit"
+                    #(let [position (:applied-lsn (mirror/status @subscriber))]
+                       (and (pos? (#'mirror/compare-lsn position before))
+                            (= [position] (slot-query source slot "confirmed_flush_lsn")))))
+            (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+              (check! (= [["51"]] (rows sink "SELECT id FROM stream_items WHERE id=51"))
+                      "The acknowledged ordinary commit was missing" {})
+              (check! (= [["0"]] (rows sink "SELECT count(*) FROM stream_items WHERE id BETWEEN 700 AND 707"))
+                      "An open stream became visible before disconnect" {})))
+          (mirror/stop! @subscriber)
+          (check! (empty? (spool-files path)) "Stopping left uncommitted files behind" {})
+          (sql! tx-a "COMMIT")
+          (reset! subscriber (mirror/start! config))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (await-stream-rows! source sink subscriber)
+            (refresh-with-streamed-catch-up! source sink subscriber))
+          (retry-stream-after-quota! config source subscriber slot directory))
+        {:status :passed :probe :streaming}
+        (finally (when @subscriber (mirror/stop! @subscriber)))))))
+
 (defn -main [& [argument mode]]
   (cond
     (= "--failover" argument)
@@ -1667,6 +1846,10 @@
     (prn (run-slot-recovery-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
                                    (System/getenv "PG_MIRROR_SOURCE_URL")
                                    (System/getenv "PG_MIRROR_RECOVERY_DIR")))
+    (= "--streaming" argument)
+    (prn (run-streaming-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
+                               (System/getenv "PG_MIRROR_SOURCE_URL")
+                               (System/getenv "PG_MIRROR_RECOVERY_DIR")))
     (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
     :else
