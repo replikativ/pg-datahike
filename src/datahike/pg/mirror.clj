@@ -8,6 +8,7 @@
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg]
+            [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.rewrite :as rewrite]
             [datahike.pg.types :as types])
   (:import [datahike.pg PgWireServer PgWireServer$QueryHandler PgWireServer$QueryResult]
@@ -42,6 +43,9 @@
 
 (defn- relation-name [{:keys [schema name]}]
   (str (ident schema) "." (ident name)))
+
+(defn- storage-table [{:keys [storage-name] :as table}]
+  (cond-> table storage-name (assoc :name storage-name)))
 
 (defn- comma-list [values] (str/join ", " values))
 
@@ -224,7 +228,8 @@
   result)
 
 (defn- sink-execute! ^PgWireServer$QueryResult [^PgWireServer$QueryHandler destination sql]
-  (checked-result (.execute destination sql)))
+  (binding [ctx/*physical-table-names?* true]
+    (checked-result (.execute destination sql))))
 
 (defn- number-bind-markers [tokens]
   ;; The executor may reorder an UPDATE's assignments before reparsing them
@@ -235,8 +240,9 @@
 (defn- sink-prepared! ^PgWireServer$QueryResult [^PgWireServer$QueryHandler destination sql args]
   (let [oids (int-array (repeat (count args) PgWireServer/OID_VARCHAR))
         statement (rewrite/rewrite sql [number-bind-markers])]
-    (checked-result (.executePrepared destination (.parse destination statement oids)
-                                      (object-array (cons nil args))))))
+    (binding [ctx/*physical-table-names?* true]
+      (checked-result (.executePrepared destination (.parse destination statement oids)
+                                        (object-array (cons nil args)))))))
 
 (defn- affected-count [^PgWireServer$QueryResult result]
   (parse-long (last (str/split (.-commandTag result) #" "))))
@@ -282,11 +288,11 @@
         written)
       (finally (when (.isActive out) (.cancelCopy out))))))
 
-(defn- transfer-staged-table! [stage destination table on-bytes]
+(defn- transfer-staged-table! [stage destination table live-table on-bytes]
   (let [export (sink-execute! stage (str "COPY " (copy-relation table) " TO STDOUT"))]
     (require! (.-copyOutMode export) "Expected COPY OUT response" {:table (relation-name table)})
     (let [lines (.-copyOutLines export)
-          written (load-copy! destination table
+          written (load-copy! destination live-table
                               (fn [write!]
                                 (doseq [line lines
                                         :let [chunk (.getBytes (str line "\n") StandardCharsets/UTF_8)]]
@@ -319,7 +325,7 @@
                      [(pr-str origin) slot publication]))))
 
 (defn- local-column-attrs [db {:keys [name columns] :as table}]
-  (let [relation (pgs/table-oid db name)]
+  (let [relation (pgs/storage-table-oid db name)]
     (require! relation "Missing local mirror relation" {:table (relation-name table)})
     (mapv (fn [column]
             (or (:datahike.pg.column/storage-ident
@@ -350,7 +356,7 @@
                          attrs (:columns table)))]
     (if (seq tx)
       (into tx (catalog-objects/bump-revision-tx
-                db catalog-objects/pg-class-oid (pgs/table-oid db (:name table))))
+                db catalog-objects/pg-class-oid (pgs/storage-table-oid db (:name table))))
       tx)))
 
 (defn- set-column-metadata! [destination table]
@@ -674,12 +680,13 @@
 
 (defn- same-table? [previous current]
   (if (every? :attnum (:columns previous))
-    (= previous current)
+    (= (dissoc previous :storage-name) (dissoc current :storage-name))
     (and current (= (wire-table previous) (wire-table current)))))
 
 (defn- changed-tables! [previous current allow-schema-refresh?]
   (let [before (tables-by-id previous)
         after (tables-by-id current)
+        occupied (into #{} (map (comp :name storage-table)) (:tables previous))
         missing (remove #(get after (:relation-id %)) (:tables previous))]
     (require! (and (= (:publication-oid previous) (:publication-oid current)) (empty? missing))
               "Publication schema or membership changed"
@@ -692,17 +699,23 @@
                                    (and allow-schema-refresh? (not-every? :attnum (:columns prior))))))
                            (:tables current))]
       (mapv (fn [table]
-              (let [prior (get before (:relation-id table))]
+              (let [prior (get before (:relation-id table))
+                    storage (if prior
+                              (:name (storage-table prior))
+                              (if (contains? occupied (:name table))
+                                (new-slot-name "pgdh_relation")
+                                (:name table)))]
                 (when prior
                   (require! allow-schema-refresh?
                             "Publication schema or membership changed" {:table (relation-name prior)})
                   (require! (and (or (every? :attnum (:columns prior)) (same-table? prior table))
-                                 (= (select-keys prior [:name :schema]) (select-keys table [:name :schema])))
-                            "Schema refresh requires a known column layout and the same relation name"
+                                 (= (:schema prior) (:schema table)))
+                            "Schema refresh requires a known column layout and the same schema"
                             {:table (relation-name table)}))
                 ;; A legacy checkpoint knows the wire order. Identical wire
                 ;; layout lets us assign the current attnums before staging.
                 {:table table
+                 :storage-name storage
                  :previous (if (and prior (not-every? :attnum (:columns prior)))
                              (update prior :columns
                                      (fn [columns]
@@ -808,11 +821,11 @@
           (map (fn [eid] (check-running!) [:db/retractEntity eid]))
           (vals @outstanding))))
 
-(defn- reconcile-table! [destination stage-db table check-running!]
+(defn- reconcile-table! [destination stage-db table live-table check-running!]
   (let [attrs (local-column-attrs stage-db table)
         staged-schema (mapv #(get-in (dbi/-schema stage-db) [% :db/valueType]) attrs)
         staged-rows (vec (stored-rows stage-db table attrs))]
-    (stage-data! destination #(reconcile-table-tx % table staged-schema staged-rows check-running!))))
+    (stage-data! destination #(reconcile-table-tx % live-table staged-schema staged-rows check-running!))))
 
 (defn- matches-relation? [table message]
   (and table (= \d (:identity message)) (= (wire-table table) (wire-table message))))
@@ -974,20 +987,42 @@
         (if error (throw error) position)
         (recur)))))
 
+(defn- set-table-name! [destination storage-name logical-name]
+  (stage-data! destination
+               (fn [db]
+                 (catalog-objects/rename-table-tx db (pgs/storage-table-oid db storage-name)
+                                                  logical-name))))
+
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
-  (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)]
+  (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
+        stage-db (d/db (:conn stage))
+        {:keys [changes]} stage
+        renames (into []
+                      (keep (fn [{:keys [table previous storage-name]}]
+                              (when (and previous (not= (:name previous) (:name table)))
+                                [storage-name (:name table)])))
+                      changes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
-      (doseq [{:keys [table previous]} (:changes stage)]
+      (doseq [{:keys [table previous storage-name]} changes :when previous]
         (check-running!)
-        (if previous
-          (do
-            (adapt-layout! destination previous table)
-            (reconcile-table! destination (d/db (:conn stage)) table check-running!)
-            (set-column-metadata! destination table))
-          (do
-            (create-table! destination table)
-            (transfer-staged-table! staged destination table on-bytes)))))))
+        (let [live-table (assoc table :name storage-name)]
+          (adapt-layout! destination previous live-table)
+          (reconcile-table! destination stage-db table live-table check-running!)
+          (set-column-metadata! destination live-table)))
+      ;; Vacate every old SQL name before assigning the new names. This
+      ;; handles name swaps and tables added under a just-vacated name.
+      (doseq [[storage] renames]
+        (set-table-name! destination storage (new-slot-name "pgdh_rename")))
+      (doseq [[storage logical] renames]
+        (set-table-name! destination storage logical))
+      (doseq [{:keys [table previous storage-name]} changes :when (nil? previous)]
+        (check-running!)
+        (let [live-table (assoc table :name storage-name)]
+          (create-table! destination live-table)
+          (transfer-staged-table! staged destination table live-table on-bytes)
+          (when (not= storage-name (:name table))
+            (set-table-name! destination storage-name (:name table))))))))
 
 (defn- changed-relation-ids [changes]
   (into #{} (mapcat #(if (= :truncate (:op %)) (:relation-ids %) [(:relation-id %)])) changes))
@@ -995,12 +1030,17 @@
 (defn- installed-manifest [current previous changes]
   ;; Legacy tables retain their stored definitions until they participate
   ;; in a refresh. Observing their source metadata does not install it.
-  (let [installed (set (map (comp :relation-id :table) changes))
+  (let [installed (into {}
+                        (map (fn [{:keys [table storage-name]}]
+                               [(:relation-id table)
+                                (cond-> table
+                                  (not= (:name table) storage-name) (assoc :storage-name storage-name))]))
+                        changes)
         prior (tables-by-id previous)]
     (cond-> (update current :tables (fn [tables]
                                       (mapv (fn [table]
                                               (let [id (:relation-id table)]
-                                                (if (installed id) table (get prior id table))))
+                                                (or (get installed id) (get prior id table))))
                                             tables)))
       (:last-schema-refresh previous) (assoc :last-schema-refresh (:last-schema-refresh previous)))))
 
@@ -1060,7 +1100,12 @@
 
                                         (not= @pending-schema (or (:pending-schema @applied) {}))
                                         (assoc @applied :pending-schema @pending-schema))
-                            changes (into [] (keep #(select-change live? %)) (:changes transaction))]
+                            changes (into [] (keep #(select-change live? %)) (:changes transaction))
+                            relations (reduce (fn [tables id]
+                                                (if-let [storage (:storage-name (get @live id))]
+                                                  (assoc-in tables [id :name] storage)
+                                                  tables))
+                                              relations (changed-relation-ids changes))]
                         (apply-commit! destination relations previous
                                        (cond-> (assoc transaction :changes changes)
                                          candidate (assoc :manifest candidate)

@@ -476,7 +476,7 @@
               attr (when (symbol? fvar) (get var->attr fvar))
               tname (when attr (namespace attr))
               cname (when attr (name attr))
-              toid (when tname (pgs/table-oid db tname))
+              toid (when tname (pgs/storage-table-oid db tname))
               ;; Pass hints: they carry the CREATE TABLE column order,
               ;; and RowDescription's attnum must agree with
               ;; pg_attribute's or pgjdbc's updatable ResultSet maps
@@ -12487,7 +12487,9 @@
       (let [{:keys [table operations]} parsed
             db (or (:speculative-db @tx-state) (d/db conn))
             schema (dbi/-schema db)
-            relation-oid (pgs/table-oid db table)
+            relation-oid (if sql-ctx/*physical-table-names?*
+                           (pgs/storage-table-oid db table)
+                           (pgs/table-oid db table))
             _ (when-not relation-oid
                 (throw (errors/pg-error :undefined-table {:table table})))
             added-columns

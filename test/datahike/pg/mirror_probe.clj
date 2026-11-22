@@ -534,6 +534,63 @@
 (defn- item-eid [path]
   (inspect-db path #(d/q '[:find ?eid . :where [?eid :schema_items/id 1]] %)))
 
+(defn- verify-table-rename! [source reference sink subscriber path]
+  (let [[[oid]] (rows sink "SELECT 'schema_items'::regclass::oid")
+        at (inspect-db path :max-tx)
+        eid (item-eid path)
+        previous (rows sink "SELECT id, summary FROM schema_items ORDER BY id")
+        previous-columns (schema-item-column-metadata sink)
+        ddl ["BEGIN"
+             "ALTER TABLE schema_items RENAME TO schema_archive"
+             "CREATE TABLE schema_items (id integer PRIMARY KEY, body text NOT NULL)"
+             "COMMIT"]
+        live-rows (fn [conn]
+                    [(rows conn "SELECT id, summary FROM schema_archive ORDER BY id")
+                     (rows conn "SELECT id, body FROM schema_items ORDER BY id")])]
+    (apply sql! reference ddl)
+    (apply sql! source
+           (into (pop ddl)
+                 ["ALTER PUBLICATION mirror_schema_pub ADD TABLE schema_items"
+                  "INSERT INTO schema_items VALUES (1, 'new relation')"
+                  "UPDATE schema_archive SET summary = 'during rename' WHERE id = 1"
+                  "COMMIT"]))
+    (sql! reference "ALTER SUBSCRIPTION mirror_schema_native REFRESH PUBLICATION")
+    (await! "The table rename and its replacement did not become visible"
+            #(let [status (mirror/status subscriber)]
+               (check! (not (#{:failed :paused} (:state status))) "Rename paused the mirror" status)
+               (and (= [["schema_archive"]] (rows sink "SELECT relname FROM pg_class WHERE relname = 'schema_archive'"))
+                    (= (live-rows source) (live-rows sink)))))
+    (await! "Native subscriber did not converge after rename" #(= (live-rows source) (live-rows reference)))
+    (check! (= [[oid oid (str eid)]]
+               (rows sink "SELECT 'schema_archive'::regclass::oid, tableoid, db_id FROM schema_archive WHERE id = 1"))
+            "The rename changed the relation or row identity" {})
+    (check! (= [[oid "schema_archive" "schema_archive"]]
+               (rows sink (str "SELECT c.oid, c.relname, t.typname FROM pg_class c JOIN pg_type t ON t.oid = c.reltype "
+                               "WHERE c.oid = 'schema_archive'::regclass")))
+            "The renamed relation and its row type disagree" {})
+    (sql! sink (str "SET datahike.as_of = " at))
+    (check! (= previous (rows sink "SELECT id, summary FROM schema_items ORDER BY id"))
+            "Name reuse changed pre-rename rows" {})
+    (check! (= previous-columns (schema-item-column-metadata sink))
+            "Name reuse changed the pre-rename catalog" {})
+    (sql! sink "RESET datahike.as_of")
+    ;; The old physical namespace now has a different logical owner. Both
+    ;; a column refresh and ordinary WAL apply must still target the archive.
+    (let [add-column "ALTER TABLE schema_archive ADD COLUMN tag text NOT NULL DEFAULT 'archived'"]
+      (sql! reference add-column)
+      (sql! source add-column
+            "BEGIN"
+            "UPDATE schema_archive SET summary = 'after rename', tag = 'changed' WHERE id = 1"
+            "UPDATE schema_items SET body = 'replacement updated' WHERE id = 1"
+            "COMMIT"))
+    (await! "Mirror stopped following the two relations after the rename"
+            #(let [status (mirror/status subscriber)]
+               (check! (not (#{:failed :paused} (:state status))) "Post-rename schema change paused the mirror" status)
+               (and (= (live-rows source) (live-rows sink))
+                    (= [["tag"]] (rows sink (str "SELECT column_name FROM information_schema.columns "
+                                                 "WHERE table_name = 'schema_archive' AND column_name = 'tag'")))
+                    (= [["changed"]] (rows sink "SELECT tag FROM schema_archive WHERE id = 1")))))))
+
 (defn run-schema-refresh-probe!
   "Compare publisher schema refresh with a native subscriber given the same
    DDL. Interrupt the handoff and revert a pending catalog change, then crash
@@ -663,7 +720,18 @@
                       "INSERT INTO schema_items (id) VALUES (4)"))
               (await! "Mirror did not refresh a metadata-only change"
                       #(and (= (evolved-rows source) (evolved-rows sink))
-                            (= (schema-item-column-metadata source) (schema-item-column-metadata sink))))))
+                            (= (schema-item-column-metadata source) (schema-item-column-metadata sink))))
+              (verify-table-rename! source reference sink @subscriber path)))
+          (mirror/stop! @subscriber)
+          (reset! subscriber (mirror/start! config))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (sql! source "BEGIN"
+                  "UPDATE schema_archive SET tag = 'after restart' WHERE id = 1"
+                  "UPDATE schema_items SET body = 'after restart' WHERE id = 1"
+                  "COMMIT")
+            (await! "Restart lost the persisted routes for the renamed and replacement tables"
+                    #(and (= [["after restart"]] (rows sink "SELECT tag FROM schema_archive WHERE id = 1"))
+                          (= [["after restart"]] (rows sink "SELECT body FROM schema_items WHERE id = 1")))))
           (mirror/stop! @subscriber)
           (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
           {:status :passed :artifacts directory})

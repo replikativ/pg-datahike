@@ -254,7 +254,7 @@
         by-table (group-by :pg_constraint/conrelid rows)]
     (mapcat
      (fn [[table {:keys [columns]}]]
-       (let [relid (long (or (pgs/table-oid db table) (Math/abs (.hashCode ^String table))))
+       (let [relid (long (or (pgs/storage-table-oid db table) (Math/abs (.hashCode ^String table))))
              names (into #{} (map :pg_constraint/conname) (get by-table relid))]
          (:rows
           (reduce
@@ -1700,7 +1700,7 @@
    pgjdbc's getPrimaryKeys makes, matched nothing."
   [db user-schema hints]
   (let [tables (pgs/derive-virtual-tables user-schema hints)
-        oid-of (fn [tname] (long (or (pgs/table-oid db tname)
+        oid-of (fn [tname] (long (or (pgs/storage-table-oid db tname)
                                      (Math/abs (.hashCode ^String tname)))))]
     (vec
      (for [[tname {:keys [columns]}] (sort-by key tables)
@@ -1754,7 +1754,7 @@
                                 (mapcat :columns (vals tables)))]
     (mapv
      (fn [[table-name {:keys [columns]}]]
-       (let [relation-oid (pgs/table-oid db table-name)
+       (let [relation-oid (pgs/storage-table-oid db table-name)
              registered (when relation-oid
                           (catalog-objects/columns-by-relation
                            db relation-oid true))]
@@ -1961,14 +1961,15 @@
                                    cte-db))]
            (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
              (mapv (fn [t]
-                     (let [tbl-oid (or (pgs/table-oid cte-db t)
+                     (let [tbl-oid (or (pgs/storage-table-oid cte-db t)
                                        (Math/abs (.hashCode ^String t)))
                            identity (regoid/registry-relation cte-db {:oid tbl-oid})
+                           logical-name (or (:name identity) t)
                            row-type (catalog-objects/object-by-identity
                                      cte-db catalog-objects/pg-type-oid
-                                     catalog-objects/public-namespace-oid t)]
+                                     catalog-objects/public-namespace-oid logical-name)]
                        {:pg_class/oid (long tbl-oid)
-                        :pg_class/relname (or (:name identity) t)
+                        :pg_class/relname logical-name
                         :pg_class/relnamespace (or (:namespace-oid identity) 2200)
                         :pg_class/relispartition false
                         :pg_class/relkind (if (contains? matviews t) "m" "r")
@@ -2243,7 +2244,7 @@
        (concat
         (for [[tname columns] table-columns
               [idx col] (map-indexed vector columns)
-              :let [tbl-oid (or (pgs/table-oid cte-db tname)
+              :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
                                    ;; Pre-existing tables from before we
                                    ;; started tracking :pg/table-oid — fall
                                    ;; back to the attnum-derived composite
@@ -2463,10 +2464,11 @@
     "pg_tables"
     ;; `hastriggers` was hard-coded false, which is what a client reads
     ;; to decide whether to look in pg_trigger at all.
-    (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
+    (let [triggered (into #{} (map :table) (trigger-entities cte-db))
+          names (catalog-objects/table-name-overrides cte-db)]
       (mapv (fn [t]
               {:pg_tables/schemaname "public"
-               :pg_tables/tablename t
+               :pg_tables/tablename (get names t t)
                :pg_tables/tableowner "datahike"
                :pg_tables/tablespace "pg_default"
                :pg_tables/hasindexes true
@@ -2703,6 +2705,7 @@
           (view-entities cte-db))
     "information_schema_columns"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          names (catalog-objects/table-name-overrides cte-db)
           table-columns (catalog-table-columns cte-db tables)
           identity-sequences (into {}
                                    (comp (filter :__seq__/identity-generation)
@@ -2812,7 +2815,7 @@
              (drop-nils
               {:information_schema_columns/table_catalog          "datahike"
                :information_schema_columns/table_schema           "public"
-               :information_schema_columns/table_name             tname
+               :information_schema_columns/table_name             (get names tname tname)
                :information_schema_columns/column_name            (:name col)
                :information_schema_columns/ordinal_position       pos
                :information_schema_columns/column_default         (get publisher-defaults (:attr col))
@@ -2854,13 +2857,14 @@
                :information_schema_columns/is_updatable           "YES"
                (pgs/row-marker-attr "information_schema_columns") true}))))
     "information_schema_tables"
-    (mapv (fn [t]
-            {:information_schema_tables/table_catalog "datahike"
-             :information_schema_tables/table_schema "public"
-             :information_schema_tables/table_name t
-             :information_schema_tables/table_type "BASE TABLE"
-             (pgs/row-marker-attr "information_schema_tables") true})
-          (pgs/table-names user-schema cte-db))
+    (let [names (catalog-objects/table-name-overrides cte-db)]
+      (mapv (fn [t]
+              {:information_schema_tables/table_catalog "datahike"
+               :information_schema_tables/table_schema "public"
+               :information_schema_tables/table_name (get names t t)
+               :information_schema_tables/table_type "BASE TABLE"
+               (pgs/row-marker-attr "information_schema_tables") true})
+            (pgs/table-names user-schema cte-db)))
     "pg_sequences"
     (mapv (fn [s]
             (cond-> {:pg_sequences/schemaname "public"

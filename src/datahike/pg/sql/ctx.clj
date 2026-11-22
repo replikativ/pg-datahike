@@ -97,13 +97,15 @@
          ;; (e.g. `p.a` re-added after DROP COLUMN is stored as
          ;; `:p/pg$att3`), and letting an absent table win silently
          ;; cross-joined `p` into `SELECT a FROM zq`.
-        in-scope (into #{default-table} cat [(keys table-aliases) (vals table-aliases)])
+        relation-aliases (:relation-aliases (meta table-aliases))
+        in-scope (or (seq relation-aliases) (conj (set (keys table-aliases)) default-table))
         override-owners (when (nil? table-alias)
-                          (into #{} (keep (fn [[alias cols]]
-                                            (when (and (contains? in-scope alias)
-                                                       (contains? cols col-name0))
-                                              alias)))
-                                col-overrides))
+                          (into #{}
+                                (filter (fn [alias]
+                                          (let [storage (get table-aliases alias alias)]
+                                            (or (contains? (get col-overrides alias) col-name0)
+                                                (contains? (get col-overrides storage) col-name0)))))
+                                in-scope))
         override-owner (cond
                          (= 1 (count override-owners)) (first override-owners)
                          (> (count override-owners) 1)
@@ -126,7 +128,6 @@
          ;; exactly as before. Relations absent from `ci` (catalog and
          ;; speculative tables) simply do not become candidates, so this
          ;; can only ever turn a failure into a resolution.
-        relation-aliases (:relation-aliases (meta table-aliases))
         ;; A column an INNER join MERGED is one column, not two
         ;; (transformJoinUsingAlias): the equality makes the two sides
         ;; the same value, so the left one answers.
@@ -396,6 +397,14 @@
    relation correctly."
   {})
 
+(def ^:dynamic *physical-table-names?*
+  "Use storage table names for the mirror's internal SQL."
+  false)
+
+(def ^:dynamic *table-name-overrides*
+  "Physical and SQL table names visible to the current statement."
+  nil)
+
 (defn extract-table-info
   "Extract table name and alias from a FROM clause Table.
 
@@ -404,14 +413,22 @@
    relation in `*relation-namespaces*`."
   [^Table table]
   (let [name (params/unquote-ident (.getName table))
+        schema (some-> (.getSchemaName table) params/unquote-ident)
+        cte (when-not schema (get *relation-namespaces* name))
+        storage (when (and (nil? cte)
+                           (or (nil? schema) (= "public" schema))
+                           (or schema (not (contains? params/*temp-table-map* name))))
+                  (let [{:keys [logical->storage storage->logical]} *table-name-overrides*]
+                    (or (get logical->storage name)
+                        (when (contains? storage->logical name)
+                          (throw (ex-info (str "relation \"" name "\" does not exist")
+                                          {:sqlstate "42P01" :error :undefined-table :table name}))))))
         alias (.getAlias table)
         alias-name (when alias (params/unquote-ident (.getName ^Alias alias)))]
     {;; A schema-qualified name never names a CTE (PostgreSQL's CTEs
      ;; live in no schema), which is how an UPDATE reaches its target
      ;; table while a CTE of the same name serves the subqueries.
-     :name  (if (.getSchemaName table)
-              name
-              (get *relation-namespaces* name name))
+     :name (or cte storage name)
      :alias (or alias-name name)}))
 
 (defn make-ctx

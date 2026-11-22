@@ -101,9 +101,11 @@ Removing published tables pauses the mirror.
 
 Set `:schema-refresh? true` in the mirror configuration to support adding,
 renaming, and dropping columns, changing supported types and precision, and
-changing defaults or nullability. Group related DDL in one PostgreSQL
-transaction and allow each refresh to finish before the next schema change.
-The table keeps its source name and primary key column identities and types.
+changing defaults or nullability. It also follows table renames within the
+publisher schema when the table keeps its PostgreSQL relation OID. Group
+related DDL in one PostgreSQL transaction and allow each refresh to finish
+before the next schema change. Keep primary key column identities and types
+stable during a refresh.
 Keep this option enabled through restart while a refresh is pending.
 
 When upgrading an existing mirror that stored only the wire layout, enable
@@ -116,6 +118,10 @@ Datahike entities keep their identity when their primary keys match, and
 historical SQL reads retain the old columns and values. Source default
 expressions are recorded as catalog metadata. PostgreSQL evaluates them
 when applications write to the publisher.
+
+A table rename preserves the mirror's relation OID and Datahike entities.
+The new SQL name becomes visible at cutover. Earlier snapshots keep the
+old name, including when the publisher adds a new table under that name.
 
 The affected tables have a resnapshot window. Their publisher changes during
 that window are reflected in the cutover transaction. Status and the durable
@@ -164,10 +170,10 @@ mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
 `CREATE SUBSCRIPTION`. The source server needs `wal_level=logical`. Run
 `clojure -M:dev -m datahike.pg.mirror-probe` after `bb prep`. Pass
 `--refresh` to exercise online table addition and its recovery boundaries.
-Pass `--schema-refresh` to exercise publisher DDL, recovery, and historical
-row and catalog reads.
+Pass `--schema-refresh` to exercise publisher DDL, table name reuse, restart,
+and historical row and catalog reads.
 
-The next stages are relation renames, primary key changes, streaming and spooling
+The next stages are primary key changes, streaming and spooling
 of large transactions, and failover slots. See the [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 

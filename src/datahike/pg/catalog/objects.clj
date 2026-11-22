@@ -103,6 +103,10 @@
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one
     :db/index true}
+   {:db/ident :datahike.pg.object/storage-name
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/value}
    {:db/ident :datahike.pg.object/namespace
     :db/valueType :db.type/ref
     :db/cardinality :db.cardinality/one
@@ -197,6 +201,7 @@
                   :datahike.pg.object/oid
                   :datahike.pg.object/kind
                   :datahike.pg.object/name
+                  :datahike.pg.object/storage-name
                   :datahike.pg.object/namespace
                   :datahike.pg.object/owner-oid
                   :datahike.pg.object/revision
@@ -271,6 +276,17 @@
                         :in [$ ?kind]
                         :where [[?object :datahike.pg.object/kind ?kind]]}
                       db kind))))))
+
+(defn table-name-overrides
+  "Map physical table namespaces to their SQL names in this catalog snapshot."
+  [db]
+  (let [db (catalog-metadata-db db)]
+    (when (and db (get (dbi/-schema db) :datahike.pg.object/storage-name))
+      (into {}
+            (d/q '[:find ?storage ?name
+                   :where [?e :datahike.pg.object/storage-name ?storage]
+                   [?e :datahike.pg.object/name ?name]]
+                 db)))))
 
 (def ^:private column-keys
   [:db/id
@@ -527,6 +543,25 @@
        [:db/retract object-ref :datahike.pg.object/identity-key old-key]
        [:db/add object-ref :datahike.pg.object/identity-key new-key]
        [:db/add object-ref :datahike.pg.object/name (str new-name)]])))
+
+(defn rename-table-tx
+  "Move a table and its row type to a new SQL name, preserving their OIDs
+   and the table's storage namespace."
+  [db relation-oid new-name]
+  (let [{old-name :datahike.pg.object/name
+         storage :datahike.pg.object/storage-name
+         :datahike.pg.object/keys [kind] :as table}
+        (object-by-address db pg-class-oid relation-oid)]
+    (when-not (= :table kind)
+      (throw (ex-info "Cannot rename an unknown table" {:sqlstate "42P01" :oid relation-oid})))
+    (when-not (= old-name new-name)
+      (let [namespace-oid (object-namespace-oid db table)
+            row-type (object-by-identity db pg-type-oid namespace-oid old-name)]
+        (cond-> (into (rename-object-tx db pg-class-oid relation-oid new-name nil)
+                      (when (= :row-type (:datahike.pg.object/kind row-type))
+                        (rename-object-tx db pg-type-oid (:datahike.pg.object/oid row-type) new-name nil)))
+          (nil? storage)
+          (conj [:db/add (:db/id table) :datahike.pg.object/storage-name old-name]))))))
 
 (defn- migration-object-map
   [{:keys [tempid class-oid oid kind name namespace-tempid owner-oid

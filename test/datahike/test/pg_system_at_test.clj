@@ -17,6 +17,8 @@
      completes without error."
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as objects]
+            [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
@@ -240,3 +242,42 @@
         (is (nil? (err result)))
         (is (= [["before" "2024-02-29 12:00:00.123456"]] (mapv vec (.rows result)))))
       (is (= [["after"]] (rows "SELECT title FROM temporal_example WHERE id = 1"))))))
+
+(deftest renamed-relations-resolve-against-the-statement-snapshot
+  (let [run #(.execute *handler* %)
+        rows (fn [query]
+               (let [result (run query)]
+                 (is (nil? (err result)) (str query " " (err result)))
+                 (mapv vec (.rows result))))
+        rename! (fn [old new]
+                  (let [db (d/db *conn*)]
+                    (d/transact *conn* (objects/rename-table-tx db (pgs/table-oid db old) new))))]
+    (doseq [query ["CREATE TABLE rename_original (id integer PRIMARY KEY, caption text)"
+                   "INSERT INTO rename_original VALUES (1, 'old row'), (2, 'second row')"]]
+      (is (nil? (err (run query))) query))
+    (let [old-db (d/db *conn*)
+          oid (str (pgs/table-oid old-db "rename_original"))]
+      (is (nil? (err (run "ALTER TABLE rename_original RENAME COLUMN caption TO label"))))
+      (rename! "rename_original" "rename_archive")
+      (is (= "42P01" (.sqlstate (run "SELECT * FROM rename_original"))))
+      (is (= [["1" "old row"] ["2" "second row"]]
+             (rows "SELECT id, label FROM public.rename_archive ORDER BY id")))
+      (doseq [query ["CREATE TABLE rename_replacement (id integer PRIMARY KEY, code bigint)"
+                     "INSERT INTO rename_replacement VALUES (1, 42)"]]
+        (is (nil? (err (run query))) query))
+      (rename! "rename_replacement" "rename_original")
+      (is (= [["old row" "42"]]
+             (rows (str "SELECT a.label, r.code FROM rename_archive a "
+                        "JOIN rename_original r ON a.id = r.id"))))
+      (is (= [[oid "rename_archive" "rename_archive"]]
+             (rows (str "SELECT c.oid, c.relname, t.typname FROM pg_class c "
+                        "JOIN pg_type t ON c.reltype = t.oid WHERE c.oid = 'rename_archive'::regclass"))))
+      (is (= [["rename_archive" "label"] ["rename_original" "code"]]
+             (rows (str "SELECT table_name, column_name FROM information_schema.columns "
+                        "WHERE table_name IN ('rename_archive', 'rename_original') "
+                        "AND column_name IN ('label', 'code') ORDER BY table_name"))))
+      (is (nil? (err (run (str "SET datahike.as_of = " (:max-tx old-db))))))
+      (is (= [["1" "old row"] ["2" "second row"]] (rows "SELECT * FROM rename_original ORDER BY id")))
+      (is (= "42P01" (.sqlstate (run "SELECT * FROM rename_archive"))))
+      (is (= [[oid "rename_original"]]
+             (rows "SELECT oid, relname FROM pg_class WHERE oid = 'rename_original'::regclass"))))))

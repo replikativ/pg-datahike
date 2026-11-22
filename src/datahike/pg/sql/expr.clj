@@ -7085,7 +7085,7 @@
         relation (if tbl (get aliases alias) (get aliases alias alias))
         oid (when (and relation (not (contains? (set (:derived-aliases ctx)) relation)))
               (or (get catalog-objects/catalog-relation-oids relation)
-                  (some-> (:db ctx) (pgs/table-oid relation))))
+                  (some-> (:db ctx) (pgs/storage-table-oid relation))))
         evar (get @(:entity-vars ctx) alias)]
     (when-not oid
       (throw (errors/pg-error :undefined-column {:column "tableoid"})))

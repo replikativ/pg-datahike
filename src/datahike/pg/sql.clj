@@ -13,13 +13,15 @@
                               | {:type :insert :tx-data [...]}
                               | {:type :system :result QueryResult}
                               | {:type :error :message str}"
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [datahike.api :as d]
             [datahike.query :as dq]
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.basis :as catalog-basis]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.cast :as sql-cast]
@@ -379,6 +381,7 @@
    to miss the cache and looked correct."
   []
   [params/*declared-param-oids* params/*temp-table-map* params/*nested-parse?*
+   ctx/*physical-table-names?*
    params/*analysis-only?*
    (when params/*session-state*
      (select-keys @params/*session-state*
@@ -1055,6 +1058,11 @@
    parse-sql wraps this with the LRU result cache."
   [^String sql schema db]
   (binding [params/*parse-db* db
+            ctx/*table-name-overrides*
+            (when-not ctx/*physical-table-names?*
+              (let [names (catalog-objects/table-name-overrides db)]
+                (when (seq names)
+                  {:storage->logical names :logical->storage (set/map-invert names)})))
             regoid/*db* db
             regoid/*relation-provider* catalog/relation-identity
             regoid/*relation-db* (or regoid/*relation-db* db)

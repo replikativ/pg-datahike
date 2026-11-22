@@ -713,22 +713,31 @@
 ;; assume are stable. User tables get 16384+ to avoid any collision.
 (def ^:const first-user-oid catalog-objects/first-user-oid)
 
-(defn table-oid
-  "The table's authoritative persistent PostgreSQL OID. Prefer the shared
-   object registry and fall back to :pg/table-oid on the row-marker for bare
-   or pre-migration databases. Datahike's schema map only surfaces schema-
-   level attrs; custom attrs on the ident entity require a Datalog lookup."
+(defn- marker-table-oid [db table-name]
+  (ffirst (d/q '{:find [?oid]
+                 :in [$ ?ident]
+                 :where [[?e :db/ident ?ident]
+                         [?e :pg/table-oid ?oid]]}
+               db (row-marker-attr table-name))))
+
+(defn- registered-table-oid
   [db table-name]
-  (or (:datahike.pg.object/oid
-       (catalog-objects/object-by-identity
-        db catalog-objects/pg-class-oid
-        catalog-objects/public-namespace-oid table-name))
-      (let [q-fn d/q]
-        (ffirst (q-fn '{:find [?oid]
-                        :in [$ ?ident]
-                        :where [[?e :db/ident ?ident]
-                                [?e :pg/table-oid ?oid]]}
-                      db (row-marker-attr table-name))))))
+  (:datahike.pg.object/oid
+   (catalog-objects/object-by-identity
+    db catalog-objects/pg-class-oid
+    catalog-objects/public-namespace-oid table-name)))
+
+(defn table-oid
+  "The table's persistent PostgreSQL OID. Prefer the registry for SQL names
+   and fall back to the row marker for bare or pre-migration databases."
+  [db table-name]
+  (or (registered-table-oid db table-name) (marker-table-oid db table-name)))
+
+(defn storage-table-oid
+  "Return the relation OID for a physical table namespace, including when
+   another relation now uses that namespace's name in SQL."
+  [db storage-name]
+  (or (marker-table-oid db storage-name) (registered-table-oid db storage-name)))
 
 (defn next-user-oid
   "Deprecated read-only view of the next shared user OID.  DDL must transact
@@ -915,7 +924,7 @@
    ;; to the wrong column: `invalid input syntax for numeric:
    ;; "2014-12-23"` in ResultSetTest.testUpdateWithPGobject.
    (let [db (::catalog-db hints)
-         relation-oid (when db (table-oid db table-name))
+         relation-oid (when db (storage-table-oid db table-name))
          column (when relation-oid
                   (catalog-objects/column-by-name db relation-oid col-name))]
      (or (:datahike.pg.column/attnum column)
@@ -1144,7 +1153,8 @@
       (into {}
             (for [relation (mapcat #(catalog-objects/objects-by-kind db %)
                                    [:table :view])
-                  :let [table-name (:datahike.pg.object/name relation)
+                  :let [table-name (or (:datahike.pg.object/storage-name relation)
+                                       (:datahike.pg.object/name relation))
                         relation-oid (:datahike.pg.object/oid relation)
                         columns (catalog-objects/columns-by-relation db relation-oid)
                         known-storage (into #{} (map :datahike.pg.column/storage-ident) columns)
@@ -1316,11 +1326,8 @@
    column belongs to the ancestor's namespace."
   [db table-name]
   (when db
-    (when-let [relation (catalog-objects/object-by-identity
-                         db catalog-objects/pg-class-oid
-                         catalog-objects/public-namespace-oid table-name)]
-      (seq (catalog-objects/columns-by-relation
-            db (:datahike.pg.object/oid relation) true)))))
+    (when-let [relation-oid (storage-table-oid db table-name)]
+      (seq (catalog-objects/columns-by-relation db relation-oid true)))))
 
 (defn column-order-from-db
   "Return columns in durable PostgreSQL attnum order. Databases without
