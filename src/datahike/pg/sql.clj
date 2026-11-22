@@ -707,6 +707,8 @@
                         (params/unquote-ident
                          (or alias (str "column" (inc idx)))))
                       (range) find-aliases)
+        _ (doseq [alias aliases]
+            (ddl/validate-table-column-name! alias))
         table-name (:table-name base)
         marker (pgs/row-marker-attr table-name)
         col-specs (mapv (fn [idx alias]

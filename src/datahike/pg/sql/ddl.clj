@@ -102,10 +102,18 @@
                    (when-not (= :db/id attr) [name attr])))
         (pgs/column-info (:schema db) table db)))
 
+(def ^:private system-column-names
+  #{"tableoid" "ctid" "xmin" "xmax" "cmin" "cmax"})
+
+(defn validate-table-column-name! [column]
+  (when (system-column-names column)
+    (throw (ex-info (str "column name \"" column "\" conflicts with a system column name")
+                    {:error :duplicate-column :sqlstate "42701" :column column}))))
+
 (defn- validate-fk-columns! [columns names]
   (doseq [column names]
     (when-not (contains? columns column)
-      (if (contains? #{"tableoid" "ctid" "xmin" "xmax" "cmin" "cmax"} column)
+      (if (system-column-names column)
         (throw (errors/pg-error :feature-not-supported
                                 {:message "system columns cannot be used in foreign keys"}))
         (throw (ex-info (str "column \"" column "\" referenced in foreign key constraint does not exist")
@@ -841,6 +849,8 @@
                     :feature-not-supported
                     {:feature (str "ON COMMIT " (str/upper-case on-commit-action))})))
         columns (.getColumnDefinitions ct)
+        _ (doseq [^ColumnDefinition column columns]
+            (validate-table-column-name! (params/unquote-ident (.getColumnName column))))
         ;; A VIRTUAL generated column (PostgreSQL 18) keeps the explicit
         ;; boundary the STORED ones used to have. Silently creating an
         ;; ordinary writable column also lets a later COPY name it, at

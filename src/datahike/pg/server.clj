@@ -12033,6 +12033,9 @@
     (when-not column
       (throw (errors/pg-error :undefined-column
                               {:column old-name :table table})))
+    (let [relation (catalog-objects/object-by-address db catalog-objects/pg-class-oid relation-oid)]
+      (when-not (= :view (:datahike.pg.object/kind relation))
+        (ddl/validate-table-column-name! new-name)))
     (when (catalog-objects/column-by-name db relation-oid new-name)
       (throw (ex-info (str "column \"" new-name "\" of relation \""
                            table "\" already exists")
@@ -12566,6 +12569,7 @@
             added-column-specs
             (mapv
              (fn [idx {:keys [name type] :as column}]
+               (ddl/validate-table-column-name! name)
                (when (catalog-objects/column-by-name db relation-oid name)
                  (throw (ex-info (str "column \"" name "\" of relation \""
                                       table "\" already exists")

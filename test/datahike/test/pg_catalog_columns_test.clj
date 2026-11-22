@@ -67,6 +67,26 @@
              (run h "SELECT pg_typeof(conenforced), pg_typeof(conparentid), pg_typeof(conperiod)
                        FROM pg_catalog.pg_constraint WHERE contype = 'c'"))))))
 
+(deftest table-columns-cannot-shadow-system-columns
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (is (nil? (.error (.execute h "CREATE TABLE ordinary (id int, oid oid, \"XMIN\" int)"))))
+      (doseq [[column sql] [["tableoid" "CREATE TABLE rejected (tableoid int)"]
+                            ["ctid" "CREATE TABLE rejected AS SELECT 1 AS ctid"]
+                            ["xmin" "ALTER TABLE ordinary ADD COLUMN xmin int"]
+                            ["xmax" "ALTER TABLE ordinary RENAME COLUMN id TO xmax"]
+                            ["cmin" "CREATE TABLE rejected (cmin int)"]
+                            ["cmax" "CREATE TABLE rejected (cmax int)"]]]
+        (let [result (.execute h ^String sql)]
+          (is (= "42701" (.sqlstate result)) sql)
+          (is (= (str "column name \"" column "\" conflicts with a system column name")
+                 (.error result))
+              sql)))
+      (is (= "t" (run h "SELECT to_regclass('rejected') IS NULL")))
+      (is (= "XMIN\nid\noid"
+             (run h "SELECT attname FROM pg_attribute
+                     WHERE attrelid = 'ordinary'::regclass AND attnum > 0 ORDER BY attname"))))))
+
 (deftest partition-ancestors-of-ordinary-relations
   (with-handler
     (fn [^PgWireServer$QueryHandler h]
