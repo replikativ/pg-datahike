@@ -102,23 +102,27 @@
       (mapv vec expressions)
       [(vec expressions)])))
 
+(defn analyze-values-cells [rows schema db]
+  (let [width (count (first rows))]
+    (when (some #(not= width (count %)) rows)
+      (throw (ex-info "VALUES lists must all be the same length" {:sqlstate "42601"})))
+    (mapv (fn [row] (mapv #(expression-output % schema db) row)) rows)))
+
+(defn values-columns [outputs]
+  (mapv (fn [i]
+          (let [columns (mapv #(nth % i) outputs)
+                common (types/select-common-type (mapv :oid columns) "VALUES")
+                modifier (:typmod (first columns))]
+            (cond-> {:name (str "column" (inc i)) :oid common}
+              (and (some? modifier)
+                   (every? #(and (= common (:oid %)) (= modifier (:typmod %))) columns))
+              (assoc :typmod modifier))))
+        (range (count (first outputs)))))
+
 (defn values-output
   "Resolve VALUES columns across every expression row without evaluating cells."
   [values schema db]
-  (let [rows (values-expression-rows values)
-        width (count (first rows))]
-    (when (some #(not= width (count %)) rows)
-      (throw (ex-info "VALUES lists must all be the same length" {:sqlstate "42601"})))
-    (let [outputs (mapv (fn [row] (mapv #(expression-output % schema db) row)) rows)]
-      (mapv (fn [i]
-              (let [columns (mapv #(nth % i) outputs)
-                    common (types/select-common-type (mapv :oid columns) "VALUES")
-                    modifier (:typmod (first columns))]
-                (cond-> {:name (str "column" (inc i)) :oid common}
-                  (and (some? modifier)
-                       (every? #(and (= common (:oid %)) (= modifier (:typmod %))) columns))
-                  (assoc :typmod modifier))))
-            (range width)))))
+  (values-columns (analyze-values-cells (values-expression-rows values) schema db)))
 
 (def ^:private fixed-table-functions
   {"pg_input_error_info" {:names ["message" "detail" "hint" "sql_error_code"] :oids [25 25 25 25] :arity #{2}}

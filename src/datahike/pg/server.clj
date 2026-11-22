@@ -5846,6 +5846,8 @@
   [parsed bound]
   (let [fetch (fn [idx] (nth bound idx))]
     (cond-> parsed
+      (contains? parsed :values-rows)
+      (params/substitute-select-plan fetch)
       (contains? parsed :in-args)
       (update :in-args params/substitute-params fetch)
       (contains? parsed :tx-data)
@@ -7681,26 +7683,24 @@
                                   (assoc-in [:local-sequence-reservations generation] position))))
             next))))))
 
+(defn- session-nextval! [conn tx-state session-state reference]
+  (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        sequence-name (sequence-reference-name db reference)
+        value (nextval-for-tx! conn tx-state sequence-name)]
+    (when session-state
+      (swap! session-state
+             (fn [state]
+               (-> state
+                   (assoc :last-sequence sequence-name)
+                   (update :seq-called (fnil conj #{}) sequence-name)))))
+    value))
+
 (defn- handle-nextval
-  "SELECT nextval('seq_name') — wire wrapper around `nextval!`."
+  "SELECT nextval('seq_name') with session-local currval and lastval state."
   [{:keys [conn tx-state session-state]} parsed]
   (try
-    (let [lookup-db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
-          seq-name (sequence-reference-name lookup-db (:seq-name parsed))
-          v (nextval-for-tx! conn tx-state seq-name)]
-      ;; Remember which sequence this session last advanced so lastval()
-      ;; can answer. PG scopes lastval to the session for exactly this
-      ;; reason — it is the "what id did my INSERT just get" idiom, and
-      ;; a global answer would hand back another connection's value.
-      (when session-state
-        (swap! session-state
-               (fn [st]
-                 (-> st
-                     (assoc :last-sequence seq-name)
-                     ;; currval is only defined for sequences THIS
-                     ;; session has advanced.
-                     (update :seq-called (fnil conj #{}) seq-name)))))
-      (single-row-result "nextval" PgWireServer/OID_INT8 (str v)))
+    (single-row-result "nextval" PgWireServer/OID_INT8
+                       (str (session-nextval! conn tx-state session-state (:seq-name parsed))))
     (catch Exception e
       ;; No prefix: every error reachable here is already PG-shaped
       ;; ("relation \"s\" does not exist", "nextval: reached maximum
@@ -8704,7 +8704,7 @@
       (catch Exception _ [query in-args nil]))
     [query in-args nil]))
 
-(defn- select-rows
+(defn- select-rows*
   "The row-producing half of `exec-select`: run the plan and apply every
    server-side pass (hidden-column stripping, windows, HAVING, compound
    aggregates, deferred correlated subqueries, DISTINCT, nextval markers).
@@ -8732,7 +8732,7 @@
             resolve-result-value
             #(params/resolve-nextvals!
               % (fn [sequence-name]
-                  (nextval-for-tx! (:conn ctx) tx-state sequence-name))
+                  (session-nextval! (:conn ctx) tx-state session-state sequence-name))
               nil call-seen)
             ;; Catalog-only SELECT: re-resolve the enriched-db against the
             ;; CURRENT db so a reused prepared statement reflects catalog
@@ -9178,6 +9178,32 @@
         {:results results :find-aliases find-aliases
          :query query :query-db query-db}))))
 
+(defn- select-rows
+  [ctx {:keys [values-rows sql-order-by sql-limit sql-offset fetch-with-ties? find-aliases] :as parsed}]
+  (if-not values-rows
+    (select-rows* ctx parsed)
+    (let [offset (or sql-offset 0)
+          _ (when (neg? offset)
+              (throw (errors/pg-error :invalid-row-count-in-result-offset-clause
+                                      {:message "OFFSET must not be negative"})))
+          _ (when (and sql-limit (neg? sql-limit))
+              (throw (errors/pg-error :invalid-row-count-in-limit-clause
+                                      {:message "LIMIT must not be negative"})))
+          cmp (when sql-order-by (null-safe-order-cmp sql-order-by))
+          plans (cond
+                  (= 0 sql-limit) []
+                  (and sql-limit (nil? cmp)) (take (+' offset sql-limit) values-rows)
+                  :else values-rows)
+          rows (mapcat (fn [row]
+                         (params/check-cancel!)
+                         (:results (select-rows* ctx row))) plans)
+          offset-rows (drop offset (if cmp (sort cmp rows) rows))
+          results (cond
+                    fetch-with-ties? (take-with-ties sql-limit cmp offset-rows)
+                    sql-limit (take sql-limit offset-rows)
+                    :else offset-rows)]
+      {:literal? true :results results :find-aliases find-aliases})))
+
 (defn- select-result-oids
   "The result column OIDs of a plain SELECT, as wire ints: schema-derived,
    blended with the parse-time OIDs, then the window outputs' and the
@@ -9235,6 +9261,10 @@
                       schema-oids)]
     (int-array (map types/oid->wire-int (blend-visible-item-oids parsed schema-oids)))))
 
+(defn- values-typmods [{:keys [values-rows output-columns]}]
+  (when (and values-rows (some :typmod output-columns))
+    (int-array (map #(or (:typmod %) -1) output-columns))))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -9257,9 +9287,10 @@
             schema-oids (when item-oids
                           (int-array
                            (map #(types/oid->wire-int (or % -1)) item-oids)))]
-        (format-query-result results
-                             find-aliases
-                             schema-oids))
+        (if-let [typmods (values-typmods parsed)]
+          (.withColumnTypmods ^PgWireServer$QueryResult
+           (format-query-result results find-aliases schema-oids typmods) typmods)
+          (format-query-result results find-aliases schema-oids)))
       ;; Derive schema-based OIDs for proper type metadata.
       ;; Shared with describeResult; see compute-schema-oids.
       (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
@@ -14940,7 +14971,9 @@
               (-> qr
                   (.withColumnSources (first sources) (second sources))
                   (.withColumnTypmods (nth sources 2)))
-              qr))
+              (if-let [typmods (values-typmods parsed)]
+                (.withColumnTypmods qr typmods)
+                qr)))
 
           ;; UNION / UNION ALL / INTERSECT / EXCEPT — the executor
           ;; runs each branch separately and combines, but pgjdbc on

@@ -4110,6 +4110,94 @@
             (or *anonymous-derived-counter* (atom -1))]
     (translate-select* select schema db options)))
 
+(defn- select-row-bounds [^Select select schema db order-by]
+  (let [limit-expr (.getLimit select)
+        limit-val (when limit-expr
+                    (let [rc (.getRowCount ^Limit limit-expr)]
+                      (when (contains-target-list-srf? rc)
+                        (throw (errors/pg-error
+                                :feature-not-supported
+                                {:message "set-returning functions are not allowed in LIMIT"})))
+                      (let [value (extract-value rc schema db)]
+                        (when-not (params/param-ref? value)
+                          (when (and (some? value) (not (integer? value)))
+                            (throw (errors/pg-error
+                                    :feature-not-supported
+                                    {:detail (str "LIMIT expression is not supported: " rc)})))
+                          (when (and (integer? value) (neg? value))
+                            (throw (errors/pg-error
+                                    :invalid-row-count-in-limit-clause
+                                    {:message "LIMIT must not be negative"}))))
+                        value)))
+        ;; Fetch.getRowCount returns primitive `long` and unboxes a nullable
+        ;; field.  It crashes for the SQL-standard default count and for
+        ;; expression counts, so always inspect getExpression instead.
+        fetch-expr (.getFetch select)
+        fetch-param (when fetch-expr
+                      (.getFetchParam
+                       ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
+        fetch-with-ties? (and fetch-param
+                              (str/includes? (str/upper-case (str fetch-param))
+                                             "WITH TIES"))
+        fetch-count-expr (when fetch-expr
+                           (.getExpression
+                            ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
+        _ (when (contains-target-list-srf? fetch-count-expr)
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "set-returning functions are not allowed in LIMIT"})))
+        fetch-count (when fetch-expr
+                      (cond
+                        ;; An omitted count defaults to one.
+                        (nil? fetch-count-expr) 1
+                        ;; PostgreSQL rejects a bare NULL for WITH TIES, but
+                        ;; deliberately permits a computed NULL such as
+                        ;; (NULL + 1), which behaves as no limit.
+                        (instance? NullValue fetch-count-expr)
+                        (when fetch-with-ties?
+                          (throw
+                           (errors/pg-error
+                            :invalid-row-count-in-limit-clause
+                            {:message "row count cannot be null in FETCH FIRST ... WITH TIES clause"})))
+                        :else (extract-value fetch-count-expr schema db)))
+        _ (when (and (some? fetch-count)
+                     (not (integer? fetch-count)))
+            (throw
+             (errors/pg-error
+              :feature-not-supported
+              {:detail (str "FETCH FIRST row count expression is not supported: "
+                            fetch-count-expr)})))
+        _ (when (and (integer? fetch-count) (neg? fetch-count))
+            (throw
+             (errors/pg-error
+              :invalid-row-count-in-limit-clause
+              {:message "FETCH FIRST row count must not be negative"})))
+        limit-val (if fetch-expr fetch-count limit-val)
+        _ (when (and fetch-with-ties? (empty? order-by))
+            (throw
+             (errors/pg-error
+              :syntax-error
+              {:message "WITH TIES cannot be specified without ORDER BY clause"})))
+        offset-expr (.getOffset select)
+        offset-val (when offset-expr
+                     (let [ofs (.getOffset ^Offset offset-expr)]
+                       (when (contains-target-list-srf? ofs)
+                         (throw (errors/pg-error
+                                 :feature-not-supported
+                                 {:message "set-returning functions are not allowed in OFFSET"})))
+                       (let [value (extract-value ofs schema db)]
+                         (when-not (params/param-ref? value)
+                           (when (and (some? value) (not (integer? value)))
+                             (throw (errors/pg-error
+                                     :feature-not-supported
+                                     {:detail (str "OFFSET expression is not supported: " ofs)})))
+                           (when (and (integer? value) (neg? value))
+                             (throw (errors/pg-error
+                                     :invalid-row-count-in-result-offset-clause
+                                     {:message "OFFSET must not be negative"}))))
+                         value)))]
+    {:limit limit-val :offset offset-val :fetch-with-ties? fetch-with-ties?}))
+
 (defn translate-select*
   "Translate a PlainSelect into a Datalog query map + metadata.
   Returns {:query map :find-aliases [...] :has-aggregates? bool}"
@@ -6644,91 +6732,9 @@
                                 order-by)))
 
 ;; LIMIT / OFFSET / FETCH FIRST
-        limit-expr (.getLimit select)
-        limit-val (when limit-expr
-                    (let [rc (.getRowCount ^Limit limit-expr)]
-                      (when (contains-target-list-srf? rc)
-                        (throw (errors/pg-error
-                                :feature-not-supported
-                                {:message "set-returning functions are not allowed in LIMIT"})))
-                      (let [value (extract-value rc schema db)]
-                        (when-not (params/param-ref? value)
-                          (when (and (some? value) (not (integer? value)))
-                            (throw (errors/pg-error
-                                    :feature-not-supported
-                                    {:detail (str "LIMIT expression is not supported: " rc)})))
-                          (when (and (integer? value) (neg? value))
-                            (throw (errors/pg-error
-                                    :invalid-row-count-in-limit-clause
-                                    {:message "LIMIT must not be negative"})))
-                          value))))
-        ;; Fetch.getRowCount returns primitive `long` and unboxes a nullable
-        ;; field.  It crashes for the SQL-standard default count and for
-        ;; expression counts, so always inspect getExpression instead.
-        fetch-expr (.getFetch select)
-        fetch-param (when fetch-expr
-                      (.getFetchParam
-                       ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
-        fetch-with-ties? (and fetch-param
-                              (str/includes? (str/upper-case (str fetch-param))
-                                             "WITH TIES"))
-        fetch-count-expr (when fetch-expr
-                           (.getExpression
-                            ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
-        _ (when (contains-target-list-srf? fetch-count-expr)
-            (throw (errors/pg-error
-                    :feature-not-supported
-                    {:message "set-returning functions are not allowed in LIMIT"})))
-        fetch-count (when fetch-expr
-                      (cond
-                        ;; An omitted count defaults to one.
-                        (nil? fetch-count-expr) 1
-                        ;; PostgreSQL rejects a bare NULL for WITH TIES, but
-                        ;; deliberately permits a computed NULL such as
-                        ;; (NULL + 1), which behaves as no limit.
-                        (instance? NullValue fetch-count-expr)
-                        (when fetch-with-ties?
-                          (throw
-                           (errors/pg-error
-                            :invalid-row-count-in-limit-clause
-                            {:message "row count cannot be null in FETCH FIRST ... WITH TIES clause"})))
-                        :else (extract-value fetch-count-expr schema db)))
-        _ (when (and (some? fetch-count)
-                     (not (integer? fetch-count)))
-            (throw
-             (errors/pg-error
-              :feature-not-supported
-              {:detail (str "FETCH FIRST row count expression is not supported: "
-                            fetch-count-expr)})))
-        _ (when (and (integer? fetch-count) (neg? fetch-count))
-            (throw
-             (errors/pg-error
-              :invalid-row-count-in-limit-clause
-              {:message "FETCH FIRST row count must not be negative"})))
-        limit-val (if fetch-expr fetch-count limit-val)
-        _ (when (and fetch-with-ties? (empty? order-by))
-            (throw
-             (errors/pg-error
-              :syntax-error
-              {:message "WITH TIES cannot be specified without ORDER BY clause"})))
-        offset-expr (.getOffset select)
-        offset-val (when offset-expr
-                     (let [ofs (.getOffset ^Offset offset-expr)]
-                       (when (contains-target-list-srf? ofs)
-                         (throw (errors/pg-error
-                                 :feature-not-supported
-                                 {:message "set-returning functions are not allowed in OFFSET"})))
-                       (let [value (extract-value ofs schema db)]
-                         (when-not (params/param-ref? value)
-                           (when (and (some? value) (not (integer? value)))
-                             (throw (errors/pg-error
-                                     :feature-not-supported
-                                     {:detail (str "OFFSET expression is not supported: " ofs)})))
-                           (when (and (integer? value) (neg? value))
-                             (throw (errors/pg-error
-                                     :invalid-row-count-in-result-offset-clause
-                                     {:message "OFFSET must not be negative"})))
-                           value))))
+        {:keys [limit offset fetch-with-ties?]} (select-row-bounds select schema db order-by)
+        limit-val (when-not (params/param-ref? limit) limit)
+        offset-val (when-not (params/param-ref? offset) offset)
 
         ;; FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE
         ;; + optional NOWAIT / SKIP LOCKED / (default: block)
@@ -9986,6 +9992,111 @@
     (and (instance? Column expression)
          (nil? (some-> ^Column expression .getTable .getName))
          (.equalsIgnoreCase "default" (.getColumnName ^Column expression)))))
+
+(defn- values-tail? [^Select statement]
+  (or (seq (.getOrderByElements statement)) (.getLimit statement)
+      (.getOffset statement) (.getFetch statement)))
+
+(defn- values-order [^Select statement names]
+  (into []
+        (mapcat
+         (fn [^OrderByElement item]
+           (let [expression (.getExpression item)
+                 position
+                 (cond
+                   (instance? LongValue expression)
+                   (let [position (.getValue ^LongValue expression)]
+                     (when-not (<= 1 position (count names))
+                       (throw (ex-info (str "ORDER BY position " position " is not in select list")
+                                       {:sqlstate "42P10"})))
+                     (dec position))
+
+                   (instance? Column expression)
+                   (let [column (unquote-ident (.getColumnName ^Column expression))
+                         index (.indexOf ^java.util.List names column)]
+                     (when (or (neg? index) (.getTable ^Column expression))
+                       (throw (errors/pg-error :undefined-column {:column column})))
+                     index)
+
+                   :else
+                   (throw (errors/pg-error :feature-not-supported
+                                           {:feature "VALUES ordered by an expression"})))]
+             [position (if (.isAsc item) :asc :desc)
+              (case (str (.getNullOrdering item))
+                "NULLS_FIRST" :first
+                "NULLS_LAST" :last
+                nil)])))
+        (.getOrderByElements statement)))
+
+(defn- values-cell [expression actual expected]
+  (if (= actual expected)
+    expression
+    (do
+      (when (and actual (not (types/implicit-coercible? actual expected)))
+        (throw (ex-info (str "VALUES could not convert type " (types/format-type actual -1)
+                             " to " (types/format-type expected -1))
+                        {:sqlstate "42846"})))
+      (let [type-name (get types/oid->pg-name expected)]
+        (when-not type-name
+          (throw (errors/pg-error :feature-not-supported
+                                  {:feature "implicit VALUES casts to user-defined types"})))
+        (CastExpression. ^net.sf.jsqlparser.expression.Expression expression ^String type-name)))))
+
+(defn translate-values
+  "Plan each VALUES row as an ordinary scalar projection. Determine a
+   common type for every column before planning its implicit casts."
+  [^Values statement schema db & [^Select outer]]
+  (when (or (seq (.getWithItemsList statement)) (seq (some-> outer .getWithItemsList)))
+    (throw (errors/pg-error :feature-not-supported {:feature "WITH before standalone VALUES"})))
+  (when (or (.getForMode statement) (some-> outer .getForMode))
+    (throw (errors/pg-error :feature-not-supported {:feature "row locking on VALUES"})))
+  (let [tail (if (and outer (values-tail? outer))
+               (do
+                 (when (values-tail? statement)
+                   (throw (errors/pg-error :feature-not-supported
+                                           {:feature "both inner and outer VALUES row bounds"})))
+                 outer)
+               statement)
+        rows (analysis/values-expression-rows statement)]
+    (doseq [cell (mapcat identity rows)]
+      (when (insert-default-expression? cell)
+        (throw (ex-info "DEFAULT is not allowed in this context" {:sqlstate "42601"})))
+      (when (contains-target-list-srf? cell)
+        (throw (errors/pg-error :feature-not-supported
+                                {:message "set-returning functions are not allowed in VALUES"})))
+      (when (seq (params/ast-window-names cell))
+        (throw (errors/pg-error :windowing-error
+                                {:message "window functions are not allowed in VALUES"})))
+      (when (some (comp fns/aggregate-function? srf-base-name) (params/ast-function-names cell))
+        (throw (ex-info "aggregate functions are not allowed in VALUES" {:sqlstate "42803"}))))
+    (let [outputs (analysis/analyze-values-cells rows schema db)
+          columns (analysis/values-columns outputs)
+          names (mapv :name columns)
+          oids (mapv :oid columns)
+          converted (mapv #(mapv values-cell %1 (mapv :oid %2) oids) rows outputs)
+          row-plans (mapv (fn [row]
+                            (let [select (doto (PlainSelect.)
+                                           (.setSelectItems
+                                            (mapv (fn [^net.sf.jsqlparser.expression.Expression cell column-name]
+                                                    (SelectItem. cell (Alias. column-name)))
+                                                  row names)))]
+                              (translate-select select schema db)))
+                          converted)
+          order-by (not-empty (values-order tail names))
+          {:keys [limit offset fetch-with-ties?]} (select-row-bounds tail schema db order-by)]
+      {:type :select :values-rows row-plans
+       :runtime-subqueries? (boolean (some :runtime-subqueries? row-plans))
+       :execution-materialization? (boolean (some :execution-materialization? row-plans))
+       :find-aliases names :select-item-oids oids :select-item-resolution-oids oids
+       :output-columns columns
+       :param-oids (into (into {} (keep (fn [value]
+                                          (when (params/param-ref? value)
+                                            [(:idx value) types/oid-int8])))
+                               [limit offset])
+                         (mapcat #(params/where-param-oids % schema nil {})
+                                 (mapcat identity converted)))
+       :sql-order-by order-by :sql-limit limit :sql-offset offset
+       :fetch-with-ties? fetch-with-ties?})))
 
 (defn- compile-insert-assignment-plans
   "Compile column expressions for an INSERT containing partial targets.
