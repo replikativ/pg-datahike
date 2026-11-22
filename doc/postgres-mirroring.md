@@ -79,7 +79,9 @@ over supported scalar built-in types without base type modifiers.
 Domains can have a default, `NOT NULL`, and one validated `CHECK`.
 The admission report identifies unsupported type definitions by column.
 The mirror installs type definitions with the tables or columns that use
-them. A change to an installed type definition pauses the mirror.
+them. With schema refresh enabled, it follows enum label additions and
+renames and changes to a domain's default, nullability, and check.
+`pg_enum` reports the publisher's member OIDs and sort order.
 
 ## Mirror partitions
 
@@ -140,9 +142,17 @@ related DDL in one PostgreSQL transaction and allow each refresh to finish
 before the next schema change.
 Keep this option enabled through restart while a refresh is pending.
 
+Columns can change between supported built-in types, enums, and domains if
+the previous primary key can still match rows. The mirror matches renamed
+enum key labels by the publisher's enum member OIDs. Earlier snapshots
+retain the old names, column types, defaults, and checks. Schema refresh
+requires the same PostgreSQL type identity for edits to registered types.
+
 When upgrading an existing mirror that stored only the wire layout, enable
 this option while its publication still has the same layout. Let the mirror
 finish recording the source column numbers and definitions before migrating.
+An upgrade from an older enum manifest records the member OIDs at its next
+schema refresh. Let that refresh finish before renaming an enum label.
 
 The worker uses PostgreSQL's post-migration rows at the shared WAL boundary.
 The refreshed schema and rows become visible with the checkpoint. Existing
@@ -214,6 +224,8 @@ and historical row and catalog reads. Pass `--primary-key-refresh` to compare
 replacement keys, key order, historical constraints, and rejected cutovers
 with PostgreSQL. Pass `--partitions` to check populated attachment,
 detachment, reattachment, truncation and crash recovery under leaf routing.
+Pass `--type-refresh` to compare enum and domain changes, column conversions,
+and historical type catalogs across an interrupted cutover and restart.
 
 The next stages are wider publication type and relation support, streaming and
 spooling of large transactions, and failover slots. See the

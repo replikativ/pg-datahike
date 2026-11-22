@@ -12266,6 +12266,62 @@
                               {:message "ALTER COLUMN TYPE USING requires a scalar row expression"})))
     (row-constraints/parse-constraint-expression sql)))
 
+(defn- readdress-column-tx [db column definition indexes oid typmod]
+  (let [name (:datahike.pg.column/name column)
+        old-attr (:datahike.pg.column/storage-ident column)
+        old-typmod (:datahike.pg.column/typmod column)
+        new-attr (:db/ident definition)
+        addr [:datahike.pg.column/address-key (:datahike.pg.column/address-key column)]
+        hint (column-hint-eid db old-attr)
+        new-hint (cond-> {:datahike.pg/for-ident new-attr :datahike.pg/column name}
+                   (and hint (:datahike.pg/internal-index (d/entity db hint)))
+                   (assoc :datahike.pg/internal-index true))
+        index-tx (mapv (fn [{:keys [entity keys]}]
+                         [:db/add entity :datahike.pg.index/keys
+                          (pr-str (mapv (fn [key]
+                                          (if (= name (:name key))
+                                            (assoc key :storage-ident new-attr)
+                                            key))
+                                        keys))])
+                       indexes)]
+    (cond-> (into [definition
+                   new-hint
+                   (if hint
+                     [:db/add hint :datahike.pg/hidden true]
+                     {:datahike.pg/for-ident old-attr :datahike.pg/hidden true})
+                   [:db/add addr :datahike.pg.column/storage-ident new-attr]
+                   [:db/add addr :datahike.pg.column/type-oid (long oid)]]
+                  index-tx)
+      typmod (conj [:db/add addr :datahike.pg.column/typmod (long typmod)])
+      (and (nil? typmod) (some? old-typmod))
+      (conj [:db/retract addr :datahike.pg.column/typmod old-typmod]))))
+
+(defn mirror-column-rewrite-tx
+  "Prepare an attribute for values already converted by the publisher.
+   The staging table supplies the storage definition of the new SQL type."
+  [db table name type-oid typmod staged-column]
+  (let [relation-oid (pgs/storage-table-oid db table)
+        column (alterable-column db table relation-oid name "TYPE")
+        indexes (column-index-dependents db table column)
+        old-attr (:datahike.pg.column/storage-ident column)
+        schema (dbi/-schema db)
+        old (get schema old-attr)
+        new-attr (available-column-storage-ident (conj (set (keys schema)) (keyword table name))
+                                                 table name (:datahike.pg.column/attnum column))
+        definition (merge (select-keys old [:db/index :db/noHistory])
+                          (select-keys staged-column [:db/valueType :db/cardinality
+                                                      :pg/type :pg/typmod :pg/array-elem :pg/array-ndim
+                                                      :datahike.pg/enum-of :datahike.pg/domain-of])
+                          {:db/ident new-attr})]
+    (when (or (:db/unique old) (some :unique? indexes))
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "Cannot rewrite a mirror column with a live unique constraint: " name)})))
+    (into (readdress-column-tx db column definition indexes type-oid typmod)
+          (keep (fn [eid]
+                  (let [value (get (d/entity db eid) old-attr)]
+                    (when (some? value) [:db/retract eid old-attr value]))))
+          (table-row-eids db table))))
+
 (defn- type-rewrite-tx
   "Rewrite one column's row values and catalog address atomically. A fresh
    physical attribute keeps old values and type metadata addressable as of the
@@ -12280,7 +12336,6 @@
         schema (dbi/-schema db)
         attnum (:datahike.pg.column/attnum column)
         {:keys [base oid typmod vtype array-spec]} (alter-type-column-spec db type)
-        old-typmod (:datahike.pg.column/typmod column)
         new-attr (available-column-storage-ident (conj (set (keys schema)) (keyword table name))
                                                  table name attnum)
         definition (merge (select-keys (get schema old-attr) [:db/index :db/noHistory])
@@ -12328,31 +12383,8 @@
         convert (fn [value]
                   (stmt/coerce-insert-value value new-attr {new-attr definition} db))
         _ (when (#{:literal :bit :bit-coerced} (:pg/default-kind definition))
-            (convert (:pg/default-value definition)))
-        addr [:datahike.pg.column/address-key (:datahike.pg.column/address-key column)]
-        hint (column-hint-eid db old-attr)
-        new-hint (cond-> {:datahike.pg/for-ident new-attr :datahike.pg/column name}
-                   (and hint (:datahike.pg/internal-index (d/entity db hint)))
-                   (assoc :datahike.pg/internal-index true))
-        index-tx (mapv (fn [{:keys [entity keys]}]
-                         [:db/add entity :datahike.pg.index/keys
-                          (pr-str (mapv (fn [key]
-                                          (if (= name (:name key))
-                                            (assoc key :storage-ident new-attr)
-                                            key))
-                                        keys))])
-                       indexes)]
-    (into (cond-> (into [definition
-                         new-hint
-                         (if hint
-                           [:db/add hint :datahike.pg/hidden true]
-                           {:datahike.pg/for-ident old-attr :datahike.pg/hidden true})
-                         [:db/add addr :datahike.pg.column/storage-ident new-attr]
-                         [:db/add addr :datahike.pg.column/type-oid (long oid)]]
-                        index-tx)
-            typmod (conj [:db/add addr :datahike.pg.column/typmod (long typmod)])
-            (and (nil? typmod) (some? old-typmod))
-            (conj [:db/retract addr :datahike.pg.column/typmod old-typmod]))
+            (convert (:pg/default-value definition)))]
+    (into (readdress-column-tx db column definition indexes oid typmod)
           (mapcat (fn [eid]
                     (let [row (d/entity db eid)
                           previous (get row old-attr)

@@ -150,12 +150,41 @@
       (if problem
         {:problem problem}
         (cond-> {:kind kind :schema schema :name name :oid (.getLong row "atttypid")}
-          (= kind :enum) (assoc :labels labels)
+          (= kind :enum) (assoc :labels labels
+                                :label-oids (mapv long (.getArray (.getArray row "enum_label_oids")))
+                                :label-order (mapv double (.getArray (.getArray row "enum_label_order"))))
           (= kind :domain) (assoc :base-type base-type
                                   :not-null? (.getBoolean row "domain_not_null")
                                   :default (.getString row "domain_default")
                                   :check-name (.getString row "domain_check_name")
                                   :check-expr (.getString row "domain_check_expr")))))))
+
+(def ^:private source-type-fields
+  (str "t.typtype AS type_kind, t.typname AS type_name, tn.nspname AS type_schema, "
+       "t.typbasetype AS type_base_oid, t.typtypmod AS type_base_typmod, "
+       "t.typnotnull AS domain_not_null, pg_catalog.pg_get_expr(t.typdefaultbin, 0) AS domain_default, "
+       "e.labels AS enum_labels, e.label_oids AS enum_label_oids, e.label_order AS enum_label_order, "
+       "dc.count AS domain_check_count, "
+       "coalesce(dc.validated, true) AS domain_validated, "
+       "dc.name AS domain_check_name, dc.expression AS domain_check_expr "))
+
+(def ^:private source-type-joins
+  (str "LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace "
+       "LEFT JOIN LATERAL (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) AS labels, "
+       " array_agg(e.oid ORDER BY e.enumsortorder) AS label_oids, "
+       " array_agg(e.enumsortorder ORDER BY e.enumsortorder) AS label_order "
+       " FROM pg_catalog.pg_enum e WHERE e.enumtypid = t.oid) e ON t.typtype = 'e' "
+       "LEFT JOIN LATERAL (SELECT count(*) AS count, bool_and(d.convalidated) AS validated, "
+       " min(d.conname::text) AS name, min(pg_catalog.pg_get_expr(d.conbin, 0)) AS expression "
+       " FROM pg_catalog.pg_constraint d WHERE d.contypid = t.oid AND d.contype = 'c') dc ON t.typtype = 'd' "))
+
+(defn- read-source-types [source expected]
+  (into {}
+        (query source (str "SELECT t.oid AS atttypid, " source-type-fields
+                           "FROM pg_catalog.pg_type t " source-type-joins
+                           "WHERE t.oid = ANY(CAST(? AS oid[]))")
+               [(str "{" (comma-list (keys expected)) "}")]
+               (fn [^ResultSet row] [(.getLong row "atttypid") (source-user-type row)]))))
 
 (defn- read-publication-row [^ResultSet row]
   (let [schema (.getString row "schemaname")
@@ -280,13 +309,7 @@
                          "       a.attname, a.atttypid, a.atttypmod, a.attgenerated, a.attnum, a.attnotnull, "
                          "       pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS default_expr, "
                          "       pg_catalog.format_type(a.atttypid, a.atttypmod) AS source_type, "
-                         "       t.typtype AS type_kind, t.typname AS type_name, tn.nspname AS type_schema, "
-                         "       t.typbasetype AS type_base_oid, t.typtypmod AS type_base_typmod, "
-                         "       t.typnotnull AS domain_not_null, "
-                         "       pg_catalog.pg_get_expr(t.typdefaultbin, 0) AS domain_default, "
-                         "       e.labels AS enum_labels, dc.count AS domain_check_count, "
-                         "       coalesce(dc.validated, true) AS domain_validated, "
-                         "       dc.name AS domain_check_name, dc.expression AS domain_check_expr, "
+                         source-type-fields ", "
                          "       (p.partition_leaves IS NOT NULL OR a.attname = ANY(p.attnames)) AS is_published, "
                          "       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') AS can_select, "
                          "       pk.key_position, idx.relname AS primary_key_name "
@@ -297,12 +320,7 @@
                          "LEFT JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = c.oid "
                          "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
                          "LEFT JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype IN ('d', 'e') "
-                         "LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace "
-                         "LEFT JOIN LATERAL (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) AS labels "
-                         " FROM pg_catalog.pg_enum e WHERE e.enumtypid = t.oid) e ON t.typtype = 'e' "
-                         "LEFT JOIN LATERAL (SELECT count(*) AS count, bool_and(d.convalidated) AS validated, "
-                         " min(d.conname::text) AS name, min(pg_catalog.pg_get_expr(d.conbin, 0)) AS expression "
-                         " FROM pg_catalog.pg_constraint d WHERE d.contypid = t.oid AND d.contype = 'c') dc ON t.typtype = 'd' "
+                         source-type-joins
                          "LEFT JOIN pg_catalog.pg_attrdef def ON def.adrelid = a.attrelid AND def.adnum = a.attnum "
                          "LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND i.indisprimary "
                          " AND i.indimmediate AND i.indisvalid "
@@ -525,8 +543,48 @@
                                "Missing replacement primary index" {:table (relation-name table)})
                      [[:db/add (:db/id object) :datahike.pg.index/primary? true]])))))
 
+(defn- enum-member-tx [db name {:keys [label-oids label-order]}]
+  (let [attr :datahike.pg.enum/publisher-members]
+    (cond-> []
+      (not (contains? (dbi/-schema db) attr))
+      (conj {:db/ident attr :db/valueType :db.type/string :db/cardinality :db.cardinality/one})
+      true
+      (conj [:db/add [:datahike.pg.enum/name name] attr (pr-str (mapv vector label-oids label-order))]))))
+
+(defn- refresh-type-tx [db [old {:keys [kind name labels not-null? default check-name check-expr] :as definition}]]
+  (let [object (catalog-objects/object-by-identity db catalog-objects/pg-type-oid
+                                                   catalog-objects/public-namespace-oid name)
+        registry-name (case kind :enum :datahike.pg.enum/name :domain :datahike.pg.domain/name)
+        eid (d/q '[:find ?e . :in $ ?attr ?name :where [?e ?attr ?name]] db registry-name name)
+        _ (require! (and eid (= kind (:datahike.pg.object/kind object)))
+                    "Missing local user type during schema refresh" {:type name})
+        type-tx (case kind
+                  :enum
+                  (let [old-labels (set (:labels old))
+                        new-labels (set labels)]
+                    (cond-> (enum-member-tx db name definition)
+                      (not= (:labels old) labels)
+                      (into (concat (for [label (:labels old) :when (not (contains? new-labels label))]
+                                      [:db/retract eid :datahike.pg.enum/values label])
+                                    (for [label labels :when (not (contains? old-labels label))]
+                                      [:db/add eid :datahike.pg.enum/values label])
+                                    [[:db/add eid :datahike.pg.enum/values-ordered (str/join "\n" labels)]]))))
+                  :domain
+                  (let [entity (d/entity db eid)]
+                    (keep (fn [[attr value]]
+                            (let [previous (get entity attr)]
+                              (when (not= previous value)
+                                (if (nil? value) [:db/retract eid attr previous] [:db/add eid attr value]))))
+                          [[:datahike.pg.domain/not-null not-null?]
+                           [:datahike.pg.domain/default-raw default]
+                           [:datahike.pg.domain/check-name check-name]
+                           [:datahike.pg.domain/check-expr check-expr]])))]
+    (when (seq type-tx)
+      (into (vec type-tx) (catalog-objects/bump-revision-tx
+                           db catalog-objects/pg-type-oid (:datahike.pg.object/oid object))))))
+
 (defn- install-types! [destination user-types]
-  (doseq [{:keys [kind name labels base-type not-null? default check-name check-expr]} (vals user-types)]
+  (doseq [{:keys [kind name labels base-type not-null?] :as definition} (vals user-types)]
     (sink-execute! destination
                    (case kind
                      :enum (str "CREATE TYPE " (ident name) " AS ENUM (" (comma-list (map literal labels)) ")")
@@ -534,10 +592,10 @@
                                   (if (= types/oid-float8 (:oid base-type))
                                     "float8"
                                     (builtin-ddl-type base-type))
-                                  (when default (str " DEFAULT " default))
-                                  (when not-null? " NOT NULL")
-                                  (when check-expr
-                                    (str " CONSTRAINT " (ident check-name) " CHECK (" check-expr ")")))))))
+                                  (when not-null? " NOT NULL"))))
+    ;; Source defaults and checks are already deparsed SQL. Store those
+    ;; expressions verbatim instead of reconstructing them from DDL tokens.
+    (stage-data! destination #(refresh-type-tx % [definition definition]))))
 
 (defn- create-table! [destination {:keys [columns] :as table}]
   (let [keys (key-columns table)
@@ -962,41 +1020,62 @@
   (update (select-keys table [:schema :name :relation-id :columns])
           :columns #(mapv (fn [column] (select-keys column [:name :oid :typmod :key?])) %)))
 
+(defn- same-type-definition? [old current]
+  (= old (if (:label-oids old) current (dissoc current :label-oids :label-order))))
+
+(defn- type-changes! [previous current allow-schema-refresh?]
+  (let [before (:types previous)
+        types-by-oid (into {} (map (juxt :oid identity)) (vals before))
+        identity-keys [:schema :name :oid :kind :base-type]]
+    (into {}
+          (for [[name definition] (:types current)
+                :let [installed (or (get before name) (get types-by-oid (:oid definition)))]
+                :when (and installed (not= installed definition)
+                           (or allow-schema-refresh? (not (same-type-definition? installed definition))))
+                :let [context {:reason :changed-type-definition :type name}]]
+            (do
+              (require! allow-schema-refresh? "Publisher changed a mirrored user type" context)
+              (require! (= (select-keys installed identity-keys) (select-keys definition identity-keys))
+                        "Schema refresh requires the same PostgreSQL type identity" context)
+              (when (= :enum (:kind installed))
+                (let [[old new] (if-let [oids (:label-oids installed)]
+                                  [oids (:label-oids definition)]
+                                  [(:labels installed) (:labels definition)])]
+                  (require! (= old (into [] (filter (set old)) new))
+                            "Schema refresh requires an ordered baseline for the installed enum labels"
+                            (assoc context :reason :unknown-enum-label-identity))))
+              [name [installed definition]])))))
+
 (defn- same-table? [previous current]
   (if (every? :attnum (:columns previous))
-    (let [shape (fn [table]
-                  (-> table
-                      (dissoc :storage-name :primary-key-name :partition-leaves :partition-parent
-                              :partition-key :partition-bound)
-                      (update :columns (fn [cols] (mapv #(dissoc % :key-position) cols)))))]
+    (let [shape #(dissoc % :storage-name :primary-key-name :partition-leaves :partition-parent
+                         :partition-key :partition-bound :columns)
+          columns (fn [table] (mapv #(dissoc % :key-position :user-type) (:columns table)))]
       (and current (= (shape previous) (shape current))
+           (= (columns previous) (columns current))
+           (every? true? (map #(same-type-definition? (:user-type %1) (:user-type %2))
+                              (:columns previous) (:columns current)))
            (or (nil? (:primary-key-name previous))
                (and (= (:primary-key-name previous) (:primary-key-name current))
                     (= (mapv :attnum (key-columns previous))
                        (mapv :attnum (key-columns current)))))))
     (and current (= (wire-table previous) (wire-table current)))))
 
-(defn- changed-tables! [previous current affected removed allow-schema-refresh?]
+(defn- changed-tables! [previous current affected removed type-changes allow-schema-refresh?]
   (let [before (relations-by-id previous)
-        types-by-oid (into {} (map (juxt :oid identity)) (vals (:types previous)))
         occupied (into (or (:retired-storage previous) #{})
                        (map (comp :name storage-table)) (all-relations previous))
         missing (remove #(or (:partition-parent %) (:partition-leaves %)) removed)]
     (require! (and (= (:publication-oid previous) (:publication-oid current)) (empty? missing))
               "Publication schema or membership changed"
               {:removed (mapv relation-name missing)})
-    (doseq [[name definition] (:types current)
-            installed [(get-in previous [:types name]) (get types-by-oid (:oid definition))]
-            :when installed]
-      (require! (= installed definition)
-                "Publisher changed a mirrored user type"
-                {:reason :changed-type-definition :type name}))
     (let [changes (filterv (fn [table]
                              (let [prior (get before (:relation-id table))]
                                (or (nil? prior)
                                    (contains? affected (:relation-id table))
                                    (contains? (:pending-schema previous) (:relation-id table))
                                    (not (same-table? prior table))
+                                   (some #(contains? type-changes (get-in % [:user-type :name])) (:columns table))
                                    (and allow-schema-refresh?
                                         (or (not-every? :attnum (:columns prior))
                                             (and (nil? (:primary-key-name prior))
@@ -1037,7 +1116,7 @@
               "Publication changed during refresh" {})))
 
 (defn- typed-column [column]
-  (select-keys column [:oid :typmod :user-type]))
+  (select-keys column [:oid :typmod]))
 
 (defn- primary-key-changed? [previous table]
   (or (not= (mapv :attnum (key-columns previous))
@@ -1071,7 +1150,7 @@
                      "Missing local primary key during schema refresh" {:table (relation-name previous)})
            [[:db/retract (:db/id entity) :db/unique :db.unique/identity]]))))))
 
-(defn- adapt-layout! [destination previous table]
+(defn- adapt-layout! [destination stage-db previous table staged-table]
   (let [before (into {} (map (juxt :attnum identity)) (:columns previous))
         after (into {} (map (juxt :attnum identity)) (:columns table))
         alter (str "ALTER TABLE " (relation-name table) " ")
@@ -1092,14 +1171,14 @@
       (sink-execute! destination (str alter "RENAME COLUMN " (ident old) " TO " (ident temporary))))
     (doseq [[_ temporary assigned] renames]
       (sink-execute! destination (str alter "RENAME COLUMN " (ident temporary) " TO " (ident assigned))))
-    (when (seq retypes)
-      (set-column-metadata! destination
-                            (assoc table :columns (mapv #(assoc % :default nil :not-null? false) retypes))))
-    (doseq [{:keys [name] :as column} retypes]
-      ;; Publisher rows carried by the staging copy provide the new values.
-      ;; The old value is retracted through the normal historical ALTER path.
-      (sink-execute! destination
-                     (str alter "ALTER COLUMN " (ident name) " TYPE " (column-ddl-type column) " USING NULL")))
+    (doseq [{:keys [name oid typmod user-type] :as column} retypes]
+      (let [[staged-attr] (local-column-attrs stage-db (assoc staged-table :columns [column]))
+            definition (d/entity stage-db staged-attr)]
+        (stage-data! destination
+                     (fn [db]
+                       (pg/mirror-column-rewrite-tx db (:name table) name
+                                                    (if user-type (pgs/resolve-type-oid db (column-ddl-type column)) oid)
+                                                    (when (not= -1 typmod) typmod) definition)))))
     (doseq [{:keys [attnum name] :as column} (:columns table) :when (not (contains? before attnum))]
       (sink-execute! destination
                      (str alter "ADD COLUMN " (ident name) " " (column-ddl-type column))))))
@@ -1127,6 +1206,18 @@
             (unique/canonical-key-value value)))
         columns values))
 
+(defn- enum-renames [type-changes]
+  (into {}
+        (keep (fn [[name [old new]]]
+                (when-let [oids (:label-oids old)]
+                  (let [new-labels (zipmap (:label-oids new) (:labels new))
+                        renames (into {} (keep (fn [[oid label]]
+                                                 (let [current (new-labels oid)]
+                                                   (when (not= label current) [label current]))))
+                                      (map vector oids (:labels old)))]
+                    (when (seq renames) [name renames])))))
+        type-changes))
+
 (defn- rows-by-previous-key! [table rows key-indexes check-running!]
   (let [seen (volatile! #{})
         columns (mapv (:columns table) key-indexes)]
@@ -1140,15 +1231,27 @@
               [key values]))
           rows)))
 
-(defn- reconcile-table-tx [db table key-indexes staged-schema staged-rows check-running!]
+(defn- reconcile-table-tx [db table key-indexes staged-schema staged-rows renamed-labels check-running!]
   (let [attrs (local-column-attrs db table)
         value-types (mapv #(get-in (dbi/-schema db) [% :db/valueType]) attrs)
         _ (require! (= staged-schema value-types) "Staged storage types differ from live storage types"
                     {:table (relation-name table)})
         key-attrs (mapv #(nth attrs %) key-indexes)
         key-columns (mapv (:columns table) key-indexes)
-        live (into {} (map (fn [[eid key]] [(previous-key key-columns key) eid]))
-                   (stored-rows db table key-attrs))
+        key-renames (mapv #(get renamed-labels (get-in % [:user-type :name]) {}) key-columns)
+        live-rows (stored-rows db table key-attrs)
+        live (into {} (map (fn [[eid key]]
+                             [(previous-key key-columns (mapv #(get %1 %2 %2) key-renames key)) eid]))
+                   live-rows)
+        ;; Retract every old spelling before adding any new one. A label
+        ;; swap or reuse can otherwise collide with a native unique key.
+        renamed-key-tx (when (some seq key-renames)
+                         (into []
+                               (mapcat (fn [[eid values]]
+                                         (keep (fn [[attr renames value]]
+                                                 (when (contains? renames value) [:db/retract eid attr value]))
+                                               (map vector key-attrs key-renames values))))
+                               live-rows))
         outstanding (volatile! live)
         marker (pgs/row-marker-attr (:name table))
         result (reduce
@@ -1168,15 +1271,17 @@
                                      (keep (fn [[attr value]] (when (some? value) [attr value])))
                                      (map vector attrs values))))))
                 [] staged-rows)]
-    (into result
-          (map (fn [eid] (check-running!) [:db/retractEntity eid]))
-          (vals @outstanding))))
+    (into (into (vec renamed-key-tx)
+                (map (fn [eid] (check-running!) [:db/retractEntity eid]))
+                (vals @outstanding))
+          result)))
 
-(defn- reconcile-table! [destination stage-db table live-table key-indexes check-running!]
+(defn- reconcile-table! [destination stage-db table live-table key-indexes renamed-labels check-running!]
   (let [attrs (local-column-attrs stage-db table)
         staged-schema (mapv #(get-in (dbi/-schema stage-db) [% :db/valueType]) attrs)
         staged-rows (rows-by-previous-key! table (stored-rows stage-db table attrs) key-indexes check-running!)]
-    (stage-data! destination #(reconcile-table-tx % live-table key-indexes staged-schema staged-rows check-running!))))
+    (stage-data! destination #(reconcile-table-tx % live-table key-indexes staged-schema staged-rows
+                                                  renamed-labels check-running!))))
 
 (defn- matches-relation? [table message]
   (and table (= \d (:identity message)) (= (wire-table table) (wire-table message))))
@@ -1264,7 +1369,7 @@
   (sink-execute! destination "SET TIME ZONE 'UTC'"))
 
 (defn- stage-tables! [{:keys [source-url publication max-snapshot-bytes max-transaction-bytes]}
-                      origin manifest {:keys [conn tables barrier phase]} check-running!]
+                      origin manifest {:keys [conn changes tables barrier phase]} check-running!]
   (with-open [replication (connect source-url true)
               source (connect source-url false)
               destination (pg/make-query-handler conn)]
@@ -1279,10 +1384,13 @@
                       (transaction!
                        destination
                        (fn []
-                         (install-types! destination (publisher-types tables))
+                         (let [relations (mapv :table changes)]
+                           (install-types! destination (publisher-types relations))
+                           (doseq [table relations]
+                             (check-running!)
+                             (create-table! destination table)))
                          (doseq [table tables]
                            (check-running!)
-                           (create-table! destination table)
                            (copy-table! source destination table on-bytes))))
                       position))
           expected (into {} (map (juxt :relation-id identity)) tables)
@@ -1377,7 +1485,8 @@
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
-        {:keys [changes removed installed-manifest refresh-topology?]} stage
+        {:keys [changes removed installed-manifest refresh-topology? type-changes]} stage
+        renamed-labels (enum-renames type-changes)
         rekeys (filterv (fn [{:keys [table previous]}]
                           (and previous (primary-key-changed? previous table)))
                         changes)
@@ -1389,6 +1498,8 @@
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
       (install-types! destination (:new-types stage))
+      (doseq [change (vals type-changes)]
+        (stage-data! destination #(refresh-type-tx % change)))
       (doseq [table removed]
         (check-running!)
         (retire-partition! destination table))
@@ -1398,10 +1509,10 @@
       (doseq [{:keys [table previous storage-name]} changes :when previous]
         (check-running!)
         (let [live-table (assoc table :name storage-name)]
-          (adapt-layout! destination previous live-table)
+          (adapt-layout! destination stage-db previous live-table table)
           (when-not (:partition-leaves table)
             (reconcile-table! destination stage-db table live-table
-                              (matching-key-indexes! previous table) check-running!))
+                              (matching-key-indexes! previous table) renamed-labels check-running!))
           (set-column-metadata! destination live-table)))
       ;; Vacate every old SQL name before assigning the new names. This
       ;; handles name swaps and tables added under a just-vacated name.
@@ -1429,7 +1540,7 @@
 (defn- changed-relation-ids [changes]
   (into #{} (mapcat #(if (= :truncate (:op %)) (:relation-ids %) [(:relation-id %)])) changes))
 
-(defn- installed-manifest [current previous changes removed]
+(defn- installed-manifest [current previous changes removed type-changes]
   ;; Legacy tables retain their stored definitions until they participate
   ;; in a refresh. Observing their source metadata does not install it.
   (let [installed (into {}
@@ -1439,7 +1550,11 @@
                                   (not= (:name table) storage-name) (assoc :storage-name storage-name))]))
                         changes)
         prior (relations-by-id previous)
-        types (merge (:types previous) (:types current))
+        types (into (or (:types previous) (sorted-map))
+                    (filter (fn [[name _]]
+                              (or (not (contains? (:types previous) name))
+                                  (contains? type-changes name))))
+                    (:types current))
         retired (into (or (:retired-storage previous) #{})
                       (map (comp :name storage-table)) removed)
         layouts (fn [tables] (mapv #(or (get installed (:relation-id %)) (get prior (:relation-id %))) tables))]
@@ -1473,7 +1588,8 @@
                        (require-stable-manifest! (:source-manifest active) current)
                        (let [affected (partition-affected @applied current)
                              removed (removed-relations @applied current)
-                             changes (changed-tables! @applied current affected removed schema-refresh?)]
+                             type-changes (type-changes! @applied current schema-refresh?)
+                             changes (changed-tables! @applied current affected removed type-changes schema-refresh?)]
                          (when (or (seq changes) (seq removed))
                            (doseq [{:keys [table previous]} changes
                                    :when (and previous (nil? (:partition-leaves table)))]
@@ -1483,12 +1599,13 @@
                                                    (comp (remove :partition-leaves)
                                                          (map (fn [table] [(:relation-id table) @durable])))
                                                    pending-tables)
-                                 manifest (installed-manifest current @applied changes removed)]
+                                 manifest (installed-manifest current @applied changes removed type-changes)]
                              (vswap! pending-schema #(merge new-pending %))
                              (vreset! stage (assoc (start-refresh! config origin current changes check-running!)
                                                    :installed-manifest manifest
                                                    :source-manifest current
                                                    :removed removed
+                                                   :type-changes type-changes
                                                    :refresh-topology? (or (seq (:partition-parents @applied))
                                                                           (seq (:partition-parents current)))
                                                    :new-types (apply dissoc (:types current) (keys (:types @applied)))))
@@ -1500,8 +1617,21 @@
                                                (or (and (not (contains? @observed id)) (not (contains? @live id)))
                                                    (and (live? id)
                                                         (not (matches-relation? (get @live id)
-                                                                                (get relations id))))))]
-                                  (when (some stale? ids) (refresh!))
+                                                                                (get relations id))))))
+                                      used-types (into {} (comp (filter live?)
+                                                                (mapcat #(:columns (get @live %)))
+                                                                (keep (fn [{:keys [oid user-type]}]
+                                                                        (when user-type [oid user-type]))))
+                                                       ids)]
+                                  ;; A changed enum spelling may identify a
+                                  ;; different key without any wire change.
+                                  (when (or (some stale? ids)
+                                            (when (seq used-types)
+                                              (let [current (read-source-types source used-types)]
+                                                (some (fn [[oid before]]
+                                                        (not (same-type-definition? before (get current oid))))
+                                                      used-types))))
+                                    (refresh!))
                                   (when-let [id (some #(when (stale? %) %) ids)]
                                     (throw (ex-info "Publication relation changed"
                                                     {:relation (get relations id)})))))

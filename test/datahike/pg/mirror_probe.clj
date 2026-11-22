@@ -1152,6 +1152,131 @@
           (when (= ["false"] (slot-query source slot-name "active::text"))
             (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot-name) ")"))))))))
 
+(defn- type-refresh-catalog [conn]
+  [(rows conn (str "SELECT oid, enumlabel, enumsortorder FROM pg_enum "
+                   "WHERE enumtypid = 'type_mood'::regtype ORDER BY enumsortorder"))
+   (rows conn (str "SELECT typnotnull, pg_get_expr(typdefaultbin, 0) FROM pg_type "
+                   "WHERE oid = 'type_amount'::regtype"))
+   (rows conn (str "SELECT conname FROM pg_constraint WHERE contypid = 'type_amount'::regtype "
+                   "AND contype = 'c' ORDER BY conname"))
+   (rows conn (str "SELECT column_name, udt_name, domain_name FROM information_schema.columns "
+                   "WHERE table_name = 'type_items' AND column_name <> 'db_id' ORDER BY ordinal_position"))])
+
+(defn run-type-refresh-probe! [source-url reference-url source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-type-refresh-" (make-array FileAttribute 0)))
+        path (str directory "/store")
+        native-slot (str "mirror_type_ref_" (str/replace (str (random-uuid)) "-" ""))
+        config {:source-url source-url :publication "type_refresh_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        main-slot (atom nil)
+        query-items "SELECT id::text, label, promoted::text, qty::text, legacy::text FROM type_items ORDER BY label"
+        query-details "SELECT id, state::text, amount::text FROM type_details ORDER BY id"
+        current-rows (fn [conn] [(rows conn query-items) (rows conn query-details)])
+        row-ids #(inspect-db path (fn [db]
+                                    (into {} (d/q '[:find ?label ?e
+                                                    :where [?e :type_items/label ?label]] db))))
+        type-ids #(rows % "SELECT typname, oid FROM pg_type WHERE typname IN ('type_mood', 'type_amount') ORDER BY typname")
+        ddl ["BEGIN"
+             "ALTER TYPE type_mood RENAME VALUE 'first' TO 'temporary'"
+             "ALTER TYPE type_mood RENAME VALUE 'second' TO 'first'"
+             "ALTER TYPE type_mood RENAME VALUE 'temporary' TO 'second'"
+             "ALTER TYPE type_mood ADD VALUE 'middle' BEFORE 'first'"
+             "ALTER DOMAIN type_amount SET DEFAULT 7"
+             "ALTER DOMAIN type_amount DROP NOT NULL"
+             "ALTER DOMAIN type_amount DROP CONSTRAINT type_nonnegative"
+             "ALTER DOMAIN type_amount ADD CONSTRAINT type_new_range CHECK (VALUE >= -2)"
+             (str "ALTER TABLE type_items ALTER COLUMN promoted TYPE type_mood USING promoted::type_mood, "
+                  "ALTER COLUMN qty TYPE type_amount USING qty::type_amount, "
+                  "ALTER COLUMN legacy TYPE text USING legacy::text")
+             "COMMIT"]]
+    (prn {:artifacts directory})
+    (with-open [source (DriverManager/getConnection source-url)
+                reference (DriverManager/getConnection reference-url)]
+      (try
+        (doseq [conn [source reference]]
+          (sql! conn "CREATE TYPE type_mood AS ENUM ('first', 'second')"
+                (str "CREATE DOMAIN type_amount AS integer DEFAULT 2 NOT NULL "
+                     "CONSTRAINT type_nonnegative CHECK (VALUE >= 0)")
+                (str "CREATE TABLE type_items (id type_mood PRIMARY KEY, label text, promoted text, "
+                     "qty integer, legacy type_amount)")
+                "CREATE TABLE type_details (id integer PRIMARY KEY, state type_mood, amount type_amount)"))
+        (sql! source "INSERT INTO type_items VALUES ('first','a','first',8,2), ('second','b','second',9,3)"
+              "INSERT INTO type_details VALUES (1,'first',2)"
+              "CREATE PUBLICATION type_refresh_pub FOR TABLE type_items, type_details")
+        (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
+        (sql! reference (str "CREATE SUBSCRIPTION type_refresh_native CONNECTION "
+                             (literal source-conninfo) " PUBLICATION type_refresh_pub "
+                             "WITH (create_slot=false, slot_name=" (literal native-slot) ")"))
+        (let [before (current-rows source)]
+          (await! "Native subscriber did not load the type refresh fixture" #(= before (current-rows reference)))
+          (reset! subscriber (mirror/start! config))
+          (reset! main-slot (:slot (await-state! @subscriber :following)))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (check! (= before (current-rows sink)) "Mirror type fixture rows differ" {})
+            (let [old-catalog (type-refresh-catalog source)
+                  old-type-ids (type-ids sink)
+                  old-row-ids (row-ids)
+                  before-at (inspect-db path #(str (.toInstant ^java.util.Date
+                                                    (:db/txInstant (d/entity % (:max-tx %))))))
+                  install-var #'mirror/install-staged-tables!
+                  install-original @install-var]
+              (check! (= old-catalog (type-refresh-catalog sink)) "Initial type metadata differs"
+                      {:source old-catalog :mirror (type-refresh-catalog sink)})
+              (apply sql! reference ddl)
+              (with-redefs-fn
+                {install-var (fn [stage destination check-running! max-bytes]
+                               (install-original stage destination check-running! max-bytes)
+                               (throw (ex-info "Interrupted type cutover" {})))}
+                (fn []
+                  (apply sql! source ddl)
+                  ;; A WAL update uses a label that identified a different
+                  ;; entity before DDL. It must wait for the new definition.
+                  (sql! source "UPDATE type_items SET qty=-1 WHERE id='second'"
+                        "INSERT INTO type_details VALUES (2,'middle',NULL)")
+                  (check! (= "Interrupted type cutover"
+                             (get-in (await-state! @subscriber :paused) [:last-error :message]))
+                          "Type refresh did not reach installation" (mirror/status @subscriber))
+                  (check! (= before (current-rows sink)) "Interrupted type installation changed rows" {})
+                  (check! (= old-catalog (type-refresh-catalog sink)) "Interrupted type installation changed metadata" {})))
+              (mirror/stop! @subscriber)
+              (child-crash! (assoc config :probe-crash-mode :refresh) (str directory "/crash.log"))
+              (await! "Crashed type refresh slot remained active"
+                      #(= ["false"] (slot-query source @main-slot "active::text")))
+              (let [[confirmed] (slot-query source @main-slot "confirmed_flush_lsn")
+                    cutover (durable-position path)]
+                (check! (= [["t"]] (rows source (str "SELECT " (literal confirmed)
+                                                     "::pg_lsn < " (literal cutover) "::pg_lsn")))
+                        "Type cutover was acknowledged before the crash" {}))
+              (reset! subscriber (mirror/start! config))
+              (with-open [restarted (DriverManager/getConnection (sink-url @subscriber))]
+                (let [expected (current-rows source)]
+                  (await! "Native subscriber did not follow the type migration" #(= expected (current-rows reference)))
+                  (check! (= expected (current-rows restarted)) "Recovered rows differ after the type migration"
+                          {:source expected :mirror (current-rows restarted)}))
+                (check! (= old-type-ids (type-ids restarted)) "Changing a type altered its local OID" {})
+                (check! (= old-row-ids (row-ids)) "Renamed enum primary keys changed entity identity"
+                        {:old old-row-ids :new (row-ids)})
+                (check! (= (type-refresh-catalog source) (type-refresh-catalog restarted)) "Refreshed type metadata differs"
+                        {:source (type-refresh-catalog source) :mirror (type-refresh-catalog restarted)})
+                (sql! restarted (str "SET datahike.as_of = " (literal before-at)))
+                (check! (= before (current-rows restarted)) "Historical rows lost old type values" {})
+                (check! (= old-catalog (type-refresh-catalog restarted)) "Historical type catalog changed"
+                        {:source old-catalog :mirror (type-refresh-catalog restarted)})
+                (sql! restarted "RESET datahike.as_of")
+                (sql! source "DELETE FROM type_items WHERE id='first'"
+                      "UPDATE type_items SET promoted='middle', qty=12 WHERE id='second'"
+                      "INSERT INTO type_details (id,state) VALUES (3,'first')")
+                (let [expected (current-rows source)]
+                  (await! "Native subscriber did not apply writes after type cutover" #(= expected (current-rows reference)))
+                  (await! "Mirror did not apply writes after type cutover" #(= expected (current-rows restarted))))))))
+        {:status :passed :artifacts directory}
+        (finally
+          (when @subscriber (mirror/stop! @subscriber))
+          (sql! reference "DROP SUBSCRIPTION IF EXISTS type_refresh_native")
+          (when (= ["false"] (slot-query source @main-slot "active::text"))
+            (sql! source (str "SELECT pg_drop_replication_slot(" (literal @main-slot) ")"))))))))
+
 (defn -main [& [argument]]
   (if (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
@@ -1162,6 +1287,7 @@
               "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
       (prn ((case argument
               "--partitions" run-partition-probe!
+              "--type-refresh" run-type-refresh-probe!
               "--primary-key-refresh" run-primary-key-probe!
               "--schema-refresh" run-schema-refresh-probe!
               "--refresh" run-refresh-probe!

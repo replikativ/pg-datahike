@@ -1107,7 +1107,7 @@
     (doseq [[rel col] [["pg_class" "relnatts"]
                        ["pg_class" "relrewrite"]
                        ["pg_attribute" "attndims"]
-                       ["pg_type" "typdefault"]]]
+                       ["pg_type" "typndims"]]]
       (is (= "42703" (:sqlstate (ex (str "SELECT r." col " FROM " rel " r"))))
           (str rel "." col " must raise, not answer NULL"))))
   (testing "a predicate over one no longer silently empties the result"

@@ -429,6 +429,8 @@
      {:db/ident :pg_type/typrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typbasetype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typnotnull :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_type/typdefault :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_type/typdefaultbin :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_node_tree"}
      {:db/ident :pg_type/typcollation :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      ;; The I/O and support functions and the storage properties, from
      ;; the generated registry (pg_type.dat, verified against PostgreSQL
@@ -1062,13 +1064,9 @@
      {:db/ident :pg_inherits/inhdetachpending :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_inherits") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_enum"
-    ;; Always empty — we don't model PG enum types. Metabase's
-    ;; describe-database probes `SELECT enumtypid FROM pg_enum`
-    ;; before sync-fields; without this catalog, the query errors
-    ;; out and sync-fields aborts.
     [{:db/ident :pg_enum/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_enum/enumtypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_enum/enumsortorder :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_enum/enumsortorder :db/valueType :db.type/double :db/cardinality :db.cardinality/one :pg/type "float4"}
      {:db/ident :pg_enum/enumlabel :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_enum") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_collation"
@@ -2192,20 +2190,22 @@
           (when (and cte-db
                      (get (dbi/-schema cte-db) :datahike.pg.domain/name))
             (mapv
-             (fn [[name base-type not-null]]
+             (fn [[eid name base-type not-null]]
                (let [object (catalog-objects/object-by-identity
                              cte-db catalog-objects/pg-type-oid
-                             catalog-objects/public-namespace-oid name)]
-                 {:pg_type/oid (:datahike.pg.object/oid object)
-                  :pg_type/typname name
-                  :pg_type/typlen -1 :pg_type/typtype "d"
-                  :pg_type/typcategory "U" :pg_type/typispreferred false
-                  :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
-                  :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
-                  :pg_type/typnotnull (boolean not-null)
-                  :pg_type/typdelim "," :pg_type/typnamespace 2200
-                  (pgs/row-marker-attr "pg_type") true}))
-             (d/q '{:find [?name ?base ?not-null]
+                             catalog-objects/public-namespace-oid name)
+                     default (:datahike.pg.domain/default-raw (d/entity cte-db eid))]
+                 (cond-> {:pg_type/oid (:datahike.pg.object/oid object)
+                          :pg_type/typname name
+                          :pg_type/typlen -1 :pg_type/typtype "d"
+                          :pg_type/typcategory "U" :pg_type/typispreferred false
+                          :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
+                          :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
+                          :pg_type/typnotnull (boolean not-null)
+                          :pg_type/typdelim "," :pg_type/typnamespace 2200
+                          (pgs/row-marker-attr "pg_type") true}
+                   default (assoc :pg_type/typdefault default :pg_type/typdefaultbin default))))
+             (d/q '{:find [?e ?name ?base ?not-null]
                     :where [[?e :datahike.pg.domain/name ?name]
                             [?e :datahike.pg.domain/base-type ?base]
                             [?e :datahike.pg.domain/not-null ?not-null]]}
@@ -3142,15 +3142,15 @@
                cte-db))
     "pg_enum"
     (vec
-     (for [{:keys [oid values]} (pgs/enum-types cte-db)
-           [idx label] (map-indexed vector values)]
-       {:pg_enum/oid
-        ;; pg_enum rows have their own OIDs. A stable hash is sufficient for
-        ;; catalog identity; enum ordering is represented separately below.
-        (long (bit-and 0x7fffffff
-                       (.hashCode ^String (str oid ":" idx ":" label))))
+     (for [{:keys [name oid values]} (pgs/enum-types cte-db)
+           :let [members (some-> (d/entity cte-db [:datahike.pg.enum/name name])
+                                 :datahike.pg.enum/publisher-members edn/read-string)]
+           [idx label] (map-indexed vector values)
+           :let [[member-oid sort-order] (get members idx)]]
+       {:pg_enum/oid (or member-oid (long (bit-and 0x7fffffff
+                                                   (.hashCode ^String (str oid ":" idx ":" label)))))
         :pg_enum/enumtypid oid
-        :pg_enum/enumsortorder (double (inc idx))
+        :pg_enum/enumsortorder (or sort-order (double (inc idx)))
         :pg_enum/enumlabel label
         (pgs/row-marker-attr "pg_enum") true}))
     "pg_policy"
