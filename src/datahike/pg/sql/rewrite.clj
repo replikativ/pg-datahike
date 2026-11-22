@@ -680,57 +680,54 @@
                 (recur (inc i) acc)))))))))
 
 ;; ============================================================================
-;; ALTER TABLE … TYPE <type> USING <expr> — strip the USING half.
-;; PG accepts a USING clause to convert column data; we treat the rewrite
-;; as a no-op so callers can issue the same DDL they'd issue against PG.
+;; ALTER TABLE … ALTER [COLUMN] name [SET DATA] TYPE <type> [USING <expr>]
+;; The AST parser only understands the shorter form without USING. Keep the
+;; expressions for the executor while normalizing the parser input.
 ;; ============================================================================
 
-(defn type-using-rule
-  "Match `TYPE <ident>[(...)] [<more idents>]* USING <anything>` and strip
-   from `USING` to the end of the statement (next `;` at depth 0 or
-   end of input).
+(defn- alter-type-clauses [toks]
+  (let [toks (vec (remove #(= :comment (:type %)) toks))]
+    (when (= ["alter" "table"] (mapv kw-text (take 2 toks)))
+      (keep (fn [tokens]
+              (let [tokens (vec (take-while #(not (punct? % ";")) tokens))
+                    idx (if (= "column" (kw-text (nth tokens 1 nil))) 2 1)
+                    column (nth tokens idx nil)
+                    type-tokens (subvec tokens (min (inc idx) (count tokens)))
+                    full-type? (= ["set" "data" "type"] (mapv kw-text (take 3 type-tokens)))]
+                (when (and (= "alter" (kw-text (first tokens)))
+                           (contains? #{:ident :quoted} (:type column))
+                           (or full-type? (= "type" (kw-text (first type-tokens)))))
+                  (let [using-idx
+                        (loop [i (if full-type? 3 1), depth 0]
+                          (when-let [token (nth type-tokens i nil)]
+                            (cond
+                              (and (zero? depth) (= "using" (kw-text token))) i
+                              (contains? #{"(" "["} (:text token)) (recur (inc i) (inc depth))
+                              (contains? #{")" "]"} (:text token)) (recur (inc i) (dec depth))
+                              :else (recur (inc i) depth))))
+                        using (when using-idx (nth type-tokens using-idx))]
+                    {:column (params/unquote-ident (:text column))
+                     :using (when using [(:end using) (:end (peek tokens))])
+                     :using-removal (when using [(:pos using) (:end (peek tokens)) " "])
+                     :type-prefix (when full-type?
+                                    [(:pos (first type-tokens)) (:pos (nth type-tokens 2)) ""])}))))
+            ;; Within the first action, skip the table name and optional
+            ;; relation syntax by locating the second ALTER keyword.
+            (let [[first-action & others] (cls/split-top-level-commas (subvec toks 2))]
+              (cons (drop-while #(not= "alter" (kw-text %)) first-action) others))))))
 
-   The `TYPE`-prefixed gating is what makes this safe: a bare `USING`
-   keyword (e.g. JOIN ... USING (col)) never has a preceding `TYPE`
-   token in the same clause, so it isn't matched."
-  [toks]
-  (let [n (count toks)]
-    (loop [i 0, acc []]
-      (if (>= i n)
-        acc
-        (let [t (nth toks i)]
-          (if-not (= "type" (kw-text t))
-            (recur (inc i) acc)
-            ;; Walk forward looking for USING. Stop at `;` or EOF.
-            (let [using-idx
-                  (loop [k (inc i), depth 0]
-                    (let [x (nth toks k nil)]
-                      (cond
-                        (nil? x) nil
-                        (punct? x "(") (recur (inc k) (inc depth))
-                        (punct? x ")") (recur (inc k) (max 0 (dec depth)))
-                        (and (zero? depth) (punct? x ";")) nil
-                        (and (zero? depth) (= "using" (kw-text x))) k
-                        :else (recur (inc k) depth))))]
-              (if (nil? using-idx)
-                (recur (inc i) acc)
-                ;; Span: from the USING token to either the next top-
-                ;; level `;` or end of input.
-                (let [end-idx (loop [k (inc using-idx), depth 0]
-                                (let [x (nth toks k nil)]
-                                  (cond
-                                    (nil? x) k
-                                    (punct? x "(") (recur (inc k) (inc depth))
-                                    (punct? x ")") (recur (inc k) (max 0 (dec depth)))
-                                    (and (zero? depth) (punct? x ";")) k
-                                    :else (recur (inc k) depth))))
-                      using-tok (nth toks using-idx)
-                      end-pos (if (and (< end-idx n)
-                                       (= ";" (:text (nth toks end-idx))))
-                                (:pos (nth toks end-idx))
-                                (:end (nth toks (dec end-idx))))]
-                  (recur end-idx
-                         (conj acc [(:pos using-tok) end-pos " "])))))))))))
+(defn alter-type-using-expressions
+  "Map column name to its USING expression from the original ALTER TABLE."
+  [sql]
+  (when (re-find #"(?i)\busing\b" sql)
+    (into {}
+          (keep (fn [{:keys [column using]}]
+                  (when-let [[start end] using]
+                    [column (str/trim (subs sql start end))])))
+          (alter-type-clauses (cls/tokenize-all sql)))))
+
+(defn type-using-rule [toks]
+  (mapcat #(keep % [:type-prefix :using-removal]) (alter-type-clauses toks)))
 
 ;; ============================================================================
 ;; INDEX/KEY varchar — quote a reserved-word column name. PG accepts

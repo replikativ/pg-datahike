@@ -128,3 +128,63 @@
   (testing "RESET datahike.system_at clears"
     (let [r (.execute *handler* "RESET datahike.system_at")]
       (is (nil? (err r))))))
+
+(deftest column-type-rewrites-preserve-rows-and-catalog-addresses
+  (let [run #(.execute *handler* %)
+        rows (fn [sql]
+               (let [result (run sql)]
+                 (is (nil? (err result)) sql)
+                 (mapv vec (.rows result))))]
+    (doseq [sql ["SET TIME ZONE 'UTC'"
+                 (str "CREATE TABLE audit_events (id bigint PRIMARY KEY, raw varchar, "
+                      "created_at timestamp DEFAULT '2024-02-29 13:55:19.123456')")
+                 "INSERT INTO audit_events (id, raw) VALUES (1, ' 23 ')"
+                 "CREATE INDEX audit_raw_idx ON audit_events (raw)"]]
+      (is (nil? (err (run sql))) sql))
+    (let [before (d/db *conn*)
+          snapshot (.toInstant ^java.util.Date (:db/txInstant (d/entity before (:max-tx before))))]
+      (is (= "42804" (.sqlstate (run "ALTER TABLE audit_events ALTER raw TYPE integer"))))
+      (is (= "22001" (.sqlstate (run "ALTER TABLE audit_events ALTER raw TYPE varchar(2)"))))
+      (is (= [["1" " 23 " "2024-02-29 13:55:19.123456"]]
+             (rows "SELECT * FROM audit_events")))
+      (is (nil? (err (run "ALTER TABLE audit_events ALTER created_at TYPE timestamp(3)"))))
+      (is (nil? (err (run (str "ALTER TABLE audit_events ALTER COLUMN raw SET DATA TYPE integer "
+                               "USING trim(raw)::int + 1, ALTER COLUMN raw SET NOT NULL")))))
+      (is (= [["1" "24" "2024-02-29 13:55:19.123"]]
+             (rows "SELECT * FROM audit_events")))
+      (is (= [["id" "20" "-1"] ["raw" "23" "-1"] ["created_at" "1114" "3"]]
+             (rows (str "SELECT attname, atttypid, atttypmod FROM pg_attribute "
+                        "WHERE attrelid = 'audit_events'::regclass AND attnum > 0 ORDER BY attnum"))))
+      (is (= [["1" "24"]]
+             (rows "SELECT id, raw FROM audit_events WHERE raw = 24")))
+      (let [parsed (.parse *handler* "SELECT id FROM audit_events WHERE raw = $1" (int-array 0))]
+        (is (= [23] (vec (.describeParams *handler* parsed)))))
+      (is (= [["2"]]
+             (rows "SELECT indkey::text FROM pg_index WHERE indexrelid = 'audit_raw_idx'::regclass")))
+      (is (= [["2" "26" "2024-02-29 13:55:19.123"]]
+             (rows "INSERT INTO audit_events (id, raw) VALUES (2, 26) RETURNING id, raw, created_at")))
+      (is (= "23502" (.sqlstate (run "INSERT INTO audit_events (id) VALUES (3)"))))
+      (is (nil? (err (run (str "SET datahike.as_of = '" snapshot "'")))))
+      (is (= [["1" " 23 " "2024-02-29 13:55:19.123456"]]
+             (rows "SELECT * FROM audit_events"))))))
+
+(deftest column-type-rewrite-rolls-back-and-allows-dropping-an-old-default
+  (let [run #(.execute *handler* %)]
+    (doseq [sql ["CREATE TABLE tasks (key integer PRIMARY KEY, detail text DEFAULT 'old')"
+                 "INSERT INTO tasks (key) VALUES (1)"
+                 "BEGIN"
+                 (str "ALTER TABLE tasks ALTER COLUMN detail DROP DEFAULT, "
+                      "ALTER COLUMN detail TYPE integer USING length(detail)")]]
+      (is (nil? (err (run sql))) sql))
+    (is (= [["3"]] (mapv vec (.rows (run "SELECT detail FROM tasks")))))
+    (is (nil? (err (run "ROLLBACK"))))
+    (is (= [["old"]] (mapv vec (.rows (run "SELECT detail FROM tasks")))))
+    (is (= [["old"]]
+           (mapv vec (.rows (run "INSERT INTO tasks (key) VALUES (2) RETURNING detail")))))
+    (doseq [sql ["BEGIN"
+                 (str "ALTER TABLE tasks ALTER COLUMN detail DROP DEFAULT, "
+                      "ALTER COLUMN detail TYPE integer USING length(detail)")
+                 "UPDATE tasks SET detail = detail + 1 WHERE key = 2"
+                 "COMMIT"]]
+      (is (nil? (err (run sql))) sql))
+    (is (= [["3"] ["4"]] (mapv vec (.rows (run "SELECT detail FROM tasks ORDER BY key")))))))

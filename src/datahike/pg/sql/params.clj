@@ -1230,7 +1230,10 @@
   ([schema table-ns col-name] (infer-param-oid-for-column schema table-ns col-name nil))
   ([schema table-ns col-name db]
    (when (and table-ns col-name schema)
-     (let [attr (keyword table-ns col-name)
+     (let [db (or db *parse-db*)
+           attr (if (map? schema)
+                  (pgs/column-storage-ident schema (pgs/schema-hints db) table-ns col-name)
+                  (keyword table-ns col-name))
            vt   (or (when (map? schema)
                       (:db/valueType (get schema attr)))
                     (when (coll? schema)
@@ -1243,7 +1246,7 @@
                        (when (coll? schema)
                          (some (fn [a] (when (= (:db/ident a) attr) (:pg/type a)))
                                schema))
-                       (pg-type-of-attr db attr))]
+                       (when attr (pg-type-of-attr db attr)))]
        (or (get types/pg-name->oid pg-type)
            (get types/dh-type->oid vt))))))
 

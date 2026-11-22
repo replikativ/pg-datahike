@@ -509,8 +509,8 @@
    if we can't find the attribute (derived tables, catalog views, etc.);
    caller falls back to TEXT.
 
-   `table-aliases` maps SQL aliases → real table names; we synthesise
-   the attribute keyword as `:<table>/<col>` and probe `db`'s schema.
+   `table-aliases` maps SQL aliases to table names. Column hints map
+   aliases for renamed or rewritten columns to their live attribute.
 
    `:db.cardinality/many` columns project as PG arrays (`int8[]`,
    `text[]`, etc.) — see `col-var!`'s emit-many-ref-array branch. The
@@ -541,15 +541,7 @@
                          ;; nil/text.
                          (get table-aliases default-table default-table)
                          default-table)
-          hint-attr (when (and hints col-table)
-                      (some (fn [[attr h]]
-                              (when (and (= (:column h) col-name)
-                                         (= (namespace attr) table-real))
-                                attr))
-                            hints))
-          attr (or hint-attr
-                   (when table-real
-                     (keyword table-real col-name)))
+          attr (pgs/column-storage-ident schema hints table-real col-name)
           props (when attr (get schema attr))
           ;; FROM-function arguments can read a bound outer column by name.
           ;; A local column still owns the unqualified reference when present.

@@ -11969,11 +11969,15 @@
                 (let [keys (try
                              (edn/read-string keys-edn)
                              (catch Exception _ []))]
-                  (when (some #(or (= column (:name %))
+                  (when (some #(or (= (:datahike.pg.column/name column) (:name %))
                                    (= (:datahike.pg.column/storage-ident column)
                                       (:storage-ident %)))
                               keys)
-                    {:entity entity :name index-name :keys keys}))))
+                    (let [index (d/entity db entity)]
+                      {:entity entity :name index-name :keys keys
+                       :method (:datahike.pg.index/method index)
+                       :unique? (:datahike.pg.index/unique? index)
+                       :materialized? (some? (:db.secondary/type index))})))))
         (d/q '{:find [?index ?name ?keys]
                :in [$ ?table]
                :where [[?index :datahike.pg.index/table ?table]
@@ -12174,6 +12178,196 @@
                 [])
         not-null? (conj [:db/add (:db/id entity) :pg/not-null true])))))
 
+(defn- available-column-storage-ident [occupied table name attnum]
+  (let [logical (keyword table name)]
+    (if (contains? occupied logical)
+      (first (remove occupied
+                     (map (fn [suffix]
+                            (keyword table (str "pg$att" attnum
+                                                (when (pos? suffix) (str "_" suffix)))))
+                          (range))))
+      logical)))
+
+(defn- alter-type-column-spec [db type]
+  (let [normalized (types/normalize-sql-type-name type)
+        base (types/base-type-name-of normalized)
+        vtype (get types/sql-name->dh-type base)
+        oid (pgs/resolve-type-oid db type)
+        typmod (or (when (= :numeric (types/cast-category base))
+                     (when-let [[precision scale] (types/parse-numeric-args normalized)]
+                       (when precision (types/encode-numeric-typmod precision scale))))
+                   (some-> (types/parse-char-length normalized) (+ types/var-hdr-sz))
+                   (types/parse-timestamp-precision normalized)
+                   (types/parse-bit-length normalized))]
+    (when-not (and vtype (types/catalog-type oid)
+                   (not (types/array-oid->element-oid oid))
+                   (not (types/unsupported-input-type? base))
+                   (not (re-find #"^(?:smallserial|bigserial|serial)" base))
+                   (not (pgs/user-type-object db type)))
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "ALTER COLUMN TYPE to " type " is not supported")})))
+    {:base base :oid oid :typmod typmod :vtype vtype}))
+
+(defn- assert-rewritable-column! [db table column indexes]
+  (let [attr (:datahike.pg.column/storage-ident column)
+        name (:datahike.pg.column/name column)
+        schema (dbi/-schema db)
+        attr-schema (get schema attr)
+        metadata (row-constraints/constraint-metadata db table)
+        inbound-fk? (and (get schema :pg/fk-parent-table)
+                         (some (fn [[columns]]
+                                 (some #{name} (jb/parse-jsonb columns)))
+                               (d/q '{:find [?columns]
+                                      :in [$ ?table]
+                                      :where [[?fk :pg/fk-parent-table ?table]
+                                              [?fk :pg/fk-parent-cols ?columns]]}
+                                    db table)))]
+    (when (or (:db/unique attr-schema)
+              (not= :db.cardinality/one (:db/cardinality attr-schema))
+              (= :db.type/ref (:db/valueType attr-schema))
+              (identity-storage-column? db table attr)
+              (some (fn [{:keys [method unique? materialized?]}]
+                      (or unique? materialized? (not (contains? #{"btree" "hash"} method))))
+                    indexes)
+              (some (fn [entry] (some #{attr} (:db/tupleAttrs (val entry)))) schema)
+              (some (fn [entry] (:generated-expr entry)) (:columns metadata))
+              (get (:domain-enum metadata) name)
+              (seq (:checks metadata))
+              (some (fn [fk] (some #{attr} (:child-attrs fk))) (:fks metadata))
+              inbound-fk?)
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "ALTER COLUMN TYPE with dependencies on column "
+                                             (dump/quote-ident name) " is not supported")})))))
+
+(defn- require-alter-assignment! [source target name type]
+  (when-not (types/assignment-cast-exists? source target)
+    (throw (ex-info (str "column " (dump/quote-ident name)
+                         " cannot be cast automatically to type " type)
+                    {:error :datatype-mismatch :sqlstate "42804"}))))
+
+(defn- alter-type-using-ast [using name]
+  (let [sql (or using (dump/quote-ident name))]
+    (when (or (str/blank? sql)
+              (some (fn [[{:keys [type text]} following]]
+                      (or (= :param type)
+                          (and (= :ident type)
+                               (let [word (str/lower-case text)]
+                                 (or (= "select" word)
+                                     (and (= "(" (:text following))
+                                          (contains? types/volatile-proc-names word)))))))
+                    (partition-all 2 1 (cls/tokenize sql))))
+      (throw (errors/pg-error :feature-not-supported
+                              {:message "ALTER COLUMN TYPE USING requires a scalar row expression"})))
+    (row-constraints/parse-constraint-expression sql)))
+
+(defn- type-rewrite-tx
+  "Rewrite one column's row values and catalog address atomically. A fresh
+   physical attribute keeps old values and type metadata addressable as of the
+   transaction before the rewrite."
+  [db table relation-oid {:keys [name type using]}]
+  (let [column (alterable-column db table relation-oid name "TYPE")
+        indexes (column-index-dependents db table column)
+        _ (assert-rewritable-column! db table column indexes)
+        old-attr (:datahike.pg.column/storage-ident column)
+        source-oid (:datahike.pg.column/type-oid column)
+        old-entity (d/entity db old-attr)
+        schema (dbi/-schema db)
+        attnum (:datahike.pg.column/attnum column)
+        {:keys [base oid typmod vtype]} (alter-type-column-spec db type)
+        old-typmod (:datahike.pg.column/typmod column)
+        new-attr (available-column-storage-ident (conj (set (keys schema)) (keyword table name))
+                                                 table name attnum)
+        definition (merge (select-keys (get schema old-attr) [:db/index :db/noHistory])
+                          (select-keys old-entity [:pg/not-null :pg/default-kind
+                                                   :pg/default-value :pg/default-arg])
+                          {:db/ident new-attr :db/valueType vtype
+                           :db/cardinality :db.cardinality/one
+                           :pg/type (or (types/oid->pg-type-marker oid) base)}
+                          (when typmod {:pg/typmod (long typmod)}))
+        using-ast (alter-type-using-ast using name)
+        using-oid (if using
+                    (first (row-eval/row-oids [using-ast] table schema db))
+                    source-oid)
+        using-oid (when-not (instance? net.sf.jsqlparser.expression.StringValue using-ast)
+                    using-oid)
+        _ (require-alter-assignment! using-oid oid name type)
+        ;; The base cast handles conversions such as numeric to integer or
+        ;; timestamps crossing TimeZone. The column assignment handles typmods,
+        ;; including rejecting strings that would need truncation.
+        conversion (if (= oid using-oid)
+                     using-ast
+                     (CCJSqlParserUtil/parseExpression
+                      (str "CAST(" using-ast " AS " base ")")))
+        default-kind (:pg/default-kind old-entity)
+        _ (when (and default-kind (not= source-oid oid))
+            (require-alter-assignment! source-oid oid name type)
+            (when-not (#{:literal :bit :bit-coerced} default-kind)
+              (throw (errors/pg-error :feature-not-supported
+                                      {:message "ALTER COLUMN TYPE with an expression DEFAULT is not supported"}))))
+        definition (if (and default-kind (not= source-oid oid))
+                     (let [source-type (types/oid->pg-name source-oid)
+                           raw (:pg/default-value old-entity)
+                           cast (CCJSqlParserUtil/parseExpression
+                                 (str "CAST(CAST('" (str/replace raw "'" "''") "' AS "
+                                      source-type ") AS " base ")"))
+                           value (row-eval/default-value cast schema db)]
+                       (assoc definition
+                              :pg/default-kind :literal
+                              :pg/default-value (types/->pg-text value oid)))
+                     definition)
+        convert (fn [value]
+                  (stmt/coerce-insert-value value new-attr {new-attr definition} db))
+        _ (when (#{:literal :bit :bit-coerced} (:pg/default-kind definition))
+            (convert (:pg/default-value definition)))
+        addr [:datahike.pg.column/address-key (:datahike.pg.column/address-key column)]
+        hint (column-hint-eid db old-attr)
+        new-hint (cond-> {:datahike.pg/for-ident new-attr :datahike.pg/column name}
+                   (and hint (:datahike.pg/internal-index (d/entity db hint)))
+                   (assoc :datahike.pg/internal-index true))
+        index-tx (mapv (fn [{:keys [entity keys]}]
+                         [:db/add entity :datahike.pg.index/keys
+                          (pr-str (mapv (fn [key]
+                                          (if (= name (:name key))
+                                            (assoc key :storage-ident new-attr)
+                                            key))
+                                        keys))])
+                       indexes)]
+    (into (cond-> (into [definition
+                         new-hint
+                         (if hint
+                           [:db/add hint :datahike.pg/hidden true]
+                           {:datahike.pg/for-ident old-attr :datahike.pg/hidden true})
+                         [:db/add addr :datahike.pg.column/storage-ident new-attr]
+                         [:db/add addr :datahike.pg.column/type-oid (long oid)]]
+                        index-tx)
+            typmod (conj [:db/add addr :datahike.pg.column/typmod (long typmod)])
+            (and (nil? typmod) (some? old-typmod))
+            (conj [:db/retract addr :datahike.pg.column/typmod old-typmod]))
+          (mapcat (fn [eid]
+                    (let [row (d/entity db eid)
+                          previous (get row old-attr)
+                          updated (convert (first (:values
+                                                   (row-eval/row-values
+                                                    [conversion] row table schema db))))]
+                      (when (and (nil? updated) (:pg/not-null old-entity))
+                        (throw (ex-info (str "column " (dump/quote-ident name) " contains null values")
+                                        {:sqlstate "23502" :table table :column name})))
+                      (cond-> []
+                        (some? previous) (conj [:db/retract eid old-attr previous])
+                        (some? updated) (conj [:db/add eid new-attr updated])))))
+          (table-row-eids db table))))
+
+(defn- type-rewrite-op [table relation-oid changes]
+  (let [time-zone types/*time-zone*
+        date-style types/*date-style*
+        statement-time params/*statement-time*]
+    [:db.fn/call
+     (fn [db]
+       (binding [types/*time-zone* time-zone
+                 types/*date-style* date-style
+                 params/*statement-time* statement-time]
+         (into [] (mapcat #(type-rewrite-tx db table relation-oid %)) changes)))]))
+
 (defn- inherited-add-column-tx-data
   "Propagate newly added parent columns through the inheritance tree.
 
@@ -12316,18 +12510,7 @@
                         known-columns))
             fresh-storage-ident!
             (fn [name attnum]
-              (let [logical-ident (keyword table name)
-                    ident (if-not (contains? @occupied-storage logical-ident)
-                            logical-ident
-                            (loop [suffix 0]
-                              (let [candidate
-                                    (keyword table
-                                             (str "pg$att" attnum
-                                                  (when (pos? suffix)
-                                                    (str "_" suffix))))]
-                                (if (contains? @occupied-storage candidate)
-                                  (recur (inc suffix))
-                                  candidate))))]
+              (let [ident (available-column-storage-ident @occupied-storage table name attnum)]
                 (swap! occupied-storage conj ident)
                 ident))
             added-column-specs
@@ -12533,10 +12716,18 @@
                              (mapv (fn [change]
                                      [:db.fn/call alter-column-nullability-tx table relation-oid change])
                                    (get nullability-ops op)))
+            type-ops (filterv #(= :alter-type (:op %)) operations)
+            _ (when-not (= (count type-ops) (count (distinct (map :name type-ops))))
+                (throw (ex-info "cannot alter type of a column twice" {:sqlstate "0A000"})))
+            rewritten-columns (set (map :name type-ops))
             default-ops (filter #(= :alter-default (:op %)) operations)
-            default-tx (map (fn [change]
-                              [:db.fn/call alter-column-default-tx table relation-oid change])
-                            default-ops)
+            default-groups (group-by (fn [{:keys [name default]}]
+                                       (and (nil? default) (contains? rewritten-columns name)))
+                                     default-ops)
+            default-tx (fn [before-rewrite?]
+                         (map (fn [change]
+                                [:db.fn/call alter-column-default-tx table relation-oid change])
+                              (get default-groups before-rewrite?)))
             backfill-tx (for [{:keys [not-null? default] :as column} added-column-specs
                               :when (or not-null? (some? (:value default)))]
                           [:db.fn/call backfill-added-column-tx table relation-oid column])
@@ -12546,7 +12737,9 @@
             tx-data (into (nullability-tx :drop-not-null)
                           (concat schema-and-constraint-data added-constraint-data
                                   attnum-data inherited-column-data hint-data backfill-tx
-                                  lifecycle-data default-tx
+                                  lifecycle-data (default-tx true)
+                                  (when (seq type-ops) [(type-rewrite-op table relation-oid type-ops)])
+                                  (default-tx false)
                                   (nullability-tx :set-not-null)))
             tx-data (if (and relation-oid (seq tx-data))
                       (into tx-data
@@ -12571,6 +12764,7 @@
               ;; instead of failing statements that used to succeed.
               (if (and (empty? nullability-ops)
                        (empty? default-ops)
+                       (empty? type-ops)
                        (not-any? #(= :add-column (:op %)) operations)
                        (re-find #"Update not supported"
                                 (str (.getMessage e))))

@@ -929,7 +929,7 @@
                               (recur (rest ts) (dec depth) (conj acc t)))
           :else (recur (rest ts) depth (conj acc t)))))))
 
-(defn- split-top-level-commas
+(defn split-top-level-commas
   "Split a token seq on commas that are not inside parens or brackets."
   [toks]
   (loop [ts toks, depth 0, cur [], out []]

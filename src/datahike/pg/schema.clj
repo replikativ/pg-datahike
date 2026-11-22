@@ -676,6 +676,25 @@
             v)))
     :else (schema-hints* db)))
 
+(defn column-storage-ident
+  "Resolve a visible SQL column to its schema attribute using rename and
+   rewrite hints. The ordinary unrenamed column is a direct lookup."
+  [schema hints table column]
+  (when table
+    (let [ident (keyword table column)
+          hint (get hints ident)]
+      (if (and (contains? schema ident)
+               (not (:hidden hint))
+               (= column (get hint :column column)))
+        ident
+        (some (fn [[attr h]]
+                (when (and (not (:hidden h))
+                           (= column (:column h))
+                           (= table (or (:table h) (namespace attr)))
+                           (contains? schema attr))
+                  attr))
+              hints)))))
+
 (defn row-marker-attr
   "Return the row-existence marker attribute for a table.
    E.g., :person/db-row-exists for table 'person'."

@@ -115,6 +115,15 @@
                (first (.getColumnDropDefaultList expression))]
       {:op :alter-default :name (unquote-ident (.getColumnName drop-default))})))
 
+(defn- alter-column-type [^AlterExpression expression using-expressions]
+  (when-let [^AlterExpression$ColumnDataType column (first (.getColDataTypeList expression))]
+    (when (and (.getColDataType column) (re-find #"(?i)\sTYPE\s" (str expression)))
+      (let [name (unquote-ident (.getColumnName column))]
+        {:op :alter-type
+         :name name
+         :type (str (.getColDataType column))
+         :using (get using-expressions name)}))))
+
 (defn- create-index-options
   "Normalize JSqlParser's `WITH (...)` tail into a keyword map.  PostgreSQL's
    HNSW knobs are integer-valued today; retaining non-integers as strings
@@ -2490,6 +2499,7 @@
                     (let [^Alter alter-stmt stmt
                           table-name (unquote-ident (.getName (.getTable alter-stmt)))
                           expressions (.getAlterExpressions alter-stmt)
+                          using-expressions (rw/alter-type-using-expressions sql)
                           ops (mapv (fn [^AlterExpression exp]
                                       (let [op (str (.getOperation exp))]
                                         (cond
@@ -2583,6 +2593,7 @@
                                           (= op "ALTER")
                                           (or (alter-column-nullability exp)
                                               (alter-column-default exp)
+                                              (alter-column-type exp using-expressions)
                                               {:op :other :raw (str exp)})
                                           :else {:op :other :raw (str exp)})))
                                     expressions)]
