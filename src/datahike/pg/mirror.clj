@@ -381,6 +381,50 @@
              :compatible? (and (empty? issues) (every? (comp empty? :issues) tables))}
       (some :partition-leaves tables) (assoc :partition-parents (filterv :partition-leaves tables)))))
 
+(defn- publication-definitions [source publication leaf-publication]
+  (into {}
+        (query source
+               (str "SELECT p.pubname, p.oid, p.pubviaroot, p.puballtables, "
+                    "       p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubgencols, "
+                    "       ARRAY(SELECT prrelid FROM pg_catalog.pg_publication_rel "
+                    "             WHERE prpubid = p.oid ORDER BY prrelid) AS relations, "
+                    "       ARRAY(SELECT pnnspid FROM pg_catalog.pg_publication_namespace "
+                    "             WHERE pnpubid = p.oid ORDER BY pnnspid) AS schemas, "
+                    "       EXISTS (SELECT 1 FROM pg_catalog.pg_publication_rel WHERE prpubid = p.oid "
+                    "               AND (prqual IS NOT NULL OR prattrs IS NOT NULL)) AS filtered "
+                    "FROM pg_catalog.pg_publication p WHERE p.pubname IN (?, ?)")
+               [publication leaf-publication]
+               (fn [^ResultSet row]
+                 [(.getString row "pubname")
+                  {:oid (.getLong row "oid")
+                   :via-root? (.getBoolean row "pubviaroot")
+                   :filtered? (.getBoolean row "filtered")
+                   :membership {:all-tables? (.getBoolean row "puballtables")
+                                :tables (vec (.getArray (.getArray row "relations")))
+                                :schemas (vec (.getArray (.getArray row "schemas")))}
+                   :options (mapv #(.getString row ^String %)
+                                  ["pubinsert" "pubupdate" "pubdelete" "pubtruncate" "pubgencols"])}]))))
+
+(defn- scan-configured-publication [source {:keys [publication leaf-publication]}]
+  (if leaf-publication
+    (let [definitions (publication-definitions source publication leaf-publication)
+          root (get definitions publication)
+          leaf (get definitions leaf-publication)
+          report (scan-publication source leaf-publication)
+          issues (cond-> (:issues report)
+                   (nil? root) (conj {:reason :root-publication-not-found})
+                   (and root (not (:via-root? root))) (conj {:reason :expected-root-publication})
+                   (:via-root? leaf) (conj {:reason :expected-leaf-publication})
+                   (or (:filtered? root) (:filtered? leaf)) (conj {:reason :publication-projection})
+                   (and root leaf (not= (:membership root) (:membership leaf)))
+                   (conj {:reason :different-publication-membership
+                          :root (:membership root) :leaf (:membership leaf)})
+                   (and root leaf (not= (:options root) (:options leaf))) (conj {:reason :different-publication-options}))]
+      (assoc report :publication publication :publication-oid (:oid root)
+             :leaf-publication {:name leaf-publication :oid (:oid leaf)}
+             :issues issues :compatible? (and (:compatible? report) (empty? issues))))
+    (scan-publication source publication)))
+
 (defn- publisher-types [tables]
   (into (sorted-map)
         (keep (fn [{:keys [user-type]}]
@@ -391,10 +435,10 @@
   (into (:tables manifest) (:partition-parents manifest)))
 
 (defn- publication-manifest
-  ([source publication] (publication-manifest source publication nil))
-  ([source publication tracked-types]
-   (let [{:keys [publication-oid tables partition-parents compatible?] :as report}
-         (scan-publication source publication)]
+  ([source config] (publication-manifest source config nil))
+  ([source config tracked-types]
+   (let [{:keys [publication-oid leaf-publication tables partition-parents compatible?] :as report}
+         (scan-configured-publication source config)]
      (require! compatible? "Publication cannot be mirrored" {:report report})
      (let [tracked (when (seq tracked-types) (read-source-types source (map :oid (vals tracked-types))))
            user-types (into (publisher-types (all-relations report))
@@ -406,33 +450,41 @@
                             tracked)]
        (cond-> {:publication-oid publication-oid :catalog-version 3
                 :tables (mapv #(dissoc % :issues) tables)}
+         leaf-publication (assoc :leaf-publication leaf-publication)
          (seq partition-parents) (assoc :partition-parents (mapv #(dissoc % :issues) partition-parents))
          (seq user-types) (assoc :types user-types))))))
 
-(defn- poll-publication-manifest [source publication tracked-types]
-  (if (seq tracked-types)
-    ;; The column and registered-type inventories must describe the same
-    ;; publisher catalog, even if a DDL transaction commits between queries.
-    (do (command! source "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        (try (publication-manifest source publication tracked-types)
-             (finally (command! source "ROLLBACK"))))
-    (publication-manifest source publication)))
+(defn- read-catalog-snapshot! [source f]
+  (command! source "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+  (try (f) (finally (command! source "ROLLBACK"))))
 
-(defn- validate-source-options! [source-url publication]
-  (require! (and (string? source-url) (str/starts-with? source-url "jdbc:postgresql://")
-                 (string? publication) (re-matches #"[a-z_][a-z0-9_]{0,62}" publication))
-            "Expected a PostgreSQL source URL and publication name" {}))
+(defn- poll-publication-manifest [source config tracked-types]
+  (if (or (:leaf-publication config) (seq tracked-types))
+    ;; Publication definitions, columns, and registered types share a snapshot.
+    (read-catalog-snapshot! source #(publication-manifest source config tracked-types))
+    (publication-manifest source config)))
+
+(defn- validate-source-options! [{:keys [source-url publication leaf-publication]}]
+  (let [valid-name? #(and (string? %) (re-matches #"[a-z_][a-z0-9_]{0,62}" %))]
+    (require! (and (string? source-url) (str/starts-with? source-url "jdbc:postgresql://")
+                   (valid-name? publication))
+              "Expected a PostgreSQL source URL and publication name" {})
+    (when (some? leaf-publication)
+      (require! (and (valid-name? leaf-publication) (not= publication leaf-publication))
+                "Expected a distinct leaf publication name" {:leaf-publication leaf-publication}))))
 
 (defn publication-report
   "Inspect a PostgreSQL 18 publication using only the source catalogs.
    Returns publication-wide issues and the issues for every table."
-  [{:keys [source-url publication]}]
-  (validate-source-options! source-url publication)
+  [{:keys [source-url leaf-publication] :as config}]
+  (validate-source-options! config)
   (with-open [source (connect source-url false false)]
     (let [version (first (query source "SHOW server_version_num" [] #(.getInt ^ResultSet % 1)))]
       (require! (and version (<= 180000 version 189999))
                 "Expected a PostgreSQL 18 publication database" {:version version})
-      (scan-publication source publication))))
+      (if leaf-publication
+        (read-catalog-snapshot! source #(scan-configured-publication source config))
+        (scan-configured-publication source config)))))
 
 (defn- checked-result ^PgWireServer$QueryResult [^PgWireServer$QueryResult result]
   (when-let [error (.-error result)]
@@ -783,14 +835,15 @@
       (throw (SQLException. "The incomplete snapshot's slot is still active" "55006")))
     (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil))))
 
-(defn- bootstrap! [replication source destination {:keys [slot publication origin]} failover? check-running! max-snapshot-bytes]
+(defn- bootstrap! [replication source destination {:keys [slot origin]} check-running!
+                   {:keys [failover? max-snapshot-bytes] :as config}]
   ;; The unique slot name was persisted locally before its first creation.
   (clear-incomplete-slot! source slot failover?)
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)]
     (with-slot-snapshot!
       replication source slot false failover?
       (fn [end-lsn]
-        (let [manifest (publication-manifest source publication)]
+        (let [manifest (publication-manifest source config)]
           (transaction!
            destination
            (fn []
@@ -1206,12 +1259,16 @@
                        (mapv :attnum (key-columns current)))))))
     (and current (= (wire-table previous) (wire-table current)))))
 
+(defn- same-publication? [previous current]
+  (= (select-keys previous [:publication-oid :leaf-publication])
+     (select-keys current [:publication-oid :leaf-publication])))
+
 (defn- changed-tables! [previous current affected removed type-changes allow-schema-refresh?]
   (let [before (relations-by-id previous)
         occupied (into (or (:retired-storage previous) #{})
                        (map (comp :name storage-table)) (all-relations previous))
         missing (remove #(or (:partition-parent %) (:partition-leaves %)) removed)]
-    (require! (and (= (:publication-oid previous) (:publication-oid current)) (empty? missing))
+    (require! (and (same-publication? previous current) (empty? missing))
               "Publication schema or membership changed"
               {:removed (mapv relation-name missing)})
     (let [changes (filterv (fn [table]
@@ -1254,7 +1311,7 @@
 
 (defn- require-stable-manifest! [target source]
   (let [after (relations-by-id source)]
-    (require! (and (= (:publication-oid target) (:publication-oid source))
+    (require! (and (same-publication? target source)
                    (= (partition-layout target) (partition-layout source))
                    (= (:types target) (:types source))
                    (every? (fn [table] (same-table? table (get after (:relation-id table))))
@@ -1594,7 +1651,7 @@
          (check-running!)
          (copy-table! source destination table on-bytes))))))
 
-(defn- stage-tables! [{:keys [source-url publication max-snapshot-bytes] :as config}
+(defn- stage-tables! [{:keys [source-url publication leaf-publication max-snapshot-bytes] :as config}
                       origin manifest {:keys [conn changes tables barrier phase]} check-running!]
   (with-publisher
     source-url
@@ -1608,13 +1665,13 @@
               end-lsn (with-slot-snapshot!
                         replication source slot true false
                         (fn [position]
-                          (require-stable-manifest! manifest (publication-manifest source publication (:types manifest)))
+                          (require-stable-manifest! manifest (publication-manifest source config (:types manifest)))
                           (copy-snapshot! source destination changes check-running! on-bytes)
                           position))
               expected (into {} (map (juxt :relation-id identity)) tables)
               included? (set (keys expected))]
           (reset! phase :catching-up)
-          (stream! (replication-copy replication slot publication end-lsn)
+          (stream! (replication-copy replication slot (or leaf-publication publication) end-lsn)
                    end-lsn end-lsn config
                    {:tick! (fn [_] (check-running!))
                     :check-running! check-running!
@@ -1849,8 +1906,8 @@
     (update-checkpoint-manifest! destination saved (assoc manifest :pending-recovery reservation))))
 
 (defn- recover-checkpoint! [replication source destination saved origin state check-running!
-                            {:keys [failover? schema-refresh? max-snapshot-bytes resnapshot-on-slot-loss?]}]
-  (let [{old-slot :slot previous :manifest :keys [end-lsn publication]} saved
+                            {:keys [failover? schema-refresh? max-snapshot-bytes resnapshot-on-slot-loss?] :as config}]
+  (let [{old-slot :slot previous :manifest :keys [end-lsn]} saved
         {new-slot :slot :as pending} (:pending-recovery previous)
         status {:state :copying :old-slot old-slot :new-slot new-slot :from-lsn end-lsn :reason (:reason pending)}]
     (require! resnapshot-on-slot-loss? "A slot recovery is pending. Enable resnapshot-on-slot-loss? to resume it."
@@ -1867,7 +1924,7 @@
             (fn [position]
               (require! (not (neg? (compare-lsn position end-lsn))) "Replacement snapshot precedes the durable checkpoint"
                         {:snapshot position :checkpoint end-lsn})
-              (let [current (publication-manifest source publication (:types previous))
+              (let [current (publication-manifest source config (:types previous))
                     removed (removed-relations previous current)
                     type-plan (type-plan! previous current schema-refresh?)
                     affected (into #{} (map :relation-id) (all-relations current))
@@ -1914,7 +1971,7 @@
     {:saved (retire-replaced-slots! source destination saved state failover?) :info info}))
 
 (defn- consume! [copy source destination saved origin state confirmed-lsn check-running! ready! config]
-  (let [{:keys [manifest end-lsn publication slot]} saved
+  (let [{:keys [manifest end-lsn slot]} saved
         {:keys [max-snapshot-bytes schema-refresh? failover?]} config
         origin-update (volatile! (when (not= (:origin saved) origin) origin))
         applied (volatile! manifest)
@@ -1932,7 +1989,7 @@
         next-watermark (volatile! (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 30)))
         next-check (volatile! 0)
         refresh! (fn []
-                   (let [current (poll-publication-manifest source publication (:types @applied))]
+                   (let [current (poll-publication-manifest source config (:types @applied))]
                      (vreset! observed (tables-by-id current))
                      (if-let [active @stage]
                        (require-stable-manifest! (:source-manifest active) current)
@@ -2069,7 +2126,7 @@
         (when-let [active @stage] (stop-refresh! active))
         (swap! state dissoc :refresh)))))
 
-(defn- replicate! [{:keys [source-url publication slot-prefix max-snapshot-bytes failover?] :as config}
+(defn- replicate! [{:keys [source-url publication leaf-publication slot-prefix failover?] :as config}
                    destination state check-running! ready!]
   (with-publisher
     source-url
@@ -2078,11 +2135,21 @@
             saved (or (checkpoint destination)
                       (let [slot (new-slot-name slot-prefix)]
                       ;; Validate before creating a slot that pins WAL.
-                        (publication-manifest source publication)
+                        (poll-publication-manifest source config nil)
                         (init-checkpoint! destination origin slot publication)
                         (checkpoint destination)))]
         (require! (= publication (:publication saved)) "The mirror belongs to a different publication"
                   {:reason :different-publication :saved-publication (:publication saved)})
+        (when (:end-lsn saved)
+          (require! (= leaf-publication (get-in saved [:manifest :leaf-publication :name]))
+                    "The mirror belongs to a different leaf publication"
+                    {:reason :different-leaf-publication
+                     :saved-leaf-publication (get-in saved [:manifest :leaf-publication :name])})
+          (when leaf-publication
+            (let [current (poll-publication-manifest source config nil)]
+              (require! (same-publication? (:manifest saved) current)
+                        "The publisher replaced a publication used by the mirror"
+                        {:reason :publication-identity-changed}))))
         (validate-origin! replication saved origin failover?)
         (swap! state assoc :slot (:slot saved) :applied-lsn (:end-lsn saved)
                :source-timeline (get-in saved [:origin :timeline]))
@@ -2091,7 +2158,7 @@
                       (do
                         (swap! state assoc :state :snapshot)
                         (bootstrap! replication source destination (assoc saved :origin origin)
-                                    failover? check-running! max-snapshot-bytes)
+                                    check-running! config)
                         (checkpoint destination)))
               {{:keys [slot end-lsn] :as saved} :saved {:keys [confirmed-lsn] :as info} :info}
               (resumable-checkpoint! replication source destination saved origin state check-running! config)]
@@ -2099,7 +2166,7 @@
           (swap! state assoc :state :catching-up :slot slot :applied-lsn end-lsn
                  :source-timeline (get-in saved [:origin :timeline]))
           (try
-            (consume! (replication-copy replication slot publication confirmed-lsn)
+            (consume! (replication-copy replication slot (or leaf-publication publication) confirmed-lsn)
                       source destination saved origin state confirmed-lsn check-running! ready! config)
             (catch SQLException error
               ;; Replication can report slot loss before the SQL status poll.
@@ -2197,14 +2264,14 @@
   "Start a PostgreSQL 18 subscriber. Bootstrap and catch-up run asynchronously.
    The :server options are passed to the read-only pgwire listener after catch-up.
    Monitor with status and release resources with stop!. Use a dedicated :store-path."
-  [{:keys [source-url publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes max-stream-spool-bytes schema-refresh? failover?
-           resnapshot-on-slot-loss?]
+  [{:keys [publication leaf-publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes
+           max-stream-spool-bytes schema-refresh? failover? resnapshot-on-slot-loss?]
     :or {slot-prefix "pgdh_mirror"
          max-snapshot-bytes (* 128 1024 1024)
          max-transaction-bytes (* 64 1024 1024)
          max-stream-spool-bytes (* 1024 1024 1024)}
     :as config}]
-  (validate-source-options! source-url publication)
+  (validate-source-options! config)
   (require! (and (string? slot-prefix) (re-matches #"[a-z0-9_]{1,30}" slot-prefix)
                  (string? store-path) (seq store-path)
                  (pos-int? max-snapshot-bytes) (pos-int? max-transaction-bytes) (pos-int? max-stream-spool-bytes))
@@ -2221,7 +2288,8 @@
         spool-store (spool/store directory max-stream-spool-bytes)
         config (assoc config :slot-prefix slot-prefix :max-snapshot-bytes max-snapshot-bytes
                       :max-transaction-bytes max-transaction-bytes :spool-store spool-store)
-        state (atom {:state :starting :publication publication})
+        state (atom (cond-> {:state :starting :publication publication}
+                      leaf-publication (assoc :leaf-publication leaf-publication)))
         stopping? (atom false)]
     (io/make-parents (str directory ".mirror-lock"))
     (let [lock (acquire-store-lock directory)

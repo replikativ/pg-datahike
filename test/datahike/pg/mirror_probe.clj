@@ -979,14 +979,53 @@
                    "WHERE c.relispartition AND c.relkind IN ('r','p') ORDER BY c.relname"))
    (rows conn "SELECT pg_get_partkeydef('pay_audit'::regclass)")])
 
+(defn- check-companion-report! [source config]
+  (let [report #(mirror/publication-report config)
+        issues #(set (map :reason (:issues (report))))]
+    (check! (:compatible? (report)) "Matched root and leaf publications were rejected" (report))
+    ;; An explicit list of today's leaves would omit tomorrow's attachment.
+    (let [result (mirror/publication-report (assoc config :leaf-publication "partition_subset_pub"))]
+      (check! (some #(= :different-publication-membership (:reason %)) (:issues result))
+              "Different publication selectors were accepted" result))
+    (sql! source "ALTER PUBLICATION partition_root_pub SET TABLE pay (bucket,id,note,occurred), pay_audit, pay_expr")
+    (check! (contains? (issues) :publication-projection) "An explicit column list was accepted" (report))
+    (sql! source "ALTER PUBLICATION partition_root_pub SET TABLE pay WHERE (bucket >= 0), pay_audit, pay_expr")
+    (check! (contains? (issues) :publication-projection) "A root row filter was accepted" (report))
+    (sql! source "ALTER PUBLICATION partition_root_pub SET TABLE pay, pay_audit, pay_expr")
+    (check! (:compatible? (report)) "Restoring the root definition did not restore admission" (report))))
+
+(defn- check-companion-resume! [source config subscriber slot]
+  (sql! source "ALTER PUBLICATION partition_root_pub SET (publish = 'insert')")
+  (let [error (:last-error (await-state! @subscriber :paused))
+        saved (durable-checkpoint (:store-path config))
+        confirmed (slot-query source slot "confirmed_flush_lsn")]
+    (check! (some #(= :different-publication-options (:reason %)) (get-in error [:report :issues]))
+            "The running mirror accepted a mismatched publication" error)
+    (mirror/stop! @subscriber)
+    (sql! source "ALTER PUBLICATION partition_root_pub SET (publish = 'insert, update, delete, truncate')")
+    (reset! subscriber (mirror/start! (dissoc config :leaf-publication)))
+    (check! (= :different-leaf-publication (:reason (:last-error (await-state! @subscriber :paused))))
+            "Restart changed the durable stream selection" (mirror/status @subscriber))
+    (mirror/stop! @subscriber)
+    (sql! source "DROP PUBLICATION partition_root_pub"
+          (str "CREATE PUBLICATION partition_root_pub FOR TABLE pay, pay_audit, pay_expr "
+               "WITH (publish_via_partition_root = true)"))
+    (reset! subscriber (mirror/start! config))
+    (check! (= :publication-identity-changed (:reason (:last-error (await-state! @subscriber :paused))))
+            "Restart accepted a replaced publication" (mirror/status @subscriber))
+    (check! (= saved (durable-checkpoint (:store-path config))) "Rejected restarts moved the checkpoint" {})
+    (check! (= confirmed (slot-query source slot "confirmed_flush_lsn"))
+            "Rejected restarts changed publisher feedback" {})))
+
 (defn run-partition-probe!
-  "Compare leaf-routed partitions with PostgreSQL, including a populated
-   attachment, writes during staging, crash recovery, and detachment."
-  [source-url reference-url source-conninfo]
+  "Compare publisher partitions with a native subscriber, including a
+   populated attachment, writes during staging, crash recovery, and detachment."
+  [source-url reference-url source-conninfo & [companion?]]
   (let [directory (str (Files/createTempDirectory "pgdh-mirror-partitions-" (make-array FileAttribute 0)))
         path (str directory "/store")
         slot-name (str "mirror_partition_ref_" (str/replace (str (random-uuid)) "-" ""))
-        config {:source-url source-url :publication "partition_pub" :store-path path :server {:port 0}}
+        config (cond-> {:source-url source-url :publication "partition_pub" :store-path path :server {:port 0}}
+                 companion? (assoc :publication "partition_root_pub" :leaf-publication "partition_pub"))
         subscriber (atom nil)
         ddl [(str "CREATE TABLE pay (obsolete integer, bucket integer, id integer, note varchar(40), "
                   "occurred timestamptz(6) DEFAULT '2024-02-29 12:00:00.123456+00', "
@@ -1022,13 +1061,19 @@
                                       "LEFT JOIN pay p ON p.id = a.id ORDER BY a.id, p.bucket"))
                       (rows conn "SELECT * FROM pay_audit ORDER BY id")])
         check-rows (fn [source reference sink]
+                     (sql! sink "SET TIME ZONE 'UTC'")
                      (let [expected (probe-rows source)]
                        (await! "Native partition subscriber did not converge" #(= expected (probe-rows reference)))
-                       (await! "Mirror partition rows did not converge"
-                               #(let [state (mirror/status @subscriber)]
-                                  (check! (not (#{:failed :paused} (:state state)))
-                                          "Mirror paused during partition refresh" state)
-                                  (= expected (probe-rows sink))))
+                       (try
+                         (await! "Mirror partition rows did not converge"
+                                 #(let [state (mirror/status @subscriber)]
+                                    (check! (not (#{:failed :paused} (:state state)))
+                                            "Mirror paused during partition refresh" state)
+                                    (= expected (probe-rows sink))))
+                         (catch clojure.lang.ExceptionInfo e
+                           (throw (ex-info (ex-message e)
+                                           {:source expected :mirror (probe-rows sink) :status (mirror/status @subscriber)}
+                                           e))))
                        (check! (= (rows source edges-query) (rows sink edges-query))
                                "Partition catalog edges differ" {:source (rows source edges-query)
                                                                  :mirror (rows sink edges-query)})
@@ -1048,14 +1093,16 @@
               "INSERT INTO pay_audit VALUES (1,'initial'), (3,'unmatched')"
               "CREATE PUBLICATION partition_pub FOR TABLE pay, pay_audit, pay_expr"
               "CREATE PUBLICATION partition_subset_pub FOR TABLE pay_jan"
-              "CREATE PUBLICATION partition_root_pub FOR TABLE pay WITH (publish_via_partition_root = true)")
-        (let [report (mirror/publication-report (assoc config :publication "partition_subset_pub"))]
+              (str "CREATE PUBLICATION partition_root_pub FOR TABLE pay, pay_audit, pay_expr "
+                   "WITH (publish_via_partition_root = true)"))
+        (let [report (mirror/publication-report (assoc (dissoc config :leaf-publication) :publication "partition_subset_pub"))]
           (check! (and (:compatible? report) (= ["pay_jan"] (mapv :name (:tables report)))
                        (empty? (:partition-parents report)))
                   "A partial publication exposed its parent or an unpublished sibling" report))
-        (let [report (mirror/publication-report (assoc config :publication "partition_root_pub"))]
+        (let [report (mirror/publication-report (assoc (dissoc config :leaf-publication) :publication "partition_root_pub"))]
           (check! (some #(= :root-partition-routing (:reason %)) (mapcat :issues (:tables report)))
                   "Root-routed publication lacked a routing blocker" report))
+        (when companion? (check-companion-report! source config))
         (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal slot-name) ", 'pgoutput')"))
         (sql! reference (str "CREATE SUBSCRIPTION partition_native CONNECTION " (literal source-conninfo)
                              " PUBLICATION partition_pub WITH (create_slot=false, slot_name=" (literal slot-name) ")"))
@@ -1063,6 +1110,11 @@
         (let [{:keys [slot]} (await-state! @subscriber :following)]
           (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
             (check-rows source reference sink)
+            (when companion?
+              (let [saved (durable-checkpoint path)]
+                (check! (= ["partition_root_pub" "partition_pub"]
+                           [(:publication saved) (get-in saved [:manifest :leaf-publication :name])])
+                        "Checkpoint lost the root or leaf publication" saved)))
             (with-open [st (.prepareStatement sink "SELECT p.tableoid FROM pay p WHERE p.id = ? ORDER BY p.bucket")]
               (.setInt st 1 1)
               (with-open [rs (.executeQuery st)]
@@ -1147,6 +1199,7 @@
                   (check-rows source reference restarted)
                   (sql! source "TRUNCATE pay")
                   (check-rows source reference restarted)))))
+          (when companion? (check-companion-resume! source config subscriber slot))
           (mirror/stop! @subscriber)
           (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
           {:status :passed :artifacts directory})
@@ -1155,6 +1208,9 @@
           (sql! reference "DROP SUBSCRIPTION IF EXISTS partition_native")
           (when (= ["false"] (slot-query source slot-name "active::text"))
             (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot-name) ")"))))))))
+
+(defn run-root-publication-probe! [source-url reference-url source-conninfo]
+  (run-partition-probe! source-url reference-url source-conninfo true))
 
 (defn- type-refresh-catalog [conn]
   [(rows conn (str "SELECT oid, enumlabel, enumsortorder FROM pg_enum "
@@ -2010,6 +2066,7 @@
               "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
       (prn ((case argument
               "--partitions" run-partition-probe!
+              "--root-publication" run-root-publication-probe!
               "--type-refresh" run-type-refresh-probe!
               "--primary-key-refresh" run-primary-key-probe!
               "--schema-refresh" run-schema-refresh-probe!

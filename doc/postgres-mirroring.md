@@ -54,7 +54,8 @@ java -jar pg-datahike-standalone.jar mirror --check mirror.edn
 The command prints an EDN report with publication-wide issues and the
 specific rules and columns that block each table. It exits with status 1 for
 an incompatible publication. Embedded callers can use
-`datahike.pg.mirror/publication-report` with `:source-url` and `:publication`.
+`datahike.pg.mirror/publication-report` with the mirror's source and
+publication options.
 
 ## Supported publications
 
@@ -103,10 +104,39 @@ WAL boundary. A detached leaf disappears from current reads when it
 leaves the publication. Historical reads preserve its earlier rows,
 partition keys, and bounds.
 
-The admission report flags root routing because direct leaf truncations
-are absent from its WAL stream. A pending detach entry in the publisher's
-catalog pauses the mirror until the catalog has settled and the worker
-restarts.
+A pending detach entry in the publisher's catalog pauses the mirror until
+the catalog has settled and the worker restarts.
+
+### Mirror alongside a root-routed publication
+
+PostgreSQL sends changes using the root relation identity and omits direct
+leaf truncations when `publish_via_partition_root` is enabled. To preserve
+the source rows and leaf identities, give the mirror its own leaf-routed
+publication alongside the root publication used by existing subscribers.
+
+For example, if `analytics` publishes `public.orders` and `public.customers`
+with root routing, create the leaf publication on the same publisher.
+
+```sql
+CREATE PUBLICATION analytics_leaf FOR TABLE public.orders, public.customers
+  WITH (publish_via_partition_root = false);
+```
+
+Configure a fresh mirror with `:publication "analytics"` and
+`:leaf-publication "analytics_leaf"`. Both publications must use the same
+selectors, such as the same list of tables, the same list of schemas, or
+`FOR ALL TABLES`. The mirror checks that both publish the same operations
+and that neither has row filters or column lists. Matching selectors
+also include future partitions as they attach. The mirror reads
+`pgoutput` from `analytics_leaf`, and the checkpoint binds both publication
+identities to the store.
+
+Edit both definitions in one publisher transaction when changing explicit
+membership or publication options. The mirror checks the pair during its
+catalog polls, before snapshot copy, and at cutover. It pauses when it
+detects a mismatch. If the leaf publication was edited separately and could
+have excluded writes, create a fresh mirror to establish a consistent
+baseline. Publication changes can take effect between catalog polls.
 
 ## Add tables to an active mirror
 
@@ -288,6 +318,8 @@ and historical row and catalog reads. Pass `--primary-key-refresh` to compare
 replacement keys, key order, historical constraints, and rejected cutovers
 with PostgreSQL. Pass `--partitions` to check populated attachment,
 detachment, reattachment, truncation and crash recovery under leaf routing.
+Pass `--root-publication` to run the same comparison with a matched
+leaf publication and verify admission and resume checks for the pair.
 Pass `--type-refresh` to compare enum and domain changes, column conversions,
 and historical type catalogs across an interrupted cutover and restart.
 Run `sh test/integration/postgres-regress/mirror-publisher.sh --type-lifecycle`
