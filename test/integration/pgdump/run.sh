@@ -56,13 +56,21 @@ src()  { psql -X -h "${SRC_HOST}" -p "${SRC_PORT}" -U "${SRC_USER}" -d "${SRC_DB
 dh()   { PGPASSWORD="${PGWIRE_PASSWORD:-datahike}" psql -X -h "${DH_HOST}" -p "${DH_PORT}" \
              -U "${DH_USER}" -d "${DH_DB}" "$@"; }
 
+seed_fixture() {
+  # Pagila's dump names the original owner. The source fixture runs as
+  # the configured connection role, as does pg_dump with --no-owner.
+  echo "[seed] $1"
+  sed -E 's/^ALTER .* OWNER TO postgres;$/-- fixture owner omitted/' "$1" |
+    src -v ON_ERROR_STOP=1 -q -f -
+}
+
 : > "${LOG}"
 
 echo "[1/4] seeding source PostgreSQL with pagila"
 if ! {
   src -v ON_ERROR_STOP=1 -q -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;" &&
-  src -v ON_ERROR_STOP=1 -q -f "${FIXTURES}/pagila-schema.sql" &&
-  src -v ON_ERROR_STOP=1 -q -f "${FIXTURES}/pagila-data.sql"
+  seed_fixture "${FIXTURES}/pagila-schema.sql" &&
+  seed_fixture "${FIXTURES}/pagila-data.sql"
 } >>"${LOG}" 2>&1; then
   echo "ERROR: could not seed PostgreSQL with Pagila" >&2
   tail -40 "${LOG}" >&2
