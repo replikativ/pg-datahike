@@ -912,6 +912,9 @@
     (instance? Function expr)
     [(expr/resolution-name (.getName ^Function expr)) 2]
 
+    (instance? TimezoneExpression expr)
+    ["timezone" 2]
+
     (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
     [(expr/resolution-name (.getName ^net.sf.jsqlparser.expression.AnalyticExpression expr)) 2]
 

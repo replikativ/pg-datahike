@@ -1505,8 +1505,8 @@
         (java.time.ZoneOffset/ofTotalSeconds (int (if (= "-" sign) west (- west))))))))
 
 (defn resolve-time-zone
-  "A PostgreSQL time-zone spec as a java.time ZoneId. Fixed abbreviations
-   come from PostgreSQL's default table and names from the tz database.
+  "A PostgreSQL time-zone spec as a java.time ZoneId. A dynamic
+   abbreviation names the zone used for calendar operations.
    A NUMERIC spec -- `+05`,
    `-03:30`, `UTC+3` -- is POSIX-style, so its sign is INVERTED: `+05` is
    five hours WEST of UTC (datetime.c DecodePosixTimezone). Unknown names
@@ -1525,6 +1525,7 @@
         (when-let [[_ sign h m sec]
                    (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
           (posix sign h m sec))
+        (some-> (datetime-zone/dynamic-abbreviation z) :zone datetime-zone/resolve-zone-name)
         (datetime-zone/zone-id z)
         (throw (errors/pg-error
                 :invalid-parameter-value

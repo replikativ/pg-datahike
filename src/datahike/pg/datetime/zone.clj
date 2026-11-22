@@ -28,10 +28,12 @@
    this port is meant to remove, so it is implemented from the C's
    branches rather than from the convenience method.
 
-   SIGN: everything here returns and accepts SECONDS WEST, as
-   PostgreSQL stores internally."
-  (:require [datahike.pg.datetime.decode :as dec])
-  (:import [java.time LocalDateTime ZoneId ZoneOffset]
+   The input decoders use integer seconds west of UTC, as PostgreSQL
+   does internally. ZoneOffset values use java.time's usual sign."
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [datahike.pg.datetime.tokens :as tokens])
+  (:import [java.time Instant LocalDateTime ZoneId ZoneOffset]
            [java.time.zone ZoneRules ZoneRulesException]))
 
 (def ^:private posix-tz
@@ -114,49 +116,64 @@
     (when (.isFixedOffset rules)
       (- (.getTotalSeconds (.getOffset rules java.time.Instant/EPOCH))))))
 
+(defn dynamic-abbreviation [^String name]
+  (let [abbrev (.toLowerCase (.trim name) java.util.Locale/ROOT)
+        entry (tokens/zone-abbrev abbrev)]
+    (when (= :dyntz (:type entry))
+      (assoc entry :abbrev abbrev))))
+
+(def ^:private abbreviation-offsets
+  (delay (edn/read-string (slurp (io/resource "datahike/pg/datetime/abbreviation_offsets.edn")))))
+
+(defn- historical-offset [abbrev second]
+  (when-let [transitions (get @abbreviation-offsets abbrev)]
+    ;; Each entry supersedes the previous occurrence of this abbreviation.
+    ;; The first entry also supplies its meaning before it first appeared.
+    (some (fn [[start east]]
+            (when (<= start second) (ZoneOffset/ofTotalSeconds (int east))))
+          (rseq transitions))))
+
 (defn offset-at-local-time
   "Choose the zone offset for a local time using PostgreSQL's transition rules.
    A gap uses the offset before the transition. An overlap uses the offset
    after the transition."
-  ^ZoneOffset [^LocalDateTime ldt ^ZoneId zone]
-  (let [rules (.getRules zone)
-        valid (.getValidOffsets rules ldt)]
-    (if (.isEmpty valid)
-      (.getOffsetBefore (.getTransition rules ldt))
-      (.get valid (dec (.size valid))))))
+  (^ZoneOffset [^LocalDateTime ldt ^ZoneId zone]
+   (let [rules (.getRules zone)
+         valid (.getValidOffsets rules ldt)]
+     (if (.isEmpty valid)
+       (.getOffsetBefore (.getTransition rules ldt))
+       (.get valid (dec (.size valid))))))
+  (^ZoneOffset [^LocalDateTime ldt ^ZoneId zone abbrev]
+   (let [offset (offset-at-local-time ldt zone)]
+     (or (when abbrev (historical-offset abbrev (.toEpochSecond ldt offset))) offset))))
+
+(defn offset-at-instant
+  "Resolve a dynamic abbreviation at an instant, falling back to its zone
+   when the abbreviation does not appear in the transition data."
+  ^ZoneOffset [^Instant instant ^ZoneId zone abbrev]
+  (or (when abbrev (historical-offset abbrev (.getEpochSecond instant)))
+      (.getOffset (.getRules zone) instant)))
+
+(defn- wall-clock ^LocalDateTime [{:keys [year mon mday hour min sec]}]
+  ;; Carry 24:00 or a leap second into the following day or minute.
+  (-> (LocalDateTime/of (int year) (int mon) (int mday) 0 0 0)
+      (.plusHours (long hour))
+      (.plusMinutes (long min))
+      (.plusSeconds (long sec))))
 
 (defn determine-offset
   "Convert local fields and a zone to seconds west of UTC.
    An out-of-range date falls back to UTC (datetime.c:1726-1730)."
-  ^long [{:keys [year mon mday hour min sec]} ^ZoneId zone]
+  ^long [tm ^ZoneId zone]
   (try
-    ;; Carry 24:00 or a leap second into the following day or minute.
-    (let [ldt (-> (LocalDateTime/of (int year) (int mon) (int mday) 0 0 0)
-                  (.plusHours (long hour))
-                  (.plusMinutes (long min))
-                  (.plusSeconds (long sec)))]
-      (- (.getTotalSeconds (offset-at-local-time ldt zone))))
+    (- (.getTotalSeconds (offset-at-local-time (wall-clock tm) zone)))
     (catch java.time.DateTimeException _ 0)))
 
 (defn determine-abbrev-offset
-  "`DetermineTimeZoneAbbrevOffset` (datetime.c:1748-1779) for a DYNTZ
-   abbreviation -- one that names a zone instead of carrying an offset.
-
-   PARTIAL, and deliberately so. The C first asks the zone's own
-   transition data whether the abbreviation as WRITTEN matches at that
-   instant, and uses that offset if it does; only on a miss does it
-   fall back to the zone's offset. Java exposes no abbreviation strings
-   from tzdb, so only the fallback is implementable here without
-   shipping the tzdb text ourselves.
-
-   What that costs: writing an abbreviation that disagrees with the
-   zone's state at the instant -- `'2000-01-01 12:00 ARST'`, summer
-   time in Buenos Aires named on a winter date -- gets the zone's
-   offset for that date rather than the abbreviation's own. The
-   abbreviation still selects the right ZONE, so it is wrong only when
-   the two disagree, and only for the 50 DYNTZ entries of 195. Recorded
-   in doc/review-backlog.md rather than papered over."
-  ^long [tm ^String zone-name]
+  "`DetermineTimeZoneAbbrevOffset` in seconds west of UTC."
+  ^long [tm ^String zone-name abbrev]
   (if-let [z (resolve-zone-name zone-name)]
-    (determine-offset tm z)
+    (try
+      (- (.getTotalSeconds (offset-at-local-time (wall-clock tm) z abbrev)))
+      (catch java.time.DateTimeException _ 0))
     0))

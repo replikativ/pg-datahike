@@ -141,8 +141,14 @@
    :file "timestamptz" :lines [13 46] :state :covered :impact :unsupported
    :detail "Relative dates resolve in the session zone or an explicit offset. Consecutive transactions get distinct values for now, with matching values within a transaction."}
   {:id :timestamptz-dynamic-zone-abbreviation
-   :file "timestamptz" :lines [569 577] :state :open :impact :unsupported
-   :detail "AT TIME ZONE rejects MSK. Offsets for dynamic abbreviations depend on the date and transition."}
+   :file "timestamptz" :lines [569 577] :state :covered :impact :unsupported
+   :detail "AT TIME ZONE uses the historical offset attached to MSK across the 2011 Moscow spring gap."}
+  {:id :timestamptz-dynamic-zone-overlap
+   :file "timestamptz" :lines [585 592] :state :covered :impact :unsupported
+   :detail "AT TIME ZONE and make_timestamptz use the historical MSK offset across the 2014 Moscow overlap."}
+  {:id :timestamptz-dynamic-zone-from-instant
+   :file "timestamptz" :lines [638 650] :state :covered :impact :unsupported
+   :detail "Instant-to-wall-clock conversion uses the MSK offset on the correct side of each Moscow transition."}
   {:id :timestamptz-at-local
    :file "timestamptz" :lines [655 668] :state :open :impact :unsupported
    :detail "AT LOCAL fails to parse, aborting the remaining session-zone comparisons."}

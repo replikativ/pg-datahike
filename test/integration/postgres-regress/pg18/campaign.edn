@@ -121,7 +121,19 @@
      [{:id :timestamptz-relative-input
        :source-lines [13 46]
        :gate "test/datahike/test/pg_temporal_text_test.clj"
-       :test-var "relative-datetime-input-uses-transaction-time"}]}
+       :test-var "relative-datetime-input-uses-transaction-time"}
+      {:id :timestamptz-dynamic-zone-abbreviation
+       :source-lines [569 577]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "historical-time-zone-abbreviations"}
+      {:id :timestamptz-dynamic-zone-overlap
+       :source-lines [585 592]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "historical-time-zone-abbreviations"}
+      {:id :timestamptz-dynamic-zone-from-instant
+       :source-lines [638 650]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "historical-time-zone-abbreviations"}]}
     {:name "interval", :boundaries #{:functions :casts :operators :temporal}, :mode :discovery
      :blockers #{:interval-window-aggregates}
      :accepted-differences #{:interval-output-style}

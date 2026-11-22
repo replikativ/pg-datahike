@@ -111,7 +111,7 @@
     :named (if-let [z (zone/resolve-zone-name (:name zone))]
              (zone/determine-offset tm z)
              (dec/dterr :bad-timezone))
-    :abbrev (zone/determine-abbrev-offset tm (:zone zone))
+    :abbrev (zone/determine-abbrev-offset tm (:zone zone) (:abbrev zone))
     :session (zone/determine-offset tm session-zone)
     0))
 
@@ -249,7 +249,7 @@
                           (throw (ex-info "bad-timezone"
                                           {:datahike.pg.datetime.lex/dterr :bad-timezone
                                            :datahike.pg.datetime.parse/zone-name (:name z)})))
-                 :abbrev (zone/determine-abbrev-offset @at (:zone z))
+                 :abbrev (zone/determine-abbrev-offset @at (:zone z) (:abbrev z))
                  :session (or (zone/fixed-offset session-zone)
                               (zone/determine-offset @at session-zone))
                  0)]

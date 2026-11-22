@@ -117,6 +117,53 @@
     (is (= "22023" (state c "SELECT ts AT TIME ZONE '<EAST>-02:60' FROM tv")))
     (is (= "22023" (state c "SELECT ts AT TIME ZONE 'Mars/Olympus' FROM tv")))))
 
+(deftest historical-time-zone-abbreviations
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (testing "wall-clock conversion at a gap and an overlap"
+      (doseq [[day cases]
+              [["2011-03-27" [["00:00:00" 3] ["01:00:00" 3] ["01:59:59" 3]
+                              ["02:00:00" 4] ["02:00:01" 4] ["02:59:59" 4]
+                              ["03:00:00" 4] ["03:00:01" 4] ["04:00:00" 4]]]
+               ["2014-10-26" [["00:00:00" 4] ["00:59:59" 4] ["01:00:00" 3]
+                              ["01:00:01" 3] ["02:00:00" 3]]]]
+              [time hours] cases]
+        (let [local (str day " " time)
+              result (-> (java.time.LocalDateTime/parse (str day "T" time))
+                         (.minusHours hours)
+                         (.format (java.time.format.DateTimeFormatter/ofPattern "uuuu-MM-dd HH:mm:ss")))]
+          (is (= [[(str result "+00")]]
+                 (rows c (str "SELECT timestamp '" local "' AT TIME ZONE 'MSK'"))) local))))
+    (testing "instant conversion uses the offset on the correct side of the transition"
+      (doseq [[day cases]
+              [["2011-03-26" [["21:00:00" 3] ["22:00:00" 3] ["22:59:59" 3]
+                              ["23:00:00" 4] ["23:00:01" 4] ["23:59:59" 4]]]
+               ["2011-03-27" [["00:00:00" 4]]]
+               ["2014-10-25" [["21:00:00" 4] ["21:59:59" 4] ["22:00:00" 3]
+                              ["22:00:01" 3] ["23:00:00" 3]]]]
+              [time hours] cases]
+        (let [utc (str day " " time)
+              result (-> (java.time.LocalDateTime/parse (str day "T" time))
+                         (.plusHours hours)
+                         (.format (java.time.format.DateTimeFormatter/ofPattern "uuuu-MM-dd HH:mm:ss")))]
+          (is (= [[result]]
+                 (rows c (str "SELECT timestamptz '" utc " UTC' AT TIME ZONE 'MSK'"))) utc))))
+    (is (= [["2014-10-25 20:00:00+00" "2014-10-25 22:00:00+00"]]
+           (rows c "SELECT make_timestamptz(2014, 10, 26, 0, 0, 0, 'MSK'), make_timestamptz(2014, 10, 26, 1, 0, 0, 'MSK')")))
+    (testing "the first recorded meaning and the most recent one precede the zone's own offset"
+      (is (= [["1899-12-31 21:00:00.123456+00" "1899-12-31 21:29:43.123456+00"
+               "2010-06-30 21:00:00+00" "2010-06-30 20:00:00+00"]]
+             (rows c (str "SELECT timestamp '1900-01-01 00:00:00.123456' AT TIME ZONE 'msk', "
+                          "timestamp '1900-01-01 00:00:00.123456' AT TIME ZONE 'Europe/Moscow', "
+                          "timestamptz '2010-07-01 00:00 MSK', "
+                          "date_trunc('day', timestamptz '2010-07-01 12:00 UTC', 'MSK')"))))
+      (is (= [["2010-06-30 21:00:00+00" "2024-01-01 04:00:00+00"]]
+             (rows c (str "SELECT to_timestamp('2010-07-01 00:00:00 MSK', 'YYYY-MM-DD HH24:MI:SS TZ'), "
+                          "timestamp '2024-01-01' AT TIME ZONE 'VET'"))))
+      (with-open [stmt (.createStatement c)
+                  rs (.executeQuery stmt "SELECT timestamp '2010-07-01' AT TIME ZONE 'MSK'")]
+        (is (= "timezone" (.getColumnLabel (.getMetaData rs) 1)))))))
+
 (deftest at-time-zone-with-interval
   (with-open [c (jdbc)]
     (is (= [["11:45:03.123456+00" "01:45:03.123456-10"

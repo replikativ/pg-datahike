@@ -3818,11 +3818,17 @@
     (instance? java.time.LocalDateTime v) (.atZone ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
     :else nil))
 
-(def ^:private resolve-time-zone
-  "A PostgreSQL time-zone spec as a java.time ZoneId. Lives in types
-   now: the CAST needs the same resolution to read a zone out of a
-   timestamptz literal, and cast.clj cannot require this namespace."
-  types/resolve-time-zone)
+(defn- time-zone-and-abbreviation [zone]
+  (if (instance? java.time.ZoneId zone)
+    [zone nil]
+    (let [name (str zone)
+          dynamic (datetime-zone/dynamic-abbreviation name)]
+      [(types/resolve-time-zone name) (:abbrev dynamic)])))
+
+(defn- transaction-instant ^java.time.Instant []
+  (if-let [^java.util.Date time datetime-in/*transaction-time*]
+    (.toInstant time)
+    (java.time.Instant/now)))
 
 (defn- local-date-time
   "A timestamp value as its wall-clock LocalDateTime. Timestamps are held
@@ -3937,25 +3943,21 @@
      (types/infinite-datetime v) v
      :else
      (let [east (when (or interval? (interval-value? zone)) (interval-zone-offset zone))
-           ^java.time.ZoneId zid (when-not east
-                                   (if (instance? java.time.ZoneId zone)
-                                     zone
-                                     (resolve-time-zone zone)))]
+           [zid abbrev] (when-not east (time-zone-and-abbreviation zone))]
        (case kind
          :timestamp
-         (let [ldt (local-date-time v)]
-           (if east
-             (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- east))
-             (.toInstant ldt (datetime-zone/offset-at-local-time ldt zid))))
+         (let [ldt (local-date-time v)
+               east (or east (.getTotalSeconds (datetime-zone/offset-at-local-time ldt zid abbrev)))]
+           (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- east)))
 
          :timestamptz
          (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)
-               east (or east (.getTotalSeconds (.getOffset (.getRules zid) inst)))]
+               east (or east (.getTotalSeconds (datetime-zone/offset-at-instant inst zid abbrev)))]
            (shift-timestamp inst east))
 
          :timetz
          (shift-timetz v (or east (.getTotalSeconds
-                                   (.getOffset (.getRules zid) (java.time.Instant/now))))))))))
+                                   (datetime-zone/offset-at-instant (transaction-instant) zid abbrev)))))))))
 
 (defn sql-timezone-local
   "The one-argument timezone overloads use the current session's zone."
@@ -3977,7 +3979,7 @@
     (let [t (if (string? value) (sql-cast/cast-scalar value "time" {}) value)
           end-of-day? (= "24:00:00" t)
           ^java.time.LocalTime time (if end-of-day? java.time.LocalTime/MIDNIGHT t)
-          now (java.time.Instant/now)
+          now (transaction-instant)
           date (.toLocalDate (java.time.LocalDateTime/ofInstant now time-zone))
           date (if end-of-day? (.plusDays date 1) date)
           source-offset (datetime-zone/offset-at-local-time (.atTime date time) time-zone)
@@ -4094,12 +4096,9 @@
   (if (or (some sql-null? [y mo d h mi sec]) (and zone (sql-null? zone)))
     :__null__
     (let [ldt (make-local-timestamp y mo d h mi sec)
-          ^java.time.ZoneId z (if zone
-                                (resolve-time-zone (str zone))
-                                (or session-zone java.time.ZoneOffset/UTC))]
-      (.toOffsetDateTime
-       (.withZoneSameInstant (.withLaterOffsetAtOverlap (java.time.ZonedDateTime/of ldt z))
-                             java.time.ZoneOffset/UTC)))))
+          [zid abbrev] (time-zone-and-abbreviation (or zone session-zone java.time.ZoneOffset/UTC))
+          offset (datetime-zone/offset-at-local-time ldt zid abbrev)]
+      (java.time.OffsetDateTime/ofInstant (.toInstant ldt offset) java.time.ZoneOffset/UTC))))
 
 (defn sql-make-interval
   "`make_interval(years, months, weeks, days, hours, mins, secs)`, each
