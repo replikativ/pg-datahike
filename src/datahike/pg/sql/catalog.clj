@@ -1978,7 +1978,7 @@
                                 (:datahike.pg.object/oid row-type) 0))
                         :pg_class/relhastriggers (contains? triggered t)
                         (pgs/row-marker-attr "pg_class") true}))
-                   (pgs/table-names user-schema))))
+                   (pgs/table-names user-schema cte-db))))
      ;; Composite types get a distinct backing pg_class row (relkind 'c');
      ;; pg_type.typrelid and pg_class.reltype link the two identities.
          (into
@@ -2474,7 +2474,7 @@
                :pg_tables/hastriggers (contains? triggered t)
                :pg_tables/rowsecurity false
                (pgs/row-marker-attr "pg_tables") true})
-            (pgs/table-names user-schema)))
+            (pgs/table-names user-schema cte-db)))
     "pg_trigger"
     ;; Populated from the trigger registry. The relation existed with
     ;; PostgreSQL 17's columns but no rows, so `\d t` listed no triggers
@@ -2860,7 +2860,7 @@
              :information_schema_tables/table_name t
              :information_schema_tables/table_type "BASE TABLE"
              (pgs/row-marker-attr "information_schema_tables") true})
-          (pgs/table-names user-schema))
+          (pgs/table-names user-schema cte-db))
     "pg_sequences"
     (mapv (fn [s]
             (cond-> {:pg_sequences/schemaname "public"

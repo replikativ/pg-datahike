@@ -75,6 +75,7 @@
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.assignment-target :as assignment-target]
             [datahike.pg.arrays.assign :as array-assign]
+            [datahike.pg.sql.virtual-db :as virtual-db]
             [datahike.pg.types :as types]
             [datahike.pg.tsearch :as tsearch]
             [datahike.pg.vector :as pg-vector]
@@ -1366,7 +1367,7 @@
 
 (defn- checked-db-with [db tx]
   (params/check-cancel!)
-  (let [result (d/db-with db tx)]
+  (let [result (virtual-db/with-data db tx)]
     (params/check-cancel!)
     result))
 
@@ -2049,7 +2050,7 @@
                                 {:db/ident       marker
                                  :db/valueType   :db.type/boolean
                                  :db/cardinality :db.cardinality/one})
-                spec-db (d/db-with db schema-tx)
+                spec-db (virtual-db/with-data db schema-tx)
                 data-tx (mapv (fn [row]
                                 (into {marker true}
                                       (keep-indexed
@@ -2058,7 +2059,7 @@
                                            (when (some? v) [(keyword sub-name a) v])))
                                        aliases)))
                               rows)
-                spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
+                spec-db2 (if (seq data-tx) (virtual-db/with-data spec-db data-tx) spec-db)]
             {:db spec-db2 :schema (:schema spec-db2)
              :name sub-name :alias (or talias sub-name) :aliases aliases}))))))
 
@@ -2184,7 +2185,7 @@
                             {:db/ident marker
                              :db/valueType :db.type/boolean
                              :db/cardinality :db.cardinality/one})
-            spec-db (d/db-with db schema-tx)
+            spec-db (virtual-db/with-data db schema-tx)
             vars (mapv (fn [c] (symbol (str "?" sub-name "_" c))) cols)
             ;; Ordinality is NOT a column here: it exists so Datalog's SET
             ;; semantics cannot collapse duplicate rows. `unnest(ARRAY[1,1,1])`
@@ -2535,7 +2536,7 @@
                                :db/valueType vt
                                :db/cardinality :db.cardinality/one})
                             cols vtypes)
-            spec-db (d/db-with db schema-tx)]
+            spec-db (virtual-db/with-data db schema-tx)]
         {:db spec-db :schema (:schema spec-db)
          :name sub-name :alias (or talias sub-name)
          :cols cols
@@ -2563,16 +2564,16 @@
               log-attr (keyword tname "log_cnt")
               called-attr (keyword tname "is_called")
               marker (pgs/row-marker-attr tname)
-              spec-db (d/db-with db
-                                 [{:db/ident value-attr :db/valueType :db.type/long
-                                   :db/cardinality :db.cardinality/one}
-                                  {:db/ident log-attr :db/valueType :db.type/long
-                                   :db/cardinality :db.cardinality/one}
-                                  {:db/ident called-attr :db/valueType :db.type/boolean
-                                   :db/cardinality :db.cardinality/one}
-                                  {:db/ident marker :db/valueType :db.type/boolean
-                                   :db/cardinality :db.cardinality/one}])
-              result (d/db-with spec-db [{value-attr value log-attr 0 called-attr called? marker true}])]
+              spec-db (virtual-db/with-data db
+                        [{:db/ident value-attr :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident log-attr :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident called-attr :db/valueType :db.type/boolean
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident marker :db/valueType :db.type/boolean
+                          :db/cardinality :db.cardinality/one}])
+              result (virtual-db/with-data spec-db [{value-attr value log-attr 0 called-attr called? marker true}])]
           {:db result :schema (:schema result) :name tname :alias (or talias tname)})))))
 
 (defn materialize-derived-select!
@@ -2887,7 +2888,7 @@
             (throw (errors/pg-error :feature-not-supported
                                     {:feature "analysis of unresolved virtual column types"})))
         tx (output-schema-tx target-name columns db)
-        spec-db (d/db-with db tx)]
+        spec-db (virtual-db/with-data db tx)]
     {:db spec-db :schema (:schema spec-db) :name target-name
      :alias (or alias target-name) :aliases (mapv :name columns)
      :output-columns columns}))

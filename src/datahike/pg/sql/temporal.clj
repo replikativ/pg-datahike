@@ -383,26 +383,28 @@
    SYSTEM_TIME AS OF '…' FOR VALID_TIME AS OF '…'` produces
    `{:as-of <Date> :valid-at <Date>}`."
   [^String sql]
-  (let [{vt-sql :sql vt-spec :spec}
-        (strip-axis sql find-for-valid-time
-                    {:msg (str "Multi-table SELECT with more than one "
-                               "FOR VALID_TIME clause is not yet supported "
-                               "— the per-statement override applies one "
-                               "valid-time pin to the whole query. Use "
-                               "explicit per-column predicates "
-                               "(`<table>._valid_from`/`._valid_to`) for "
-                               "the multi-table case, or split into "
-                               "separate queries.")
-                     :error :sql/multi-for-valid-time-unsupported})
-        {st-sql :sql st-spec :spec}
-        (strip-axis vt-sql find-for-system-time
-                    {:msg (str "More than one FOR SYSTEM_TIME clause in "
-                               "one statement is not supported — pin "
-                               "tx-time once per query. Use a session-"
-                               "level `SET datahike.as_of` or split into "
-                               "separate queries.")
-                     :error :sql/multi-for-system-time-unsupported})
-        override (not-empty
-                  (merge (valid-time-override vt-spec)
-                         (system-time-override st-spec)))]
-    {:sql st-sql :override override}))
+  (if (re-find #"(?i)valid_time|system_time" sql)
+    (let [{vt-sql :sql vt-spec :spec}
+          (strip-axis sql find-for-valid-time
+                      {:msg (str "Multi-table SELECT with more than one "
+                                 "FOR VALID_TIME clause is not yet supported "
+                                 "— the per-statement override applies one "
+                                 "valid-time pin to the whole query. Use "
+                                 "explicit per-column predicates "
+                                 "(`<table>._valid_from`/`._valid_to`) for "
+                                 "the multi-table case, or split into "
+                                 "separate queries.")
+                       :error :sql/multi-for-valid-time-unsupported})
+          {st-sql :sql st-spec :spec}
+          (strip-axis vt-sql find-for-system-time
+                      {:msg (str "More than one FOR SYSTEM_TIME clause in "
+                                 "one statement is not supported — pin "
+                                 "tx-time once per query. Use a session-"
+                                 "level `SET datahike.as_of` or split into "
+                                 "separate queries.")
+                       :error :sql/multi-for-system-time-unsupported})
+          override (not-empty
+                    (merge (valid-time-override vt-spec)
+                           (system-time-override st-spec)))]
+      {:sql st-sql :override override})
+    {:sql sql :override nil}))

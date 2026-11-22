@@ -560,6 +560,9 @@
 
 (def ^:const row-marker-col "db-row-exists")
 
+(defn- as-of-view? [db]
+  (and db (= :as-of (get-in (dbi/-secondary-view db) [:system :mode]))))
+
 (defn- schema-hints*
   [db]
   (let [q-fn d/q
@@ -645,18 +648,22 @@
                                  (update acc (namespace ident) (fnil conj []) (name ident))
                                  acc))
                              {} ordered-idents)]
-    (assoc (reduce (fn [acc [ident expr]]
-                     (update acc ident assoc :generated "s" :generated-expr expr))
-                   (reduce (fn [acc [ident]]
-                             (update acc ident assoc :not-null? true))
-                           (reduce (fn [acc [ident pt]]
-                                     (update acc ident assoc :pg-type pt))
-                                   ident-hints
-                                   pg-types)
-                           not-nulls)
-                   generateds)
-           ::column-order column-order
-           ::catalog-db db)))
+    (cond-> (assoc (reduce (fn [acc [ident expr]]
+                             (update acc ident assoc :generated "s" :generated-expr expr))
+                           (reduce (fn [acc [ident]]
+                                     (update acc ident assoc :not-null? true))
+                                   (reduce (fn [acc [ident pt]]
+                                             (update acc ident assoc :pg-type pt))
+                                           ident-hints
+                                           pg-types)
+                                   not-nulls)
+                           generateds)
+                   ::column-order column-order
+                   ::catalog-db db)
+      ;; An as-of DB delegates its structural schema map to the current
+      ;; DB. Exclude attributes and row markers created after the snapshot.
+      (as-of-view? db)
+      (assoc ::visible-idents (into #{} (map second) ordered-idents)))))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
@@ -975,7 +982,9 @@
 
 (defn- derive-virtual-tables*
   [schema hints]
-  (let [user-attrs (remove (fn [[k _]] (or (not (keyword? k))
+  (let [visible-idents (::visible-idents hints)
+        schema (if visible-idents (select-keys schema visible-idents) schema)
+        user-attrs (remove (fn [[k _]] (or (not (keyword? k))
                                            (internal-attr? k)
                                            (nil? (namespace k))
                                            (:hidden (get hints k))))
@@ -1261,8 +1270,11 @@
 
 (defn table-names
   "Return sorted list of virtual table names for a schema."
-  [schema]
-  (sort (keys (derive-virtual-tables schema))))
+  ([schema] (table-names schema nil))
+  ([schema db]
+   (let [visibility (when (as-of-view? db)
+                      (select-keys (schema-hints db) [::visible-idents]))]
+     (sort (keys (derive-virtual-tables schema (or visibility {})))))))
 
 ;; ============================================================================
 ;; Catalog query helpers (pg_tables, information_schema, etc.)

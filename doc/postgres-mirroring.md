@@ -124,6 +124,11 @@ manifest report its start positions and cutover LSN under
 so a restart resnapshots them even when the source layout has changed back.
 With schema refresh disabled, schema drift pauses the mirror.
 
+Use `SET datahike.as_of` to query the pre-refresh columns and rows. The
+same snapshot applies to `information_schema.columns`, `pg_attribute`,
+and catalog joins. `FOR SYSTEM_TIME AS OF` selects a snapshot for one
+statement and works with prepared queries.
+
 ## Recovery and status
 
 The checkpoint in `pgdh_mirror.checkpoint` stores the publisher identity, end
@@ -160,10 +165,10 @@ mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
 `clojure -M:dev -m datahike.pg.mirror-probe` after `bb prep`. Pass
 `--refresh` to exercise online table addition and its recovery boundaries.
 Pass `--schema-refresh` to exercise publisher DDL, recovery, and historical
-reads.
+row and catalog reads.
 
-The next stages are historical catalog queries, streaming and spooling of
-large transactions, and failover slots. See the [consolidation plan](consolidation-plan.md) and
+The next stages are relation renames, primary key changes, streaming and spooling
+of large transactions, and failover slots. See the [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 
 ## Known performance trap in Option 2, today

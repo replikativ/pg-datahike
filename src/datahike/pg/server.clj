@@ -5739,12 +5739,14 @@
 (defn- statement-read-db
   "Select a live or active transaction snapshot for alias input/output.
    A completed transaction may retain bookkeeping but no longer owns reads."
-  [conn tx-state session-state]
-  (or *snapshot-db*
-      (let [ts @tx-state]
-        (if (:in-tx? ts)
-          (or (:speculative-db ts) (apply-temporal (d/db conn) session-state))
-          (apply-temporal (d/db conn) session-state)))))
+  ([conn tx-state session-state]
+   (statement-read-db conn tx-state session-state nil))
+  ([conn tx-state session-state override]
+   (or *snapshot-db*
+       (let [ts @tx-state]
+         (if-let [speculative (when (:in-tx? ts) (:speculative-db ts))]
+           (if override (apply-temporal speculative session-state override) speculative)
+           (apply-temporal (d/db conn) session-state override))))))
 
 (def ^:private ^:dynamic *nested-statement?*
   "True while a routine body runs one of its own statements. A `$n` in
@@ -8223,8 +8225,7 @@
              (nil? (:sql-limit parsed)) (nil? (:sql-offset parsed))
              (nil? (:sql-order-by parsed))
              (nil? (:sub-results parsed))
-             (not (re-find #"(?i)for\s+(valid_time|system_time)"
-                           (or (:sql parsed) ""))))
+             (nil? (::temporal-override parsed)))
     (let [query (:query parsed)
           in-args (vec (:in-args parsed))
           aliases (:find-aliases parsed)
@@ -14230,7 +14231,8 @@
   [sql schema db temp-tables session-id session-state analyses previous]
   (binding [params/*session-state* session-state]
     (let [context (prepared-analysis-context session-state temp-tables)
-          old (when (= sql (:sql previous)) (:prepared-analysis previous))
+          old (when (= sql (or (::temporal-source previous) (:sql previous)))
+                (:prepared-analysis previous))
           token (:prepared-analysis-token previous)
           valid? (and old token
                       (locking analyses (.get ^java.util.WeakHashMap analyses token))
@@ -14704,16 +14706,9 @@
                     ;; uses the extended protocol, which is every
                     ;; pgjdbc client by default.
                     params/*statement-handler* (or params/*statement-handler* (nested-executor this))]
-            (let [base-db (apply-temporal (d/db conn) session-state)
-                ;; In an open transaction, parse/validate against the
-                ;; speculative-db so a statement referencing a table
-                ;; created earlier in the SAME uncommitted transaction
-                ;; (e.g. `BEGIN; CREATE TABLE t; PREPARE … SELECT FROM t`)
-                ;; resolves it. Mirrors the dispatch's db selection.
-                  db (if (:in-tx? @tx-state)
-                       (or (:speculative-db @tx-state) base-db)
-                       base-db)
-                  parsed (parse-prepared-session-sql sql (dbi/-schema db) db
+            (let [{source :sql override :override} (sql-temporal/preprocess sql)
+                  db (statement-read-db conn tx-state session-state override)
+                  parsed (parse-prepared-session-sql source (dbi/-schema db) db
                                                      temp-tables session-id session-state
                                                      prepared-analyses *previous-prepared*)]
             ;; Surface parse-time errors (undefined relation/column,
@@ -14739,8 +14734,10 @@
                   ;; type declarations (1-indexed to match `$N`; 0 = "you
                   ;; infer it"). describeParams and describeResult read the
                   ;; same map that was bound during translation above.
-                    parsed (assoc parsed :sql sql
-                                  :declared-param-oids declared-param-oids)]
+                    parsed (cond-> (assoc parsed :sql sql
+                                          :declared-param-oids declared-param-oids)
+                             override (assoc ::temporal-source source
+                                             ::temporal-override override))]
                 (when bump-dispatch! (bump-dispatch! parsed))
             ;; Pre-compute result metadata for row-producing system
             ;; queries so describeResult emits a proper RowDescription
@@ -14872,9 +14869,7 @@
                 ;; (or the alias-name fallback), which can disagree with
                 ;; the int4/int8 width the Execute path actually sends,
                 ;; corrupting binary-format decoding on the client.
-                db (if (:in-tx? @tx-state)
-                     (or (:speculative-db @tx-state) (d/db conn))
-                     (d/db conn))
+                db (statement-read-db conn tx-state session-state (::temporal-override parsed))
                 ;; Bare `$N` output columns are typed from the Parse
                 ;; message's declared OID — see effective-item-oids
                 ;; (issue #27). Statically unknown columns go out as text.
@@ -14905,9 +14900,7 @@
           ;; arity + column types, so the first branch is canonical.
           (= :set-operation (:type parsed))
           (when-let [sub (first (:sub-results parsed))]
-            (let [db (if (:in-tx? @tx-state)
-                       (or (:speculative-db @tx-state) (d/db conn))
-                       (d/db conn))
+            (let [db (statement-read-db conn tx-state session-state (::temporal-override parsed))
                   aliases (first (select-output-shape
                                   sub (or (:enriched-db sub) db) nil))
                   oids (int-array
@@ -14928,9 +14921,7 @@
           ;; columns, so the left one describes the result.
           (= :full-join (:type parsed))
           (when-let [sub (:left-query parsed)]
-            (let [db (if (:in-tx? @tx-state)
-                       (or (:speculative-db @tx-state) (d/db conn))
-                       (d/db conn))
+            (let [db (statement-read-db conn tx-state session-state (::temporal-override parsed))
                   db (or (:enriched-db sub) db)
                   [aliases oids] (select-output-shape sub db (effective-item-oids sub))
                   oids (int-array (map #(types/oid->wire-int (or % PgWireServer/OID_TEXT)) oids))]
@@ -14958,7 +14949,8 @@
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
-        (let [bound (binding [regoid/*db* (statement-read-db conn tx-state session-state)
+        (let [db (statement-read-db conn tx-state session-state (::temporal-override parsed))
+              bound (binding [regoid/*db* db
                               regoid/*relation-db* nil
                               regoid/*search-path* (effective-search-path session-state)
                               regoid/*relation-provider* catalog/relation-identity
@@ -14975,7 +14967,7 @@
                           (throw e))))]
           (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
                                                       (java.util.IdentityHashMap.))
-                    regoid/*db* (statement-read-db conn tx-state session-state)
+                    regoid/*db* db
                     regoid/*relation-db* nil
                     regoid/*search-path* (effective-search-path session-state)
                     regoid/*relation-provider* catalog/relation-identity
@@ -15127,34 +15119,7 @@
                             {stripped-sql :sql per-stmt-override :override}
                             (sql-temporal/preprocess sql)
                             sql stripped-sql
-                            ;; FETCH from a cursor binds *snapshot-db* so the
-                      ;; SELECT sees the state captured at DECLARE, not
-                      ;; whatever committed since. Non-cursor paths get
-                      ;; the normal live db.
-                            real-db (or *snapshot-db*
-                                        (apply-temporal (d/db conn) session-state per-stmt-override))
-                            db (if (and (not *snapshot-db*) (:in-tx? @tx-state))
-                                 (or (:speculative-db @tx-state) real-db)
-                                 real-db)
-                            ;; Use the IDB protocol method, not keyword
-                            ;; access. AsOfDB / SinceDB / HistoricalDB are
-                            ;; defrecords with only [origin-db time-point]
-                            ;; fields; `(:schema wrapper)` returns nil
-                            ;; because defrecord ILookup never reaches the
-                            ;; protocol. `(dbi/-schema wrapper)` correctly
-                            ;; delegates to origin-db's schema (datahike's
-                            ;; `db.cljc:553`). Without this, SELECT under
-                            ;; `SET datahike.as_of = …` collapses to errors
-                            ;; like \"Query for unknown vars\" because
-                            ;; column-info / derive-virtual-tables receive
-                            ;; an empty schema map. Note: the schema
-                            ;; returned is the *current* schema cached on
-                            ;; the origin-db, not a true historical schema —
-                            ;; columns added after the as-of timestamp are
-                            ;; visible to the translator but contain no
-                            ;; data at that time. A real historical schema
-                            ;; would require a `schema-as-of` upstream in
-                            ;; datahike (see TODO).
+                            db (statement-read-db conn tx-state session-state per-stmt-override)
                             schema (dbi/-schema db)
                             statement-basis (catalog-basis/capture db)
                       ;; Prepared-statement path: reuse the Parse-time result

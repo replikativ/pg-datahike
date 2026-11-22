@@ -43,6 +43,7 @@
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.template :as template]
+            [datahike.pg.sql.virtual-db :as virtual-db]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select
@@ -427,8 +428,8 @@
                                   (cache-put! cache cache-key (vec (mapcat identity fragments))))
               combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
                                          sorted-names))
-              spec-db (d/db-with db combined-schema)]
-          (if (seq combined-data) (d/db-with spec-db combined-data) spec-db))))))
+              spec-db (virtual-db/with-data db combined-schema)]
+          (if (seq combined-data) (virtual-db/with-data spec-db combined-data) spec-db))))))
 
 ;; ============================================================================
 ;; parse-sql result cache

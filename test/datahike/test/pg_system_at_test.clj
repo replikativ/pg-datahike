@@ -188,3 +188,55 @@
                  "COMMIT"]]
       (is (nil? (err (run sql))) sql))
     (is (= [["3"] ["4"]] (mapv vec (.rows (run "SELECT detail FROM tasks ORDER BY key")))))))
+
+(deftest historical-catalogs-and-user-data-share-the-statement-snapshot
+  (let [run #(.execute *handler* %)
+        rows (fn [query]
+               (let [result (run query)]
+                 (is (nil? (err result)) (str query " " (err result)))
+                 (mapv vec (.rows result))))
+        columns (str "SELECT column_name, data_type, datetime_precision FROM information_schema.columns "
+                     "WHERE table_name = 'temporal_example' AND column_name <> 'db_id' ORDER BY ordinal_position")]
+    (doseq [query ["CREATE TABLE temporal_example (id integer PRIMARY KEY, label text, obsolete text, stamp timestamp(6))"
+                   "INSERT INTO temporal_example VALUES (1, 'before', 'old', '2024-02-29 12:00:00.123456')"]]
+      (is (nil? (err (run query))) query))
+    (let [before (d/db *conn*)
+          snapshot (.toInstant ^java.util.Date (:db/txInstant (d/entity before (:max-tx before))))]
+      (doseq [query ["ALTER TABLE temporal_example RENAME COLUMN label TO title"
+                     "ALTER TABLE temporal_example DROP COLUMN obsolete, ADD COLUMN extra bigint"
+                     "ALTER TABLE temporal_example ALTER COLUMN stamp TYPE timestamp(3)"
+                     "UPDATE temporal_example SET title = 'after'"
+                     "CREATE TABLE future_example (id integer PRIMARY KEY)"
+                     (str "SET datahike.as_of = " (:max-tx before))]]
+        (is (nil? (err (run query))) query))
+      (is (= [["id" "integer" nil] ["label" "text" nil] ["obsolete" "text" nil]
+              ["stamp" "timestamp without time zone" "6"]]
+             (rows columns)))
+      (is (= [["label"] ["obsolete"]]
+             (rows (str "SELECT a.attname FROM pg_attribute a JOIN pg_class r ON a.attrelid = r.oid "
+                        "WHERE r.relname = 'temporal_example' AND a.attname IN ('label', 'obsolete') ORDER BY a.attnum"))))
+      (is (empty? (rows "SELECT relname FROM pg_class WHERE relname = 'future_example'")))
+      (is (empty? (rows "SELECT table_name FROM information_schema.tables WHERE table_name = 'future_example'")))
+      (is (= [["before" "label"]]
+             (rows (str "SELECT t.label, c.column_name FROM temporal_example t "
+                        "JOIN information_schema.columns c ON c.table_name = 'temporal_example' "
+                        "AND c.column_name = 'label' WHERE t.id = 1"))))
+      (is (= [["before" "label"]]
+             (rows (str "WITH cols AS (SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'temporal_example' AND column_name = 'label') "
+                        "SELECT t.label, c.column_name FROM temporal_example t CROSS JOIN cols c WHERE t.id = 1"))))
+      (is (nil? (err (run "RESET datahike.as_of"))))
+      (is (= [["id" "integer" nil] ["title" "text" nil] ["stamp" "timestamp without time zone" "3"]
+              ["extra" "bigint" nil]]
+             (rows columns)))
+      (let [parsed (.parse *handler*
+                           (str "SELECT label, stamp FROM temporal_example FOR SYSTEM_TIME AS OF '"
+                                snapshot "' WHERE id = $1")
+                           (int-array 0))
+            described (.describeResult *handler* parsed)
+            result (.executePrepared *handler* parsed (object-array [nil 1]))]
+        (is (= [23] (vec (.describeParams *handler* parsed))))
+        (is (= [25 1114] (vec (.-columnOids described))))
+        (is (nil? (err result)))
+        (is (= [["before" "2024-02-29 12:00:00.123456"]] (mapv vec (.rows result)))))
+      (is (= [["after"]] (rows "SELECT title FROM temporal_example WHERE id = 1"))))))

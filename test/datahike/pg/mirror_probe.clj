@@ -525,7 +525,7 @@
    (rows conn "SELECT id, summary, stamp::text, flag FROM schema_items ORDER BY id")
    (rows conn "SELECT id, tag FROM schema_meta ORDER BY id")])
 
-(defn- evolved-column-metadata [conn]
+(defn- schema-item-column-metadata [conn]
   (rows conn (str "SELECT column_name, data_type, datetime_precision, is_nullable, column_default "
                   "FROM information_schema.columns "
                   "WHERE table_name = 'schema_items' AND column_name <> 'db_id' "
@@ -547,6 +547,9 @@
                 :schema-refresh? true :server {:port 0}}
         subscriber (atom nil)
         old-query "SELECT id, label, obsolete, stamp::text FROM schema_items ORDER BY id"
+        temporal-query (fn [at]
+                         (str "SELECT id, label, obsolete, stamp::text FROM schema_items "
+                              "FOR SYSTEM_TIME AS OF " (literal at) " ORDER BY id"))
         old-rows [["1" "original" "keep history" "2024-06-01 12:00:00.123456"]]]
     (prn {:artifacts directory})
     (with-open [source (DriverManager/getConnection source-url)
@@ -566,6 +569,7 @@
         (await! "Native subscriber did not load the initial layout" #(= old-rows (rows reference old-query)))
         (reset! subscriber (mirror/start! config))
         (let [{:keys [slot]} (await-state! @subscriber :following)
+              old-columns (schema-item-column-metadata source)
               old-id (item-eid path)
               old-at (inspect-db path #(str (.toInstant ^java.util.Date
                                              (:db/txInstant (d/entity % (:max-tx %))))))
@@ -634,14 +638,19 @@
                 (await! "Native subscriber did not converge on the new layout" #(= expected (evolved-rows reference)))
                 (check! (= expected (evolved-rows sink)) "Mirror rows differ after schema refresh"
                         {:source expected :mirror (evolved-rows sink)}))
-              (check! (= (evolved-column-metadata source) (evolved-column-metadata sink))
+              (check! (= (schema-item-column-metadata source) (schema-item-column-metadata sink))
                       "Publisher defaults, types, or nullability changed"
-                      {:source (evolved-column-metadata source) :mirror (evolved-column-metadata sink)})
+                      {:source (schema-item-column-metadata source) :mirror (schema-item-column-metadata sink)})
               (check! (= ids (set (keys (get-in (mirror/status @subscriber) [:last-schema-refresh :from]))))
                       "Restart lost the resnapshot positions" {})
               (sql! sink (str "SET datahike.as_of = " (literal old-at)))
               (check! (= old-rows (rows sink old-query)) "Historical schema or row was lost" {})
+              (check! (= old-columns (schema-item-column-metadata sink))
+                      "Historical catalog differs from the publisher's original columns"
+                      {:expected old-columns :mirror (schema-item-column-metadata sink)})
               (sql! sink "RESET datahike.as_of")
+              (check! (= old-rows (rows sink (temporal-query old-at)))
+                      "Extended query with inline system time lost the historical row" {})
               (sql! source "INSERT INTO schema_items (id) VALUES (3)")
               (await! "Mirror stopped following after schema refresh" #(= (evolved-rows source) (evolved-rows sink)))
               ;; Dropping nullability and a default leaves the wire descriptor
@@ -654,7 +663,7 @@
                       "INSERT INTO schema_items (id) VALUES (4)"))
               (await! "Mirror did not refresh a metadata-only change"
                       #(and (= (evolved-rows source) (evolved-rows sink))
-                            (= (evolved-column-metadata source) (evolved-column-metadata sink))))))
+                            (= (schema-item-column-metadata source) (schema-item-column-metadata sink))))))
           (mirror/stop! @subscriber)
           (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
           {:status :passed :artifacts directory})
