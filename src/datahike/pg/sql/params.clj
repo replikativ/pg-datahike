@@ -1476,10 +1476,10 @@
                            (let [[tns cn] (col-ns-name c)]
                              (when-let [oid (infer-param-oid-for-column schema tns cn)]
                                (.put result (.getIndex p) oid))))
-           record-timezone-param! (fn [operand oid]
-                                    (let [base (unwrap-scalar-parens operand)]
-                                      (when (instance? JdbcParameter base)
-                                        (.putIfAbsent result (.getIndex ^JdbcParameter base) oid))))
+           record-scalar-param-type! (fn [operand oid]
+                                       (let [base (unwrap-scalar-parens operand)]
+                                         (when (instance? JdbcParameter base)
+                                           (.putIfAbsent result (.getIndex ^JdbcParameter base) oid))))
            ;; OID of a literal comparand, so `? OP <literal>` (e.g.
            ;; `$1 = 1`, with no column to borrow a type from) still
            ;; resolves the param's type. SignedExpression wraps a
@@ -1678,10 +1678,10 @@
                             (walk (.getLeftExpression ^CastExpression n)))
                           (instance? TimezoneExpression n)
                           (let [[value zones] (timezone-operands n)]
-                            (record-timezone-param! value types/oid-timestamptz)
+                            (record-scalar-param-type! value types/oid-timestamptz)
                             (walk value)
                             (doseq [zone zones]
-                              (record-timezone-param! zone types/oid-text)
+                              (record-scalar-param-type! zone types/oid-text)
                               (walk zone)))
                          ;; COALESCE/GREATEST/LEAST/NULLIF use PostgreSQL's
                          ;; common-type selection. An unknown parameter can
@@ -1697,9 +1697,15 @@
                                               []))]
                             (when (= name "timezone")
                               (case (count args)
-                                1 (record-timezone-param! (first args) types/oid-timestamptz)
-                                2 (do (record-timezone-param! (first args) types/oid-text)
-                                      (record-timezone-param! (second args) types/oid-timestamptz))
+                                1 (record-scalar-param-type! (first args) types/oid-timestamptz)
+                                2 (do (record-scalar-param-type! (first args) types/oid-text)
+                                      (record-scalar-param-type! (second args) types/oid-timestamptz))
+                                nil))
+                            (when (#{"date_trunc" "pg_catalog.date_trunc"} name)
+                              (case (count args)
+                                2 (record-scalar-param-type! (first args) types/oid-text)
+                                3 (doseq [[arg oid] (map vector args [types/oid-text types/oid-timestamptz types/oid-text])]
+                                    (record-scalar-param-type! arg oid))
                                 nil))
                             (when (#{"coalesce" "greatest" "least" "nullif"} name)
                               (when-let [comparand

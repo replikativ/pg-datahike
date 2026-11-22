@@ -220,6 +220,14 @@
     :hint (str "No function matches the given name and argument "
                "types. You might need to add explicit type casts.")}))
 
+(defn- ambiguous-function [fname arg-oids]
+  (errors/pg-error :ambiguous-function
+                   {:message (str "function " fname "("
+                                  (str/join ", " (map #(get types/oid->pg-name % "unknown") arg-oids))
+                                  ") is not unique")
+                    :hint (str "Could not choose a best candidate function. "
+                               "You might need to add explicit type casts.")}))
+
 (defn- call-arg-oids
   "The argument types a 42883 names: an untyped literal is PostgreSQL's
    `unknown`, and so is an argument this layer cannot type."
@@ -256,13 +264,7 @@
         oids (call-arg-oids ctx arg-exprs)]
     (case (types/aggregate-resolution fname oids unknown?)
       :none (throw (no-such-function fname oids))
-      :ambiguous (throw (errors/pg-error
-                         :ambiguous-function
-                         {:message (str "function " fname "("
-                                        (str/join ", " (map #(get types/oid->pg-name % "unknown") oids))
-                                        ") is not unique")
-                          :hint (str "Could not choose a best candidate function. "
-                                     "You might need to add explicit type casts.")}))
+      :ambiguous (throw (ambiguous-function fname oids))
       nil)))
 
 (def ^:private vector-function-names
@@ -2503,114 +2505,28 @@
                 result-var])
         result-var)
 
-      ;; DATE_TRUNC(precision, ts) → floor to precision boundary.
-      ;; Accepts ts as either:
-      ;;   - java.util.Date  (the type Datahike returns for :db.type/instant
-      ;;     attrs — Metabase's Question Builder breakouts go through this
-      ;;     branch with `temporal-unit "month"`)
-      ;;   - Long/epoch-seconds (some legacy callers / synthetic values)
-      ;; and returns the same shape it received, so downstream
-      ;; aggregations / projections see a value of the original type.
-      ;; PG's DATE_TRUNC also returns a TIMESTAMP, so Date in / Date out
-      ;; is the right wire-side default.
       (= fname "date_trunc")
-      (let [[precision ts zone-arg] args
-            ;; A timestamptz -- or a date, which resolves to the
-            ;; timestamptz overload -- is truncated on its wall clock in
-            ;; a zone: the explicit third argument, else the session's.
-            ;; In UTC, `date_trunc('day', ts)` under America/New_York
-            ;; answered 20:00 the evening before.
-            tz-input? (contains? #{types/oid-timestamptz types/oid-date}
-                                 (source-oid ctx (second params)))
-            session-zone (when tz-input? (or types/*time-zone* java.time.ZoneOffset/UTC))
-            fn-param (symbol (str "?date-trunc" (swap! (:var-counter ctx) inc)))
-            trunc-zdt (fn [unit ^java.time.ZonedDateTime zdt]
-                        (case unit
-                          "second"  (.truncatedTo zdt java.time.temporal.ChronoUnit/SECONDS)
-                          "minute"  (.truncatedTo zdt java.time.temporal.ChronoUnit/MINUTES)
-                          "hour"    (.truncatedTo zdt java.time.temporal.ChronoUnit/HOURS)
-                          "day"     (.truncatedTo zdt java.time.temporal.ChronoUnit/DAYS)
-                          "week"    (let [dow (.getValue (.getDayOfWeek zdt))
-                                          start (.minusDays zdt (dec dow))]
-                                      (.truncatedTo start java.time.temporal.ChronoUnit/DAYS))
-                          "month"   (.truncatedTo (.withDayOfMonth zdt 1)
-                                                  java.time.temporal.ChronoUnit/DAYS)
-                          "quarter" (let [m (.getMonthValue zdt)
-                                          qstart (- m (mod (dec m) 3))]
-                                      (.truncatedTo (.withDayOfMonth (.withMonth zdt qstart) 1)
-                                                    java.time.temporal.ChronoUnit/DAYS))
-                          "year"    (.truncatedTo (.withDayOfYear zdt 1)
-                                                  java.time.temporal.ChronoUnit/DAYS)
-                          zdt))
-            trunc-fn (fn [prec ts & [zone-text]]
-                       ;; NULL out, not nil: a datalog binding that yields nil
-                       ;; FILTERS THE ROW, so `date_trunc('month', d)` dropped
-                       ;; every row whose d was NULL.
-                       (if (or (fns/sql-null? prec) (fns/sql-null? ts)
-                               (and zone-arg (fns/sql-null? zone-text)))
-                         :__null__
-                         ;; An infinite timestamp truncates to itself --
-                         ;; there is no day for it to be the start of.
-                         ;; Reading the sentinel's instant answered
-                         ;; `292278994-08-17 00:00:00`.
-                         (if (types/infinite-datetime ts)
-                           ts
-                           (let [unit (let [u (if (keyword? prec) (name prec) (str prec))]
-                                        (str/replace u #"s$" ""))]
-                             (let [^java.time.ZoneId zone
-                                   (cond zone-arg (types/resolve-time-zone (str zone-text))
-                                         session-zone session-zone
-                                         :else java.time.ZoneOffset/UTC)]
-                               (cond
-                                 (or (instance? java.util.Date ts)
-                                     (instance? java.time.OffsetDateTime ts))
-                                 (let [inst (if (instance? java.util.Date ts)
-                                              (.toInstant ^java.util.Date ts)
-                                              (.toInstant ^java.time.OffsetDateTime ts))
-                                       zdt (.atZone inst zone)
-                                       trunc (trunc-zdt unit zdt)]
-                                   (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
-
-                             ;; A `date` column arrives as a LocalDate, which
-                             ;; the fall-through returned UNTRUNCATED --
-                             ;; `date_trunc('month', d)` answered d. PostgreSQL
-                             ;; resolves a date argument to the timestamptz
-                             ;; overload, so the result is an instant.
-                                 (instance? java.time.LocalDate ts)
-                                 (let [zdt (.atStartOfDay ^java.time.LocalDate ts zone)
-                                       trunc (trunc-zdt unit zdt)]
-                                   (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
-
-                             ;; A `timestamp` (no zone) stays zone-less.
-                                 (instance? java.time.LocalDateTime ts)
-                                 (let [zdt (.atZone ^java.time.LocalDateTime ts
-                                                    java.time.ZoneOffset/UTC)]
-                                   (.toLocalDateTime ^java.time.ZonedDateTime (trunc-zdt unit zdt)))
-
-                                 ;; date_trunc(text, interval) -- and a time,
-                                 ;; which resolves to it through the implicit
-                                 ;; time -> interval cast.
-                                 ((requiring-resolve 'datahike.pg.interval.core/interval?) ts)
-                                 (fns/interval-trunc prec ts)
-                                 (instance? java.time.LocalTime ts)
-                                 (fns/interval-trunc
-                                  prec ((requiring-resolve 'datahike.pg.interval.core/interval)
-                                        0 0 (quot (.toNanoOfDay ^java.time.LocalTime ts) 1000)))
-
-                                 (number? ts)
-                                 (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
-                                                    java.time.ZoneOffset/UTC)
-                                       trunc (trunc-zdt unit zdt)]
-                                   (.getEpochSecond (.toInstant ^java.time.ZonedDateTime trunc)))
-
-                                 :else ts))))))]
+      (let [operands (mapv params/unwrap-scalar-parens arg-exprs)
+            [_ source-oid :as oids] (call-arg-oids ctx operands)
+            result-oid (fns/date-trunc-resolution oids)
+            _ (case result-oid
+                :none (throw (no-such-function fname oids))
+                :ambiguous (throw (ambiguous-function fname oids))
+                nil)
+            ;; A literal coerced during Parse keeps that input time zone
+            ;; even when the resulting instant is truncated after SET.
+            source (second operands)
+            args (if (and (nil? source-oid) (instance? StringValue source))
+                   (assoc args 1 (sql-cast/cast-scalar (string-value-text source) "timestamptz"
+                                                       {:explicit? true :prefer-local-datetime? true}))
+                   args)
+            session (if (= result-oid types/oid-timestamptz)
+                      (session-temporal-context! ctx)
+                      {})
+            fn-param (ctx/fresh-var! ctx)]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj trunc-fn)
-        (swap! (:where-clauses ctx) conj
-               [(if zone-arg
-                  (list fn-param precision ts zone-arg)
-                  (list fn-param precision ts))
-                result-var])
+        (swap! (:in-args ctx) conj (partial fns/sql-date-trunc source-oid result-oid))
+        (swap! (:where-clauses ctx) conj [(apply list fn-param session args) result-var])
         result-var)
 
       ;; DATE_ADD(unit, amount, epoch-seconds) → add amount to timestamp

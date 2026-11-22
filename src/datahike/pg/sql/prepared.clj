@@ -117,11 +117,14 @@
 (defn- bind-literal!
   ([state tokens node target-oid] (bind-literal! state tokens node target-oid nil))
   ([state tokens node target-oid enclosing-cast]
+   (bind-literal! state tokens node target-oid enclosing-cast false))
+  ([state tokens node target-oid enclosing-cast freeze-datetime?]
    (when (literal? node)
      (let [node (null-or-literal node)
            text (expr/string-value-text ^StringValue node)
            alias (alias-element target-oid)
-           datetime? (and (datetime-input-oids target-oid) (relative-datetime-input? text))]
+           datetime? (and (datetime-input-oids target-oid)
+                          (or freeze-datetime? (relative-datetime-input? text)))]
        (when (or alias (= target-oid types/oid-oid) datetime?)
          (when-not *capture-literals?* (unsupported!))
          (let [elem (types/array-oid->element-oid target-oid)
@@ -425,6 +428,9 @@
                           (and (contains? regoid/alias-types alias-type) (= 1 (count args)))
                           (bind-literal! state tokens (first args) (source-types! state db alias-type))
 
+                          (and (= fname "date_trunc") (= 3 (count args)))
+                          (bind-literal! state tokens (second args) types/oid-timestamptz nil true)
+
                           ;; This implementation's nextval still consumes a
                           ;; textual sequence name. Preserve that spelling,
                           ;; but include the sequence as an analysis input.
@@ -580,7 +586,8 @@
     (and (some #(= :string (:type %)) tokens)
          (or (some #(and (= :string (:type %)) (relative-datetime-input? (:text %))) tokens)
              (some #(and (contains? #{:ident :quoted} (:type %))
-                         (type-name? (ident (:text %)))) tokens)
+                         (let [name (ident (:text %))]
+                           (or (= "date_trunc" name) (type-name? name)))) tokens)
              (some type-name? (attribute-values :pg/type))
              (some type-name? (attribute-values :pg/array-elem))
              (some (fn [value]

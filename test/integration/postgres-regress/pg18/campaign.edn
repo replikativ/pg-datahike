@@ -85,7 +85,12 @@
      :boundaries #{:scalar-type :casts :operators},
      :requires ["test_setup"],
      :mode :unmeasured}
-    {:name "date", :boundaries #{:casts :operators :temporal}, :mode :unmeasured}
+    {:name "date", :boundaries #{:casts :operators :temporal}, :mode :unmeasured
+     :strict-slices
+     [{:id :date-trunc-calendar-boundaries
+       :source-lines [315 324]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "postgres-date-trunc-slices"}]}
     {:name "time", :boundaries #{:typmods :casts :operators :temporal}, :mode :strict
      :strict-slices
      [{:id :time-variable-zone-requires-date
@@ -113,7 +118,11 @@
      [{:id :timestamp-relative-input
        :source-lines [13 45]
        :gate "test/datahike/test/pg_temporal_text_test.clj"
-       :test-var "relative-datetime-input-uses-transaction-time"}]}
+       :test-var "relative-datetime-input-uses-transaction-time"}
+      {:id :timestamp-date-trunc-units-and-infinity
+       :source-lines [177 181]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "postgres-date-trunc-slices"}]}
     {:name "timestamptz",
      :boundaries #{:time-zones :functions :casts :operators :temporal}, :mode :discovery
      :blockers #{:at-local :timezone-abbreviations :temporal-overflow :temporal-diagnostics}
@@ -122,6 +131,10 @@
        :source-lines [13 46]
        :gate "test/datahike/test/pg_temporal_text_test.clj"
        :test-var "relative-datetime-input-uses-transaction-time"}
+      {:id :timestamptz-date-trunc-units-and-zones
+       :source-lines [219 230]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "postgres-date-trunc-slices"}
       {:id :timestamptz-dynamic-zone-abbreviation
        :source-lines [569 577]
        :gate "test/datahike/test/pg_type_output_test.clj"
