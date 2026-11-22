@@ -28,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$pg_bin/initdb" -D "$data_dir" -U mirror_admin -A trust --no-locale >/dev/null
+"$pg_bin/initdb" -D "$data_dir" -U mirror_admin -A trust --no-locale --encoding=UTF8 >/dev/null
 "$pg_bin/pg_ctl" -D "$data_dir" -l "$PG_MIRROR_RECOVERY_DIR/postgres.log" -w start \
   -o "-p $port -k $PG_MIRROR_RECOVERY_DIR -c listen_addresses=127.0.0.1 -c wal_level=logical" >/dev/null
 
