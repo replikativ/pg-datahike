@@ -3865,22 +3865,20 @@
      :timestamp    wall-clock time in `zone` -> the instant (timestamptz)
      :timestamptz  the instant -> wall-clock time in `zone` (timestamp)
      :timetz       the time, shifted to `zone`'s offset (timetz)
-   Instants are returned as java.util.Date; a timestamp result is the
-   instant whose UTC reading is the wall-clock time, like a timestamp
-   column. NULL in either operand is NULL."
+   Instant results preserve fractional seconds. A timestamp result
+   encodes the wall-clock fields in UTC, as a timestamp column does.
+   NULL in either operand is NULL."
   [v zone kind]
   (if (or (nil? v) (= :__null__ v) (nil? zone) (= :__null__ zone))
     :__null__
     (let [zid (resolve-time-zone zone)]
       (case kind
         :timestamp
-        (java.util.Date/from (.toInstant (.atZone (local-date-time v) zid)))
+        (.toInstant (.atZone (local-date-time v) zid))
 
         :timestamptz
-        (let [inst (.toInstant (.atZone (local-date-time v) java.time.ZoneOffset/UTC))]
-          (java.util.Date/from
-           (.toInstant (.atZone (java.time.LocalDateTime/ofInstant inst zid)
-                                java.time.ZoneOffset/UTC))))
+        (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)]
+          (.toInstant (java.time.LocalDateTime/ofInstant inst zid) java.time.ZoneOffset/UTC))
 
         :timetz
         (let [v (if (string? v)

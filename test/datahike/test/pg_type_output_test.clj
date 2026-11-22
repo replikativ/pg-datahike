@@ -91,6 +91,10 @@
     (testing "a chain is left-associative"
       (is (= [["2020-01-01 11:00:00.12"]]
              (rows c "SELECT ts AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Berlin' FROM tv WHERE id = 1"))))
+    (testing "converting either timestamp kind preserves microseconds"
+      (is (= [["2024-03-01 00:30:00.654321+00" "2024-03-01 01:30:00.654321"]]
+             (rows c (str "SELECT timestamp '2024-03-01 00:30:00.654321' AT TIME ZONE 'UTC', "
+                          "timestamptz '2024-03-01 00:30:00.654321+00' AT TIME ZONE 'Europe/Berlin'")))))
     (is (= "22023" (state c "SELECT ts AT TIME ZONE 'Mars/Olympus' FROM tv")))))
 
 (deftest time-and-money-input
