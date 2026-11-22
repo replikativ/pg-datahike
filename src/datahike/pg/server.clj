@@ -13903,7 +13903,9 @@
                  :column-attrs    column-attrs
                  :ns              ns
                  :table           table
-                 :row-marker      (pgs/row-marker-attr table)
+                 :row-marker      (let [marker (pgs/row-marker-attr table)]
+                                    (when (contains? (dbi/-schema db-now) marker)
+                                      marker))
                  :ancestor-markers ancestor-markers
                  :tempid-prefix   (str "copy-" (java.util.UUID/randomUUID) "-row-")
                  ;; The handler a BEFORE ROW trigger's body runs its own

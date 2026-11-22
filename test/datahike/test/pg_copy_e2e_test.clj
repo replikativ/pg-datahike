@@ -970,3 +970,14 @@
     (is (= [["survived"]] (query-rows c "SELECT 'survived'")))
     (is (= "42601" (state-of c "COPY cw FROM stdin WITH (FORMAT bogus)")))
     (is (= [["survived"]] (query-rows c "SELECT 'survived'")))))
+
+(deftest copy-into-a-native-table-keeps-existing-row-membership
+  (d/transact *conn* [{:db/ident :native_copy/id :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}
+                      {:db/ident :native_copy/note :db/valueType :db.type/string
+                       :db/cardinality :db.cardinality/one}])
+  (d/transact *conn* [{:native_copy/id 1}])
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (= 1 (copy-in-text c "COPY native_copy (id, note) FROM STDIN" "2\tloaded\n")))
+    (is (= [[1 nil] [2 "loaded"]]
+           (query-rows c "SELECT id, note FROM native_copy ORDER BY id")))))
