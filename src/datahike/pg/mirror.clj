@@ -24,7 +24,7 @@
 (def ^:private sql-types
   {16 "boolean" 20 "bigint" 21 "smallint" 23 "integer" 25 "text"
    700 "real" 701 "double precision" 1043 "varchar" 1082 "date"
-   1700 "numeric" 2950 "uuid"})
+   1114 "timestamp" 1184 "timestamptz" 1700 "numeric" 2950 "uuid"})
 
 (defn- require! [condition message data]
   (when-not condition
@@ -91,6 +91,7 @@
       (= -1 typmod) base
       (and (= 1043 oid) (> typmod types/var-hdr-sz))
       (str base "(" (- typmod types/var-hdr-sz) ")")
+      (and (#{1114 1184} oid) (<= 0 typmod 6)) (str base "(" typmod ")")
       (= 1700 oid)
       (let [[precision scale] (types/decode-numeric-typmod typmod)]
         (when (and precision (<= 1 precision 1000) (<= -1000 scale 1000))

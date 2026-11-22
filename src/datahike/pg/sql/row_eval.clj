@@ -21,7 +21,8 @@
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
-            [datahike.pg.types :as types])
+            [datahike.pg.types :as types]
+            [datahike.pg.sql.cast :as sql-cast])
   (:import [datahike.pg ColumnSubstitutingDeParser ColumnSubstitutingDeParser$Unsupported]
            [net.sf.jsqlparser.schema Column]))
 
@@ -62,10 +63,14 @@
 
 (defn- stored-value
   "A column's value as SELECT reads it from storage."
-  [schema attr v]
-  (if (= :db.type/bigdec (get-in schema [attr :db/valueType]))
-    (types/numeric-storage->value v)
-    v))
+  [schema attr oid v]
+  (let [value-type (get-in schema [attr :db/valueType])
+        pg-type (types/oid->pg-type-marker oid)]
+    (cond
+      (= :db.type/bigdec value-type) (types/numeric-storage->value v)
+      (types/precise-timestamp-column? value-type pg-type)
+      (sql-cast/timestamp-storage->value pg-type v)
+      :else v)))
 
 (defn- scopes
   "The relations the expressions see, each {:alias :table :columns}, a
@@ -82,13 +87,13 @@
       (conj {:alias (or alias table) :table table
              :columns (mapv (fn [{:keys [name attr oid]}]
                               {:name name :oid oid
-                               :read #(stored-value schema attr (get % attr))})
+                               :read #(stored-value schema attr oid (get % attr))})
                             cols)})
       excluded?
       (conj {:alias "excluded" :table table
              :columns (mapv (fn [{:keys [name attr oid]}]
                               {:name name :oid oid
-                               :read #(stored-value schema attr
+                               :read #(stored-value schema attr oid
                                                     (get % (keyword "excluded" name)))})
                             cols)})
       (seq column-types)

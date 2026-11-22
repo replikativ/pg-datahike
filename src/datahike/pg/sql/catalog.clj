@@ -2790,6 +2790,9 @@
                  [idx col] (map-indexed vector
                                         (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
                  :let [vtype     (:valuetype col)
+                       timestamp? (contains? #{types/oid-timestamp types/oid-timestamptz}
+                                             (:oid col))
+                       typmod    (get typmods (:attr col))
                        pos       (long (if (zero? idx)
                                          1
                                          (inc (or (:attnum col) idx))))
@@ -2822,10 +2825,14 @@
                :information_schema_columns/numeric_precision      (numeric-precision vtype (:attr col))
                :information_schema_columns/numeric_precision_radix (numeric-radix vtype)
                :information_schema_columns/numeric_scale          (numeric-scale vtype (:attr col))
-               :information_schema_columns/datetime_precision     (datetime-precision vtype)
+               :information_schema_columns/datetime_precision     (if timestamp?
+                                                                    (if (and typmod (>= typmod 0)) typmod 6)
+                                                                    (datetime-precision vtype))
                :information_schema_columns/udt_catalog            "datahike"
                :information_schema_columns/udt_schema             "pg_catalog"
-               :information_schema_columns/udt_name               (udt-name vtype)
+               :information_schema_columns/udt_name               (if timestamp?
+                                                                    (:typname (types/catalog-type (:oid col)))
+                                                                    (udt-name vtype))
                :information_schema_columns/dtd_identifier         (str pos)
                :information_schema_columns/is_self_referencing    "NO"
                :information_schema_columns/is_identity            (if identity? "YES" "NO")

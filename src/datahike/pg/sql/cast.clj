@@ -478,15 +478,69 @@
                          (when tz? " with time zone") ": \"" s "\"")
                     {:error :invalid-datetime-format :sqlstate "22007"}))))
 
+(defn- zoned-timestamp? [type-name]
+  (contains? #{"timestamptz" "timestamp with time zone"}
+             (types/base-type-name-of type-name)))
+
+(defn- read-timestamp [type-name text context]
+  ((if (zoned-timestamp? type-name) in/timestamptz-in in/timestamp-in)
+   text context))
+
+(defn- timestamp-with-precision [parsed precision]
+  (if (and (some? precision) (< -1 precision 6) (contains? parsed :usec))
+    (let [micros (:usec parsed)
+          quantum (nth [1000000 100000 10000 1000 100 10 1] precision)
+          rounded (* (if (neg? micros) -1 1) quantum
+                     (quot (+ (abs micros) (quot quantum 2)) quantum))]
+      (when-not (<= in/min-timestamp rounded (dec in/end-timestamp))
+        (throw (errors/pg-error :datetime-field-overflow {:message "timestamp out of range"})))
+      (assoc parsed :usec rounded))
+    parsed))
+
+(defn- decoded-timestamp [type-name parsed]
+  (if (zoned-timestamp? type-name)
+    (carrier/->offset-datetime parsed)
+    (carrier/->local-datetime parsed)))
+
+(defn timestamp-storage->value
+  "Decode canonical ISO timestamp storage without consulting session settings."
+  [type-name stored]
+  (if (string? stored)
+    (decoded-timestamp type-name
+                       (read-timestamp type-name stored
+                                       {:date-order :ymd :session-zone types/utc-zone}))
+    stored))
+
+(defn- timestamp-input [type-name precision value]
+  (let [oid (if (zoned-timestamp? type-name) types/oid-timestamptz types/oid-timestamp)
+        text (if (string? value)
+               value
+               (binding [types/*date-style* [:iso :ymd]]
+                 (types/temporal->pg-text value oid)))]
+    (when-not text
+      (throw (errors/pg-error :datatype-mismatch
+                              {:message (str "expected a " (types/oid->pg-name oid) " value")})))
+    (timestamp-with-precision (read-timestamp type-name text (datetime-ctx)) precision)))
+
+(defn timestamp-value->storage
+  "Validate and round an assigned timestamp. The stored text always uses ISO
+   order and UTC for zoned timestamps, independent of connection settings."
+  [type-name precision value]
+  (if (or (nil? value) (= :__null__ value))
+    value
+    (let [oid (if (zoned-timestamp? type-name) types/oid-timestamptz types/oid-timestamp)
+          v (decoded-timestamp type-name (timestamp-input type-name precision value))]
+      (binding [types/*date-style* [:iso :ymd] types/*time-zone* types/utc-zone]
+        (types/temporal->pg-text v oid)))))
+
 (defn cast-scalar
   "Apply a SQL cast of `v` to the target named by `type-str`.
 
    Options:
      :explicit?       — an explicit CAST reshapes silently; an assignment
                         raises instead (matters for bit width coercion).
-     :prefer-local-datetime? — return a LocalDateTime (microsecond
-                        precision) rather than a Date for a timestamp
-                        cast. See the :timestamp branch.
+     :prefer-local-datetime? — carry timestamp values with microsecond
+                        precision using LocalDateTime or OffsetDateTime.
      :src-oid         — the OID of the value being cast, when the caller
                         knows it. Only `::text` uses it, to tell a date
                         from a timestamp: both are java.util.Date here.
@@ -642,28 +696,18 @@
         ;; which is the passthrough-on-failure shape: "did not parse"
         ;; and "parsed" were the same value.
         :timestamp
-        (let [tz? (contains? #{"timestamptz" "timestamp with time zone"}
-                             (types/base-type-name-of type-str))]
+        (let [precision (types/parse-timestamp-precision type-str)]
           (cond
+            prefer-local-datetime?
+            (decoded-timestamp type-str (timestamp-input type-str precision v))
+
+            ;; Legacy consumers still need the original carriers.
             (instance? java.util.Date v) v
             (instance? java.time.LocalDateTime v) v
-            (nil? v) nil
             :else
-            (let [r ((if tz? in/timestamptz-in in/timestamp-in)
-                     (str v) (datetime-ctx))]
-              ;; A timestamptz may not be a bare `LocalDateTime`: the
-              ;; renderer needs to know to print the `+00`. It used to
-              ;; become a `java.util.Date` for that, at the cost of
-              ;; microseconds -- `OffsetDateTime` carries both, and
-              ;; `types/->pg-text` already renders one.
-              ;;
-              ;; Gated on `prefer-local-datetime?` like the plain
-              ;; timestamp beside it, because the other callers feed
-              ;; values into stores that expect a Date.
-              (cond
-                (not prefer-local-datetime?) (carrier/->date-value r)
-                tz? (carrier/->offset-datetime r)
-                :else (carrier/->local-datetime r)))))
+            (carrier/->date-value
+             (timestamp-with-precision (read-timestamp type-str (str v) (datetime-ctx))
+                                       precision))))
 
         ;; `interval_in`, via the ported decoder. There was NO interval
         ;; arm at all before this, so an interval literal fell through

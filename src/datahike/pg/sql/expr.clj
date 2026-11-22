@@ -124,7 +124,8 @@
 ;; Forward declarations for the mutually-recursive translate-* family.
 
 (declare jsonb-column? json-column? reject-json-operator!)
-(declare coerce-unknown-literal coerce-comparison-operands catalog-def-lookup! statement-clock)
+(declare coerce-unknown-literal coerce-comparison-operands catalog-def-lookup! statement-clock
+         column-vtype column-pg-type)
 
 (def ^:private ^:const max-inline-numeric-precision
   "BigDecimals wider than this travel as Datalog inputs instead of query-form
@@ -4589,7 +4590,7 @@
 
    Text is left alone -- it is parsed in the session zone already."
   [src-oid target-oid zone]
-  (let [zone (or zone java.time.ZoneOffset/UTC)
+  (let [^java.time.ZoneId zone (or zone java.time.ZoneOffset/UTC)
         instant (fn [v]
                   (cond (instance? java.util.Date v) (.toInstant ^java.util.Date v)
                         (instance? java.time.Instant v) v
@@ -4620,7 +4621,7 @@
            (= target-oid types/oid-timestamptz))
       (fn [v]
         (if-let [w (when-not (types/infinite-datetime v) (wall v))]
-          (java.util.Date/from (.toInstant (.atZone ^java.time.LocalDateTime w zone)))
+          (.toOffsetDateTime (.atZone ^java.time.LocalDateTime w zone))
           v))
 
       :else identity)))
@@ -4949,27 +4950,7 @@
                      (if inner-raw "true" "false")
                      (types/->pg-text inner-raw src-oid))
           is-bool? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
-        ;; ::date — extract the LocalDate so serialization can omit the
-        ;; time part ("2017-03-13" instead of "2017-03-13 00:00:00").
-          ;; A value that is already temporal (a bound parameter, a
-          ;; folded expression) is converted, not stringified: `str` of a
-          ;; java.util.Date is its toString, which no parser reads, and the
-          ;; cast silently became NULL.
-          (and (or is-date? is-ts?) (not (string? inner-raw)))
-          (sql-cast/cast-scalar inner-raw type-str
-                                {:explicit? true
-                                 :parse-timestamp parse-timestamp-string})
-          ;; Delegate, like every other branch of this fold. Keeping a
-          ;; private copy of what `cast-scalar` does meant keeping its
-          ;; own idea of FAILURE too, and this one answered nil -- so a
-          ;; fold of `'nonsense'::date::text` produced NULL where
-          ;; PostgreSQL raises. The bare `'nonsense'::date` was right
-          ;; the whole time; only a cast reaching this fold, which is a
-          ;; NESTED one, took the private path.
-          is-date? (sql-cast/cast-scalar
-                    inner-raw type-str
-                    {:explicit? true
-                     :parse-timestamp parse-timestamp-string})
+          is-date? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::time — extract the LocalTime so serialization emits only
         ;; "HH:MM:SS[.fff]" and drops any date component the input had.
           is-time? (sql-cast/cast-scalar
@@ -5046,7 +5027,8 @@
                             (sql-cast/cast-scalar
                              (zone-shift v) type-str
                              {:explicit? true
-                              :parse-timestamp parse-timestamp-string})))]
+                              :parse-timestamp parse-timestamp-string
+                              :prefer-local-datetime? true})))]
               (swap! (:in-params ctx) conj ts-fn-param)
               (swap! (:in-args ctx) conj (null-preserving ts-fn))
               (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
@@ -7136,6 +7118,9 @@
                     (= :db.type/bigdec (:db/valueType attr-schema))
                     types/numeric-storage->value
 
+                    (types/precise-timestamp-column? (:db/valueType attr-schema) pg-type)
+                    (partial sql-cast/timestamp-storage->value pg-type)
+
                     (contains? #{"bit" "varbit"} pg-type)
                     (fn [v]
                       (if (string? v)
@@ -7152,13 +7137,21 @@
         decoded)
       raw)))
 
+(defn- precise-timestamp-column? [ctx expr]
+  (and (instance? Column expr)
+       (types/precise-timestamp-column? (column-vtype ctx expr) (column-pg-type ctx expr))))
+
 (defn- column-storage-value
   "Encode a typed SQL value for direct binding against a stored datom."
   [ctx resolved v]
-  (let [attr (ctx/attr-of ctx resolved)]
-    (if (= :db.type/bigdec (get-in (:schema ctx) [attr :db/valueType]))
-      (types/numeric-value->storage v)
-      v)))
+  (let [attr (ctx/attr-of ctx resolved)
+        attr-schema (get (:schema ctx) attr)
+        pg-type (or (:pg/type attr-schema) (params/pg-type-of-attr (:db ctx) attr))]
+    (cond
+      (= :db.type/bigdec (:db/valueType attr-schema)) (types/numeric-value->storage v)
+      (types/precise-timestamp-column? (:db/valueType attr-schema) pg-type)
+      (sql-cast/timestamp-value->storage pg-type nil v)
+      :else v)))
 
 (defn- session-value-expr!
   "Lower a bare SQL session value to a zero-argument Datalog input fn.
@@ -8619,6 +8612,8 @@
       (and (#{types/oid-time types/oid-timetz} oid)
            (not (instance? Column typed)))
       [(sql-cast/cast-scalar s (types/oid->pg-name oid) {:explicit? true})]
+      (and (= :db.type/string vt) (contains? #{types/oid-timestamp types/oid-timestamptz} oid))
+      [(sql-cast/cast-scalar s (types/oid->pg-name oid) {:prefer-local-datetime? true})]
       ;; Text needs no input function.
       (= :db.type/string vt) nil
       :else
@@ -9461,6 +9456,7 @@
                  (not= types/oid-vector (source-oid ctx left))
                  (nil? (.getArrayConstructor ^Column left))
                  (instance? JdbcParameter right)
+                 (not (precise-timestamp-column? ctx left))
                  ;; A column that is really an OUTER row's value is a
                  ;; constant, not a relation to seek -- see column-binding.
                  (not (column-binding ctx left)))

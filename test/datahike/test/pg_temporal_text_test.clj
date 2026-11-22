@@ -25,6 +25,7 @@
   (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
+(def ^:dynamic *conn* nil)
 
 (defn text-fixture [f]
   (pg/reset-lock-registry!)
@@ -35,7 +36,7 @@
     (let [conn (d/connect cfg)
           {:keys [server]} (pg/start-server {"txt" conn} {:port 0})]
       (try
-        (binding [*port* (.getPort server)]
+        (binding [*port* (.getPort server) *conn* conn]
           (f))
         (finally
           (.stop server)
@@ -808,3 +809,47 @@
     (testing "and the whole-number fields carry no scale at all"
       (is (= "2000" (one c "SELECT extract(year from '2000-01-01'::timestamp)::text")))
       (is (= "6" (one c "SELECT extract(dow from '2000-01-01'::timestamp)::text"))))))
+
+(deftest timestamp-columns-keep-microseconds
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (exec! c "CREATE TABLE precise (id integer PRIMARY KEY, ts timestamp(6), tz timestamptz, rounded timestamp(3))")
+    (exec! c (str "INSERT INTO precise VALUES "
+                  "(1, '2024-02-29 13:55:19.123456', '2024-02-29 19:25:19.123456+05:30', '1999-12-31 23:59:59.999500'), "
+                  "(2, '2024-02-29 13:55:19.123457', '2024-02-29 19:25:19.123457+05:30', '2024-02-29 13:55:19.123500')"))
+    (is (= "2024-02-29 13:55:19.123456" (one c "SELECT ts FROM precise WHERE id = 1")))
+    (is (= "2024-02-29 13:55:19.123457+00" (one c "SELECT tz FROM precise WHERE id = 2")))
+    (is (= "1999-12-31 23:59:59.999" (one c "SELECT rounded FROM precise WHERE id = 1")))
+    (is (= "2024-02-29 13:55:19.124" (one c "SELECT rounded FROM precise WHERE id = 2")))
+    (is (= "1" (one c "SELECT id FROM precise WHERE ts = '2024-02-29 13:55:19.123456'")))
+    (is (= "2" (one c "SELECT id FROM precise WHERE ts > '2024-02-29 13:55:19.123456'")))
+    (with-open [st (.prepareStatement c "SELECT id FROM precise WHERE ts = ?")]
+      (.setObject st 1 (java.time.LocalDateTime/parse "2024-02-29T13:55:19.123457"))
+      (with-open [rs (.executeQuery st)]
+        (is (.next rs))
+        (is (= 2 (.getInt rs 1)))
+        (is (not (.next rs)))))
+    (is (= "2024-02-29 13:55:19.123458"
+           (one c "UPDATE precise SET ts = '2024-02-29 13:55:19.123458' WHERE id = 2 RETURNING ts")))
+    (exec! c "ALTER TABLE precise ADD COLUMN added timestamp(4)")
+    (is (= "2024-02-29 13:55:19.1235"
+           (one c "UPDATE precise SET added = ts WHERE id = 2 RETURNING added")))
+    (exec! c "CREATE TABLE precise_copy AS SELECT ts, tz FROM precise WHERE id = 2")
+    (is (= "2024-02-29 13:55:19.123458" (one c "SELECT ts FROM precise_copy")))
+    (is (= "2024-02-29 13:55:19.123457+00" (one c "SELECT tz FROM precise_copy")))
+    (exec! c "SET TIME ZONE 'Asia/Kathmandu'")
+    (is (= "2024-02-29 19:40:19.123457+05:45" (one c "SELECT tz FROM precise WHERE id = 2")))
+    (is (= "2024-02-29 13:55:19.123458+05:45"
+           (one c "SELECT ts::timestamptz FROM precise WHERE id = 2")))
+    (is (= "2024-02-29 13:55:19.1235"
+           (one c "SELECT ts::timestamp(4) FROM precise WHERE id = 2")))))
+
+(deftest instant-backed-timestamp-columns-remain-readable
+  (d/transact *conn* [{:db/ident :legacy/ts
+                       :db/valueType :db.type/instant
+                       :db/cardinality :db.cardinality/one}])
+  (d/transact *conn* [{:legacy/ts #inst "2024-02-29T13:55:19.123Z"}])
+  (with-open [c (jdbc)]
+    (is (= "2024-02-29 13:55:19.123" (one c "SELECT ts FROM legacy")))
+    (exec! c "INSERT INTO legacy (ts) VALUES ('2024-03-01 13:55:19.124'::timestamp)")
+    (is (= "2024-03-01 13:55:19.124" (one c "SELECT max(ts) FROM legacy")))))

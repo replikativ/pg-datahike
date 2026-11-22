@@ -8093,7 +8093,8 @@
         (sql-cast/cast-scalar
          inner type-str
          {:explicit? true
-          :parse-timestamp expr/parse-timestamp-string})))))
+          :parse-timestamp expr/parse-timestamp-string
+          :prefer-local-datetime? true})))))
 
 (defn- widen-integral
   "Widen a narrow integral result to Long. `length()` answers an
@@ -8669,6 +8670,9 @@
         ;; type from Bind. (Must precede the jsonb branch below, or a
         ;; jsonb `?` param would be serialized as its placeholder record.)
           (params/param-ref? val) val
+
+          (types/precise-timestamp-column? vtype pg-type)
+          (sql-cast/timestamp-value->storage pg-type typmod val)
 
         ;; jsonb columns are :db.type/string, so a `'{…}'::jsonb` STRING literal would
         ;; otherwise be stored verbatim (non-canonical → equality/DISTINCT wrong,

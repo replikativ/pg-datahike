@@ -700,8 +700,9 @@
                                                  first
                                                  types/infer-oid-from-value)
                                         types/oid-text)
-                                vtype (or (types/dh-type-for-oid oid)
-                                          :db.type/string)
+                                vtype (if (contains? #{types/oid-timestamp types/oid-timestamptz} oid)
+                                        :db.type/string
+                                        (or (types/dh-type-for-oid oid) :db.type/string))
                                 attr (keyword table-name alias)
                                 pg-type (get types/oid->pg-type-marker oid)
                                 typmod (nth ctas-column-typmods idx nil)]

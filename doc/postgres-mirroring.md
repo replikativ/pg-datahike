@@ -67,9 +67,11 @@ Source DDL, generated columns, sequence counters, partitioning, inheritance, and
 row filters or column projections require separate handling.
 
 Supported column types are boolean, smallint, integer, bigint, text, varchar,
-real, double precision, numeric, uuid, and date. The subscriber preserves
-`varchar(n)` and `numeric(p,s)` modifiers. Timestamp
-columns require a storage carrier that preserves PostgreSQL microseconds.
+real, double precision, numeric, uuid, date, timestamp, and timestamptz.
+The subscriber preserves `varchar(n)`, `numeric(p,s)`, and timestamp
+precision modifiers. SQL-created timestamp columns preserve PostgreSQL
+microseconds through snapshot COPY, live apply, and historical reads.
+Existing Datahike instant-backed columns remain readable.
 Choose a fixed publication and coordinate schema changes with the
 mirror operator. The worker checks publication membership and relation
 definitions and pauses on incompatibility. A new store and snapshot are needed

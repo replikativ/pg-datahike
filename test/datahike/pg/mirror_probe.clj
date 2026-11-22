@@ -15,9 +15,12 @@
 
 (def ^:private schema-ddl
   [(str "CREATE TABLE probe_parent (tenant integer, id bigint, label varchar(40), payload text, "
+        "occurred timestamptz DEFAULT '2024-02-29 19:25:19.123456+05:30', "
         "PRIMARY KEY (tenant, id) INCLUDE (label))")
    (str "CREATE TABLE probe_child (id integer PRIMARY KEY, tenant integer, parent_id bigint, note text, "
         "amount numeric(12,3) DEFAULT 3.14159, bucket numeric(8,-2), "
+        "wall_time timestamp(6) DEFAULT '2024-02-29 13:55:19.123457', "
+        "rounded timestamp(3) DEFAULT '1999-12-31 23:59:59.999500', "
         "FOREIGN KEY (tenant, parent_id) REFERENCES probe_parent(tenant, id) ON DELETE CASCADE)")])
 
 (defn- check! [condition message data]
@@ -37,8 +40,8 @@
           out)))))
 
 (defn- fixture-rows [conn]
-  [(rows conn "SELECT tenant, id, label, payload FROM probe_parent ORDER BY tenant, id")
-   (rows conn "SELECT id, tenant, parent_id, note, amount, bucket FROM probe_child ORDER BY id")])
+  [(rows conn "SELECT tenant, id, label, payload, occurred::text FROM probe_parent ORDER BY tenant, id")
+   (rows conn "SELECT id, tenant, parent_id, note, amount, bucket, wall_time::text, rounded::text FROM probe_child ORDER BY id")])
 
 (defn- literal [value]
   (str "'" (str/replace value "'" "''") "'"))
@@ -69,10 +72,18 @@
   (str "jdbc:postgresql://127.0.0.1:" (:port (await-state! subscriber :following))
        "/datahike?user=reader&sslmode=disable&prepareThreshold=1"))
 
-(defn- check-rows! [source reference sink]
+(defn- check-rows! [source reference sink subscriber]
+  (sql! sink "SET TIME ZONE 'UTC'")
   (let [expected (fixture-rows source)]
     (await! "Native subscriber failed to converge" #(= expected (fixture-rows reference)))
-    (await! "pg-datahike subscriber failed to converge" #(= expected (fixture-rows sink)))))
+    (try
+      (await! "pg-datahike subscriber failed to converge"
+              #(let [status (mirror/status subscriber)]
+                 (check! (not (#{:failed :paused} (:state status)))
+                         "Mirror paused before matching source rows" status)
+                 (= expected (fixture-rows sink))))
+      (catch clojure.lang.ExceptionInfo e
+        (throw (ex-info (ex-message e) (mirror/status subscriber) e))))))
 
 (defn- expect-read-only! [f]
   (let [state (try (f) nil (catch SQLException e (.getSQLState e)))]
@@ -140,7 +151,7 @@
 
 (defn- check-admission! [source config]
   (sql! source
-        "CREATE TABLE probe_unhandled (id integer PRIMARY KEY, observed timestamptz, payload jsonb)"
+        "CREATE TABLE probe_unhandled (id integer PRIMARY KEY, observed timetz, payload jsonb)"
         "CREATE TABLE probe_no_key (note text)"
         "ALTER TABLE probe_no_key REPLICA IDENTITY FULL"
         "CREATE TABLE probe_no_columns ()"
@@ -174,7 +185,13 @@
   (rows conn (str "SELECT c.relname, a.attname, a.atttypmod "
                   "FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
                   "WHERE c.relname IN ('probe_parent', 'probe_child') "
-                  "AND a.attname IN ('label', 'amount', 'bucket') ORDER BY c.relname, a.attname")))
+                  "AND a.attname IN ('label', 'amount', 'bucket', 'occurred', 'wall_time', 'rounded') "
+                  "ORDER BY c.relname, a.attname")))
+
+(defn- timestamp-catalog [conn]
+  (rows conn (str "SELECT column_name, udt_name, datetime_precision FROM information_schema.columns "
+                  "WHERE table_name IN ('probe_parent', 'probe_child') "
+                  "AND column_name IN ('occurred', 'wall_time', 'rounded') ORDER BY column_name")))
 
 (defn run-probe!
   "Exercise initial snapshot, PostgreSQL row parity, SQL read-only enforcement,
@@ -190,6 +207,8 @@
     (with-open [source (DriverManager/getConnection source-url)
                 reference (DriverManager/getConnection reference-url)]
       (try
+        (sql! source "SET TIME ZONE 'UTC'")
+        (sql! reference "SET TIME ZONE 'UTC'")
         (apply sql! source schema-ddl)
         (apply sql! reference schema-ddl)
         (sql! source
@@ -223,7 +242,8 @@
                        "INSERT INTO probe_parent VALUES (1, 90, 'rolled back', NULL)"
                        "ROLLBACK" "BEGIN"
                        "UPDATE probe_parent SET label = 'during copy' WHERE tenant = 1 AND id = 1"
-                       "UPDATE probe_child SET id = 11, amount = 6.626571, bucket = 1234 WHERE id = 10"
+                       (str "UPDATE probe_child SET id = 11, amount = 6.626571, bucket = 1234, "
+                            "wall_time = '2024-02-29 13:55:19.123458' WHERE id = 10")
                        "INSERT INTO probe_child VALUES (12, 1, 1, NULL)"
                        "DELETE FROM probe_parent WHERE tenant = 1 AND id = 2"
                        "COMMIT"))
@@ -235,15 +255,18 @@
 
         (let [{:keys [slot]} (mirror/status @subscriber)]
           (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
-            (check-rows! source reference sink)
+            (check-rows! source reference sink @subscriber)
             (check! (= (column-modifiers source) (column-modifiers sink))
                     "Mirror metadata changed the source type modifiers"
                     {:source (column-modifiers source) :mirror (column-modifiers sink)})
+            (check! (= (timestamp-catalog source) (timestamp-catalog sink))
+                    "Mirror metadata changed the source timestamp types"
+                    {:source (timestamp-catalog source) :mirror (timestamp-catalog sink)})
             (check-read-only! sink)
             (let [[pid] (slot-query source slot "active_pid")]
               (sql! source (str "SELECT pg_terminate_backend(" pid ")"))
               (sql! source "UPDATE probe_parent SET label = 'after reconnect' WHERE tenant = 1 AND id = 1")
-              (check-rows! source reference sink)
+              (check-rows! source reference sink @subscriber)
               (check! (not= [pid] (slot-query source slot "active_pid"))
                       "Expected a replacement replication connection" {}))
             ;; A keepalive can advertise a WAL position ahead of the last
@@ -255,10 +278,13 @@
                       "Keepalive changed the confirmed position beyond the checkpoint" {})))
 
           (mirror/stop! @subscriber)
-          (let [before (inspect-db path :max-tx)
+          (let [[before before-instant] (inspect-db path
+                                                    #(let [tx (:max-tx %)]
+                                                       [tx (:db/txInstant (d/entity % tx))]))
                 checkpoint (durable-position path)
                 [confirmed] (slot-query source slot "confirmed_flush_lsn")]
-            (sql! source "UPDATE probe_parent SET label = 'after crash', payload = NULL WHERE tenant = 1 AND id = 1")
+            (sql! source (str "UPDATE probe_parent SET label = 'after crash', payload = NULL, "
+                              "occurred = '2024-02-29 13:55:19.123457+00' WHERE tenant = 1 AND id = 1"))
             (let [apply-change #'mirror/apply-change!
                   original @apply-change]
               (with-redefs-fn {apply-change (fn [destination relations change]
@@ -283,7 +309,12 @@
                       "The durable cursor did not commit with the source row" {})
               (reset! subscriber (mirror/start! config))
               (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
-                (check-rows! source reference sink))
+                (check-rows! source reference sink @subscriber)
+                (sql! sink (str "SET datahike.as_of = "
+                                (literal (str (.toInstant ^java.util.Date before-instant)))))
+                (check! (= [["2024-02-29 13:55:19.123456+00"]]
+                           (rows sink "SELECT occurred::text FROM probe_parent WHERE tenant = 1 AND id = 1"))
+                        "The pre-crash timestamp lost precision in a historical SQL read" {}))
               (mirror/stop! @subscriber)
               (check! (= crash-history (inspect-db path #(row-history % before)))
                       "Replayed commit rewrote Datahike history" {})
@@ -297,7 +328,7 @@
           (reset! subscriber (mirror/start! config))
           (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
             (sql! source "TRUNCATE probe_parent, probe_child")
-            (check-rows! source reference sink)
+            (check-rows! source reference sink @subscriber)
             (check! (= [[] []] (fixture-rows sink)) "Multi-table truncate left rows" {})
             (await! "Publisher did not confirm the truncate"
                     #(= [(:applied-lsn (mirror/status @subscriber))] (slot-query source slot "confirmed_flush_lsn")))

@@ -8292,10 +8292,8 @@
    something happened to cast it. PostgreSQL reads a typed parameter
    when it is bound.
 
-   The value is whatever the input function returns -- a timestamp's
-   LocalDateTime keeps its microseconds, which a java.util.Date (the
-   binary path's carrier) would round away. `bound` is the 1-indexed
-   vector."
+   Text and binary timestamps use the same microsecond-precision
+   carriers. `bound` is the 1-indexed vector."
   [bound declared]
   (if (empty? declared)
     bound
@@ -8305,9 +8303,15 @@
                                             (contains? regoid/alias-oids oid)
                                             (contains? regoid/alias-oids (types/array-oid->element-oid oid))))
                      (assoc acc idx
-                            (try (if (contains? regoid/alias-oids (types/array-oid->element-oid oid))
+                            (try (cond
+                                   (contains? regoid/alias-oids (types/array-oid->element-oid oid))
                                    (pg-arr/from-pg-text v (types/oid->elem-kw (types/array-oid->element-oid oid)))
-                                   (input/parse oid v))
+
+                                   (contains? #{types/oid-timestamp types/oid-timestamptz} oid)
+                                   (sql-cast/cast-scalar v (types/oid->pg-name oid)
+                                                         {:prefer-local-datetime? true})
+
+                                   :else (input/parse oid v))
                                  (catch clojure.lang.ExceptionInfo e
                                    (let [[code message fields] (errors/classify-exception e)]
                                      (throw (PgWireServer$PgProtocolException.
@@ -12347,6 +12351,7 @@
                            (types/encode-numeric-typmod precision scale))))
                      char-typmod (when-let [length (types/parse-char-length normalized)]
                                    (+ length 4))
+                     timestamp-typmod (types/parse-timestamp-precision normalized)
                      bit-typmod (some-> (types/parse-bit-length normalized) long)]
                  (assoc column
                         :attnum attnum
@@ -12356,7 +12361,7 @@
                         :type-object user-type
                         :type-oid (pgs/resolve-type-oid db type)
                         :typmod (or vector-typmod numeric-typmod
-                                    char-typmod bit-typmod))))
+                                    char-typmod timestamp-typmod bit-typmod))))
              (range) added-columns)
             add-spec-by-name (into {} (map (juxt :name identity)) added-column-specs)
             _ (doseq [{:keys [op columns]} operations]

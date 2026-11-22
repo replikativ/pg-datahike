@@ -309,10 +309,10 @@
    "boolean"           :db.type/boolean
    "bool"              :db.type/boolean
    ;; Date/time
-   "timestamp"         :db.type/instant
-   "timestamp without time zone" :db.type/instant
-   "timestamp with time zone"    :db.type/instant
-   "timestamptz"       :db.type/instant
+   "timestamp"         :db.type/string
+   "timestamp without time zone" :db.type/string
+   "timestamp with time zone"    :db.type/string
+   "timestamptz"       :db.type/string
    "date"              :db.type/instant
    ;; time-of-day: store the normalized text (a bare time can't be a
    ;; java.util.Date/Instant, and parse-timestamp-string rejects it).
@@ -1308,6 +1308,25 @@
       unquote-type-name
       str/lower-case))
 
+(defn timestamp-type?
+  "Whether a SQL type names a scalar timestamp, with or without a time zone."
+  [type-name]
+  (contains? #{"timestamp" "timestamptz" "timestamp without time zone" "timestamp with time zone"}
+             (base-type-name-of type-name)))
+
+(defn precise-timestamp-column?
+  "SQL timestamp columns that store lossless text. Legacy instant attributes
+   keep their original Datahike value type."
+  [value-type pg-type]
+  (and (= :db.type/string value-type) (timestamp-type? pg-type)))
+
+(defn parse-timestamp-precision
+  "Return the declared precision of a timestamp type, if it has one."
+  [type-name]
+  (when (timestamp-type? type-name)
+    (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-name))
+            second parse-long (min 6))))
+
 (defn parse-char-length
   "The `n` of `varchar(n)` / `char(n)`, or nil for an unmodified text
    type. Only the length-carrying names qualify -- `text` has no limit."
@@ -1995,10 +2014,9 @@
    in the JVM's default time zone and locale -- all of which reached
    clients at one time or another.
 
-   `src-oid` disambiguates what the value's class cannot: Datahike has only
-   :db.type/instant, so `date`, `timestamp` and `timestamptz` columns all
-   arrive as java.util.Date at UTC. Absent a hint an instant renders as a
-   timestamp, the wider form that loses no information."
+   `src-oid` disambiguates legacy instant-backed columns. A java.util.Date
+   may represent a date, a wall-clock timestamp or an absolute instant.
+   Absent a hint, it renders as a wall-clock timestamp."
   ([v] (temporal->pg-text v nil))
   ([v src-oid]
    (cond

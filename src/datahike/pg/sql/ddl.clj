@@ -1120,6 +1120,7 @@
                                  (let [[p s] (types/parse-numeric-args raw-type)]
                                    (when (or p s)
                                      (types/encode-numeric-typmod p s))))
+                               timestamp-typmod (when-not array-spec (types/parse-timestamp-precision raw-type))
                                ;; varchar(n) / char(n): the declared
                                ;; length was dropped entirely, so the
                                ;; column reported as plain `text` with no
@@ -1212,6 +1213,7 @@
                                          ;; (count returns int).
                                          :pg/array-ndim  (long (:ndim array-spec)))
                        numeric-typmod (assoc :pg/typmod numeric-typmod)
+                       timestamp-typmod (assoc :pg/typmod timestamp-typmod)
                        char-typmod (assoc :pg/typmod char-typmod)
                        bit-typmod (assoc :pg/typmod bit-typmod)
                        vector-typmod (assoc :pg/typmod vector-typmod)

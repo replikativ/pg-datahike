@@ -689,8 +689,11 @@
    for any further normalisation."
   [^String raw attr schema]
   (let [vtype (get-in schema [attr :db/valueType])
+        pg-type (get-in schema [attr :pg/type])
         elem  (get-in schema [attr :pg/array-elem])]
     (cond
+      ;; The assignment path applies the timestamp typmod and keeps microseconds.
+      (types/precise-timestamp-column? vtype pg-type) raw
       ;; Native PG-array column — pass the raw text through; the array
       ;; column path in coerce-insert-value will parse it.
       (some? elem) raw
