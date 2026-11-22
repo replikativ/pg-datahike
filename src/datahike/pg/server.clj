@@ -1203,7 +1203,7 @@
          ;; fn is tagged ^:datahike.pg/fresh-insert: it throws or emits the
          ;; payload as fresh entities, so it writes NO existing rows —
          ;; attribute it as the empty set. Untagged tx-fns stay opaque.
-              :db.fn/call
+              (:db.fn/call :db.fn/call-with-tempids)
               (if (:datahike.pg/fresh-insert (meta (nth item 1 nil)))
                 acc
                 (reduced ::opaque))
@@ -2416,7 +2416,7 @@
                  #(row-constraints/compile-constraint-metadata
                    (cached-row-constraint-metadata db table-name))))
 
-(defn- apply-column-constraints
+(defn- column-constraint-operations
   "Wrap an INSERT tx-data vector in a :db.fn/call that validates
    every incoming entity against the table's registered constraints:
 
@@ -2435,59 +2435,123 @@
    Non-map items (retract ops, prior :db.fn/call wrappers) pass
    through unchanged. Sequence defaults have already been reserved against
    the live connection before this function checks their resulting values."
-  [tx-data table-name ns db]
-  (let [constraint-plan
-        (row-constraint-plan db table-name)
-        explicit-nulls? (some (fn [entry]
+  [tx-data table-name constraint-plan]
+  (let [explicit-nulls? (some (fn [entry]
                                 (and (map? entry) (some nil? (vals entry))))
                               tx-data)]
-    (guard-catalog-tx
-     (if-not (row-constraints/plan-required? constraint-plan explicit-nulls?)
-       tx-data
-       [[:db.fn/call
+    (if-not (row-constraints/plan-required? constraint-plan explicit-nulls?)
+      tx-data
+      [[:db.fn/call
         ;; fresh-insert-fn: conflict attribution treats this as writing no
         ;; existing rows — it emits the payload as fresh entities (or raises).
         ;; Sequence reservations have already committed independently through
         ;; nextval markers, so this transaction never writes their counters.
-         (fresh-insert-fn
-          (fn [txdb]
-            (let [input-tx-data tx-data
-                  result (reduce
-                          (fn [acc entry]
-                            (if-not (map? entry)
-                              (conj acc entry)
-                              (let [{:keys [attrs]}
-                                    (row-constraints/prepare-candidate
-                                     entry constraint-plan
-                                     (fn [value attr]
-                                       (#'stmt/coerce-insert-value
-                                        value attr (dbi/-schema txdb) txdb)))]
-                                (conj acc attrs))))
-                          []
-                          input-tx-data)
+        (fresh-insert-fn
+         (fn [txdb]
+           (let [input-tx-data tx-data
+                 result (reduce
+                         (fn [acc entry]
+                           (if-not (map? entry)
+                             (conj acc entry)
+                             (let [{:keys [attrs]}
+                                   (row-constraints/prepare-candidate
+                                    entry constraint-plan
+                                    (fn [value attr]
+                                      (#'stmt/coerce-insert-value
+                                       value attr (dbi/-schema txdb) txdb)))]
+                               (conj acc attrs))))
+                         []
+                         input-tx-data)
                 ;; Second pass — CHECK + FK enforcement sees the final
                 ;; entity maps (post-default, post-identity). Only map
                 ;; entries count as rows; :db/add tuples from sequence
                 ;; bumps etc. don't.
-                  filled-entities (filterv map? result)
-                  effective-rows (into {}
-                                       (keep (fn [row]
-                                               (when-let [id (:db/id row)] [id row])))
-                                       filled-entities)]
-              (doseq [em filled-entities]
-                (row-constraints/validate-mutation!
-                 txdb table-name em constraint-plan effective-rows
-                 (row-eval/check-fn txdb)
-                 nil))
+                 filled-entities (filterv map? result)
+                 effective-rows (into {}
+                                      (keep (fn [row]
+                                              (when-let [id (:db/id row)] [id row])))
+                                      filled-entities)]
+             (doseq [em filled-entities]
+               (row-constraints/validate-mutation!
+                txdb table-name em constraint-plan effective-rows
+                (row-eval/check-fn txdb)
+                nil))
              ;; Datahike represents SQL NULL as an absent datom.  Nil map
              ;; entries existed only long enough to distinguish explicit
              ;; NULL from an omitted/defaulted column above.
-              (mapv (fn [entry]
-                      (if (map? entry)
-                        (into {} (remove (comp nil? val)) entry)
-                        entry))
-                    result))))]])
-     (or *statement-catalog-basis* (catalog-basis/capture db)))))
+             (mapv (fn [entry]
+                     (if (map? entry)
+                       (into {} (remove (comp nil? val)) entry)
+                       entry))
+                   result))))]])))
+
+(defn- apply-column-constraints [tx-data table-name db]
+  (guard-catalog-tx
+   (column-constraint-operations tx-data table-name
+                                 (row-constraint-plan db table-name))
+   (or *statement-catalog-basis* (catalog-basis/capture db))))
+
+(defn- rewrite-insert-entity-ids
+  [operations resolve-id]
+  (letfn [(resolve-row [row]
+            (reduce-kv (fn [row attr value]
+                         (if-let [eid (resolve-id attr value)]
+                           (assoc row attr eid)
+                           row))
+                       row row))]
+    (mapv (fn [operation]
+            (cond
+              (map? operation)
+              (resolve-row operation)
+
+              (and (vector? operation)
+                   (#{:db/add :db/retract} (first operation)))
+              (let [[_ eid attr value] operation
+                    entity-id (resolve-id :db/id eid)
+                    reference-id (resolve-id attr value)]
+                (cond-> operation
+                  entity-id (assoc 1 entity-id)
+                  reference-id (assoc 3 reference-id)))
+
+              (and (vector? operation)
+                   (= :db.fn/call (first operation))
+                   (:datahike.pg/insert-unique-check (meta (second operation))))
+              (update operation 2 #(mapv resolve-row %))
+
+              :else operation))
+          operations)))
+
+(defn- replay-insert-ids
+  "Resolve references to rows from earlier SQL statements using the
+   writer's tempid assignments. Build the uniqueness and constraint checks
+   after resolution so they inspect the same values as the row writes."
+  [db eid->tempid constraint-plan operations build-operations fresh?]
+  (when (and (seq eid->tempid)
+             ;; Fresh rows only carry provisional IDs as native refs.
+             ;; Materialized upserts can also write to a provisional row.
+             (or (not fresh?)
+                 (some #(dbu/ref? db (:attr %)) (:columns constraint-plan))))
+    (let [bindings (volatile! {})]
+      (rewrite-insert-entity-ids
+       operations
+       (fn [attr eid]
+         (when-let [tempid (get eid->tempid eid)]
+           (when (or (= :db/id attr) (dbu/ref? db attr))
+             (vswap! bindings assoc [attr eid] tempid)))
+         nil))
+      (when (seq @bindings)
+        (let [tempid-by-operand @bindings
+              replay (fn [_ tempids]
+                       (build-operations
+                        (rewrite-insert-entity-ids
+                         operations
+                         (fn [attr eid]
+                           (when-let [tempid (get tempid-by-operand [attr eid])]
+                             (or (get tempids tempid)
+                                 (throw (errors/pg-error
+                                         :serialization-failure))))))))]
+          [:db.fn/call-with-tempids
+           (if fresh? (fresh-insert-fn replay) replay)])))))
 
 (defn- single-insert-candidate-tx-data
   "Project a translated INSERT onto one already materialized candidate.
@@ -3383,7 +3447,7 @@
           fired (fire-row-triggers db table-name (:tx-data prepared) :insert)
           parsed (note-suppressed parsed (:tx-data prepared) fired)
           tx-data (-> fired
-                      (apply-column-constraints table-name (:ns parsed) db)
+                      (apply-column-constraints table-name db)
                       (guard-materialized-upsert parsed)
                       tx-wrap)
           returning (:returning parsed)
@@ -9679,12 +9743,23 @@
               final-base (if reservation-only-advance?
                            durable-db
                            post-reservation-spec-db)
-              tx-data (apply-column-constraints
-                       (:tx-data prepared) table-name (:ns parsed) final-base)
-              tx-data (guard-materialized-upsert tx-data parsed)
-              spec-report (dc/with final-base tx-data)
+              constraint-plan (row-constraint-plan final-base table-name)
+              constrain #(column-constraint-operations % table-name constraint-plan)
+              expected-catalog (or *statement-catalog-basis*
+                                   (catalog-basis/capture final-base))
+              tx-data (guard-catalog-tx (constrain (:tx-data prepared))
+                                        expected-catalog)
+              spec-report (dc/with final-base (guard-materialized-upsert tx-data parsed))
               _ (unique-constraints/validate-report! spec-report)
               _ (restore-prepared-insert-outcome! parsed prepared)
+              replay (replay-insert-ids final-base (:eid->tempid @tx-state)
+                                        constraint-plan (:tx-data prepared) constrain
+                                        (= :plain (:insert-mode parsed)))
+              commit-tx-data (guard-materialized-upsert
+                              (if replay
+                                (guard-catalog-tx [replay] expected-catalog)
+                                tx-data)
+                              parsed)
               new-tempids (into {} (keep (fn [[tid eid]] (when (string? tid) [eid tid])))
                                 (:tempids spec-report))
               db-after (:db-after spec-report)
@@ -9728,7 +9803,7 @@
           ;; Publish the speculative write only after RETURNING succeeds.
           (swap! tx-state (fn [ts]
                             (-> ts
-                                (update :tx-buffer into tx-data)
+                                (update :tx-buffer into commit-tx-data)
                                 (assoc :speculative-db db-after)
                                 (cond-> reservation-only-advance?
                                   (assoc :begin-max-tx (:max-tx durable-db)))
@@ -14186,6 +14261,22 @@
             params/*cancel* (:cancel copy-session)]
     (f)))
 
+(defn- copy-write-operations
+  [table unique-plan column-plan rows]
+  (when (seq rows)
+    ;; COPY has INSERT semantics even when Datahike would upsert on a
+    ;; unique identity. Check the keys against the writer's DB first.
+    (into [[:db.fn/call
+            (fresh-insert-fn
+             (fn [txdb]
+               (let [specs (plain-unique-specs txdb table unique-plan)]
+                 (reduce (fn [seen row]
+                           (validate-plain-candidate-unique!
+                            txdb table specs seen row))
+                         #{} rows))
+               []))]]
+          (column-constraint-operations rows table column-plan))))
+
 (defn- publish-copy!
   "Publish a completely validated COPY exactly once.
 
@@ -14193,7 +14284,7 @@
    rows join the ordinary speculative database and commit buffer, so later
    statements see them and ROLLBACK discards them."
   [{:keys [conn copy-state tx-state]}]
-  (let [{:keys [tx-data table ns catalog-basis speculative-db tempids
+  (let [{:keys [tx-data table catalog-basis speculative-db tempids
                 constraint-plan]} @copy-state
         ;; PostgreSQL implements immediate FKs as queued AFTER ROW triggers
         ;; and drains them after COPY has consumed the input.  Checking here,
@@ -14204,31 +14295,13 @@
              speculative-db table row constraint-plan {}
              (row-eval/check-fn speculative-db)
              nil))
-        constrained-tx-data
-        (binding [*statement-catalog-basis* catalog-basis]
-          (apply-column-constraints tx-data table ns speculative-db))
-        ;; A string tempid plus :db.unique/identity is an upsert in Datahike.
-        ;; COPY is PostgreSQL INSERT semantics, so recheck every native and
-        ;; catalog key at writer time before any candidate map can silently
-        ;; resolve onto a concurrently inserted entity.
-        unique-guard
-        [:db.fn/call
-         (fresh-insert-fn
-          (fn [txdb]
-            (let [specs (plain-unique-specs txdb table constraint-plan)]
-              (reduce (fn [seen row]
-                        (validate-plain-candidate-unique!
-                         txdb table specs seen row))
-                      #{} tx-data))
-            []))]
-        commit-tx-data
-        (if (seq tx-data)
-          ;; apply-column-constraints puts the catalog guard first. Keep it
-          ;; first, then uniqueness admission, then the constraint/materialized
-          ;; row payload.
-          (into [(first constrained-tx-data) unique-guard]
-                (rest constrained-tx-data))
-          constrained-tx-data)]
+        column-plan (row-constraint-plan speculative-db table)
+        build-operations #(copy-write-operations table constraint-plan column-plan %)
+        replay (replay-insert-ids speculative-db (:eid->tempid @tx-state)
+                                  column-plan tx-data build-operations true)
+        commit-tx-data (guard-catalog-tx
+                        (if replay [replay] (build-operations tx-data))
+                        catalog-basis)]
     ;; Constraint/default work above can itself be substantial for a large
     ;; statement. Recheck immediately before the one visible publication.
     (check-copy-interrupt! @copy-state)

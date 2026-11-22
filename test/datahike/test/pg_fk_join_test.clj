@@ -9,7 +9,10 @@
             [datahike.api :as d]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager SQLException Statement]))
+  (:import [java.io StringReader]
+           [java.sql Connection DriverManager SQLException Statement]
+           [org.postgresql PGConnection]
+           [org.postgresql.copy CopyManager]))
 
 (def ^:dynamic *conn* nil)
 (def ^:dynamic *port* nil)
@@ -171,6 +174,52 @@
       (is (= [["1" "10"]]
              (pairs a (str "SELECT d.id, t.id FROM replay_doc d JOIN replay_target t "
                            "ON d.link = t.db_id WHERE d.id = 1")))))))
+
+(deftest insert-and-copy-resolve-native-reference-keys-on-the-writer
+  (d/transact *conn* [{:db/ident :replay_doc/id :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}
+                      {:db/ident :replay_doc/link :db/valueType :db.type/ref
+                       :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                      {:db/ident :replay_doc/input_id :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}
+                      {:db/ident :replay_target/id :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}])
+  (doseq [[operation target-id decoy-id] [[:insert 10 20] [:copy 30 40]]]
+    (testing (name operation)
+      (with-open [a (jdbc)
+                  b (jdbc)
+                  sa (.createStatement a)
+                  sb (.createStatement b)]
+        (.execute sa "BEGIN")
+        (.executeUpdate sa (str "INSERT INTO replay_target (id) VALUES (" target-id ")"))
+        (let [provisional-id
+              (with-open [rows (.executeQuery sa (str "SELECT db_id FROM replay_target WHERE id = " target-id))]
+                (.next rows)
+                (.getLong rows 1))]
+          (case operation
+            :insert
+            (is (= 1 (.executeUpdate sa (str "INSERT INTO replay_doc VALUES ("
+                                             target-id "," provisional-id "," provisional-id ")"))))
+            :copy
+            (let [manager (CopyManager. (.unwrap a PGConnection))]
+              (with-open [input (StringReader. (str target-id "\t" provisional-id "\t" provisional-id "\n"))]
+                (is (= 1 (.copyIn manager "COPY replay_doc (id, link, input_id) FROM STDIN" input))))))
+          ;; The decoy occupies the original entity ID and uses it as a
+          ;; unique reference key. A check against the stale key would
+          ;; reject the original INSERT or COPY instead of replaying it.
+          (.executeUpdate sb (str "INSERT INTO replay_target (id) VALUES (" decoy-id ")"))
+          (is (= [(str decoy-id)]
+                 (mapv first (pairs b (str "SELECT id, db_id FROM replay_target WHERE db_id = " provisional-id)))))
+          (.executeUpdate sb (str "INSERT INTO replay_doc VALUES (" decoy-id "," provisional-id ",0)"))
+          (.execute sa "COMMIT")
+          (is (= #{[target-id target-id provisional-id] [decoy-id decoy-id 0]}
+                 (d/q '[:find ?id ?linked-id ?input-id
+                        :in $ [?id ...]
+                        :where [?doc :replay_doc/id ?id]
+                        [?doc :replay_doc/link ?link]
+                        [?doc :replay_doc/input_id ?input-id]
+                        [?link :replay_target/id ?linked-id]]
+                      (d/db *conn*) [target-id decoy-id]))))))))
 
 (defn- statement-state [^Statement statement sql]
   (try
