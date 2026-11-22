@@ -14,9 +14,10 @@
            [org.postgresql PGConnection]))
 
 (def ^:private schema-ddl
-  [(str "CREATE TABLE probe_parent (tenant integer, id bigint, label text, payload text, "
+  [(str "CREATE TABLE probe_parent (tenant integer, id bigint, label varchar(40), payload text, "
         "PRIMARY KEY (tenant, id) INCLUDE (label))")
    (str "CREATE TABLE probe_child (id integer PRIMARY KEY, tenant integer, parent_id bigint, note text, "
+        "amount numeric(12,3) DEFAULT 3.14159, bucket numeric(8,-2), "
         "FOREIGN KEY (tenant, parent_id) REFERENCES probe_parent(tenant, id) ON DELETE CASCADE)")])
 
 (defn- check! [condition message data]
@@ -37,7 +38,7 @@
 
 (defn- fixture-rows [conn]
   [(rows conn "SELECT tenant, id, label, payload FROM probe_parent ORDER BY tenant, id")
-   (rows conn "SELECT id, tenant, parent_id, note FROM probe_child ORDER BY id")])
+   (rows conn "SELECT id, tenant, parent_id, note, amount, bucket FROM probe_child ORDER BY id")])
 
 (defn- literal [value]
   (str "'" (str/replace value "'" "''") "'"))
@@ -137,6 +138,44 @@
         (:end-lsn (#'mirror/checkpoint handler)))
       (finally (d/release conn)))))
 
+(defn- check-admission! [source config]
+  (sql! source
+        "CREATE TABLE probe_unhandled (id integer PRIMARY KEY, observed timestamptz, payload jsonb)"
+        "CREATE TABLE probe_no_key (note text)"
+        "ALTER TABLE probe_no_key REPLICA IDENTITY FULL"
+        "CREATE TABLE probe_no_columns ()"
+        "CREATE PUBLICATION probe_empty"
+        (str "CREATE PUBLICATION probe_incompatible FOR TABLE "
+             "probe_unhandled (id, observed) WHERE (id > 0), probe_no_key, probe_no_columns "
+             "WITH (publish = 'insert')"))
+  (let [report #(mirror/publication-report (assoc config :publication %))
+        slots-before (rows source "SELECT slot_name FROM pg_replication_slots WHERE database = current_database()")
+        incompatible (report "probe_incompatible")
+        issues (into {} (map (fn [table] [(:name table) (set (map (juxt :reason :column) (:issues table)))]))
+                     (:tables incompatible))]
+    (check! (= [{:reason :publication-not-found}] (:issues (report "probe_absent")))
+            "Missing publication was not reported" {})
+    (check! (= [{:reason :empty-publication}] (:issues (report "probe_empty")))
+            "Empty publication was not reported" {})
+    (check! (= [{:reason :disabled-operations :operations [:update :delete :truncate]}] (:issues incompatible))
+            "Incomplete publication operations were not reported" incompatible)
+    (check! (= {"probe_unhandled" #{[:row-filter nil] [:type "observed"]
+                                    [:unpublished-column "payload"] [:type "payload"]}
+                "probe_no_key" #{[:replica-identity nil] [:missing-immediate-primary-key nil]}
+                "probe_no_columns" #{[:no-columns nil] [:missing-immediate-primary-key nil]}}
+               issues)
+            "The catalog check omitted an incompatible table or column" incompatible)
+    (check! (not (:compatible? incompatible)) "Incompatible publication was admitted" incompatible)
+    (check! (:compatible? (report "mirror_pub")) "Publication with common type modifiers was rejected" {})
+    (check! (= slots-before (rows source "SELECT slot_name FROM pg_replication_slots WHERE database = current_database()"))
+            "The catalog check created a slot" {})))
+
+(defn- column-modifiers [conn]
+  (rows conn (str "SELECT c.relname, a.attname, a.atttypmod "
+                  "FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+                  "WHERE c.relname IN ('probe_parent', 'probe_child') "
+                  "AND a.attname IN ('label', 'amount', 'bucket') ORDER BY c.relname, a.attname")))
+
 (defn run-probe!
   "Exercise initial snapshot, PostgreSQL row parity, SQL read-only enforcement,
    reconnect, crash replay, history, schema drift and lost slot detection."
@@ -157,8 +196,9 @@
               "INSERT INTO probe_parent SELECT 1, 1, 'before', string_agg(md5(i::text), '' ORDER BY i) FROM generate_series(1, 1000) i"
               "INSERT INTO probe_parent VALUES (1, 2, 'delete me', NULL)"
               "INSERT INTO probe_child VALUES (10, 1, 1, 'keep'), (20, 1, 2, 'cascade')"
-              "CREATE PUBLICATION mirror_pub FOR TABLE probe_parent, probe_child"
-              (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
+              "CREATE PUBLICATION mirror_pub FOR TABLE probe_parent, probe_child")
+        (check-admission! source config)
+        (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
         (sql! reference (str "CREATE SUBSCRIPTION mirror_native CONNECTION " (literal source-conninfo)
                              " PUBLICATION mirror_pub WITH (create_slot = false, slot_name = "
                              (literal native-slot) ")"))
@@ -183,7 +223,7 @@
                        "INSERT INTO probe_parent VALUES (1, 90, 'rolled back', NULL)"
                        "ROLLBACK" "BEGIN"
                        "UPDATE probe_parent SET label = 'during copy' WHERE tenant = 1 AND id = 1"
-                       "UPDATE probe_child SET id = 11 WHERE id = 10"
+                       "UPDATE probe_child SET id = 11, amount = 6.626571, bucket = 1234 WHERE id = 10"
                        "INSERT INTO probe_child VALUES (12, 1, 1, NULL)"
                        "DELETE FROM probe_parent WHERE tenant = 1 AND id = 2"
                        "COMMIT"))
@@ -196,6 +236,9 @@
         (let [{:keys [slot]} (mirror/status @subscriber)]
           (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
             (check-rows! source reference sink)
+            (check! (= (column-modifiers source) (column-modifiers sink))
+                    "Mirror metadata changed the source type modifiers"
+                    {:source (column-modifiers source) :mirror (column-modifiers sink)})
             (check-read-only! sink)
             (let [[pid] (slot-query source slot "active_pid")]
               (sql! source (str "SELECT pg_terminate_backend(" pid ")"))

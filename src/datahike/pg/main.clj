@@ -177,8 +177,9 @@
   (println)
   (println dump-help-text)
   (println)
-  (println "java -jar pg-datahike-VERSION-standalone.jar mirror CONFIG.edn")
-  (println "Start a read-only mirror of a PostgreSQL 18 publication."))
+  (println "java -jar pg-datahike-VERSION-standalone.jar mirror [--check] CONFIG.edn")
+  (println "Start a read-only mirror of a PostgreSQL 18 publication.")
+  (println "Use --check to report incompatible publication tables before starting."))
 
 ;; ----------------------------------------------------------------------------
 ;; Template + pre-create

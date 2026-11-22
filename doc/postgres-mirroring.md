@@ -42,6 +42,20 @@ store. One worker owns the store and a generated permanent `pgoutput` slot.
 The SQL listener opens after snapshot copy and catch-up. Client writes return
 SQLSTATE `25006`.
 
+## Check a publication
+
+Use the same source URL and publication as the mirror configuration to inspect
+compatibility before creating a replication slot or a local store.
+
+```bash
+java -jar pg-datahike-standalone.jar mirror --check mirror.edn
+```
+
+The command prints an EDN report with publication-wide issues and the
+specific rules and columns that block each table. It exits with status 1 for
+an incompatible publication. Embedded callers can use
+`datahike.pg.mirror/publication-report` with `:source-url` and `:publication`.
+
 ## Supported publications
 
 This version accepts whole, unfiltered, permanent tables with a single or
@@ -52,8 +66,9 @@ and preserves their transaction boundaries using the normal Datahike writer.
 Source DDL, generated columns, sequence counters, partitioning, inheritance, and
 row filters or column projections require separate handling.
 
-Supported column types without modifiers are boolean, smallint, integer, bigint,
-text, varchar, real, double precision, numeric, uuid, and date. Timestamp
+Supported column types are boolean, smallint, integer, bigint, text, varchar,
+real, double precision, numeric, uuid, and date. The subscriber preserves
+`varchar(n)` and `numeric(p,s)` modifiers. Timestamp
 columns require a storage carrier that preserves PostgreSQL microseconds.
 Choose a fixed publication and coordinate schema changes with the
 mirror operator. The worker checks publication membership and relation

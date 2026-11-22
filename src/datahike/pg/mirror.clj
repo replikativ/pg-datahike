@@ -4,7 +4,8 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.types :as types])
   (:import [datahike.pg PgWireServer PgWireServer$QueryHandler PgWireServer$QueryResult]
            [java.io ByteArrayOutputStream]
            [java.nio ByteBuffer]
@@ -84,59 +85,118 @@
       {:system-id (.getString result "systemid")
        :timeline (.getInt result "timeline") :database database :database-oid database-oid})))
 
-(defn- publication-manifest [source publication]
-  (let [[oid all-inserts? all-updates? all-deletes? all-truncates?]
-        (first (query source
-                      (str "SELECT oid, pubinsert, pubupdate, pubdelete, pubtruncate "
-                           "FROM pg_publication WHERE pubname = ?")
-                      [publication]
-                      (fn [^ResultSet r]
-                        (into [(.getLong r 1)] (map #(.getBoolean r (int %))) (range 2 6)))))
-        rows (query source
-                    (str "SELECT p.schemaname, p.tablename, c.oid, p.rowfilter, "
+(defn- column-ddl-type [{:keys [oid typmod]}]
+  (let [base (sql-types oid)]
+    (cond
+      (= -1 typmod) base
+      (and (= 1043 oid) (> typmod types/var-hdr-sz))
+      (str base "(" (- typmod types/var-hdr-sz) ")")
+      (= 1700 oid)
+      (let [[precision scale] (types/decode-numeric-typmod typmod)]
+        (when (and precision (<= 1 precision 1000) (<= -1000 scale 1000))
+          (str base "(" precision "," scale ")"))))))
+
+(defn- read-publication-row [^ResultSet row]
+  (let [schema (.getString row "schemaname")
+        relation (when schema
+                   {:schema schema :name (.getString row "tablename")
+                    :relation-id (.getLong row "relation_id")})
+        column-name (.getString row "attname")
+        column (when column-name
+                 {:name column-name :oid (.getLong row "atttypid")
+                  :typmod (.getInt row "atttypmod") :key? (.getBoolean row "is_key")})]
+    {:publication-oid (.getLong row "publication_oid")
+     :operations {:insert (.getBoolean row "pubinsert") :update (.getBoolean row "pubupdate")
+                  :delete (.getBoolean row "pubdelete") :truncate (.getBoolean row "pubtruncate")}
+     :relation relation
+     :table-issues
+     (when relation
+       (cond-> []
+         (= "pgdh_mirror" schema) (conj {:reason :reserved-schema})
+         (.getBoolean row "has_filter") (conj {:reason :row-filter})
+         (or (.getBoolean row "relispartition") (= "p" (.getString row "relkind")))
+         (conj {:reason :partitioning})
+         (not (#{"r" "p"} (.getString row "relkind"))) (conj {:reason :relation-kind})
+         (not= "p" (.getString row "relpersistence")) (conj {:reason :nonpermanent-table})
+         (not= "d" (.getString row "relreplident"))
+         (conj {:reason :replica-identity :mode (.getString row "relreplident")})
+         (.getBoolean row "has_inheritance") (conj {:reason :inheritance})
+         (.getBoolean row "has_row_security") (conj {:reason :row-security})))
+     :column column
+     :column-issues
+     (when column
+       (let [source-type (.getString row "source_type")]
+         (mapv #(assoc % :column column-name :source-type source-type)
+               (cond-> []
+                 (not= "" (.getString row "attgenerated")) (conj {:reason :generated-column})
+                 (not (.getBoolean row "is_published")) (conj {:reason :unpublished-column})
+                 (not (.getBoolean row "can_select")) (conj {:reason :missing-select})
+                 (not (contains? sql-types (:oid column))) (conj {:reason :type :oid (:oid column)})
+                 (and (contains? sql-types (:oid column)) (nil? (column-ddl-type column)))
+                 (conj {:reason :type-modifier :typmod (:typmod column)})))))}))
+
+(defn- scan-publication [source publication]
+  (let [rows (query source
+                    (str "SELECT pub.oid AS publication_oid, pub.pubinsert, pub.pubupdate, pub.pubdelete, pub.pubtruncate, "
+                         "       p.schemaname, p.tablename, c.oid AS relation_id, p.rowfilter IS NOT NULL AS has_filter, "
                          "       c.relkind, c.relpersistence, c.relreplident, c.relispartition, "
+                         "       pg_catalog.row_security_active(c.oid) AS has_row_security, "
+                         "       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits "
+                         "               WHERE inhrelid = c.oid OR inhparent = c.oid) AS has_inheritance, "
                          "       a.attname, a.atttypid, a.atttypmod, a.attgenerated, "
-                         "       a.attname = ANY(p.attnames), "
-                         "       NOT EXISTS (SELECT 1 FROM pg_inherits "
-                         "                   WHERE inhrelid = c.oid OR inhparent = c.oid), "
-                         "       EXISTS (SELECT 1 FROM pg_index i "
+                         "       pg_catalog.format_type(a.atttypid, a.atttypmod) AS source_type, "
+                         "       a.attname = ANY(p.attnames) AS is_published, "
+                         "       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') AS can_select, "
+                         "       EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
                          "               CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, pos) "
                          "               WHERE i.indrelid = c.oid AND i.indisprimary AND i.indimmediate "
-                         "               AND i.indisvalid AND k.pos <= i.indnkeyatts AND k.attnum = a.attnum) "
-                         "FROM pg_publication_tables p "
-                         "JOIN pg_namespace n ON n.nspname = p.schemaname "
-                         "JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename "
-                         "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
-                         "WHERE p.pubname = ? ORDER BY p.schemaname, p.tablename, a.attnum")
-                    [publication]
-                    (fn [^ResultSet r]
-                      {:relation {:schema (.getString r 1) :name (.getString r 2) :relation-id (.getLong r 3)}
-                       :supported? (and (nil? (.getString r 4))
-                                        (= "r" (.getString r 5))
-                                        (= "p" (.getString r 6))
-                                        (= "d" (.getString r 7))
-                                        (not (.getBoolean r 8))
-                                        (= "" (.getString r 12))
-                                        (.getBoolean r 13)
-                                        (.getBoolean r 14))
-                       :column {:name (.getString r 9) :oid (.getLong r 10) :typmod (.getInt r 11)
-                                :key? (.getBoolean r 15)}}))
-        tables (mapv (fn [columns]
-                       (let [relation (:relation (first columns))
-                             definitions (mapv :column columns)]
-                         (require! (and (not= "pgdh_mirror" (:schema relation))
-                                        (some :key? definitions)
-                                        (every? :supported? columns)
-                                        (every? #(and (contains? sql-types (:oid %))
-                                                      (= -1 (:typmod %))) definitions))
-                                   "Unsupported publication table, identity, or column type"
-                                   (assoc relation :columns definitions))
-                         (assoc relation :columns definitions)))
-                     (partition-by :relation rows))]
-    (require! (and oid (every? true? [all-inserts? all-updates? all-deletes? all-truncates?]) (seq tables))
-              "Expected a nonempty publication with INSERT, UPDATE, DELETE and TRUNCATE enabled"
-              {:publication publication})
-    {:publication-oid oid :tables tables}))
+                         "               AND i.indisvalid AND k.pos <= i.indnkeyatts AND k.attnum = a.attnum) AS is_key "
+                         "FROM pg_catalog.pg_publication pub "
+                         "LEFT JOIN pg_catalog.pg_publication_tables p ON p.pubname = pub.pubname "
+                         "LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname "
+                         "LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename "
+                         "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+                         "WHERE pub.pubname = ? ORDER BY p.schemaname, p.tablename, a.attnum")
+                    [publication] read-publication-row)
+        {:keys [publication-oid operations]} (first rows)
+        tables (mapv (fn [table-rows]
+                       (let [{:keys [relation table-issues]} (first table-rows)
+                             columns (into [] (keep :column) table-rows)
+                             issues (into table-issues (mapcat :column-issues) table-rows)]
+                         (assoc relation :columns columns
+                                :issues (cond-> issues
+                                          (empty? columns) (conj {:reason :no-columns})
+                                          (not-any? :key? columns) (conj {:reason :missing-immediate-primary-key})))))
+                     (partition-by :relation (filter :relation rows)))
+        disabled (into [] (remove #(get operations %)) [:insert :update :delete :truncate])
+        issues (cond
+                 (nil? publication-oid) [{:reason :publication-not-found}]
+                 :else (cond-> []
+                         (empty? tables) (conj {:reason :empty-publication})
+                         (seq disabled) (conj {:reason :disabled-operations :operations disabled})))]
+    {:publication publication :publication-oid publication-oid :issues issues :tables tables
+     :compatible? (and (empty? issues) (every? (comp empty? :issues) tables))}))
+
+(defn- publication-manifest [source publication]
+  (let [{:keys [publication-oid tables compatible?] :as report} (scan-publication source publication)]
+    (require! compatible? "Publication cannot be mirrored" {:report report})
+    {:publication-oid publication-oid :tables (mapv #(dissoc % :issues) tables)}))
+
+(defn- validate-source-options! [source-url publication]
+  (require! (and (string? source-url) (str/starts-with? source-url "jdbc:postgresql://")
+                 (string? publication) (re-matches #"[a-z_][a-z0-9_]{0,62}" publication))
+            "Expected a PostgreSQL source URL and publication name" {}))
+
+(defn publication-report
+  "Inspect a PostgreSQL 18 publication using only the source catalogs.
+   Returns publication-wide issues and the issues for every table."
+  [{:keys [source-url publication]}]
+  (validate-source-options! source-url publication)
+  (with-open [source (connect source-url false)]
+    (let [version (first (query source "SHOW server_version_num" [] #(.getInt ^ResultSet % 1)))]
+      (require! (and version (<= 180000 version 189999))
+                "Expected a PostgreSQL 18 publication database" {:version version})
+      (scan-publication source publication))))
 
 (defn- checked-result ^PgWireServer$QueryResult [^PgWireServer$QueryResult result]
   (when-let [error (.-error result)]
@@ -216,7 +276,7 @@
   (sink-execute!
    destination
    (str "CREATE TABLE " (relation-name table) " ("
-        (comma-list (map (fn [{:keys [name oid]}] (str (ident name) " " (sql-types oid))) columns))
+        (comma-list (map (fn [{:keys [name] :as column}] (str (ident name) " " (column-ddl-type column))) columns))
         ", PRIMARY KEY (" (comma-list (keep #(when (:key? %) (ident (:name %))) columns)) "))")))
 
 (defn- slot-info [source slot]
@@ -729,12 +789,11 @@
          max-snapshot-bytes (* 128 1024 1024)
          max-transaction-bytes (* 64 1024 1024)}
     :as config}]
-  (require! (and (string? source-url) (str/starts-with? source-url "jdbc:postgresql://")
-                 (string? publication) (re-matches #"[a-z_][a-z0-9_]{0,62}" publication)
-                 (string? slot-prefix) (re-matches #"[a-z0-9_]{1,30}" slot-prefix)
+  (validate-source-options! source-url publication)
+  (require! (and (string? slot-prefix) (re-matches #"[a-z0-9_]{1,30}" slot-prefix)
                  (string? store-path) (seq store-path)
                  (pos-int? max-snapshot-bytes) (pos-int? max-transaction-bytes))
-            "Expected a source URL, publication, store path, slot prefix and positive byte limits" {})
+            "Expected a store path, slot prefix and positive byte limits" {})
   (require! (and (or (nil? server) (map? server))
                  (not-any? #(get server %) [:database-template :on-create-database :on-delete-database]))
             "Mirror listeners do not support database provisioning" {})
@@ -773,12 +832,8 @@
   (.join worker)
   (status mirror))
 
-(defn -main [& [path]]
-  (require! path "Usage: clojure -M -m datahike.pg.mirror path-to-mirror.edn" {})
-  (let [config (cond-> (edn/read-string (slurp path))
-                 (System/getenv "PG_MIRROR_SOURCE_URL")
-                 (assoc :source-url (System/getenv "PG_MIRROR_SOURCE_URL")))
-        mirror (start! config)]
+(defn- run-mirror! [config]
+  (let [mirror (start! config)]
     (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable #(stop! mirror)))
     (loop [previous nil]
       (let [current (status mirror)]
@@ -787,3 +842,18 @@
                 (and (= :paused (:state current)) (nil? (:port current))))
           (do (stop! mirror) (System/exit 1))
           (do (Thread/sleep 1000) (recur current)))))))
+
+(defn -main [& args]
+  (let [check? (= "--check" (first args))
+        paths (if check? (rest args) args)]
+    (require! (= 1 (count paths))
+              "Usage: clojure -M -m datahike.pg.mirror [--check] path-to-mirror.edn" {})
+    (let [source-url (System/getenv "PG_MIRROR_SOURCE_URL")
+          config (cond-> (edn/read-string (slurp (first paths)))
+                   source-url (assoc :source-url source-url))]
+      (if check?
+        (let [report (publication-report config)]
+          (prn report)
+          (flush)
+          (when-not (:compatible? report) (System/exit 1)))
+        (run-mirror! config)))))
