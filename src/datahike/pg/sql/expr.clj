@@ -1059,6 +1059,19 @@
 
     :else nil))
 
+(defn- user-type-oid [ctx expr]
+  (let [db (:db ctx)
+        type (cond
+               (instance? CastExpression expr) (some-> ^CastExpression expr .getColDataType str)
+               (and db (instance? Column expr))
+               (let [resolved (ctx/resolve-column expr (:table-aliases ctx) (:default-table ctx)
+                                                  (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+                     attr (ctx/attr-of ctx resolved)
+                     entity (when attr (d/entity db attr))]
+                 (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))))]
+    (when type
+      (:datahike.pg.object/oid (pgs/user-type-object db type)))))
+
 (defn enum-spec-for-exprs [ctx exprs]
   "Return the registry spec for the first enum-typed SQL expression. Public
    for statement lowering, which must use the same type recovery for ORDER BY
@@ -1958,7 +1971,8 @@
             arg-oid (try
                       (if (and (oid-infer/untyped-literal? arg-expr)
                                (not (pg-bits/bit-string-literal? arg-expr))) 705
-                          (oid-infer/expr-oid arg-expr oid-env))
+                          (or (user-type-oid ctx arg-expr)
+                              (oid-infer/expr-oid arg-expr oid-env)))
                       (catch Throwable _ nil))
             type-oid (or arg-oid types/oid-text)
             fn-param (symbol (str "?pg-typeof" (swap! (:var-counter ctx) inc)))

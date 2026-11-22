@@ -74,6 +74,13 @@ and time and timestamp precision. Snapshot COPY and live apply preserve
 PostgreSQL microseconds, `24:00:00`, `timetz` offsets, and `text[]`
 lower bounds. Array support in the subscriber currently covers `text[]`.
 
+The subscriber also copies enums in `public` and domains in `public`
+over supported scalar built-in types without base type modifiers.
+Domains can have a default, `NOT NULL`, and one validated `CHECK`.
+The admission report identifies unsupported type definitions by column.
+The mirror installs type definitions with the tables or columns that use
+them. A change to an installed type definition pauses the mirror.
+
 ## Add tables to an active mirror
 
 Add supported tables to the publisher's publication. The worker detects the

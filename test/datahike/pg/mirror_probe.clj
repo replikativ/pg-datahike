@@ -14,7 +14,10 @@
            [org.postgresql PGConnection]))
 
 (def ^:private schema-ddl
-  [(str "CREATE TABLE probe_parent (tenant integer, id bigint, label varchar(40), payload text, "
+  ["CREATE TYPE probe_rating AS ENUM ('Unrated', 'G', 'PG-13', 'R', 'contains''quote')"
+   (str "CREATE DOMAIN probe_year AS integer DEFAULT 2001 NOT NULL "
+        "CONSTRAINT probe_year_range CHECK (VALUE >= 1901 AND VALUE <= 2155)")
+   (str "CREATE TABLE probe_parent (tenant integer, id bigint, label varchar(40), payload text, "
         "occurred timestamptz DEFAULT '2024-02-29 19:25:19.123456+05:30', "
         "PRIMARY KEY (tenant, id) INCLUDE (label))")
    (str "CREATE TABLE probe_child (id integer PRIMARY KEY, tenant integer, parent_id bigint, note text, "
@@ -26,7 +29,8 @@
         "observed timetz(6), wall time(3), fixed character(4), payload bytea, tags text[], lexemes tsvector)")
    (str "CREATE TABLE probe_type_keys (observed timetz(6), payload bytea, tags text[], "
         "attrs jsonb, fixed character(4), lexemes tsvector, label text, "
-        "PRIMARY KEY (observed, payload, tags, attrs, fixed, lexemes))")])
+        "rating probe_rating, released probe_year, "
+        "PRIMARY KEY (observed, payload, tags, attrs, fixed, lexemes, rating, released))")])
 
 (defn- check! [condition message data]
   (when-not condition (throw (ex-info message data))))
@@ -50,7 +54,7 @@
 
 (defn- type-key-rows [conn]
   (rows conn (str "SELECT observed::text, payload::text, tags::text, attrs::text, fixed::text, "
-                  "lexemes::text, label FROM probe_type_keys ORDER BY label")))
+                  "lexemes::text, label, rating::text, released::text FROM probe_type_keys ORDER BY label")))
 
 (defn- fixture-rows [conn]
   [(rows conn "SELECT tenant, id, label, payload, occurred::text FROM probe_parent ORDER BY tenant, id")
@@ -175,12 +179,14 @@
 (defn- check-admission! [source config]
   (sql! source
         "CREATE TABLE probe_unhandled (id integer PRIMARY KEY, observed inet, payload xml)"
+        "CREATE DOMAIN probe_multi_check AS integer CHECK (VALUE > 0) CHECK (VALUE < 42)"
+        "CREATE TABLE probe_unhandled_domain (id integer PRIMARY KEY, n probe_multi_check)"
         "CREATE TABLE probe_no_key (note text)"
         "ALTER TABLE probe_no_key REPLICA IDENTITY FULL"
         "CREATE TABLE probe_no_columns ()"
         "CREATE PUBLICATION probe_empty"
         (str "CREATE PUBLICATION probe_incompatible FOR TABLE "
-             "probe_unhandled (id, observed) WHERE (id > 0), probe_no_key, probe_no_columns "
+             "probe_unhandled (id, observed) WHERE (id > 0), probe_no_key, probe_no_columns, probe_unhandled_domain "
              "WITH (publish = 'insert')"))
   (let [report #(mirror/publication-report (assoc config :publication %))
         slots-before (rows source "SELECT slot_name FROM pg_replication_slots WHERE database = current_database()")
@@ -196,6 +202,7 @@
     (check! (= {"probe_unhandled" #{[:row-filter nil] [:type "observed"]
                                     [:unpublished-column "payload"] [:type "payload"]}
                 "probe_no_key" #{[:replica-identity nil] [:missing-immediate-primary-key nil]}
+                "probe_unhandled_domain" #{[:type-definition "n"]}
                 "probe_no_columns" #{[:no-columns nil] [:missing-immediate-primary-key nil]}}
                issues)
             "The catalog check omitted an incompatible table or column" incompatible)
@@ -220,6 +227,18 @@
   (rows conn (str "SELECT column_name, data_type, udt_name, datetime_precision, character_maximum_length, "
                   "character_octet_length FROM information_schema.columns WHERE table_name = 'probe_types' "
                   "AND column_name NOT IN ('id', 'db_id') ORDER BY column_name")))
+
+(defn- user-type-catalog [conn]
+  [(rows conn (str "SELECT column_name, data_type, udt_schema, udt_name, domain_schema, domain_name, is_nullable "
+                   "FROM information_schema.columns WHERE table_name = 'probe_type_keys' "
+                   "AND column_name IN ('rating', 'released') ORDER BY column_name"))
+   (rows conn (str "SELECT typname, typtype, COALESCE(typnotnull, false) FROM pg_type "
+                   "WHERE typname IN ('probe_year', 'probe_rating') ORDER BY typname"))
+   (rows conn "SELECT enumlabel FROM pg_enum WHERE enumtypid = 'probe_rating'::regtype ORDER BY enumsortorder")
+   (rows conn (str "SELECT conname FROM pg_constraint WHERE contypid = 'probe_year'::regtype "
+                   "AND contype = 'c' ORDER BY conname"))
+   (rows conn (str "SELECT pg_typeof(rating)::text, pg_typeof(released)::text "
+                   "FROM probe_type_keys ORDER BY label"))])
 
 (defn run-probe!
   "Exercise initial snapshot, PostgreSQL row parity, SQL read-only enforcement,
@@ -251,8 +270,9 @@
               (str "INSERT INTO probe_types (id, attrs, observed, wall, fixed, payload, tags, lexemes) VALUES "
                    "(2, 'null', '24:00:00+01:30:45', '23:59:59.999500', '', decode('','hex'), '{}', '')")
               (str "INSERT INTO probe_type_keys VALUES "
-                   "('14:00:00.123456+04', decode('00ff','hex'), '[0:1]={a,NULL}', '{\"num\":1.200}', 'a', 'cat:2 fox:1D', 'one'), "
-                   "('24:00:00+01:30:45', decode('','hex'), '{}', 'null', '雪', '', 'two')")
+                   "('14:00:00.123456+04', decode('00ff','hex'), '[0:1]={a,NULL}', '{\"num\":1.200}', "
+                   "'a', 'cat:2 fox:1D', 'one', 'Unrated', DEFAULT), "
+                   "('24:00:00+01:30:45', decode('','hex'), '{}', 'null', '雪', '', 'two', 'G', 1998)")
               "CREATE PUBLICATION mirror_pub FOR TABLE probe_parent, probe_child, probe_types, probe_type_keys")
         (check-admission! source config)
         (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
@@ -307,6 +327,9 @@
             (check! (= (type-catalog source) (type-catalog sink))
                     "The mirror catalog changed application type metadata"
                     {:source (type-catalog source) :mirror (type-catalog sink)})
+            (check! (= (user-type-catalog source) (user-type-catalog sink))
+                    "The mirror catalog changed enum or domain metadata"
+                    {:source (user-type-catalog source) :mirror (user-type-catalog sink)})
             (check-read-only! sink)
             (let [[pid] (slot-query source slot "active_pid")]
               (sql! source (str "SELECT pg_terminate_backend(" pid ")"))
@@ -335,7 +358,8 @@
                        "occurred = '2024-02-29 13:55:19.123457+00' WHERE tenant = 1 AND id = 1")
                   (str "UPDATE probe_types SET doc = ' [1, 2] ', attrs = '{\"changed\": [true, null, 2.00]}', "
                        "observed = '24:00:00+02', tags = ARRAY['', 'a'] WHERE id = 1")
-                  "UPDATE probe_type_keys SET observed = '14:00:00.123457+04' WHERE label = 'during copy'"
+                  (str "UPDATE probe_type_keys SET observed = '14:00:00.123457+04', rating = 'contains''quote', "
+                       "released = 1997 WHERE label = 'during copy'")
                   "DELETE FROM probe_type_keys WHERE label = 'two'"
                   "COMMIT")
             (let [apply-change #'mirror/apply-change!
@@ -573,20 +597,28 @@
    "ALTER TABLE schema_items ADD COLUMN aliases text[] DEFAULT ARRAY['initial']"
    "ALTER TABLE schema_items ADD COLUMN observed timetz(6) DEFAULT '14:30:00.123456+04'"
    "ALTER TABLE schema_items ADD COLUMN metadata jsonb DEFAULT '{\"defined\": true}'"
+   "CREATE TYPE schema_quality AS ENUM ('new', 'active', 'archived')"
+   "CREATE DOMAIN schema_year AS integer CHECK (VALUE >= 1901 AND VALUE <= 2155)"
+   "ALTER TABLE schema_items ADD COLUMN quality schema_quality DEFAULT 'new'"
+   "ALTER TABLE schema_items ADD COLUMN released schema_year DEFAULT 2020"
    "ALTER TABLE schema_meta ALTER COLUMN tag SET DEFAULT 'changed'"
    "COMMIT"])
 
 (defn- evolved-rows [conn]
   [(rows conn "SELECT id, label FROM schema_account ORDER BY id")
    (rows conn (str "SELECT id, summary, stamp::text, flag, tokens::text, aliases::text, observed::text, "
-                   "metadata::text FROM schema_items ORDER BY id"))
+                   "metadata::text, quality::text, released::text FROM schema_items ORDER BY id"))
    (rows conn "SELECT id, tag, key_data::text FROM schema_meta ORDER BY id")])
 
 (defn- schema-item-column-metadata [conn]
-  (rows conn (str "SELECT column_name, data_type, datetime_precision, is_nullable, column_default "
-                  "FROM information_schema.columns "
-                  "WHERE table_name = 'schema_items' AND column_name <> 'db_id' "
-                  "ORDER BY ordinal_position")))
+  ;; Match the mirror's publisher connection when deparsing defaults.
+  (sql! conn "SET search_path = pg_catalog")
+  (try
+    (rows conn (str "SELECT column_name, data_type, datetime_precision, is_nullable, column_default "
+                    "FROM information_schema.columns "
+                    "WHERE table_name = 'schema_items' AND column_name <> 'db_id' "
+                    "ORDER BY ordinal_position"))
+    (finally (sql! conn "RESET search_path"))))
 
 (defn- item-eid [path]
   (inspect-db path #(d/q '[:find ?eid . :where [?eid :schema_items/id 1]] %)))
@@ -726,7 +758,7 @@
                   (sql! source "BEGIN"
                         "UPDATE schema_account SET label = 'during schema copy' WHERE id = 1"
                         (str "UPDATE schema_items SET summary = NULL, tokens = '[0:1]={x,y}', "
-                             "observed = '14:30:00.123457+04' WHERE id = 1")
+                             "observed = '14:30:00.123457+04', quality = 'active', released = 2024 WHERE id = 1")
                         "INSERT INTO schema_items (id) VALUES (2)"
                         "UPDATE schema_meta SET key_data = '{\"num\":1.200}' WHERE id = 1"
                         "INSERT INTO schema_meta (id) VALUES (2)"

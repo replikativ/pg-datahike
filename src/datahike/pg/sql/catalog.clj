@@ -362,7 +362,8 @@
         (let [rows (if (>= (parse-long PgWireServer/SERVER_VERSION_NUM) 180000)
                      (into rows (not-null-constraint-rows rows user-schema cte-db))
                      rows)]
-          (mapv #(assoc % :pg_constraint/conenforced true
+          (mapv #(assoc % :pg_constraint/contypid (get % :pg_constraint/contypid 0)
+                        :pg_constraint/conenforced true
                         :pg_constraint/conislocal true
                         :pg_constraint/coninhcount 0
                         :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
@@ -1304,6 +1305,7 @@
      {:db/ident :pg_constraint/conindid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/conparentid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/conrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/contypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/connamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/confrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condeferrable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
@@ -1395,6 +1397,9 @@
      {:db/ident :information_schema_columns/numeric_precision_radix :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/numeric_scale :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/datetime_precision :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/domain_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/domain_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/domain_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/udt_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/udt_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/udt_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -2712,6 +2717,17 @@
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           names (catalog-objects/table-name-overrides cte-db)
           table-columns (catalog-table-columns cte-db tables)
+          types-by-oid (into {}
+                             (map (juxt :datahike.pg.object/oid identity))
+                             (mapcat #(catalog-objects/objects-by-kind cte-db %) [:domain :enum :composite-type]))
+          domain-bases (into {}
+                             (map (fn [[name base not-null]]
+                                    [name {:oid (pgs/resolve-type-oid cte-db base) :not-null? not-null}]))
+                             (d/q '{:find [?name ?base ?not-null]
+                                    :where [[?e :datahike.pg.domain/name ?name]
+                                            [?e :datahike.pg.domain/base-type ?base]
+                                            [?e :datahike.pg.domain/not-null ?not-null]]}
+                                  cte-db))
           identity-sequences (into {}
                                    (comp (filter :__seq__/identity-generation)
                                          (map (juxt :__seq__/name identity)))
@@ -2801,7 +2817,11 @@
                  [idx col] (map-indexed vector
                                         (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
                  :let [vtype     (:valuetype col)
-                       oid       (:oid col)
+                       declared-oid (or (:type-oid col) (:oid col))
+                       type-name (:datahike.pg.object/name (get types-by-oid declared-oid))
+                       domain    (get domain-bases type-name)
+                       oid       (or (:oid domain) declared-oid)
+                       user-type (get types-by-oid oid)
                        typmod    (get typmods (:attr col))
                        char-length (when (and (#{types/oid-bpchar types/oid-varchar} oid)
                                               typmod (> typmod types/var-hdr-sz))
@@ -2829,6 +2849,7 @@
                :information_schema_columns/column_default         (get publisher-defaults (:attr col))
                :information_schema_columns/is_nullable            (if (or identity?
                                                                           (:not-null? col)
+                                                                          (:not-null? domain)
                                                                           (= :db.unique/identity (:unique col)))
                                                                     "NO" "YES")
                ;; From the column's DECLARED OID, not its storage
@@ -2837,18 +2858,23 @@
                ;; timestamp alike, so a `date` column reported
                ;; `timestamp without time zone` here.
                :information_schema_columns/data_type
-               (if (contains? types/array-oid->element-oid oid)
-                 "ARRAY"
-                 (or (get types/oid->pg-name oid) (pgs/pg-type-name vtype)))
+               (cond
+                 user-type "USER-DEFINED"
+                 (contains? types/array-oid->element-oid oid) "ARRAY"
+                 :else (or (get types/oid->pg-name oid) (pgs/pg-type-name vtype)))
                :information_schema_columns/character_maximum_length char-length
                :information_schema_columns/character_octet_length (when char-length (* 4 char-length))
                :information_schema_columns/numeric_precision      (numeric-precision vtype (:attr col))
                :information_schema_columns/numeric_precision_radix (numeric-radix vtype)
                :information_schema_columns/numeric_scale          (numeric-scale vtype (:attr col))
                :information_schema_columns/datetime_precision     datetime-precision
+               :information_schema_columns/domain_catalog         (when domain "datahike")
+               :information_schema_columns/domain_schema          (when domain "public")
+               :information_schema_columns/domain_name            (when domain type-name)
                :information_schema_columns/udt_catalog            "datahike"
-               :information_schema_columns/udt_schema             "pg_catalog"
-               :information_schema_columns/udt_name               (or (:typname (types/catalog-type oid))
+               :information_schema_columns/udt_schema             (if user-type "public" "pg_catalog")
+               :information_schema_columns/udt_name               (or (:datahike.pg.object/name user-type)
+                                                                      (:typname (types/catalog-type oid))
                                                                       (udt-name vtype))
                :information_schema_columns/dtd_identifier         (str pos)
                :information_schema_columns/is_self_referencing    "NO"
@@ -3161,6 +3187,11 @@
     (let [hints (pgs/schema-hints cte-db)
           tables  (pgs/derive-virtual-tables user-schema hints)
           q-fn    d/q
+          domains (q-fn '{:find [?type ?name ?expr]
+                          :where [[?e :datahike.pg.domain/name ?type]
+                                  [?e :datahike.pg.domain/check-name ?name]
+                                  [?e :datahike.pg.domain/check-expr ?expr]]}
+                        cte-db)
           ;; CHECK constraints persisted via :pg/check-* attrs.
           checks  (try
                     (q-fn '{:find  [?n ?t ?x]
@@ -3196,6 +3227,19 @@
                        (str "{" (str/join "," attnums) "}"))]
       (vec
        (concat
+        (for [[type-name cname cexpr] domains]
+          {:pg_constraint/oid (long (constraint-oid "c" cname type-name))
+           :pg_constraint/conname cname
+           :pg_constraint/contype "c"
+           :pg_constraint/conrelid 0
+           :pg_constraint/contypid (long (pgs/resolve-type-oid cte-db type-name))
+           :pg_constraint/connamespace 2200
+           :pg_constraint/confrelid 0
+           :pg_constraint/condeferrable false
+           :pg_constraint/condeferred false
+           :pg_constraint/convalidated true
+           :pg_constraint/condef (str "CHECK (" cexpr ")")
+           (pgs/row-marker-attr "pg_constraint") true})
         ;; UNIQUE / PRIMARY KEY rows — one per unique column.
         (for [[tname {:keys [columns]}] (sort-by key tables)
               col columns

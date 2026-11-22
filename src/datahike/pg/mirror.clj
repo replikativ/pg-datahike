@@ -108,7 +108,7 @@
       {:system-id (.getString result "systemid")
        :timeline (.getInt result "timeline") :database database :database-oid database-oid})))
 
-(defn- column-ddl-type [{:keys [oid typmod]}]
+(defn- builtin-ddl-type [{:keys [oid typmod]}]
   (let [base (sql-types oid)]
     (cond
       (= -1 typmod) base
@@ -120,6 +120,43 @@
         (when (and precision (<= 1 precision 1000) (<= -1000 scale 1000))
           (str base "(" precision "," scale ")"))))))
 
+(defn- column-ddl-type [{:keys [user-type] :as column}]
+  (if user-type (ident (:name user-type)) (builtin-ddl-type column)))
+
+(defn- source-user-type [^ResultSet row]
+  (when-let [kind (case (.getString row "type_kind") "e" :enum "d" :domain nil)]
+    (let [name (.getString row "type_name")
+          schema (.getString row "type_schema")
+          base-type {:oid (.getLong row "type_base_oid")
+                     :typmod (.getInt row "type_base_typmod")}
+          labels (when-let [values (.getArray row "enum_labels")]
+                   (vec (.getArray values)))
+          problem (cond
+                    (not= schema "public") :type-schema
+                    (or (not= name (types/normalize-sql-type-name (ident name)))
+                        (re-find #"[.\"()\[\]]" name)
+                        (contains? types/pg-name->oid name)
+                        (not= types/oid-text (pgs/field-type->oid name))) :type-name
+                    (and (= kind :enum)
+                         (or (empty? labels) (some #(or (empty? %) (re-find #"[\r\n]" %)) labels))) :enum-labels
+                    (and (= kind :domain)
+                         (or (contains? types/array-oid->element-oid (:oid base-type))
+                             (nil? (builtin-ddl-type base-type)))) :domain-base-type
+                    (and (= kind :domain) (not= -1 (:typmod base-type))) :domain-base-modifier
+                    (and (= kind :domain)
+                         (> (.getInt row "domain_check_count") 1)) :domain-checks
+                    (and (= kind :domain)
+                         (not (.getBoolean row "domain_validated"))) :unvalidated-domain-check)]
+      (if problem
+        {:problem problem}
+        (cond-> {:kind kind :schema schema :name name :oid (.getLong row "atttypid")}
+          (= kind :enum) (assoc :labels labels)
+          (= kind :domain) (assoc :base-type base-type
+                                  :not-null? (.getBoolean row "domain_not_null")
+                                  :default (.getString row "domain_default")
+                                  :check-name (.getString row "domain_check_name")
+                                  :check-expr (.getString row "domain_check_expr")))))))
+
 (defn- read-publication-row [^ResultSet row]
   (let [schema (.getString row "schemaname")
         relation (when schema
@@ -127,12 +164,14 @@
                     :relation-id (.getLong row "relation_id")})
         column-name (.getString row "attname")
         key-position (.getInt row "key_position")
+        user-type (when column-name (source-user-type row))
         column (when column-name
                  (cond-> {:name column-name :oid (.getLong row "atttypid")
                           :typmod (.getInt row "atttypmod") :key? (pos? key-position)
                           :attnum (.getInt row "attnum") :not-null? (.getBoolean row "attnotnull")
                           :default (.getString row "default_expr")}
-                   (pos? key-position) (assoc :key-position key-position)))]
+                   (pos? key-position) (assoc :key-position key-position)
+                   (and user-type (not (:problem user-type))) (assoc :user-type user-type)))]
     {:publication-oid (.getLong row "publication_oid")
      :operations {:insert (.getBoolean row "pubinsert") :update (.getBoolean row "pubupdate")
                   :delete (.getBoolean row "pubdelete") :truncate (.getBoolean row "pubtruncate")}
@@ -160,7 +199,10 @@
                  (not= "" (.getString row "attgenerated")) (conj {:reason :generated-column})
                  (not (.getBoolean row "is_published")) (conj {:reason :unpublished-column})
                  (not (.getBoolean row "can_select")) (conj {:reason :missing-select})
-                 (not (contains? sql-types (:oid column))) (conj {:reason :type :oid (:oid column)})
+                 (:problem user-type)
+                 (conj {:reason :type-definition :detail (:problem user-type) :oid (:oid column)})
+                 (and (nil? user-type) (not (contains? sql-types (:oid column))))
+                 (conj {:reason :type :oid (:oid column)})
                  (and (contains? sql-types (:oid column)) (nil? (column-ddl-type column)))
                  (conj {:reason :type-modifier :typmod (:typmod column)})))))}))
 
@@ -175,6 +217,13 @@
                          "       a.attname, a.atttypid, a.atttypmod, a.attgenerated, a.attnum, a.attnotnull, "
                          "       pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS default_expr, "
                          "       pg_catalog.format_type(a.atttypid, a.atttypmod) AS source_type, "
+                         "       t.typtype AS type_kind, t.typname AS type_name, tn.nspname AS type_schema, "
+                         "       t.typbasetype AS type_base_oid, t.typtypmod AS type_base_typmod, "
+                         "       t.typnotnull AS domain_not_null, "
+                         "       pg_catalog.pg_get_expr(t.typdefaultbin, 0) AS domain_default, "
+                         "       e.labels AS enum_labels, dc.count AS domain_check_count, "
+                         "       coalesce(dc.validated, true) AS domain_validated, "
+                         "       dc.name AS domain_check_name, dc.expression AS domain_check_expr, "
                          "       a.attname = ANY(p.attnames) AS is_published, "
                          "       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') AS can_select, "
                          "       pk.key_position, idx.relname AS primary_key_name "
@@ -183,6 +232,13 @@
                          "LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname "
                          "LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename "
                          "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+                         "LEFT JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype IN ('d', 'e') "
+                         "LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace "
+                         "LEFT JOIN LATERAL (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) AS labels "
+                         " FROM pg_catalog.pg_enum e WHERE e.enumtypid = t.oid) e ON t.typtype = 'e' "
+                         "LEFT JOIN LATERAL (SELECT count(*) AS count, bool_and(d.convalidated) AS validated, "
+                         " min(d.conname::text) AS name, min(pg_catalog.pg_get_expr(d.conbin, 0)) AS expression "
+                         " FROM pg_catalog.pg_constraint d WHERE d.contypid = t.oid AND d.contype = 'c') dc ON t.typtype = 'd' "
                          "LEFT JOIN pg_catalog.pg_attrdef def ON def.adrelid = a.attrelid AND def.adnum = a.attnum "
                          "LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND i.indisprimary "
                          " AND i.indimmediate AND i.indisvalid "
@@ -211,10 +267,18 @@
     {:publication publication :publication-oid publication-oid :issues issues :tables tables
      :compatible? (and (empty? issues) (every? (comp empty? :issues) tables))}))
 
+(defn- publisher-types [tables]
+  (into (sorted-map)
+        (keep (fn [{:keys [user-type]}]
+                (when user-type [(:name user-type) user-type])))
+        (mapcat :columns tables)))
+
 (defn- publication-manifest [source publication]
   (let [{:keys [publication-oid tables compatible?] :as report} (scan-publication source publication)]
     (require! compatible? "Publication cannot be mirrored" {:report report})
-    {:publication-oid publication-oid :catalog-version 3 :tables (mapv #(dissoc % :issues) tables)}))
+    (let [user-types (publisher-types tables)]
+      (cond-> {:publication-oid publication-oid :catalog-version 3 :tables (mapv #(dissoc % :issues) tables)}
+        (seq user-types) (assoc :types user-types)))))
 
 (defn- validate-source-options! [source-url publication]
   (require! (and (string? source-url) (str/starts-with? source-url "jdbc:postgresql://")
@@ -388,6 +452,20 @@
                                "Missing replacement primary index" {:table (relation-name table)})
                      [[:db/add (:db/id object) :datahike.pg.index/primary? true]])))))
 
+(defn- install-types! [destination user-types]
+  (doseq [{:keys [kind name labels base-type not-null? default check-name check-expr]} (vals user-types)]
+    (sink-execute! destination
+                   (case kind
+                     :enum (str "CREATE TYPE " (ident name) " AS ENUM (" (comma-list (map literal labels)) ")")
+                     :domain (str "CREATE DOMAIN " (ident name) " AS "
+                                  (if (= types/oid-float8 (:oid base-type))
+                                    "float8"
+                                    (builtin-ddl-type base-type))
+                                  (when default (str " DEFAULT " default))
+                                  (when not-null? " NOT NULL")
+                                  (when check-expr
+                                    (str " CONSTRAINT " (ident check-name) " CHECK (" check-expr ")")))))))
+
 (defn- create-table! [destination {:keys [columns] :as table}]
   (let [keys (key-columns table)
         native-key? (and (= 1 (count keys))
@@ -449,6 +527,7 @@
           (transaction!
            destination
            (fn []
+             (install-types! destination (:types manifest))
              (doseq [table (:tables manifest)]
                (check-running!)
                (create-table! destination table)
@@ -545,6 +624,9 @@
                  (.position buffer (.limit buffer))
                  {:op :message :transactional? (= (char 1) flags) :lsn position :payload payload}))
           \O (do (read-lsn buffer) (read-cstr buffer) {:op :origin})
+          ;; pgoutput supplies a base type name for domains. The manifest
+          ;; uses the source relation OID and the full catalog definition.
+          \Y {:op :type :oid (uint32 buffer) :schema (read-cstr buffer) :name (read-cstr buffer)}
           (throw (ex-info "Unsupported pgoutput message" {:tag tag})))]
     (require! (zero? (.remaining buffer)) "Extra bytes in a pgoutput message" {:tag tag})
     message))
@@ -559,8 +641,8 @@
               {:table (:name table) :columns (count columns) :values (count values)})
     (mapv vector columns values)))
 
-(defn- cast-param [{:keys [oid]}]
-  (str "CAST(? AS " (sql-types oid) ")"))
+(defn- cast-param [{:keys [oid user-type]}]
+  (str "CAST(? AS " (if user-type (ident (:name user-type)) (sql-types oid)) ")"))
 
 (defn- key-pairs [table values]
   (let [pairs (filterv (comp :key? first) (tuple-pairs table values))]
@@ -725,11 +807,18 @@
 (defn- changed-tables! [previous current allow-schema-refresh?]
   (let [before (tables-by-id previous)
         after (tables-by-id current)
+        types-by-oid (into {} (map (juxt :oid identity)) (vals (:types previous)))
         occupied (into #{} (map (comp :name storage-table)) (:tables previous))
         missing (remove #(get after (:relation-id %)) (:tables previous))]
     (require! (and (= (:publication-oid previous) (:publication-oid current)) (empty? missing))
               "Publication schema or membership changed"
               {:removed (mapv relation-name missing)})
+    (doseq [[name definition] (:types current)
+            installed [(get-in previous [:types name]) (get types-by-oid (:oid definition))]
+            :when installed]
+      (require! (= installed definition)
+                "Publisher changed a mirrored user type"
+                {:reason :changed-type-definition :type name}))
     (let [changes (filterv (fn [table]
                              (let [prior (get before (:relation-id table))]
                                (or (nil? prior)
@@ -773,7 +862,7 @@
               "Publication changed during refresh" {})))
 
 (defn- typed-column [column]
-  (select-keys column [:oid :typmod]))
+  (select-keys column [:oid :typmod :user-type]))
 
 (defn- primary-key-changed? [previous table]
   (or (not= (mapv :attnum (key-columns previous))
@@ -856,8 +945,8 @@
         (map vector attrs previous values)))
 
 (defn- previous-key [columns values]
-  (mapv (fn [{:keys [oid]} value]
-          (condp = oid
+  (mapv (fn [{:keys [oid user-type]} value]
+          (condp = (or (get-in user-type [:base-type :oid]) oid)
             types/oid-jsonb (jsonb/parse-jsonb value)
             types/oid-bpchar (some-> value (str/replace #" +\z" ""))
             (unique/canonical-key-value value)))
@@ -955,7 +1044,7 @@
                 (require! (nil? pending) "Received BEGIN before the previous COMMIT" {})
                 (recur relations (assoc message :changes [] :bytes 0) durable))
 
-              :origin
+              (:origin :type)
               (recur relations pending durable)
 
               :message
@@ -1015,6 +1104,7 @@
                       (transaction!
                        destination
                        (fn []
+                         (install-types! destination (publisher-types tables))
                          (doseq [table tables]
                            (check-running!)
                            (create-table! destination table)
@@ -1032,11 +1122,11 @@
                                      (require! (matches-relation? table message)
                                                "Staged relation changed" {:relation relation-id})))
                 :select-change! #(select-change included? %)
-                :commit! (fn [relations _ {:keys [changes bytes barriers]}]
+                :commit! (fn [_ _ {:keys [changes bytes barriers]}]
                            (when (seq changes)
                              (on-bytes bytes)
                              (transaction! destination
-                                           #(doseq [change changes] (apply-change! destination relations change))))
+                                           #(doseq [change changes] (apply-change! destination expected change))))
                            (contains? barriers barrier))}))))
 
 (defn- start-refresh! [config origin manifest changes check-running!]
@@ -1094,6 +1184,7 @@
                       changes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
+      (install-types! destination (:new-types stage))
       (doseq [{:keys [previous storage-name]} rekeys]
         (check-running!)
         (drop-primary-key! destination (assoc previous :name storage-name)))
@@ -1135,12 +1226,14 @@
                                 (cond-> table
                                   (not= (:name table) storage-name) (assoc :storage-name storage-name))]))
                         changes)
-        prior (tables-by-id previous)]
+        prior (tables-by-id previous)
+        types (merge (:types previous) (:types current))]
     (cond-> (update current :tables (fn [tables]
                                       (mapv (fn [table]
                                               (let [id (:relation-id table)]
                                                 (or (get installed id) (get prior id table))))
                                             tables)))
+      (seq types) (assoc :types types)
       (:last-schema-refresh previous) (assoc :last-schema-refresh (:last-schema-refresh previous)))))
 
 (defn- consume! [copy source destination saved state confirmed-lsn check-running! ready! config]
@@ -1176,7 +1269,9 @@
                                  manifest (installed-manifest current @applied changes)]
                              (vswap! pending-schema #(merge new-pending %))
                              (vreset! stage (assoc (start-refresh! config origin current changes check-running!)
-                                                   :installed-manifest manifest :source-manifest current))
+                                                   :installed-manifest manifest
+                                                   :source-manifest current
+                                                   :new-types (apply dissoc (:types current) (keys (:types @applied)))))
                              (vreset! stage-signaled? false)))))))
         live? (fn [id] (and (contains? @live id) (not (contains? @pending-schema id))))
         validate-transaction! (fn [relations changes]
@@ -1190,7 +1285,7 @@
                                   (when-let [id (some #(when (stale? %) %) ids)]
                                     (throw (ex-info "Publication relation changed"
                                                     {:relation (get relations id)})))))
-        apply-live! (fn [relations previous transaction cutover? active]
+        apply-live! (fn [previous transaction cutover? active]
                       (let [candidate (cond
                                         cutover?
                                         (cond-> (:installed-manifest active)
@@ -1201,11 +1296,8 @@
                                         (not= @pending-schema (or (:pending-schema @applied) {}))
                                         (assoc @applied :pending-schema @pending-schema))
                             changes (into [] (keep #(select-change live? %)) (:changes transaction))
-                            relations (reduce (fn [tables id]
-                                                (if-let [storage (:storage-name (get @live id))]
-                                                  (assoc-in tables [id :name] storage)
-                                                  tables))
-                                              relations (changed-relation-ids changes))]
+                            relations (into {} (map (fn [id] [id (storage-table (get @live id))]))
+                                            (changed-relation-ids changes))]
                         (apply-commit! destination relations previous
                                        (cond-> (assoc transaction :changes changes)
                                          candidate (assoc :manifest candidate)
@@ -1254,7 +1346,7 @@
                                  "Table refresh reached a different cutover position" {:position end-lsn})
                        (refresh!))
                      (try
-                       (apply-live! relations previous transaction cutover? active)
+                       (apply-live! previous transaction cutover? active)
                        (catch clojure.lang.ExceptionInfo error
                          ;; DROP NOT NULL preserves the wire layout. A NULL may
                          ;; beat the periodic catalog scan to the mirror.
@@ -1263,7 +1355,7 @@
                              (throw error))
                            (refresh!)
                            (when (= prior @pending-schema) (throw error))
-                           (apply-live! relations previous transaction false nil))))
+                           (apply-live! previous transaction false nil))))
                      (vreset! durable end-lsn)
                      (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros)
                      (when cutover?
