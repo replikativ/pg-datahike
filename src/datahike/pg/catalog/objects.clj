@@ -288,6 +288,17 @@
                    [?e :datahike.pg.object/name ?name]]
                  db)))))
 
+(defn primary-index-oid [db relation-oid]
+  (when (get (dbi/-schema db) :datahike.pg.index/primary?)
+    (d/q '[:find ?oid .
+           :in $ ?class-oid ?relation-oid
+           :where [?relation :datahike.pg.object/class-oid ?class-oid]
+           [?relation :datahike.pg.object/oid ?relation-oid]
+           [?i :datahike.pg.index/relation ?relation]
+           [?i :datahike.pg.index/primary? true]
+           [?i :datahike.pg.object/oid ?oid]]
+         db pg-class-oid relation-oid)))
+
 (def ^:private column-keys
   [:db/id
    :datahike.pg.column/address-key

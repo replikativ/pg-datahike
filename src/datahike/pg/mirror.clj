@@ -6,6 +6,7 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.constraints.unique :as unique]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg]
             [datahike.pg.sql.ctx :as ctx]
@@ -122,15 +123,18 @@
                    {:schema schema :name (.getString row "tablename")
                     :relation-id (.getLong row "relation_id")})
         column-name (.getString row "attname")
+        key-position (.getInt row "key_position")
         column (when column-name
-                 {:name column-name :oid (.getLong row "atttypid")
-                  :typmod (.getInt row "atttypmod") :key? (.getBoolean row "is_key")
-                  :attnum (.getInt row "attnum") :not-null? (.getBoolean row "attnotnull")
-                  :default (.getString row "default_expr")})]
+                 (cond-> {:name column-name :oid (.getLong row "atttypid")
+                          :typmod (.getInt row "atttypmod") :key? (pos? key-position)
+                          :attnum (.getInt row "attnum") :not-null? (.getBoolean row "attnotnull")
+                          :default (.getString row "default_expr")}
+                   (pos? key-position) (assoc :key-position key-position)))]
     {:publication-oid (.getLong row "publication_oid")
      :operations {:insert (.getBoolean row "pubinsert") :update (.getBoolean row "pubupdate")
                   :delete (.getBoolean row "pubdelete") :truncate (.getBoolean row "pubtruncate")}
      :relation relation
+     :primary-key-name (.getString row "primary_key_name")
      :table-issues
      (when relation
        (cond-> []
@@ -170,24 +174,27 @@
                          "       pg_catalog.format_type(a.atttypid, a.atttypmod) AS source_type, "
                          "       a.attname = ANY(p.attnames) AS is_published, "
                          "       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') AS can_select, "
-                         "       EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
-                         "               CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, pos) "
-                         "               WHERE i.indrelid = c.oid AND i.indisprimary AND i.indimmediate "
-                         "               AND i.indisvalid AND k.pos <= i.indnkeyatts AND k.attnum = a.attnum) AS is_key "
+                         "       pk.key_position, idx.relname AS primary_key_name "
                          "FROM pg_catalog.pg_publication pub "
                          "LEFT JOIN pg_catalog.pg_publication_tables p ON p.pubname = pub.pubname "
                          "LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname "
                          "LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename "
                          "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
                          "LEFT JOIN pg_catalog.pg_attrdef def ON def.adrelid = a.attrelid AND def.adnum = a.attnum "
+                         "LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND i.indisprimary "
+                         " AND i.indimmediate AND i.indisvalid "
+                         "LEFT JOIN pg_catalog.pg_class idx ON idx.oid = i.indexrelid "
+                         "LEFT JOIN LATERAL (SELECT k.pos AS key_position "
+                         " FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, pos) "
+                         " WHERE k.pos <= i.indnkeyatts AND k.attnum = a.attnum) pk ON true "
                          "WHERE pub.pubname = ? ORDER BY p.schemaname, p.tablename, a.attnum")
                     [publication] read-publication-row)
         {:keys [publication-oid operations]} (first rows)
         tables (mapv (fn [table-rows]
-                       (let [{:keys [relation table-issues]} (first table-rows)
+                       (let [{:keys [relation table-issues primary-key-name]} (first table-rows)
                              columns (into [] (keep :column) table-rows)
                              issues (into table-issues (mapcat :column-issues) table-rows)]
-                         (assoc relation :columns columns
+                         (assoc relation :columns columns :primary-key-name primary-key-name
                                 :issues (cond-> issues
                                           (empty? columns) (conj {:reason :no-columns})
                                           (not-any? :key? columns) (conj {:reason :missing-immediate-primary-key})))))
@@ -204,7 +211,7 @@
 (defn- publication-manifest [source publication]
   (let [{:keys [publication-oid tables compatible?] :as report} (scan-publication source publication)]
     (require! compatible? "Publication cannot be mirrored" {:report report})
-    {:publication-oid publication-oid :catalog-version 2 :tables (mapv #(dissoc % :issues) tables)}))
+    {:publication-oid publication-oid :catalog-version 3 :tables (mapv #(dissoc % :issues) tables)}))
 
 (defn- validate-source-options! [source-url publication]
   (require! (and (string? source-url) (str/starts-with? source-url "jdbc:postgresql://")
@@ -362,13 +369,34 @@
 (defn- set-column-metadata! [destination table]
   (stage-data! destination #(column-metadata-tx % table)))
 
+(defn- key-columns [table]
+  (sort-by #(or (:key-position %) (:attnum %)) (filter :key? (:columns table))))
+
+(defn- install-primary-key! [destination table]
+  (let [name (:primary-key-name table)]
+    (sink-execute! destination
+                   (str "CREATE UNIQUE INDEX " (ident name) " ON " (relation-name table)
+                        " (" (comma-list (map (comp ident :name) (key-columns table))) ")"))
+    (stage-data! destination
+                 (fn [db]
+                   (let [object (catalog-objects/object-by-identity
+                                 db catalog-objects/pg-class-oid catalog-objects/public-namespace-oid name)]
+                     (require! (= :index (:datahike.pg.object/kind object))
+                               "Missing replacement primary index" {:table (relation-name table)})
+                     [[:db/add (:db/id object) :datahike.pg.index/primary? true]])))))
+
 (defn- create-table! [destination {:keys [columns] :as table}]
-  (sink-execute!
-   destination
-   (str "CREATE TABLE " (relation-name table) " ("
-        (comma-list (map (fn [{:keys [name] :as column}] (str (ident name) " " (column-ddl-type column))) columns))
-        ", PRIMARY KEY (" (comma-list (keep #(when (:key? %) (ident (:name %))) columns)) "))"))
-  (set-column-metadata! destination table))
+  (let [keys (key-columns table)
+        native-key? (and (= 1 (count keys))
+                         (= (:primary-key-name table) (str (:name table) "_pkey")))]
+    (sink-execute!
+     destination
+     (str "CREATE TABLE " (relation-name table) " ("
+          (comma-list (map (fn [{:keys [name] :as column}] (str (ident name) " " (column-ddl-type column))) columns))
+          (when native-key? (str ", PRIMARY KEY (" (ident (:name (first keys))) ")"))
+          ")"))
+    (set-column-metadata! destination table)
+    (when-not native-key? (install-primary-key! destination table))))
 
 (defn- slot-info [source slot]
   (first (query source
@@ -680,7 +708,15 @@
 
 (defn- same-table? [previous current]
   (if (every? :attnum (:columns previous))
-    (= (dissoc previous :storage-name) (dissoc current :storage-name))
+    (let [shape (fn [table]
+                  (-> table
+                      (dissoc :storage-name :primary-key-name)
+                      (update :columns (fn [cols] (mapv #(dissoc % :key-position) cols)))))]
+      (and current (= (shape previous) (shape current))
+           (or (nil? (:primary-key-name previous))
+               (and (= (:primary-key-name previous) (:primary-key-name current))
+                    (= (mapv :attnum (key-columns previous))
+                       (mapv :attnum (key-columns current)))))))
     (and current (= (wire-table previous) (wire-table current)))))
 
 (defn- changed-tables! [previous current allow-schema-refresh?]
@@ -696,7 +732,11 @@
                                (or (nil? prior)
                                    (contains? (:pending-schema previous) (:relation-id table))
                                    (not (same-table? prior table))
-                                   (and allow-schema-refresh? (not-every? :attnum (:columns prior))))))
+                                   (and allow-schema-refresh?
+                                        (or (not-every? :attnum (:columns prior))
+                                            (and (nil? (:primary-key-name prior))
+                                                 (not= (mapv :attnum (key-columns prior))
+                                                       (mapv :attnum (key-columns table)))))))))
                            (:tables current))]
       (mapv (fn [table]
               (let [prior (get before (:relation-id table))
@@ -732,13 +772,37 @@
 (defn- typed-column [column]
   (select-keys column [:oid :typmod]))
 
-(defn- require-stable-keys! [{:keys [table previous]}]
-  (when previous
-    (let [keys-of (fn [table]
-                    (mapv #(select-keys % [:attnum :oid :typmod])
-                          (filter :key? (:columns table))))]
-      (require! (= (keys-of previous) (keys-of table))
-                "Schema refresh requires a stable primary key" {:table (relation-name table)}))))
+(defn- primary-key-changed? [previous table]
+  (or (not= (mapv :attnum (key-columns previous))
+            (mapv :attnum (key-columns table)))
+      (and (:primary-key-name previous)
+           (not= (:primary-key-name previous) (:primary-key-name table)))))
+
+(defn- matching-key-indexes! [previous table]
+  (let [by-attnum (into {} (map-indexed (fn [i col] [(:attnum col) [i col]])) (:columns table))]
+    (mapv (fn [before]
+            (let [[i after] (get by-attnum (:attnum before))]
+              (require! (and after (= (typed-column before) (typed-column after)))
+                        "Schema refresh cannot match rows without the previous primary key columns and types"
+                        {:table (relation-name table) :reason :missing-previous-key :column (:name before)})
+              i))
+          (key-columns previous))))
+
+(defn- drop-primary-key! [destination previous]
+  (stage-data!
+   destination
+   (fn [db]
+     (let [relation-oid (pgs/storage-table-oid db (:name previous))]
+       (if-let [oid (catalog-objects/primary-index-oid db relation-oid)]
+         (catalog-objects/drop-object-tx db catalog-objects/pg-class-oid oid)
+         (let [keys (key-columns previous)
+               attr (if (= 1 (count keys))
+                      (first (local-column-attrs db (assoc previous :columns keys)))
+                      (keyword (:name previous) "pg$pk_tuple"))
+               entity (d/entity db attr)]
+           (require! (= :db.unique/identity (:db/unique entity))
+                     "Missing local primary key during schema refresh" {:table (relation-name previous)})
+           [[:db/retract (:db/id entity) :db/unique :db.unique/identity]]))))))
 
 (defn- adapt-layout! [destination previous table]
   (let [before (into {} (map (juxt :attnum identity)) (:columns previous))
@@ -788,26 +852,36 @@
             :else [:db/add eid attr new]))
         (map vector attrs previous values)))
 
-(defn- reconcile-table-tx [db table staged-schema staged-rows check-running!]
+(defn- rows-by-previous-key! [table rows key-indexes check-running!]
+  (let [seen (volatile! #{})]
+    (mapv (fn [[_ values]]
+            (check-running!)
+            (let [key (mapv #(unique/canonical-key-value (nth values %)) key-indexes)]
+              (require! (and (every? some? key) (not (contains? @seen key)))
+                        "Schema refresh found a missing or duplicate value in the previous primary key"
+                        {:table (relation-name table) :reason :ambiguous-previous-key})
+              (vswap! seen conj key)
+              [key values]))
+          rows)))
+
+(defn- reconcile-table-tx [db table key-indexes staged-schema staged-rows check-running!]
   (let [attrs (local-column-attrs db table)
         value-types (mapv #(get-in (dbi/-schema db) [% :db/valueType]) attrs)
         _ (require! (= staged-schema value-types) "Staged storage types differ from live storage types"
                     {:table (relation-name table)})
-        key-indexes (into [] (keep-indexed (fn [idx col] (when (:key? col) idx))) (:columns table))
-        row-key (fn [values] (mapv #(nth values %) key-indexes))
         key-attrs (mapv #(nth attrs %) key-indexes)
-        live (into {} (map (fn [[eid key]] [key eid])) (stored-rows db table key-attrs))
+        live (into {} (map (fn [[eid key]] [(mapv unique/canonical-key-value key) eid]))
+                   (stored-rows db table key-attrs))
         outstanding (volatile! live)
         marker (pgs/row-marker-attr (:name table))
         result (reduce
-                (fn [tx [_ values]]
+                (fn [tx [key values]]
                   (check-running!)
                   (doseq [[column value] (map vector (:columns table) values)]
                     (require! (or (some? value) (not (:not-null? column)))
                               "Staged row violates publisher nullability"
                               {:table (relation-name table) :column (:name column)}))
-                  (let [key (row-key values)
-                        eid (get @outstanding key)]
+                  (let [eid (get @outstanding key)]
                     (vswap! outstanding dissoc key)
                     (if eid
                       (let [row (d/entity db eid)
@@ -821,11 +895,11 @@
           (map (fn [eid] (check-running!) [:db/retractEntity eid]))
           (vals @outstanding))))
 
-(defn- reconcile-table! [destination stage-db table live-table check-running!]
+(defn- reconcile-table! [destination stage-db table live-table key-indexes check-running!]
   (let [attrs (local-column-attrs stage-db table)
         staged-schema (mapv #(get-in (dbi/-schema stage-db) [% :db/valueType]) attrs)
-        staged-rows (vec (stored-rows stage-db table attrs))]
-    (stage-data! destination #(reconcile-table-tx % live-table staged-schema staged-rows check-running!))))
+        staged-rows (rows-by-previous-key! table (stored-rows stage-db table attrs) key-indexes check-running!)]
+    (stage-data! destination #(reconcile-table-tx % live-table key-indexes staged-schema staged-rows check-running!))))
 
 (defn- matches-relation? [table message]
   (and table (= \d (:identity message)) (= (wire-table table) (wire-table message))))
@@ -997,6 +1071,9 @@
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
         {:keys [changes]} stage
+        rekeys (filterv (fn [{:keys [table previous]}]
+                          (and previous (primary-key-changed? previous table)))
+                        changes)
         renames (into []
                       (keep (fn [{:keys [table previous storage-name]}]
                               (when (and previous (not= (:name previous) (:name table)))
@@ -1004,11 +1081,15 @@
                       changes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
+      (doseq [{:keys [previous storage-name]} rekeys]
+        (check-running!)
+        (drop-primary-key! destination (assoc previous :name storage-name)))
       (doseq [{:keys [table previous storage-name]} changes :when previous]
         (check-running!)
-        (let [live-table (assoc table :name storage-name)]
+        (let [live-table (assoc table :name storage-name)
+              key-indexes (matching-key-indexes! previous table)]
           (adapt-layout! destination previous live-table)
-          (reconcile-table! destination stage-db table live-table check-running!)
+          (reconcile-table! destination stage-db table live-table key-indexes check-running!)
           (set-column-metadata! destination live-table)))
       ;; Vacate every old SQL name before assigning the new names. This
       ;; handles name swaps and tables added under a just-vacated name.
@@ -1022,7 +1103,12 @@
           (create-table! destination live-table)
           (transfer-staged-table! staged destination table live-table on-bytes)
           (when (not= storage-name (:name table))
-            (set-table-name! destination storage-name (:name table))))))))
+            (set-table-name! destination storage-name (:name table)))))
+      ;; Relation and index names share a PostgreSQL namespace. Install
+      ;; the replacement keys after retiring old names across the batch.
+      (doseq [{:keys [table storage-name]} rekeys]
+        (check-running!)
+        (install-primary-key! destination (assoc table :name storage-name))))))
 
 (defn- changed-relation-ids [changes]
   (into #{} (mapcat #(if (= :truncate (:op %)) (:relation-ids %) [(:relation-id %)])) changes))
@@ -1068,7 +1154,8 @@
                        (require-stable-manifest! (:source-manifest active) current)
                        (let [changes (changed-tables! @applied current schema-refresh?)]
                          (when (seq changes)
-                           (doseq [change changes] (require-stable-keys! change))
+                           (doseq [{:keys [table previous]} changes :when previous]
+                             (matching-key-indexes! previous table))
                            (let [new-pending (into {}
                                                    (keep (fn [{:keys [table previous]}]
                                                            (when previous [(:relation-id table) @durable])))

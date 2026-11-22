@@ -4574,6 +4574,7 @@
                 :db/index true}]
               [:datahike.pg.index/keys str1]
               [:datahike.pg.index/unique? bool1]
+              [:datahike.pg.index/primary? bool1]
               [:datahike.pg.index/legacy-incomplete? bool1]]
         missing (into []
                       (keep (fn [[ident tmpl]]
@@ -11678,9 +11679,12 @@
                   (throw (errors/pg-error
                           :feature-not-supported
                           {:message "partial and extended unique indexes are not supported"})))))
-          table-object (catalog-objects/object-by-identity
-                        db catalog-objects/pg-class-oid
-                        catalog-objects/public-namespace-oid (:table parsed))
+          table-object (if sql-ctx/*physical-table-names?*
+                         (when-let [oid (pgs/storage-table-oid db (:table parsed))]
+                           (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid))
+                         (catalog-objects/object-by-identity
+                          db catalog-objects/pg-class-oid
+                          catalog-objects/public-namespace-oid (:table parsed)))
           _ (when-not (= :table (:datahike.pg.object/kind table-object))
               (throw (errors/pg-error :undefined-table
                                       {:table (:table parsed)})))

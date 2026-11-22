@@ -540,8 +540,11 @@
         eid (item-eid path)
         previous (rows sink "SELECT id, summary FROM schema_items ORDER BY id")
         previous-columns (schema-item-column-metadata sink)
+        key-query (str "SELECT conname FROM pg_constraint "
+                       "WHERE conrelid = 'schema_archive'::regclass AND contype = 'p'")
         ddl ["BEGIN"
              "ALTER TABLE schema_items RENAME TO schema_archive"
+             "ALTER TABLE schema_archive RENAME CONSTRAINT schema_items_pkey TO schema_archive_pkey"
              "CREATE TABLE schema_items (id integer PRIMARY KEY, body text NOT NULL)"
              "COMMIT"]
         live-rows (fn [conn]
@@ -561,6 +564,8 @@
                (and (= [["schema_archive"]] (rows sink "SELECT relname FROM pg_class WHERE relname = 'schema_archive'"))
                     (= (live-rows source) (live-rows sink)))))
     (await! "Native subscriber did not converge after rename" #(= (live-rows source) (live-rows reference)))
+    (check! (= (rows source key-query) (rows sink key-query))
+            "The renamed relation's primary key catalog differs" {})
     (check! (= [[oid oid (str eid)]]
                (rows sink "SELECT 'schema_archive'::regclass::oid, tableoid, db_id FROM schema_archive WHERE id = 1"))
             "The rename changed the relation or row identity" {})
@@ -741,6 +746,124 @@
           (when (= ["false"] (slot-query source native-slot "active::text"))
             (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")"))))))))
 
+(defn- primary-key-layout [conn]
+  (rows conn (str "SELECT c.conname, c.conkey::text, i.indkey::text FROM pg_constraint c "
+                  "JOIN pg_index i ON c.conindid = i.indexrelid "
+                  "WHERE c.conrelid = 'key_items'::regclass AND c.contype = 'p' AND i.indisprimary")))
+
+(defn run-primary-key-probe! [source-url reference-url source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-key-" (make-array FileAttribute 0)))
+        path (str directory "/store")
+        native-slot (str "mirror_key_ref_" (str/replace (str (random-uuid)) "-" ""))
+        config {:source-url source-url :publication "mirror_key_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        slot (atom nil)
+        table-ddl (str "CREATE TABLE key_items (legacy integer PRIMARY KEY, region integer NOT NULL, "
+                       "item_no bigint NOT NULL, label text)")
+        row-query "SELECT legacy, region, item_no, label FROM key_items ORDER BY item_no, label"
+        key-column-query (str "SELECT column_name, ordinal_position FROM information_schema.key_column_usage "
+                              "WHERE table_name = 'key_items' AND constraint_name = 'key_items_v2' ORDER BY ordinal_position")
+        change-key (fn [key-name columns]
+                     (str "ALTER TABLE key_items DROP CONSTRAINT " key-name ", ADD CONSTRAINT "
+                          "key_items_v2 PRIMARY KEY (" columns ")"))]
+    (prn {:artifacts directory})
+    (with-open [source (DriverManager/getConnection source-url)
+                reference (DriverManager/getConnection reference-url)]
+      (try
+        (doseq [c [source reference]] (sql! c table-ddl))
+        (sql! source "INSERT INTO key_items VALUES (1, 7, 101, 'first'), (2, 7, 102, 'second')"
+              "CREATE PUBLICATION mirror_key_pub FOR TABLE key_items")
+        (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
+        (sql! reference (str "CREATE SUBSCRIPTION mirror_key_native CONNECTION "
+                             (literal source-conninfo) " PUBLICATION mirror_key_pub"
+                             " WITH (create_slot=false, slot_name=" (literal native-slot) ")"))
+        (await! "Native subscriber did not load the first key layout" #(= (rows source row-query) (rows reference row-query)))
+        (reset! subscriber (mirror/start! config))
+        (reset! slot (:slot (await-state! @subscriber :following)))
+        (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+          (let [old-layout (primary-key-layout source)
+                old-at (inspect-db path :max-tx)
+                eid-query "SELECT db_id FROM key_items WHERE item_no = 101"
+                old-eid (rows sink eid-query)
+                ddl (change-key "key_items_pkey" "item_no, region")]
+            (check! (= old-layout (primary-key-layout sink)) "Initial primary key catalog differs" {})
+            (sql! reference ddl)
+            (sql! source "BEGIN" ddl
+                  "UPDATE key_items SET label = 'during cutover' WHERE legacy = 1"
+                  "INSERT INTO key_items VALUES (3, 8, 103, 'during cutover')"
+                  "COMMIT")
+            (await! "Mirror did not install the replacement primary key"
+                    #(let [state (mirror/status @subscriber)]
+                       (check! (not (#{:paused :failed} (:state state))) "The replacement key paused the mirror" state)
+                       (and (= (primary-key-layout source) (primary-key-layout sink))
+                            (= (rows source row-query) (rows sink row-query)))))
+            (check! (= old-eid (rows sink eid-query)) "Replacing the key changed an existing entity" {})
+            (check! (= (rows source key-column-query) (rows sink key-column-query))
+                    "Information schema disagrees on the replacement key columns" {})
+            (sql! sink (str "SET datahike.as_of = " old-at))
+            (check! (= old-layout (primary-key-layout sink)) "Old primary key catalog was lost" {})
+            (sql! sink "RESET datahike.as_of")
+            ;; These rows share the old key. WAL must use the new key
+            ;; when one of them is changed or deleted.
+            (sql! source "INSERT INTO key_items VALUES (1, 7, 104, 'duplicate old key')"
+                  "UPDATE key_items SET label = 'new key update' WHERE item_no = 101 AND region = 7"
+                  "DELETE FROM key_items WHERE item_no = 102 AND region = 7")
+            (await! "Mirror did not use the replacement key for live changes"
+                    #(= (rows source row-query) (rows sink row-query)))
+            (check! (= old-eid (rows sink eid-query)) "Live update changed an existing entity" {})
+            (let [ddl (change-key "key_items_v2" "region, item_no")]
+              (sql! reference ddl)
+              (sql! source ddl))
+            (await! "Mirror did not update the key column order"
+                    #(= (primary-key-layout source) (primary-key-layout sink)))))
+        (mirror/stop! @subscriber)
+        (reset! subscriber (mirror/start! config))
+        (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+          (sql! source "UPDATE key_items SET label = 'after restart' WHERE item_no = 101 AND region = 7")
+          (await! "Key replacement did not survive restart"
+                  #(= (rows source row-query) (rows sink row-query) (rows reference row-query)))
+          (let [before (rows sink row-query)
+                layout (primary-key-layout sink)
+                ddl (str "ALTER TABLE key_items DROP CONSTRAINT key_items_v2, "
+                         "ADD CONSTRAINT key_items_label_pkey PRIMARY KEY (label)")]
+            (sql! reference ddl)
+            (sql! source "BEGIN" ddl
+                  "UPDATE key_items SET item_no = 101 WHERE label = 'duplicate old key'"
+                  "COMMIT")
+            (let [{:keys [last-error]} (await-state! @subscriber :paused)]
+              (check! (= :ambiguous-previous-key (:reason last-error))
+                      "Duplicate old key did not report an ambiguous row match" last-error))
+            (check! (= [before layout] [(rows sink row-query) (primary-key-layout sink)])
+                    "An ambiguous key changed the published mirror" {})
+            (sql! source "BEGIN"
+                  "UPDATE key_items SET item_no = 104 WHERE label = 'duplicate old key'"
+                  (change-key "key_items_label_pkey" "region, item_no")
+                  "ALTER TABLE key_items ALTER COLUMN label DROP NOT NULL"
+                  "COMMIT")))
+        (mirror/stop! @subscriber)
+        (reset! subscriber (mirror/start! config))
+        (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+          (check! (= [(rows source row-query) (primary-key-layout source)]
+                     [(rows sink row-query) (primary-key-layout sink)])
+                  "Restoring the old key did not recover the pending refresh" {})
+          (let [before (rows sink row-query)
+                layout (primary-key-layout sink)]
+            (sql! source "ALTER TABLE key_items DROP CONSTRAINT key_items_v2, DROP COLUMN region, ADD PRIMARY KEY (item_no)")
+            (let [{:keys [last-error]} (await-state! @subscriber :paused)]
+              (check! (= :missing-previous-key (:reason last-error))
+                      "Unmatchable old key did not report the specific admission failure" last-error))
+            (check! (= [before layout] [(rows sink row-query) (primary-key-layout sink)])
+                    "An unmatchable key changed the published mirror" {})))
+        {:status :passed :artifacts directory}
+        (finally
+          (when @subscriber (mirror/stop! @subscriber))
+          (when (and @slot (= ["false"] (slot-query source @slot "active::text")))
+            (sql! source (str "SELECT pg_drop_replication_slot(" (literal @slot) ")")))
+          (sql! reference "DROP SUBSCRIPTION IF EXISTS mirror_key_native")
+          (when (= ["false"] (slot-query source native-slot "active::text"))
+            (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")"))))))))
+
 (defn -main [& [argument]]
   (if (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
@@ -750,6 +873,7 @@
       (check! (every? seq [source reference conninfo])
               "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
       (prn ((case argument
+              "--primary-key-refresh" run-primary-key-probe!
               "--schema-refresh" run-schema-refresh-probe!
               "--refresh" run-refresh-probe!
               run-probe!)

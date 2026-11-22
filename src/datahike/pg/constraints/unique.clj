@@ -44,6 +44,7 @@
     :datahike.pg.index/method
     :datahike.pg.index/keys
     :datahike.pg.index/unique?
+    :datahike.pg.index/primary?
     :datahike.pg.index/legacy-incomplete?
     :datahike.pg.object/address-key
     :datahike.pg.object/identity-key
@@ -68,6 +69,7 @@
    :datahike.pg.index/method
    :datahike.pg.index/keys
    :datahike.pg.index/unique?
+   :datahike.pg.index/primary?
    :datahike.pg.index/legacy-incomplete?])
 
 (defn- invalid-descriptor! [name message]
@@ -124,6 +126,7 @@
                     relation (:datahike.pg.index/relation object)
                     keys-edn (:datahike.pg.index/keys object)
                     unique? (:datahike.pg.index/unique? object)
+                    primary? (:datahike.pg.index/primary? object)
                     legacy-incomplete? (:datahike.pg.index/legacy-incomplete? object)
                     method (:datahike.pg.index/method object)
                     namespace-ref (:datahike.pg.object/namespace object)
@@ -162,17 +165,21 @@
                                         (:datahike.pg.object/address-key relation))
                                      (= (objects/identity-key
                                          objects/pg-class-oid
-                                         objects/public-namespace-oid table)
+                                         objects/public-namespace-oid
+                                         (:datahike.pg.object/name relation))
                                         (:datahike.pg.object/identity-key relation))
                                      (= (:db/id public-namespace)
                                         relation-namespace-eid)
-                                     (= table (:datahike.pg.object/name relation))
+                                     (= table (or (:datahike.pg.object/storage-name relation)
+                                                  (:datahike.pg.object/name relation)))
                                      (string? method)
                                      (string? keys-edn)
                                      (boolean? unique?))
                         (invalid-descriptor! name "incomplete or incoherent index metadata"))
                     _ (when (and unique? (not= "btree" method))
                         (invalid-descriptor! name "unique enforcement requires btree"))
+                    _ (when (and primary? (not unique?))
+                        (invalid-descriptor! name "a primary index must enforce uniqueness"))
                     keys (try
                            (edn/read-string keys-edn)
                            (catch Exception _

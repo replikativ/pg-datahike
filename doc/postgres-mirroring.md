@@ -104,8 +104,7 @@ renaming, and dropping columns, changing supported types and precision, and
 changing defaults or nullability. It also follows table renames within the
 publisher schema when the table keeps its PostgreSQL relation OID. Group
 related DDL in one PostgreSQL transaction and allow each refresh to finish
-before the next schema change. Keep primary key column identities and types
-stable during a refresh.
+before the next schema change.
 Keep this option enabled through restart while a refresh is pending.
 
 When upgrading an existing mirror that stored only the wire layout, enable
@@ -122,6 +121,13 @@ when applications write to the publisher.
 A table rename preserves the mirror's relation OID and Datahike entities.
 The new SQL name becomes visible at cutover. Earlier snapshots keep the
 old name, including when the publisher adds a new table under that name.
+
+The mirror follows changes to a primary key's columns and their order.
+It matches rows by the previous key during refresh and uses the new key
+for WAL changes after cutover. Keep the previous key columns, their types,
+and their non-null, unique values through cutover. The mirror pauses if
+the previous key columns are missing or retyped, or their values make the
+row match ambiguous. A later migration can remove the previous columns.
 
 The affected tables have a resnapshot window. Their publisher changes during
 that window are reflected in the cutover transaction. Status and the durable
@@ -171,10 +177,13 @@ mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
 `clojure -M:dev -m datahike.pg.mirror-probe` after `bb prep`. Pass
 `--refresh` to exercise online table addition and its recovery boundaries.
 Pass `--schema-refresh` to exercise publisher DDL, table name reuse, restart,
-and historical row and catalog reads.
+and historical row and catalog reads. Pass `--primary-key-refresh` to compare
+replacement keys, key order, historical constraints, and rejected cutovers
+with PostgreSQL.
 
-The next stages are primary key changes, streaming and spooling
-of large transactions, and failover slots. See the [consolidation plan](consolidation-plan.md) and
+The next stages are wider publication type and relation support, streaming and
+spooling of large transactions, and failover slots. See the
+[consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 
 ## Known performance trap in Option 2, today

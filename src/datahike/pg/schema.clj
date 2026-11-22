@@ -663,7 +663,11 @@
       ;; An as-of DB delegates its structural schema map to the current
       ;; DB. Exclude attributes and row markers created after the snapshot.
       (as-of-view? db)
-      (assoc ::visible-idents (into #{} (map second) ordered-idents)))))
+      (assoc ::visible-idents (into #{} (map second) ordered-idents)
+             ::visible-uniqueness
+             (into {} (q-fn '[:find ?ident ?unique
+                              :where [?e :db/ident ?ident] [?e :db/unique ?unique]]
+                            db))))))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
@@ -943,6 +947,11 @@
     (or (internal-namespace? ns)
         (= (name ident) row-marker-col))))
 
+(defn schema-unique [hints attr props]
+  (if-let [visible (::visible-uniqueness hints)]
+    (get visible attr)
+    (:db/unique props)))
+
 (defn relation-membership-attrs
   "Describe the physical attributes that establish membership in `table-name`.
 
@@ -1004,6 +1013,7 @@
                                    h (get hints ident)
                                    col-name (or (:column h) local-col)
                                    vtype (:db/valueType props)
+                                   unique (schema-unique hints ident props)
                                    col {:name        col-name
                                         :attr        ident
                                         :oid         (declared-col-oid
@@ -1011,7 +1021,7 @@
                                                       vtype)
                                         :valuetype   vtype
                                         :cardinality (:db/cardinality props)
-                                        :unique      (:db/unique props)
+                                        :unique      unique
                                         ;; `NOT NULL` as DDL recorded it,
                                         ;; carried on the hint map because
                                         ;; `(:schema db)` surfaces only the
@@ -1025,7 +1035,7 @@
                                         :ref?        (= vtype :db.type/ref)
                                         :references  (:references h)
                                         :internal-index? (:internal-index? h)
-                                        :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
+                                        :indexed?    (or (:db/index props) (some? unique))}]
                                (-> tables
                                    (update-in [table-name :columns] (fnil conj []) col)
                                    (assoc-in [table-name :attrs col-name] ident))))
