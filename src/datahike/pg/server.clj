@@ -6761,6 +6761,7 @@
     (let [real-db (d/db conn)]
       (swap! tx-state assoc
              :in-tx? true :aborted? false :tx-buffer []
+             :transaction-time datetime-in/*transaction-time*
              :tx-options {}
              :ddl-version 0
              ;; `BEGIN ISOLATION LEVEL X` pins the tx's level (classify
@@ -6794,6 +6795,7 @@
   (let [real-db (d/db conn)]
     (swap! tx-state assoc
            :in-tx? true :implicit? true :aborted? false :tx-buffer []
+           :transaction-time datetime-in/*transaction-time*
            :tx-options {}
            :ddl-version 0
            :read-only? (boolean (:read-only? @session-state))
@@ -7034,6 +7036,7 @@
                       :ddl-version 0
                       :owned-locks #{})
                (dissoc :speculative-db
+                       :transaction-time
                        :temp-tables-before
                        :local-sequence-reservations
                        :local-sequence-generations
@@ -7304,7 +7307,7 @@
 (defn- handle-now [_ctx _parsed]
   (single-row-result "now"
                      types/oid-timestamptz
-                     (value->string (java.util.Date.))))
+                     (types/->pg-text (params/transaction-time) types/oid-timestamptz)))
 
 (defn- handle-pg-keywords [_ctx _parsed]
   (single-row-result "string_agg" PgWireServer/OID_TEXT ""))
@@ -12385,11 +12388,13 @@
 (defn- type-rewrite-op [table relation-oid changes]
   (let [time-zone types/*time-zone*
         date-style types/*date-style*
+        transaction-time datetime-in/*transaction-time*
         statement-time params/*statement-time*]
     [:db.fn/call
      (fn [db]
        (binding [types/*time-zone* time-zone
                  types/*date-style* date-style
+                 datetime-in/*transaction-time* transaction-time
                  params/*statement-time* statement-time]
          (into [] (mapcat #(type-rewrite-tx db table relation-oid %)) changes)))]))
 
@@ -13464,6 +13469,7 @@
                  ;; us once per CopyData frame. Preserve stable-expression,
                  ;; cancellation, and timeout context across those callbacks.
                  :statement-time  params/*statement-time*
+                 :transaction-time datetime-in/*transaction-time*
                  :regoid-search-path (effective-search-path (:session-state ctx))
                  :regoid-database-name (:db-name @(:session-state ctx))
                  :regoid-temp-tables (:temp-tables ctx)
@@ -13708,6 +13714,7 @@
             regoid/*database-name* (or (:regoid-database-name copy-session) "datahike")
             regoid/*temp-tables* (:regoid-temp-tables copy-session)
             params/*statement-time* (:statement-time copy-session)
+            datetime-in/*transaction-time* (:transaction-time copy-session)
             params/*scalar-subquery-cache* (:scalar-subquery-cache copy-session)
             params/*cancel* (:cancel copy-session)]
     (f)))
@@ -14266,7 +14273,10 @@
 
 (defn- parse-prepared-session-sql
   [sql schema db temp-tables session-id session-state analyses previous]
-  (binding [params/*session-state* session-state]
+  (binding [params/*session-state* session-state
+            datetime-in/*transaction-time* (or (get-in previous [:input-clock-context :time])
+                                               datetime-in/*transaction-time*)
+            datetime-in/*analysis-zone* (get-in previous [:input-clock-context :zone])]
     (let [context (prepared-analysis-context session-state temp-tables)
           old (when (= sql (or (::temporal-source previous) (:sql previous)))
                 (:prepared-analysis previous))
@@ -14295,6 +14305,9 @@
                           (.put ^java.util.WeakHashMap analyses token analysis))
                         token)))]
       (cond-> (assoc parsed :sql sql)
+        (:uses-input-clock? parsed)
+        (assoc :input-clock-context {:time datetime-in/*transaction-time*
+                                     :zone (or datetime-in/*analysis-zone* types/*time-zone*)})
         analysis (assoc :prepared-analysis analysis :prepared-analysis-token token)))))
 
 (defn- invalidate-changed-prepared-analyses!
@@ -14509,6 +14522,15 @@
         ;; only need the running spec-db so the next dc/with sees prior
         ;; rows in the same scope.
         batch-state (atom nil)
+        group-time (volatile! nil)
+        transaction-time (fn []
+                           (or (:transaction-time @tx-state)
+                               datetime-in/*transaction-time*
+                               @group-time
+                               (let [instant (.truncatedTo (java.time.Instant/now) java.time.temporal.ChronoUnit/MICROS)
+                                     time (java.sql.Timestamp/from instant)]
+                                 (when @batch-state (vreset! group-time time))
+                                 time)))
         ;; A URL-pinned branch handler owns one reference acquired through
         ;; d/connect. Datahike may return the same cached connection to several
         ;; wire sessions, so each handler must release exactly its own reference.
@@ -14720,6 +14742,7 @@
                     params/*session-prepared* sql-prepared
                     params/*session-cursors* cursors
                     params/*query-string* @query-string
+                    datetime-in/*transaction-time* (transaction-time)
                     ;; The date/timestamp OUTPUT format is this session's
                     ;; setting, and the renderer runs on this thread.
                     types/*date-style* (or (:date-style @session-state) [:iso :mdy])
@@ -15012,6 +15035,7 @@
                     regoid/*database-name* (or (:db-name @session-state) "datahike")
                     regoid/*temp-tables* temp-tables
                     params/*statement-time* (java.util.Date.)
+                    datetime-in/*transaction-time* (transaction-time)
                     params/*scalar-subquery-cache* (atom {})
                     ;; The extended protocol renders its rows here, so the
                     ;; session's date style has to be in scope on this
@@ -15040,6 +15064,10 @@
       (executeInGroup [this sql]
         (.executeInGroup this sql false))
 
+      (endQueryGroup [_]
+        (vreset! group-time nil)
+        nil)
+
       (executeInGroup [this sql multi-statement?]
         ;; Simple-query group member: a write opens/joins the 'Q''s
         ;; implicit transaction (committed at end-of-'Q' via
@@ -15067,6 +15095,7 @@
                   regoid/*database-name* (or (:db-name @session-state) "datahike")
                   regoid/*temp-tables* temp-tables
                   params/*statement-time* (java.util.Date.)
+                  datetime-in/*transaction-time* (transaction-time)
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
                   ;; pg_prepared_statements and pg_cursors are views over
@@ -15573,6 +15602,7 @@
       (executeInGroup [_ sql] (statement #(.executeInGroup h sql)))
       (executeInGroup [_ sql multi-statement?]
         (statement #(.executeInGroup h sql multi-statement?)))
+      (endQueryGroup [_] (run #(.endQueryGroup h)))
       (parse [_ sql oids] (run #(.parse h sql oids)))
       (reparse [_ sql oids previous] (run #(.reparse h sql oids previous)))
       (describeParams [_ parsed] (run #(.describeParams h parsed)))

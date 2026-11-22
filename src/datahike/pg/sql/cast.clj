@@ -357,19 +357,7 @@
           (pg-bits/coerce-width w explicit?)))))
 
 (defn datetime-ctx
-  "What the ported parser reads from session state.
-
-   `:now` is deliberately ABSENT, so the four clock-reading tokens --
-   `now`, `today`, `tomorrow`, `yesterday` -- fail as unparseable.
-   That is what this path needs and what the server already did: their
-   value is the STATEMENT's, and a cast is constant-folded into a
-   cached plan, so folding one would freeze it for that plan's life.
-   Supporting them needs the deferred treatment `now()` gets, and the
-   parser is ready for it -- pass a `:now` and they work.
-
-   `:session-zone` is the session's `TimeZone`, which is what the
-   parser applies to text carrying NO explicit offset. It defaults to
-   UTC, so a session that never SETs a zone parses exactly as before."
+  "DateStyle and TimeZone for decoding text in this session."
   []
   {:date-order (second types/*date-style*)
    :session-zone (or types/*time-zone* zone/utc)})

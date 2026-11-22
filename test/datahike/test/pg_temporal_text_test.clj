@@ -332,6 +332,66 @@
 ;; Reading a temporal value FROM text
 ;; ============================================================================
 
+(deftest relative-datetime-input-uses-transaction-time
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'America/Los_Angeles'")
+    (let [query "SELECT timestamp 'now'::text"
+          before (one c query)]
+      (one c "SELECT pg_sleep(0.03)")
+      (is (not= before (one c query))))
+    (doseq [[table zone-clause days]
+            [["clock_local" "without time zone" [["today" "1"] ["yesterday" "1"] ["tomorrow" "3"]]]
+             ["clock_zoned" "with time zone" [["today" "1"] ["yesterday" "1"] ["tomorrow" "1"]
+                                              ["tomorrow EST" "1"] ["tomorrow zulu" "1"]]]]]
+      (let [type-name (str "timestamp(3) " zone-clause)
+            insert (str "INSERT INTO " table " VALUES ")
+            count-rows (str "SELECT count(*) FROM " table " WHERE value = " type-name " ")]
+        (exec! c (str "CREATE TABLE " table " (value " type-name ")"))
+        (exec! c "BEGIN")
+        (exec! c (str insert "('today'), ('yesterday'), ('tomorrow'), ('tomorrow EST'), ('tomorrow zulu')"))
+        (doseq [[day n] days]
+          (is (= n (one c (str count-rows "'" day "'")))))
+        (exec! c "COMMIT")
+        (exec! c (str "DELETE FROM " table))
+        (exec! c (str insert "('now')"))
+        (one c "SELECT pg_sleep(0.03)")
+        (exec! c "BEGIN")
+        (exec! c (str insert "('now')"))
+        (one c "SELECT pg_sleep(0.03)")
+        (exec! c (str insert "('now')"))
+        (is (= "2" (one c (str count-rows "'now'"))))
+        (is (= "2" (one c (str "SELECT count(DISTINCT value) FROM " table))))
+        (is (= "t" (one c "SELECT localtimestamp(3) = timestamp(3) 'now'")))
+        (exec! c "COMMIT")
+        (exec! c (str "TRUNCATE " (.toUpperCase ^String table java.util.Locale/ROOT)))
+        (is (= "0" (one c (str "SELECT count(*) FROM " table))))))
+    (is (= "t" (one c "SELECT pg_input_is_valid('now', 'timestamptz')")))))
+
+(deftest relative-datetime-literals-belong-to-prepared-analysis
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 14")
+    (exec! c "CREATE TABLE clock_rows (origin timestamp, result timestamp)")
+    (exec! c "INSERT INTO clock_rows VALUES ('today', NULL)")
+    (exec! c (str "PREPARE clock_update AS UPDATE clock_rows SET result = 'today' "
+                  "WHERE origin = timestamp 'today'"))
+    (exec! c (str "PREPARE clock_input AS SELECT "
+                  "(timestamptz 'today' AT TIME ZONE 'UTC')::text AS fixed, "
+                  "('today'::text)::timestamp::text AS late"))
+    (let [result (fn []
+                   (with-open [stmt (.createStatement c)
+                               rs (.executeQuery stmt "EXECUTE clock_input")]
+                     (.next rs)
+                     [(.getString rs 1) (.getString rs 2)]))
+          [fixed late] (result)]
+      (exec! c "SET TIME ZONE -14")
+      (let [[fixed-after late-after] (result)]
+        (is (= fixed fixed-after))
+        (is (not= late late-after))
+        (is (= late-after (one c "SELECT timestamp 'today'::text")))
+        (is (not= fixed (one c "SELECT (timestamptz 'today' AT TIME ZONE 'UTC')::text")))
+        (exec! c "EXECUTE clock_update")
+        (is (= "1" (one c "SELECT count(*) FROM clock_rows WHERE origin = result")))))))
+
 (deftest a-month-name-names-a-month-wherever-it-falls
   ;; PostgreSQL's datetime input tokenises before it interprets
   ;; (`datetktbl` in datetime.c), so the month name is recognised in
@@ -703,13 +763,9 @@
       (is (= "00:00:00+00" (one c "SELECT ('allballs'::timetz)::text")))
       (is (= "00:00:00" (one c "SELECT ('ALLBALLS'::time)::text"))
           "datetime.c folds the token"))
-    (testing "the volatile ones are still refused, deliberately"
-      ;; `now` / `today` / `tomorrow` / `yesterday` take the statement's
-      ;; time, and a cast is constant-folded into a cached plan, so
-      ;; answering one here would freeze it. They need the deferred
-      ;; treatment `now()` gets.
-      (is (= "22007" (first (err-of c "SELECT 'now'::timestamp"))))
-      (is (= "22007" (first (err-of c "SELECT 'today'::date")))))))
+    (testing "relative inputs respect the target type"
+      (is (= "t" (one c "SELECT DATE 'today' = current_date")))
+      (is (= "22007" (first (err-of c "SELECT TIME 'today'")))))))
 
 (deftest the-bc-era-on-a-timestamp
   (with-open [c (jdbc)]

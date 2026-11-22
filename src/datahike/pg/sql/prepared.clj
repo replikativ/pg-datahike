@@ -1,5 +1,5 @@
 (ns datahike.pg.sql.prepared
-  "Detached analysis inputs for prepared statements containing OID literals.
+  "Detached analysis inputs for prepared statements containing context-sensitive literals.
 
    The source and observations distinguish re-lowering an analyzed statement
    from analyzing its original text after a dependency changes. No artifact
@@ -15,6 +15,7 @@
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.input :as input]
             [datahike.pg.schema :as schema]
+            [datahike.pg.sql.cast :as cast]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.classify :as classify]
             [datahike.pg.sql.expr :as expr]
@@ -80,9 +81,10 @@
 (defn- source-span
   "Validate a parser node's token coordinates against the lexical source.
    The literal must be unambiguous within that node; never search by value."
-  [node tokens]
-  (let [^ASTNodeAccess node (null-or-literal node)
-        ast (.getASTNode node)]
+  [^ASTNodeAccess node tokens ^ASTNodeAccess enclosing-cast]
+  ;; A typed literal such as TIMESTAMP 'now' has a synthetic StringValue.
+  ;; The enclosing cast still records its exact source span.
+  (let [ast (or (.getASTNode node) (some-> enclosing-cast .getASTNode))]
     (when-not ast (unsupported!))
     (let [first-token (.jjtGetFirstToken ast)
           last-token (.jjtGetLastToken ast)]
@@ -100,36 +102,47 @@
 (defn- sql-string [s]
   (str "'" (str/replace s "'" "''") "'"))
 
+(def ^:private datetime-input-oids
+  #{types/oid-date types/oid-time types/oid-timetz types/oid-timestamp types/oid-timestamptz})
+
+(defn- relative-datetime-input? [s]
+  (re-find #"(?i)\b(?:now|today|tomorrow|yesterday)\b" s))
+
+(defn- resolved-datetime [text oid]
+  (let [value (cast/cast-scalar text (type-spelling oid) {:explicit? true :prefer-local-datetime? true})]
+    (binding [types/*date-style* [:iso :ymd]
+              types/*time-zone* types/utc-zone]
+      (types/->pg-text value oid))))
+
 (defn- bind-literal!
-  ([state tokens node target-oid] (bind-literal! state tokens node target-oid true))
-  ([state tokens node target-oid typed?]
-   (when (and (literal? node) (or (alias-element target-oid) (= target-oid types/oid-oid)))
-     (when-not *capture-literals?* (unsupported!))
+  ([state tokens node target-oid] (bind-literal! state tokens node target-oid nil))
+  ([state tokens node target-oid enclosing-cast]
+   (when (literal? node)
      (let [node (null-or-literal node)
            text (expr/string-value-text ^StringValue node)
-           elem (types/array-oid->element-oid target-oid)
            alias (alias-element target-oid)
-           value (if elem
-                   (arrays/from-pg-text text (types/oid->elem-kw elem))
-                   (if alias
-                     (regoid/input (types/oid->pg-name target-oid) text)
-                     (input/parse types/oid-oid text)))
-          ;; A plain oid reads digits, not names. It still contributes a
-          ;; relation invalidation address, as ISREGCLASSCONST does.
-           [start end] (source-span node tokens)
-           storage (if elem (arrays/to-storage-text value) (str value))
-           replacement (if typed?
-                         (str "CAST(" (sql-string storage) " AS " (type-spelling target-oid) ")")
-                         (sql-string storage))
-           site {:start start :end end :oid target-oid :replacement replacement}
-           existing (get-in @state [:sites start])]
-       (when (and existing (not= site existing)) (unsupported!))
-       (when (>= (count (:sites @state)) max-sites) (unsupported!))
-       (swap! state assoc-in [:sites start] site)
-       (swap! state update :types conj target-oid)
-      ;; Array Consts do not contain scalar regclass Const nodes.
-       (when (and (not elem) (contains? #{types/oid-regclass types/oid-oid} target-oid))
-         (swap! state update :relation-oids conj (long value)))))))
+           datetime? (and (datetime-input-oids target-oid) (relative-datetime-input? text))]
+       (when (or alias (= target-oid types/oid-oid) datetime?)
+         (when-not *capture-literals?* (unsupported!))
+         (let [elem (types/array-oid->element-oid target-oid)
+               [start end] (source-span node tokens enclosing-cast)
+               storage (cond
+                         datetime? (resolved-datetime text target-oid)
+                         elem (arrays/to-storage-text (arrays/from-pg-text text (types/oid->elem-kw elem)))
+                         alias (str (regoid/input (types/oid->pg-name target-oid) text))
+                         :else (str (input/parse types/oid-oid text)))
+               replacement (if enclosing-cast
+                             (sql-string storage)
+                             (str "CAST(" (sql-string storage) " AS " (type-spelling target-oid) ")"))
+               site {:start start :end end :oid target-oid :replacement replacement}
+               existing (get-in @state [:sites start])]
+           (when (and existing (not= site existing)) (unsupported!))
+           (when (>= (count (:sites @state)) max-sites) (unsupported!))
+           (swap! state assoc-in [:sites start] site)
+           (swap! state update :types conj target-oid)
+           ;; Array constants carry no scalar relation dependency.
+           (when (contains? #{types/oid-regclass types/oid-oid} target-oid)
+             (swap! state update :relation-oids conj (Long/parseLong storage)))))))))
 
 (defn- metadata-row [db datom]
   (let [attr (dbi/-ident-for db (:a datom))]
@@ -393,7 +406,7 @@
                       (instance? CastExpression node)
                       (let [^CastExpression cast node
                             oid (source-types! state db (str (.getColDataType cast)))]
-                        (bind-literal! state tokens (.getLeftExpression cast) oid false))
+                        (bind-literal! state tokens (.getLeftExpression cast) oid cast))
 
                       (instance? Function node)
                       (let [^Function function node
@@ -565,7 +578,8 @@
                            (when (contains? schema attribute)
                              (map :v (take (inc max-rows) (d/datoms db :aevt attribute)))))]
     (and (some #(= :string (:type %)) tokens)
-         (or (some #(and (contains? #{:ident :quoted} (:type %))
+         (or (some #(and (= :string (:type %)) (relative-datetime-input? (:text %))) tokens)
+             (some #(and (contains? #{:ident :quoted} (:type %))
                          (type-name? (ident (:text %)))) tokens)
              (some type-name? (attribute-values :pg/type))
              (some type-name? (attribute-values :pg/array-elem))
@@ -574,7 +588,7 @@
                    (attribute-values :datahike.pg.function/arg-types))))))
 
 (defn analyze
-  "Capture supported OID literal coercions and exact analysis inputs.
+  "Capture supported OID and datetime literals and their analysis inputs.
    `parser-source` must be the parser-normalized SQL whose coordinates the
    pristine AST uses. Unsupported or oversized shapes return nil."
   [parser-source db parsed context]

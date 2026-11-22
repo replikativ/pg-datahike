@@ -135,11 +135,11 @@
    :file "time" :lines [46 48] :state :covered :impact :wrong-result
    :detail "A missing date for America/New_York is reported through pg_input_is_valid and pg_input_error_info."}
   {:id :timestamp-relative-input
-   :file "timestamp" :lines [15 24] :state :open :impact :unsupported
-   :detail "Relative timestamp input rejects today and aborts the subsequent transaction statements."}
+   :file "timestamp" :lines [13 45] :state :covered :impact :unsupported
+   :detail "Relative dates accept zone suffixes without changing the wall clock. Across transactions now changes, and within a transaction both inserts and queries use the same clock."}
   {:id :timestamptz-relative-input
-   :file "timestamptz" :lines [15 25] :state :open :impact :unsupported
-   :detail "Relative timestamptz input rejects today and aborts the subsequent transaction statements."}
+   :file "timestamptz" :lines [13 46] :state :covered :impact :unsupported
+   :detail "Relative dates resolve in the session zone or an explicit offset. Consecutive transactions get distinct values for now, with matching values within a transaction."}
   {:id :timestamptz-dynamic-zone-abbreviation
    :file "timestamptz" :lines [569 577] :state :open :impact :unsupported
    :detail "AT TIME ZONE rejects MSK. Offsets for dynamic abbreviations depend on the date and transition."}
@@ -149,6 +149,9 @@
   {:id :timetz-local-view
    :file "timetz" :lines [91 102] :state :open :impact :unsupported
    :detail "AT LOCAL fails to parse in the view definition, aborting the remaining conversion comparisons."}
+  {:id :timetz-addition-diagnostic
+   :file "timetz" :lines [64 64] :state :covered :impact :internal-error
+   :detail "Adding two timetz values raises SQLSTATE 42883 during analysis, including on an empty table."}
   {:id :timetz-interval-offset
    :file "timetz" :lines [103 107] :state :covered :impact :unsupported
    :detail "Stored timetz values produce the same results with a POSIX name and an equivalent interval. The gate also checks stored intervals and timezone(interval, value)."}

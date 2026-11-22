@@ -36,7 +36,35 @@
             [datahike.pg.datetime.lex :as lex]
             [datahike.pg.datetime.parse :as parse]
             [datahike.pg.datetime.zone :as zone]
-            [datahike.pg.errors :as errors]))
+            [datahike.pg.errors :as errors])
+  (:import [java.time ZoneId ZonedDateTime]
+           [java.util Date]))
+
+(def ^:dynamic *transaction-time*
+  "The SQL transaction's clock, if called from a session."
+  nil)
+(def ^:dynamic *analysis-zone*
+  "The original zone when lowering an existing prepared literal again."
+  nil)
+(def ^:dynamic *on-clock-read*
+  "Called when an input actually depends on the clock."
+  nil)
+
+(defn- decoder-context [{:keys [date-order now session-zone]}]
+  (let [^Date time *transaction-time*
+        ^ZoneId session-zone (or *analysis-zone* session-zone zone/utc)]
+    {:date-order date-order
+     :zone? true
+     :session-zone session-zone
+     :now (or now
+              (delay
+                (when *on-clock-read* (*on-clock-read*))
+                (when time
+                  (let [at (ZonedDateTime/ofInstant (.toInstant time) session-zone)]
+                    {:tm {:year (.getYear at) :mon (.getMonthValue at) :mday (.getDayOfMonth at)
+                          :hour (.getHour at) :min (.getMinute at) :sec (.getSecond at)
+                          :usec (quot (.getNano at) 1000)}
+                     :west (- (.getTotalSeconds (.getOffset at)))}))))}))
 
 (def ^:private dterr->error
   {:bad-format [:invalid-datetime-format nil]
@@ -173,10 +201,10 @@
    `'2000-01-01 12:00:00 PST'::date` is 2000-01-01 -- because
    `date_in` passes a non-NULL `tzp` (date.c:134) like every other
    input function."
-  [^String s {:keys [date-order now] :as _ctx}]
+  [^String s ctx]
   (with-dterr "date" s
     (let [r (parse/decode-datetime (lex/tokenize s (:date lex/buflen-for))
-                                   {:date-order date-order :now now :zone? true})]
+                                   (decoder-context ctx))]
       (case (:dtype r)
         :date (let [tm (:tm r)]
                 (when-not (valid-julian? tm) (raise! :field-overflow "date" s))
@@ -190,10 +218,10 @@
   "`time_in` (date.c:1368-1404). Microseconds since midnight.
    86400000000 is legal and renders as `24:00:00` -- there is no day to
    carry into. No zone."
-  [^String s {:keys [date-order now] :as _ctx}]
+  [^String s ctx]
   (with-dterr "time" s
     (let [r (parse/decode-time-only (lex/tokenize s (:time lex/buflen-for))
-                                    {:date-order date-order :now now :zone? true})]
+                                    (decoder-context ctx))]
       {:kind :time :usec (time->usec (:tm r))})))
 
 (defn timetz-in
@@ -203,10 +231,10 @@
    literal supplies the date, or when the zone is a FIXED offset --
    which is why `'12:00 UTC'::timetz` works and
    `'12:00 America/New_York'::timetz` does not."
-  [^String s {:keys [date-order now session-zone] :as _ctx}]
+  [^String s ctx]
   (with-dterr "time with time zone" s
-    (let [r (parse/decode-time-only (lex/tokenize s (:timetz lex/buflen-for))
-                                    {:date-order date-order :now now :zone? true})
+    (let [{:keys [session-zone] :as ctx} (decoder-context ctx)
+          r (parse/decode-time-only (lex/tokenize s (:timetz lex/buflen-for)) ctx)
           z (:zone r)
           ;; Forced only on the branches that need a date, so an
           ;; ordinary time never reads the clock.
@@ -231,10 +259,10 @@
   "`timestamp_in` (timestamp.c:160-220). No zone is kept -- the literal
    may CARRY one and it is parsed and then ignored, which is why
    `'2001-02-03 04:05:06+05:30:30'::timestamp` is 04:05:06 unshifted."
-  [^String s {:keys [date-order now] :as _ctx}]
+  [^String s ctx]
   (with-dterr "timestamp" s
     (let [r (parse/decode-datetime (lex/tokenize s (:timestamp lex/buflen-for))
-                                   {:date-order date-order :now now :zone? true})]
+                                   (decoder-context ctx))]
       (case (:dtype r)
         :date {:kind :timestamp :usec (tm->timestamp (:tm r) nil "timestamp" s)}
         :late {:kind :infinity}
@@ -249,10 +277,10 @@
   "`timestamptz_in` (timestamp.c:412-470). As `timestamp-in`, and the
    zone IS kept -- resolved here, after the date is known, and folded
    into the value so that what comes back is a UTC instant."
-  [^String s {:keys [date-order now session-zone] :as _ctx}]
+  [^String s ctx]
   (with-dterr "timestamp with time zone" s
-    (let [r (parse/decode-datetime (lex/tokenize s (:timestamptz lex/buflen-for))
-                                   {:date-order date-order :now now :zone? true})]
+    (let [{:keys [session-zone] :as ctx} (decoder-context ctx)
+          r (parse/decode-datetime (lex/tokenize s (:timestamptz lex/buflen-for)) ctx)]
       (case (:dtype r)
         :date {:kind :timestamptz
                :usec (tm->timestamp (:tm r)

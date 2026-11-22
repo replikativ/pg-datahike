@@ -179,6 +179,8 @@
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE empty_times (t time)")
     (is (= "42725" (state c "SELECT t + time '00:01' FROM empty_times")))
+    (exec! c "CREATE TABLE empty_zoned_times (t timetz)")
+    (is (= "42883" (state c "SELECT t + time with time zone '00:01' FROM empty_zoned_times")))
     (with-open [st (.createStatement c)
                 rs (.executeQuery st "SELECT EXTRACT(SECOND FROM TIME '13:30:25.575401')")]
       (is (= "extract" (.getColumnLabel (.getMetaData rs) 1)))

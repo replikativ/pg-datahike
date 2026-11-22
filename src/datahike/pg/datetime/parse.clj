@@ -64,17 +64,9 @@
 (def ^:private hr24 :hr24)
 
 (defn- clock!
-  "The transaction timestamp, or a refusal.
-
-   A caller that cannot supply one passes no `:now`, and the four
-   clock-reading tokens then fail as unparseable -- which is what the
-   cast path needs. Their value is the STATEMENT's, and a cast is
-   constant-folded into a cached plan, so folding `'today'::date` once
-   would freeze it for the life of that plan. Supporting them properly
-   needs the deferred treatment `now()` gets; until then refusing is
-   the honest answer and matches what the server already does."
+  "Resolve the optional transaction clock only for input that needs it."
   [now]
-  (or now (dec/dterr :bad-format)))
+  (or (force now) (dec/dterr :bad-format)))
 
 (defn- claim
   "Merge `tmask` into `fmask`, refusing an overlap. The C's

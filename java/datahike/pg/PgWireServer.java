@@ -189,6 +189,9 @@ public final class PgWireServer {
             return executeInGroup(sql);
         }
 
+        /** Close the clock scope of a Simple Query or a Sync group. */
+        default void endQueryGroup() { /* default: no-op */ }
+
         /**
          * Extended Query protocol Parse phase. Translate the SQL once
          * and return an opaque state object that subsequent Bind/
@@ -1234,6 +1237,7 @@ public final class PgWireServer {
                         // which every non-holdable portal was created. Do not
                         // retain eager rows or allow stale resume after Sync.
                         portals.clear();
+                        handler.endQueryGroup();
                         sendReadyForQuery(out, txStatus[0]);
                         out.flush();
                         inError[0] = false;
@@ -1293,6 +1297,7 @@ public final class PgWireServer {
                         copyState.simpleQuery = null;
                         if (failed && txStatus[0] == 'T') txStatus[0] = 'E';
                         if (simpleQuery == null) {
+                            handler.endQueryGroup();
                             sendReadyForQuery(out, txStatus[0]);
                             out.flush();
                         } else if (failed) {
@@ -1779,6 +1784,7 @@ public final class PgWireServer {
                 handler.markTransactionFailed();
                 txStatus[0] = 'E';
             }
+            handler.endQueryGroup();
             sendReadyForQuery(out, txStatus[0]);
             out.flush();
             return;
@@ -1796,6 +1802,7 @@ public final class PgWireServer {
         // what splitStatements' blank-fragment skipping mirrors.
         if (statements.length == 0) {
             sendEmptyQueryResponse(out);
+            handler.endQueryGroup();
             sendReadyForQuery(out, txStatus[0]);
             out.flush();
             return;
@@ -2013,6 +2020,7 @@ public final class PgWireServer {
             }
         }
 
+        handler.endQueryGroup();
         sendReadyForQuery(out, txStatus[0]);
         out.flush();  // Single flush for all response messages
     }
@@ -2949,6 +2957,7 @@ public final class PgWireServer {
         if (txStatus[0] != 'T') {
             portals.clear();
         }
+        handler.endQueryGroup();
         sendReadyForQuery(out, txStatus[0]);
         out.flush();
     }

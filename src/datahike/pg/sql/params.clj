@@ -27,6 +27,7 @@
    (:schema db) doesn't surface."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.cast :as sql-cast]
@@ -195,11 +196,11 @@
   nil)
 
 (def ^:dynamic *statement-time*
-  "The wall-clock instant captured once at statement execution. SQL stable
-   value functions (now/current_timestamp/current_date/current_time and
-   their local variants) derive from this value so sibling calls agree.
-   Nil during parsing and non-server use."
+  "The wall-clock instant captured at statement execution."
   nil)
+
+(defn transaction-time []
+  (or datetime-in/*transaction-time* *statement-time* (java.util.Date.)))
 
 (def ^:dynamic *analysis-only?*
   "Internal lowering mode for plain EXPLAIN. Catalog/schema reads are allowed;

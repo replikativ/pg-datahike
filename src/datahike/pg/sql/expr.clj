@@ -1724,7 +1724,7 @@
       ;; NOW() → current timestamp as java.util.Date
       (= fname "now")
       (let [fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))
-            now-fn (fn [] (or params/*statement-time* (java.util.Date.)))]
+            now-fn params/transaction-time]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj now-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -4706,15 +4706,24 @@
 
       :else identity)))
 
-(defn time-now-cast?
-  "A time literal whose constant depends on when the statement is parsed."
+(defn- cast-operand [^CastExpression cast]
+  (let [inner (.getLeftExpression cast)]
+    (if (and (instance? ParenthesedExpressionList inner) (= 1 (count inner)))
+      (first inner)
+      inner)))
+
+(defn- text-to-datetime-cast? [^CastExpression cast]
+  (let [inner (cast-operand cast)]
+    (and (#{:date :time :timestamp} (types/cast-category (str (.getColDataType cast))))
+         (instance? CastExpression inner)
+         (= :text (types/cast-category (str (.getColDataType ^CastExpression inner)))))))
+
+(defn runtime-datetime-cast?
+  "A cast from already typed text requires execution-time conversion."
   [node]
   (when (instance? CastExpression node)
-    (let [^CastExpression cast node
-          inner (.getLeftExpression cast)]
-      (and (= :time (types/cast-category (str (.getColDataType cast))))
-           (instance? StringValue inner)
-           (= "now" (str/lower-case (str/trim (string-value-text inner))))))))
+    (or (text-to-datetime-cast? node)
+        (runtime-datetime-cast? (cast-operand node)))))
 
 (defn translate-cast-expr
   "Translate a CAST expression to a Datalog function binding.
@@ -4805,14 +4814,6 @@
         zone-shift (zone-crossing src-oid target-oid types/*time-zone*)
         inner-raw (zone-shift inner-raw)]
     (cond
-      (time-now-cast? cast-expr)
-      (let [precision (some-> (re-find #"\(\s*(\d+)\s*\)" type-str) second parse-long)
-            kind (if (= target-oid types/oid-timetz) "current_time" "localtime")]
-        ;; PostgreSQL reads the special text literal during parse. Keep it
-        ;; in this prepared plan and out of the shared translation cache.
-        (params/session-dependent!)
-        (statement-clock kind precision types/*time-zone*))
-
       is-vector?
       (let [cast1 #(sql-cast/cast-scalar % type-str {:explicit? true})]
         (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
@@ -4993,7 +4994,8 @@
         (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
         result-var)
       :else
-      (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
+      (if (and (not (symbol? inner-raw)) (not (seq? inner-raw))
+               (not (and any-ts? (text-to-datetime-cast? cast-expr))))
       ;; Constant value — cast at translation time
         (cond
           ;; Casting NULL yields NULL for every target type. Without this
@@ -5360,6 +5362,11 @@
               :ambiguous-function
               {:message "operator is not unique: time without time zone + time without time zone"
                :hint "Could not choose a best candidate operator. You might need to add explicit type casts."}))
+      (and (= op-sym '+) (= types/oid-timetz loid) (= types/oid-timetz roid))
+      (throw (errors/pg-error
+              :undefined-function
+              {:message "operator does not exist: time with time zone + time with time zone"
+               :hint "No operator matches the given name and argument types. You might need to add explicit type casts."}))
       (and (= op-sym '-) (= types/oid-time loid) (= types/oid-time roid))
       'datahike.pg.query-fns/sql-time-
 
@@ -6890,7 +6897,7 @@
     array-oid))
 
 (defn- statement-clock
-  "The SQL value functions over the statement's time, read in the session
+  "The SQL value functions over the transaction's time, read in the session
    zone `zone` (captured at translation, and part of the plan-cache key):
    current_timestamp is the instant; current_time the wall clock with the
    zone's offset at that instant; localtimestamp and localtime the wall
@@ -6903,7 +6910,7 @@
    -- the regression suite's own check that the two agree -- was false
    once the cast honoured the zone and the value functions did not."
   [kind precision zone]
-  (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))
+  (let [^java.util.Date st (params/transaction-time)
         instant (.toInstant st)
         p (long (min 6 (max 0 (or precision 6))))
         factor (long (Math/pow 10 (- 9 p)))
@@ -6915,7 +6922,7 @@
                          (* (quot (.getNano i) factor) factor)))
         zdt (.atZone instant ^java.time.ZoneId (or zone java.time.ZoneOffset/UTC))]
     (case kind
-      "current_timestamp" (java.util.Date/from instant)
+      "current_timestamp" (java.sql.Timestamp/from instant)
       "current_time" (.toOffsetTime (.toOffsetDateTime zdt))
       "localtimestamp" (.toLocalDateTime zdt)
       "localtime" (.toLocalTime zdt)
@@ -8093,14 +8100,14 @@
           now-fn (cond
                    (or (= key-str "current_timestamp")
                        (= key-str "now()"))
-                   (fn [] (or params/*statement-time* (java.util.Date.)))
+                   params/transaction-time
                    ;; LocalDate (not a midnight java.util.Date) so the
                    ;; result renders as "yyyy-MM-dd" with OID 1082, like
                    ;; PG's date type.
                    (contains? #{"current_date" "current_time"} key-str)
                    (let [zone types/*time-zone*]
                      (fn [] (statement-clock key-str nil zone)))
-                   :else (fn [] (or params/*statement-time* (java.util.Date.))))
+                   :else params/transaction-time)
           fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))]
       (swap! (:in-params ctx) conj fn-param)
       (swap! (:in-args ctx) conj now-fn)

@@ -99,16 +99,29 @@
     {:name "timetz", :boundaries #{:typmods :casts :time-zones :temporal}, :mode :discovery
      :blockers #{:at-local :temporal-operator-diagnostics}
      :strict-slices
-     [{:id :timetz-interval-offset
+     [{:id :timetz-addition-diagnostic
+       :source-lines [64 64]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "time-expression-metadata"}
+      {:id :timetz-interval-offset
        :source-lines [103 107]
        :gate "test/datahike/test/pg_type_output_test.clj"
        :test-var "at-time-zone-with-interval"}]}
     {:name "timestamp", :boundaries #{:functions :casts :operators :temporal}, :mode :discovery
-     :blockers #{:relative-datetime-input :temporal-overflow :temporal-diagnostics}}
+     :blockers #{:temporal-overflow :temporal-diagnostics}
+     :strict-slices
+     [{:id :timestamp-relative-input
+       :source-lines [13 45]
+       :gate "test/datahike/test/pg_temporal_text_test.clj"
+       :test-var "relative-datetime-input-uses-transaction-time"}]}
     {:name "timestamptz",
      :boundaries #{:time-zones :functions :casts :operators :temporal}, :mode :discovery
-     :blockers #{:relative-datetime-input :at-local :timezone-abbreviations
-                 :temporal-overflow :temporal-diagnostics}}
+     :blockers #{:at-local :timezone-abbreviations :temporal-overflow :temporal-diagnostics}
+     :strict-slices
+     [{:id :timestamptz-relative-input
+       :source-lines [13 46]
+       :gate "test/datahike/test/pg_temporal_text_test.clj"
+       :test-var "relative-datetime-input-uses-transaction-time"}]}
     {:name "interval", :boundaries #{:functions :casts :operators :temporal}, :mode :discovery
      :blockers #{:interval-window-aggregates}
      :accepted-differences #{:interval-output-style}
