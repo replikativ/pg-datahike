@@ -95,6 +95,17 @@
       (is (= [["2024-03-01 00:30:00.654321+00" "2024-03-01 01:30:00.654321"]]
              (rows c (str "SELECT timestamp '2024-03-01 00:30:00.654321' AT TIME ZONE 'UTC', "
                           "timestamptz '2024-03-01 00:30:00.654321+00' AT TIME ZONE 'Europe/Berlin'")))))
+    (testing "the session offset reported by PostgreSQL is a valid zone"
+      (exec! c "SET TIME ZONE 2.5")
+      (is (= [["<+02:30>-02:30" "10:30:00+02:30" "2020-01-01 12:30:00.5"]]
+             (rows c (str "SELECT current_setting('TimeZone'), "
+                          "ttz AT TIME ZONE current_setting('TimeZone'), "
+                          "tz AT TIME ZONE current_setting('TimeZone') FROM tv WHERE id = 1"))))
+      (exec! c "SET TIME ZONE '<-07:30>+07:30'")
+      (is (= [["<-07:30>+07:30" "00:30:00-07:30"]]
+             (rows c (str "SELECT current_setting('TimeZone'), "
+                          "ttz AT TIME ZONE current_setting('TimeZone') FROM tv WHERE id = 1")))))
+    (is (= "22023" (state c "SELECT ts AT TIME ZONE '<EAST>-02:60' FROM tv")))
     (is (= "22023" (state c "SELECT ts AT TIME ZONE 'Mars/Olympus' FROM tv")))))
 
 (deftest time-and-money-input

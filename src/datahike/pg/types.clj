@@ -1490,6 +1490,18 @@
       (when (clojure.string/ends-with? base "[]")
         (or (:elem (parse-array-type-name sql-type-name)) :text)))))
 
+(defn- quoted-posix-zone-offset
+  "Fixed offset from a POSIX TZ string with a quoted abbreviation, such as
+   the <+02:30>-02:30 returned by SHOW after SET TIME ZONE 2.5."
+  [zone]
+  (when-let [[_ sign hour minute second]
+             (re-matches #"<[^>]*>([+-]?)(\d{1,2})(?::(\d{1,2})(?::(\d{1,2}))?)?" zone)]
+    (let [minute (parse-long (or minute "0"))
+          second (parse-long (or second "0"))
+          west (+ (* 3600 (parse-long hour)) (* 60 minute) second)]
+      (when (and (< minute 60) (<= second 60) (<= west (* 18 3600)))
+        (java.time.ZoneOffset/ofTotalSeconds (int (if (= "-" sign) west (- west))))))))
+
 (defn resolve-time-zone
   "A PostgreSQL time-zone spec as a java.time ZoneId. Names and
    abbreviations resolve through the tz database. A NUMERIC spec -- `+05`,
@@ -1504,8 +1516,11 @@
                                (Long/parseLong (or sec "0")))]
                   (java.time.ZoneOffset/ofTotalSeconds
                    (int (if (= "-" sign) total (- total))))))]
-    (if-let [[_ sign h m sec] (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
-      (posix sign h m sec)
+    (if-let [offset (or (quoted-posix-zone-offset z)
+                        (when-let [[_ sign h m sec]
+                                   (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
+                          (posix sign h m sec)))]
+      offset
       (try
         (java.time.ZoneId/of z java.time.ZoneId/SHORT_IDS)
         (catch Exception _
@@ -1891,7 +1906,9 @@
          :text (str "<" (tz-offset-text secs) ">" (tz-offset-text (- secs)))})
 
       :else
-      (if-let [[canonical zone] (get @tz-names low)]
+      (if-let [[canonical zone] (or (get @tz-names low)
+                                    (when-let [zone (quoted-posix-zone-offset raw)]
+                                      [raw zone]))]
         {:zone zone :text canonical}
         ;; POSIX `[STD]offset`, no DST part: positive is west.
         (if-let [[_ sign h m] (re-matches #"(?:[A-Za-z]{3,})?([+-]?)(\d{1,2})(?::(\d{2}))?" raw)]
