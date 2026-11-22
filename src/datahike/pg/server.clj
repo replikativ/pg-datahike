@@ -1423,31 +1423,43 @@
        (= :db.fn/call (first op))
        (::record-effects-from-report (meta (second op)))))
 
+(defn- retracts-entities? [tx-data]
+  (some #(and (vector? %)
+              (#{:db/retractEntity :db.fn/retractEntity} (first %)))
+        tx-data))
+
 (defn- committed-write-eas
-  "Include indirect effects of entity retractions and deferred sequence
-   cleanup. Keep submitted row tombstones and unknown operations opaque."
+  "Record deferred sequence cleanup and indirect effects of entity retractions.
+   A deleted entity conflicts on every attr. Other unknown writes stay opaque."
   [{:keys [db-before db-after tx-data]} submitted]
   (let [estimated (tx-buffer-eas submitted db-before)
         deferred? (and (= ::opaque estimated) (some record-effects-from-report? submitted))
         direct (if deferred?
                  (tx-buffer-eas (remove record-effects-from-report? submitted) db-before)
                  estimated)]
-    (if (and (set? direct)
-             (or deferred?
-                 (some #(and (vector? %)
-                             (#{:db/retractEntity :db.fn/retractEntity} (first %)))
-                       submitted)))
-      (into direct
-            (keep (fn [^datahike.datom.Datom datom]
-                    (let [attribute (.-a datom)
-                          ident (if (number? attribute)
-                                  (or (dbi/-ident-for db-after attribute)
-                                      (dbi/-ident-for db-before attribute)
-                                      attribute)
-                                  attribute)]
-                      (when-not (= :db/txInstant ident)
-                        [(.-e datom) ident]))))
-            tx-data)
+    (if (and (set? direct) (or deferred? (retracts-entities? submitted)))
+      (let [with-deleted-entities
+            (into direct
+                  (comp (remove :added)
+                        (map :e)
+                        (remove #(contains? direct [% ::all]))
+                        (distinct)
+                        (filter #(empty? (dbi/datoms db-after :eavt [%])))
+                        (map #(vector % ::all)))
+                  tx-data)]
+        (into with-deleted-entities
+              (keep (fn [^datahike.datom.Datom datom]
+                      (let [eid (.-e datom)
+                            attribute (.-a datom)
+                            ident (if (number? attribute)
+                                    (or (dbi/-ident-for db-after attribute)
+                                        (dbi/-ident-for db-before attribute)
+                                        attribute)
+                                    attribute)]
+                        (when (and (not= :db/txInstant ident)
+                                   (not (contains? with-deleted-entities [eid ::all])))
+                          [eid ident]))))
+              tx-data))
       direct)))
 
 (defn- transact-recorded!
@@ -7045,16 +7057,40 @@
   ;; transaction's window read and its own transact.
   (Object.))
 
+(defn- with-retraction-overlap-guard
+  "Check indirect changes at the end of replay using the same basis as
+   the conflict window. Only inspect keys written by concurrent commits."
+  [buffer basis their-eas]
+  (if (retracts-entities? buffer)
+    (conj buffer
+          [:db.fn/call
+           (fresh-insert-fn
+            (fn [txdb]
+              (when (or (not= (:max-tx basis) (:max-tx txdb))
+                        (some (fn [[eid attr]]
+                                (let [key (if (= ::all attr) [eid] [eid attr])
+                                      before (seq (dbi/datoms basis :eavt key))
+                                      after (seq (dbi/datoms txdb :eavt key))]
+                                  (or (not= before after)
+                                      (not= (map :tx before) (map :tx after))
+                                      (and (nil? after)
+                                           (seq (dbi/datoms basis :eavt [eid]))
+                                           (empty? (dbi/datoms txdb :eavt [eid]))))))
+                              (when (set? their-eas) their-eas)))
+                (throw (ex-info "could not serialize access due to concurrent update"
+                                {:error :serialization-failure
+                                 :detail "entity retraction overlaps a concurrent write"})))
+              []))])
+    buffer))
+
 (defn- rebase-tx-state!
   "After a row-lock wait, the values this transaction has read are stale
    by exactly the awaited holder's commit. Re-anchor the speculative
    overlay on the latest committed database so the retried statement
    computes against fresh row values; this also narrows the commit-time
-   conflict window to post-rebase commits. Replaying the buffer is only
-   attempted when it is deterministic (real-eid ops, no tempids); a
-   replay overlap with an intervening commit throws the same
-   serialization-failure the commit itself would have raised — just
-   earlier. Temporal-wrapped speculative dbs opt out entirely."
+   conflict window to post-rebase commits. Replay rebuilds temporary
+   entity assignments and checks for conflicts with intervening writes.
+   Temporal-wrapped speculative databases keep their original snapshot."
   [conn tx-state]
   (let [ts @tx-state
         spec (:speculative-db ts)]
@@ -7079,7 +7115,8 @@
                     (throw (ex-info "could not serialize access due to concurrent update"
                                     {:error :serialization-failure
                                      :detail (str "rebase base=" begin ", current=" cur)})))
-                  (let [rep (dc/with base buf nil (:tx-options ts))]
+                  (let [guarded (with-retraction-overlap-guard buf base their)
+                        rep (dc/with base guarded nil (:tx-options ts))]
                     (unique-constraints/validate-report! rep)
                     (swap! tx-state assoc
                            :speculative-db (:db-after rep)
@@ -7153,43 +7190,33 @@
           real-db (d/db conn)
           current-max-tx (when begin-max-tx (:max-tx real-db))
           advanced? (and begin-max-tx current-max-tx
-                         (> current-max-tx begin-max-tx))]
-    ;; Concurrent-write detection: fire 40001 only when our write set
-    ;; overlaps a concurrent committer's. Preferred check is ROW-level
-    ;; ([eid attr] pairs) against the recent-commit ring — O(concurrent
-    ;; writes) and no false abort when two transactions update different
-    ;; rows of the same column.
-      (when (and (seq buf) advanced?)
-        (let [our-eas (tx-buffer-eas buf real-db)
-              their-eas (ring-write-eas-graced (db-ring-key real-db)
-                                               begin-max-tx current-max-tx)
-            ;; No attribute-level whole-database fallback here anymore:
-            ;; an unresolvable window (ring gap after the grace loop, or
-            ;; an unattributable buffer) aborts conservatively instead.
-            ;; A spurious 40001 costs the client one retry; the old scan
-            ;; cost seconds — while row locks were held, which convoyed
-            ;; every other writer (measured: tpcb c4 collapsed to 3 tps).
-              conflict?
-              (cond
-                (= ::gap their-eas) true
+                         (> current-max-tx begin-max-tx))
+          guarded
+          (if (and (seq buf) advanced?)
+            (let [our-eas (tx-buffer-eas buf real-db)
+                  their-eas (ring-write-eas-graced (db-ring-key real-db)
+                                                   begin-max-tx current-max-tx)
+                  conflict?
+                  (cond
+                    (= ::gap their-eas) true
 
-                ;; nextval commits outside the surrounding transaction. They
-                ;; do not conflict unless this transaction directly mutates
-                ;; the same private sequence storage.
-                (= ::sequence-only their-eas)
-                (some direct-sequence-value-write? buf)
+                    ;; nextval reservations commit outside the surrounding
+                    ;; SQL transaction and only conflict with direct writes
+                    ;; to the sequence's own storage.
+                    (= ::sequence-only their-eas)
+                    (some direct-sequence-value-write? buf)
 
-                (not= ::opaque our-eas)
-                (eas-overlap? our-eas their-eas)
+                    (= ::opaque our-eas) true
 
-                :else true)]
-          (when conflict?
-            (throw (ex-info "could not serialize access due to concurrent update"
-                            {:error  :serialization-failure
-                             :detail (str "base=" begin-max-tx
-                                          ", current=" current-max-tx)})))))
-      (when (seq buf)
-        (transact-recorded! conn buf (:tx-options @tx-state)))
+                    :else (eas-overlap? our-eas their-eas))]
+              (when conflict?
+                (throw (ex-info "could not serialize access due to concurrent update"
+                                {:error :serialization-failure
+                                 :detail (str "base=" begin-max-tx ", current=" current-max-tx)})))
+              (with-retraction-overlap-guard buf real-db their-eas))
+            (with-retraction-overlap-guard buf real-db nil))]
+      (when (seq guarded)
+        (transact-recorded! conn guarded (:tx-options @tx-state)))
       ;; A successful DDL commit publishes schema/catalog changes after the
       ;; statement-level cache bust. Advance once more now so a concurrent
       ;; session that revalidated against the pre-commit DB cannot retain a

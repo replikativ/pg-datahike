@@ -9,7 +9,7 @@
             [datahike.api :as d]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager SQLException Statement]))
 
 (def ^:dynamic *conn* nil)
 (def ^:dynamic *port* nil)
@@ -172,6 +172,13 @@
              (pairs a (str "SELECT d.id, t.id FROM replay_doc d JOIN replay_target t "
                            "ON d.link = t.db_id WHERE d.id = 1")))))))
 
+(defn- statement-state [^Statement statement sql]
+  (try
+    (.execute statement sql)
+    nil
+    (catch SQLException exception
+      (.getSQLState exception))))
+
 (deftest deleting-a-native-reference-target-records-the-inbound-write
   (with-open [a (jdbc)
               b (jdbc)
@@ -182,11 +189,87 @@
     (is (= 1 (.executeUpdate sb "DELETE FROM company WHERE id = 1")))
     (is (= [["Alice" nil]]
            (pairs b "SELECT name, company FROM person WHERE id = 1")))
-    (is (= "40001"
-           (try
-             (.execute sa "COMMIT")
-             nil
-             (catch java.sql.SQLException e
-               (.getSQLState e)))))
+    (is (= "40001" (statement-state sa "COMMIT")))
     (is (= [["Alice" nil]]
            (pairs b "SELECT name, company FROM person WHERE id = 1")))))
+
+(defn- check-inbound-reference-conflict [next-command]
+  (with-open [a (jdbc)
+              b (jdbc)
+              sa (.createStatement a)
+              sb (.createStatement b)]
+    (.execute sa "BEGIN")
+    (is (= 1 (.executeUpdate sa "DELETE FROM company WHERE id = 1")))
+    (is (= 1 (.executeUpdate sb "UPDATE person SET company = 1 WHERE id = 3")))
+    (is (= "40001" (statement-state sa next-command)))
+    (.execute sa "ROLLBACK")
+    (is (= [["Charlie" "Acme"]]
+           (pairs b (str "SELECT p.name, c.name FROM person p JOIN company c "
+                         "ON p.company = c.db_id WHERE p.id = 3"))))))
+
+(deftest commit-does-not-remove-a-concurrently-written-inbound-reference
+  (check-inbound-reference-conflict "COMMIT"))
+
+(deftest rebase-does-not-remove-a-concurrently-written-inbound-reference
+  (check-inbound-reference-conflict "UPDATE person SET name = 'Alice updated' WHERE id = 1"))
+
+(deftest replay-preserves-a-concurrent-reference-to-a-different-target
+  (with-open [a (jdbc)
+              b (jdbc)
+              sa (.createStatement a)
+              sb (.createStatement b)]
+    (.execute sa "BEGIN")
+    (is (= 1 (.executeUpdate sa "DELETE FROM company WHERE id = 1")))
+    (is (= 1 (.executeUpdate sb "UPDATE person SET company = 2 WHERE id = 1")))
+    (.execute sa "COMMIT")
+    (is (= [["Alice" "Globex"]]
+           (pairs b (str "SELECT p.name, c.name FROM person p JOIN company c "
+                         "ON p.company = c.db_id WHERE p.id = 1"))))))
+
+(defn- install-component! [row]
+  (d/transact *conn* [{:db/ident :person/component :db/valueType :db.type/ref
+                       :db/cardinality :db.cardinality/one :db/isComponent true}
+                      {:db/ident :component_data/id :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}
+                      {:db/ident :component_data/note :db/valueType :db.type/string
+                       :db/cardinality :db.cardinality/one}])
+  (d/transact *conn* [{:db/id [:person/id 1] :person/component row}]))
+
+(deftest deleting-a-component-conflicts-with-a-new-attribute-on-it
+  (install-component! {:component_data/id 10})
+  (with-open [a (jdbc)
+              b (jdbc)
+              sa (.createStatement a)
+              sb (.createStatement b)]
+    (.execute sa "BEGIN")
+    (is (= 1 (.executeUpdate sa "UPDATE component_data SET note = 'changed' WHERE id = 10")))
+    (is (= 1 (.executeUpdate sb "DELETE FROM person WHERE id = 1")))
+    (is (= "40001" (statement-state sa "COMMIT")))
+    (is (= [] (pairs b "SELECT id, note FROM component_data")))))
+
+(deftest replayed-component-deletion-conflicts-with-a-concurrent-null-assignment
+  (install-component! {:component_data/id 10 :component_data/note "old"})
+  (with-open [a (jdbc)
+              b (jdbc)
+              sa (.createStatement a)
+              sb (.createStatement b)]
+    (.execute sa "BEGIN")
+    (is (= 1 (.executeUpdate sa "DELETE FROM person WHERE id = 1")))
+    (is (= 1 (.executeUpdate sb "UPDATE component_data SET note = NULL WHERE id = 10")))
+    (is (= "40001" (statement-state sa "COMMIT")))
+    (is (= [["10" nil]] (pairs b "SELECT id, note FROM component_data")))))
+
+(deftest replay-rechecks-the-basis-at-the-writer
+  (with-open [a (jdbc)
+              sa (.createStatement a)]
+    (.execute sa "BEGIN")
+    (is (= 1 (.executeUpdate sa "DELETE FROM company WHERE id = 1")))
+    (let [transact-recorded @#'pg/transact-recorded!]
+      (with-redefs-fn {#'pg/transact-recorded!
+                       (fn [conn operations options]
+                         (d/transact conn [[:db/add [:person/id 3] :person/company [:company/id 1]]])
+                         (transact-recorded conn operations options))}
+        #(is (= "40001" (statement-state sa "COMMIT")))))
+    (is (= [["Charlie" "Acme"]]
+           (pairs a (str "SELECT p.name, c.name FROM person p JOIN company c "
+                         "ON p.company = c.db_id WHERE p.id = 3"))))))
