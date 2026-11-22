@@ -501,6 +501,8 @@
     ;; wrong for the same reason a bare float8 was.
      (or (instance? Float v) (instance? Double v))
      ((requiring-resolve 'datahike.pg.types/float->pg-text) v (instance? Float v))
+     (and (instance? java.math.BigDecimal v) (not= types/oid-money elem-oid))
+     (.toPlainString ^java.math.BigDecimal v)
      (and (number? v)
           (not (contains? #{types/oid-money types/oid-regproc types/oid-regprocedure types/oid-regclass types/oid-regtype types/oid-regnamespace} elem-oid)))
      (str v)
@@ -810,3 +812,20 @@
         (array elem-type [] [0] (or lbounds [1]))
         (let [[coerced dims] (coerce-tree tree elem-type)]
           (array elem-type coerced dims (or lbounds (vec (repeat (max 1 (count dims)) 1)))))))))
+
+(defn render-stored-array
+  "Render canonical storage in the reader's session. Older non-ISO temporal
+   text has no writer DateStyle metadata, so preserve its wire spelling."
+  [value oid]
+  (let [elem-oid (types/array-oid->element-oid oid)
+        temporal? (#{types/oid-date types/oid-timestamp types/oid-timestamptz} elem-oid)
+        canonical? (or (not temporal?)
+                       (every? #(or (nil? %)
+                                    (#{"infinity" "-infinity"} %)
+                                    (re-find #"^\d{4,7}-\d{2}-\d{2}(?:[ T]|$)" %))
+                               (flat-elements (from-pg-text value :text))))]
+    (if canonical?
+      (let [array (binding [types/*date-style* [:iso :ymd]]
+                    (from-pg-text value (types/oid->elem-kw elem-oid)))]
+        (to-pg-text array oid))
+      value)))

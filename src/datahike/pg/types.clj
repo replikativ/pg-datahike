@@ -2113,8 +2113,7 @@
 (def ^:private array-output
   ;; Array input/output live above this registry. Resolve after its namespace
   ;; has loaded, as temporal carrier renderers do, without a load-time cycle.
-  (delay [(requiring-resolve 'datahike.pg.arrays/from-pg-text)
-          (requiring-resolve 'datahike.pg.arrays/to-pg-text)]))
+  (delay (requiring-resolve 'datahike.pg.arrays/render-stored-array)))
 
 (defn ->pg-text
   "PostgreSQL's output function for a value (its type's `typoutput`).
@@ -2134,8 +2133,7 @@
      ;; text (`concat(NULL, 'x')` answered ":__null__x").
      (or (nil? v) (= :__null__ v)) nil
      (and (string? v) (session-formatted-array-oids src-oid))
-     (let [[read-array render-array] @array-output]
-       (render-array (read-array v (oid->elem-kw (array-oid->element-oid src-oid))) src-oid))
+     (@array-output v src-oid)
      (and (contains? regoid/alias-oids src-oid) (number? v))
      (regoid/output src-oid v #(or (get oid->pg-name %)
                                    (:typname (pg-catalog/type-by-oid %))

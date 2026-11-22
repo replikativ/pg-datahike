@@ -9,7 +9,9 @@
    fn results, subscript expressions, ANY/ALL) is covered in
    pg_array_sql_test.clj."
   (:require [clojure.test :refer [deftest testing is]]
-            [datahike.pg.arrays :as arr]))
+            [datahike.pg.arrays :as arr]
+            [datahike.pg.sql.fns :as fns]
+            [datahike.pg.types :as types]))
 
 ;; ---------------------------------------------------------------------------
 ;; Construction + predicates
@@ -489,3 +491,16 @@
     (let [oid 1007
           original "[2:4]={1,2,3}"]
       (is (= original (decode-arr oid (encode-arr oid original)))))))
+
+
+(deftest stored-temporal-array-output-preserves-legacy-date-style
+  (let [date-array (types/element-oid->array-oid types/oid-date)]
+    (binding [types/*date-style* [:iso :mdy]]
+      (is (= "{04/03/2024}" (types/->pg-text "{04/03/2024}" date-array))))
+    (binding [types/*date-style* [:sql :dmy]]
+      (is (= "{04/03/2024}" (types/->pg-text "{2024-03-04}" date-array))))))
+
+(deftest mirrored-array-elements-use-postgres-type-codecs
+  (is (= "{0.0000001}" (arr/to-storage-text (arr/from-pg-text "{0.0000001}" :numeric))))
+  (is (fns/sql-eq? (arr/from-pg-text "{\"\\\\012\"}" :bytea)
+                   (arr/from-pg-text "{\"\\\\x0a\"}" :bytea))))

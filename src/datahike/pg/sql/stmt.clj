@@ -2850,7 +2850,7 @@
   [target-name columns db]
   (let [column-tx
         (conj
-         (mapv (fn [{:keys [name oid typmod vtype pg-type array-elem record-fields]}]
+         (mapv (fn [{:keys [name oid typmod vtype pg-type array-elem record-fields enum-name domain-name]}]
                  (let [element (or array-elem (some-> oid types/array-oid->element-oid types/oid->elem-kw))
                        pg-type (or pg-type (get types/oid->pg-type-marker oid))
                        vtype (or vtype
@@ -2864,7 +2864,9 @@
                             :pg/type pg-type}
                      element (assoc :pg/array-elem element)
                      (and typmod (not= -1 typmod)) (assoc :pg/typmod typmod)
-                     record-fields (assoc :pg/record-fields record-fields))))
+                     record-fields (assoc :pg/record-fields record-fields)
+                     enum-name (assoc :datahike.pg/enum-of enum-name)
+                     domain-name (assoc :datahike.pg/domain-of domain-name))))
                columns)
          {:db/ident (pgs/row-marker-attr target-name)
           :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one})
@@ -2935,6 +2937,22 @@
     (throw (errors/pg-error :feature-not-supported
                             {:feature "analysis of this derived relation"}))))
 
+(defn- partition-output-columns [db relation-oid]
+  (when relation-oid
+    (mapv (fn [column]
+            (let [attr (d/entity db (:datahike.pg.column/storage-ident column))
+                  oid (:datahike.pg.column/type-oid column)
+                  vtype (:db/valueType attr)]
+              {:name (:datahike.pg.column/name column)
+               :oid oid :typmod (:datahike.pg.column/typmod column)
+               :vtype vtype
+               :pg-type (or (:pg/type attr) (types/oid->pg-type-marker oid)
+                            (types/pg-name-for-dh-type vtype))
+               :array-elem (:pg/array-elem attr)
+               :enum-name (:datahike.pg/enum-of attr)
+               :domain-name (:datahike.pg/domain-of attr)}))
+          (catalog-objects/columns-by-relation db relation-oid true))))
+
 (defn- partition-scan-schema [db options]
   (when (and (:partition-scan? options) (not (get (dbi/-schema db) pgs/partition-scan-tableoid)))
     [{:db/ident pgs/partition-scan-tableoid
@@ -2966,13 +2984,15 @@
    (if params/*analysis-only?*
      (let [result (materialize-output-schema!
                    db target-name alias
-                   (name-output-columns (analyze-select-body-columns inner schema db)
+                   (name-output-columns (or (not-empty (partition-output-columns db (:partition-oid options)))
+                                            (analyze-select-body-columns inner schema db))
                                         explicit-aliases (or alias target-name)))]
        (if-let [tx (partition-scan-schema (:db result) options)]
          (let [analysis-db (virtual-db/with-data (:db result) tx)]
            (assoc result :db analysis-db :schema (:schema analysis-db)))
          result))
-     (let [tick! (params/cancellation-ticker)
+     (let [declared (partition-output-columns db (:partition-oid options))
+           tick! (params/cancellation-ticker)
            with-fn checked-db-with
            is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
            values? (instance? Values inner)
@@ -3468,8 +3488,11 @@
            col-record (mapv (fn [i] (first (filter pg-rec/record? (sample-rows i))))
                             (range (count sub-aliases)))
            col-timestamp (mapv (fn [i]
-                                 (let [oid (nth sub-oids i nil)]
-                                   (when (#{types/oid-timestamp types/oid-timestamptz} oid)
+                                 (let [oid (nth sub-oids i nil)
+                                       pg-type (get-in declared [i :pg-type])]
+                                   (cond
+                                     (types/timestamp-type? pg-type) pg-type
+                                     (#{types/oid-timestamp types/oid-timestamptz} oid)
                                      (types/oid->pg-type-marker oid))))
                                (range (count sub-aliases)))
            col-pg-type (mapv (fn [i]
@@ -3483,7 +3506,7 @@
            col-types (mapv (fn [i] (if (or (nth col-array-elem i) (nth col-record i)
                                            (nth col-timestamp i))
                                      :db.type/string
-                                     (col-vtype i)))
+                                     (or (get-in declared [i :vtype]) (col-vtype i))))
                            (range (count sub-aliases)))
            col-coercions (mapv (fn [i]
                                  (cond
@@ -3508,12 +3531,13 @@
            (into (output-schema-tx
                   target-name
                   (mapv (fn [i a]
-                          {:name a :oid (nth sub-oids i nil) :vtype (nth col-types i)
-                           :pg-type (or (nth col-pg-type i)
-                                        (types/pg-name-for-dh-type (nth col-types i)))
-                           :array-elem (nth col-array-elem i)
-                           :record-fields (when-let [record (nth col-record i)]
-                                            (pg-rec/layout->text (pg-rec/layout record)))})
+                          (merge {:oid (nth sub-oids i nil) :vtype (nth col-types i)
+                                  :pg-type (or (nth col-pg-type i)
+                                               (types/pg-name-for-dh-type (nth col-types i)))
+                                  :array-elem (nth col-array-elem i)
+                                  :record-fields (when-let [record (nth col-record i)]
+                                                   (pg-rec/layout->text (pg-rec/layout record)))}
+                                 (nth declared i nil) {:name a}))
                         (range) sub-aliases)
                   db) (partition-scan-schema db options))
            spec-db (with-fn db schema-tx)
@@ -4132,7 +4156,7 @@
                                             :where [?e :datahike.pg.object/oid ?oid]
                                             [?e :datahike.pg.partition/definition ?definition]]
                                           db oid)]
-                           (when (seq query) [query nil true]))))
+                           (when (seq query) [query nil oid]))))
                      (first
                       (d/q '{:find [?definition ?columns]
                              :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
@@ -4210,7 +4234,7 @@
                     ^ParenthesedSelect from-item db schema
                     (cond-> {}
                       derived-where (assoc :additional-where derived-where)
-                      partition-scan? (assoc :partition-scan? true)))]
+                      partition-scan? (assoc :partition-scan? true :partition-oid partition-scan?)))]
             [sub-db sub-schema sub-name sub-alias]
             [db schema nil nil])
 
@@ -4479,7 +4503,7 @@
                (if-let [{spec-db :db spec-schema :schema
                          sub-name :name sub-alias :alias}
                         (materialize-derived-select! ^ParenthesedSelect rt db schema
-                                                     (when partition-join? {:partition-scan? true}))]
+                                                     (when partition-join? {:partition-scan? true :partition-oid partition-join?}))]
                  [spec-db spec-schema
                   ;; Register the USER'S alias too, not just the storage
                   ;; namespace. Only `sub-name` was registered, so
