@@ -1433,7 +1433,8 @@
                    #{types/oid-time types/oid-timetz} :timetz
                    :timestamptz)]
         (swap! (:where-clauses ctx) conj
-               [(list 'datahike.pg.query-fns/sql-at-time-zone (second args) (first args) kind)
+               [(list 'datahike.pg.query-fns/sql-at-time-zone (second args) (first args) kind
+                      (= types/oid-interval (source-oid ctx (first params))))
                 result-var])
         result-var)
 
@@ -8132,7 +8133,8 @@
                   zone-var (let [z (translate-expr ctx zone-expr)]
                              (if (seq? z) (ctx/materialize-arg! ctx z) z))
                   value-var (if (seq? value-var) (ctx/materialize-arg! ctx value-var) value-var)]
-              [(list 'datahike.pg.query-fns/sql-at-time-zone value-var zone-var kind)
+              [(list 'datahike.pg.query-fns/sql-at-time-zone value-var zone-var kind
+                     (= types/oid-interval (source-oid ctx zone-expr)))
                (case kind :timestamp types/oid-timestamptz
                      :timestamptz types/oid-timestamp
                      :timetz types/oid-timetz)]))

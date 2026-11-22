@@ -97,7 +97,12 @@
        :gate "test/datahike/test/pg_temporal_text_test.clj"
        :test-var "postgres-time-input-needs-a-date-for-variable-zone-offsets"}]}
     {:name "timetz", :boundaries #{:typmods :casts :time-zones :temporal}, :mode :discovery
-     :blockers #{:at-local :timetz-interval-conversion :temporal-operator-diagnostics}}
+     :blockers #{:at-local :temporal-operator-diagnostics}
+     :strict-slices
+     [{:id :timetz-interval-offset
+       :source-lines [103 107]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "at-time-zone-with-interval"}]}
     {:name "timestamp", :boundaries #{:functions :casts :operators :temporal}, :mode :discovery
      :blockers #{:relative-datetime-input :temporal-overflow :temporal-diagnostics}}
     {:name "timestamptz",

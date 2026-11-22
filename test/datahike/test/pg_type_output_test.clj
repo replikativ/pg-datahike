@@ -117,6 +117,30 @@
     (is (= "22023" (state c "SELECT ts AT TIME ZONE '<EAST>-02:60' FROM tv")))
     (is (= "22023" (state c "SELECT ts AT TIME ZONE 'Mars/Olympus' FROM tv")))))
 
+(deftest at-time-zone-with-interval
+  (with-open [c (jdbc)]
+    (is (= [["11:45:03.123456+00" "01:45:03.123456-10"
+             "2024-02-29 22:00:00.654321+00" "2024-03-01 03:00:00.654321"]]
+           (rows c (str "SELECT TIMETZ '17:15:03.123456+05:30' AT TIME ZONE INTERVAL '00:00', "
+                        "TIMETZ '17:15:03.123456+05:30' AT TIME ZONE INTERVAL '-10:00', "
+                        "TIMESTAMP '2024-03-01 00:30:00.654321' AT TIME ZONE INTERVAL '+02:30', "
+                        "TIMESTAMPTZ '2024-03-01 00:30:00.654321+00' AT TIME ZONE INTERVAL '+02:30'"))))
+    (testing "a seconds offset truncates its fraction and can exceed the Java zone range"
+      (is (= [["14:31:02+20:01:02" "18:30:00+00"]]
+             (rows c (str "SELECT TIMETZ '24:00+05:30' AT TIME ZONE INTERVAL '+20:01:02.5', "
+                          "(TIMETZ '24:00+05:30' AT TIME ZONE INTERVAL '+20:01:02.5') AT TIME ZONE 'UTC'")))))
+    (testing "a stored interval resolves to the same overload"
+      (exec! c "CREATE TABLE intervals (z interval, t timetz)")
+      (exec! c "INSERT INTO intervals VALUES ('-10:00', '10:00:00.123456+02')")
+      (is (= [["22:00:00.123456-10" "22:00:00.123456-10" "22:00:00.123456-10" "22:00:00.123456-10"]]
+             (rows c (str "SELECT t AT TIME ZONE 'UTC+10', t AT TIME ZONE INTERVAL '-10:00', "
+                          "t AT TIME ZONE z, timezone(z, t) FROM intervals ORDER BY t")))))
+    (is (= [[nil "infinity"]]
+           (rows c (str "SELECT TIMETZ '00:00+00' AT TIME ZONE NULL::interval, "
+                        "TIMESTAMP 'infinity' AT TIME ZONE INTERVAL '1 day'"))))
+    (doseq [zone ["1 day" "1 month" "infinity"]]
+      (is (= "22023" (state c (str "SELECT TIMETZ '00:00+00' AT TIME ZONE INTERVAL '" zone "'")))))))
+
 (deftest time-expression-metadata
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE empty_times (t time)")

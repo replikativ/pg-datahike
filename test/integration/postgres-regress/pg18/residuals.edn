@@ -147,8 +147,11 @@
    :file "timestamptz" :lines [655 668] :state :open :impact :unsupported
    :detail "AT LOCAL fails to parse, aborting the remaining session-zone comparisons."}
   {:id :timetz-local-view
-   :file "timetz" :lines [91 107] :state :open :impact :unsupported
+   :file "timetz" :lines [91 102] :state :open :impact :unsupported
    :detail "AT LOCAL fails to parse in the view definition, aborting the remaining conversion comparisons."}
+  {:id :timetz-interval-offset
+   :file "timetz" :lines [103 107] :state :covered :impact :unsupported
+   :detail "Stored timetz values produce the same results with a POSIX name and an equivalent interval. The gate also checks stored intervals and timezone(interval, value)."}
   {:id :virtual-generated-columns
    :file "generated_virtual" :lines [8 9] :state :boundary :impact :unsupported
    :detail "VIRTUAL generated columns are explicitly rejected."}

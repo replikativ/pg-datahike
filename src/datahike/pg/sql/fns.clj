@@ -39,6 +39,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.regoid :as regoid]
+            [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.datetime.zone :as datetime-zone]
             [datahike.pg.errors :as errors]
             [datahike.pg.geo :as geo]
@@ -3860,42 +3861,95 @@
             {:message (str "invalid input syntax for type timestamp with time zone: \""
                            v "\"")}))))
 
+(def ^:private interval-fields
+  (delay (let [r #(deref (requiring-resolve %))]
+           [(r 'datahike.pg.interval.core/months)
+            (r 'datahike.pg.interval.core/days)
+            (r 'datahike.pg.interval.core/micros)])))
+
+(def ^:private ^:const usecs-per-sec 1000000)
+(def ^:private ^:const usecs-per-day 86400000000)
+
+(defn- interval-zone-offset [interval]
+  (let [zone (@interval-coerce interval)
+        [months days micros] @interval-fields
+        error (cond
+                (types/infinite-datetime zone) "must be finite"
+                (or (not (zero? (months zone))) (not (zero? (days zone))))
+                "must not include months or days")]
+    (when error
+      (throw (errors/pg-error :invalid-parameter-value
+                              {:message (str "interval time zone \"" (types/->pg-text zone types/oid-interval)
+                                             "\" " error)})))
+    (unchecked-int (quot (micros zone) usecs-per-sec))))
+
+(defn- timetz-source [v]
+  (cond
+    (instance? java.time.OffsetTime v)
+    [(.toLocalTime ^java.time.OffsetTime v) (.getTotalSeconds (.getOffset ^java.time.OffsetTime v))]
+    (instance? java.time.LocalTime v) [v 0]
+    (string? v)
+    ;; Stored times are canonical text. An interval conversion can also
+    ;; produce a wider offset than java.time can represent.
+    (if-let [[_ time sign hour minute second]
+             (re-matches #"^(\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)([+-])(\d{2,})(?::(\d{2})(?::(\d{2}))?)?$" v)]
+      (let [t (sql-cast/cast-scalar time "time" {})
+            secs (+ (* 3600 (parse-long hour)) (* 60 (parse-long (or minute "0")))
+                    (parse-long (or second "0")))]
+        [(if (= "24:00:00" t) java.time.LocalTime/MIDNIGHT t)
+         (if (= "-" sign) (- secs) secs)])
+      (let [{:keys [usec west]} (datetime-in/timetz-in v (sql-cast/datetime-ctx))]
+        [(java.time.LocalTime/ofNanoOfDay (* 1000 (mod usec usecs-per-day))) (- west)]))
+    :else
+    (throw (errors/pg-error :invalid-parameter-value
+                            {:message "AT TIME ZONE expects a time value"}))))
+
+(defn- shift-timetz [v east]
+  (let [[^java.time.LocalTime t original-east] (timetz-source v)
+        local (.plusSeconds t (- east original-east))]
+    (if (<= -64800 east 64800)
+      (java.time.OffsetTime/of local (java.time.ZoneOffset/ofTotalSeconds (int east)))
+      (str (types/->pg-text local types/oid-time) (types/offset-seconds-text east)))))
+
+(def ^:private ^java.time.Instant pg-epoch (java.time.Instant/parse "2000-01-01T00:00:00Z"))
+(def ^:private pg-min-timestamp
+  (.plusSeconds pg-epoch (quot datetime-in/min-timestamp usecs-per-sec)))
+(def ^:private pg-end-timestamp
+  (.plusSeconds pg-epoch (quot datetime-in/end-timestamp usecs-per-sec)))
+
+(defn- shift-timestamp [^java.time.Instant t seconds]
+  (let [shifted (.plusSeconds t (long seconds))]
+    (when (or (.isBefore shifted pg-min-timestamp)
+              (not (.isBefore shifted pg-end-timestamp)))
+      (throw (errors/pg-error :datetime-field-overflow {:message "timestamp out of range"})))
+    shifted))
+
 (defn sql-at-time-zone
-  "`value AT TIME ZONE zone` (timestamp.c timestamp_zone / timestamptz_zone,
-   date.c timetz_zone). `kind` comes from the operand's static type:
-     :timestamp    wall-clock time in `zone` -> the instant (timestamptz)
-     :timestamptz  the instant -> wall-clock time in `zone` (timestamp)
-     :timetz       the time, shifted to `zone`'s offset (timetz)
-   Instant results preserve fractional seconds. A timestamp result
-   encodes the wall-clock fields in UTC, as a timestamp column does.
-   NULL in either operand is NULL."
-  [v zone kind]
-  (if (or (nil? v) (= :__null__ v) (nil? zone) (= :__null__ zone))
-    :__null__
-    (let [zid (resolve-time-zone zone)]
-      (case kind
-        :timestamp
-        (let [ldt (local-date-time v)]
-          (.toInstant ldt (datetime-zone/offset-at-local-time ldt zid)))
+  "Convert a timestamp or time using a named zone or an interval offset.
+   The input's SQL type determines the direction of timestamp conversion."
+  ([v zone kind] (sql-at-time-zone v zone kind false))
+  ([v zone kind interval?]
+   (cond
+     (or (sql-null? v) (sql-null? zone)) :__null__
+     (types/infinite-datetime v) v
+     :else
+     (let [east (when (or interval? (interval-value? zone)) (interval-zone-offset zone))
+           ^java.time.ZoneId zid (when-not east (resolve-time-zone zone))]
+       (case kind
+         :timestamp
+         (let [ldt (local-date-time v)]
+           (if east
+             (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- east))
+             (.toInstant ldt (datetime-zone/offset-at-local-time ldt zid))))
 
-        :timestamptz
-        (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)]
-          (.toInstant (java.time.LocalDateTime/ofInstant inst zid) java.time.ZoneOffset/UTC))
+         :timestamptz
+         (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)
+               east (or east (.getTotalSeconds (.getOffset (.getRules zid) inst)))]
+           (shift-timestamp inst east))
 
-        :timetz
-        (let [v (if (string? v)
-                  ;; time/timetz columns keep their text form
-                  ((requiring-resolve 'datahike.pg.sql.cast/cast-scalar) v "timetz" {})
-                  v)
-              ^java.time.OffsetTime t (cond
-                                        (instance? java.time.OffsetTime v) v
-                                        (instance? java.time.LocalTime v)
-                                        (java.time.OffsetTime/of v java.time.ZoneOffset/UTC)
-                                        :else (throw (errors/pg-error
-                                                      :invalid-parameter-value
-                                                      {:message "AT TIME ZONE expects a time value"})))
-              offset (.getOffset (.getRules zid) (java.time.Instant/now))]
-          (.withOffsetSameInstant t offset))))))
+         :timetz
+         (shift-timetz v (or east (.getTotalSeconds
+                                   (.getOffset (.getRules zid) (java.time.Instant/now))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Datetime constructors, age and date_bin -- ported from PostgreSQL 17's
@@ -3906,15 +3960,6 @@
 
 (def ^:private interval-make
   (delay @(requiring-resolve 'datahike.pg.interval.core/interval)))
-
-(def ^:private interval-fields
-  (delay (let [r #(deref (requiring-resolve %))]
-           [(r 'datahike.pg.interval.core/months)
-            (r 'datahike.pg.interval.core/days)
-            (r 'datahike.pg.interval.core/micros)])))
-
-(def ^:private ^:const usecs-per-sec 1000000)
-(def ^:private ^:const usecs-per-day 86400000000)
 
 (defn- int-arg ^long [v]
   (if (number? v) (long v) (Long/parseLong (str/trim (str v)))))

@@ -1759,15 +1759,18 @@
 (def ^:private interval->text
   (delay @(requiring-resolve 'datahike.pg.interval.core/->pg-text-postgres)))
 
-(defn offset-text
-  "EncodeTimezone: +HH, then :MM and :SS only when non-zero."
-  [^java.time.ZoneOffset o]
-  (let [total (.getTotalSeconds o)
-        a (Math/abs total)
+(defn offset-seconds-text
+  "Encode seconds east of Greenwich as +HH, adding minutes and seconds
+   when needed."
+  [^long total]
+  (let [a (Math/abs total)
         h (quot a 3600) m (quot (rem a 3600) 60) sec (rem a 60)]
     (str (if (neg? total) "-" "+") (format "%02d" h)
          (when (or (pos? m) (pos? sec)) (format ":%02d" m))
          (when (pos? sec) (format ":%02d" sec)))))
+
+(defn offset-text [^java.time.ZoneOffset offset]
+  (offset-seconds-text (.getTotalSeconds offset)))
 
 (defn- timestamp-text [^java.time.LocalDateTime ldt]
   (str (.toLocalDate ldt) " " (time-text (.toLocalTime ldt))))
@@ -1850,16 +1853,6 @@
           (map (fn [^String id] [(str/lower-case id) [id (java.time.ZoneId/of id)]]))
           (java.time.ZoneId/getAvailableZoneIds))))
 
-(defn- tz-offset-text
-  "Seconds east of Greenwich as `+HH[:MM[:SS]]`, as a TimeZone's `SHOW`
-   text writes it."
-  [^long secs]
-  (let [a (Math/abs secs)
-        h (quot a 3600) m (quot (rem a 3600) 60) sec (rem a 60)]
-    (str (if (neg? secs) "-" "+") (format "%02d" h)
-         (when (or (pos? m) (pos? sec)) (format ":%02d" m))
-         (when (pos? sec) (format ":%02d" sec)))))
-
 (defn- invalid-time-zone [raw]
   (errors/pg-error
    :invalid-parameter-value
@@ -1902,7 +1895,7 @@
       (let [secs (Math/round (* 3600.0 (Double/parseDouble raw)))]
         (when (> (Math/abs secs) (* 18 3600)) (throw (invalid-time-zone raw)))
         {:zone (java.time.ZoneOffset/ofTotalSeconds (int secs))
-         :text (str "<" (tz-offset-text secs) ">" (tz-offset-text (- secs)))})
+         :text (str "<" (offset-seconds-text secs) ">" (offset-seconds-text (- secs)))})
 
       :else
       (if-let [[canonical zone] (or (get @tz-names low)
