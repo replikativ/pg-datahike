@@ -967,6 +967,7 @@
     (instance? net.sf.jsqlparser.expression.operators.relational.ExistsExpression expr)
     ["exists" 2]
     (instance? ArrayConstructor expr) ["array" 2]
+    (instance? ExtractExpression expr) ["extract" 2]
     (instance? net.sf.jsqlparser.expression.RowConstructor expr) ["row" 2]
 
     ;; CURRENT_DATE / CURRENT_TIMESTAMP / USER / … — JSqlParser surfaces

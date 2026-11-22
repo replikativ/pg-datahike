@@ -5316,6 +5316,11 @@
       'datahike.pg.query-fns/sql-date+time
       (and (= op-sym '-) (timestamp? loid) (timestamp? roid))
       'datahike.pg.query-fns/sql-timestamp-
+      (and (= op-sym '+) (= types/oid-time loid) (= types/oid-time roid))
+      (throw (errors/pg-error
+              :ambiguous-function
+              {:message "operator is not unique: time without time zone + time without time zone"
+               :hint "Could not choose a best candidate operator. You might need to add explicit type casts."}))
       (and (= op-sym '-) (= types/oid-time loid) (= types/oid-time roid))
       'datahike.pg.query-fns/sql-time-
 

@@ -117,6 +117,16 @@
     (is (= "22023" (state c "SELECT ts AT TIME ZONE '<EAST>-02:60' FROM tv")))
     (is (= "22023" (state c "SELECT ts AT TIME ZONE 'Mars/Olympus' FROM tv")))))
 
+(deftest time-expression-metadata
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE empty_times (t time)")
+    (is (= "42725" (state c "SELECT t + time '00:01' FROM empty_times")))
+    (with-open [st (.createStatement c)
+                rs (.executeQuery st "SELECT EXTRACT(SECOND FROM TIME '13:30:25.575401')")]
+      (is (= "extract" (.getColumnLabel (.getMetaData rs) 1)))
+      (is (.next rs))
+      (is (= "25.575401" (.getString rs 1))))))
+
 (deftest time-and-money-input
   (with-open [c (jdbc)]
     (seed! c)

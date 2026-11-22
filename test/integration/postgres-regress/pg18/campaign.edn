@@ -86,8 +86,7 @@
      :requires ["test_setup"],
      :mode :unmeasured}
     {:name "date", :boundaries #{:casts :operators :temporal}, :mode :unmeasured}
-    {:name "time", :boundaries #{:typmods :casts :operators :temporal}, :mode :discovery
-     :blockers #{:extract-column-label :temporal-operator-diagnostics}
+    {:name "time", :boundaries #{:typmods :casts :operators :temporal}, :mode :strict
      :strict-slices
      [{:id :time-variable-zone-requires-date
        :source-lines [17 20]
