@@ -5134,6 +5134,8 @@
         "CREATE TABLE")))
 
 (defn- table-create-tx-data [db parsed]
+  (doseq [column (:column-order parsed)]
+    (ddl/validate-table-column-name! column))
   (let [table-name (:table-name parsed)
         raw-ddl-data (ddl-tx-data parsed)
         sequence-names (vec (distinct (keep #(when (map? %) (:__seq__/name %))

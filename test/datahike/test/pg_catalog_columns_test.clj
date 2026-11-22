@@ -82,6 +82,9 @@
           (is (= (str "column name \"" column "\" conflicts with a system column name")
                  (.error result))
               sql)))
+      (doseq [sql ["CREATE TABLE IF NOT EXISTS ordinary (xmin int)"
+                   "CREATE TABLE IF NOT EXISTS ordinary AS SELECT 1 AS ctid"]]
+        (is (nil? (.error (.execute h ^String sql))) sql))
       (is (= "t" (run h "SELECT to_regclass('rejected') IS NULL")))
       (is (= "XMIN\nid\noid"
              (run h "SELECT attname FROM pg_attribute

@@ -849,8 +849,6 @@
                     :feature-not-supported
                     {:feature (str "ON COMMIT " (str/upper-case on-commit-action))})))
         columns (.getColumnDefinitions ct)
-        _ (doseq [^ColumnDefinition column columns]
-            (validate-table-column-name! (params/unquote-ident (.getColumnName column))))
         ;; A VIRTUAL generated column (PostgreSQL 18) keeps the explicit
         ;; boundary the STORED ones used to have. Silently creating an
         ;; ordinary writable column also lets a later COPY name it, at
