@@ -72,10 +72,31 @@ The subscriber preserves `varchar(n)`, `numeric(p,s)`, and timestamp
 precision modifiers. SQL-created timestamp columns preserve PostgreSQL
 microseconds through snapshot COPY, live apply, and historical reads.
 Existing Datahike instant-backed columns remain readable.
-Choose a fixed publication and coordinate schema changes with the
-mirror operator. The worker checks publication membership and relation
-definitions and pauses on incompatibility. A new store and snapshot are needed
-to adopt a changed publication or start a new history epoch after slot loss.
+
+## Add tables to an active mirror
+
+Add supported tables to the publisher's publication. The worker detects the
+addition and begins copying the new tables while continuing to apply changes
+to the existing tables.
+
+```sql
+ALTER PUBLICATION analytics ADD TABLE public.activity_log;
+```
+
+Refresh uses an additional temporary logical slot on the publisher and two
+additional connections while it runs. Status reports the tables and the
+copying or catch-up phase under `:refresh`. From a shared WAL commit, the
+mirror installs the new tables and records the refreshed publication and
+checkpoint in one durable transaction. The new tables become queryable at
+that commit, which is where their local history begins.
+
+If the refresh stops before installation, a restart stages the new tables
+from a fresh snapshot. A restart after installation resumes from the durable
+checkpoint. The temporary slot is released when its connection closes.
+The snapshot byte limit also bounds staging input, including replayed data.
+
+Removing tables or changing their existing relation definitions pauses the
+mirror. Coordinated schema refresh remains follow-up work.
 
 ## Recovery and status
 
@@ -110,11 +131,12 @@ mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
 `PG_MIRROR_SOURCE_URL` and `PG_MIRROR_REFERENCE_URL` to the JDBC URLs and
 `PG_MIRROR_SOURCE_CONNINFO` to the source libpq connection string used by
 `CREATE SUBSCRIPTION`. The source server needs `wal_level=logical`. Run
-`clojure -M:dev -m datahike.pg.mirror-probe` after `bb prep`.
+`clojure -M:dev -m datahike.pg.mirror-probe` after `bb prep`. Pass
+`--refresh` to exercise online table addition, interrupted installation,
+and crash recovery at the refresh checkpoint.
 
-The next stages are per-table synchronization for online table addition,
-coordinated schema evolution, streaming and spooling of large transactions,
-and failover slots. See the [consolidation plan](consolidation-plan.md) and
+The next stages are coordinated schema evolution, streaming and spooling of
+large transactions, and failover slots. See the [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 
 ## Known performance trap in Option 2, today

@@ -121,15 +121,23 @@
 
 (defn- run-crash-worker! [config]
   (let [apply-commit #'mirror/apply-commit!
-        original @apply-commit]
+        original @apply-commit
+        refresh? (= :refresh (:probe-crash-mode config))]
     (with-redefs-fn {apply-commit (fn [destination relations previous transaction]
                                     (original destination relations previous transaction)
-                                    (when (seq (:changes transaction))
+                                    (when (if refresh?
+                                            (:install! transaction)
+                                            (seq (:changes transaction)))
                                       (.halt (Runtime/getRuntime) 86)))}
       (fn []
         (let [subscriber (mirror/start! config)]
           (try
-            (check! (not (await-state! subscriber :following)) "Crash worker reached cutover" {})
+            (if refresh?
+              (await! "Crash worker did not reach the refresh commit"
+                      #(let [seen (mirror/status subscriber)]
+                         (check! (not (#{:paused :failed} (:state seen))) "Refresh crash worker stopped" seen)
+                         false))
+              (check! (not (await-state! subscriber :following)) "Crash worker reached cutover" {}))
             (finally (mirror/stop! subscriber))))))))
 
 (defn- row-history [db after]
@@ -352,6 +360,148 @@
           (when (= ["false"] (slot-query source native-slot "active::text"))
             (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")"))))))))
 
+(defn- refresh-rows [conn]
+  [(rows conn "SELECT id, label FROM refresh_account ORDER BY id")
+   (rows conn "SELECT id, note, happened::text FROM refresh_event ORDER BY id")
+   (rows conn "SELECT id, note FROM refresh_note ORDER BY id")])
+
+(defn- table-absent? [conn]
+  (try
+    (rows conn "SELECT id FROM refresh_event")
+    false
+    (catch SQLException error
+      (= "42P01" (.getSQLState error)))))
+
+(defn- sync-slots [source]
+  (rows source (str "SELECT slot_name FROM pg_replication_slots"
+                    " WHERE database = current_database() AND temporary"
+                    " AND left(slot_name, 10) = 'pgdh_sync_'")))
+
+(defn run-refresh-probe!
+  "Exercise an online publication addition, a failed handoff, and a crash
+   after the durable handoff but before feedback to PostgreSQL."
+  [source-url reference-url source-conninfo]
+  (let [directory (str (Files/createTempDirectory "pgdh-mirror-refresh-" (make-array FileAttribute 0)))
+        path (str directory "/store")
+        log (str directory "/refresh-crash.log")
+        native-slot (str "mirror_refresh_ref_" (str/replace (str (random-uuid)) "-" ""))
+        config {:source-url source-url :publication "mirror_refresh_pub" :store-path path :server {:port 0}}
+        subscriber (atom nil)
+        schema ["CREATE TABLE refresh_account (id integer PRIMARY KEY, label text)"
+                (str "CREATE TABLE refresh_event (id integer PRIMARY KEY, note varchar(40), "
+                     "happened timestamptz(6))")
+                "CREATE TABLE refresh_note (id integer PRIMARY KEY, note text)"]]
+    (prn {:artifacts directory})
+    (with-open [source (DriverManager/getConnection source-url)
+                reference (DriverManager/getConnection reference-url)]
+      (try
+        (doseq [c [source reference]]
+          (sql! c "SET TIME ZONE 'UTC'")
+          (apply sql! c schema))
+        (sql! source "INSERT INTO refresh_account VALUES (1, 'initial')"
+              "INSERT INTO refresh_event VALUES (1,'snapshot','2024-06-01 12:00:00.123456+00')"
+              "INSERT INTO refresh_note VALUES (1, 'before truncate')"
+              "CREATE PUBLICATION mirror_refresh_pub FOR TABLE refresh_account")
+        (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
+        (sql! reference (str "CREATE SUBSCRIPTION mirror_refresh_native CONNECTION "
+                             (literal source-conninfo) " PUBLICATION mirror_refresh_pub"
+                             " WITH (create_slot = false, slot_name = " (literal native-slot) ")"))
+        (reset! subscriber (mirror/start! config))
+        (let [{:keys [slot]} (await-state! @subscriber :following)
+              started (promise)
+              release-copy (promise)
+              copy-table #'mirror/copy-table!
+              transfer #'mirror/transfer-staged-table!
+              copy-original @copy-table
+              transfer-original @transfer]
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (check! (table-absent? sink) "Unpublished table was visible" {})
+            (with-redefs-fn
+              {copy-table
+               (fn [publisher destination table on-bytes]
+                 (when (= "refresh_event" (:name table))
+                   (deliver started true)
+                   (check! (deref release-copy 30000 false) "Probe did not release the staging snapshot" {}))
+                 (copy-original publisher destination table on-bytes))
+               transfer
+               (fn [staged destination table on-bytes]
+                 (transfer-original staged destination table on-bytes)
+                 (throw (ex-info "Interrupted refresh before durable cutover" {})))}
+              (fn []
+                (try
+                  (sql! source "ALTER PUBLICATION mirror_refresh_pub ADD TABLE refresh_event, refresh_note")
+                  (sql! reference "ALTER SUBSCRIPTION mirror_refresh_native REFRESH PUBLICATION")
+                  (check! (deref started 30000 false) "Online refresh did not start copying"
+                          (mirror/status @subscriber))
+                  (check! (= 1 (count (sync-slots source))) "Refresh did not use an owned temporary slot" {})
+                  ;; The two table versions must advance to one boundary
+                  ;; even when the source changes both in one transaction.
+                  (sql! source "BEGIN"
+                        "TRUNCATE refresh_account, refresh_note"
+                        "INSERT INTO refresh_account VALUES (1, 'during copy')"
+                        (str "UPDATE refresh_event SET note = 'during copy', "
+                             "happened = '2024-06-01 12:00:00.123457+00' WHERE id = 1")
+                        "INSERT INTO refresh_note VALUES (2, 'after truncate')"
+                        "COMMIT")
+                  (await! "Existing table stopped following during the staging copy"
+                          #(= [["during copy"]] (rows sink "SELECT label FROM refresh_account WHERE id = 1")))
+                  (check! (table-absent? sink) "A staged table escaped before its commit" {})
+                  (finally (deliver release-copy true)))
+                (let [paused (await-state! @subscriber :paused)]
+                  (check! (= "Interrupted refresh before durable cutover" (get-in paused [:last-error :message]))
+                          "Did not reach the interruption after staging rows" paused))
+                (check! (table-absent? sink) "A rolled-back staging copy became visible" {})
+                (check! (= [["during copy"]] (rows sink "SELECT label FROM refresh_account WHERE id = 1"))
+                        "An interruption lost already-applied rows" {}))))
+          (mirror/stop! @subscriber)
+          (await! "A stopped stage retained publisher WAL" #(empty? (sync-slots source)))
+          ;; The child starts with only the old manifest and no staging data.
+          ;; It must resnapshot, then crash after its new tables and manifest
+          ;; commit but before the publisher is sent that commit position.
+          (child-crash! (assoc config :probe-crash-mode :refresh) log)
+          (await! "The crashed main slot remained active" #(= ["false"] (slot-query source slot "active::text")))
+          (await! "A crashed stage retained publisher WAL" #(empty? (sync-slots source)))
+          (let [cutover (durable-position path)
+                history (inspect-db path #(d/q '[:find ?event ?value ?tx
+                                                 :where [?event :refresh_event/note ?value ?tx]]
+                                               (d/history %)))
+                [confirmed] (slot-query source slot "confirmed_flush_lsn")]
+            (check! (= [["t"]]
+                       (rows source (str "SELECT " (literal confirmed) "::pg_lsn < " (literal cutover) "::pg_lsn")))
+                    "Refresh was acknowledged before the crash" {:confirmed confirmed :durable cutover})
+            (check! (= ["during copy"] (mapv second history)) "The handoff installed extra history" {:history history})
+            (reset! subscriber (mirror/start! config))
+            (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+              (sql! sink "SET TIME ZONE 'UTC'")
+              (let [expected (refresh-rows source)]
+                (await! "Native refresh subscriber failed to converge" #(= expected (refresh-rows reference)))
+                (check! (= expected (refresh-rows sink)) "Restart did not recover the durable refresh" {}))
+              (check! (= history (inspect-db path #(d/q '[:find ?event ?value ?tx
+                                                          :where [?event :refresh_event/note ?value ?tx]]
+                                                        (d/history %))))
+                      "Replayed handoff rewrote Datahike history" {})
+              (sql! source "BEGIN"
+                    "UPDATE refresh_account SET label = 'after cutover' WHERE id = 1"
+                    "UPDATE refresh_event SET note = 'after cutover' WHERE id = 1"
+                    "COMMIT")
+              (let [expected (refresh-rows source)]
+                (await! "Native subscriber did not follow the multi-table commit" #(= expected (refresh-rows reference)))
+                (await! "Mirror did not follow the multi-table commit" #(= expected (refresh-rows sink))))
+              (check! (= 1 (inspect-db path #(count
+                                              (d/q '[:find ?tx
+                                                     :where [_ :refresh_account/label "after cutover" ?tx]
+                                                     [_ :refresh_event/note "after cutover" ?tx]]
+                                                   (d/history %)))))
+                      "The post-cutover transaction was split locally" {})))
+          (mirror/stop! @subscriber)
+          (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
+          {:status :passed :artifacts directory})
+        (finally
+          (when @subscriber (mirror/stop! @subscriber))
+          (sql! reference "DROP SUBSCRIPTION IF EXISTS mirror_refresh_native")
+          (when (= ["false"] (slot-query source native-slot "active::text"))
+            (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")"))))))))
+
 (defn -main [& [argument]]
   (if (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
@@ -360,4 +510,5 @@
           conninfo (System/getenv "PG_MIRROR_SOURCE_CONNINFO")]
       (check! (every? seq [source reference conninfo])
               "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
-      (prn (run-probe! source reference conninfo)))))
+      (prn ((if (= "--refresh" argument) run-refresh-probe! run-probe!)
+            source reference conninfo)))))

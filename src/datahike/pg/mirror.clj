@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.server :as pg]
+            [datahike.pg.sql.rewrite :as rewrite]
             [datahike.pg.types :as types])
   (:import [datahike.pg PgWireServer PgWireServer$QueryHandler PgWireServer$QueryResult]
            [java.io ByteArrayOutputStream]
@@ -207,9 +208,16 @@
 (defn- sink-execute! ^PgWireServer$QueryResult [^PgWireServer$QueryHandler destination sql]
   (checked-result (.execute destination sql)))
 
+(defn- number-bind-markers [tokens]
+  ;; The executor may reorder an UPDATE's assignments before reparsing them
+  ;; as a projection. Like pgjdbc, retain each parameter's protocol number.
+  (map-indexed (fn [index {:keys [pos end]}] [pos end (str "$" (inc index))])
+               (filter #(and (= :param (:type %)) (= "?" (:text %))) tokens)))
+
 (defn- sink-prepared! ^PgWireServer$QueryResult [^PgWireServer$QueryHandler destination sql args]
-  (let [oids (int-array (repeat (count args) PgWireServer/OID_VARCHAR))]
-    (checked-result (.executePrepared destination (.parse destination sql oids)
+  (let [oids (int-array (repeat (count args) PgWireServer/OID_VARCHAR))
+        statement (rewrite/rewrite sql [number-bind-markers])]
+    (checked-result (.executePrepared destination (.parse destination statement oids)
                                       (object-array (cons nil args))))))
 
 (defn- affected-count [^PgWireServer$QueryResult result]
@@ -226,29 +234,48 @@
            (catch Throwable rollback-error (.addSuppressed error rollback-error)))
       (throw error))))
 
-(defn- copy-table! [^Connection source ^PgWireServer$QueryHandler destination
-                    table on-bytes]
-  (let [columns (comma-list (map (comp ident :name) (:columns table)))
-        table-name (relation-name table)
-        source-api (.getCopyAPI (.unwrap source PGConnection))
-        out (.copyOut source-api (str "COPY " table-name " (" columns ") TO STDOUT"))]
+(defn- copy-relation [table]
+  (str (relation-name table) " ("
+       (comma-list (map (comp ident :name) (:columns table))) ")"))
+
+(defn- load-copy! [^PgWireServer$QueryHandler destination table feed!]
+  (let [reply (sink-execute! destination (str "COPY " (copy-relation table) " FROM STDIN"))]
+    (require! (.-copyInMode reply) "Expected COPY IN response" {:table (relation-name table)}))
+  (try
+    (feed! #(.copyChunk destination ^bytes %))
+    (affected-count (checked-result (.copyComplete destination)))
+    (catch Throwable error
+      (.copyAbort destination "Mirror COPY failed")
+      (throw error))))
+
+(defn- copy-table! [^Connection source destination table on-bytes]
+  (let [source-api (.getCopyAPI (.unwrap source PGConnection))
+        out (.copyOut source-api (str "COPY " (copy-relation table) " TO STDOUT"))]
     (try
-      (let [reply (sink-execute! destination (str "COPY " table-name " (" columns ") FROM STDIN"))]
-        (require! (.-copyInMode reply) "Expected COPY IN response" {:table table-name}))
-      (try
-        (loop []
-          (when-let [^bytes chunk (.readFromCopy out)]
-            (on-bytes (alength chunk))
-            (.copyChunk destination chunk)
-            (recur)))
-        (let [written (affected-count (checked-result (.copyComplete destination)))]
-          (require! (= written (.getHandledRowCount out)) "COPY row counts differ"
-                    {:table table-name :source (.getHandledRowCount out) :destination written})
-          written)
-        (catch Throwable error
-          (.copyAbort destination "Mirror COPY failed")
-          (throw error)))
+      (let [written (load-copy! destination table
+                                (fn [write!]
+                                  (loop []
+                                    (when-let [^bytes chunk (.readFromCopy out)]
+                                      (on-bytes (alength chunk))
+                                      (write! chunk)
+                                      (recur)))))]
+        (require! (= written (.getHandledRowCount out)) "COPY row counts differ"
+                  {:table (relation-name table) :source (.getHandledRowCount out) :destination written})
+        written)
       (finally (when (.isActive out) (.cancelCopy out))))))
+
+(defn- transfer-staged-table! [stage destination table on-bytes]
+  (let [export (sink-execute! stage (str "COPY " (copy-relation table) " TO STDOUT"))]
+    (require! (.-copyOutMode export) "Expected COPY OUT response" {:table (relation-name table)})
+    (let [lines (.-copyOutLines export)
+          written (load-copy! destination table
+                              (fn [write!]
+                                (doseq [line lines
+                                        :let [chunk (.getBytes (str line "\n") StandardCharsets/UTF_8)]]
+                                  (on-bytes (alength chunk))
+                                  (write! chunk))))]
+      (require! (= (count lines) written) "Staged COPY row counts differ"
+                {:table (relation-name table) :source (count lines) :destination written}))))
 
 (def ^:private checkpoint-table "pgdh_mirror.checkpoint")
 
@@ -295,41 +322,48 @@
                           :retained-wal-bytes (some-> (.getString r 6) parse-long)
                           :unconfirmed-wal-bytes (some-> (.getString r 7) parse-long)}))))
 
-(defn- bootstrap! [^Connection replication source destination
-                   {:keys [slot publication]} check-running! max-snapshot-bytes]
-  (when-let [existing (slot-info source slot)]
-    ;; The unique slot name was persisted locally before its first creation.
-    (require! (and (:matches? existing) (not (:active? existing)))
-              "Cannot restart an incomplete snapshot while its slot is in use or has changed" {:slot slot})
-    (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil)))
+(defn- snapshot-budget [check-running! limit]
+  (let [copied (volatile! 0)]
+    (fn [n]
+      (check-running!)
+      (require! (<= (vswap! copied + n) limit) "Snapshot exceeds the configured byte limit" {:limit limit}))))
+
+(defn- with-slot-snapshot! [^Connection replication source slot temporary? f]
   (let [api (.getReplicationAPI (.unwrap replication PGConnection))
-        created (-> api .createReplicationSlot .logical (.withSlotName slot)
-                    (.withOutputPlugin "pgoutput") .make)
-        snapshot (.getSnapshotName created)
-        end-lsn (.asString (.getConsistentPoint created))
-        copied (volatile! 0)
-        on-bytes (fn [n]
-                   (check-running!)
-                   (require! (<= (vswap! copied + n) max-snapshot-bytes)
-                             "Initial snapshot exceeds the configured byte limit"
-                             {:limit max-snapshot-bytes}))]
+        builder (-> api .createReplicationSlot .logical (.withSlotName slot) (.withOutputPlugin "pgoutput"))
+        created (.make (if temporary? (.withTemporaryOption builder) builder))
+        snapshot (.getSnapshotName created)]
     (require! (seq snapshot) "The slot did not export a snapshot" {:slot slot})
     (command! source "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
     (try
       (command! source (str "SET TRANSACTION SNAPSHOT " (literal snapshot)))
       (command! source "SET LOCAL row_security = off")
-      (let [manifest (publication-manifest source publication)]
-        (transaction!
-         destination
-         (fn []
-           (doseq [table (:tables manifest)]
-             (check-running!)
-             (create-table! destination table)
-             (copy-table! source destination table on-bytes))
-           (sink-prepared! destination
-                           (str "UPDATE " checkpoint-table " SET manifest = ?, end_lsn = ? WHERE id = 1")
-                           [(pr-str manifest) end-lsn]))))
+      (command! source "SET LOCAL DateStyle = 'ISO, YMD'")
+      (command! source "SET LOCAL TIME ZONE 'UTC'")
+      (f (.asString (.getConsistentPoint created)))
       (finally (command! source "ROLLBACK")))))
+
+(defn- bootstrap! [replication source destination {:keys [slot publication]} check-running! max-snapshot-bytes]
+  (when-let [existing (slot-info source slot)]
+    ;; The unique slot name was persisted locally before its first creation.
+    (require! (and (:matches? existing) (not (:active? existing)))
+              "Cannot restart an incomplete snapshot while its slot is in use or has changed" {:slot slot})
+    (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil)))
+  (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)]
+    (with-slot-snapshot!
+      replication source slot false
+      (fn [end-lsn]
+        (let [manifest (publication-manifest source publication)]
+          (transaction!
+           destination
+           (fn []
+             (doseq [table (:tables manifest)]
+               (check-running!)
+               (create-table! destination table)
+               (copy-table! source destination table on-bytes))
+             (sink-prepared! destination
+                             (str "UPDATE " checkpoint-table " SET manifest = ?, end_lsn = ? WHERE id = 1")
+                             [(pr-str manifest) end-lsn]))))))))
 
 (defn- lsn [value] (LogSequenceNumber/valueOf (str value)))
 
@@ -491,17 +525,21 @@
       (require! (= 1 count) "A mirrored change did not affect exactly one row"
                 {:relation-id relation-id :operation op :affected count}))))
 
-(defn- apply-commit! [destination relations previous {:keys [end-lsn xid commit-micros changes]}]
+(defn- apply-commit! [destination relations previous {:keys [end-lsn xid commit-micros changes install! manifest]}]
   (transaction!
    destination
    (fn []
      (doseq [change changes]
        (apply-change! destination relations change))
+     (when install! (install! destination))
      (let [result (sink-prepared! destination
                                   (str "UPDATE " checkpoint-table
-                                       " SET end_lsn = ?, source_xid = ?, source_commit_micros = ? "
-                                       "WHERE id = 1 AND end_lsn = ?")
-                                  [end-lsn (str xid) (str commit-micros) previous])]
+                                       " SET end_lsn = ?, source_xid = ?, source_commit_micros = ?"
+                                       (when manifest ", manifest = ?")
+                                       " WHERE id = 1 AND end_lsn = ?")
+                                  (conj (cond-> [end-lsn (str xid) (str commit-micros)]
+                                          manifest (conj (pr-str manifest)))
+                                        previous))]
        (require! (= 1 (affected-count result)) "Mirror checkpoint changed while applying a transaction"
                  {:expected previous :next end-lsn})))))
 
@@ -543,7 +581,7 @@
              {:reply? (= 1 (.get buffer))})
         (throw (ex-info "Unexpected PostgreSQL replication packet" {}))))))
 
-(defn- validate-resume! [source {:keys [slot publication manifest end-lsn]}]
+(defn- validate-resume! [source {:keys [slot end-lsn]}]
   (let [{:keys [matches? active? invalidation confirmed-lsn] :as info} (slot-info source slot)]
     (when active?
       (throw (SQLException. "Replication slot is still active" "55006")))
@@ -551,88 +589,93 @@
                    (not (pos? (compare-lsn confirmed-lsn end-lsn))))
               "Replication slot cannot resume from the durable checkpoint"
               {:slot slot :checkpoint end-lsn :slot-status info :resnapshot-required? true})
-    (require! (= manifest (publication-manifest source publication))
-              "Publication schema or membership changed" {:publication publication})
     info))
 
-(defn- emit-barrier! [source]
-  (let [barrier (str (UUID/randomUUID))]
-    (query source "SELECT pg_logical_emit_message(true, 'pg_datahike_mirror', CAST(? AS text))"
-           [barrier] (constantly nil))
-    barrier))
+(defn- emit-barrier!
+  ([source] (emit-barrier! source (str (UUID/randomUUID))))
+  ([source barrier]
+   (query source "SELECT pg_logical_emit_message(true, 'pg_datahike_mirror', CAST(? AS text))"
+          [barrier] (constantly nil))
+   barrier))
 
 (defn- publish-status! [state info]
   (swap! state merge (select-keys info [:confirmed-lsn :restart-lsn :retained-wal-bytes :unconfirmed-wal-bytes])))
 
-(defn- validate-running-publication! [source {:keys [slot publication manifest]} state]
+(defn- checked-running-slot! [source slot state]
   (let [{:keys [matches? invalidation] :as info} (slot-info source slot)]
     (require! (and matches? (nil? invalidation))
               "Replication slot is unavailable" {:slot slot :slot-status info :resnapshot-required? true})
-    (require! (= manifest (publication-manifest source publication))
-              "Publication schema or membership changed" {:publication publication})
     (publish-status! state info)))
 
-(defn- consume! [copy source destination saved state confirmed-lsn
-                 check-running! ready! max-transaction-bytes]
-  (let [{:keys [manifest end-lsn]} saved
-        expected (into {} (map (juxt :relation-id identity)) (:tables manifest))
-        _ (command! source "SET synchronous_commit = local")
-        barrier (emit-barrier! source)
-        next-watermark (volatile! (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 30)))
-        last-packet (volatile! (System/nanoTime))
-        next-check (volatile! 0)
+(defn- new-slot-name [prefix]
+  (str prefix "_" (str/replace (str (UUID/randomUUID)) "-" "")))
+
+(defn- tables-by-id [manifest]
+  (into {} (map (juxt :relation-id identity)) (:tables manifest)))
+
+(defn- added-tables!
+  "Require the publisher to retain each admitted relation and its wire layout."
+  [previous current]
+  (let [before (tables-by-id previous)
+        after (tables-by-id current)
+        changed (into [] (keep (fn [[id table]] (when-not (= table (get after id)) table))) before)]
+    (require! (and (= (:publication-oid previous) (:publication-oid current)) (empty? changed))
+              "Publication schema or membership changed"
+              {:changed (mapv #(select-keys % [:schema :name :relation-id]) changed)})
+    (into [] (remove #(contains? before (:relation-id %))) (:tables current))))
+
+(defn- matches-relation? [table message]
+  (and (= \d (:identity message))
+       (= table (select-keys message [:schema :name :relation-id :columns]))))
+
+(defn- select-change [included? {:keys [op relation-id relation-ids] :as message}]
+  (if (= :truncate op)
+    (when-let [ids (seq (filterv included? relation-ids))]
+      (assoc message :relation-ids (vec ids)))
+    (when (included? relation-id) message)))
+
+(defn- stream!
+  "Read ordered protocol v1 transactions. A commit is acknowledged after its
+   callback succeeds. Returning true from commit! ends this stream."
+  [copy end-lsn confirmed-lsn max-transaction-bytes
+   {:keys [tick! relation-frame! select-change! barrier? commit!]}]
+  (let [last-packet (volatile! (System/nanoTime))
         next-feedback (volatile! 0)
         feedback-position (volatile! confirmed-lsn)
         reply! (fn [request-reply?]
                  (feedback! copy @feedback-position request-reply?)
-                 (vreset! next-feedback (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 1))))
-        barrier-deadline (+ (System/nanoTime) (.toNanos TimeUnit/MINUTES 10))]
-    (loop [relations {} pending nil durable end-lsn caught-up? false]
-      (check-running!)
-      (let [now (System/nanoTime)]
-        (when-not caught-up?
-          (require! (< now barrier-deadline) "Timed out waiting for the initial catch-up barrier" {}))
-        (when (>= now @next-feedback)
-          (reply! true))
-        (when (>= now @next-check)
-          (validate-running-publication! source saved state)
-          (vreset! next-check (+ now (.toNanos TimeUnit/SECONDS 5)))
-          ;; An otherwise idle publication can pin WAL generated by unrelated
-          ;; databases. A committed message lets us checkpoint that progress.
-          (when (and caught-up? (nil? pending) (>= now @next-watermark)
-                     (> (or (:unconfirmed-wal-bytes @state) 0) (* 16 1024 1024)))
-            (emit-barrier! source)
-            (vreset! next-watermark (+ now (.toNanos TimeUnit/SECONDS 30))))))
+                 (vreset! next-feedback (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 1))))]
+    (loop [relations {} pending nil durable end-lsn]
+      (tick! (nil? pending))
+      (when (>= (System/nanoTime) @next-feedback)
+        (reply! true))
       (let [{:keys [^ByteBuffer data reply?] :as packet} (read-packet copy)]
         (when packet (vreset! last-packet (System/nanoTime)))
         (when reply? (reply! false))
         (if data
           (let [size (.remaining data)
-                {:keys [op relation-id identity end-lsn transactional? payload] :as message} (decode data)]
+                {:keys [op relation-id end-lsn transactional? payload] :as message} (decode data)]
             (case op
               :relation
               (do
-                (require! (and (= identity \d)
-                               (= (select-keys message [:schema :name :relation-id :columns])
-                                  (get expected relation-id)))
-                          "Publication relation changed" {:relation (dissoc message :op)})
-                (recur (assoc relations relation-id message) pending durable caught-up?))
+                (relation-frame! message)
+                (recur (assoc relations relation-id message) pending durable))
 
               :begin
               (do
                 (require! (nil? pending) "Received BEGIN before the previous COMMIT" {})
-                (recur relations (assoc message :changes [] :bytes 0) durable caught-up?))
+                (recur relations (assoc message :changes [] :bytes 0) durable))
 
               :origin
-              (recur relations pending durable caught-up?)
+              (recur relations pending durable)
 
               :message
-              (recur relations (if (and transactional? (= barrier payload))
+              (recur relations (if (and transactional? payload (barrier? payload))
                                  (do
                                    (require! pending "Received a transactional message outside a transaction" {})
-                                   (assoc pending :barrier? true))
+                                   (update pending :barriers (fnil conj #{}) payload))
                                  pending)
-                     durable caught-up?)
+                     durable)
 
               :commit
               (do
@@ -641,37 +684,201 @@
                                (not (neg? (compare-lsn end-lsn (:commit-lsn message)))))
                           "pgoutput COMMIT did not match BEGIN" {:commit message})
                 (let [new? (pos? (compare-lsn end-lsn durable))
-                      applied (if new? end-lsn durable)
-                      reached-barrier? (:barrier? pending)]
-                  (when new?
-                    (apply-commit! destination relations durable (assoc pending :end-lsn end-lsn))
-                    (swap! state assoc :applied-lsn applied
-                           :source-xid (:xid pending) :source-commit-micros (:commit-micros pending)))
+                      stop? (when new? (commit! relations durable (assoc pending :end-lsn end-lsn)))]
                   (when (pos? (compare-lsn end-lsn @feedback-position))
                     (vreset! feedback-position end-lsn))
                   (reply! false)
-                  (when reached-barrier?
-                    (validate-running-publication! source saved state)
-                    (ready!))
-                  (recur relations nil applied (or caught-up? reached-barrier?))))
+                  (if stop? end-lsn (recur relations nil (if new? end-lsn durable)))))
 
               (let [bytes (+ (or (:bytes pending) 0) size)]
                 (require! pending "Received a change outside a pgoutput transaction" {:operation op})
                 (require! (<= bytes max-transaction-bytes) "Transaction exceeds the configured byte limit"
                           {:xid (:xid pending) :limit max-transaction-bytes})
-                (recur relations (-> pending (assoc :bytes bytes) (update :changes conj message))
-                       durable caught-up?))))
+                (recur relations
+                       (let [change (select-change! message)]
+                         (cond-> (assoc pending :bytes bytes)
+                           change (update :changes conj change)))
+                       durable))))
           (do
             (when-not packet
               (when (> (- (System/nanoTime) @last-packet) (.toNanos TimeUnit/SECONDS 30))
                 (throw (SQLException. "Timed out waiting for publisher replication traffic" "08006")))
               (Thread/sleep 20))
-            (recur relations pending durable caught-up?)))))))
+            (recur relations pending durable)))))))
 
-(defn- new-slot-name [prefix]
-  (str prefix "_" (str/replace (str (UUID/randomUUID)) "-" "")))
+(defn- set-copy-format! [destination]
+  (sink-execute! destination "SET DateStyle = 'ISO, YMD'")
+  (sink-execute! destination "SET TIME ZONE 'UTC'"))
 
-(defn- replicate! [{:keys [source-url publication slot-prefix max-snapshot-bytes max-transaction-bytes]}
+(defn- stage-tables! [{:keys [source-url publication max-snapshot-bytes max-transaction-bytes]}
+                      origin manifest {:keys [conn tables barrier phase]} check-running!]
+  (with-open [replication (connect source-url true)
+              source (connect source-url false)
+              destination (pg/make-query-handler conn)]
+    (require! (= origin (source-identity replication source)) "Publisher changed during table refresh" {})
+    (set-copy-format! destination)
+    (let [slot (new-slot-name "pgdh_sync")
+          on-bytes (snapshot-budget check-running! max-snapshot-bytes)
+          end-lsn (with-slot-snapshot!
+                    replication source slot true
+                    (fn [position]
+                      (added-tables! manifest (publication-manifest source publication))
+                      (transaction!
+                       destination
+                       (fn []
+                         (doseq [table tables]
+                           (check-running!)
+                           (create-table! destination table)
+                           (copy-table! source destination table on-bytes))))
+                      position))
+          expected (into {} (map (juxt :relation-id identity)) tables)
+          included? (set (keys expected))]
+      (reset! phase :catching-up)
+      (stream! (replication-copy replication slot publication end-lsn)
+               end-lsn end-lsn max-transaction-bytes
+               {:tick! (fn [_] (check-running!))
+                :barrier? #(= barrier %)
+                :relation-frame! (fn [{:keys [relation-id] :as message}]
+                                   (when-let [table (get expected relation-id)]
+                                     (require! (matches-relation? table message)
+                                               "Staged relation changed" {:relation relation-id})))
+                :select-change! #(select-change included? %)
+                :commit! (fn [relations _ {:keys [changes bytes barriers]}]
+                           (when (seq changes)
+                             (on-bytes bytes)
+                             (transaction! destination
+                                           #(doseq [change changes] (apply-change! destination relations change))))
+                           (contains? barriers barrier))}))))
+
+(defn- start-refresh! [config origin manifest tables check-running!]
+  (let [store {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :write :keep-history? false :max-string-length 0}
+        _ (d/create-database store)
+        conn (d/connect store)
+        stopped? (atom false)
+        done (promise)
+        stage {:store store :conn conn :tables tables :manifest manifest
+               :phase (atom :copying) :barrier (str (UUID/randomUUID))
+               :stopped? stopped? :done done}
+        running! #(do (check-running!)
+                      (require! (not @stopped?) "Table refresh stopped" {}))
+        worker (Thread. (fn []
+                          (deliver done
+                                   (try {:position (stage-tables! config origin manifest stage running!)}
+                                        (catch Throwable error {:error error}))))
+                        "pg-datahike-table-refresh")]
+    (.start worker)
+    (assoc stage :worker worker)))
+
+(defn- stop-refresh! [{:keys [worker stopped? conn store]}]
+  (reset! stopped? true)
+  (.join ^Thread worker)
+  (try (d/release conn) (finally (d/delete-database store))))
+
+(defn- refresh-result! [stage check-running!]
+  (let [deadline (+ (System/nanoTime) (.toNanos TimeUnit/MINUTES 10))]
+    (loop []
+      (check-running!)
+      (require! (< (System/nanoTime) deadline) "Timed out waiting for table refresh cutover" {})
+      (if-let [{:keys [position error]} (deref (:done stage) 50 nil)]
+        (if error (throw error) position)
+        (recur)))))
+
+(defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
+  (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)]
+    (with-open [staged (pg/make-query-handler (:conn stage))]
+      (set-copy-format! staged)
+      (doseq [table (:tables stage)]
+        (check-running!)
+        (create-table! destination table)
+        (transfer-staged-table! staged destination table on-bytes)))))
+
+(defn- consume! [copy source destination saved state confirmed-lsn check-running! ready! config]
+  (let [{:keys [origin manifest end-lsn publication slot]} saved
+        {:keys [max-transaction-bytes max-snapshot-bytes]} config
+        applied (volatile! manifest)
+        live-ids (volatile! (set (keys (tables-by-id manifest))))
+        observed (volatile! (tables-by-id manifest))
+        stage (volatile! nil)
+        stage-signaled? (volatile! false)
+        following? (volatile! false)
+        _ (command! source "SET synchronous_commit = local")
+        _ (set-copy-format! destination)
+        initial (emit-barrier! source)
+        initial-deadline (+ (System/nanoTime) (.toNanos TimeUnit/MINUTES 10))
+        next-watermark (volatile! (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 30)))
+        next-check (volatile! 0)
+        refresh! (fn []
+                   (let [current (publication-manifest source publication)
+                         added (added-tables! @applied current)]
+                     (vreset! observed (tables-by-id current))
+                     (if-let [active @stage]
+                       (added-tables! (:manifest active) current)
+                       (when (seq added)
+                         (vreset! stage (start-refresh! config origin current added check-running!))
+                         (vreset! stage-signaled? false)))))]
+    (try
+      (stream!
+       copy end-lsn confirmed-lsn max-transaction-bytes
+       {:tick! (fn [between-transactions?]
+                 (check-running!)
+                 (let [now (System/nanoTime)]
+                   (when-not @following?
+                     (require! (< now initial-deadline) "Timed out waiting for the initial catch-up barrier" {}))
+                   (when (>= now @next-check)
+                     (checked-running-slot! source slot state)
+                     (refresh!)
+                     (vreset! next-check (+ now (.toNanos TimeUnit/SECONDS 5)))
+                     (when (and @following? between-transactions? (>= now @next-watermark)
+                                (> (or (:unconfirmed-wal-bytes @state) 0) (* 16 1024 1024)))
+                       (emit-barrier! source)
+                       (vreset! next-watermark (+ now (.toNanos TimeUnit/SECONDS 30)))))
+                   (when-let [active @stage]
+                     (when-let [error (:error (deref (:done active) 0 nil))] (throw error))
+                     (let [phase @(:phase active)
+                           status {:state phase :tables (mapv relation-name (:tables active))}]
+                       (when-not (= status (:refresh @state))
+                         (swap! state assoc :refresh status))
+                       (when (and between-transactions? (= :catching-up phase) (not @stage-signaled?))
+                         (emit-barrier! source (:barrier active))
+                         (vreset! stage-signaled? true))))))
+        :barrier? (fn [payload] (or (= initial payload) (= (:barrier @stage) payload)))
+        :relation-frame! (fn [{:keys [relation-id] :as message}]
+                           (when-not (matches-relation? (get @observed relation-id) message)
+                             (refresh!))
+                           (require! (matches-relation? (get @observed relation-id) message)
+                                     "Publication relation changed" {:relation (dissoc message :op)}))
+        :select-change! #(select-change @live-ids %)
+        :commit! (fn [relations previous {:keys [end-lsn xid commit-micros barriers] :as transaction}]
+                   (let [active @stage
+                         cutover? (contains? barriers (:barrier active))
+                         initial? (contains? barriers initial)]
+                     (when (or cutover? initial?) (refresh!))
+                     (when cutover?
+                       (require! (= end-lsn (refresh-result! active check-running!))
+                                 "Table refresh reached a different cutover position" {:position end-lsn})
+                       (refresh!))
+                     (apply-commit! destination relations previous
+                                    (cond-> transaction
+                                      cutover?
+                                      (assoc :manifest (:manifest active)
+                                             :install! #(install-staged-tables! active % check-running! max-snapshot-bytes))))
+                     (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros)
+                     (when cutover?
+                       (vreset! applied (:manifest active))
+                       (vreset! live-ids (set (keys (tables-by-id @applied))))
+                       (vreset! stage nil)
+                       (stop-refresh! active)
+                       (swap! state dissoc :refresh))
+                     (when initial?
+                       (ready!)
+                       (vreset! following? true))
+                     false))})
+      (finally
+        (when-let [active @stage] (stop-refresh! active))
+        (swap! state dissoc :refresh)))))
+
+(defn- replicate! [{:keys [source-url publication slot-prefix max-snapshot-bytes] :as config}
                    destination state check-running! ready!]
   (with-open [replication (connect source-url true)
               source (connect source-url false)]
@@ -694,7 +901,7 @@
       (publish-status! state info)
       (swap! state assoc :state :catching-up :applied-lsn end-lsn)
       (consume! (replication-copy replication slot publication confirmed-lsn)
-                source destination saved state confirmed-lsn check-running! ready! max-transaction-bytes))))
+                source destination saved state confirmed-lsn check-running! ready! config))))
 
 (defn- retryable? [error]
   (and (instance? SQLException error)
