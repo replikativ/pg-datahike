@@ -494,6 +494,21 @@
                 (if-not (zero? c) c
                         (compare (vec (:lbounds a)) (vec (:lbounds b))))))))))))
 
+(defn timetz-sort-key
+  "PostgreSQL compares UTC-equivalent microseconds, then seconds west."
+  [value]
+  (if (sql-null? value)
+    :__null__
+    (let [[usec west]
+          (if (instance? java.time.OffsetTime value)
+            (let [^java.time.OffsetTime time value]
+              [(quot (.toNanoOfDay (.toLocalTime time)) 1000)
+               (- (.getTotalSeconds (.getOffset time)))])
+            (let [{:keys [usec west]}
+                  (datetime-in/timetz-in value {:date-order :mdy :session-zone types/utc-zone})]
+              [usec west]))]
+      [(+ usec (* west 1000000)) west])))
+
 (defn order-cmp
   "`compare`, with two corrections.
 
@@ -534,6 +549,8 @@
         (Long/compareUnsigned (.getLeastSignificantBits ua)
                               (.getLeastSignificantBits ub))
         high))
+    (and (instance? java.time.OffsetTime a) (instance? java.time.OffsetTime b))
+    (compare (timetz-sort-key a) (timetz-sort-key b))
     (and (pg-rec/record? a) (pg-rec/record? b)) (record-order-cmp a b)
     (and (pg-arr/array? a) (pg-arr/array? b)) (array-order-cmp a b)
     ;; PostgreSQL has no operator between a composite and a scalar.

@@ -63,6 +63,7 @@
 (def sql--                               fns/sql--)
 (def sql-and3                            fns/sql-and3)
 (def sql-at-time-zone                    fns/sql-at-time-zone)
+(def timetz-sort-key                     fns/timetz-sort-key)
 (def sql-timezone-local                  fns/sql-timezone-local)
 (def sql-between3?                       fns/sql-between3?)
 (def sql-between?                        fns/sql-between?)

@@ -377,6 +377,27 @@
       (is (= java.time.LocalTime/MAX (.getObject rs 1 java.time.LocalTime))))
     (is (= "22008" (state c "SELECT '24:00:01'::time")))))
 
+(deftest timetz-order-and-view-output
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE zoned_times (id int, t timetz)")
+    (exec! c (str "INSERT INTO zoned_times VALUES (1, '07:07-08'), (2, '08:08-04'), "
+                  "(3, '10:00+01'), (4, '09:00+00'), (5, '24:00+00'), (6, NULL)"))
+    (is (= [["3"] ["4"] ["2"] ["1"] ["5"] ["6"]]
+           (rows c "SELECT id FROM zoned_times ORDER BY t")))
+    (is (= [["6" nil] ["5" "24:00:00+00"] ["1" "07:07:00-08"]]
+           (rows c "SELECT id, t AS x FROM zoned_times ORDER BY x DESC NULLS FIRST LIMIT 3")))
+    (doseq [columns ["id, t" "*"]]
+      (is (= [["3" "10:00:00+01"] ["4" "09:00:00+00"]]
+             (rows c (str "SELECT " columns " FROM zoned_times ORDER BY 2 LIMIT 2")))))
+    (is (= [["3" "10:00:00+01" "10:00:00+01"]]
+           (rows c "SELECT *, t AS \"Local Clock\" FROM zoned_times ORDER BY \"Local Clock\" LIMIT 1")))
+    (is (= [["t"]] (rows c "SELECT '10:00+01'::timetz < '09:00+00'::timetz")))
+    (exec! c (str "CREATE VIEW zoned_view AS SELECT id, timezone('UTC', t) AS z "
+                  "FROM zoned_times WHERE id IN (1, 2) ORDER BY t"))
+    (is (= [["2" "12:08:00+00" "time with time zone"]
+            ["1" "15:07:00+00" "time with time zone"]]
+           (rows c "SELECT id, z, pg_typeof(z) FROM zoned_view")))))
+
 (deftest time-precision-comparison-and-fixed-width-text
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE typed (id int, t time(3), tz timetz(6), fixed char(4))")

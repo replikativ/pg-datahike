@@ -3526,6 +3526,9 @@
                                    (nth col-timestamp i)
                                    (partial sql-cast/timestamp-value->storage (nth col-timestamp i) nil)
 
+                                   (#{"time" "timetz"} (nth col-pg-type i))
+                                   (fn [v] (or (types/temporal->pg-text v) (str v)))
+
                                    :else (col-coerce (nth col-types i))))
                                (range (count sub-aliases)))
            schema-tx
@@ -6487,6 +6490,12 @@
                                                 "NULLS_FIRST" :first
                                                 "NULLS_LAST"  :last
                                                 nil)
+                                        alias-idx
+                                        (when (and (instance? Column expr)
+                                                   (nil? (.getTable ^Column expr)))
+                                          (let [idx (.indexOf ^java.util.List fa-snap
+                                                              (unquote-ident (.getColumnName ^Column expr)))]
+                                            (when-not (neg? idx) idx)))
                                         order-source-expr
                                         (cond
                                           (instance? LongValue expr)
@@ -6496,22 +6505,12 @@
                                                (nth select-items (dec pos)))))
 
                                           (instance? Column expr)
-                                          (let [col-name (.getColumnName ^Column expr)
-                                                tbl (.getTable ^Column expr)
-                                                alias-idx (when (nil? tbl)
-                                                            (some (fn [[i a]]
-                                                                    (when (= a col-name) i))
-                                                                  (map-indexed vector fa-snap)))]
-                                            (if (and alias-idx (< alias-idx (count select-items)))
-                                              (let [selected (.getExpression ^SelectItem
-                                                              (nth select-items alias-idx))]
-                                                ;; `SELECT * ... ORDER BY col`: star expansion
-                                                ;; creates one find alias per physical column,
-                                                ;; but `select-items` still contains only the
-                                                ;; single `*` AST node. Keep the ORDER BY column
-                                                ;; as the type source in that case.
-                                                (if (instance? AllColumns selected) expr selected))
-                                              expr))
+                                          (if (and alias-idx (< alias-idx (count select-items)))
+                                            (let [selected (.getExpression ^SelectItem
+                                                            (nth select-items alias-idx))]
+                                              ;; A star has no single column type.
+                                              (if (instance? AllColumns selected) expr selected))
+                                            expr)
 
                                           :else expr)
                                         matching-select-idx
@@ -6613,16 +6612,9 @@
                                             {:post-window matching-window-out-pos}
 
                                             (instance? Column expr)
-                                            (let [col-name (.getColumnName ^Column expr)
-                                                  tbl (.getTable ^Column expr)
-                                                  ;; Only alias-resolve unqualified column refs
-                                                  alias-idx (when (nil? tbl)
-                                                              (some (fn [[i a]]
-                                                                      (when (= a col-name) i))
-                                                                    (map-indexed vector fa-snap)))]
-                                              (if alias-idx
-                                                (nth fe-snap alias-idx)
-                                                (expr/translate-expr ctx expr)))
+                                            (if alias-idx
+                                              (nth fe-snap alias-idx)
+                                              (expr/translate-expr ctx expr))
 
                                             (some? matching-select-idx)
                                             (nth fe-snap matching-select-idx)
@@ -6680,6 +6672,22 @@
                                                    (not (map? v)))
                                             (expr/enum-rank-var! ctx enum-spec v)
                                             v)
+                                        ;; The visible OIDs include expanded stars, so
+                                        ;; ORDER BY an ordinal can use the projected type.
+                                        order-oid
+                                        (or (when-let [index (if (instance? LongValue expr)
+                                                               (dec (.getValue ^LongValue expr))
+                                                               alias-idx)]
+                                              (nth select-item-oids index nil))
+                                            (oid/expr-oid order-source-expr agg-oid-env))
+                                        ;; In storage a timetz is text. Build its typed
+                                        ;; sort key before the original value is projected.
+                                        v (if (and (symbol? v)
+                                                   (= types/oid-timetz order-oid)
+                                                   (not (some #(= v (:out-var %)) project-set-specs)))
+                                            (ctx/materialize-arg!
+                                             ctx (list 'datahike.pg.query-fns/timetz-sort-key v))
+                                            v)
                                         ;; An aggregate written out in ORDER BY rather
                                         ;; than referenced by alias. PostgreSQL allows it
                                         ;; whether or not it is projected — `SELECT dept
@@ -6728,7 +6736,7 @@
                                                             {:error :feature-not-supported
                                                              :feature "ORDER BY on aggregate not in SELECT list"
                                                              :detail (str "ORDER BY on aggregate not in SELECT list is not supported: " (str expr))})))]
-                                    [v (if asc? :asc :desc) nulls]))
+                                    [v (if asc? :asc :desc) nulls order-oid]))
                                 order-by)))
 
 ;; LIMIT / OFFSET / FETCH FIRST
@@ -7833,6 +7841,7 @@
         (when (and (pos-int? limit-val)
                    (= 1 (count order-by))
                    (= 1 (count order-by-spec))
+                   (not= types/oid-timetz (get-in order-by-spec [0 3]))
                    (not fetch-with-ties?)
                    default-table
                    (not @has-aggregates?)
