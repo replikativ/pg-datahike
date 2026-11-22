@@ -1270,13 +1270,9 @@
           (range 1 (count sig)))))
 
 (defn only-keyword-rule
-  "`FROM|JOIN|UPDATE|DELETE FROM ONLY t` -- drop the word.
-
-   JSqlParser accepts it in a SELECT and silently discards it, and
-   rejects it outright in a DELETE. Either way the translator cannot
-   learn it from the AST, so it is read from the SQL beforehand
-   (`params/only-tables-in`) and removed here, leaving a statement the
-   parser accepts and a set of names the translator honours."
+  "Preserve ONLY on the individual table token as a parser comment.
+   JSqlParser rejects ONLY in JOIN and DELETE, and omits it from the
+   Table node for a FROM item. The table's first token retains comments."
   [toks]
   (let [sig (vec (remove #(= :comment (:type %)) toks))]
     (keep (fn [i]
@@ -1290,7 +1286,9 @@
                          (contains? #{"from" "join" "update"}
                                     (str/lower-case (:text prev))))
                 ;; Through to the next token's start, so the space goes too.
-                [(:pos t) (:pos nxt) ""])))
+                [(:pos t) (:pos nxt) (if-let [marker params/*only-table-marker*]
+                                          (str marker " ")
+                                          "")])))
           (range 1 (count sig)))))
 
 (defn order-by-using-rule

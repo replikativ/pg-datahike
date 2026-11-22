@@ -555,18 +555,40 @@
    reads it here."
   #{})
 
+(def ^:dynamic *only-table-marker* nil)
+
+(defn only-table-marker [sql]
+  (loop [marker "__pgdh_only__"]
+    (let [comment (str "/*" marker "*/")]
+      (if (str/includes? sql comment)
+        (recur (str marker "_"))
+        comment))))
+
+(defn only-table-reference? [^Table table]
+  (when *only-table-marker*
+    (loop [token (some-> table .getASTNode .jjtGetFirstToken .specialToken)]
+      (when token
+        (or (= *only-table-marker* (.-image ^net.sf.jsqlparser.parser.Token token))
+            (recur (.-specialToken ^net.sf.jsqlparser.parser.Token token)))))))
+
 (defn only-tables-in
-  "The tables `sql` names with ONLY. Token-driven, so the word inside a
-   string or a comment is not the keyword, and a column called `only`
-   is not a modifier."
+  "Return the target names of ONLY modifiers for UPDATE and DELETE."
   [toks]
-  (into #{}
-        (keep (fn [[a b]]
-                (when (and (= :ident (:type a))
-                           (= "only" (str/lower-case (:text a)))
-                           (contains? #{:ident :quoted} (:type b)))
-                  (str/lower-case (:text b)))))
-        (partition 2 1 (remove #(= :comment (:type %)) toks))))
+  (let [signature (vec (remove #(= :comment (:type %)) toks))]
+    (into #{}
+          (keep (fn [i]
+                  (let [previous (get signature (dec i))
+                        modifier (get signature i)
+                        first-name (get signature (inc i))
+                        table (if (= "." (:text (get signature (+ i 2))))
+                                (get signature (+ i 3)) first-name)]
+                    (when (and (= :ident (:type previous))
+                               (#{"from" "join" "update"} (str/lower-case (:text previous)))
+                               (= :ident (:type modifier))
+                               (= "only" (str/lower-case (:text modifier)))
+                               (#{:ident :quoted} (:type table)))
+                      (str/lower-case (unquote-ident (:text table)))))))
+          (range 1 (count signature)))))
 
 (def routine-error-key
   "Marks an exception as having escaped a ROUTINE BODY -- a plpgsql

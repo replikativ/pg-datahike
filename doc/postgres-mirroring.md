@@ -59,8 +59,10 @@ publication options.
 
 ## Supported publications
 
-This version accepts whole, unfiltered, permanent tables. Default replica
-identity requires a single or composite non-deferrable primary key. Under
+This version accepts whole, unfiltered, permanent tables in `public`.
+The admission report identifies tables in other schemas before any slot
+is created. Default replica identity requires a single or composite
+non-deferrable primary key. Under
 `REPLICA IDENTITY FULL`, the mirror uses that key when available. Otherwise
 it matches the entire old tuple, including NULL values, and applies the
 change to the matching row with the lowest local entity ID. The current
@@ -73,9 +75,9 @@ unsupported types such as `json` and `json[]` for those tables.
 key. The selected index must be an immediate unique B-tree index over
 non-null columns with default operator classes and deterministic collations.
 The mirror uses the selected key columns for updates and deletes. It copies
-those columns as a unique index and preserves the publisher's primary key
-separately when one exists. Index `INCLUDE` columns are copied as table
-columns.
+those columns as a unique index and preserves the publisher's immediate
+primary key separately when one exists. Index `INCLUDE` columns are copied
+as table columns.
 
 The mirror copies column names and supported types into a fresh read model.
 Publisher defaults,
@@ -100,7 +102,8 @@ PostgreSQL microseconds, `24:00:00`, and `timetz` offsets.
 The subscriber also copies enums in `public` and domains in `public`
 over supported scalar built-in types without base type modifiers.
 Domains can have a default, `NOT NULL`, and one validated `CHECK`.
-The admission report identifies unsupported type definitions by column.
+The admission report identifies unsupported type definitions by column,
+including checks that depend on publisher-side functions outside `pg_catalog`.
 The mirror installs type definitions with the tables or columns that use
 them. With schema refresh enabled, it follows enum label additions and
 renames and changes to a domain's default, nullability, and check.

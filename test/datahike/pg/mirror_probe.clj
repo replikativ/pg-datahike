@@ -189,6 +189,15 @@
         "CREATE TABLE probe_unhandled (id integer PRIMARY KEY, observed inet, payload xml)"
         "CREATE DOMAIN probe_multi_check AS integer CHECK (VALUE > 0) CHECK (VALUE < 42)"
         "CREATE TABLE probe_unhandled_domain (id integer PRIMARY KEY, n probe_multi_check)"
+        "CREATE FUNCTION probe_positive(n integer) RETURNS boolean LANGUAGE sql IMMUTABLE RETURN n > 0"
+        "CREATE DOMAIN probe_custom_check AS integer CHECK (public.probe_positive(VALUE))"
+        "CREATE TABLE probe_custom_domain (id integer PRIMARY KEY, n probe_custom_check)"
+        "CREATE PUBLICATION probe_custom_domain_pub FOR TABLE probe_custom_domain"
+        "CREATE SCHEMA probe_other"
+        "CREATE TABLE probe_other.accounts (id integer NOT NULL)"
+        "CREATE UNIQUE INDEX accounts_identity ON probe_other.accounts (id)"
+        "ALTER TABLE probe_other.accounts REPLICA IDENTITY USING INDEX accounts_identity"
+        "CREATE PUBLICATION probe_other_pub FOR TABLE probe_other.accounts"
         "CREATE TABLE probe_no_key (note text)"
         "ALTER TABLE probe_no_key REPLICA IDENTITY NOTHING"
         "CREATE TABLE probe_no_columns ()"
@@ -215,6 +224,14 @@
                issues)
             "The catalog check omitted an incompatible table or column" incompatible)
     (check! (not (:compatible? incompatible)) "Incompatible publication was admitted" incompatible)
+    (let [custom (report "probe_custom_domain_pub")
+          other (report "probe_other_pub")]
+      (check! (and (not (:compatible? custom))
+                   (some #(= :domain-publisher-function (:detail %)) (-> custom :tables first :issues)))
+              "Domain check depending on a publisher function was admitted" custom)
+      (check! (and (not (:compatible? other))
+                   (some #(= :table-schema (:reason %)) (-> other :tables first :issues)))
+              "Alternate identity table in a non-public schema was admitted" other))
     (check! (:compatible? (report "mirror_pub")) "Publication with common type modifiers was rejected" {})
     (check! (= slots-before (rows source "SELECT slot_name FROM pg_replication_slots WHERE database = current_database()"))
             "The catalog check created a slot" {})))
@@ -1175,7 +1192,9 @@
                       (rows conn "SELECT bucket, id, note FROM pay_second ORDER BY bucket,id")
                       (rows conn "SELECT * FROM pay_empty")
                       (rows conn "SELECT * FROM pay_expr ORDER BY id")
-                      (rows conn "SELECT count(*) FROM ONLY pay")
+                      (rows conn "SELECT count(*) FROM ONLY public.pay")
+                      (rows conn (str "SELECT p.id FROM pay p LEFT JOIN ONLY pay q "
+                                      "ON p.bucket = q.bucket AND p.id = q.id ORDER BY p.bucket, p.id"))
                       (rows conn "SELECT * FROM pay ORDER BY bucket,id")
                       (rows conn "SELECT count(*) FROM pay WHERE tableoid = 'pay_feb'::regclass")
                       (rows conn "SELECT tableoid::regclass::text, count(*) FROM pay GROUP BY tableoid ORDER BY 1")

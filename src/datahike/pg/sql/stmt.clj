@@ -48,6 +48,7 @@
             [datahike.pg.cache :as pg-cache]
             [datahike.db.interface :as dbi]
             [datahike.pg.catalog.basis :as catalog-basis]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.errors :as errors]
             [datahike.pg.input :as input]
@@ -4146,7 +4147,7 @@
                                      (= "pg_temp" (.getSchemaName table))))
                     (or
                      (when (and (contains? schema :datahike.pg.partition/definition)
-                                (not (contains? params/*only-tables* (str/lower-case view-name)))
+                                (not (params/only-table-reference? table))
                                 (not (contains? *cte-namespaces* view-name))
                                 (or (nil? (.getSchemaName table))
                                     (= "public" (unquote-ident (.getSchemaName table)))))
@@ -4193,6 +4194,13 @@
             [item]))
         ;; FROM clause — may be a Table, view, or derived table (subquery)
         explicit-from (unwrap-derived-parentheses (.getFromItem select))
+        only-aliases (into #{}
+                           (keep (fn [item]
+                                   (when (and (instance? Table item)
+                                              (params/only-table-reference? item))
+                                     (let [{:keys [name alias]} (ctx/extract-table-info ^Table item)]
+                                       (or alias name)))))
+                           (cons explicit-from (map #(.getRightItem ^Join %) (.getJoins select))))
         [expanded-from partition-scan?] (expand-view explicit-from)
         from-item (name-anonymous-derived expanded-from)
         ;; A child's restriction must reach its translator before the child
@@ -6283,7 +6291,7 @@
           ;; base-name entries, which must not manufacture a second eid.
           (doseq [[alias-key evar] @(:entity-vars ctx)
                   :let [tname (get (:table-aliases ctx) alias-key alias-key)]
-                  :when (contains? params/*only-tables* (str/lower-case (str tname)))
+                  :when (contains? only-aliases alias-key)
                   child (ctx/inheritance-descendants db tname)]
             (ctx/add-clause!
              ctx (list 'not [evar (pgs/row-marker-attr child) true])))

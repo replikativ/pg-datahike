@@ -1059,6 +1059,7 @@
    parse-sql wraps this with the LRU result cache."
   [^String sql schema db]
   (binding [params/*parse-db* db
+            params/*only-table-marker* (params/only-table-marker sql)
             ctx/*table-name-overrides*
             (when-not ctx/*physical-table-names?*
               (let [names (catalog-objects/table-name-overrides db)]
