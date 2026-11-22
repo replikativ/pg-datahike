@@ -93,11 +93,11 @@
    :file "fast_default" :lines [87 98] :state :covered :impact :wrong-result
    :detail "ADD COLUMN with a literal default fills existing rows. SET DEFAULT affects later writes, and short rows in a VALUES list remain separate rows."}
   {:id :expression-default-backfill
-   :file "fast_default" :lines [67 67] :state :open :impact :unsupported
-   :detail "Adding a column with an expression default to a populated table requires backfill evaluation. The volatile default case needs a separate value per existing row."}
+   :file "fast_default" :lines [67 67] :state :covered :impact :unsupported
+   :detail "ADD COLUMN evaluates the typed volatile default per existing row. The gate includes the upstream random expression, transaction-stable timestamps, and UUID values that survive COMMIT."}
   {:id :fast-default-rewrite-event
    :file "fast_default" :lines [59 61] :state :boundary :impact :unsupported
-   :detail "The first difference is CREATE EVENT TRIGGER on table_rewrite. The volatile backfill fails separately because it needs per-row default evaluation."}
+   :detail "CREATE EVENT TRIGGER on table_rewrite is unsupported. A separate gate checks the volatile backfill's row values."}
   {:id :sequence-data-discovery
    :file "sequence" :lines [416 417] :state :open :impact :wrong-result
    :detail "pg_get_sequence_data now gives stock pg_dump both position fields. With CACHE 10 and three calls, native 18.6 reports the reserved upper value 10 and pg-datahike reports the handed-out value 3."}

@@ -12164,33 +12164,65 @@
           (map (fn [[attr value]] [:db/add eid attr value]))
           metadata)))
 
-(defn- backfill-added-column-tx [db table relation-oid {:keys [name not-null?]}]
-  (let [column (alterable-column db table relation-oid name "ADD COLUMN with a default or NOT NULL")
+(defn- prepare-added-column-backfill
+  [db schema-db table relation-oid {:keys [name not-null?]} resolve-value]
+  (let [column (alterable-column schema-db table relation-oid name "ADD COLUMN with a default or NOT NULL")
         attr (:datahike.pg.column/storage-ident column)
-        entity (d/entity db attr)
+        entity (d/entity schema-db attr)
         kind (:pg/default-kind entity)
-        rows (table-row-eids db table)]
-    (when (and (seq rows) (#{:nextval :expr} kind))
-      (throw (errors/pg-error
-              :feature-not-supported
-              {:message "backfilling an expression default on ADD COLUMN is not supported"})))
-    (let [value (when (#{:literal :bit :bit-coerced :fn} kind)
-                  (stmt/coerce-insert-value
-                   (row-constraints/eval-default kind (:pg/default-value entity))
-                   attr (dbi/-schema db) db))]
-      (when (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))
-        (when-let [spec (get-in (row-constraints/constraint-plan db table) [:domain-enum name])]
-          (when (if (= :enum (:kind spec)) (some? value) (seq rows))
-            (row-constraints/validate-pre-arbiter!
-             db table {attr value} {:domain-enum {name spec}} (row-eval/check-fn db) nil))))
-      (when (and not-null? (seq rows) (nil? value))
-        (throw (ex-info (str "column \"" name "\" of relation \"" table
-                             "\" contains null values")
-                        {:sqlstate "23502" :table table :column name})))
-      (cond-> (if (some? value)
-                (mapv (fn [eid] [:db/add eid attr value]) rows)
-                [])
-        not-null? (conj [:db/add (:db/id entity) :pg/not-null true])))))
+        default (when kind [kind (:pg/default-value entity) (:pg/default-arg entity)])
+        ast (when (= :expr kind)
+              (ddl/parse-default-expression (:pg/default-value entity)))
+        schema (dbi/-schema schema-db)
+        input-schema (dbi/-schema db)
+        _ (when ast (row-eval/row-oids [ast] nil input-schema db))
+        evaluate #(-> (materialize-column-default default resolve-value ast
+                                                  (fn [expr]
+                                                    (resolve-value (row-eval/default-value expr input-schema db))))
+                      (stmt/coerce-insert-value attr schema schema-db))
+        value (if (#{:expr :nextval} kind) evaluate (constantly (evaluate)))
+        spec (when (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))
+               (get-in (row-constraints/constraint-plan schema-db table) [:domain-enum name]))
+        check-fn (when spec (row-eval/check-fn schema-db))]
+    (fn [ops eid]
+      (let [v (value)]
+        (when (and spec (or (some? v) (= :domain (:kind spec))))
+          (row-constraints/validate-pre-arbiter!
+           schema-db table {attr v} {:domain-enum {name spec}} check-fn nil))
+        (when (and not-null? (nil? v))
+          (throw (ex-info (str "column \"" name "\" of relation \"" table
+                               "\" contains null values")
+                          {:sqlstate "23502" :table table :column name})))
+        (if (some? v) (conj! ops [:db/add eid attr v]) ops)))))
+
+(defn- added-column-backfill-op
+  "Materialize defaults once, before the writer runs. Sequence reservations
+   use the session path, and retry or COMMIT reuses the prepared values."
+  [{:keys [conn tx-state session-state]} db table relation-oid schema-tx columns]
+  (let [schema-db (:db-after (dc/with db schema-tx))
+        resolve-value #(params/resolve-nextvals! % (partial session-nextval! conn tx-state session-state))
+        backfills (mapv #(prepare-added-column-backfill db schema-db table relation-oid % resolve-value)
+                        columns)
+        rows (table-row-eids db table)
+        tick! (params/cancellation-ticker)
+        row-data (persistent!
+                  (reduce (fn [ops eid]
+                            (tick!)
+                            (reduce (fn [ops backfill] (backfill ops eid))
+                                    ops backfills))
+                          (transient []) (sort rows)))
+        ops (into row-data
+                  (keep (fn [{:keys [not-null? storage-ident]}]
+                          (when not-null?
+                            [:db/add [:db/ident storage-ident] :pg/not-null true])))
+                  columns)]
+    [:db.fn/call
+     (fn [current-db]
+       (when-not (= rows (table-row-eids current-db table))
+         (throw (ex-info "could not serialize column default backfill"
+                         {:error :serialization-failure
+                          :detail "table rows changed while ADD COLUMN evaluated defaults"})))
+       ops)]))
 
 (defn- available-column-storage-ident [occupied table name attnum]
   (let [logical (keyword table name)]
@@ -12795,17 +12827,19 @@
                          (map (fn [change]
                                 [:db.fn/call alter-column-default-tx table relation-oid change])
                               (get default-groups before-rewrite?)))
-            backfill-tx (for [{:keys [not-null? default type-object] :as column} added-column-specs
-                              :when (or not-null? (some? (:value default))
-                                        (= :domain (:datahike.pg.object/kind type-object)))]
-                          [:db.fn/call backfill-added-column-tx table relation-oid column])
+            backfill-columns (filterv (fn [{:keys [not-null? default type-object]}]
+                                        (or not-null? (some? (:value default))
+                                            (= :domain (:datahike.pg.object/kind type-object))))
+                                      added-column-specs)
             ;; PostgreSQL drops nullability before adding columns, then
-            ;; validates SET NOT NULL against the resulting table. Run the
-            ;; scan in the writer as well as on a speculative transaction.
-            tx-data (into (nullability-tx :drop-not-null)
-                          (concat schema-and-constraint-data added-constraint-data
-                                  attnum-data inherited-column-data hint-data backfill-tx
-                                  lifecycle-data (default-tx true)
+            ;; validates SET NOT NULL against the resulting table.
+            schema-tx (into (nullability-tx :drop-not-null)
+                            (concat schema-and-constraint-data added-constraint-data
+                                    attnum-data inherited-column-data hint-data))
+            backfill-tx (when (seq backfill-columns)
+                          [(added-column-backfill-op ctx db table relation-oid schema-tx backfill-columns)])
+            tx-data (into schema-tx
+                          (concat backfill-tx lifecycle-data (default-tx true)
                                   (when (seq type-ops) [(type-rewrite-op table relation-oid type-ops)])
                                   (default-tx false)
                                   (nullability-tx :set-not-null)))
@@ -12815,7 +12849,8 @@
                              db catalog-objects/pg-class-oid relation-oid))
                       tx-data)
             tx-data (cond-> tx-data
-                      (some #(= :add-foreign-key (:op %)) operations)
+                      (or (seq backfill-columns)
+                          (some #(= :add-foreign-key (:op %)) operations))
                       (guard-catalog-tx (catalog-basis/capture db)))]
         (if (seq tx-data)
           (try

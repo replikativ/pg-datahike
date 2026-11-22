@@ -338,9 +338,13 @@
        :gate "test/datahike/test/pg_matview_test.clj"
        :test-var "postgres-materialized-view-with-no-data"}]}
     {:name "fast_default", :boundaries #{:defaults :ddl :dml}, :mode :discovery
-     :blockers #{:expression-default-backfill :table-rewrite-events}
+     :blockers #{:table-rewrite-events}
      :strict-slices
-     [{:id :alter-table-preserves-existing-default-values
+     [{:id :expression-default-backfill
+       :source-lines [67 67]
+       :gate "test/datahike/test/pg_expression_default_test.clj"
+       :test-var "alter-column-backfills-typed-expressions"}
+      {:id :alter-table-preserves-existing-default-values
        :source-lines [87 98]
        :gate "test/datahike/test/pg_expression_default_test.clj"
        :test-var "fast-default-keeps-old-row-values"}]}
