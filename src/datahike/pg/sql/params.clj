@@ -860,7 +860,10 @@
                (let [resolved
                      (case (:fn v)
                        :nextval (nextval-fn (:seq-name v))
-                       :now     (java.util.Date.)
+                       :now (case (:clock v)
+                              :wall (java.util.Date.)
+                              :statement (or *statement-time* (java.util.Date.))
+                              (transaction-time))
                        :random-uuid (java.util.UUID/randomUUID)
                        :uuid-v7 (coerce/generate-uuid-v7)
                        :raise   (throw (ex-info (:message v) (:data v)))

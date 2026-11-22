@@ -232,8 +232,8 @@
    is applied. A literal is returned as its text: like any untyped
    literal it is read by the column type's input function when the value
    is coerced for the column (DEFAULT 1.50 on numeric keeps its scale; a
-   guess at the literal's type read it as a double). `now` is the
-   statement time, as PostgreSQL's transaction timestamp is."
+   guess at the literal's type read it as a double). `now` reads the
+   transaction clock."
   [kind value]
   (case kind
     (:literal :bit :bit-coerced) value
@@ -242,12 +242,11 @@
     :expr (throw (ex-info "expression default needs the SQL evaluator"
                           {:error :unevaluated-expression-default
                            :expression value}))
-    :fn (let [^java.util.Date statement-time
-              (or params/*statement-time* (java.util.Date.))
-              instant (.toInstant statement-time)
+    :fn (let [^java.util.Date transaction-time (params/transaction-time)
+              instant (.toInstant transaction-time)
               utc (.atZone instant java.time.ZoneOffset/UTC)]
           (case value
-            "now" statement-time
+            "now" transaction-time
             "current_date" (.toLocalDate utc)
             "current_time" (.toLocalTime utc)
             "current_user" "datahike"

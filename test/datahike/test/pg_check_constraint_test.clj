@@ -170,7 +170,17 @@
       (is (= ["true"]
              (run c (str "SELECT ((((now() AT TIME ZONE 'Asia/Kolkata')"
                          " - a) < interval '1 minute'))::text FROM dz2")))
-          "the stored default is the same wall clock the expression gives now"))))
+          "the stored default is the same wall clock the expression gives now"))
+    (testing "defaults and INSERT now() share the transaction clock"
+      (run c (str "CREATE TABLE clock_writes (id int PRIMARY KEY, "
+                  "given timestamptz, written timestamptz DEFAULT now())"))
+      (run c "BEGIN")
+      (run c "INSERT INTO clock_writes(id, given) VALUES (1, now())")
+      (run c "SELECT pg_sleep(0.03)")
+      (run c "INSERT INTO clock_writes(id, given) VALUES (2, now())")
+      (run c "COMMIT")
+      (is (= ["1"] (run c "SELECT count(DISTINCT written) FROM clock_writes")))
+      (is (= ["2"] (run c "SELECT count(*) FROM clock_writes WHERE given = written"))))))
 
 (deftest on-conflict-checks-and-where-use-sql-semantics
   (with-open [c (jdbc)]

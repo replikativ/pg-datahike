@@ -8448,7 +8448,10 @@
          (#{"now" "current_timestamp" "transaction_timestamp"
             "statement_timestamp" "clock_timestamp"
             "localtimestamp" "localtime" "current_date" "current_time"} fname)
-         {:fn :now}
+         {:fn :now :clock (case fname
+                            "clock_timestamp" :wall
+                            "statement_timestamp" :statement
+                            :transaction)}
 
          ;; UUID generators are volatile too. A concrete UUID folded into
          ;; the parse cache would be reused by every execution of the same
