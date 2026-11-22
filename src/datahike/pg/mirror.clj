@@ -162,11 +162,21 @@
         parent-id (.getLong row "partition_parent")
         leaves (when-let [ids (.getArray row "partition_leaves")]
                  (mapv long (.getArray ids)))
+        partition-bound (.getString row "partition_bound")
+        partition-key (when leaves
+                        {:strategy (.getString row "partition_strategy")
+                         :attnums (mapv parse-long (str/split (.getString row "partition_attributes") #" "))
+                         :opclasses (.getString row "partition_opclasses")
+                         :collations (.getString row "partition_collations")
+                         :expressions (.getString row "partition_expressions")
+                         :default-id (.getLong row "partition_default")
+                         :definition (.getString row "partition_key_definition")})
         relation (when schema
                    (cond-> {:schema schema :name (.getString row "tablename")
                             :relation-id (.getLong row "relation_id")}
                      (pos? parent-id) (assoc :partition-parent parent-id)
-                     leaves (assoc :partition-leaves leaves)))
+                     partition-bound (assoc :partition-bound partition-bound)
+                     leaves (assoc :partition-leaves leaves :partition-key partition-key)))
         column-name (.getString row "attname")
         key-position (.getInt row "key_position")
         user-type (when column-name (source-user-type row))
@@ -225,7 +235,7 @@
                          "  FROM publication pub JOIN pg_catalog.pg_publication_tables p ON p.pubname = pub.pubname "
                          "  JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname "
                          "  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename), "
-                         "parent_candidates AS ("
+                         "parent_roots AS ("
                          "  SELECT c.oid FROM publication pub JOIN pg_catalog.pg_class c ON c.relkind = 'p' "
                          "  WHERE NOT pub.pubviaroot AND c.relpersistence = 'p' AND c.oid >= 16384 AND (pub.puballtables "
                          "    OR EXISTS (SELECT 1 FROM pg_catalog.pg_publication_rel pr "
@@ -236,13 +246,17 @@
                          "  JOIN pg_catalog.pg_class leaf ON leaf.oid = p.relation_id AND leaf.relispartition "
                          "  CROSS JOIN LATERAL pg_catalog.pg_partition_ancestors(p.relation_id) a(ancestor) "
                          "  JOIN pg_catalog.pg_class c ON c.oid = a.ancestor AND c.relkind = 'p' WHERE NOT pub.pubviaroot), "
-                         "parents AS ("
-                         "  SELECT c.oid, ARRAY(SELECT t.relid::oid FROM pg_catalog.pg_partition_tree(c.oid) t "
-                         "                     WHERE t.isleaf ORDER BY t.relid::oid) AS leaves "
-                         "  FROM parent_candidates c "
+                         "covered_parents AS ("
+                         "  SELECT c.oid FROM parent_roots c "
                          "  WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_partition_tree(c.oid) t "
                          "                    WHERE t.isleaf AND NOT EXISTS "
                          "                      (SELECT 1 FROM published p WHERE p.relation_id = t.relid))), "
+                         "parent_candidates AS ("
+                         "  SELECT DISTINCT t.relid::oid AS oid FROM covered_parents c "
+                         "  CROSS JOIN LATERAL pg_catalog.pg_partition_tree(c.oid) t WHERE NOT t.isleaf), "
+                         "parents AS ("
+                         "  SELECT c.oid, ARRAY(SELECT t.relid::oid FROM pg_catalog.pg_partition_tree(c.oid) t "
+                         "                     WHERE t.isleaf ORDER BY t.relid::oid) AS leaves FROM parent_candidates c), "
                          "relations AS ("
                          "  SELECT p.*, NULL::oid[] AS partition_leaves FROM published p "
                          "  UNION ALL SELECT c.oid, n.nspname, c.relname, NULL, NULL, p.leaves FROM parents p "
@@ -252,7 +266,14 @@
                          "       p.schemaname, p.tablename, c.oid AS relation_id, p.rowfilter IS NOT NULL AS has_filter, "
                          "       c.relkind, c.relpersistence, c.relreplident, c.relispartition, "
                          "       parent.inhparent AS partition_parent, p.partition_leaves, "
-                         "       coalesce(parent.inhdetachpending, false) AS partition_detach_pending, "
+                         "       (coalesce(parent.inhdetachpending, false) OR EXISTS "
+                         "         (SELECT 1 FROM pg_catalog.pg_inherits ip WHERE ip.inhparent = c.oid AND ip.inhdetachpending)) "
+                         "       AS partition_detach_pending, "
+                         "       pg_catalog.pg_get_expr(c.relpartbound, c.oid) AS partition_bound, "
+                         "       pt.partstrat AS partition_strategy, pt.partattrs::text AS partition_attributes, "
+                         "       pt.partclass::text AS partition_opclasses, pt.partcollation::text AS partition_collations, "
+                         "       pg_catalog.pg_get_expr(pt.partexprs, c.oid) AS partition_expressions, "
+                         "       pt.partdefid AS partition_default, pg_catalog.pg_get_partkeydef(pt.partrelid) AS partition_key_definition, "
                          "       pg_catalog.row_security_active(c.oid) AS has_row_security, "
                          "       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits "
                          "               WHERE inhrelid = c.oid OR inhparent = c.oid) AS has_inheritance, "
@@ -273,6 +294,7 @@
                          "LEFT JOIN relations p ON true "
                          "LEFT JOIN pg_catalog.pg_class c ON c.oid = p.relation_id "
                          "LEFT JOIN pg_catalog.pg_inherits parent ON c.relispartition AND parent.inhrelid = c.oid "
+                         "LEFT JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = c.oid "
                          "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
                          "LEFT JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype IN ('d', 'e') "
                          "LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace "
@@ -537,6 +559,23 @@
               (map (fn [id] (str "SELECT " columns " FROM " (relation-name (tables id))))
                    (:partition-leaves parent)))))
 
+(defn- local-partition-key [db table local]
+  (when-let [{:keys [attnums default-id] :as key} (:partition-key table)]
+    (let [oid (:datahike.pg.object/oid (get local (:relation-id table)))
+          names (into {} (map (juxt :attnum :name)) (:columns table))]
+      (-> key
+          (dissoc :default-id :definition)
+          (assoc :default-oid (get-in local [default-id :datahike.pg.object/oid] 0)
+                 :attnums (mapv (fn [attnum]
+                                  (if (zero? attnum)
+                                    0
+                                    (let [column (catalog-objects/column-by-name db oid (get names attnum))
+                                          local-attnum (:datahike.pg.column/attnum column)]
+                                      (require! local-attnum "Missing local partition key column"
+                                                {:table (relation-name table) :attnum attnum})
+                                      local-attnum)))
+                                attnums))))))
+
 (defn- partition-topology-tx [db manifest]
   (let [relations (all-relations manifest)
         by-id (into {} (map (juxt :relation-id identity)) relations)
@@ -547,7 +586,10 @@
         schema (dbi/-schema db)
         attributes (when (seq (:partition-parents manifest))
                      (for [[attr vtype] [[:datahike.pg.partition/definition :db.type/string]
-                                         [:datahike.pg.partition/parent-oid :db.type/long]]
+                                         [:datahike.pg.partition/parent-oid :db.type/long]
+                                         [:datahike.pg.partition/key :db.type/string]
+                                         [:datahike.pg.partition/key-definition :db.type/string]
+                                         [:datahike.pg.partition/bound :db.type/string]]
                            :when (not (contains? schema attr))]
                        {:db/ident attr :db/valueType vtype :db/cardinality :db.cardinality/one}))]
     (into (vec attributes)
@@ -558,6 +600,7 @@
                    old (d/entity db eid)
                    definition (when partition-leaves (partition-query table by-id))
                    parent-oid (get-in local [partition-parent :datahike.pg.object/oid])
+                   partition-key (some-> (local-partition-key db table local) pr-str)
                    changes (into []
                                  (keep (fn [[attr value]]
                                          (let [before (get old attr)]
@@ -566,7 +609,10 @@
                                              (nil? value) [:db/retract eid attr before]
                                              :else [:db/add eid attr value]))))
                                  [[:datahike.pg.partition/definition definition]
-                                  [:datahike.pg.partition/parent-oid parent-oid]])]
+                                  [:datahike.pg.partition/parent-oid parent-oid]
+                                  [:datahike.pg.partition/key partition-key]
+                                  [:datahike.pg.partition/key-definition (get-in table [:partition-key :definition])]
+                                  [:datahike.pg.partition/bound (when parent-oid (:partition-bound table))]])]
                (when (seq changes)
                  (into changes (catalog-objects/bump-revision-tx db catalog-objects/pg-class-oid oid))))))
           relations)))
@@ -890,9 +936,9 @@
   (into {} (map (juxt :relation-id identity)) (all-relations manifest)))
 
 (defn- partition-layout [manifest]
-  (into {} (keep (fn [{:keys [relation-id partition-parent partition-leaves]}]
+  (into {} (keep (fn [{:keys [relation-id partition-parent partition-leaves partition-key partition-bound]}]
                    (when (or partition-parent partition-leaves)
-                     [relation-id [partition-parent partition-leaves]])))
+                     [relation-id [partition-parent partition-leaves partition-key partition-bound]])))
         (all-relations manifest)))
 
 (defn- partition-affected [previous current]
@@ -920,7 +966,8 @@
   (if (every? :attnum (:columns previous))
     (let [shape (fn [table]
                   (-> table
-                      (dissoc :storage-name :primary-key-name :partition-leaves :partition-parent)
+                      (dissoc :storage-name :primary-key-name :partition-leaves :partition-parent
+                              :partition-key :partition-bound)
                       (update :columns (fn [cols] (mapv #(dissoc % :key-position) cols)))))]
       (and current (= (shape previous) (shape current))
            (or (nil? (:primary-key-name previous))
@@ -1323,7 +1370,9 @@
                        (keep (fn [attr]
                                (when-let [value (get entity attr)]
                                  [:db/retract eid attr value]))
-                             [:datahike.pg.partition/definition :datahike.pg.partition/parent-oid]))))))))
+                             [:datahike.pg.partition/definition :datahike.pg.partition/parent-oid
+                              :datahike.pg.partition/key :datahike.pg.partition/key-definition
+                              :datahike.pg.partition/bound]))))))))
 
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)

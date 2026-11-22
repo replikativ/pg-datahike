@@ -89,12 +89,17 @@ Use the publisher's default leaf routing, with
 When the publication covers all leaves, readers can query the parent or
 any intermediate parent. `ONLY` reads the empty physical parent.
 `pg_class` and `pg_inherits` expose the mirrored table hierarchy.
+`pg_partitioned_table` reports partition keys and default partitions
+using the mirror's relation OIDs and column numbers. `pg_get_partkeydef`
+renders the key definition, and `pg_get_expr` renders partition bounds
+from `pg_class.relpartbound`. On a parent scan, `tableoid::regclass`
+identifies the leaf that supplied the row.
 
 A new attachment takes a consistent snapshot of the affected leaves.
 The new parent layout and its rows become visible at the same durable
 WAL boundary. A detached leaf disappears from current reads when it
-leaves the publication. Historical reads preserve its earlier rows and
-parent layout.
+leaves the publication. Historical reads preserve its earlier rows,
+partition keys, and bounds.
 
 The admission report flags root routing because direct leaf truncations
 are absent from its WAL stream. A pending detach entry in the publisher's

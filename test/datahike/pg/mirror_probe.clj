@@ -961,6 +961,20 @@
           (when (= ["false"] (slot-query source native-slot "active::text"))
             (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")"))))))))
 
+(defn- partition-catalog [conn]
+  [(rows conn (str "SELECT c.relname, p.partstrat, p.partnatts, d.relname, p.partclass::text, "
+                   "p.partcollation::text, pg_get_partkeydef(c.oid) FROM pg_partitioned_table p "
+                   "JOIN pg_class c ON c.oid = p.partrelid LEFT JOIN pg_class d ON d.oid = p.partdefid "
+                   "ORDER BY c.relname"))
+   (rows conn (str "SELECT c.relname, a.attname FROM pg_partitioned_table p JOIN pg_class c ON c.oid = p.partrelid "
+                   "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(p.partattrs) "
+                   "ORDER BY c.relname, a.attname"))
+   (rows conn (str "SELECT c.relname, pg_get_expr(p.partexprs, c.oid) FROM pg_partitioned_table p "
+                   "JOIN pg_class c ON c.oid = p.partrelid WHERE p.partexprs IS NOT NULL ORDER BY c.relname"))
+   (rows conn (str "SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) FROM pg_class c "
+                   "WHERE c.relispartition AND c.relkind IN ('r','p') ORDER BY c.relname"))
+   (rows conn "SELECT pg_get_partkeydef('pay_audit'::regclass)")])
+
 (defn run-partition-probe!
   "Compare leaf-routed partitions with PostgreSQL, including a populated
    attachment, writes during staging, crash recovery, and detachment."
@@ -970,14 +984,21 @@
         slot-name (str "mirror_partition_ref_" (str/replace (str (random-uuid)) "-" ""))
         config {:source-url source-url :publication "partition_pub" :store-path path :server {:port 0}}
         subscriber (atom nil)
-        ddl [(str "CREATE TABLE pay (bucket integer, id integer, note varchar(40), "
+        ddl [(str "CREATE TABLE pay (obsolete integer, bucket integer, id integer, note varchar(40), "
                   "occurred timestamptz(6) DEFAULT '2024-02-29 12:00:00.123456+00', "
                   "PRIMARY KEY (bucket,id)) PARTITION BY RANGE (bucket)")
              "CREATE TABLE pay_jan PARTITION OF pay FOR VALUES FROM (0) TO (10)"
              "CREATE TABLE pay_second PARTITION OF pay FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (bucket)"
              "CREATE TABLE pay_feb PARTITION OF pay_second FOR VALUES FROM (10) TO (20)"
+             "CREATE TABLE pay_empty PARTITION OF pay FOR VALUES FROM (30) TO (40) PARTITION BY RANGE (bucket)"
+             "CREATE TABLE pay_rest PARTITION OF pay DEFAULT"
+             "ALTER TABLE pay DROP COLUMN obsolete"
+             "CREATE TABLE pay_expr (bucket integer, id integer) PARTITION BY LIST ((bucket + 1))"
+             "CREATE TABLE pay_expr_a PARTITION OF pay_expr FOR VALUES IN (2)"
+             "ALTER TABLE pay_expr_a ADD PRIMARY KEY (id)"
              "CREATE TABLE pay_audit (id integer PRIMARY KEY, note text)"]
-        row-query "SELECT bucket, id, note, occurred::text FROM pay ORDER BY bucket, id"
+        row-query (str "SELECT bucket, id, note, occurred::text, tableoid::regclass::text "
+                       "FROM pay ORDER BY bucket, id")
         parent-oid-query "SELECT oid FROM pg_class WHERE relname = 'pay' AND relkind = 'p'"
         edges-query (str "SELECT p.relname, c.relname FROM pg_inherits i "
                          "JOIN pg_class p ON i.inhparent = p.oid JOIN pg_class c ON i.inhrelid = c.oid "
@@ -987,7 +1008,14 @@
         probe-rows (fn [conn]
                      [(rows conn row-query)
                       (rows conn "SELECT bucket, id, note FROM pay_second ORDER BY bucket,id")
+                      (rows conn "SELECT * FROM pay_empty")
+                      (rows conn "SELECT * FROM pay_expr ORDER BY id")
                       (rows conn "SELECT count(*) FROM ONLY pay")
+                      (rows conn "SELECT * FROM pay ORDER BY bucket,id")
+                      (rows conn "SELECT count(*) FROM pay WHERE tableoid = 'pay_feb'::regclass")
+                      (rows conn "SELECT tableoid::regclass::text, count(*) FROM pay GROUP BY tableoid ORDER BY 1")
+                      (rows conn (str "SELECT a.id, p.tableoid::regclass::text FROM pay_audit a "
+                                      "LEFT JOIN pay p ON p.id = a.id ORDER BY a.id, p.bucket"))
                       (rows conn "SELECT * FROM pay_audit ORDER BY id")])
         check-rows (fn [source reference sink]
                      (let [expected (probe-rows source)]
@@ -999,7 +1027,10 @@
                                   (= expected (probe-rows sink))))
                        (check! (= (rows source edges-query) (rows sink edges-query))
                                "Partition catalog edges differ" {:source (rows source edges-query)
-                                                                 :mirror (rows sink edges-query)})))]
+                                                                 :mirror (rows sink edges-query)})
+                       (check! (= (partition-catalog source) (partition-catalog sink))
+                               "Partition keys or bounds differ" {:source (partition-catalog source)
+                                                                  :mirror (partition-catalog sink)})))]
     (prn {:artifacts directory})
     (with-open [source (DriverManager/getConnection source-url)
                 reference (DriverManager/getConnection reference-url)]
@@ -1009,9 +1040,15 @@
           (apply sql! c ddl))
         (sql! source
               "INSERT INTO pay VALUES (1,1,'moves'), (2,2,'truncate'), (11,1,'existing')"
-              "INSERT INTO pay_audit VALUES (1,'initial')"
-              "CREATE PUBLICATION partition_pub FOR TABLE pay, pay_audit"
+              "INSERT INTO pay_expr VALUES (1,1)"
+              "INSERT INTO pay_audit VALUES (1,'initial'), (3,'unmatched')"
+              "CREATE PUBLICATION partition_pub FOR TABLE pay, pay_audit, pay_expr"
+              "CREATE PUBLICATION partition_subset_pub FOR TABLE pay_jan"
               "CREATE PUBLICATION partition_root_pub FOR TABLE pay WITH (publish_via_partition_root = true)")
+        (let [report (mirror/publication-report (assoc config :publication "partition_subset_pub"))]
+          (check! (and (:compatible? report) (= ["pay_jan"] (mapv :name (:tables report)))
+                       (empty? (:partition-parents report)))
+                  "A partial publication exposed its parent or an unpublished sibling" report))
         (let [report (mirror/publication-report (assoc config :publication "partition_root_pub"))]
           (check! (some #(= :root-partition-routing (:reason %)) (mapcat :issues (:tables report)))
                   "Root-routed publication lacked a routing blocker" report))
@@ -1022,6 +1059,11 @@
         (let [{:keys [slot]} (await-state! @subscriber :following)]
           (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
             (check-rows source reference sink)
+            (with-open [st (.prepareStatement sink "SELECT p.tableoid FROM pay p WHERE p.id = ? ORDER BY p.bucket")]
+              (.setInt st 1 1)
+              (with-open [rs (.executeQuery st)]
+                (check! (= "oid" (.getColumnTypeName (.getMetaData rs) 1)) "tableoid lost its OID type" {})
+                (check! (and (.next rs) (pos? (.getLong rs 1))) "Prepared tableoid read lost its leaf" {})))
             (sql! source "UPDATE pay SET bucket=12 WHERE bucket=1 AND id=1" "TRUNCATE pay_jan")
             (check-rows source reference sink)
             (let [pre-attach (rows sink row-query)
@@ -1058,7 +1100,7 @@
                           "UPDATE pay SET bucket=22 WHERE bucket=12 AND id=1"
                           "UPDATE pay_audit SET note='during attach' WHERE id=1" "COMMIT")
                     (await! "Unrelated rows stopped following during partition refresh"
-                            #(= [["1" "during attach"]] (rows sink "SELECT * FROM pay_audit")))
+                            #(= [["1" "during attach"]] (rows sink "SELECT * FROM pay_audit WHERE id=1")))
                     (check! (= pre-attach (rows sink row-query)) "Partition changes escaped before cutover" {})
                     (finally (deliver continue-copy true)))
                   (check! (= "Interrupted partition cutover"
@@ -1082,6 +1124,7 @@
                 (check! (= pre-attach (rows restarted row-query)) "Historical parent lost the pre-attach rows" {})
                 (sql! restarted "RESET datahike.as_of")
                 (let [before (rows restarted row-query)
+                      old-catalog (partition-catalog restarted)
                       before-at (snapshot-at)]
                   (sql! reference "ALTER TABLE pay DETACH PARTITION pay_mar")
                   (sql! source "ALTER TABLE pay DETACH PARTITION pay_mar")
@@ -1092,6 +1135,7 @@
                           "The detached publication leaf stayed queryable" {})
                   (sql! restarted (str "SET datahike.as_of = " (literal before-at)))
                   (check! (= before (rows restarted row-query)) "Historical parent lost detached partition rows" {})
+                  (check! (= old-catalog (partition-catalog restarted)) "Historical partition metadata changed" {})
                   (sql! restarted "RESET datahike.as_of")
                   (sql! reference "TRUNCATE pay_mar" (second ddl))
                   (sql! source "UPDATE pay_mar SET note='changed while detached'" (second ddl))

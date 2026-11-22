@@ -560,6 +560,8 @@
 
 (def ^:const row-marker-col "db-row-exists")
 
+(def ^:const partition-scan-tableoid :datahike.pg.partition/scan-tableoid)
+
 (defn- as-of-view? [db]
   (and db (= :as-of (get-in (dbi/-secondary-view db) [:system :mode]))))
 

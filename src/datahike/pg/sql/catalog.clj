@@ -1973,6 +1973,10 @@
                                     :where [[?e :datahike.pg.partition/definition _]
                                             [?e :datahike.pg.object/oid ?oid]]}
                                   cte-db))
+               bounds (into {} (d/q '[:find ?oid ?bound
+                                      :where [?e :datahike.pg.partition/bound ?bound]
+                                      [?e :datahike.pg.object/oid ?oid]]
+                                    cte-db))
                has-partitions (set (vals partitions))
                matviews (into {}
                               (d/q '{:find [?n ?populated]
@@ -1989,21 +1993,22 @@
                            row-type (catalog-objects/object-by-identity
                                      cte-db catalog-objects/pg-type-oid
                                      catalog-objects/public-namespace-oid logical-name)]
-                       {:pg_class/oid (long tbl-oid)
-                        :pg_class/relname logical-name
-                        :pg_class/relnamespace (or (:namespace-oid identity) 2200)
-                        :pg_class/relispartition (contains? partitions tbl-oid)
-                        :pg_class/relhassubclass (contains? has-partitions tbl-oid)
-                        :pg_class/relkind (cond
-                                            (contains? parents tbl-oid) "p"
-                                            (contains? matviews t) "m"
-                                            :else "r")
-                        :pg_class/relispopulated (get matviews t true)
-                        :pg_class/reltype
-                        (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                                (:datahike.pg.object/oid row-type) 0))
-                        :pg_class/relhastriggers (contains? triggered t)
-                        (pgs/row-marker-attr "pg_class") true}))
+                       (cond-> {:pg_class/oid (long tbl-oid)
+                                :pg_class/relname logical-name
+                                :pg_class/relnamespace (or (:namespace-oid identity) 2200)
+                                :pg_class/relispartition (contains? partitions tbl-oid)
+                                :pg_class/relhassubclass (contains? has-partitions tbl-oid)
+                                :pg_class/relkind (cond
+                                                    (contains? parents tbl-oid) "p"
+                                                    (contains? matviews t) "m"
+                                                    :else "r")
+                                :pg_class/relispopulated (get matviews t true)
+                                :pg_class/reltype
+                                (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                                        (:datahike.pg.object/oid row-type) 0))
+                                :pg_class/relhastriggers (contains? triggered t)
+                                (pgs/row-marker-attr "pg_class") true}
+                         (contains? bounds tbl-oid) (assoc :pg_class/relpartbound (get bounds tbl-oid)))))
                    (pgs/table-names user-schema cte-db))))
      ;; Composite types get a distinct backing pg_class row (relkind 'c');
      ;; pg_type.typrelid and pg_class.reltype link the two identities.
@@ -3190,10 +3195,27 @@
     "pg_stat_activity" []
     "pg_statistic_ext"
     []
+    "pg_partitioned_table"
+    (mapv (fn [[oid key-text]]
+            (let [{:keys [strategy attnums default-oid opclasses collations expressions]}
+                  (edn/read-string key-text)]
+              (cond-> {:pg_partitioned_table/partrelid oid
+                       :pg_partitioned_table/partstrat strategy
+                       :pg_partitioned_table/partnatts (long (count attnums))
+                       :pg_partitioned_table/partdefid default-oid
+                       :pg_partitioned_table/partattrs (str/join " " attnums)
+                       :pg_partitioned_table/partclass opclasses
+                       :pg_partitioned_table/partcollation collations
+                       (pgs/row-marker-attr "pg_partitioned_table") true}
+                expressions (assoc :pg_partitioned_table/partexprs expressions))))
+          (d/q '[:find ?oid ?key-text
+                 :where [?e :datahike.pg.partition/key ?key-text]
+                 [?e :datahike.pg.object/oid ?oid]]
+               cte-db))
     ;; The server has no foreign-data objects, default grants, event
     ;; triggers, subscriptions, or security label providers.
     ("pg_foreign_data_wrapper" "pg_foreign_server" "pg_default_acl"
-                               "pg_partitioned_table" "pg_largeobject_metadata"
+                               "pg_largeobject_metadata"
                                "pg_event_trigger" "pg_subscription" "pg_seclabels")
     []
     "pg_publication"

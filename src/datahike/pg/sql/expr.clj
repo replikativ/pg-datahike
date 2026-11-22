@@ -1897,11 +1897,12 @@
       ;; the surrounding SELECT composes correctly with WHERE / JOIN /
       ;; ORDER BY. Two-arg `column` form returns a single column name;
       ;; we don't model that yet — return the full def.
-      (contains? #{"pg_get_indexdef" "pg_get_constraintdef" "pg_get_triggerdef"} fname)
+      (contains? #{"pg_get_indexdef" "pg_get_constraintdef" "pg_get_triggerdef" "pg_get_partkeydef"} fname)
       (let [[key-attr def-attr] (case fname
                                   "pg_get_indexdef" [:pg_index/indexrelid :pg_index/indexdef]
                                   "pg_get_constraintdef" [:pg_constraint/oid :pg_constraint/condef]
-                                  "pg_get_triggerdef" [:pg_trigger/oid :pg_trigger/tgdef])]
+                                  "pg_get_triggerdef" [:pg_trigger/oid :pg_trigger/tgdef]
+                                  "pg_get_partkeydef" [:datahike.pg.object/oid :datahike.pg.partition/key-definition])]
         (catalog-def-lookup! ctx (or (first args) :__null__) key-attr def-attr result-var))
 
       (and (= fname "isfinite")
@@ -6873,7 +6874,7 @@
     (swap! (:where-clauses ctx) conj
            (list 'or-join [a result-var]
                  (list 'and [e key-attr a] [e def-attr result-var])
-                 (list 'and (list 'not-join [a] [e2 key-attr a])
+                 (list 'and (list 'not-join [a] [e2 key-attr a] [e2 def-attr '_])
                        [(list 'ground :__null__) result-var])))
     result-var))
 
@@ -7081,7 +7082,8 @@
 
 (defn- translate-tableoid
   "The `tableoid` system column: the pg_class OID of the relation a row
-   comes from, a constant per relation. Every table has it and no user
+   comes from. Partition parents read the OID from each projected leaf row.
+   Every table has it and no user
    column may take the name, so it never competes with ordinary resolution.
    Unqualified, it needs exactly one relation in scope (42702 otherwise).
    Derived relations, CTEs and views have none (42703)."
@@ -7097,14 +7099,17 @@
                     (params/ambiguous-column! "tableoid"))
                   (first occurrences)))
         relation (if tbl (get aliases alias) (get aliases alias alias))
+        partition-scan? (contains? (:partition-scan-aliases ctx) alias)
         oid (when (and relation (not (contains? (set (:derived-aliases ctx)) relation)))
               (or (get catalog-objects/catalog-relation-oids relation)
                   (some-> (:db ctx) (pgs/storage-table-oid relation))))
         evar (get @(:entity-vars ctx) alias)]
-    (when-not oid
+    (when-not (or oid partition-scan?)
       (throw (errors/pg-error :undefined-column {:column "tableoid"})))
-    (if (and (contains? @(:left-join-evars ctx) evar)
-             (not= alias (:join-condition-right-alias ctx)))
+    (cond
+      partition-scan? (ctx/col-var! ctx [:aliased alias pgs/partition-scan-tableoid])
+      (and (contains? @(:left-join-evars ctx) evar)
+           (not= alias (:join-condition-right-alias ctx)))
       ;; A null-extended row has no tableoid. The current ON condition
       ;; considers only actual rows of its right relation.
       (let [arg (symbol (str "?tableoid-" (swap! (:var-counter ctx) inc)))
@@ -7114,7 +7119,7 @@
         (swap! (:nullable-vars ctx) conj result)
         (ctx/add-clause! ctx [(list arg evar) result])
         result)
-      oid)))
+      :else oid)))
 
 (defn column-value!
   "Return a column's SQL value variable. Most Datahike scalar values are

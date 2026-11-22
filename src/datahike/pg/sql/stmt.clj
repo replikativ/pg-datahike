@@ -354,9 +354,8 @@
    For LEFT joins, records the ref-attr and right-table alias for later
    or-join wrapping in translate-select.
    Returns {:name str :alias str :join-type keyword :ref-attr kw :left-entity-var sym}."
-  [ctx ^Join join _default-table]
-  (let [right-table (.getRightItem join)
-        ;; A LEFT JOIN LATERAL is INNER as far as the or-join pass is
+  [ctx ^Join join right-table]
+  (let [;; A LEFT JOIN LATERAL is INNER as far as the or-join pass is
         ;; concerned: its NULL-extended row is produced by the row
         ;; producer itself (see the `:outer?` spec), and letting the
         ;; or-join construction wrap the function-binding clause instead
@@ -2932,6 +2931,11 @@
     (throw (errors/pg-error :feature-not-supported
                             {:feature "analysis of this derived relation"}))))
 
+(defn- partition-scan-schema [db options]
+  (when (and (:partition-scan? options) (not (get (dbi/-schema db) pgs/partition-scan-tableoid)))
+    [{:db/ident pgs/partition-scan-tableoid
+      :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]))
+
 (defn materialize-set-op!
   "Run a SELECT (PlainSelect, SetOperationList, or VALUES) and persist its rows
    under `target-name/<col>` in a speculative db. Returns the same
@@ -2956,14 +2960,24 @@
   ([inner target-name db schema alias explicit-aliases options]
    (params/check-cancel!)
    (if params/*analysis-only?*
-     (materialize-output-schema!
-      db target-name alias
-      (name-output-columns (analyze-select-body-columns inner schema db)
-                           explicit-aliases (or alias target-name)))
+     (let [result (materialize-output-schema!
+                   db target-name alias
+                   (name-output-columns (analyze-select-body-columns inner schema db)
+                                        explicit-aliases (or alias target-name)))]
+       (if-let [tx (partition-scan-schema (:db result) options)]
+         (let [analysis-db (virtual-db/with-data (:db result) tx)]
+           (assoc result :db analysis-db :schema (:schema analysis-db)))
+         result))
      (let [tick! (params/cancellation-ticker)
            with-fn checked-db-with
            is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
            values? (instance? Values inner)
+           parse-branch (fn [^PlainSelect select]
+                          (let [parsed (translate-select select schema db options)]
+                            (if (:partition-scan? options)
+                              (let [leaf (:name (ctx/extract-table-info ^Table (.getFromItem select)))]
+                                (assoc parsed :partition-leaf-oid (pgs/storage-table-oid db leaf)))
+                              parsed)))
            branch-parsed
            (cond
              values?
@@ -3001,12 +3015,12 @@
                                  :else :union)))
                    parsed (mapv (fn [s]
                                   (when (instance? PlainSelect s)
-                                    (translate-select ^PlainSelect s schema db)))
+                                    (parse-branch s)))
                                 branches)]
                {:op op-kind :branches parsed})
 
              :else
-             {:op nil :branches [(translate-select ^PlainSelect inner schema db options)]})
+             {:op nil :branches [(parse-branch inner)]})
            _ (when (and (some? (:op branch-parsed))
                         (not= :union-all (:op branch-parsed))
                         (some #{types/oid-vector}
@@ -3130,7 +3144,15 @@
                                                               query in-args
                                                               (:compound-exprs p))]
                               rows))))
-           branch-rows (mapv #(checked-rows (run-branch %)) (:branches branch-parsed))
+           ;; The standard set-operation rows carry only projected columns.
+           ;; Keep the leaf OID in row metadata until we build the scan's
+           ;; private datom, so SELECT * sees the declared columns only.
+           branch-rows (mapv (fn [branch]
+                               (let [rows (checked-rows (run-branch branch))]
+                                 (if-let [oid (:partition-leaf-oid branch)]
+                                   (mapv #(with-meta (vec %) {::partition-leaf-oid oid}) rows)
+                                   rows)))
+                             (:branches branch-parsed))
          ;; Apply the same logical projection to the first branch's aliases.
          ;; Set-operation branches must agree in width; SQL takes the exposed
          ;; column names from this branch.
@@ -3479,17 +3501,17 @@
                                    :else (col-coerce (nth col-types i))))
                                (range (count sub-aliases)))
            schema-tx
-           (output-schema-tx
-            target-name
-            (mapv (fn [i a]
-                    {:name a :oid (nth sub-oids i nil) :vtype (nth col-types i)
-                     :pg-type (or (nth col-pg-type i)
-                                  (types/pg-name-for-dh-type (nth col-types i)))
-                     :array-elem (nth col-array-elem i)
-                     :record-fields (when-let [record (nth col-record i)]
-                                      (pg-rec/layout->text (pg-rec/layout record)))})
-                  (range) sub-aliases)
-            db)
+           (into (output-schema-tx
+                  target-name
+                  (mapv (fn [i a]
+                          {:name a :oid (nth sub-oids i nil) :vtype (nth col-types i)
+                           :pg-type (or (nth col-pg-type i)
+                                        (types/pg-name-for-dh-type (nth col-types i)))
+                           :array-elem (nth col-array-elem i)
+                           :record-fields (when-let [record (nth col-record i)]
+                                            (pg-rec/layout->text (pg-rec/layout record)))})
+                        (range) sub-aliases)
+                  db) (partition-scan-schema db options))
            spec-db (with-fn db schema-tx)
            data-tx (vec (for [row sub-results]
                           (let [vals (if (sequential? row) (vec row) [row])
@@ -3504,7 +3526,9 @@
                          ;; Always include the row marker so the
                          ;; entity exists even if every projected
                          ;; column was NULL.
-                            (assoc cols row-marker true))))
+                            (cond-> (assoc cols row-marker true)
+                              (::partition-leaf-oid (meta row))
+                              (assoc pgs/partition-scan-tableoid (::partition-leaf-oid (meta row)))))))
            spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
        {:db      spec-db2
       ;; `:pg/record-fields` is transacted onto the attribute entity, and
@@ -4086,7 +4110,7 @@
           (if (and db (instance? Table item))
             (let [^Table table item
                   view-name (unquote-ident (.getName table))
-                  [definition columns-str]
+                  [definition columns-str partition?]
                   ;; Resolve an unqualified owning temp relation before a
                   ;; persisted view of the same name, as for ordinary tables.
                   (when-not (and (contains? params/*temp-table-map* view-name)
@@ -4104,7 +4128,7 @@
                                             :where [?e :datahike.pg.object/oid ?oid]
                                             [?e :datahike.pg.partition/definition ?definition]]
                                           db oid)]
-                           (when (seq query) [query nil]))))
+                           (when (seq query) [query nil true]))))
                      (first
                       (d/q '{:find [?definition ?columns]
                              :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
@@ -4129,17 +4153,20 @@
                                    "*")
                       ^net.sf.jsqlparser.statement.select.Select wrapper
                       (CCJSqlParserUtil/parse
-                       (str "SELECT * FROM (SELECT " projection
-                            " FROM (" definition ") AS __view_source) AS __view"))
+                       (if partition?
+                         (str "SELECT * FROM (" definition ") AS __partition")
+                         (str "SELECT * FROM (SELECT " projection
+                              " FROM (" definition ") AS __view_source) AS __view")))
                       ^PlainSelect wrapper-select (.getPlainSelect wrapper)
                       ^ParenthesedSelect derived (.getFromItem wrapper-select)]
                   (.setAlias derived (or (.getAlias table) (Alias. view-name)))
-                  derived)
-                item))
-            item))
+                  [derived partition?])
+                [item]))
+            [item]))
         ;; FROM clause — may be a Table, view, or derived table (subquery)
         explicit-from (unwrap-derived-parentheses (.getFromItem select))
-        from-item (-> explicit-from expand-view name-anonymous-derived)
+        [expanded-from partition-scan?] (expand-view explicit-from)
+        from-item (name-anonymous-derived expanded-from)
         ;; A child's restriction must reach its translator before the child
         ;; materializes. Views and join-position children keep their own scope.
         derived-where (when (instance? ParenthesedSelect explicit-from)
@@ -4177,7 +4204,9 @@
                     sub-name :name sub-alias :alias}
                    (materialize-derived-select!
                     ^ParenthesedSelect from-item db schema
-                    (when derived-where {:additional-where derived-where}))]
+                    (cond-> {}
+                      derived-where (assoc :additional-where derived-where)
+                      partition-scan? (assoc :partition-scan? true)))]
             [sub-db sub-schema sub-name sub-alias]
             [db schema nil nil])
 
@@ -4256,6 +4285,13 @@
         ;; materialize it into the db and register its alias. The JOIN
         ;; is then handled as an ordinary table join in translate-join.
         joins (.getJoins select)
+        ;; Keep expansion local to this translation. Parse and Bind can
+        ;; revisit the same cached AST with another database snapshot.
+        join-items (into {} (map (fn [^Join join]
+                                   (let [[item partition?] (expand-view
+                                                            (unwrap-derived-parentheses (.getRightItem join)))]
+                                     [join [(name-anonymous-derived item) partition?]]))) joins)
+        right-item #(first (join-items %))
         ;; Aliases a LATERAL inner can correlate WITH. Only the FROM
         ;; item is in scope here; PostgreSQL also allows correlating to
         ;; an EARLIER join item, which would need this to grow as the
@@ -4289,7 +4325,7 @@
                                     (unquote-ident (.getName ^Alias a))
                                     (when (instance? Table item)
                                       (unquote-ident (.getName ^Table item))))))
-                              (cons from-item (map #(.getRightItem ^Join %) (or joins []))))]
+                              (cons from-item (map right-item joins)))]
             (when-let [dup (first (for [[n c] (frequencies visible) :when (> c 1)] n))]
               (throw (ex-info (str "table name \"" dup "\" specified more than once")
                               {:error :duplicate-alias :sqlstate "42712" :table dup}))))
@@ -4303,12 +4339,7 @@
         [db schema join-aliases derived-joins lsrf-specs]
         (reduce
          (fn [[db schema aliases derived lsrfs] ^Join j]
-           (let [raw-rt (.getRightItem j)
-                 rt (-> raw-rt
-                        unwrap-derived-parentheses
-                        expand-view
-                        name-anonymous-derived)
-                 _ (when-not (identical? raw-rt rt) (.setRightItem j rt))
+           (let [[rt partition-join?] (join-items j)
                  ;; A joined relation is checked like the FROM item
                  ;; above: absent, it used to surface as "missing
                  ;; FROM-clause entry" for the first column that named
@@ -4443,7 +4474,8 @@
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
                          sub-name :name sub-alias :alias}
-                        (materialize-derived-select! ^ParenthesedSelect rt db schema)]
+                        (materialize-derived-select! ^ParenthesedSelect rt db schema
+                                                     (when partition-join? {:partition-scan? true}))]
                  [spec-db spec-schema
                   ;; Register the USER'S alias too, not just the storage
                   ;; namespace. Only `sub-name` was registered, so
@@ -4456,7 +4488,7 @@
                   (cond-> (assoc aliases sub-name sub-name)
                     (and sub-alias (not= sub-alias sub-name))
                     (assoc sub-alias sub-name))
-                  (conj derived {:join j :alias (or sub-alias sub-name)})
+                  (conj derived {:join j :alias (or sub-alias sub-name) :partition-scan? partition-join?})
                   lsrfs]
                  [db schema aliases derived lsrfs])
 
@@ -4506,7 +4538,7 @@
                out)))
          {}
          (cond-> (into [] (keep (fn [^Join j]
-                                  (let [rt (.getRightItem j)]
+                                  (let [rt (right-item j)]
                                     (when (instance? Table rt) rt)))
                                 (or joins [])))
            (instance? Table from-item) (conj from-item)))
@@ -4529,7 +4561,7 @@
                 [[default-table (get table-aliases default-table default-table)]]
                 [])
               (keep (fn [^Join j]
-                      (let [rt (.getRightItem j)]
+                      (let [rt (right-item j)]
                         (cond
                           (instance? Table rt)
                           (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]
@@ -4560,7 +4592,7 @@
         merged-joins
         (:merged
          (reduce (fn [{:keys [left] :as acc} ^Join j]
-                   (let [rt (.getRightItem j)]
+                   (let [rt (right-item j)]
                      (if-not (instance? Table rt)
                        acc
                        (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)
@@ -4605,6 +4637,9 @@
                            :parse-sql params/*parse-sql*
                            :hints hints
                            :derived-aliases derived-alias-set
+                           :partition-scan-aliases (into (cond-> #{} partition-scan? (conj default-table))
+                                                         (comp (filter :partition-scan?) (map :alias))
+                                                         derived-joins)
                            :computed-aliases (into #{} (map :alias)
                                                    (cond-> (vec lsrf-specs)
                                                      lsrf-spec (conj lsrf-spec)))
@@ -4707,7 +4742,7 @@
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins
                      (mapv (fn [^Join j]
-                             (translate-join ctx j default-table))
+                             (translate-join ctx j (right-item j)))
                            joins))
 
         ;; WHERE clause
@@ -4759,7 +4794,7 @@
                     keyed-preds (when (and (= 1 (count joins))
                                            (or (.isSimple join) (.isCross join))
                                            (instance? Table from-item)
-                                           (instance? Table (.getRightItem join))
+                                           (instance? Table (right-item join))
                                            (empty? derived-alias-set)
                                            (empty? params/*from-bindings*)
                                            (empty? params/*statement-row-scope-tables*))

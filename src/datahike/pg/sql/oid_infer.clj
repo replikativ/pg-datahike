@@ -260,6 +260,7 @@
    ;; pg_get_*def synthesizers — return SQL text
    "pg_get_indexdef"      types/oid-text
    "pg_get_constraintdef" types/oid-text
+   "pg_get_partkeydef"    types/oid-text
    "pg_get_userbyid"      types/oid-name
    "obj_description"      types/oid-text
    "col_description"      types/oid-text
@@ -568,6 +569,7 @@
         ;; runtime, but retains the outer column's declared SQL type here.
         bound-oid bound-oid
         outer-oid outer-oid
+        (= "tableoid" (str/lower-case col-name)) types/oid-oid
         ;; Native PG array column wins over the storage-type fallback.
         pg-name-oid pg-name-oid
         (nil? base-oid) nil

@@ -446,7 +446,7 @@
                   so `WHERE <renamed-col>` and `JOIN … ON …` resolve hint-
                   mapped columns to their real attribute keywords."
   [schema table-aliases default-table & [{:keys [db parse-sql hints derived-aliases ref-targets
-                                                 computed-aliases column-overrides]}]]
+                                                 computed-aliases column-overrides partition-scan-aliases]}]]
   {:schema        schema
    :table-aliases table-aliases
    :default-table default-table
@@ -479,6 +479,7 @@
    ;; namespace (source's :customer/name instead of the speculative
    ;; :c/name) and matches nothing.
    :derived-aliases (or derived-aliases #{})
+   :partition-scan-aliases partition-scan-aliases
    ;; Aliases of COMPUTED relations — a correlated SRF or LATERAL
    ;; subquery whose rows come from a function binding rather than from
    ;; datoms. They have columns but NO entities, so anything that

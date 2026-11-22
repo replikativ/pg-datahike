@@ -4704,7 +4704,6 @@
 (def pg-get-statisticsobjdef        (constantly :__null__))
 (def pg-get-statisticsobjdef-columns (constantly :__null__))
 (def pg-get-statisticsobjdef-expressions (constantly :__null__))
-(def pg-get-partkeydef              (constantly :__null__))
 (def pg-get-viewdef                 (constantly :__null__))
 (def pg-get-triggerdef              (constantly :__null__))
 (def pg-get-ruledef                 (constantly :__null__))
@@ -6339,7 +6338,6 @@
    "pg_get_statisticsobjdef"            pg-get-statisticsobjdef
    "pg_get_statisticsobjdef_columns"    pg-get-statisticsobjdef-columns
    "pg_get_statisticsobjdef_expressions" pg-get-statisticsobjdef-expressions
-   "pg_get_partkeydef"      pg-get-partkeydef
    "pg_get_viewdef"         pg-get-viewdef
    "pg_get_triggerdef"      pg-get-triggerdef
    "pg_get_ruledef"         pg-get-ruledef
