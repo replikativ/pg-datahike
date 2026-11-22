@@ -1295,6 +1295,32 @@
                      (for [[n default] (drop (count positional) spec)]
                        (get by-name n (net.sf.jsqlparser.expression.LongValue. (long default))))))))))
 
+(defn- session-temporal-context! [ctx]
+  (let [state params/*session-state*
+        defaults {:time-zone (or types/*time-zone* types/utc-zone)
+                  :date-style types/*date-style*}
+        session-fn (fn []
+                     (if state
+                       (let [{:keys [time-zone date-style]} @state]
+                         {:time-zone (or time-zone types/utc-zone)
+                          :date-style (or date-style [:iso :mdy])})
+                       defaults))
+        fn-param (ctx/fresh-var! ctx)]
+    (params/session-dependent!)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj session-fn)
+    (ctx/materialize-arg! ctx (list fn-param))))
+
+(defn- timezone-value! [ctx v value-oid]
+  (let [v (ctx/materialize-arg! ctx v)]
+    (if (= value-oid types/oid-time)
+      ;; The timezone overloads take timetz. An ordinary time picks up
+      ;; the session offset through PostgreSQL's implicit cast.
+      (ctx/materialize-arg!
+       ctx (list 'datahike.pg.query-fns/sql-timezone-local
+                 v value-oid (session-temporal-context! ctx)))
+      v)))
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -1426,24 +1452,11 @@
           result-var)
 
       (and (= fname "timezone") (= 1 (count args)))
-      (let [value-oid (first (call-arg-oids ctx arg-exprs))
-            state params/*session-state*
-            defaults {:time-zone (or types/*time-zone* types/utc-zone)
-                      :date-style types/*date-style*}
-            session-fn (fn []
-                         (if state
-                           (let [{:keys [time-zone date-style]} @state]
-                             {:time-zone (or time-zone types/utc-zone)
-                              :date-style (or date-style [:iso :mdy])})
-                           defaults))
-            fn-param (ctx/fresh-var! ctx)]
+      (let [value-oid (first (call-arg-oids ctx arg-exprs))]
         (when-not (contains? #{nil types/oid-time types/oid-timetz types/oid-date
                                types/oid-timestamp types/oid-timestamptz} value-oid)
           (undefined-function! ctx fname arg-exprs))
-        (params/session-dependent!)
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj session-fn)
-        (let [session (ctx/materialize-arg! ctx (list fn-param))]
+        (let [session (session-temporal-context! ctx)]
           (swap! (:where-clauses ctx) conj
                  [(list 'datahike.pg.query-fns/sql-timezone-local (first args) (or value-oid 0) session)
                   result-var]))
@@ -1457,7 +1470,8 @@
                    #{types/oid-time types/oid-timetz} :timetz
                    :timestamptz)]
         (swap! (:where-clauses ctx) conj
-               [(list 'datahike.pg.query-fns/sql-at-time-zone (second args) (first args) kind
+               [(list 'datahike.pg.query-fns/sql-at-time-zone
+                      (timezone-value! ctx (second args) value-oid) (first args) kind
                       (= types/oid-interval (source-oid ctx (first params))))
                 result-var])
         result-var)
@@ -8156,7 +8170,7 @@
                          :timestamptz)
                   zone-var (let [z (translate-expr ctx zone-expr)]
                              (if (seq? z) (ctx/materialize-arg! ctx z) z))
-                  value-var (if (seq? value-var) (ctx/materialize-arg! ctx value-var) value-var)]
+                  value-var (timezone-value! ctx value-var value-oid)]
               [(list 'datahike.pg.query-fns/sql-at-time-zone value-var zone-var kind
                      (= types/oid-interval (source-oid ctx zone-expr)))
                (case kind :timestamp types/oid-timestamptz

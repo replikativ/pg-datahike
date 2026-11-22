@@ -161,6 +161,20 @@
     (is (= "42883" (state c "SELECT timezone(42)")))
     (is (= "42883" (state c "SELECT timezone('12:00'::text)")))))
 
+(deftest timezone-coerces-plain-time-in-the-current-session-zone
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE local_times (t time)")
+    (exec! c "INSERT INTO local_times VALUES ('12:00:00.123456')")
+    (exec! c (str "PREPARE t_conv AS SELECT t AT TIME ZONE INTERVAL '00:00', "
+                  "timezone('UTC', t), pg_typeof(t AT TIME ZONE 'UTC') FROM local_times"))
+    (exec! c "SET TIME ZONE 2.5")
+    (is (= [["09:30:00.123456+00" "09:30:00.123456+00" "time with time zone"]]
+           (rows c "EXECUTE t_conv")))
+    (exec! c "SET TIME ZONE '-7.5'")
+    (is (= [["19:30:00.123456+00" "19:30:00.123456+00" "time with time zone"]]
+           (rows c "EXECUTE t_conv")))
+    (is (= [[nil]] (rows c "SELECT NULL::time AT TIME ZONE INTERVAL '00:00'")))))
+
 (deftest time-expression-metadata
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE empty_times (t time)")
