@@ -40,7 +40,9 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.datetime.in :as datetime-in]
+            [datahike.pg.datetime.lex :as datetime-lex]
             [datahike.pg.datetime.tokens :as datetime-tokens]
+            [datahike.pg.datetime.decode :as datetime-decode]
             [datahike.pg.datetime.zone :as datetime-zone]
             [datahike.pg.errors :as errors]
             [datahike.pg.geo :as geo]
@@ -3820,12 +3822,11 @@
     (instance? java.time.LocalDateTime v) (.atZone ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
     :else nil))
 
-(defn- time-zone-and-abbreviation [zone]
-  (if (instance? java.time.ZoneId zone)
-    [zone nil]
-    (let [name (str zone)
-          dynamic (datetime-zone/dynamic-abbreviation name)]
-      [(types/resolve-time-zone name) (:abbrev dynamic)])))
+(defn- east-at-wall [wall {:keys [east zone abbrev]}]
+  (or east (.getTotalSeconds (datetime-zone/offset-at-local-time wall zone abbrev))))
+
+(defn- east-at-instant [instant {:keys [east zone abbrev]}]
+  (or east (.getTotalSeconds (datetime-zone/offset-at-instant instant zone abbrev))))
 
 (defn- transaction-instant ^java.time.Instant []
   (if-let [^java.util.Date time datetime-in/*transaction-time*]
@@ -3953,21 +3954,18 @@
 
                   (or interval? (interval-value? zone))
                   (interval-zone-offset zone))
-           [zid abbrev] (when-not east (time-zone-and-abbreviation zone))]
+           zone (if east {:east east} (types/resolve-expression-time-zone zone))]
        (case kind
          :timestamp
-         (let [ldt (local-date-time v)
-               east (or east (.getTotalSeconds (datetime-zone/offset-at-local-time ldt zid abbrev)))]
-           (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- east)))
+         (let [ldt (local-date-time v)]
+           (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- (east-at-wall ldt zone))))
 
          :timestamptz
-         (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)
-               east (or east (.getTotalSeconds (datetime-zone/offset-at-instant inst zid abbrev)))]
-           (shift-timestamp inst east))
+         (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)]
+           (shift-timestamp inst (east-at-instant inst zone)))
 
          :timetz
-         (shift-timetz v (or east (.getTotalSeconds
-                                   (datetime-zone/offset-at-instant (transaction-instant) zid abbrev)))))))))
+         (shift-timetz v (east-at-instant (transaction-instant) zone)))))))
 
 (defn sql-timezone-local
   "The one-argument timezone overloads use the current session's zone."
@@ -4099,6 +4097,32 @@
     :__null__
     (make-local-timestamp y mo d h mi sec)))
 
+(defn- make-timestamptz-zone [zone]
+  ;; parse_sane_timezone tries DecodeTimezone before names. Its signed
+  ;; numeric fields count east and accept compact hhmm.
+  (if (instance? java.time.ZoneId zone)
+    (types/resolve-expression-time-zone zone)
+    (let [name (str zone)]
+      (cond
+        (re-find #"^[0-9]" name)
+        (throw (errors/pg-error
+                :invalid-parameter-value
+                {:message (str "invalid input syntax for type numeric time zone: \"" name "\"")
+                 :hint "Numeric time zones must have \"-\" or \"+\" as first character."}))
+
+        (#{\+ \-} (first name))
+        (try
+          {:east (- (datetime-decode/decode-timezone name))}
+          (catch clojure.lang.ExceptionInfo e
+            (case (::datetime-lex/dterr (ex-data e))
+              :bad-format (types/resolve-expression-time-zone name)
+              :tzdisp-overflow
+              (throw (errors/pg-error :invalid-parameter-value
+                                      {:message (str "numeric time zone \"" name "\" out of range")}))
+              (throw e))))
+
+        :else (types/resolve-expression-time-zone name)))))
+
 (defn sql-make-timestamptz
   "`make_timestamptz(y, m, d, h, mi, s [, zone])`: the wall clock placed
    in `zone`, else in `session-zone`, which the translator passes."
@@ -4106,9 +4130,9 @@
   (if (or (some sql-null? [y mo d h mi sec]) (and zone (sql-null? zone)))
     :__null__
     (let [ldt (make-local-timestamp y mo d h mi sec)
-          [zid abbrev] (time-zone-and-abbreviation (or zone session-zone java.time.ZoneOffset/UTC))
-          offset (datetime-zone/offset-at-local-time ldt zid abbrev)]
-      (java.time.OffsetDateTime/ofInstant (.toInstant ldt offset) java.time.ZoneOffset/UTC))))
+          zone (make-timestamptz-zone (or zone session-zone java.time.ZoneOffset/UTC))
+          instant (shift-timestamp (.toInstant ldt java.time.ZoneOffset/UTC) (- (east-at-wall ldt zone)))]
+      (java.time.OffsetDateTime/ofInstant instant java.time.ZoneOffset/UTC))))
 
 (defn sql-make-interval
   "`make_interval(years, months, weeks, days, hours, mins, secs)`, each
@@ -4593,15 +4617,10 @@
                              types/*date-style* date-style]
                      (sql-cast/cast-scalar value "timestamptz" {:explicit? true :prefer-local-datetime? true}))
                    value)
-           ^java.time.ZoneId zone
-           (when (= result-oid types/oid-timestamptz)
-             (if (instance? java.time.ZoneId zone)
-               zone
-               (let [name (str zone)]
-                 (when-not (= name (str/trim name))
-                   (throw (errors/pg-error :invalid-parameter-value
-                                           {:message (str "time zone \"" name "\" not recognized")})))
-                 (types/resolve-time-zone name))))
+           ;; DecodeTimezoneNameToTz uses the underlying zone of a
+           ;; dynamic abbreviation for date_trunc.
+           zone (when (= result-oid types/oid-timestamptz)
+                  (dissoc (types/resolve-expression-time-zone zone) :abbrev))
            unit (trunc-unit! field result-oid)]
        (cond
          (types/infinite-datetime value) value
@@ -4623,12 +4642,13 @@
          (let [instant (if (#{types/oid-timestamp types/oid-date} source-oid)
                          (sql-at-time-zone value time-zone :timestamp)
                          (ts-instant value))
-               zoned (.atZone ^java.time.Instant instant zone)
-               wall (trunc-wall-clock (.toLocalDateTime zoned) unit)
-               offset (if (calendar-trunc-units unit)
-                        (datetime-zone/offset-at-local-time wall zone)
-                        (.getOffset zoned))]
-           (.atOffset (shift-timestamp (.toInstant wall offset) 0) java.time.ZoneOffset/UTC)))))))
+               east (east-at-instant instant zone)
+               source-wall (java.time.LocalDateTime/ofInstant
+                            (.plusSeconds ^java.time.Instant instant east) java.time.ZoneOffset/UTC)
+               wall (trunc-wall-clock source-wall unit)
+               target-east (if (calendar-trunc-units unit) (east-at-wall wall zone) east)]
+           (.atOffset (shift-timestamp (.toInstant wall java.time.ZoneOffset/UTC) (- target-east))
+                      java.time.ZoneOffset/UTC)))))))
 
 (defn sql-extract-date
   "`EXTRACT(field FROM date)` -- extract_date (date.c), which, unlike

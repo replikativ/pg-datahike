@@ -65,9 +65,30 @@
                (if sec (Long/parseLong sec) 0))]
       (if (= sign "-") (- v) v))))
 
+(defn posix-zone-seconds-west
+  "Decode a fixed POSIX zone specification using PostgreSQL's getoffset
+   bounds. The seconds field admits 60. The abbreviation may be empty,
+   quoted, or attached directly to the offset."
+  [name]
+  (when-let [[_ sign hour minute second]
+             (re-matches #"(?:<[^>]*>|(?![<:])[^0-9,+-]*)([+-]?)([0-9]+)(?::([0-9]+)(?::([0-9]+))?)?"
+                         name)]
+    (let [hour (parse-long hour)
+          minute (parse-long (or minute "0"))
+          second (parse-long (or second "0"))]
+      (when (and hour minute second (<= hour 167) (<= minute 59) (<= second 60))
+        (let [west (+ (* 3600 hour) (* 60 minute) second)]
+          (if (= sign "-") (- west) west))))))
+
 (def ^:private names-by-lowercase
   (delay (into {} (map (juxt #(.toLowerCase ^String % java.util.Locale/ROOT) identity))
                (ZoneId/getAvailableZoneIds))))
+
+(defn registered-zone-id
+  "Look up a tzdb ID without accepting Java's synthetic GMT+ or UTC+ IDs."
+  ^ZoneId [^String name]
+  (when-let [id (get @names-by-lowercase (.toLowerCase name java.util.Locale/ROOT))]
+    (ZoneId/of id)))
 
 (defn zone-id
   "`pg_tzset`: a zone NAME to a zone, or nil if there is no such zone.
@@ -84,8 +105,7 @@
   [^String name]
   (or (try (ZoneId/of name) (catch ZoneRulesException _ nil)
            (catch java.time.DateTimeException _ nil))
-      (when-let [id (get @names-by-lowercase (.toLowerCase name java.util.Locale/ROOT))]
-        (ZoneId/of id))))
+      (registered-zone-id name)))
 
 (def utc
   "The session zone until `SET TimeZone` is honoured (expr.clj:1613

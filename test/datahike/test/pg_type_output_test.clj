@@ -207,6 +207,34 @@
     (doseq [zone ["1 day" "1 month" "infinity"]]
       (is (= "22023" (state c (str "SELECT TIMETZ '00:00+00' AT TIME ZONE INTERVAL '" zone "'")))))))
 
+(deftest fixed-expression-zone-offsets-match-postgres
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'UTC'")
+    (is (= [["2020-05-03 03:04:05.123456+00" "2020-05-01 03:04:05.123456"
+             "03:04:05.123456-168" "2020-05-02 00:00:00+00"
+             "2020-05-02 04:06:08.123456+00" "2020-05-01 21:34:05.123456+00"]]
+           (rows c (str "SELECT timestamp '2020-05-02 03:04:05.123456' AT TIME ZONE 'UTC+24', "
+                        "timestamptz '2020-05-02 03:04:05.123456+00' AT TIME ZONE 'UTC+24', "
+                        "timetz '03:04:05.123456+00' AT TIME ZONE 'UTC+167:59:60', "
+                        "date_trunc('day', timestamptz '2020-05-02 03:04:05.123456+00', 'UTC+24'), "
+                        "timezone('UTC+1:2:3', timestamp '2020-05-02 03:04:05.123456'), "
+                        "make_timestamptz(2020, 5, 2, 3, 4, 5.123456, '+0530')"))))
+    (doseq [zone ["UTC+168" "UTC+24:60" "UTC+24:10:61" "+0530" "UTC "]]
+      (is (= "22023" (state c (str "SELECT timestamp '2020-05-02' AT TIME ZONE '" zone "'")))
+          (pr-str zone)))
+    (doseq [zone ["24" "+24" "-24:30:1"]]
+      (is (= "22023" (state c (str "SELECT make_timestamptz(2020, 5, 2, 0, 0, 0, '" zone "')")))
+          (pr-str zone)))
+    (with-open [stmt (.prepareStatement c
+                                        (str "SELECT timezone(?, timestamp '2020-05-02 03:04:05.123456'), "
+                                             "make_timestamptz(2020, 5, 2, 3, 4, 5.123456, ?)"))]
+      (.setString stmt 1 "+05:30")
+      (.setString stmt 2 "+05:30")
+      (with-open [result (.executeQuery stmt)]
+        (is (.next result))
+        (is (= ["2020-05-02 08:34:05.123456+00" "2020-05-01 21:34:05.123456+00"]
+               (mapv #(.getString result (int %)) [1 2])))))))
+
 (deftest insert-timezone-expressions-use-the-execution-clock
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE clock_writes (id int, a timestamp, b timestamp, rendered text)")
