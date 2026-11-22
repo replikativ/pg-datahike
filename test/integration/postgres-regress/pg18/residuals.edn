@@ -108,8 +108,14 @@
    :file "insert_conflict" :lines [13 16] :state :open :impact :unsupported
    :detail "The first independent failure is CREATE UNIQUE INDEX with text_pattern_ops. Later ON CONFLICT arbiter differences depend on those indexes. EXPLAIN INSERT has a separate parser gap."}
   {:id :returning-update-source-binding
-   :file "returning" :lines [41 44] :state :open :impact :unsupported
-   :detail "UPDATE FROM reaches RETURNING without the joined source alias in scope. The statement fails before the write and later SELECT output reflects the unchanged row."}
+   :file "returning" :lines [41 44] :state :covered :impact :unsupported
+   :detail "UPDATE FROM returns the updated target and the selected source tuple. The gate also checks typed Describe, star expansion, CTEs, and source correlation."}
+  {:id :returning-delete-source-binding
+   :file "returning" :lines [48 51] :state :covered :impact :wrong-result
+   :detail "DELETE USING requires a matching source row and returns that row with the old target. The gate also checks an empty source, duplicate matches, and rollback."}
+  {:id :returning-old-new-grammar
+   :file "returning" :lines [217 218] :state :open :impact :unsupported
+   :detail "RETURNING WITH (OLD AS ..., NEW AS ...) requires parser support and separate old and new target scopes."}
   {:id :reset-transaction-isolation
    :file "transactions" :lines [39 42] :state :covered :impact :wrong-result
    :detail "RESET of a current transaction characteristic now returns 0A000. The gate checks that the transaction then returns 25P02 until rollback."}

@@ -1689,24 +1689,23 @@
 ;; ============================================================================
 
 (defn- returning-items
-  "RETURNING's output columns, {:kind :name :expr}, with `*` and `t.*`
-   expanded to the table's columns (inherited ones included) in order.
-   The expressions are resolved, validated and typed where they are
-   compiled, as a projection over the row (row-eval)."
-  [returning db table-name table-alias schema]
-  (let [visible (or table-alias table-name)]
-    (vec
-     (mapcat
-      (fn [{:keys [kind table] :as item}]
-        (if (= :star kind)
-          (do
-            (when (and table (not= table visible))
-              (throw (ex-info (str "missing FROM-clause entry for table \"" table "\"")
-                              {:error :undefined-table :sqlstate "42P01" :table table})))
-            (map (fn [{:keys [name]}] {:kind :column :name name})
-                 (row-eval/table-columns db schema table-name)))
-          [item]))
-      returning))))
+  "Expand RETURNING stars in target/source order. Keep each expanded
+   column's relation so duplicate column names remain distinct."
+  [returning db table-name table-alias schema source-scopes]
+  (let [visible (or table-alias table-name)
+        scopes (into [{:alias visible :columns (row-eval/table-columns db schema table-name)}]
+                     source-scopes)]
+    (into []
+          (mapcat (fn [{:keys [kind table] :as item}]
+                    (if (= :star kind)
+                      (let [selected (if table (filter #(= table (:alias %)) scopes) scopes)]
+                        (when (empty? selected)
+                          (throw (ex-info (str "missing FROM-clause entry for table \"" table "\"")
+                                          {:error :undefined-table :sqlstate "42P01" :table table})))
+                        (for [{:keys [alias columns]} selected, {:keys [name]} columns]
+                          {:kind :column :name name :table alias}))
+                      [item])))
+          returning)))
 
 (declare ^:dynamic *cached-bound*)
 
@@ -1718,9 +1717,9 @@
         ;; and a stored name need not be a plain identifier (`"MyCol"`,
         ;; `"Order"`, `"sp ace"`).
         quoted #(str \" (str/replace % "\"" "\"\"") \")]
-    (mapv (fn [{:keys [kind name expr]}]
+    (mapv (fn [{:keys [kind name table expr]}]
             (if (and (= :column kind) (not (instance? Column expr)))
-              (Column. (net.sf.jsqlparser.schema.Table. ^String (quoted visible))
+              (Column. (net.sf.jsqlparser.schema.Table. ^String (quoted (or table visible)))
                        ^String (quoted name))
               expr))
           items)))
@@ -1729,11 +1728,12 @@
   "RETURNING as {:items :asts :oids}: the output columns, the expressions
    evaluated per row, and their OIDs as the compiled projection types them
    -- what Describe reports and Execute renders with."
-  [returning db table-name table-alias schema]
-  (let [items (returning-items returning db table-name table-alias schema)
+  [returning db table-name table-alias schema & [source-scopes]]
+  (let [items (returning-items returning db table-name table-alias schema source-scopes)
         visible (or table-alias table-name)
         asts (returning-asts items visible)
-        plan-oids (row-eval/row-oids asts table-name schema db {:alias visible})]
+        plan-oids (row-eval/row-oids asts table-name schema db
+                                     {:alias visible :source-scopes source-scopes})]
     {:items items
      :asts asts
      :oids (mapv #(or % PgWireServer/OID_TEXT) plan-oids)}))
@@ -1748,22 +1748,24 @@
    eids: entity IDs to return.
    table-name: the table name (namespace prefix for attributes).
    schema: database schema."
-  [returning row-db subquery-db eids table-name table-alias schema command]
+  [returning row-db subquery-db eids table-name table-alias schema command
+   & [{:keys [source-scopes source-values]}]]
   (let [;; A templated simple query carries its literals only as the
         ;; 1-indexed *cached-bound*; RETURNING `i + 1` read `$1` as NULL.
         bound (or params/*bound-params* (some-> *cached-bound* rest vec))
         {:keys [items asts oids]} (binding [params/*bound-params* bound]
                                     (returning-columns returning row-db table-name
-                                                       table-alias schema))
+                                                       table-alias schema source-scopes))
         col-names (mapv :name items)
         visible (or table-alias table-name)
         results (binding [params/*bound-params* bound]
                   (mapv (fn [eid]
                           (row-eval/row-values
-                           asts (into {} (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
+                           asts (into {::row-eval/source-values (get source-values eid)}
+                                      (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
                                       (d/datoms row-db :eavt eid))
                            table-name schema row-db
-                           {:alias visible :exec-db subquery-db}))
+                           {:alias visible :exec-db subquery-db :source-scopes source-scopes}))
                         eids))
         row-arrays (into-array (Class/forName "[Ljava.lang.String;")
                                (for [{:keys [values]} results]
@@ -3454,7 +3456,7 @@
   `(binding [sql-ctx/*relation-namespaces* (or (:cte-namespaces ~parsed) {})]
      ~@body))
 
-(defn- build-delete-tx
+(defn- build-plain-delete-tx
   "Build entity IDs and tx-data for a DELETE against `db`.
    Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
    that need speculative tempid remapping should remap afterward.
@@ -3530,16 +3532,25 @@
     {:eids eids
      :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
 
-(defn- execute-delete [conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
+(declare joined-write-rows)
+
+(defn- build-delete-tx [ctx db schema parsed]
+  (if (:from-sql parsed)
+    (let [{:keys [eids] :as matched} (joined-write-rows ctx db schema parsed)]
+      (assoc matched :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)))
+    (build-plain-delete-tx db schema parsed)))
+
+(defn- execute-delete [ctx conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-delete-tx db schema parsed))
+          {:keys [eids tx-data] :as matched}
+          (with-cte-namespaces parsed (build-delete-tx ctx db schema parsed))
           ;; For RETURNING, snapshot values BEFORE delete
           returning (:returning parsed)
           returning-result (when returning
                              (build-returning-result returning db db eids table
-                                                     (:alias parsed) schema :delete))
+                                                     (:alias parsed) schema :delete matched))
           ;; FK enforcement — RESTRICT raises, CASCADE returns extra eids
           ;; to retract atomically alongside the parent deletion.
           cascade-eids (collect-fk-cascade-retractions! db table eids)
@@ -3633,29 +3644,35 @@
       (when-not (types/assignment-cast-exists? source target)
         (or (second src-type) (types/format-type source -1))))))
 
-(defn- update-set-plan
-  "An UPDATE's SET list as PostgreSQL plans it: a query over the target
-   whose target list computes the new values (preprocess_targetlist),
-   here `SELECT <target>.db_id, (<e1>), ... FROM <target> [AS a] WHERE
-   <where>`, translated by the SELECT translator once per statement.
-   Returns {:plan :assignments}; an assignment of DEFAULT projects the
-   column's default -- `nextval(...)` per row -- or carries a
-   :default-fill for a constant one.
+(defn- joined-write-source-scopes [plan db aliases]
+  (let [db (or (:enriched-db plan) db)
+        relations (into {} (:relation-sources plan))
+        scopes (mapv (fn [alias]
+                       (when-not (contains? relations alias)
+                         (throw (errors/pg-error :undefined-table {:table alias})))
+                       (let [columns (pgs/column-info (dbi/-schema db) (get relations alias) db)]
+                         {:alias alias
+                          :columns (into [] (comp (remove #(= "db_id" (:name %)))
+                                                  (map #(select-keys % [:name :oid]))) columns)}))
+                     aliases)]
+    (mapv #(assoc %1 :offset %2)
+          scopes (reductions + 0 (map (comp count :columns) scopes)))))
 
-   UPDATE ... FROM joins the source relation into that same query, as
-   PostgreSQL does: the SET list is evaluated for EVERY joined pair, and
-   a target row matched by several of them is updated once (which pair
-   wins is unspecified). Identical pairs collapse here, which is only
-   visible to a volatile SET expression.
+(defn- joined-write-plan
+  "Plan the target and source tuple used by UPDATE or DELETE through SELECT.
+   Project the target identity, any SET values, and source columns needed
+   by RETURNING. DEFAULT either supplies a typed expression or carries a
+   constant :default-fill.
 
-   The values are computed where PostgreSQL computes them: over the
-   pre-statement rows the WHERE keeps, with one statement time, and with
-   uncorrelated subqueries run once."
+   SET runs over the command snapshot for each joined match. A target row
+   matched several times is modified once, using the selected source tuple."
   [parsed schema db]
-  (let [k [::set-plan (pg-cache/identity-key parsed) (pg-cache/identity-key schema)]]
+  (let [k [::set-plan (pg-cache/identity-key parsed) (pg-cache/identity-key schema)
+           params/*analysis-only?*]]
     (or (when-not (:execution-materialization? parsed)
           (.get ^java.util.Map update-row-match-cache k))
-        (let [{:keys [table alias assignments where-expr from-sql]} parsed
+        (let [{:keys [table alias assignments where-expr from-sql returning from-aliases]} parsed
+              sources (when (seq returning) from-aliases)
               visible (or alias
                           (when (str/starts-with? table temp-table-prefix)
                             (second (re-matches #"[^_]*_(.*)"
@@ -3706,6 +3723,7 @@
               text (str (:with-sql parsed)
                         "SELECT " (quoted (or visible table)) ".db_id"
                         (apply str (map #(str ", (" (:sql %) ")") assignments))
+                        (apply str (map #(str ", " (quoted %) ".*") sources))
                         " FROM " from-name (when visible (str " AS " (quoted visible)))
                         (when from-sql (str ", " from-sql))
                         (when where-expr (str " WHERE " where-expr)))
@@ -3746,7 +3764,8 @@
                                          " but expression is of type " mismatch)
                                     {:sqlstate "42804"
                                      :hint "You will need to rewrite or cast the expression."}))))
-              v {:plan plan :assignments assignments}]
+              v {:plan plan :assignments assignments
+                 :source-scopes (when (seq sources) (joined-write-source-scopes plan db sources))}]
           ;; A plan enriched against db ROWS (a derived, VALUES or
           ;; function source is materialised into a snapshot) is valid
           ;; only for that db, exactly as the parse cache's own
@@ -3758,20 +3777,17 @@
             (.put ^java.util.Map update-row-match-cache k v))
           v))))
 
-(defn- build-update-tx-from-plan
-  "The SET values come from update-set-plan's query -- over the target,
-   joined to the source relation when the statement has a FROM --
-   run by the SELECT executor (select-rows) against `db`, then take the
-   assignment cast into the column. {:eids :tx-data}."
+(defn- joined-write-rows
+  "Select the target and joined source together. Preserve the selected
+   source tuple for RETURNING and keep one match for each target row."
   [ctx db schema parsed]
-  (let [{:keys [ns]} parsed
-        ;; `update-set-plan` translates at EXECUTE time, after the
+  (let [;; The SELECT is translated at EXECUTE time, after the
         ;; binding made at parse time has gone, so `ONLY` is restored
         ;; from the parsed map for it.
-        {:keys [plan assignments]}
+        {:keys [plan assignments source-scopes]}
         (binding [params/*only-tables* (or (:only-tables parsed)
                                            params/*only-tables*)]
-          (update-set-plan parsed schema db))
+          (joined-write-plan parsed schema db))
         bound *cached-bound*
         plan (if bound (resolve-param-refs plan bound) plan)
         ;; A correlated subquery is translated per row and reads `$n`
@@ -3797,15 +3813,25 @@
                                             child-markers))))
                           rows))
                rows)
-        ;; UPDATE ... FROM: a target row several source rows match is
-        ;; updated once. PostgreSQL leaves the winning pair unspecified.
+        ;; Each target is modified once. PostgreSQL leaves the selected
+        ;; source unspecified when several rows match it.
         rows (if (:from-sql parsed)
                (second (reduce (fn [[seen out] row]
                                  (if (contains? seen (first row))
                                    [seen out]
                                    [(conj seen (first row)) (conj out row)]))
                                [#{} []] rows))
-               rows)
+               rows)]
+    (cond-> {:rows rows :assignments assignments :eids (mapv first rows)}
+      (seq source-scopes)
+      (assoc :source-scopes source-scopes
+             :source-values (into {} (map (fn [row]
+                                            [(first row) (subvec row (inc (count assignments)))])
+                                          rows))))))
+
+(defn- build-update-tx-from-plan [ctx db schema parsed]
+  (let [{:keys [ns]} parsed
+        {:keys [rows assignments] :as matched} (joined-write-rows ctx db schema parsed)
         ;; GENERATED ALWAYS AS (expr) STORED. Two obligations, and the
         ;; UPDATE path is the only place with both the row as it was and
         ;; the values replacing it.
@@ -3879,7 +3905,7 @@
                                                                 schema db))))
                                            gen-cols)))))))
                       rows)]
-    {:eids (mapv first rows) :tx-data tx-data}))
+    (assoc (dissoc matched :rows :assignments) :tx-data tx-data)))
 
 (defn- build-update-tx
   "Build entity IDs and tx-data for an UPDATE against `db`.
@@ -4011,7 +4037,7 @@
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-update-tx ctx db schema parsed))
+          {:keys [eids tx-data] :as built} (with-cte-namespaces parsed (build-update-tx ctx db schema parsed))
           _ (check-update-identity-collisions! db schema tx-data)
           _ (check-not-null-on-update! db tx-data)
           _ (check-updates-against-row-constraints!
@@ -4037,7 +4063,7 @@
         ;; RETURNING: read values from db-after
         (let [db-after (if tx-report (:db-after tx-report) db)
               result (build-returning-result returning db-after db eids table (:alias parsed)
-                                             (:schema db-after) :update)]
+                                             (:schema db-after) :update built)]
           (when (seq tx-data) (transact-speculative-report! conn db tx-report))
           (fire-after-row-triggers! db table :update after-rows changed-columns)
           (fire-statement-triggers! db table :update :after after-rows changed-columns)
@@ -9550,7 +9576,7 @@
               ;; conflict window from BEGIN→COMMIT to first-write→COMMIT.
               _ (when (empty? (:tx-buffer @tx-state))
                   (rebase-tx-state! conn tx-state))
-              {:keys [eids tx-data]}
+              {:keys [eids tx-data] :as built}
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
                       {:keys [eids] :as built} (with-cte-namespaces parsed (build-update-tx ctx spec-db schema parsed))
@@ -9607,7 +9633,7 @@
               returning-result
               (when-let [returning (:returning parsed)]
                 (build-returning-result returning db-after spec-db eids (:table parsed)
-                                        (:alias parsed) (:schema db-after) :update))]
+                                        (:alias parsed) (:schema db-after) :update built))]
           ;; A failing RETURNING projection aborts the statement without
           ;; changing the transaction's speculative image or commit buffer.
           (swap! tx-state (fn [ts]
@@ -9634,10 +9660,10 @@
               ;; Same blocking row-lock + rebase discipline as exec-update.
               _ (when (empty? (:tx-buffer @tx-state))
                   (rebase-tx-state! conn tx-state))
-              {:keys [eids]}
+              {:keys [eids] :as matched}
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-delete-tx spec-db schema parsed))
+                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-delete-tx ctx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db)))
@@ -9669,7 +9695,7 @@
               returning-result (when-let [returning (:returning parsed)]
                                  (build-returning-result returning spec-db spec-db eids
                                                          (:table parsed) (:alias parsed)
-                                                         (:schema spec-db) :delete))
+                                                         (:schema spec-db) :delete matched))
               ;; Apply to speculative-db with ORIGINAL entity IDs.
               ;; The cascaded children go in the SAME transaction, as
               ;; retractEntity is atomic and PostgreSQL's cascade is
@@ -9707,7 +9733,7 @@
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "DELETE error: " e)))
-      (execute-delete conn parsed schema :tx-wrap (:tx-wrap ctx)))))
+      (execute-delete ctx conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
 (defn- table-row-eids
   "All row entity-ids of `table` in `db` — union across EVERY attr in
@@ -14913,8 +14939,11 @@
                      (d/db conn))
                 schema (dbi/-schema db)
                 table-ns (or (:ns parsed) (:table parsed))
+                source-scopes (when (seq (:from-aliases parsed))
+                                (binding [params/*analysis-only?* true]
+                                  (:source-scopes (joined-write-plan parsed schema db))))
                 {:keys [items oids]} (returning-columns (:returning parsed) db table-ns
-                                                        (:alias parsed) schema)
+                                                        (:alias parsed) schema source-scopes)
                 names (mapv :name items)
                 oids (int-array (map types/oid->wire-int oids))]
             (PgWireServer$QueryResult.

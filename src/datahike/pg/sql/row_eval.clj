@@ -79,8 +79,10 @@
    - with :excluded?, ON CONFLICT's `excluded` row (the row's
      :excluded/<column> entries);
    - with `column-types` ({name attr-or-type}), a table-less scope for
-     names such as a domain's VALUE, read from the row's bare keys."
-  [db schema table {:keys [alias excluded? column-types]}]
+     names such as a domain's VALUE, read from the row's bare keys;
+   - with :source-scopes, joined DML source values already read by the
+     command's row-selection query."
+  [db schema table {:keys [alias excluded? column-types source-scopes]}]
   (let [cols (when (seq table) (table-columns db schema table))]
     (cond-> []
       (seq table)
@@ -96,8 +98,16 @@
                                :read #(stored-value schema attr oid
                                                     (get % (keyword "excluded" name)))})
                             cols)})
+      (seq source-scopes)
+      (into (map (fn [{:keys [alias columns offset]}]
+                   {:alias alias
+                    :columns (mapv (fn [index column]
+                                     (assoc column :read #(get (::source-values %) (+ offset index))))
+                                   (range) columns)}))
+            source-scopes)
       (seq column-types)
       (conj {:alias value-scope
+             :quote-bare-columns? true
              :columns (vec (for [[n t] column-types]
                              {:name n :oid (type-oid db schema t)
                               :read #(get % (keyword "" n))}))}))))
@@ -135,7 +145,7 @@
    context, and DDL clears it. A plan that failed to translate is not
    kept; one the row projection cannot run raises 0A000."
   [asts scs schema db]
-  (let [quoted (into #{} (comp (filter #(nil? (:table %))) (mapcat :columns) (map :name)) scs)
+  (let [quoted (into #{} (comp (filter :quote-bare-columns?) (mapcat :columns) (map :name)) scs)
         texts (mapv #(expression-text % quoted) asts)
         ;; The catalog basis is part of the key for the same reason
         ;; parse-sql's own key has it: this memo would otherwise answer
@@ -206,6 +216,8 @@
      :column-types {name attr-or-type-name} for names the table lacks --
                    a domain's VALUE, typed as the domain's base type,
                    read from the row's bare key
+     :source-scopes  joined relations and their typed output columns,
+                     reading this row's ::source-values vector
      :exec-db      the database subqueries read (default `db`):
                    RETURNING's command snapshot, which does not see the
                    statement's own writes

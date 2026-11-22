@@ -184,7 +184,16 @@
      :boundaries #{:defaults :result-metadata :expressions :dml},
      :requires ["test_setup"],
      :mode :discovery
-     :blockers #{:returning-update-source-binding}}
+     :strict-slices
+     [{:id :returning-update-source-binding
+       :source-lines [41 44]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "update-from-returning-keeps-the-joined-row-and-types"}
+      {:id :returning-delete-source-binding
+       :source-lines [48 51]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "delete-using-requires-a-source-row-and-returns-that-row"}]
+     :blockers #{:returning-old-new-grammar}}
     {:name "transactions",
      :boundaries #{:error-recovery :transactions :savepoints},
      :requires ["test_setup"],

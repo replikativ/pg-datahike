@@ -4098,6 +4098,10 @@
       (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
     case-var))
 
+(defn- qualified-star-alias [^net.sf.jsqlparser.statement.select.AllTableColumns expression]
+  (when-let [^Table table (.getTable expression)]
+    (unquote-ident (or (some-> table .getAlias .getName) (.getName table)))))
+
 (defn translate-select
   "Translate a SELECT while sharing anonymous relation identities across its
    complete nested query tree."
@@ -5468,13 +5472,7 @@
                 ;; tables — Metabase's build_privilege_map and pgjdbc's
                 ;; getSchemas idiom both rely on it.
                 (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
-                (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
-                      ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
-                      raw-name (when tbl
-                                 (str/lower-case
-                                  (or (when-let [a (.getAlias tbl)]
-                                        (.getName ^Alias a))
-                                      (.getName tbl))))
+                (let [raw-name (qualified-star-alias expr)
                       ;; Resolve alias → real table via table-aliases.
                       real (or (get table-aliases raw-name) raw-name)
                       cols (pgs/column-info schema real db)]
@@ -6131,13 +6129,7 @@
                            ;; AllTableColumns must come BEFORE AllColumns
                            ;; (it's a subclass).
                      (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
-                     (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
-                           ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
-                           raw-name (when tbl
-                                      (str/lower-case
-                                       (or (when-let [a (.getAlias tbl)]
-                                             (.getName ^Alias a))
-                                           (.getName tbl))))
+                     (let [raw-name (qualified-star-alias expr)
                            real (or (get table-aliases raw-name) raw-name)
                            cols (pgs/column-info schema real db)
                            picked (remove #(= "db_id" (:name %)) cols)]
@@ -6205,9 +6197,7 @@
                          explicit (select-item-alias item)]
                      (cond
                        (instance? net.sf.jsqlparser.statement.select.AllTableColumns expression)
-                       (output-star-columns
-                        (some-> ^net.sf.jsqlparser.statement.select.AllTableColumns expression
-                                .getTable .getName unquote-ident))
+                       (output-star-columns (qualified-star-alias expression))
                        (instance? AllColumns expression) (output-star-columns nil)
                        :else
                        (let [oid (or (oid/expr-oid expression oid-env)
@@ -8017,6 +8007,7 @@
              ;; SQL projection types before hidden inputs reshape :find.
              :visible-select-items visible-select-items
              :output-columns output-columns
+             :relation-sources star-relations
              ;; Unlike an ordinary projection, UNION/INTERSECT/EXCEPT keep
              ;; bare strings, NULL and undeclared parameters as UNKNOWN while
              ;; finding a per-column common type. This parallel vector
@@ -9177,12 +9168,12 @@
                         :feature-not-supported
                         {:feature "nextval() in RETURNING"})))
               (cond
-                (instance? AllColumns item-expr)
-                {:kind :star}
-
                 (instance? AllTableColumns item-expr)
                 {:kind :star
                  :table (some-> ^AllTableColumns item-expr .getTable .getName unquote-ident)}
+
+                (instance? AllColumns item-expr)
+                {:kind :star}
 
                 :else
                 {:kind :expr
@@ -10692,6 +10683,18 @@
                  :catalog-target-name raw-table)
           returning (assoc :returning returning))))))
 
+(defn- from-item-name [^FromItem item]
+  (when item
+    (if-let [alias (.getAlias item)]
+      (unquote-ident (.getName ^Alias alias))
+      (when (instance? Table item)
+        (unquote-ident (.getName ^Table item))))))
+
+(defn- write-with-sql [withs]
+  (when (seq withs)
+    ;; A WithItem renders its own RECURSIVE keyword.
+    (str "WITH " (str/join ", " (map str withs)) " ")))
+
 (defn translate-delete
   "Translate a DELETE statement to Datahike retraction query + tx-data."
   [^Delete delete schema]
@@ -10708,7 +10711,12 @@
         table-name (first (canonical-relation schema raw-table []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
-        _ (reject-hidden-target-name! delete raw-table alias-name)
+        using (.getUsingList delete)
+        from-names (into [] (keep from-item-name) using)
+        _ (when-let [dup (some #{(or alias-name raw-table)} from-names)]
+            (throw (ex-info (str "table name \"" dup "\" specified more than once")
+                            {:error :duplicate-alias :sqlstate "42712" :table dup})))
+        _ (reject-hidden-target-name! delete raw-table alias-name from-names)
         ns table-name
         where-expr (.getWhere delete)]
     (let [returning (.getReturningClause delete)]
@@ -10717,7 +10725,12 @@
                :alias alias-name
                :ns ns
                :where-expr where-expr}
-        (and (not returning)
+        (seq using)
+        (assoc :from-sql (str/join ", " (map str using))
+               :from-aliases from-names
+               :with-sql (write-with-sql (.getWithItemsList delete))
+               :declared-param-oids params/*declared-param-oids*)
+        (and (empty? using) (not returning)
              (target-delete-expression? where-expr raw-table alias-name))
         (assoc :catalog-dependency-shape :target-delete-v1
                :catalog-target-name raw-table)
@@ -10830,13 +10843,7 @@
         ;; its own name (only a Table has one to clash with).
         from-items (cons (.getFromItem update)
                          (map #(.getRightItem ^Join %) (or (.getJoins update) [])))
-        from-names (keep (fn [item]
-                           (when item
-                             (if-let [a (.getAlias ^FromItem item)]
-                               (unquote-ident (.getName ^Alias a))
-                               (when (instance? Table item)
-                                 (unquote-ident (.getName ^Table item))))))
-                         from-items)
+        from-names (into [] (keep from-item-name) from-items)
         ;; PostgreSQL's target is in the range table with the rest, so a
         ;; FROM relation visible under the same name is 42712
         ;; (setTargetTable / checkNameSpaceConflicts).
@@ -10903,9 +10910,7 @@
         ;; parsed as ordinary SQL: the CTE is then materialised by the
         ;; SELECT translator, for the FROM relation and for a subquery
         ;; in SET alike.
-        with-sql (when (seq withs)
-                   ;; A WithItem renders its own RECURSIVE keyword.
-                   (str "WITH " (str/join ", " (map str withs)) " "))
+        with-sql (write-with-sql withs)
         ;; The FROM relation as written, joins included: the SET list is
         ;; translated at Execute as a query over the target joined to it
         ;; (server/update-set-plan). The shapes below are what the
@@ -10931,6 +10936,7 @@
                ;; PostgreSQL plans UPDATE ... FROM.
              :with-sql with-sql
              :from-sql from-sql
+             :from-aliases (vec from-names)
                ;; The parameter types this statement was translated with:
                ;; the SET list is translated again at Execute
                ;; (server/update-set-plan) and must see the same ones.

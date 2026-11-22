@@ -265,3 +265,49 @@
                                   "ON CONFLICT (id) DO UPDATE SET a = 5 WHERE a > 0"))))
     (is (= "42703" (sqlstate (str "INSERT INTO returning_scope VALUES (1, 9, 9, true) "
                                   "ON CONFLICT (id) DO UPDATE SET a = 5 WHERE excluded.nosuch > 0"))))))
+
+(deftest update-from-returning-keeps-the-joined-row-and-types
+  (run "CREATE TABLE dml_target (id integer PRIMARY KEY, n integer)")
+  (run "CREATE TABLE dml_source (s_id integer, delta smallint, tag text)")
+  (run "INSERT INTO dml_target VALUES (1,10),(2,20)")
+  (run "INSERT INTO dml_source VALUES (1,2,'a'),(2,3,'b')")
+  (let [sql (str "UPDATE dml_target t SET n = n + s.delta FROM dml_source s "
+                 "WHERE t.id = s.s_id RETURNING *, s.*, t.n + s.delta, (SELECT s.tag), pg_typeof(s.delta)")
+        ^PgWireServer$QueryResult description (.describeResult *handler* (.parse *handler* sql (int-array 0)))]
+    (is (= [23 23 23 21 25 23 21 25 23 25 2206] (vec (.-columnOids description))))
+    (is (= #{["1" "12" "1" "2" "a" "1" "2" "a" "14" "a" "smallint"]
+             ["2" "23" "2" "3" "b" "2" "3" "b" "26" "b" "smallint"]}
+           (set (rows sql)))))
+  (run "BEGIN")
+  (try
+    (is (= #{["1" "16" "4" "4"] ["2" "29" "6" "6"]}
+           (set (rows (str "WITH source AS (SELECT s_id, delta * 2 AS inc FROM dml_source) "
+                           "UPDATE dml_target t SET n = t.n + s.inc FROM source s "
+                           "WHERE t.id = s.s_id RETURNING t.*, s.inc, (SELECT s.inc)")))))
+    (finally (run "ROLLBACK")))
+  (is (= [["1" "12"] ["2" "23"]] (rows "SELECT * FROM dml_target ORDER BY id"))))
+
+(deftest delete-using-requires-a-source-row-and-returns-that-row
+  (run "CREATE TABLE delete_target (id integer PRIMARY KEY, n integer)")
+  (run "CREATE TABLE delete_source (s_id integer, label text)")
+  (run "INSERT INTO delete_target VALUES (1,10),(2,20)")
+  ;; An empty USING source must prevent deletion even when WHERE only
+  ;; references the target.
+  (is (= "DELETE 0" (.-commandTag ^PgWireServer$QueryResult
+                     (run "DELETE FROM delete_target t USING delete_source s WHERE t.n > 0"))))
+  (is (= [["1"] ["2"]] (rows "SELECT id FROM delete_target ORDER BY id")))
+  (run "INSERT INTO delete_source VALUES (1,'paired'),(1,'also paired')")
+  (run "BEGIN")
+  (try
+    (let [sql (str "DELETE FROM delete_target t USING delete_source s "
+                   "WHERE t.id = s.s_id RETURNING t.*, s.s_id, (SELECT s.label)")
+          ^PgWireServer$QueryResult description (.describeResult *handler* (.parse *handler* sql (int-array 0)))
+          result (rows sql)]
+      (is (= [23 23 23 25] (vec (.-columnOids description))))
+      (is (contains? #{[["1" "10" "1" "paired"]] [["1" "10" "1" "also paired"]]} result))
+      (is (= [["2"]] (rows "SELECT id FROM delete_target"))))
+    (finally (run "ROLLBACK")))
+  (is (= [["1" "10" "1"]]
+         (rows (str "DELETE FROM delete_target t USING delete_source s "
+                    "WHERE t.id = s.s_id RETURNING t.*, s.s_id"))))
+  (is (= [["2"]] (rows "SELECT id FROM delete_target"))))
