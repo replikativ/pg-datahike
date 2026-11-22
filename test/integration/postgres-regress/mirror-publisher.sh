@@ -3,11 +3,10 @@ set -eu
 
 probe=--slot-recovery
 follower=mirror_recovery_reader
-if test "${1:-}" = --streaming; then
-  probe=$1
-  follower=mirror_stream_reader
-  shift
-fi
+case "${1:-}" in
+  --streaming) probe=$1; follower=mirror_stream_reader; shift ;;
+  --type-lifecycle) probe=$1; follower=mirror_lifecycle_reader; shift ;;
+esac
 
 pg_bin=${PG_MIRROR_PG_BIN:-$(pg_config --bindir)}
 PG_MIRROR_RECOVERY_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pgdh-mirror-publisher-XXXXXXXX")

@@ -207,12 +207,12 @@
        " min(d.conname::text) AS name, min(pg_catalog.pg_get_expr(d.conbin, 0)) AS expression "
        " FROM pg_catalog.pg_constraint d WHERE d.contypid = t.oid AND d.contype = 'c') dc ON t.typtype = 'd' "))
 
-(defn- read-source-types [source expected]
+(defn- read-source-types [source oids]
   (into {}
         (query source (str "SELECT t.oid AS atttypid, " source-type-fields
                            "FROM pg_catalog.pg_type t " source-type-joins
                            "WHERE t.oid = ANY(CAST(? AS oid[]))")
-               [(str "{" (comma-list (keys expected)) "}")]
+               [(str "{" (comma-list oids) "}")]
                (fn [^ResultSet row] [(.getLong row "atttypid") (source-user-type row)]))))
 
 (defn- read-publication-row [^ResultSet row]
@@ -390,15 +390,33 @@
 (defn- all-relations [manifest]
   (into (:tables manifest) (:partition-parents manifest)))
 
-(defn- publication-manifest [source publication]
-  (let [{:keys [publication-oid tables partition-parents compatible?] :as report}
-        (scan-publication source publication)]
-    (require! compatible? "Publication cannot be mirrored" {:report report})
-    (let [user-types (publisher-types (all-relations report))]
-      (cond-> {:publication-oid publication-oid :catalog-version 3
-               :tables (mapv #(dissoc % :issues) tables)}
-        (seq partition-parents) (assoc :partition-parents (mapv #(dissoc % :issues) partition-parents))
-        (seq user-types) (assoc :types user-types)))))
+(defn- publication-manifest
+  ([source publication] (publication-manifest source publication nil))
+  ([source publication tracked-types]
+   (let [{:keys [publication-oid tables partition-parents compatible?] :as report}
+         (scan-publication source publication)]
+     (require! compatible? "Publication cannot be mirrored" {:report report})
+     (let [tracked (when (seq tracked-types) (read-source-types source (map :oid (vals tracked-types))))
+           user-types (into (publisher-types (all-relations report))
+                            (keep (fn [[oid definition]]
+                                    (require! (and definition (not (:problem definition)))
+                                              "A registered publisher type changed to an unsupported definition"
+                                              {:oid oid :detail (:problem definition)})
+                                    [(:name definition) definition]))
+                            tracked)]
+       (cond-> {:publication-oid publication-oid :catalog-version 3
+                :tables (mapv #(dissoc % :issues) tables)}
+         (seq partition-parents) (assoc :partition-parents (mapv #(dissoc % :issues) partition-parents))
+         (seq user-types) (assoc :types user-types))))))
+
+(defn- poll-publication-manifest [source publication tracked-types]
+  (if (seq tracked-types)
+    ;; The column and registered-type inventories must describe the same
+    ;; publisher catalog, even if a DDL transaction commits between queries.
+    (do (command! source "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        (try (publication-manifest source publication tracked-types)
+             (finally (command! source "ROLLBACK"))))
+    (publication-manifest source publication)))
 
 (defn- validate-source-options! [source-url publication]
   (require! (and (string? source-url) (str/starts-with? source-url "jdbc:postgresql://")
@@ -1142,28 +1160,36 @@
 (defn- same-type-definition? [old current]
   (= old (if (:label-oids old) current (dissoc current :label-oids :label-order))))
 
-(defn- type-changes! [previous current allow-schema-refresh?]
-  (let [before (:types previous)
-        types-by-oid (into {} (map (juxt :oid identity)) (vals before))
-        identity-keys [:schema :name :oid :kind :base-type]]
-    (into {}
-          (for [[name definition] (:types current)
-                :let [installed (or (get before name) (get types-by-oid (:oid definition)))]
-                :when (and installed (not= installed definition)
-                           (or allow-schema-refresh? (not (same-type-definition? installed definition))))
-                :let [context {:reason :changed-type-definition :type name}]]
-            (do
-              (require! allow-schema-refresh? "Publisher changed a mirrored user type" context)
-              (require! (= (select-keys installed identity-keys) (select-keys definition identity-keys))
-                        "Schema refresh requires the same PostgreSQL type identity" context)
-              (when (= :enum (:kind installed))
-                (let [[old new] (if-let [oids (:label-oids installed)]
-                                  [oids (:label-oids definition)]
-                                  [(:labels installed) (:labels definition)])]
-                  (require! (= old (into [] (filter (set old)) new))
-                            "Schema refresh requires an ordered baseline for the installed enum labels"
-                            (assoc context :reason :unknown-enum-label-identity))))
-              [name [installed definition]])))))
+(defn- types-by-oid [manifest]
+  (into {} (map (juxt :oid identity)) (vals (:types manifest))))
+
+(defn- type-plan! [previous current allow-schema-refresh?]
+  (let [before (types-by-oid previous)
+        after (types-by-oid current)
+        removals (into [] (remove #(contains? after (:oid %))) (vals before))
+        additions (into (sorted-map) (remove #(contains? before (:oid (val %)))) (:types current))
+        identity-keys [:schema :oid :kind :base-type]
+        _ (require! (or allow-schema-refresh? (empty? removals)) "Publisher removed a mirrored user type"
+                    {:reason :dropped-type :types (mapv :name removals)})
+        edits (into {}
+                    (for [[name definition] (:types current)
+                          :let [installed (get before (:oid definition))]
+                          :when (and installed (not= installed definition)
+                                     (or allow-schema-refresh? (not (same-type-definition? installed definition))))
+                          :let [context {:reason :changed-type-definition :type name}]]
+                      (do
+                        (require! allow-schema-refresh? "Publisher changed a mirrored user type" context)
+                        (require! (= (select-keys installed identity-keys) (select-keys definition identity-keys))
+                                  "Schema refresh requires the same PostgreSQL type identity" context)
+                        (when (= :enum (:kind installed))
+                          (let [[old new] (if-let [oids (:label-oids installed)]
+                                            [oids (:label-oids definition)]
+                                            [(:labels installed) (:labels definition)])]
+                            (require! (= old (into [] (filter (set old)) new))
+                                      "Schema refresh requires an ordered baseline for the installed enum labels"
+                                      (assoc context :reason :unknown-enum-label-identity))))
+                        [name [installed definition]])))]
+    {:additions additions :removals removals :edits edits}))
 
 (defn- same-table? [previous current]
   (if (every? :attnum (:columns previous))
@@ -1230,6 +1256,7 @@
   (let [after (relations-by-id source)]
     (require! (and (= (:publication-oid target) (:publication-oid source))
                    (= (partition-layout target) (partition-layout source))
+                   (= (:types target) (:types source))
                    (every? (fn [table] (same-table? table (get after (:relation-id table))))
                            (all-relations target)))
               "Publication changed during refresh" {})))
@@ -1581,7 +1608,7 @@
               end-lsn (with-slot-snapshot!
                         replication source slot true false
                         (fn [position]
-                          (require-stable-manifest! manifest (publication-manifest source publication))
+                          (require-stable-manifest! manifest (publication-manifest source publication (:types manifest)))
                           (copy-snapshot! source destination changes check-running! on-bytes)
                           position))
               expected (into {} (map (juxt :relation-id identity)) tables)
@@ -1682,11 +1709,25 @@
                               :datahike.pg.partition/key :datahike.pg.partition/key-definition
                               :datahike.pg.partition/bound]))))))))
 
+(defn- update-type-names-tx [db removals edits]
+  (let [rename-ops (into []
+                         (mapcat (fn [[old current]]
+                                   (when (not= (:name old) (:name current))
+                                     (pgs/registered-type-name-tx db (:kind old) (:name old) (:name current)))))
+                         (vals edits))
+        retraction? #(= :db/retract (first %))]
+    ;; Vacate all names before assigning any, including enum registry
+    ;; unique keys. This lets surviving types swap names in one cutover.
+    (into [] (concat (mapcat #(pgs/registered-type-name-tx db (:kind %) (:name %) nil) removals)
+                     (filter retraction? rename-ops)
+                     (remove retraction? rename-ops)))))
+
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
-        {:keys [changes removed installed-manifest refresh-topology? type-changes]} stage
-        renamed-labels (enum-renames type-changes)
+        {:keys [changes removed installed-manifest refresh-topology? type-plan]} stage
+        {:keys [additions removals edits]} type-plan
+        renamed-labels (enum-renames edits)
         rekeys (filterv (fn [{:keys [table previous]}]
                           (and previous (primary-key-changed? previous table)))
                         changes)
@@ -1697,12 +1738,19 @@
                       changes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
-      (install-types! destination (:new-types stage))
-      (doseq [change (vals type-changes)]
-        (stage-data! destination #(refresh-type-tx % change)))
       (doseq [table removed]
         (check-running!)
         (retire-partition! destination table))
+      ;; A table's row type also occupies a type name. Free the old table
+      ;; names before installing types while using storage names for apply.
+      (doseq [[storage] renames]
+        (set-table-name! destination storage (new-slot-name "pgdh_rename")))
+      (when (or (seq removals) (some (fn [[old current]] (not= (:name old) (:name current))) (vals edits)))
+        (stage-data! destination #(update-type-names-tx % removals edits)))
+      (install-types! destination additions)
+      (doseq [[old current :as change] (vals edits)]
+        (when (not= (dissoc old :name) (dissoc current :name))
+          (stage-data! destination #(refresh-type-tx % change))))
       (doseq [{:keys [previous storage-name]} rekeys :when (seq (key-columns previous))]
         (check-running!)
         (drop-primary-key! destination (assoc previous :name storage-name)))
@@ -1714,10 +1762,6 @@
             (reconcile-table! destination stage-db table live-table
                               (matching-key-indexes! previous table) renamed-labels check-running!))
           (set-column-metadata! destination live-table)))
-      ;; Vacate every old SQL name before assigning the new names. This
-      ;; handles name swaps and tables added under a just-vacated name.
-      (doseq [[storage] renames]
-        (set-table-name! destination storage (new-slot-name "pgdh_rename")))
       (doseq [[storage logical] renames]
         (set-table-name! destination storage logical))
       (doseq [{:keys [table previous storage-name]} changes :when (nil? previous)]
@@ -1737,7 +1781,7 @@
       (when refresh-topology?
         (install-partition-topology! destination installed-manifest)))))
 
-(defn- installed-manifest [current previous changes removed type-changes]
+(defn- installed-manifest [current previous changes removed {:keys [edits]}]
   ;; Legacy tables retain their stored definitions until they participate
   ;; in a refresh. Observing their source metadata does not install it.
   (let [installed (into {}
@@ -1747,10 +1791,11 @@
                                   (not= (:name table) storage-name) (assoc :storage-name storage-name))]))
                         changes)
         prior (relations-by-id previous)
-        types (into (or (:types previous) (sorted-map))
-                    (filter (fn [[name _]]
-                              (or (not (contains? (:types previous) name))
-                                  (contains? type-changes name))))
+        previous-types (types-by-oid previous)
+        types (into (sorted-map)
+                    (map (fn [[name definition]]
+                           [name (if (contains? edits name) definition
+                                     (get previous-types (:oid definition) definition))]))
                     (:types current))
         retired (into (or (:retired-storage previous) #{})
                       (map (comp :name storage-table)) removed)
@@ -1761,14 +1806,13 @@
       (seq retired) (assoc :retired-storage retired)
       (seq types) (assoc :types types))))
 
-(defn- installation-plan [previous current changes removed type-changes]
-  {:installed-manifest (installed-manifest current previous changes removed type-changes)
+(defn- installation-plan [previous current changes removed type-plan]
+  {:installed-manifest (installed-manifest current previous changes removed type-plan)
    :source-manifest current
    :changes changes
    :removed removed
-   :type-changes type-changes
-   :refresh-topology? (or (seq (:partition-parents previous)) (seq (:partition-parents current)))
-   :new-types (apply dissoc (:types current) (keys (:types previous)))})
+   :type-plan type-plan
+   :refresh-topology? (or (seq (:partition-parents previous)) (seq (:partition-parents current)))})
 
 (defn- recoverable-slot-loss? [error]
   (contains? #{:slot-missing :slot-invalidated :slot-confirmation-ahead} (:reason (ex-data error))))
@@ -1823,12 +1867,12 @@
             (fn [position]
               (require! (not (neg? (compare-lsn position end-lsn))) "Replacement snapshot precedes the durable checkpoint"
                         {:snapshot position :checkpoint end-lsn})
-              (let [current (publication-manifest source publication)
+              (let [current (publication-manifest source publication (:types previous))
                     removed (removed-relations previous current)
-                    type-changes (type-changes! previous current schema-refresh?)
+                    type-plan (type-plan! previous current schema-refresh?)
                     affected (into #{} (map :relation-id) (all-relations current))
-                    changes (changed-tables! previous current affected removed type-changes schema-refresh?)
-                    plan (installation-plan previous current changes removed type-changes)
+                    changes (changed-tables! previous current affected removed (:edits type-plan) schema-refresh?)
+                    plan (installation-plan previous current changes removed type-plan)
                     gap (merge (dissoc pending :slot)
                                (dissoc status :state) {:snapshot-lsn position
                                                        :from-timeline (get-in saved [:origin :timeline])
@@ -1888,15 +1932,15 @@
         next-watermark (volatile! (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 30)))
         next-check (volatile! 0)
         refresh! (fn []
-                   (let [current (publication-manifest source publication)]
+                   (let [current (poll-publication-manifest source publication (:types @applied))]
                      (vreset! observed (tables-by-id current))
                      (if-let [active @stage]
                        (require-stable-manifest! (:source-manifest active) current)
                        (let [affected (partition-affected @applied current)
                              removed (removed-relations @applied current)
-                             type-changes (type-changes! @applied current schema-refresh?)
-                             changes (changed-tables! @applied current affected removed type-changes schema-refresh?)]
-                         (when (or (seq changes) (seq removed))
+                             type-plan (type-plan! @applied current schema-refresh?)
+                             changes (changed-tables! @applied current affected removed (:edits type-plan) schema-refresh?)]
+                         (when (or (seq changes) (seq removed) (some seq (vals type-plan)))
                            (doseq [{:keys [table previous]} changes
                                    :when (and previous (nil? (:partition-leaves table)))]
                              (matching-key-indexes! previous table))
@@ -1905,7 +1949,7 @@
                                                    (comp (remove :partition-leaves)
                                                          (map (fn [table] [(:relation-id table) @durable])))
                                                    pending-tables)
-                                 install (installation-plan @applied current changes removed type-changes)]
+                                 install (installation-plan @applied current changes removed type-plan)]
                              (vswap! pending-schema #(merge new-pending %))
                              (vreset! stage (merge (start-refresh! config origin current changes check-running!) install))
                              (vreset! stage-signaled? false)))))))
@@ -1925,7 +1969,7 @@
                                   ;; different key without any wire change.
                                   (when (or (some stale? ids)
                                             (when (seq used-types)
-                                              (let [current (read-source-types source used-types)]
+                                              (let [current (read-source-types source (keys used-types))]
                                                 (some (fn [[oid before]]
                                                         (not (same-type-definition? before (get current oid))))
                                                       used-types))))

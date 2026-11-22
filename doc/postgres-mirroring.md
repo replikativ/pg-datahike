@@ -144,9 +144,10 @@ Keep this option enabled through restart while a refresh is pending.
 
 Columns can change between supported built-in types, enums, and domains if
 the previous primary key can still match rows. The mirror matches renamed
-enum key labels by the publisher's enum member OIDs. Earlier snapshots
-retain the old names, column types, defaults, and checks. Schema refresh
-requires the same PostgreSQL type identity for edits to registered types.
+enum key labels by the publisher's enum member OIDs. Renaming a tracked
+enum or domain preserves its mirror type OID. When the publisher drops
+one and reuses its name, the replacement receives a new mirror type OID.
+Earlier snapshots retain the previous names, types, defaults, and checks.
 
 When upgrading an existing mirror that stored only the wire layout, enable
 this option while its publication still has the same layout. Let the mirror
@@ -289,6 +290,9 @@ with PostgreSQL. Pass `--partitions` to check populated attachment,
 detachment, reattachment, truncation and crash recovery under leaf routing.
 Pass `--type-refresh` to compare enum and domain changes, column conversions,
 and historical type catalogs across an interrupted cutover and restart.
+Run `sh test/integration/postgres-regress/mirror-publisher.sh --type-lifecycle`
+to verify type renames, name swaps, drops and replacements, and preservation
+of earlier type identities across a crash.
 Run `sh test/integration/postgres-regress/mirror-failover.sh promote` with
 `PG_MIRROR_PG_BIN` pointing to PostgreSQL 18 binaries to promote a disposable
 standby during a schema refresh. The `diverge` mode promotes a standby that

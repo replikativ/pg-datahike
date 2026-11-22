@@ -1832,6 +1832,152 @@
         {:status :passed :probe :streaming}
         (finally (when @subscriber (mirror/stop! @subscriber)))))))
 
+(defn- lifecycle-rows [conn]
+  (rows conn (str "SELECT id::text, value::text, score::text, note, pg_typeof(id)::text, "
+                  "pg_typeof(value)::text, pg_typeof(score)::text FROM lifecycle_items ORDER BY note")))
+
+(defn- lifecycle-catalog [conn]
+  [(rows conn (str "SELECT typname, typtype, COALESCE(typbasetype, 0), pg_get_expr(typdefaultbin, 0) "
+                   "FROM pg_type WHERE typname LIKE 'lifecycle_%' AND typtype IN ('e','d') ORDER BY typname"))
+   (rows conn (str "SELECT t.typname, e.oid, e.enumlabel FROM pg_enum e JOIN pg_type t ON e.enumtypid=t.oid "
+                   "WHERE t.typname LIKE 'lifecycle_%' ORDER BY t.typname, e.enumsortorder"))])
+
+(defn- lifecycle-oids [conn]
+  (into {} (rows conn "SELECT typname, oid FROM pg_type WHERE typname LIKE 'lifecycle_%' AND typtype IN ('e','d','c')")))
+
+(defn- lifecycle-snapshot [conn]
+  [(lifecycle-rows conn) (lifecycle-catalog conn) (lifecycle-oids conn)])
+
+(defn- lifecycle-compare! [source sink subscriber]
+  (let [expected [(lifecycle-rows source) (lifecycle-catalog source)]]
+    (try
+      (await! "Registered type rows or catalogs did not converge"
+              #(let [status (mirror/status @subscriber)]
+                 (check! (not (#{:paused :failed} (:state status))) "Mirror stopped during a registered type change" status)
+                 (= expected [(lifecycle-rows sink) (lifecycle-catalog sink)])))
+      (catch clojure.lang.ExceptionInfo error
+        (throw (ex-info (ex-message error)
+                        {:source expected :mirror [(lifecycle-rows sink) (lifecycle-catalog sink)]
+                         :status (mirror/status @subscriber)} error))))))
+
+(defn run-type-lifecycle-probe! [source-url follower-url directory]
+  (let [path (str directory "/type-lifecycle-store")
+        config {:source-url follower-url :publication "lifecycle_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        first-id #(inspect-db path (fn [db] (d/q '[:find ?e . :where [?e :lifecycle_items/note "first"]] db)))
+        snapshot-time #(inspect-db path (fn [db] (str (.toInstant ^java.util.Date
+                                                       (:db/txInstant (d/entity db (:max-tx db)))))))
+        replacement ["BEGIN"
+                     "ALTER TYPE lifecycle_state RENAME TO lifecycle_old_state"
+                     "CREATE TYPE lifecycle_state AS ENUM ('alpha','off','new','on')"
+                     (str "ALTER TABLE lifecycle_items ALTER COLUMN value TYPE lifecycle_state USING "
+                          "(CASE WHEN value::text='new' THEN 'alpha' ELSE value::text END)::lifecycle_state")
+                     "DROP TYPE lifecycle_old_state"
+                     "ALTER DOMAIN lifecycle_credit RENAME TO lifecycle_old_credit"
+                     "CREATE DOMAIN lifecycle_credit AS integer DEFAULT 9 CONSTRAINT lifecycle_positive CHECK (VALUE >= 0)"
+                     "ALTER TABLE lifecycle_items ALTER COLUMN score TYPE lifecycle_credit USING score::int::lifecycle_credit"
+                     "ALTER TABLE lifecycle_aux RENAME TO lifecycle_aux_archive"
+                     "CREATE DOMAIN lifecycle_aux AS integer DEFAULT 11"
+                     "ALTER TABLE lifecycle_items ADD COLUMN secondary lifecycle_aux DEFAULT 12"
+                     "COMMIT"]]
+    (with-open [source (DriverManager/getConnection source-url)]
+      (try
+        (sql! source "CREATE TYPE lifecycle_mood AS ENUM ('low','high')"
+              "CREATE TYPE lifecycle_flag AS ENUM ('off','on')"
+              "CREATE DOMAIN lifecycle_score AS smallint DEFAULT 3 CHECK (VALUE > 0)"
+              (str "CREATE TABLE lifecycle_items (id lifecycle_mood PRIMARY KEY, value lifecycle_flag, "
+                   "score lifecycle_score, note text)")
+              "CREATE TABLE lifecycle_aux (id integer PRIMARY KEY)"
+              "INSERT INTO lifecycle_items VALUES ('low','off',4,'first'),('high','on',6,'second')"
+              "INSERT INTO lifecycle_aux VALUES (1)"
+              "CREATE ROLE mirror_lifecycle_reader LOGIN REPLICATION"
+              "GRANT SELECT ON lifecycle_items,lifecycle_aux TO mirror_lifecycle_reader"
+              "GRANT EXECUTE ON FUNCTION pg_logical_emit_message(boolean,text,text,boolean) TO mirror_lifecycle_reader"
+              "CREATE PUBLICATION lifecycle_pub FOR TABLE lifecycle_items,lifecycle_aux")
+        (reset! subscriber (mirror/start! config))
+        (let [{:keys [slot]} (await-state! @subscriber :following)
+              row-id (first-id)]
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (let [before (lifecycle-snapshot sink)
+                  before-at (snapshot-time)
+                  old-oids (lifecycle-oids sink)]
+              (lifecycle-compare! source sink subscriber)
+              (sql! source "BEGIN"
+                    "ALTER TYPE lifecycle_mood RENAME TO lifecycle_state"
+                    "ALTER TYPE lifecycle_state RENAME VALUE 'low' TO 'idle'"
+                    "CREATE TYPE lifecycle_mood AS ENUM ('off','on','new')"
+                    "ALTER TABLE lifecycle_items ALTER COLUMN value TYPE lifecycle_mood USING value::text::lifecycle_mood"
+                    "DROP TYPE lifecycle_flag"
+                    "ALTER DOMAIN lifecycle_score RENAME TO lifecycle_credit"
+                    "COMMIT"
+                    "UPDATE lifecycle_items SET value='new' WHERE id='idle'")
+              (lifecycle-compare! source sink subscriber)
+              (let [renamed (lifecycle-oids sink)]
+                (check! (= (old-oids "lifecycle_mood") (renamed "lifecycle_state")) "Enum rename allocated a new local OID" {})
+                (check! (= (old-oids "lifecycle_score") (renamed "lifecycle_credit")) "Domain rename allocated a new local OID" {})
+                (check! (and (not= (old-oids "lifecycle_mood") (renamed "lifecycle_mood"))
+                             (not (contains? renamed "lifecycle_flag")))
+                        "Reused and dropped type names have the wrong identities" renamed)
+                (check! (and row-id (= row-id (first-id))) "Rename changed the matching row's identity" {})
+                (sql! source "BEGIN" "ALTER TYPE lifecycle_mood RENAME TO lifecycle_swap"
+                      "ALTER TYPE lifecycle_state RENAME TO lifecycle_mood"
+                      "ALTER TYPE lifecycle_swap RENAME TO lifecycle_state" "COMMIT")
+                (lifecycle-compare! source sink subscriber)
+                (let [swapped (lifecycle-oids sink)
+                      before-replacement (lifecycle-snapshot sink)
+                      before-replacement-at (snapshot-time)
+                      install-original @#'mirror/install-staged-tables!]
+                  (check! (= [(renamed "lifecycle_mood") (renamed "lifecycle_state")]
+                             [(swapped "lifecycle_state") (swapped "lifecycle_mood")])
+                          "Type name swap reassigned or lost an OID" swapped)
+                  (with-redefs-fn
+                    {#'mirror/install-staged-tables! (fn [& args]
+                                                       (apply install-original args)
+                                                       (throw (ex-info "Interrupted registered type replacement" {})))}
+                    (fn []
+                      (apply sql! source replacement)
+                      (check! (= "Interrupted registered type replacement"
+                                 (get-in (await-state! @subscriber :paused) [:last-error :message]))
+                              "Probe did not reach the replacement install" (mirror/status @subscriber))
+                      (check! (= before-replacement (lifecycle-snapshot sink)) "Replacement rollback altered visible types" {})))
+                  (mirror/stop! @subscriber)
+                  (child-crash! (assoc config :probe-crash-mode :refresh) (str directory "/lifecycle-crash.log"))
+                  (await! "Crashed type replacement kept the publisher slot active"
+                          #(= ["false"] (slot-query source slot "active::text")))
+                  (check! (pos? (#'mirror/compare-lsn (durable-position path)
+                                                      (first (slot-query source slot "confirmed_flush_lsn"))))
+                          "Publisher acknowledged type replacement before the crash" {})
+                  (reset! subscriber (mirror/start! config))
+                  (with-open [restarted (DriverManager/getConnection (sink-url @subscriber))]
+                    (lifecycle-compare! source restarted subscriber)
+                    (let [current (lifecycle-oids restarted)]
+                      (check! (and (not= (swapped "lifecycle_state") (current "lifecycle_state"))
+                                   (not= (swapped "lifecycle_credit") (current "lifecycle_credit"))
+                                   (= (swapped "lifecycle_credit") (current "lifecycle_old_credit"))
+                                   (= (swapped "lifecycle_aux") (current "lifecycle_aux_archive"))
+                                   (not (contains? current "lifecycle_old_state")))
+                              "Replacement types or renamed row type have the wrong OIDs" current))
+                    (check! (= [["12" "lifecycle_aux"] ["12" "lifecycle_aux"]]
+                               (rows restarted "SELECT secondary, pg_typeof(secondary)::text FROM lifecycle_items ORDER BY note"))
+                            "Reusing a table row type's old name produced the wrong column" {})
+                    (doseq [[at expected] [[before-at before] [before-replacement-at before-replacement]]]
+                      (sql! restarted (str "SET datahike.as_of = " (literal at)))
+                      (check! (= expected (lifecycle-snapshot restarted)) "Historical type identities or rows changed"
+                              {:expected expected :actual (lifecycle-snapshot restarted)}))
+                    (sql! restarted "RESET datahike.as_of")
+                    (sql! source "ALTER DOMAIN lifecycle_old_credit RENAME TO lifecycle_unused")
+                    (lifecycle-compare! source restarted subscriber)
+                    (check! (= (swapped "lifecycle_credit") ((lifecycle-oids restarted) "lifecycle_unused"))
+                            "An unreferenced rename did not preserve the tracked OID" {})
+                    (sql! source "DROP DOMAIN lifecycle_unused"
+                          "UPDATE lifecycle_items SET score=32768,value='off' WHERE id='idle'")
+                    (lifecycle-compare! source restarted subscriber)
+                    (check! (= row-id (first-id)) "Replacement changed the matching row's identity" {})
+                    (check! (not (contains? (lifecycle-oids restarted) "lifecycle_unused")) "Dropped tracked type remained visible" {})))))))
+        {:status :passed :probe :type-lifecycle}
+        (finally (when @subscriber (mirror/stop! @subscriber)))))))
+
 (defn -main [& [argument mode]]
   (cond
     (= "--failover" argument)
@@ -1850,6 +1996,10 @@
     (prn (run-streaming-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
                                (System/getenv "PG_MIRROR_SOURCE_URL")
                                (System/getenv "PG_MIRROR_RECOVERY_DIR")))
+    (= "--type-lifecycle" argument)
+    (prn (run-type-lifecycle-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
+                                    (System/getenv "PG_MIRROR_SOURCE_URL")
+                                    (System/getenv "PG_MIRROR_RECOVERY_DIR")))
     (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
     :else

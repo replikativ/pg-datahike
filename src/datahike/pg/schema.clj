@@ -163,6 +163,28 @@
     :db/cardinality :db.cardinality/one
     :db/doc "Column's SQL type is a registered DOMAIN (`:datahike.pg.domain/name`). Storage lowers to the domain's base type; the dump re-emits with the domain name."}])
 
+(defn registered-type-name-tx
+  "Change the SQL name of an enum or domain and its column annotations.
+   Passing nil removes the registry and catalog entry after source drop."
+  [db kind old-name new-name]
+  (let [[registry column-tag] (case kind
+                                :enum [:datahike.pg.enum/name :datahike.pg/enum-of]
+                                :domain [:datahike.pg.domain/name :datahike.pg/domain-of])
+        eid (d/q '[:find ?e . :in $ ?attr ?name :where [?e ?attr ?name]] db registry old-name)
+        oid (:datahike.pg.object/oid
+             (catalog-objects/object-by-identity db catalog-objects/pg-type-oid
+                                                 catalog-objects/public-namespace-oid old-name))]
+    (when-not eid
+      (throw (ex-info (str "type " (pr-str old-name) " does not exist")
+                      {:error :undefined-object :sqlstate "42704"})))
+    (if new-name
+      (into [[:db/retract eid registry old-name] [:db/add eid registry new-name]]
+            (concat (mapcat (fn [[column]]
+                              [[:db/retract column column-tag old-name] [:db/add column column-tag new-name]])
+                            (d/q '[:find ?e :in $ ?attr ?name :where [?e ?attr ?name]] db column-tag old-name))
+                    (catalog-objects/rename-object-tx db catalog-objects/pg-type-oid oid new-name nil)))
+      (into [[:db/retractEntity eid]] (catalog-objects/drop-object-tx db catalog-objects/pg-type-oid oid)))))
+
 (defn ensure-hint-schema!
   "Idempotently install the :datahike.pg/* hint schema attrs on `conn`.
    Safe to call multiple times. Called automatically by `set-hint!` and

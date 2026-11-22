@@ -11093,25 +11093,7 @@
         (when (regoid/type-identity db {:namespace-oid 2200 :name new-name})
           (throw (ex-info (str "type " (pr-str new-name) " already exists")
                           {:error :duplicate-object :sqlstate "42710"})))
-        (let [column-eids (map first
-                               (d/q '{:find [?col]
-                                      :in [$ ?name]
-                                      :where [[?col :datahike.pg/enum-of ?name]]}
-                                    db type-name))
-              oid (:datahike.pg.object/oid
-                   (catalog-objects/object-by-identity
-                    db catalog-objects/pg-type-oid
-                    catalog-objects/public-namespace-oid type-name))
-              tx-data (into
-                       [[:db/retract eid :datahike.pg.enum/name type-name]
-                        [:db/add eid :datahike.pg.enum/name new-name]]
-                       (concat
-                        (mapcat (fn [col]
-                                  [[:db/retract col :datahike.pg/enum-of type-name]
-                                   [:db/add col :datahike.pg/enum-of new-name]])
-                                column-eids)
-                        (catalog-objects/rename-object-tx
-                         db catalog-objects/pg-type-oid oid new-name nil)))]
+        (let [tx-data (pgs/registered-type-name-tx db :enum type-name new-name)]
           (if (:in-tx? @tx-state)
             (execute-ddl-in-tx tx-state tx-data "ALTER TYPE")
             (do (transact-recorded! conn tx-data) (empty-result "ALTER TYPE")))))
