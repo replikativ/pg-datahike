@@ -499,11 +499,12 @@
   (into (:tables manifest) (:partition-parents manifest)))
 
 (defn- publication-manifest
-  ([source config] (publication-manifest source config nil))
-  ([source config tracked-types]
-   (let [{:keys [publication-oid leaf-publication tables partition-parents compatible?] :as report}
+  ([source config] (publication-manifest source config nil false))
+  ([source config tracked-types allow-empty?]
+   (let [{:keys [publication-oid leaf-publication tables partition-parents compatible? issues] :as report}
          (scan-configured-publication source config)]
-     (require! compatible? "Publication cannot be mirrored" {:report report})
+     (require! (or compatible? (and allow-empty? (= [{:reason :empty-publication}] issues)))
+               "Publication cannot be mirrored" {:report report})
      (let [tracked (when (seq tracked-types) (read-source-types source (map :oid (vals tracked-types))))
            user-types (into (publisher-types (all-relations report))
                             (keep (fn [[oid definition]]
@@ -522,11 +523,11 @@
   (command! source "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
   (try (f) (finally (command! source "ROLLBACK"))))
 
-(defn- poll-publication-manifest [source config tracked-types]
+(defn- poll-publication-manifest [source config tracked-types allow-empty?]
   (let [read! #(if (or (:leaf-publication config) (seq tracked-types))
                  ;; Publication definitions, columns, and registered types share a snapshot.
-                 (read-catalog-snapshot! source (fn [] (publication-manifest source config tracked-types)))
-                 (publication-manifest source config))]
+                 (read-catalog-snapshot! source (fn [] (publication-manifest source config tracked-types allow-empty?)))
+                 (publication-manifest source config tracked-types allow-empty?))]
     (try
       (read!)
       (catch clojure.lang.ExceptionInfo error
@@ -1366,6 +1367,23 @@
   (let [remaining (relations-by-id current)]
     (into [] (remove #(contains? remaining (:relation-id %))) (all-relations previous))))
 
+(defn- partition-relation? [{:keys [partition-parent partition-leaves]}]
+  (or partition-parent partition-leaves))
+
+(defn- plan-publication-removals [previous current removed]
+  (let [active (relations-by-id current)
+        active-names (into #{} (map :name) (vals active))
+        frozen (into (:unpublished-tables previous {})
+                     (comp (remove partition-relation?) (map (juxt :relation-id identity)))
+                     removed)]
+    (reduce-kv (fn [plan id table]
+                 (cond
+                   (contains? active id) plan
+                   (contains? active-names (:name table)) (update plan :retire conj table)
+                   :else (assoc-in plan [:retain id] table)))
+               {:retain {} :retire (filterv partition-relation? removed)}
+               frozen)))
+
 (defn- wire-table [table]
   (update (select-keys table [:schema :name :relation-id :columns])
           :columns #(mapv (fn [column] (select-keys column [:name :oid :typmod :key?])) %)))
@@ -1376,14 +1394,15 @@
 (defn- types-by-oid [manifest]
   (into {} (map (juxt :oid identity)) (vals (:types manifest))))
 
-(defn- type-plan! [previous current allow-schema-refresh?]
+(defn- type-plan! [previous current retired-type-oids allow-schema-refresh?]
   (let [before (types-by-oid previous)
         after (types-by-oid current)
         removals (into [] (remove #(contains? after (:oid %))) (vals before))
+        guarded-removals (remove #(contains? retired-type-oids (:oid %)) removals)
         additions (into (sorted-map) (remove #(contains? before (:oid (val %)))) (:types current))
         identity-keys [:schema :oid :kind :base-type]
-        _ (require! (or allow-schema-refresh? (empty? removals)) "Publisher removed a mirrored user type"
-                    {:reason :dropped-type :types (mapv :name removals)})
+        _ (require! (or allow-schema-refresh? (empty? guarded-removals)) "Publisher removed a mirrored user type"
+                    {:reason :dropped-type :types (mapv :name guarded-removals)})
         edits (into {}
                     (for [[name definition] (:types current)
                           :let [installed (get before (:oid definition))]
@@ -1424,17 +1443,17 @@
   (= (select-keys previous [:publication-oid :leaf-publication])
      (select-keys current [:publication-oid :leaf-publication])))
 
-(defn- changed-tables! [previous current affected removed type-changes allow-schema-refresh?]
-  (let [before (relations-by-id previous)
+(defn- changed-tables! [previous current affected type-changes allow-schema-refresh?]
+  (let [unpublished (:unpublished-tables previous)
+        before (merge unpublished (relations-by-id previous))
         occupied (into (or (:retired-storage previous) #{})
-                       (map (comp :name storage-table)) (all-relations previous))
-        missing (remove #(or (:partition-parent %) (:partition-leaves %)) removed)]
-    (require! (and (same-publication? previous current) (empty? missing))
-              "Publication schema or membership changed"
-              {:removed (mapv relation-name missing)})
+                       (map (comp :name storage-table)) (vals before))]
+    (require! (same-publication? previous current) "The publisher replaced a publication used by the mirror"
+              {:reason :publication-identity-changed})
     (let [changes (filterv (fn [table]
                              (let [prior (get before (:relation-id table))]
                                (or (nil? prior)
+                                   (contains? unpublished (:relation-id table))
                                    (contains? affected (:relation-id table))
                                    (contains? (:pending-schema previous) (:relation-id table))
                                    (not (same-table? prior table))
@@ -1872,7 +1891,7 @@
               end-lsn (with-slot-snapshot!
                         replication source slot true false
                         (fn [position]
-                          (require-stable-manifest! manifest (publication-manifest source config (:types manifest)))
+                          (require-stable-manifest! manifest (publication-manifest source config (:types manifest) true))
                           (copy-snapshot! source destination changes check-running! on-bytes)
                           position))
               expected (into {} (map (juxt :relation-id identity)) tables)
@@ -1944,7 +1963,7 @@
                  (catalog-objects/rename-table-tx db (pgs/storage-table-oid db storage-name)
                                                   logical-name))))
 
-(defn- retire-partition! [destination table]
+(defn- retire-table! [destination table]
   ;; Keep the old attributes and entities for AS OF. The catalog advances
   ;; to a fresh storage name if the publisher later reuses the SQL name.
   (let [storage (:name (storage-table table))
@@ -1990,7 +2009,7 @@
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
-        {:keys [changes removed installed-manifest refresh-topology? type-plan]} stage
+        {:keys [changes retire installed-manifest refresh-topology? type-plan]} stage
         {:keys [additions removals edits]} type-plan
         renamed-labels (enum-renames edits)
         rekeys (filterv (fn [{:keys [table previous]}]
@@ -2009,9 +2028,9 @@
                       changes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
-      (doseq [table removed]
+      (doseq [table retire]
         (check-running!)
-        (retire-partition! destination table))
+        (retire-table! destination table))
       ;; A table's row type also occupies a type name. Free the old table
       ;; names before installing types while using storage names for apply.
       (doseq [[storage] renames]
@@ -2057,7 +2076,7 @@
       (when refresh-topology?
         (install-partition-topology! destination installed-manifest)))))
 
-(defn- installed-manifest [current previous changes removed {:keys [edits]}]
+(defn- installed-manifest [current previous changes {:keys [retain retire]} {:keys [edits]}]
   ;; Legacy tables retain their stored definitions until they participate
   ;; in a refresh. Observing their source metadata does not install it.
   (let [installed (into {}
@@ -2074,21 +2093,55 @@
                                      (get previous-types (:oid definition) definition))]))
                     (:types current))
         retired (into (or (:retired-storage previous) #{})
-                      (map (comp :name storage-table)) removed)
+                      (map (comp :name storage-table)) retire)
         layouts (fn [tables] (mapv #(or (get installed (:relation-id %)) (get prior (:relation-id %))) tables))]
     (cond-> (merge (select-keys previous [:last-schema-refresh :recovery-gaps :slots-to-retire])
                    (update current :tables layouts))
       (seq (:partition-parents current)) (update :partition-parents layouts)
+      (seq retain) (assoc :unpublished-tables retain)
       (seq retired) (assoc :retired-storage retired)
       (seq types) (assoc :types types))))
 
-(defn- installation-plan [previous current changes removed type-plan]
-  {:installed-manifest (installed-manifest current previous changes removed type-plan)
-   :source-manifest current
-   :changes changes
-   :removed removed
-   :type-plan type-plan
-   :refresh-topology? (or (seq (:partition-parents previous)) (seq (:partition-parents current)))})
+(defn- retain-unpublished-types [previous current retained-tables]
+  (let [installed-types (types-by-oid previous)
+        published-types (types-by-oid current)
+        retained-types (publisher-types (vals retained-tables))]
+    (reduce (fn [manifest {:keys [oid name] :as definition}]
+              (if-let [published (get published-types oid)]
+                (let [published-labels (zipmap (:label-oids published) (:labels published))]
+                  (require! (or (not= :enum (:kind definition))
+                                (if-let [ids (:label-oids definition)]
+                                  (= (:labels definition) (mapv published-labels ids))
+                                  (every? (set (:labels published)) (:labels definition))))
+                            "An enum used by an unpublished table changed its labels"
+                            {:reason :unpublished-enum-labels :type name})
+                  manifest)
+                (let [{:keys [name] :as installed} (get installed-types oid definition)
+                      present (get-in manifest [:types name])]
+                  (require! (or (nil? present) (= oid (:oid present)))
+                            "A publisher type name is still used by an unpublished table"
+                            {:reason :unpublished-type-name :type name})
+                  (assoc-in manifest [:types name] installed))))
+            current
+            (vals retained-types))))
+
+(defn- installation-plan [previous current affected schema-refresh?]
+  (let [removed (removed-relations previous current)
+        {:keys [retain retire] :as removal-plan} (plan-publication-removals previous current removed)
+        retained (retain-unpublished-types previous current retain)
+        retiring-ids (into #{} (map :relation-id) retire)
+        active-before (remove #(contains? retiring-ids (:relation-id %)) (all-relations previous))
+        active-type-oids (into #{} (map :oid) (vals (publisher-types active-before)))
+        retired-type-oids (into #{} (comp (map :oid) (remove active-type-oids)) (vals (publisher-types retire)))
+        type-plan (type-plan! previous retained retired-type-oids schema-refresh?)
+        changes (changed-tables! previous current affected (:edits type-plan) schema-refresh?)]
+    {:installed-manifest (installed-manifest retained previous changes removal-plan type-plan)
+     :source-manifest current
+     :changes changes
+     :removed removed
+     :retire retire
+     :type-plan type-plan
+     :refresh-topology? (or (seq (:partition-parents previous)) (seq (:partition-parents current)))}))
 
 (defn- recoverable-slot-loss? [error]
   (contains? #{:slot-missing :slot-invalidated :slot-confirmation-ahead} (:reason (ex-data error))))
@@ -2143,12 +2196,9 @@
             (fn [position]
               (require! (not (neg? (compare-lsn position end-lsn))) "Replacement snapshot precedes the durable checkpoint"
                         {:snapshot position :checkpoint end-lsn})
-              (let [current (publication-manifest source config (:types previous))
-                    removed (removed-relations previous current)
-                    type-plan (type-plan! previous current schema-refresh?)
+              (let [current (publication-manifest source config (:types previous) true)
                     affected (into #{} (map :relation-id) (all-relations current))
-                    changes (changed-tables! previous current affected removed (:edits type-plan) schema-refresh?)
-                    plan (installation-plan previous current changes removed type-plan)
+                    {:keys [changes] :as plan} (installation-plan previous current affected schema-refresh?)
                     gap (merge (dissoc pending :slot)
                                (dissoc status :state) {:snapshot-lsn position
                                                        :from-timeline (get-in saved [:origin :timeline])
@@ -2209,24 +2259,23 @@
         next-watermark (volatile! (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 30)))
         next-check (volatile! 0)
         refresh! (fn []
-                   (let [current (poll-publication-manifest source config (:types @applied))]
+                   (let [current (poll-publication-manifest source config (:types @applied) true)]
                      (vreset! observed (tables-by-id current))
                      (if-let [active @stage]
                        (require-stable-manifest! (:source-manifest active) current)
                        (let [affected (partition-affected @applied current)
-                             removed (removed-relations @applied current)
-                             type-plan (type-plan! @applied current schema-refresh?)
-                             changes (changed-tables! @applied current affected removed (:edits type-plan) schema-refresh?)]
+                             {:keys [changes removed type-plan] :as install}
+                             (installation-plan @applied current affected schema-refresh?)]
                          (when (or (seq changes) (seq removed) (some seq (vals type-plan)))
                            (doseq [{:keys [table previous]} changes
                                    :when (and previous (nil? (:partition-leaves table)))]
                              (matching-key-indexes! previous table))
-                           (let [pending-tables (into removed (keep :previous) changes)
+                           (let [;; Unpublished ordinary tables still receive earlier WAL up to cutover.
+                                 pending-tables (into (filterv partition-relation? removed) (keep :previous) changes)
                                  new-pending (into {}
                                                    (comp (remove :partition-leaves)
                                                          (map (fn [table] [(:relation-id table) @durable])))
-                                                   pending-tables)
-                                 install (installation-plan @applied current changes removed type-plan)]
+                                                   pending-tables)]
                              (vswap! pending-schema #(merge new-pending %))
                              (vreset! stage (merge (start-refresh! config origin current changes check-running!) install))
                              (vreset! stage-signaled? false)))))))
@@ -2262,7 +2311,11 @@
                                                         (not (same-type-definition? before (get current oid))))
                                                       used-types))))
                                     (refresh!))
-                                  (when-let [id (some #(when (stale? %) %) ids)]
+                                  (when-let [id (some (fn [id]
+                                                        (when (and (stale? id)
+                                                                   (not (contains? (:unpublished-tables @applied) id)))
+                                                          id))
+                                                      ids)]
                                     (throw (ex-info "Publication relation changed"
                                                     {:relation (get relations id)})))
                                   (doseq [id ids :when (check-catalog? id)]
@@ -2369,7 +2422,7 @@
             saved (or (checkpoint destination)
                       (let [slot (new-slot-name slot-prefix)]
                       ;; Validate before creating a slot that pins WAL.
-                        (poll-publication-manifest source config nil)
+                        (poll-publication-manifest source config nil false)
                         (init-checkpoint! destination origin slot publication)
                         (checkpoint destination)))]
         (require! (= publication (:publication saved)) "The mirror belongs to a different publication"
@@ -2380,7 +2433,7 @@
                     {:reason :different-leaf-publication
                      :saved-leaf-publication (get-in saved [:manifest :leaf-publication :name])})
           (when leaf-publication
-            (let [current (poll-publication-manifest source config nil)]
+            (let [current (poll-publication-manifest source config nil true)]
               (require! (same-publication? (:manifest saved) current)
                         "The publisher replaced a publication used by the mirror"
                         {:reason :publication-identity-changed}))))

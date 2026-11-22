@@ -481,9 +481,69 @@
                     " WHERE database = current_database() AND temporary"
                     " AND left(slot_name, 10) = 'pgdh_sync_'")))
 
+(defn- check-unpublication! [source reference subscriber config slot directory]
+  (let [path (:store-path config)
+        frozen (fn [] (vals (get-in (durable-checkpoint path) [:manifest :unpublished-tables])))
+        event-rows #(rows % "SELECT id, note FROM refresh_event ORDER BY id")
+        event-identity #(rows % "SELECT 'refresh_event'::regclass::oid, db_id FROM refresh_event WHERE id = 1")]
+    (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+      (let [identity (event-identity sink)]
+        (mirror/stop! @subscriber)
+        (sql! source "UPDATE refresh_event SET note = 'last published value' WHERE id = 1")
+        (await! "Native subscriber missed the last published update"
+                #(= [["1" "last published value"]] (event-rows reference)))
+        (sql! source "ALTER PUBLICATION mirror_refresh_pub DROP TABLE refresh_event"
+              "UPDATE refresh_event SET note = 'while unpublished' WHERE id = 1"
+              "UPDATE refresh_account SET label = 'still following' WHERE id = 1")
+        (sql! reference "ALTER SUBSCRIPTION mirror_refresh_native REFRESH PUBLICATION")
+        (child-crash! (assoc config :probe-crash-mode :refresh) (str directory "/removal-crash.log"))
+        (await! "The crashed removal slot remained active" #(= ["false"] (slot-query source slot "active::text")))
+        (check! (= ["refresh_event"] (mapv :name (frozen))) "Removal did not reach the durable checkpoint" {})
+        (reset! subscriber (mirror/start! config))
+        (with-open [restarted (DriverManager/getConnection (sink-url @subscriber))]
+          (check! (= (event-rows reference) (event-rows restarted) [["1" "last published value"]])
+                  "Publisher removal changed the last mirrored rows" {})
+          (check! (= identity (event-identity restarted)) "Unpublication changed relation or row identity" {})
+          (check! (= [["still following"]] (rows restarted "SELECT label FROM refresh_account"))
+                  "A retained table stopped following after removal" {})
+          (sql! source "ALTER PUBLICATION mirror_refresh_pub ADD TABLE refresh_event"
+                "INSERT INTO refresh_event (id, note) VALUES (2, 'republished')")
+          (sql! reference "TRUNCATE refresh_event"
+                "ALTER SUBSCRIPTION mirror_refresh_native REFRESH PUBLICATION")
+          (let [expected (event-rows source)]
+            (await! "Native subscriber did not recopy the republished table" #(= expected (event-rows reference)))
+            (await! "Mirror did not resync the republished table" #(= expected (event-rows restarted))))
+          (check! (= identity (event-identity restarted)) "Re-adding the same publisher table changed identity" {}))))
+    (sql! source "BEGIN"
+          "DROP TABLE refresh_note"
+          "DROP TYPE refresh_status"
+          "ALTER PUBLICATION mirror_refresh_pub DROP TABLE refresh_account, refresh_event"
+          "COMMIT")
+    (sql! reference "ALTER SUBSCRIPTION mirror_refresh_native REFRESH PUBLICATION")
+    (await! "An empty publication did not retain its last rows"
+            #(= #{"refresh_account" "refresh_event" "refresh_note"} (set (map :name (frozen)))))
+    (mirror/stop! @subscriber)
+    (reset! subscriber (mirror/start! config))
+    (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+      (check! (= (refresh-rows reference) (refresh-rows sink)) "Restart forgot the unpublished tables" {})
+      (check! (= [["active"]] (rows sink "SELECT status::text FROM refresh_note"))
+              "Dropping the source table and its type lost its retained values" {})
+      (let [query "SELECT id, note, status::text FROM refresh_note"
+            before (rows sink query)
+            as-of (inspect-db path #(str (.toInstant ^java.util.Date (:db/txInstant (d/entity % (:max-tx %))))))]
+        (sql! source "CREATE TABLE refresh_note (id integer PRIMARY KEY, note text)"
+              "INSERT INTO refresh_note VALUES (3, 'replacement')"
+              "ALTER PUBLICATION mirror_refresh_pub ADD TABLE refresh_note")
+        (await! "A replacement with the same name did not take over the live name"
+                #(= [["3" "replacement"]] (rows sink "SELECT id, note FROM refresh_note")))
+        (sql! sink (str "SET datahike.as_of = " (literal as-of)))
+        (check! (= before (rows sink query)) "Name reuse lost the historical rows or type" {}))
+      (check! (= #{"refresh_account" "refresh_event"} (set (map :name (frozen))))
+              "Name reuse lost an unrelated retained table" {}))))
+
 (defn run-refresh-probe!
-  "Exercise an online publication addition, a failed handoff, and a crash
-   after the durable handoff but before feedback to PostgreSQL."
+  "Exercise online publication changes, an interrupted handoff, and recovery
+   after committing a handoff but before feedback to PostgreSQL."
   [source-url reference-url source-conninfo]
   (let [directory (str (Files/createTempDirectory "pgdh-mirror-refresh-" (make-array FileAttribute 0)))
         path (str directory "/store")
@@ -491,10 +551,12 @@
         native-slot (str "mirror_refresh_ref_" (str/replace (str (random-uuid)) "-" ""))
         config {:source-url source-url :publication "mirror_refresh_pub" :store-path path :server {:port 0}}
         subscriber (atom nil)
-        schema ["CREATE TABLE refresh_account (id integer PRIMARY KEY, label text)"
+        schema ["CREATE TYPE refresh_status AS ENUM ('active', 'closed')"
+                "CREATE TABLE refresh_account (id integer PRIMARY KEY, label text)"
                 (str "CREATE TABLE refresh_event (id integer PRIMARY KEY, note varchar(40), "
                      "happened timestamptz(6))")
-                "CREATE TABLE refresh_note (id integer PRIMARY KEY, note text)"]]
+                (str "CREATE TABLE refresh_note (id integer PRIMARY KEY, note text, "
+                     "status refresh_status DEFAULT 'active')")]]
     (prn {:artifacts directory})
     (with-open [source (DriverManager/getConnection source-url)
                 reference (DriverManager/getConnection reference-url)]
@@ -597,6 +659,7 @@
                                                      [_ :refresh_event/note "after cutover" ?tx]]
                                                    (d/history %)))))
                       "The post-cutover transaction was split locally" {})))
+          (check-unpublication! source reference subscriber config slot directory)
           (mirror/stop! @subscriber)
           (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
           {:status :passed :artifacts directory})
