@@ -147,3 +147,27 @@
              (pairs c "SELECT p.name, c.name FROM person p LEFT JOIN company c
                          ON p.company = c.db_id AND c.name = 'Acme'
                        ORDER BY p.name"))))))
+
+(deftest update-ref-to-a-transaction-local-row-survives-replay
+  (d/transact *conn* [{:db/ident :replay_doc/id :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}
+                      {:db/ident :replay_doc/link :db/valueType :db.type/ref
+                       :db/cardinality :db.cardinality/one}
+                      {:db/ident :replay_target/id :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}])
+  (d/transact *conn* [{:replay_doc/id 1}])
+  (with-open [a (jdbc)
+              b (jdbc)
+              sa (.createStatement a)
+              sb (.createStatement b)]
+    (.execute sa "BEGIN")
+    (.executeUpdate sa "INSERT INTO replay_target (id) VALUES (10)")
+    (let [provisional-id (with-open [rs (.executeQuery sa "SELECT db_id FROM replay_target WHERE id = 10")]
+                           (.next rs)
+                           (.getLong rs 1))]
+      (is (= 1 (.executeUpdate sa (str "UPDATE replay_doc SET link = " provisional-id " WHERE id = 1"))))
+      (.executeUpdate sb "INSERT INTO replay_target (id) VALUES (20)")
+      (.execute sa "COMMIT")
+      (is (= [["1" "10"]]
+             (pairs a (str "SELECT d.id, t.id FROM replay_doc d JOIN replay_target t "
+                           "ON d.link = t.db_id WHERE d.id = 1")))))))

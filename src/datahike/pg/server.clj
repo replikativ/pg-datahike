@@ -20,6 +20,7 @@
             [datahike.api :as d]
             [datahike.core :as dc]
             [datahike.db.interface :as dbi]
+            [datahike.db.utils :as dbu]
             [datahike.writer :as writer]
             [datahike.tx-preds :as tx-preds]
             [datahike.versioning :as versioning]
@@ -9554,16 +9555,22 @@
     parsed))
 
 (defn- remap-row-operations
-  "Keep buffered row writes addressed to the same temporary row when a
-   replay allocates different entity IDs."
-  [operations eid->tempid]
-  (mapv (fn [[op eid :as operation]]
-          (if-let [tempid (get eid->tempid eid)]
-            (cond-> (assoc operation 1 tempid)
-              (#{:db/retract :db/retractEntity} op)
-              (vary-meta assoc ::transaction-local-retraction true))
-            operation))
-        operations))
+  "Keep buffered row writes addressed to the same temporary rows when
+   replay allocates different entity IDs. Remap reference values as well as
+   the entity operand."
+  [db operations eid->tempid]
+  (if (empty? eid->tempid)
+    operations
+    (mapv (fn [[op eid attr value :as operation]]
+            (let [tempid (get eid->tempid eid)
+                  value-tempid (get eid->tempid value)]
+              (cond-> operation
+                tempid (assoc 1 tempid)
+                (and tempid (#{:db/retract :db/retractEntity} op))
+                (vary-meta assoc ::transaction-local-retraction true)
+                (and value-tempid (dbu/ref? db attr))
+                (assoc 3 value-tempid))))
+          operations)))
 
 (declare query-output)
 
@@ -9811,7 +9818,7 @@
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-report (dc/with spec-db tx-data)
               _ (unique-constraints/validate-report! spec-report)
-              commit-tx-data (remap-row-operations tx-data eid->tempid)
+              commit-tx-data (remap-row-operations spec-db tx-data eid->tempid)
               db-after (:db-after spec-report)
               returning-result
               (when-let [returning (:returning parsed)]
@@ -9869,7 +9876,7 @@
                                                          (:schema spec-db) :delete matched))
               spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) deleted-eids)
               spec-report (dc/with spec-db spec-tx-data)
-              commit-tx-data (remap-row-operations spec-tx-data eid->tempid)]
+              commit-tx-data (remap-row-operations spec-db spec-tx-data eid->tempid)]
           (swap! tx-state (fn [ts]
                             (-> ts
                                 (update :tx-buffer into (guard-catalog-tx commit-tx-data))
@@ -9997,7 +10004,7 @@
               row-tx (mapv (fn [eid] [:db/retractEntity eid]) eids)
               metadata-tx (concat restart-tx definition-tx)
               spec-report (dc/with spec-db (into row-tx metadata-tx))
-              commit-tx-data (into (remap-row-operations row-tx eid->tempid) metadata-tx)
+              commit-tx-data (into (remap-row-operations spec-db row-tx eid->tempid) metadata-tx)
               ;; BEFORE/AFTER TRUNCATE triggers. They were parsed,
               ;; stored, and reported in pg_trigger with the right
               ;; tgtype -- and never fired, because `matching-triggers`
