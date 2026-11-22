@@ -390,6 +390,24 @@
     (is (= [[1] [2] [3] [4]]
            (query-rows c "SELECT id FROM copy_twice ORDER BY id")))))
 
+(deftest transaction-local-copy-replays-delete-and-truncate-in-order
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))
+              st (.createStatement c)]
+    (.execute st "CREATE TABLE copy_parent (id int PRIMARY KEY)")
+    (.execute st "CREATE TABLE copy_child (id int REFERENCES copy_parent(id))")
+    (.execute st "BEGIN")
+    (.executeUpdate st "INSERT INTO copy_parent VALUES (1),(2)")
+    (is (= 2 (copy-in-text c "COPY copy_child(id) FROM STDIN" "1\n2\n")))
+    (is (= 1 (.executeUpdate st "DELETE FROM copy_child WHERE id = 1")))
+    (.execute st "COMMIT")
+    (is (= [[2]] (query-rows c "SELECT id FROM copy_child")))
+    (.execute st "BEGIN")
+    (is (= 1 (copy-in-text c "COPY copy_child(id) FROM STDIN" "1\n")))
+    (.execute st "TRUNCATE copy_parent, copy_child")
+    (.execute st "COMMIT")
+    (is (= [] (query-rows c "SELECT id FROM copy_parent")))
+    (is (= [] (query-rows c "SELECT id FROM copy_child")))))
+
 (deftest copy-rolls-back-to-savepoint
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (with-open [st (.createStatement c)]
