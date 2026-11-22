@@ -12196,22 +12196,23 @@
 (defn- alter-type-column-spec [db type]
   (let [normalized (types/normalize-sql-type-name type)
         base (types/base-type-name-of normalized)
-        vtype (get types/sql-name->dh-type base)
+        array-spec (types/parse-array-type-name normalized)
+        vtype (if array-spec :db.type/string (get types/sql-name->dh-type base))
         oid (pgs/resolve-type-oid db type)
-        typmod (or (when (= :numeric (types/cast-category base))
+        typmod (or (when (or (= :numeric (:elem array-spec)) (= :numeric (types/cast-category base)))
                      (when-let [[precision scale] (types/parse-numeric-args normalized)]
                        (when precision (types/encode-numeric-typmod precision scale))))
                    (some-> (types/parse-char-length normalized) (+ types/var-hdr-sz))
                    (types/parse-timestamp-precision normalized)
+                   (types/parse-time-precision normalized)
                    (types/parse-bit-length normalized))]
     (when-not (and vtype (types/catalog-type oid)
-                   (not (types/array-oid->element-oid oid))
                    (not (types/unsupported-input-type? base))
                    (not (re-find #"^(?:smallserial|bigserial|serial)" base))
                    (not (pgs/user-type-object db type)))
       (throw (errors/pg-error :feature-not-supported
                               {:message (str "ALTER COLUMN TYPE to " type " is not supported")})))
-    {:base base :oid oid :typmod typmod :vtype vtype}))
+    {:base base :oid oid :typmod typmod :vtype vtype :array-spec array-spec}))
 
 (defn- assert-rewritable-column! [db table column indexes]
   (let [attr (:datahike.pg.column/storage-ident column)
@@ -12278,7 +12279,7 @@
         old-entity (d/entity db old-attr)
         schema (dbi/-schema db)
         attnum (:datahike.pg.column/attnum column)
-        {:keys [base oid typmod vtype]} (alter-type-column-spec db type)
+        {:keys [base oid typmod vtype array-spec]} (alter-type-column-spec db type)
         old-typmod (:datahike.pg.column/typmod column)
         new-attr (available-column-storage-ident (conj (set (keys schema)) (keyword table name))
                                                  table name attnum)
@@ -12288,7 +12289,11 @@
                           {:db/ident new-attr :db/valueType vtype
                            :db/cardinality :db.cardinality/one
                            :pg/type (or (types/oid->pg-type-marker oid) base)}
-                          (when typmod {:pg/typmod (long typmod)}))
+                          (when typmod {:pg/typmod (long typmod)})
+                          (when array-spec
+                            {:pg/type (:pg-name array-spec)
+                             :pg/array-elem (:elem array-spec)
+                             :pg/array-ndim (long (:ndim array-spec))}))
         using-ast (alter-type-using-ast using name)
         using-oid (if using
                     (first (row-eval/row-oids [using-ast] table schema db))
@@ -12531,27 +12536,30 @@
                      storage-ident (fresh-storage-ident! name attnum)
                      normalized (types/normalize-sql-type-name type)
                      base-type (str/replace normalized #"\s*\([^)]*\)" "")
+                     array-spec (types/parse-array-type-name normalized)
                      user-type (pgs/user-type-object db type)
                      vector-typmod (when (= "vector" base-type)
                                      (pg-vector/parse-typmod normalized))
                      numeric-typmod
-                     (when (= :numeric (types/cast-category base-type))
+                     (when (or (= :numeric (:elem array-spec)) (= :numeric (types/cast-category base-type)))
                        (let [[precision scale] (types/parse-numeric-args normalized)]
                          (when (or precision scale)
                            (types/encode-numeric-typmod precision scale))))
                      char-typmod (when-let [length (types/parse-char-length normalized)]
                                    (+ length 4))
-                     timestamp-typmod (types/parse-timestamp-precision normalized)
+                     temporal-typmod (or (types/parse-timestamp-precision normalized)
+                                         (types/parse-time-precision normalized))
                      bit-typmod (some-> (types/parse-bit-length normalized) long)]
                  (assoc column
                         :attnum attnum
                         :storage-ident storage-ident
                         :normalized-type normalized
                         :base-type base-type
+                        :array-spec array-spec
                         :type-object user-type
                         :type-oid (pgs/resolve-type-oid db type)
                         :typmod (or vector-typmod numeric-typmod
-                                    char-typmod timestamp-typmod bit-typmod))))
+                                    char-typmod temporal-typmod bit-typmod))))
              (range) added-columns)
             add-spec-by-name (into {} (map (juxt :name identity)) added-column-specs)
             _ (doseq [{:keys [op columns]} operations]
@@ -12595,7 +12603,7 @@
                                                  :add-column
                                                  (for [{:keys [name]} columns
                                                        :let [{:keys [type storage-ident base-type typmod default
-                                                                     type-object normalized-type]}
+                                                                     type-object normalized-type array-spec]}
                                                              (get add-spec-by-name name)
                                                              metadata (alter-default-metadata default base-type name)
                                                              raw-type type
@@ -12607,9 +12615,13 @@
                                                                          {:error :feature-not-supported
                                                                           :sqlstate "0A000"
                                                                           :type unsupported-base})))
-                                                             dh-type (or (get types/sql-name->dh-type normalized-type)
-                                                                         (get types/sql-name->dh-type base-type)
-                                                                         :db.type/string)
+                                                             dh-type (if array-spec
+                                                                       :db.type/string
+                                                                       (or (get types/sql-name->dh-type normalized-type)
+                                                                           (get types/sql-name->dh-type base-type)
+                                                                           :db.type/string))
+                                                             pg-type (or (:pg-name array-spec)
+                                                                         (ddl/pg-type-hint base-type false))
                                                              type-kind (:datahike.pg.object/kind type-object)
                                                              type-name (:datahike.pg.object/name type-object)]]
                                                    (cond-> (merge {:db/ident storage-ident
@@ -12621,9 +12633,11 @@
                                   ;; so a column added by ALTER as `date`
                                   ;; or `smallint` reported its storage
                                   ;; type (timestamp / int8) forever.
-                                                     (ddl/pg-type-hint base-type false)
-                                                     (assoc :pg/type
-                                                            (ddl/pg-type-hint base-type false))
+                                                     pg-type
+                                                     (assoc :pg/type pg-type)
+                                                     array-spec
+                                                     (assoc :pg/array-elem (:elem array-spec)
+                                                            :pg/array-ndim (long (:ndim array-spec)))
                                                      (= :enum type-kind)
                                                      (assoc :datahike.pg/enum-of type-name)
                                                      (= :domain type-kind)

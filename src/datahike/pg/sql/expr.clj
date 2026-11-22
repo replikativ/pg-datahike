@@ -7141,6 +7141,9 @@
   (and (instance? Column expr)
        (types/precise-timestamp-column? (column-vtype ctx expr) (column-pg-type ctx expr))))
 
+(defn- time-of-day-oid? [oid]
+  (contains? #{types/oid-time types/oid-timetz} oid))
+
 (defn- column-storage-value
   "Encode a typed SQL value for direct binding against a stored datom."
   [ctx resolved v]
@@ -7151,6 +7154,8 @@
       (= :db.type/bigdec (:db/valueType attr-schema)) (types/numeric-value->storage v)
       (types/precise-timestamp-column? (:db/valueType attr-schema) pg-type)
       (sql-cast/timestamp-value->storage pg-type nil v)
+      (and (some? v) (not= :__null__ v) (#{"time" "timetz"} pg-type))
+      (types/->pg-text (sql-cast/cast-scalar v pg-type {}) (types/pg-name->oid pg-type))
       :else v)))
 
 (defn- session-value-expr!
@@ -8914,6 +8919,8 @@
                                (jsonb-column? ctx right)))
            vector-cmp? (or (= types/oid-vector (source-oid ctx left))
                            (= types/oid-vector (source-oid ctx right)))
+           time-oid (some #(when (time-of-day-oid? %) %)
+                          [(source-oid ctx left) (source-oid ctx right)])
            ;; timestamptz against a timestamp or date: PostgreSQL casts
            ;; the wall clock to timestamptz, i.e. places it in the session
            ;; zone, before comparing. Comparing the wall clock's UTC
@@ -8945,21 +8952,26 @@
                         (cmp (get rank (str a) Long/MAX_VALUE)
                              (get rank (str b) Long/MAX_VALUE))))
                p))
-           vector-cmp-param
-           (when vector-cmp?
+           typed-cmp-param
+           (when (or vector-cmp? time-oid)
              (let [cmp (case op = zero? not= (complement zero?)
                              < neg? > pos? <= #(not (pos? %)) >= #(not (neg? %)))
-                   p (symbol (str "?vector-cmp-" (swap! (:var-counter ctx) inc)))]
+                   p (symbol (str "?typed-cmp-" (swap! (:var-counter ctx) inc)))
+                   compare-values (if time-oid
+                                    (let [timetz? (= types/oid-timetz time-oid)]
+                                      (fn [a b] (compare (sql-cast/time-order-key a timetz?)
+                                                         (sql-cast/time-order-key b timetz?))))
+                                    pg-vector/compare-values)]
                (swap! (:in-params ctx) conj p)
                (swap! (:in-args ctx) conj
-                      (fn [a b] (cmp (pg-vector/compare-values a b))))
+                      (fn [a b] (cmp (compare-values a b))))
                p))]
        (conj guards
              (cond
                enum-cmp-param
                [(list enum-cmp-param l r)]
-               vector-cmp-param
-               [(list vector-cmp-param l r)]
+               typed-cmp-param
+               [(list typed-cmp-param l r)]
                (and jsonb-cmp? (= op '=))
                [(list 'datahike.pg.query-fns/jsonb-eq? l r)]
                jsonb-cmp?
@@ -9457,6 +9469,7 @@
                  (nil? (.getArrayConstructor ^Column left))
                  (instance? JdbcParameter right)
                  (not (precise-timestamp-column? ctx left))
+                 (not (time-of-day-oid? (source-oid ctx left)))
                  ;; A column that is really an OUTER row's value is a
                  ;; constant, not a relation to seek -- see column-binding.
                  (not (column-binding ctx left)))

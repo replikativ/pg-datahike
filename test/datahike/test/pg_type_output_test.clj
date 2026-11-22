@@ -128,6 +128,29 @@
       (is (= java.time.LocalTime/MAX (.getObject rs 1 java.time.LocalTime))))
     (is (= "22008" (state c "SELECT '24:00:01'::time")))))
 
+(deftest time-precision-comparison-and-fixed-width-text
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE typed (id int, t time(3), tz timetz(6), fixed char(4))")
+    (exec! c (str "INSERT INTO typed VALUES "
+                  "(1, '23:59:59.999500', '14:00:00.123456+04', 'a'), "
+                  "(2, '00:00:00', '24:00:00+02', 'b'), "
+                  "(3, '00:00:00.000500', '00:00:00+02', 'c')"))
+    (is (= [["24:00:00" "14:00:00.123456+04" "a   " "a"]
+            ["00:00:00" "24:00:00+02" "b   " "b"]
+            ["00:00:00.001" "00:00:00+02" "c   " "c"]]
+           (rows c "SELECT t, tz, fixed, fixed::text FROM typed ORDER BY id")))
+    (is (= [["2"]] (rows c "SELECT id FROM typed WHERE tz = '24:00+02'")))
+    (is (= [["1"]] (rows c "SELECT id FROM typed WHERE t = CAST('24:00' AS time)")))
+    (is (= [["1"] ["3"]]
+           (rows c "SELECT id FROM typed WHERE tz < CAST('12:00:00+00' AS timetz) ORDER BY id")))
+    (is (= "42883" (state c "SELECT id FROM typed WHERE tz = CAST('24:00+02' AS text)")))
+    (with-open [ps (.prepareStatement c "SELECT id FROM typed WHERE tz = CAST(? AS timetz)")]
+      (.setString ps 1 "14:00:00.123456+04")
+      (with-open [rs (.executeQuery ps)]
+        (is (.next rs))
+        (is (= 1 (.getInt rs 1)))
+        (is (false? (.next rs)))))))
+
 (deftest bytea-survives-a-derived-relation
   ;; A derived relation re-infers each column's type from the VALUES it
   ;; carries. A byte[] matched no category, fell through to the

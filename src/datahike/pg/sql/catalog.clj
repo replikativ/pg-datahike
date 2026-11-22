@@ -2784,10 +2784,6 @@
                                                      [?e :pg/default-kind :publisher]
                                                      [?e :pg/default-value ?value]]}
                                            cte-db)))
-          datetime-precision (fn [vtype]
-                               (case vtype
-                                 :db.type/instant 6
-                                 nil))
           ;; Drop nil-valued keys per PG's information_schema convention —
           ;; columns that don't apply to the type are simply absent (the
           ;; wire layer surfaces them as SQL NULL).
@@ -2805,9 +2801,16 @@
                  [idx col] (map-indexed vector
                                         (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
                  :let [vtype     (:valuetype col)
-                       timestamp? (contains? #{types/oid-timestamp types/oid-timestamptz}
-                                             (:oid col))
+                       oid       (:oid col)
                        typmod    (get typmods (:attr col))
+                       char-length (when (and (#{types/oid-bpchar types/oid-varchar} oid)
+                                              typmod (> typmod types/var-hdr-sz))
+                                     (- typmod types/var-hdr-sz))
+                       datetime-precision (cond
+                                            (= types/oid-date oid) 0
+                                            (#{types/oid-time types/oid-timetz
+                                               types/oid-timestamp types/oid-timestamptz} oid)
+                                            (if (and typmod (>= typmod 0)) typmod 6))
                        pos       (long (if (zero? idx)
                                          1
                                          (inc (or (:attnum col) idx))))
@@ -2834,20 +2837,19 @@
                ;; timestamp alike, so a `date` column reported
                ;; `timestamp without time zone` here.
                :information_schema_columns/data_type
-               (or (get types/oid->pg-name (:oid col)) (pgs/pg-type-name vtype))
-               :information_schema_columns/character_maximum_length nil
-               :information_schema_columns/character_octet_length nil
+               (if (contains? types/array-oid->element-oid oid)
+                 "ARRAY"
+                 (or (get types/oid->pg-name oid) (pgs/pg-type-name vtype)))
+               :information_schema_columns/character_maximum_length char-length
+               :information_schema_columns/character_octet_length (when char-length (* 4 char-length))
                :information_schema_columns/numeric_precision      (numeric-precision vtype (:attr col))
                :information_schema_columns/numeric_precision_radix (numeric-radix vtype)
                :information_schema_columns/numeric_scale          (numeric-scale vtype (:attr col))
-               :information_schema_columns/datetime_precision     (if timestamp?
-                                                                    (if (and typmod (>= typmod 0)) typmod 6)
-                                                                    (datetime-precision vtype))
+               :information_schema_columns/datetime_precision     datetime-precision
                :information_schema_columns/udt_catalog            "datahike"
                :information_schema_columns/udt_schema             "pg_catalog"
-               :information_schema_columns/udt_name               (if timestamp?
-                                                                    (:typname (types/catalog-type (:oid col)))
-                                                                    (udt-name vtype))
+               :information_schema_columns/udt_name               (or (:typname (types/catalog-type oid))
+                                                                      (udt-name vtype))
                :information_schema_columns/dtd_identifier         (str pos)
                :information_schema_columns/is_self_referencing    "NO"
                :information_schema_columns/is_identity            (if identity? "YES" "NO")

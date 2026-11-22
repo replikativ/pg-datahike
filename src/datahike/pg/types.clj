@@ -1327,6 +1327,13 @@
     (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-name))
             second parse-long (min 6))))
 
+(defn parse-time-precision
+  "Return the declared precision of TIME or TIME WITH TIME ZONE."
+  [type-name]
+  (when (contains? cast-time-types (base-type-name-of type-name))
+    (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-name))
+            second parse-long (min 6))))
+
 (defn parse-char-length
   "The `n` of `varchar(n)` / `char(n)`, or nil for an unmodified text
    type. Only the length-carrying names qualify -- `text` has no limit."

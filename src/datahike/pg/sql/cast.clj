@@ -382,11 +382,25 @@
    `DecodeTimeOnly`'s business, and so are the forms the regex never
    had: `040506`, `0405`, `now`, a text month refused, a weekday
    refused."
-  [^String input timetz?]
-  (let [ctx (datetime-ctx)]
+  [^String input timetz? precision]
+  (let [ctx (datetime-ctx)
+        parsed (if timetz? (in/timetz-in input ctx) (in/time-in input ctx))
+        parsed (if (and precision (< precision 6))
+                 (let [scale (nth [1000000 100000 10000 1000 100 10] precision)]
+                   (update parsed :usec #(* scale (quot (+ % (quot scale 2)) scale))))
+                 parsed)]
+    ((if timetz? carrier/->timetz carrier/->time) parsed)))
+
+(defn time-order-key
+  "PostgreSQL's comparison key for a time of day, including end of day.
+   TIMETZ compares UTC microseconds first and seconds west of UTC second."
+  [value timetz?]
+  (let [text (if (string? value) value (types/temporal->pg-text value))
+        ctx (datetime-ctx)]
     (if timetz?
-      (carrier/->timetz (in/timetz-in input ctx))
-      (carrier/->time (in/time-in input ctx)))))
+      (let [{:keys [usec west]} (in/timetz-in text ctx)]
+        [(+ usec (* west 1000000)) west])
+      (:usec (in/time-in text ctx)))))
 
 (defn- parse-date-strict
   "PostgreSQL `date_in`, via the ported parser. Returns a `LocalDate`
@@ -627,7 +641,11 @@
                (cond
                  (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)
                  (pg-arr/array? v)   (pg-arr/to-pg-text v)
-                 (string? v)         v
+                 (string? v)
+                 (if (and (= types/oid-bpchar src-oid)
+                          (not (#{"char" "character" "bpchar"} (types/base-type-name-of type-str))))
+                   (str/replace v #" +\z" "")
+                   v)
                  ;; booltext, the bool -> text CAST: `true`, where the
                  ;; output function `->pg-text` uses says `t`.
                  (boolean? v)        (if v "true" "false")
@@ -742,6 +760,7 @@
 
         :time (let [timetz? (contains? #{"timetz" "time with time zone"}
                                        (types/base-type-name-of type-str))
+                    precision (types/parse-time-precision type-str)
                     local (cond
                             ;; `'infinity'::timestamp::time` is NULL in
                             ;; PostgreSQL -- a time has no infinity, so
@@ -757,12 +776,16 @@
                             (instance? java.util.Date v)
                             (-> ^java.util.Date v .toInstant
                                 (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
-                            :else (parse-time-input (str v) timetz?))]
+                            :else nil)]
                 (cond
                   (= ::infinite local) :__null__
-                  (and timetz? (instance? java.time.LocalTime local))
-                  (java.time.OffsetTime/of ^java.time.LocalTime local java.time.ZoneOffset/UTC)
-                  :else local))
+                  (nil? local) (parse-time-input (str v) timetz? precision)
+                  :else (let [t (if (and timetz? (instance? java.time.LocalTime local))
+                                  (java.time.OffsetTime/of ^java.time.LocalTime local java.time.ZoneOffset/UTC)
+                                  local)]
+                          (if (and precision (< precision 6))
+                            (parse-time-input (types/temporal->pg-text t) timetz? precision)
+                            t))))
 
         ;; Not a width-classified category — the OID-name types.
         (cond

@@ -8706,8 +8706,9 @@
         ;; 22008, 'garbage' 22007) and canonicalises ('1:2:3 PM' is stored
         ;; as 13:02:03). The raw input string used to be stored verbatim.
           (and (#{"time" "timetz"} pg-type) (some? val) (not= :__null__ val))
-          (types/->pg-text (sql-cast/cast-scalar val pg-type {:explicit? true})
-                           (if (= "time" pg-type) types/oid-time types/oid-timetz))
+          (let [declared (if (and typmod (>= typmod 0)) (str pg-type "(" typmod ")") pg-type)]
+            (types/->pg-text (sql-cast/cast-scalar val declared {:explicit? true})
+                             (if (= "time" pg-type) types/oid-time types/oid-timetz)))
 
         ;; interval columns keep their text form too, and so did the raw
         ;; input: '24 hours' read back as `24 hours` where PostgreSQL

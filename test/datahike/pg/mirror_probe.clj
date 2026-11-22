@@ -21,7 +21,12 @@
         "amount numeric(12,3) DEFAULT 3.14159, bucket numeric(8,-2), "
         "wall_time timestamp(6) DEFAULT '2024-02-29 13:55:19.123457', "
         "rounded timestamp(3) DEFAULT '1999-12-31 23:59:59.999500', "
-        "FOREIGN KEY (tenant, parent_id) REFERENCES probe_parent(tenant, id) ON DELETE CASCADE)")])
+        "FOREIGN KEY (tenant, parent_id) REFERENCES probe_parent(tenant, id) ON DELETE CASCADE)")
+   (str "CREATE TABLE probe_types (id integer PRIMARY KEY, doc json, attrs jsonb, "
+        "observed timetz(6), wall time(3), fixed character(4), payload bytea, tags text[], lexemes tsvector)")
+   (str "CREATE TABLE probe_type_keys (observed timetz(6), payload bytea, tags text[], "
+        "attrs jsonb, fixed character(4), lexemes tsvector, label text, "
+        "PRIMARY KEY (observed, payload, tags, attrs, fixed, lexemes))")])
 
 (defn- check! [condition message data]
   (when-not condition (throw (ex-info message data))))
@@ -39,9 +44,19 @@
           (recur (conj out (mapv #(.getString result (int %)) (range 1 (inc n)))))
           out)))))
 
+(defn- type-rows [conn]
+  (rows conn (str "SELECT id, doc::text, attrs::text, observed::text, wall::text, fixed, "
+                  "payload::text, tags::text, lexemes::text FROM probe_types ORDER BY id")))
+
+(defn- type-key-rows [conn]
+  (rows conn (str "SELECT observed::text, payload::text, tags::text, attrs::text, fixed::text, "
+                  "lexemes::text, label FROM probe_type_keys ORDER BY label")))
+
 (defn- fixture-rows [conn]
   [(rows conn "SELECT tenant, id, label, payload, occurred::text FROM probe_parent ORDER BY tenant, id")
-   (rows conn "SELECT id, tenant, parent_id, note, amount, bucket, wall_time::text, rounded::text FROM probe_child ORDER BY id")])
+   (rows conn "SELECT id, tenant, parent_id, note, amount, bucket, wall_time::text, rounded::text FROM probe_child ORDER BY id")
+   (type-rows conn)
+   (type-key-rows conn)])
 
 (defn- literal [value]
   (str "'" (str/replace value "'" "''") "'"))
@@ -159,7 +174,7 @@
 
 (defn- check-admission! [source config]
   (sql! source
-        "CREATE TABLE probe_unhandled (id integer PRIMARY KEY, observed timetz, payload jsonb)"
+        "CREATE TABLE probe_unhandled (id integer PRIMARY KEY, observed inet, payload xml)"
         "CREATE TABLE probe_no_key (note text)"
         "ALTER TABLE probe_no_key REPLICA IDENTITY FULL"
         "CREATE TABLE probe_no_columns ()"
@@ -201,6 +216,11 @@
                   "WHERE table_name IN ('probe_parent', 'probe_child') "
                   "AND column_name IN ('occurred', 'wall_time', 'rounded') ORDER BY column_name")))
 
+(defn- type-catalog [conn]
+  (rows conn (str "SELECT column_name, data_type, udt_name, datetime_precision, character_maximum_length, "
+                  "character_octet_length FROM information_schema.columns WHERE table_name = 'probe_types' "
+                  "AND column_name NOT IN ('id', 'db_id') ORDER BY column_name")))
+
 (defn run-probe!
   "Exercise initial snapshot, PostgreSQL row parity, SQL read-only enforcement,
    reconnect, crash replay, history, schema drift and lost slot detection."
@@ -223,7 +243,17 @@
               "INSERT INTO probe_parent SELECT 1, 1, 'before', string_agg(md5(i::text), '' ORDER BY i) FROM generate_series(1, 1000) i"
               "INSERT INTO probe_parent VALUES (1, 2, 'delete me', NULL)"
               "INSERT INTO probe_child VALUES (10, 1, 1, 'keep'), (20, 1, 2, 'cascade')"
-              "CREATE PUBLICATION mirror_pub FOR TABLE probe_parent, probe_child")
+              (str "INSERT INTO probe_types SELECT 1, '{ \"dup\": 1, \"dup\": 2 }'::json, "
+                   "jsonb_build_object('toast', string_agg(md5(i::text), '' ORDER BY i), "
+                   "'decimal', 1.200, 'null', NULL), '23:59:59.123456-03:30', '11:12:13.111500', "
+                   "'é', decode('00ffa10a','hex'), '[-2:0]={\"NULL\",NULL,\"a,b\"}'::text[], "
+                   "'fox:3A cat:2 cat:1'::tsvector FROM generate_series(1, 1000) i")
+              (str "INSERT INTO probe_types (id, attrs, observed, wall, fixed, payload, tags, lexemes) VALUES "
+                   "(2, 'null', '24:00:00+01:30:45', '23:59:59.999500', '', decode('','hex'), '{}', '')")
+              (str "INSERT INTO probe_type_keys VALUES "
+                   "('14:00:00.123456+04', decode('00ff','hex'), '[0:1]={a,NULL}', '{\"num\":1.200}', 'a', 'cat:2 fox:1D', 'one'), "
+                   "('24:00:00+01:30:45', decode('','hex'), '{}', 'null', '雪', '', 'two')")
+              "CREATE PUBLICATION mirror_pub FOR TABLE probe_parent, probe_child, probe_types, probe_type_keys")
         (check-admission! source config)
         (sql! source (str "SELECT pg_create_logical_replication_slot(" (literal native-slot) ", 'pgoutput')"))
         (sql! reference (str "CREATE SUBSCRIPTION mirror_native CONNECTION " (literal source-conninfo)
@@ -253,6 +283,10 @@
                        (str "UPDATE probe_child SET id = 11, amount = 6.626571, bucket = 1234, "
                             "wall_time = '2024-02-29 13:55:19.123458' WHERE id = 10")
                        "INSERT INTO probe_child VALUES (12, 1, 1, NULL)"
+                       (str "UPDATE probe_types SET observed = '23:59:59.123457-03:30', "
+                            "wall = '22:00:59.999500', fixed = '雪', payload = decode('ff00','hex'), "
+                            "tags = '[0:2]={\"a,b\",\"NULL\",NULL}', lexemes = 'cat:1D fox:2B' WHERE id = 1")
+                       "UPDATE probe_type_keys SET label = 'during copy' WHERE label = 'one'"
                        "DELETE FROM probe_parent WHERE tenant = 1 AND id = 2"
                        "COMMIT"))
                (original publisher destination table on-bytes))}
@@ -270,6 +304,9 @@
             (check! (= (timestamp-catalog source) (timestamp-catalog sink))
                     "Mirror metadata changed the source timestamp types"
                     {:source (timestamp-catalog source) :mirror (timestamp-catalog sink)})
+            (check! (= (type-catalog source) (type-catalog sink))
+                    "The mirror catalog changed application type metadata"
+                    {:source (type-catalog source) :mirror (type-catalog sink)})
             (check-read-only! sink)
             (let [[pid] (slot-query source slot "active_pid")]
               (sql! source (str "SELECT pg_terminate_backend(" pid ")"))
@@ -290,9 +327,17 @@
                                                     #(let [tx (:max-tx %)]
                                                        [tx (:db/txInstant (d/entity % tx))]))
                 checkpoint (durable-position path)
+                previous-types (type-rows source)
+                previous-type-keys (type-key-rows source)
                 [confirmed] (slot-query source slot "confirmed_flush_lsn")]
-            (sql! source (str "UPDATE probe_parent SET label = 'after crash', payload = NULL, "
-                              "occurred = '2024-02-29 13:55:19.123457+00' WHERE tenant = 1 AND id = 1"))
+            (sql! source "BEGIN"
+                  (str "UPDATE probe_parent SET label = 'after crash', payload = NULL, "
+                       "occurred = '2024-02-29 13:55:19.123457+00' WHERE tenant = 1 AND id = 1")
+                  (str "UPDATE probe_types SET doc = ' [1, 2] ', attrs = '{\"changed\": [true, null, 2.00]}', "
+                       "observed = '24:00:00+02', tags = ARRAY['', 'a'] WHERE id = 1")
+                  "UPDATE probe_type_keys SET observed = '14:00:00.123457+04' WHERE label = 'during copy'"
+                  "DELETE FROM probe_type_keys WHERE label = 'two'"
+                  "COMMIT")
             (let [apply-change #'mirror/apply-change!
                   original @apply-change]
               (with-redefs-fn {apply-change (fn [destination relations change]
@@ -322,7 +367,11 @@
                                 (literal (str (.toInstant ^java.util.Date before-instant)))))
                 (check! (= [["2024-02-29 13:55:19.123456+00"]]
                            (rows sink "SELECT occurred::text FROM probe_parent WHERE tenant = 1 AND id = 1"))
-                        "The pre-crash timestamp lost precision in a historical SQL read" {}))
+                        "The pre-crash timestamp lost precision in a historical SQL read" {})
+                (check! (= previous-types (type-rows sink))
+                        "The pre-crash application types changed in a historical read" {})
+                (check! (= previous-type-keys (type-key-rows sink))
+                        "The pre-crash replica identity changed in a historical read" {}))
               (mirror/stop! @subscriber)
               (check! (= crash-history (inspect-db path #(row-history % before)))
                       "Replayed commit rewrote Datahike history" {})
@@ -335,9 +384,9 @@
 
           (reset! subscriber (mirror/start! config))
           (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
-            (sql! source "TRUNCATE probe_parent, probe_child")
+            (sql! source "TRUNCATE probe_parent, probe_child, probe_types, probe_type_keys")
             (check-rows! source reference sink @subscriber)
-            (check! (= [[] []] (fixture-rows sink)) "Multi-table truncate left rows" {})
+            (check! (every? empty? (fixture-rows sink)) "Multi-table truncate left rows" {})
             (await! "Publisher did not confirm the truncate"
                     #(= [(:applied-lsn (mirror/status @subscriber))] (slot-query source slot "confirmed_flush_lsn")))
             (let [[confirmed] (slot-query source slot "confirmed_flush_lsn")]
@@ -346,7 +395,7 @@
               (await-state! @subscriber :paused)
               (check! (= [confirmed] (slot-query source slot "confirmed_flush_lsn"))
                       "Schema drift advanced the checkpoint" {})
-              (check! (= [[] []] (fixture-rows sink)) "Schema drift made partial data visible" {})))
+              (check! (every? empty? (fixture-rows sink)) "Schema drift made partial data visible" {})))
 
           (mirror/stop! @subscriber)
           (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
@@ -505,8 +554,10 @@
 (def ^:private schema-refresh-fixture
   ["CREATE TABLE schema_account (id integer PRIMARY KEY, label text)"
    (str "CREATE TABLE schema_items (id integer PRIMARY KEY, label varchar(32) NOT NULL DEFAULT 'original', "
-        "obsolete text, stamp timestamp(6) DEFAULT '2024-06-01 12:00:00.123456')")
-   "CREATE TABLE schema_meta (id integer PRIMARY KEY, tag text DEFAULT 'original')"])
+        "obsolete text, stamp timestamp(6) DEFAULT '2024-06-01 12:00:00.123456', "
+        "tokens text DEFAULT '{first,NULL}')")
+   (str "CREATE TABLE schema_meta (id integer, key_data jsonb DEFAULT '{\"num\":1.20}', "
+        "tag text DEFAULT 'original', PRIMARY KEY (id, key_data))")])
 
 (def ^:private source-schema-changes
   ["BEGIN"
@@ -517,13 +568,19 @@
    "ALTER TABLE schema_items ALTER COLUMN summary SET DEFAULT concat('publ','isher')"
    "ALTER TABLE schema_items ALTER COLUMN summary DROP NOT NULL"
    "ALTER TABLE schema_items ADD COLUMN flag text DEFAULT 'fast' NOT NULL"
+   "ALTER TABLE schema_items ALTER COLUMN tokens DROP DEFAULT"
+   "ALTER TABLE schema_items ALTER COLUMN tokens TYPE text[] USING tokens::text[]"
+   "ALTER TABLE schema_items ADD COLUMN aliases text[] DEFAULT ARRAY['initial']"
+   "ALTER TABLE schema_items ADD COLUMN observed timetz(6) DEFAULT '14:30:00.123456+04'"
+   "ALTER TABLE schema_items ADD COLUMN metadata jsonb DEFAULT '{\"defined\": true}'"
    "ALTER TABLE schema_meta ALTER COLUMN tag SET DEFAULT 'changed'"
    "COMMIT"])
 
 (defn- evolved-rows [conn]
   [(rows conn "SELECT id, label FROM schema_account ORDER BY id")
-   (rows conn "SELECT id, summary, stamp::text, flag FROM schema_items ORDER BY id")
-   (rows conn "SELECT id, tag FROM schema_meta ORDER BY id")])
+   (rows conn (str "SELECT id, summary, stamp::text, flag, tokens::text, aliases::text, observed::text, "
+                   "metadata::text FROM schema_items ORDER BY id"))
+   (rows conn "SELECT id, tag, key_data::text FROM schema_meta ORDER BY id")])
 
 (defn- schema-item-column-metadata [conn]
   (rows conn (str "SELECT column_name, data_type, datetime_precision, is_nullable, column_default "
@@ -533,6 +590,9 @@
 
 (defn- item-eid [path]
   (inspect-db path #(d/q '[:find ?eid . :where [?eid :schema_items/id 1]] %)))
+
+(defn- metadata-eid [path]
+  (inspect-db path #(d/q '[:find ?eid . :where [?eid :schema_meta/id 1]] %)))
 
 (defn- verify-table-rename! [source reference sink subscriber path]
   (let [[[oid]] (rows sink "SELECT 'schema_items'::regclass::oid")
@@ -608,11 +668,11 @@
         config {:source-url source-url :publication "mirror_schema_pub" :store-path path
                 :schema-refresh? true :server {:port 0}}
         subscriber (atom nil)
-        old-query "SELECT id, label, obsolete, stamp::text FROM schema_items ORDER BY id"
+        old-query "SELECT id, label, obsolete, stamp::text, tokens FROM schema_items ORDER BY id"
         temporal-query (fn [at]
-                         (str "SELECT id, label, obsolete, stamp::text FROM schema_items "
+                         (str "SELECT id, label, obsolete, stamp::text, tokens FROM schema_items "
                               "FOR SYSTEM_TIME AS OF " (literal at) " ORDER BY id"))
-        old-rows [["1" "original" "keep history" "2024-06-01 12:00:00.123456"]]]
+        old-rows [["1" "original" "keep history" "2024-06-01 12:00:00.123456" "{first,NULL}"]]]
     (prn {:artifacts directory})
     (with-open [source (DriverManager/getConnection source-url)
                 reference (DriverManager/getConnection reference-url)]
@@ -633,6 +693,7 @@
         (let [{:keys [slot]} (await-state! @subscriber :following)
               old-columns (schema-item-column-metadata source)
               old-id (item-eid path)
+              old-meta-id (metadata-eid path)
               old-at (inspect-db path #(str (.toInstant ^java.util.Date
                                              (:db/txInstant (d/entity % (:max-tx %))))))
               ids (set (map parse-long
@@ -664,8 +725,10 @@
                   (check! (deref started 30000 false) "Schema refresh did not begin" (mirror/status @subscriber))
                   (sql! source "BEGIN"
                         "UPDATE schema_account SET label = 'during schema copy' WHERE id = 1"
-                        "UPDATE schema_items SET summary = NULL WHERE id = 1"
+                        (str "UPDATE schema_items SET summary = NULL, tokens = '[0:1]={x,y}', "
+                             "observed = '14:30:00.123457+04' WHERE id = 1")
                         "INSERT INTO schema_items (id) VALUES (2)"
+                        "UPDATE schema_meta SET key_data = '{\"num\":1.200}' WHERE id = 1"
                         "INSERT INTO schema_meta (id) VALUES (2)"
                         "COMMIT")
                   (await! "Unchanged relation stopped applying during schema copy"
@@ -693,6 +756,8 @@
                        (rows source (str "SELECT " (literal confirmed) "::pg_lsn < " (literal cutover) "::pg_lsn")))
                     "Schema cutover was acknowledged before the crash" {:confirmed confirmed :durable cutover})
             (check! (= old-id (item-eid path)) "Existing primary key lost its Datahike entity" {})
+            (check! (= old-meta-id (metadata-eid path))
+                    "Equivalent JSONB key lost its Datahike entity during refresh" {})
             (reset! subscriber (mirror/start! config))
             (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
               (sql! sink "SET TIME ZONE 'UTC'")

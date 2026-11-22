@@ -66,12 +66,13 @@ and preserves their transaction boundaries using the normal Datahike writer.
 Source DDL, generated columns, sequence counters, partitioning, inheritance, and
 row filters or column projections require separate handling.
 
-Supported column types are boolean, smallint, integer, bigint, text, varchar,
-real, double precision, numeric, uuid, date, timestamp, and timestamptz.
-The subscriber preserves `varchar(n)`, `numeric(p,s)`, and timestamp
-precision modifiers. SQL-created timestamp columns preserve PostgreSQL
-microseconds through snapshot COPY, live apply, and historical reads.
-Existing Datahike instant-backed columns remain readable.
+Supported column types are boolean, smallint, integer, bigint, real, double
+precision, numeric, text, varchar, character, bytea, uuid, date, time,
+timetz, timestamp, timestamptz, json, jsonb, text[], and tsvector.
+The subscriber preserves character widths, numeric precision and scale,
+and time and timestamp precision. Snapshot COPY and live apply preserve
+PostgreSQL microseconds, `24:00:00`, `timetz` offsets, and `text[]`
+lower bounds. Array support in the subscriber currently covers `text[]`.
 
 ## Add tables to an active mirror
 

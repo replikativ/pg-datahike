@@ -7,6 +7,7 @@
             [datahike.db.interface :as dbi]
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.constraints.unique :as unique]
+            [datahike.pg.jsonb :as jsonb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg]
             [datahike.pg.sql.ctx :as ctx]
@@ -28,9 +29,11 @@
            [org.postgresql.util PSQLException]))
 
 (def ^:private sql-types
-  {16 "boolean" 20 "bigint" 21 "smallint" 23 "integer" 25 "text"
-   700 "real" 701 "double precision" 1043 "varchar" 1082 "date"
-   1114 "timestamp" 1184 "timestamptz" 1700 "numeric" 2950 "uuid"})
+  {16 "boolean" 17 "bytea" 20 "bigint" 21 "smallint" 23 "integer" 25 "text"
+   114 "json" 700 "real" 701 "double precision" 1009 "text[]"
+   1042 "bpchar" 1043 "varchar" 1082 "date" 1083 "time" 1114 "timestamp"
+   1184 "timestamptz" 1266 "timetz" 1700 "numeric" 2950 "uuid"
+   3614 "tsvector" 3802 "jsonb"})
 
 (defn- require! [condition message data]
   (when-not condition
@@ -109,9 +112,9 @@
   (let [base (sql-types oid)]
     (cond
       (= -1 typmod) base
-      (and (= 1043 oid) (> typmod types/var-hdr-sz))
+      (and (#{1042 1043} oid) (> typmod types/var-hdr-sz))
       (str base "(" (- typmod types/var-hdr-sz) ")")
-      (and (#{1114 1184} oid) (<= 0 typmod 6)) (str base "(" typmod ")")
+      (and (#{1083 1114 1184 1266} oid) (<= 0 typmod 6)) (str base "(" typmod ")")
       (= 1700 oid)
       (let [[precision scale] (types/decode-numeric-typmod typmod)]
         (when (and precision (<= 1 precision 1000) (<= -1000 scale 1000))
@@ -852,11 +855,20 @@
             :else [:db/add eid attr new]))
         (map vector attrs previous values)))
 
+(defn- previous-key [columns values]
+  (mapv (fn [{:keys [oid]} value]
+          (condp = oid
+            types/oid-jsonb (jsonb/parse-jsonb value)
+            types/oid-bpchar (some-> value (str/replace #" +\z" ""))
+            (unique/canonical-key-value value)))
+        columns values))
+
 (defn- rows-by-previous-key! [table rows key-indexes check-running!]
-  (let [seen (volatile! #{})]
+  (let [seen (volatile! #{})
+        columns (mapv (:columns table) key-indexes)]
     (mapv (fn [[_ values]]
             (check-running!)
-            (let [key (mapv #(unique/canonical-key-value (nth values %)) key-indexes)]
+            (let [key (previous-key columns (mapv values key-indexes))]
               (require! (and (every? some? key) (not (contains? @seen key)))
                         "Schema refresh found a missing or duplicate value in the previous primary key"
                         {:table (relation-name table) :reason :ambiguous-previous-key})
@@ -870,7 +882,8 @@
         _ (require! (= staged-schema value-types) "Staged storage types differ from live storage types"
                     {:table (relation-name table)})
         key-attrs (mapv #(nth attrs %) key-indexes)
-        live (into {} (map (fn [[eid key]] [(mapv unique/canonical-key-value key) eid]))
+        key-columns (mapv (:columns table) key-indexes)
+        live (into {} (map (fn [[eid key]] [(previous-key key-columns key) eid]))
                    (stored-rows db table key-attrs))
         outstanding (volatile! live)
         marker (pgs/row-marker-attr (:name table))
