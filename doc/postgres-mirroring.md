@@ -103,7 +103,8 @@ The subscriber also copies enums in `public` and domains in `public`
 over supported scalar built-in types without base type modifiers.
 Domains can have a default, `NOT NULL`, and one validated `CHECK`.
 The admission report identifies unsupported type definitions by column,
-including checks that depend on publisher-side functions outside `pg_catalog`.
+including checks that depend on publisher-side functions or operators
+outside `pg_catalog`.
 The mirror installs type definitions with the tables or columns that use
 them. With schema refresh enabled, it follows enum label additions and
 renames and changes to a domain's default, nullability, and check.
@@ -260,6 +261,7 @@ LSN, transaction ID, and publisher commit timestamp. Each source commit and its
 checkpoint reach durable storage together. Feedback reports committed positions
 only. After a disconnect, commits already in the checkpoint are acknowledged
 and skipped.
+
 The mirror upgrades an older SQL checkpoint in the same writer transaction
 that retires its storage and hides it from current and historical SQL.
 The publisher slot and applied position survive the upgrade.

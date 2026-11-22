@@ -178,7 +178,7 @@
                     (and (= kind :domain)
                          (> (.getInt row "domain_check_count") 1)) :domain-checks
                     (and (= kind :domain)
-                         (.getBoolean row "domain_publisher_function")) :domain-publisher-function
+                         (.getBoolean row "domain_publisher_dependency")) :domain-publisher-dependency
                     (and (= kind :domain)
                          (not (.getBoolean row "domain_validated"))) :unvalidated-domain-check)]
       (if problem
@@ -200,7 +200,7 @@
        "e.labels AS enum_labels, e.label_oids AS enum_label_oids, e.label_order AS enum_label_order, "
        "dc.count AS domain_check_count, "
        "coalesce(dc.validated, true) AS domain_validated, "
-       "coalesce(dc.publisher_function, false) AS domain_publisher_function, "
+       "coalesce(dc.publisher_dependency, false) AS domain_publisher_dependency, "
        "dc.name AS domain_check_name, dc.expression AS domain_check_expr "))
 
 (def ^:private source-type-joins
@@ -211,10 +211,11 @@
        " FROM pg_catalog.pg_enum e WHERE e.enumtypid = t.oid) e ON t.typtype = 'e' "
        "LEFT JOIN LATERAL (SELECT count(*) AS count, bool_and(d.convalidated) AS validated, "
        " bool_or(EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep "
-       " JOIN pg_catalog.pg_proc proc ON proc.oid = dep.refobjid "
-       " JOIN pg_catalog.pg_namespace pn ON pn.oid = proc.pronamespace "
+       " LEFT JOIN pg_catalog.pg_proc proc ON dep.refclassid = 'pg_catalog.pg_proc'::regclass AND proc.oid = dep.refobjid "
+       " LEFT JOIN pg_catalog.pg_operator opr ON dep.refclassid = 'pg_catalog.pg_operator'::regclass AND opr.oid = dep.refobjid "
+       " JOIN pg_catalog.pg_namespace pn ON pn.oid = coalesce(proc.pronamespace, opr.oprnamespace) "
        " WHERE dep.classid = 'pg_catalog.pg_constraint'::regclass AND dep.objid = d.oid "
-       " AND dep.refclassid = 'pg_catalog.pg_proc'::regclass AND pn.nspname <> 'pg_catalog')) AS publisher_function, "
+       " AND pn.nspname <> 'pg_catalog')) AS publisher_dependency, "
        " min(d.conname::text) AS name, min(pg_catalog.pg_get_expr(d.conbin, 0)) AS expression "
        " FROM pg_catalog.pg_constraint d WHERE d.contypid = t.oid AND d.contype = 'c') dc ON t.typtype = 'd' "))
 

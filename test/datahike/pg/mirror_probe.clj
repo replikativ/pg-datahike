@@ -188,7 +188,11 @@
         "CREATE FUNCTION probe_positive(n integer) RETURNS boolean LANGUAGE sql IMMUTABLE RETURN n > 0"
         "CREATE DOMAIN probe_custom_check AS integer CHECK (public.probe_positive(VALUE))"
         "CREATE TABLE probe_custom_domain (id integer PRIMARY KEY, n probe_custom_check)"
-        "CREATE PUBLICATION probe_custom_domain_pub FOR TABLE probe_custom_domain"
+        "CREATE FUNCTION probe_lt(a integer, b integer) RETURNS boolean LANGUAGE sql IMMUTABLE RETURN a < b"
+        "CREATE OPERATOR public.## (FUNCTION = probe_lt, LEFTARG = integer, RIGHTARG = integer)"
+        "CREATE DOMAIN probe_operator_check AS integer CHECK (VALUE OPERATOR(public.##) 10)"
+        "CREATE TABLE probe_operator_domain (id integer PRIMARY KEY, n probe_operator_check)"
+        "CREATE PUBLICATION probe_custom_domain_pub FOR TABLE probe_custom_domain, probe_operator_domain"
         "CREATE SCHEMA probe_other"
         "CREATE TABLE probe_other.accounts (id integer NOT NULL)"
         "CREATE UNIQUE INDEX accounts_identity ON probe_other.accounts (id)"
@@ -223,8 +227,12 @@
     (let [custom (report "probe_custom_domain_pub")
           other (report "probe_other_pub")]
       (check! (and (not (:compatible? custom))
-                   (some #(= :domain-publisher-function (:detail %)) (-> custom :tables first :issues)))
-              "Domain check depending on a publisher function was admitted" custom)
+                   (= #{"probe_custom_domain" "probe_operator_domain"}
+                      (into #{} (comp (filter #(some (fn [issue] (= :domain-publisher-dependency (:detail issue)))
+                                                     (:issues %)))
+                                      (map :name))
+                            (:tables custom))))
+              "Domain check depending on a publisher function or operator was admitted" custom)
       (check! (and (not (:compatible? other))
                    (some #(= :table-schema (:reason %)) (-> other :tables first :issues)))
               "Alternate identity table in a non-public schema was admitted" other))
