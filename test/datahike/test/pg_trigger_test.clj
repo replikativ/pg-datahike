@@ -488,3 +488,19 @@
       (ok! h "CREATE TRIGGER tr2 BEFORE INSERT ON t2 FOR EACH ROW EXECUTE FUNCTION g()")
       (ok! h "INSERT INTO t2 VALUES (1, 1)")
       (is (= [["1" "42"]] (rows (ok! h "SELECT id, n FROM t2")))))))
+
+(deftest direct-returning-omits-vetoed-rows
+  (with-h [h (fresh-handler)]
+    (ok! h "CREATE TABLE p (i int PRIMARY KEY, n int)")
+    (ok! h "CREATE TABLE c (i int REFERENCES p(i) ON DELETE CASCADE)")
+    (ok! h "INSERT INTO p VALUES (1,10),(2,20)")
+    (ok! h "INSERT INTO c VALUES (1),(2)")
+    (trigfn! h "veto" "BEGIN IF OLD.i = 2 THEN RETURN NULL; END IF; RETURN coalesce(NEW, OLD); END")
+    (ok! h "CREATE TRIGGER v BEFORE UPDATE OR DELETE ON p FOR EACH ROW EXECUTE FUNCTION veto()")
+    (let [result (ok! h "UPDATE p SET n = n RETURNING n")]
+      (is (= "UPDATE 1" (.commandTag result)))
+      (is (= [["10"]] (rows result))))
+    (let [result (ok! h "DELETE FROM p RETURNING i")]
+      (is (= "DELETE 1" (.commandTag result)))
+      (is (= [["1"]] (rows result))))
+    (is (= [["2"]] (rows (ok! h "SELECT i FROM c"))))))

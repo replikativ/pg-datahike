@@ -3143,15 +3143,14 @@
                row)))
 
 (defn- apply-before-row-updates
-  "Run the BEFORE ROW UPDATE triggers. Returns `[tx-data rows]`, where
-   the tx-data is what should actually be written -- a trigger may have
-   changed the row or returned NULL to cancel the update for it -- and
-   `rows` is what the AFTER triggers will see."
+  "Run BEFORE ROW UPDATE triggers. Return [tx-data after-rows updated-eids].
+   UPDATE counts and RETURNING use the rows that survived the triggers,
+   including rows whose values stayed the same."
   [db table-name tx-data changed-columns eids]
   (let [by-eid (update-rows-from-ops db table-name tx-data eids)
         triggers (matching-triggers db table-name :update :before :row changed-columns)]
     (if (or (empty? triggers) (empty? by-eid))
-      [tx-data (mapv (fn [[_ r]] (select-keys r [:old :new])) by-eid) 0]
+      [tx-data (mapv (fn [[_ r]] (select-keys r [:old :new])) by-eid) eids]
       (let [handler (trigger-handler! table-name)
             outcomes (into {}
                            (map (fn [[eid {:keys [old new base]}]]
@@ -3180,7 +3179,9 @@
          (into [] (keep (fn [[_ {:keys [row old]}]]
                           (when row {:old old :new row})))
                outcomes)
-         (count (remove (comp :row val) outcomes))]))))
+         (let [vetoed (into #{} (keep (fn [[eid outcome]] (when (nil? (:row outcome)) eid)))
+                            outcomes)]
+           (filterv (complement vetoed) eids))]))))
 
 (defn- entity-columns
   "A stored row as `{column value}`, for OLD."
@@ -3456,10 +3457,9 @@
   `(binding [sql-ctx/*relation-namespaces* (or (:cte-namespaces ~parsed) {})]
      ~@body))
 
-(defn- build-plain-delete-tx
-  "Build entity IDs and tx-data for a DELETE against `db`.
-   Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
-   that need speculative tempid remapping should remap afterward.
+(defn- match-plain-delete-rows
+  "Match target rows for a DELETE against `db`. The result contains the
+   real entity IDs, including rows from the speculative transaction.
 
    When `parsed` carries an `:enriched-db` (CTEs were materialised at
    parse-sql time), the WHERE-clause query runs against it and the
@@ -3529,56 +3529,41 @@
                    (if (seq in-args)
                      (run-param-query q #(apply d/q q query-db in-args))
                      (run-param-query q #(d/q q query-db))))]
-    {:eids eids
-     :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
+    {:eids eids}))
 
 (declare joined-write-rows)
 
-(defn- build-delete-tx [ctx db schema parsed]
+(defn- match-delete-rows [ctx db schema parsed]
   (if (:from-sql parsed)
-    (let [{:keys [eids] :as matched} (joined-write-rows ctx db schema parsed)]
-      (assoc matched :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)))
-    (build-plain-delete-tx db schema parsed)))
+    (joined-write-rows ctx db schema parsed)
+    (match-plain-delete-rows db schema parsed)))
+
+(defn- prepare-delete-effects
+  "Run BEFORE triggers and resolve foreign-key effects for rows that will be deleted."
+  [db table eids]
+  (fire-statement-triggers! db table :delete :before)
+  (let [old-rows (into {} (map (fn [eid] [eid (entity-columns db table eid)])) eids)
+        kept (vec (keep-row-deletes db table eids old-rows))
+        cascaded (collect-fk-cascade-retractions! db table kept)]
+    {:eids kept
+     :deleted-eids (into kept (remove (set kept)) cascaded)
+     :after-rows (mapv (fn [eid] {:old (get old-rows eid)}) kept)}))
 
 (defn- execute-delete [ctx conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data] :as matched}
-          (with-cte-namespaces parsed (build-delete-tx ctx db schema parsed))
-          ;; For RETURNING, snapshot values BEFORE delete
-          returning (:returning parsed)
-          returning-result (when returning
+          matched (with-cte-namespaces parsed (match-delete-rows ctx db schema parsed))
+          {:keys [eids deleted-eids after-rows]} (prepare-delete-effects db table (:eids matched))
+          returning-result (when-let [returning (:returning parsed)]
                              (build-returning-result returning db db eids table
                                                      (:alias parsed) schema :delete matched))
-          ;; FK enforcement — RESTRICT raises, CASCADE returns extra eids
-          ;; to retract atomically alongside the parent deletion.
-          cascade-eids (collect-fk-cascade-retractions! db table eids)
-          cascade-tx (when (seq cascade-eids)
-                       (mapv (fn [e] [:db/retractEntity e]) cascade-eids))
-          ;; BEFORE ROW sees the row as OLD and may veto the delete by
-          ;; returning NULL; the rows it kept are what is retracted and
-          ;; what AFTER ROW then sees.
-          _ (fire-statement-triggers! db table :delete :before)
-          old-rows (into {} (map (fn [e] [e (entity-columns db table e)])) eids)
-          kept (vec (keep-row-deletes db table eids old-rows))
-          suppressed (- (count eids) (count kept))
-          tx-data (if (zero? suppressed)
-                    tx-data
-                    (filterv (fn [op]
-                               (or (not (vector? op))
-                                   (not= :db/retractEntity (first op))
-                                   (some #{(second op)} kept)))
-                             tx-data))
-          full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))
-          full-tx (tx-wrap full-tx)]
-      (when (seq full-tx)
-        (transact-recorded! conn full-tx))
-      (let [deleted-rows (mapv (fn [e] {:old (get old-rows e)}) kept)]
-        (fire-after-row-triggers! db table :delete deleted-rows)
-        (fire-statement-triggers! db table :delete :after deleted-rows))
-      (or returning-result
-          (empty-result (str "DELETE " (count kept)))))
+          tx-data (tx-wrap (mapv (fn [eid] [:db/retractEntity eid]) deleted-eids))]
+      (when (seq tx-data)
+        (transact-recorded! conn tx-data))
+      (fire-after-row-triggers! db table :delete after-rows)
+      (fire-statement-triggers! db table :delete :after after-rows)
+      (or returning-result (empty-result (str "DELETE " (count eids)))))
     (catch Exception e
       (classified-error "DELETE error: " e))))
 
@@ -4049,8 +4034,8 @@
                                          (name (nth op 2))))
                                      tx-data))
           _ (fire-statement-triggers! db table :update :before nil changed-columns)
-          [tx-data after-rows cancelled] (apply-before-row-updates
-                                          db table tx-data changed-columns eids)
+          [tx-data after-rows updated-eids] (apply-before-row-updates
+                                             db table tx-data changed-columns eids)
           tx-data (tx-wrap tx-data)
           returning (:returning parsed)
           tx-report (when (seq tx-data)
@@ -4062,7 +4047,7 @@
       (if returning
         ;; RETURNING: read values from db-after
         (let [db-after (if tx-report (:db-after tx-report) db)
-              result (build-returning-result returning db-after db eids table (:alias parsed)
+              result (build-returning-result returning db-after db updated-eids table (:alias parsed)
                                              (:schema db-after) :update built)]
           (when (seq tx-data) (transact-speculative-report! conn db tx-report))
           (fire-after-row-triggers! db table :update after-rows changed-columns)
@@ -4073,7 +4058,7 @@
             ;; A row a BEFORE trigger cancelled was not updated, so it
             ;; is not counted. Every other MATCHED row is, including one
             ;; whose new value equals its old.
-            (empty-result (str "UPDATE " (- (count eids) cancelled))))))
+            (empty-result (str "UPDATE " (count updated-eids))))))
     (catch Exception e
       (classified-error "UPDATE error: " e))))
 
@@ -9612,9 +9597,9 @@
                                          tx-data))
               _ (fire-statement-triggers! spec-db (:table parsed) :update :before
                                           nil changed-columns)
-              [tx-data after-rows cancelled] (apply-before-row-updates
-                                              spec-db (:table parsed) tx-data
-                                              changed-columns eids)
+              [tx-data after-rows updated-eids] (apply-before-row-updates
+                                                 spec-db (:table parsed) tx-data
+                                                 changed-columns eids)
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-report (dc/with spec-db tx-data)
               _ (unique-constraints/validate-report! spec-report)
@@ -9632,7 +9617,7 @@
               db-after (:db-after spec-report)
               returning-result
               (when-let [returning (:returning parsed)]
-                (build-returning-result returning db-after spec-db eids (:table parsed)
+                (build-returning-result returning db-after spec-db updated-eids (:table parsed)
                                         (:alias parsed) (:schema db-after) :update built))]
           ;; A failing RETURNING projection aborts the statement without
           ;; changing the transaction's speculative image or commit buffer.
@@ -9645,7 +9630,7 @@
           (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
                                     :update :after after-rows changed-columns)
           (or returning-result
-              (empty-result (str "UPDATE " (- (count eids) cancelled)))))
+              (empty-result (str "UPDATE " (count updated-eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
@@ -9660,10 +9645,10 @@
               ;; Same blocking row-lock + rebase discipline as exec-update.
               _ (when (empty? (:tx-buffer @tx-state))
                   (rebase-tx-state! conn tx-state))
-              {:keys [eids] :as matched}
+              matched
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-delete-tx ctx spec-db schema parsed))
+                      {:keys [eids] :as built} (with-cte-namespaces parsed (match-delete-rows ctx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db)))
@@ -9678,43 +9663,20 @@
                     built)))
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
-              ;; ON DELETE CASCADE. This called the compatibility shim,
-              ;; which walks the FK graph for its RESTRICT raise and
-              ;; THROWS THE CASCADE EIDS AWAY -- its own docstring says
-              ;; so and tells new callers not to use it. So a parent
-              ;; row was deleted and its children were left behind:
-              ;; silent orphans, on the path a plain `DELETE` takes.
-              cascade-eids (collect-fk-cascade-retractions!
-                            spec-db (:table parsed) eids)
-              _ (fire-statement-triggers! spec-db (:table parsed) :delete :before)
-              old-rows (into {} (map (fn [e] [e (entity-columns spec-db (:table parsed) e)]))
-                             eids)
-              ;; A BEFORE ROW DELETE trigger returning NULL cancels the
-              ;; delete for that row.
-              eids (vec (keep-row-deletes spec-db (:table parsed) eids old-rows))
+              {:keys [eids deleted-eids after-rows]}
+              (prepare-delete-effects spec-db (:table parsed) (:eids matched))
               returning-result (when-let [returning (:returning parsed)]
                                  (build-returning-result returning spec-db spec-db eids
                                                          (:table parsed) (:alias parsed)
                                                          (:schema spec-db) :delete matched))
-              ;; Apply to speculative-db with ORIGINAL entity IDs.
-              ;; The cascaded children go in the SAME transaction, as
-              ;; retractEntity is atomic and PostgreSQL's cascade is
-              ;; part of the deleting statement.
-              spec-tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
-                                 (map (fn [eid] [:db/retractEntity eid]))
-                                 cascade-eids)
+              spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) deleted-eids)
               spec-report (dc/with spec-db spec-tx-data)
-              ;; A row inserted earlier in this SQL transaction has no
-              ;; committed entity to retract. Cancel its entity map and any
-              ;; subsequent updates instead of emitting retractEntity with a
-              ;; tempid, which Datahike rejects. Persisted rows still receive
-              ;; ordinary entity retractions.
+              ;; Direct targets inserted within the transaction still use
+              ;; tempids in the commit buffer.
               inserted-eids (into #{} (filter #(contains? eid->tempid %)) eids)
               deleted-tempids (into #{} (map eid->tempid) inserted-eids)
-              commit-tx-data (into []
-                                   (comp (remove inserted-eids)
-                                         (map (fn [eid] [:db/retractEntity eid])))
-                                   (concat eids cascade-eids))]
+              commit-tx-data (filterv (fn [[_ eid]] (not (contains? inserted-eids eid)))
+                                      spec-tx-data)]
           (swap! tx-state (fn [ts]
                             (let [buffer (if (seq deleted-tempids)
                                            (into [] (remove #(writes-tempid? deleted-tempids %))
@@ -9724,11 +9686,10 @@
                                   (assoc :tx-buffer (into buffer (guard-catalog-tx commit-tx-data))
                                          :speculative-db (:db-after spec-report))
                                   (update :eid->tempid #(apply dissoc % inserted-eids))))))
-          (let [deleted-rows (mapv (fn [e] {:old (get old-rows e)}) eids)]
-            (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
-                                      :delete deleted-rows)
-            (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
-                                      :delete :after deleted-rows))
+          (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
+                                    :delete after-rows)
+          (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
+                                    :delete :after after-rows)
           (or returning-result (empty-result (str "DELETE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)

@@ -8316,6 +8316,29 @@
                (run-const-select (pf sql schema db) db))))
           (run-const-select p db))))))
 
+(defn- deferred-const-value
+  "Plan a VALUES scalar through SELECT and evaluate it at the candidate's
+   column stage. The shared projection marker keeps clocks and volatile
+   result expressions out of the INSERT plan cache."
+  [e schema db]
+  (when-not (and params/*parse-sql* schema db)
+    (throw (errors/pg-error :feature-not-supported
+                            {:message (str "cannot evaluate expression here: " e)})))
+  (let [plan (binding [params/*bound-params* nil]
+               (params/*parse-sql* (str "SELECT " e) schema db))]
+    (when (= :error (:type plan))
+      (throw (ex-info (:message plan)
+                      {:sqlstate (:sqlstate plan) :error-fields (:error-fields plan)})))
+    {:fn :projection
+     :projection-fn
+     (fn []
+       (let [current-db (or params/*runtime-db* db)
+             fetch #(nth params/*bound-params* (dec (long %)) nil)
+             bound-plan (params/substitute-select-plan plan fetch)]
+         (if-let [run params/*row-execute*]
+           (sql-value (ffirst (run bound-plan current-db)))
+           (run-const-select bound-plan current-db))))}))
+
 (defn- extract-numeric-binary
   "Evaluate a binary numeric expression in INSERT ... VALUES using the
    same PostgreSQL arithmetic helpers as SELECT/UPDATE."
@@ -8506,15 +8529,6 @@
     ;; transactor (issue #14).
      (instance? TimeKeyExpression e)
      {:fn :now}
-    ;; now() AT TIME ZONE 'UTC' → current timestamp marker, like the
-    ;; bare-function case above. Any other AT TIME ZONE is an ordinary
-    ;; expression; it used to become now() as well.
-     (and (instance? TimezoneExpression e)
-          (let [left (.getLeftExpression ^TimezoneExpression e)]
-            (and (instance? net.sf.jsqlparser.expression.Function left)
-                 (= "now" (expr/resolution-name (.getName ^net.sf.jsqlparser.expression.Function left))))))
-     {:fn :now}
-
     ;; ArrayConstructor literal: ARRAY[1,2,3] / ARRAY[ARRAY[1,2],…].
     ;; Build a typed PgArray; coerce-insert-value will serialize it
     ;; for storage on an array column. Recurses on nested
@@ -10130,6 +10144,16 @@
              :insert-shared-assignment-plans assignment-plans)
       (assoc result :insert-source-order source-attrs))))
 
+(defn- timezone-value-expression? [expression]
+  (let [expression (unwrap-parens expression)]
+    (cond
+      (instance? TimezoneExpression expression) true
+      (instance? Function expression)
+      (= "timezone" (expr/resolution-name (.getName ^Function expression)))
+      (instance? CastExpression expression)
+      (recur (.getLeftExpression ^CastExpression expression))
+      :else false)))
+
 (defn- expand-insert-values-srfs
   "Expand top-level SRFs in one INSERT ... VALUES row.
 
@@ -10463,7 +10487,10 @@
 
       ;; Normal INSERT with VALUES
       (and (instance? Values select) (seq col-names))
-      (let [ev (fn [e] (extract-value e schema db))
+      (let [ev (fn [e]
+                 (if (timezone-value-expression? e)
+                   (deferred-const-value e schema db)
+                   (extract-value e schema db)))
             num-cols (count col-names)
             row-exprs (analysis/values-expression-rows select)
             width (count (first row-exprs))

@@ -207,6 +207,32 @@
     (doseq [zone ["1 day" "1 month" "infinity"]]
       (is (= "22023" (state c (str "SELECT TIMETZ '00:00+00' AT TIME ZONE INTERVAL '" zone "'")))))))
 
+(deftest insert-timezone-expressions-use-the-execution-clock
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE clock_writes (id int, a timestamp, b timestamp, rendered text)")
+    (exec! c (str "PREPARE insert_clock (int, text) AS INSERT INTO clock_writes VALUES "
+                  "($1, now() AT TIME ZONE $2, timezone($2, now()), (now() AT TIME ZONE $2)::text)"))
+    (exec! c "BEGIN")
+    (exec! c "EXECUTE insert_clock(1, 'Asia/Kolkata')")
+    (is (= [["t" "t" "t"]]
+           (rows c (str "SELECT a = b, a = timezone('Asia/Kolkata', now()), rendered = a::text "
+                        "FROM clock_writes WHERE id = 1"))))
+    (exec! c "COMMIT")
+    (exec! c "SELECT pg_sleep(0.025)")
+    (exec! c "EXECUTE insert_clock(2, 'Asia/Kolkata')")
+    (is (= [["t"]]
+           (rows c (str "SELECT later.a > earlier.a FROM clock_writes earlier "
+                        "CROSS JOIN clock_writes later WHERE earlier.id = 1 AND later.id = 2"))))
+    (is (= "22023" (state c "EXECUTE insert_clock(3, 'Nonsense/Zone')")))
+    (with-open [st (.prepareStatement c
+                                      (str "INSERT INTO clock_writes VALUES "
+                                           "(3, now() AT TIME ZONE ?, timezone(?, now()), "
+                                           "(now() AT TIME ZONE ?)::text)"))]
+      (doseq [index [1 2 3]]
+        (.setString st index "Asia/Kolkata"))
+      (is (= 1 (.executeUpdate st))))
+    (is (= [["t" "t"]] (rows c "SELECT a = b, rendered = a::text FROM clock_writes WHERE id = 3")))))
+
 (deftest timezone-uses-the-current-session-setting
   (with-open [c (jdbc)]
     (exec! c "SET TIME ZONE 2.5")
