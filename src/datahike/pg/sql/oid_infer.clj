@@ -851,9 +851,10 @@
       (when-let [element-oid (some-> first-arg (expr-oid env))]
         (get types/element-oid->array-oid element-oid types/oid-text-array))
       ;; `timezone(zone, v)` is `v AT TIME ZONE zone`, which swaps the
-      ;; two timestamp types; a time stays a timetz.
+      ;; two timestamp types; a time becomes timetz. The one-argument
+      ;; overload uses the session zone and has the same return rules.
       (= rule :at-time-zone)
-      (let [o (some-> (second args) (expr-oid env))]
+      (let [o (some-> (last args) (expr-oid env))]
         (condp contains? o
           #{types/oid-timestamp} types/oid-timestamptz
           #{types/oid-time types/oid-timetz} types/oid-timetz

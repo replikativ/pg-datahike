@@ -141,6 +141,26 @@
     (doseq [zone ["1 day" "1 month" "infinity"]]
       (is (= "22023" (state c (str "SELECT TIMETZ '00:00+00' AT TIME ZONE INTERVAL '" zone "'")))))))
 
+(deftest timezone-uses-the-current-session-setting
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 2.5")
+    (is (= [["2024-03-01 00:30:00.654321+02:30" "2024-03-01 03:00:00.654321"
+             "14:15:03.123456+02:30" "12:00:00+02:30" "2024-07-01 00:00:00"
+             "2024-07-01 03:00:00" nil "timestamp with time zone"]]
+           (rows c (str "SELECT timezone(TIMESTAMP '2024-03-01 00:30:00.654321'), "
+                        "timezone(TIMESTAMPTZ '2024-03-01 00:30:00.654321+00'), "
+                        "timezone(TIMETZ '17:15:03.123456+05:30'), timezone(TIME '12:00'), "
+                        "timezone(DATE '2024-07-01'), timezone('2024-07-01 01:30+01'), "
+                        "timezone(NULL::timestamp), pg_typeof(timezone(TIMESTAMP '2024-03-01 00:30'))"))))
+    (exec! c "PREPARE local_tz AS SELECT timezone(TIMETZ '17:15:03.123456+05:30')")
+    (is (= [["14:15:03.123456+02:30"]] (rows c "EXECUTE local_tz")))
+    (exec! c "SET TIME ZONE '-7.5'")
+    (is (= [["04:15:03.123456-07:30"]] (rows c "EXECUTE local_tz")))
+    (exec! c "RESET TIME ZONE")
+    (is (= [["11:45:03.123456+00"]] (rows c "EXECUTE local_tz")))
+    (is (= "42883" (state c "SELECT timezone(42)")))
+    (is (= "42883" (state c "SELECT timezone('12:00'::text)")))))
+
 (deftest time-expression-metadata
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE empty_times (t time)")

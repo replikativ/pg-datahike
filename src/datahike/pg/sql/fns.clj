@@ -3904,12 +3904,15 @@
     (throw (errors/pg-error :invalid-parameter-value
                             {:message "AT TIME ZONE expects a time value"}))))
 
-(defn- shift-timetz [v east]
-  (let [[^java.time.LocalTime t original-east] (timetz-source v)
-        local (.plusSeconds t (- east original-east))]
-    (if (<= -64800 east 64800)
-      (java.time.OffsetTime/of local (java.time.ZoneOffset/ofTotalSeconds (int east)))
-      (str (types/->pg-text local types/oid-time) (types/offset-seconds-text east)))))
+(defn- shift-timetz
+  ([v east]
+   (let [[t original-east] (timetz-source v)]
+     (shift-timetz t original-east east)))
+  ([^java.time.LocalTime t original-east east]
+   (let [local (.plusSeconds t (- east original-east))]
+     (if (<= -64800 east 64800)
+       (java.time.OffsetTime/of local (java.time.ZoneOffset/ofTotalSeconds (int east)))
+       (str (types/->pg-text local types/oid-time) (types/offset-seconds-text east))))))
 
 (def ^:private ^java.time.Instant pg-epoch (java.time.Instant/parse "2000-01-01T00:00:00Z"))
 (def ^:private pg-min-timestamp
@@ -3934,7 +3937,10 @@
      (types/infinite-datetime v) v
      :else
      (let [east (when (or interval? (interval-value? zone)) (interval-zone-offset zone))
-           ^java.time.ZoneId zid (when-not east (resolve-time-zone zone))]
+           ^java.time.ZoneId zid (when-not east
+                                   (if (instance? java.time.ZoneId zone)
+                                     zone
+                                     (resolve-time-zone zone)))]
        (case kind
          :timestamp
          (let [ldt (local-date-time v)]
@@ -3950,6 +3956,43 @@
          :timetz
          (shift-timetz v (or east (.getTotalSeconds
                                    (.getOffset (.getRules zid) (java.time.Instant/now))))))))))
+
+(defn sql-timezone-local
+  "The one-argument timezone overloads use the current session's zone."
+  [value input-oid {:keys [^java.time.ZoneId time-zone date-style]}]
+  (cond
+    (or (sql-null? value) (types/infinite-datetime value))
+    (if (sql-null? value) :__null__ value)
+
+    (= input-oid types/oid-timestamp)
+    (sql-at-time-zone value time-zone :timestamp)
+
+    (= input-oid types/oid-timestamptz)
+    (sql-at-time-zone value time-zone :timestamptz)
+
+    (= input-oid types/oid-timetz)
+    (sql-at-time-zone value time-zone :timetz)
+
+    (= input-oid types/oid-time)
+    (let [t (if (string? value) (sql-cast/cast-scalar value "time" {}) value)
+          end-of-day? (= "24:00:00" t)
+          ^java.time.LocalTime time (if end-of-day? java.time.LocalTime/MIDNIGHT t)
+          now (java.time.Instant/now)
+          date (.toLocalDate (java.time.LocalDateTime/ofInstant now time-zone))
+          date (if end-of-day? (.plusDays date 1) date)
+          source-offset (datetime-zone/offset-at-local-time (.atTime date time) time-zone)
+          target-offset (.getOffset (.getRules time-zone) now)]
+      (shift-timetz time (.getTotalSeconds source-offset) (.getTotalSeconds target-offset)))
+
+    (= input-oid types/oid-date)
+    (sql-at-time-zone (sql-at-time-zone value time-zone :timestamp) time-zone :timestamptz)
+
+    :else
+    (let [instant (binding [types/*time-zone* time-zone
+                            types/*date-style* date-style]
+                    (sql-cast/cast-scalar value "timestamptz"
+                                          {:explicit? true :prefer-local-datetime? true}))]
+      (sql-at-time-zone instant time-zone :timestamptz))))
 
 ;; ---------------------------------------------------------------------------
 ;; Datetime constructors, age and date_bin -- ported from PostgreSQL 17's

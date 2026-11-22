@@ -1425,6 +1425,30 @@
                   result-var])
           result-var)
 
+      (and (= fname "timezone") (= 1 (count args)))
+      (let [value-oid (first (call-arg-oids ctx arg-exprs))
+            state params/*session-state*
+            defaults {:time-zone (or types/*time-zone* types/utc-zone)
+                      :date-style types/*date-style*}
+            session-fn (fn []
+                         (if state
+                           (let [{:keys [time-zone date-style]} @state]
+                             {:time-zone (or time-zone types/utc-zone)
+                              :date-style (or date-style [:iso :mdy])})
+                           defaults))
+            fn-param (ctx/fresh-var! ctx)]
+        (when-not (contains? #{nil types/oid-time types/oid-timetz types/oid-date
+                               types/oid-timestamp types/oid-timestamptz} value-oid)
+          (undefined-function! ctx fname arg-exprs))
+        (params/session-dependent!)
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj session-fn)
+        (let [session (ctx/materialize-arg! ctx (list fn-param))]
+          (swap! (:where-clauses ctx) conj
+                 [(list 'datahike.pg.query-fns/sql-timezone-local (first args) (or value-oid 0) session)
+                  result-var]))
+        result-var)
+
       ;; timezone(zone, value) is `value AT TIME ZONE zone`.
       (and (= fname "timezone") (= 2 (count args)))
       (let [value-oid (source-oid ctx (second params))
