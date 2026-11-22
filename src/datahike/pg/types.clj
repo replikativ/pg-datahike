@@ -17,6 +17,8 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [datahike.pg.catalog.regoid :as regoid]
+            [datahike.pg.datetime.tokens :as datetime-tokens]
+            [datahike.pg.datetime.zone :as datetime-zone]
             [datahike.pg.errors :as errors]
             [datahike.pg.pg-catalog :as pg-catalog])
   (:import [datahike.pg PgWireServer]))
@@ -1503,8 +1505,9 @@
         (java.time.ZoneOffset/ofTotalSeconds (int (if (= "-" sign) west (- west))))))))
 
 (defn resolve-time-zone
-  "A PostgreSQL time-zone spec as a java.time ZoneId. Names and
-   abbreviations resolve through the tz database. A NUMERIC spec -- `+05`,
+  "A PostgreSQL time-zone spec as a java.time ZoneId. Fixed abbreviations
+   come from PostgreSQL's default table and names from the tz database.
+   A NUMERIC spec -- `+05`,
    `-03:30`, `UTC+3` -- is POSIX-style, so its sign is INVERTED: `+05` is
    five hours WEST of UTC (datetime.c DecodePosixTimezone). Unknown names
    raise 22023, as in PostgreSQL."
@@ -1516,20 +1519,16 @@
                                (Long/parseLong (or sec "0")))]
                   (java.time.ZoneOffset/ofTotalSeconds
                    (int (if (= "-" sign) total (- total))))))]
-    (if-let [offset (or (quoted-posix-zone-offset z)
-                        (when-let [[_ sign h m sec]
-                                   (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
-                          (posix sign h m sec)))]
-      offset
-      (try
-        (java.time.ZoneId/of z java.time.ZoneId/SHORT_IDS)
-        (catch Exception _
-          (try (java.time.ZoneId/of (clojure.string/upper-case z) java.time.ZoneId/SHORT_IDS)
-               (catch Exception _
-                 (throw (ex-info (str "time zone \"" z "\" not recognized")
-                                 {:error :invalid-parameter-value
-                                  :sqlstate "22023"
-                                  :message (str "time zone \"" z "\" not recognized")})))))))))
+    (or (when-let [offset (:offset (datetime-tokens/zone-abbrev (str/lower-case z)))]
+          (java.time.ZoneOffset/ofTotalSeconds (int offset)))
+        (quoted-posix-zone-offset z)
+        (when-let [[_ sign h m sec]
+                   (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
+          (posix sign h m sec))
+        (datetime-zone/zone-id z)
+        (throw (errors/pg-error
+                :invalid-parameter-value
+                {:message (str "time zone \"" z "\" not recognized")})))))
 
 (defrecord PgLsn [^java.math.BigInteger value]
   Object

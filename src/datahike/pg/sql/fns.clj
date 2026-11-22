@@ -39,6 +39,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.catalog.regoid :as regoid]
+            [datahike.pg.datetime.zone :as datetime-zone]
             [datahike.pg.errors :as errors]
             [datahike.pg.geo :as geo]
             [datahike.pg.mac :as mac]
@@ -3874,7 +3875,8 @@
     (let [zid (resolve-time-zone zone)]
       (case kind
         :timestamp
-        (.toInstant (.atZone (local-date-time v) zid))
+        (let [ldt (local-date-time v)]
+          (.toInstant ldt (datetime-zone/offset-at-local-time ldt zid)))
 
         :timestamptz
         (let [inst (.toInstant (local-date-time v) java.time.ZoneOffset/UTC)]

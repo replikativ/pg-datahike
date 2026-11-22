@@ -63,6 +63,10 @@
                (if sec (Long/parseLong sec) 0))]
       (if (= sign "-") (- v) v))))
 
+(def ^:private names-by-lowercase
+  (delay (into {} (map (juxt #(.toLowerCase ^String % java.util.Locale/ROOT) identity))
+               (ZoneId/getAvailableZoneIds))))
+
 (defn zone-id
   "`pg_tzset`: a zone NAME to a zone, or nil if there is no such zone.
 
@@ -76,12 +80,10 @@
    reach this function -- they are resolved earlier, against
    `tokens/zone-abbrevs` -- and routing them here would be the bug."
   [^String name]
-  (let [folded (delay (into {} (map (juxt #(.toLowerCase ^String %) identity))
-                            (ZoneId/getAvailableZoneIds)))]
-    (or (try (ZoneId/of name) (catch ZoneRulesException _ nil)
-             (catch java.time.DateTimeException _ nil))
-        (when-let [id (get @folded (.toLowerCase name))]
-          (ZoneId/of id)))))
+  (or (try (ZoneId/of name) (catch ZoneRulesException _ nil)
+           (catch java.time.DateTimeException _ nil))
+      (when-let [id (get @names-by-lowercase (.toLowerCase name java.util.Locale/ROOT))]
+        (ZoneId/of id))))
 
 (def utc
   "The session zone until `SET TimeZone` is honoured (expr.clj:1613
@@ -112,49 +114,29 @@
     (when (.isFixedOffset rules)
       (- (.getTotalSeconds (.getOffset rules java.time.Instant/EPOCH))))))
 
+(defn offset-at-local-time
+  "Choose the zone offset for a local time using PostgreSQL's transition rules.
+   A gap uses the offset before the transition. An overlap uses the offset
+   after the transition."
+  ^ZoneOffset [^LocalDateTime ldt ^ZoneId zone]
+  (let [rules (.getRules zone)
+        valid (.getValidOffsets rules ldt)]
+    (if (.isEmpty valid)
+      (.getOffsetBefore (.getTransition rules ldt))
+      (.get valid (dec (.size valid))))))
+
 (defn determine-offset
-  "`DetermineTimeZoneOffsetInternal`. The local fields and a zone to
-   SECONDS WEST.
-
-   Three cases, and the last two are where this differs from
-   `ZonedDateTime/of`:
-
-     one valid offset   use it
-     none (a gap)       the BEFORE offset, local fields unchanged
-     two (an overlap)   the AFTER offset
-
-   An out-of-range date is not an error: the C falls through to
-   `overflow` and assumes UTC (datetime.c:1726-1730)."
-  ^long [{:keys [year mon mday hour min sec]} ^ZoneId z]
-  (let [rules (.getRules z)]
-    (try
-      ;; The C builds the local time as if it were GMT and then probes.
-      ;; `hour` may be 24 and `sec` may be 60, neither of which
-      ;; LocalDateTime accepts, so the overflow is carried in rather
-      ;; than clamped -- the offset for 24:00 is the offset for the
-      ;; following midnight, which is what the C's seconds arithmetic
-      ;; computes.
-      (let [base (LocalDateTime/of (int year) (int mon) (int mday) 0 0 0)
-            ldt (-> base
-                    (.plusHours (long hour))
-                    (.plusMinutes (long min))
-                    (.plusSeconds (long sec)))
-            valid (.getValidOffsets rules ldt)]
-        (cond
-          (= 1 (.size valid))
-          (- (.getTotalSeconds ^ZoneOffset (.get valid 0)))
-
-          ;; A GAP. PostgreSQL prefers the BEFORE reading
-          ;; (datetime.c:1703-1708); java.time would shift forward and
-          ;; use the after offset.
-          (.isEmpty valid)
-          (- (.getTotalSeconds (.getOffsetBefore (.getTransition rules ldt))))
-
-          ;; An OVERLAP. PostgreSQL prefers the AFTER reading;
-          ;; `ZonedDateTime/of` would take the first, which is before.
-          :else
-          (- (.getTotalSeconds ^ZoneOffset (.get valid 1)))))
-      (catch java.time.DateTimeException _ 0))))
+  "Convert local fields and a zone to seconds west of UTC.
+   An out-of-range date falls back to UTC (datetime.c:1726-1730)."
+  ^long [{:keys [year mon mday hour min sec]} ^ZoneId zone]
+  (try
+    ;; Carry 24:00 or a leap second into the following day or minute.
+    (let [ldt (-> (LocalDateTime/of (int year) (int mon) (int mday) 0 0 0)
+                  (.plusHours (long hour))
+                  (.plusMinutes (long min))
+                  (.plusSeconds (long sec)))]
+      (- (.getTotalSeconds (offset-at-local-time ldt zone))))
+    (catch java.time.DateTimeException _ 0)))
 
 (defn determine-abbrev-offset
   "`DetermineTimeZoneAbbrevOffset` (datetime.c:1748-1779) for a DYNTZ

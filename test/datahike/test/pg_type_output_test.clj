@@ -95,6 +95,15 @@
       (is (= [["2024-03-01 00:30:00.654321+00" "2024-03-01 01:30:00.654321"]]
              (rows c (str "SELECT timestamp '2024-03-01 00:30:00.654321' AT TIME ZONE 'UTC', "
                           "timestamptz '2024-03-01 00:30:00.654321+00' AT TIME ZONE 'Europe/Berlin'")))))
+    (testing "named zones use the PostgreSQL gap and overlap offsets"
+      (is (= [["2024-11-03 06:30:00.123456+00" "2024-03-10 07:30:00.123456+00"]]
+             (rows c (str "SELECT TIMESTAMP '2024-11-03 01:30:00.123456' AT TIME ZONE 'America/New_York', "
+                          "TIMESTAMP '2024-03-10 02:30:00.123456' AT TIME ZONE 'america/new_york'")))))
+    (testing "fixed abbreviations do not acquire a region's summer offset"
+      (is (= [["2024-07-01 20:00:00+00" "2024-07-01 19:00:00+00" "08:00:00-04"]]
+             (rows c (str "SELECT TIMESTAMP '2024-07-01 12:00' AT TIME ZONE 'PST', "
+                          "TIMESTAMP '2024-07-01 12:00' AT TIME ZONE 'America/Los_Angeles', "
+                          "TIMETZ '12:00+00' AT TIME ZONE 'EDT'")))))
     (testing "the session offset reported by PostgreSQL is a valid zone"
       (exec! c "SET TIME ZONE 2.5")
       (is (= [["<+02:30>-02:30" "10:30:00+02:30" "2020-01-01 12:30:00.5"]]
