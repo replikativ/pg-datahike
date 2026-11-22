@@ -2552,13 +2552,13 @@
   (let [tname (unquote-ident (.getName tbl))
         talias (when-let [a (.getAlias tbl)]
                  (unquote-ident (str/trim (.getName ^Alias a))))]
-    (when-let [entity (sequence/entity-by-name db tname)]
+    (when-let [eid (sequence/id-by-name db tname)]
       (if params/*analysis-only?*
         (materialize-output-schema!
          db tname talias [{:name "last_value" :oid types/oid-int8}
                           {:name "log_cnt" :oid types/oid-int8}
                           {:name "is_called" :oid types/oid-bool}])
-        (let [[value called?] (sequence/position entity)
+        (let [[value called?] (sequence/position (d/pull db '[*] eid))
               value-attr (keyword tname "last_value")
               log-attr (keyword tname "log_cnt")
               called-attr (keyword tname "is_called")

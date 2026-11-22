@@ -11,10 +11,13 @@
 
 (def position-attributes #{:__seq__/is-called :__seq__/value})
 
-(defn entity-by-name [db name]
+(defn id-by-name [db name]
   (when (and name db (contains? (dbi/-schema db) :__seq__/name))
-    (when-let [eid (dbu/entid db [:__seq__/name name])]
-      (d/pull db '[*] eid))))
+    (dbu/entid db [:__seq__/name name])))
+
+(defn entity-by-name [db name]
+  (when-let [eid (id-by-name db name)]
+    (d/pull db '[*] eid)))
 
 (defn position
   "Return [last_value is_called]. Older stores distinguish the initial
