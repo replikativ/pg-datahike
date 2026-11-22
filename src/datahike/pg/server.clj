@@ -6231,17 +6231,7 @@
 
 (defn- execute-arg-untyped?
   [sql]
-  (loop [expression (CCJSqlParserUtil/parseExpression sql)]
-    (cond
-      (instance? net.sf.jsqlparser.expression.Parenthesis expression)
-      (recur (.getExpression ^net.sf.jsqlparser.expression.Parenthesis expression))
-
-      (and (instance? net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList
-                      expression)
-           (= 1 (.size ^java.util.List expression)))
-      (recur (.get ^java.util.List expression 0))
-
-      :else (oid/untyped-literal? expression))))
+  (oid/untyped-literal? (params/unwrap-scalar-parens (CCJSqlParserUtil/parseExpression sql))))
 
 (defn- prepared-arg-shape
   [parsed arg]
@@ -6322,6 +6312,9 @@
                                unknown? (inc i))]
                   (recur (inc i) (conj values coerced)))))))))))
 
+(defn- parse-timestamp-param [text oid]
+  (sql-cast/cast-scalar text (types/oid->pg-name oid) {:prefer-local-datetime? true}))
+
 (defn- coerce-prepared-arg
   "Read one evaluated EXECUTE argument through its prepared parameter type's
    text input function after checking PostgreSQL assignment compatibility."
@@ -6329,9 +6322,12 @@
   (when (some? value)
     (check-prepared-arg-cast! source-oid target-oid untyped? index))
   (letfn [(input-value [text oid]
-            (if-let [element-oid (types/array-oid->element-oid oid)]
-              (pg-arr/from-pg-text text (types/oid->elem-kw element-oid))
-              (if (input/parser oid) (input/parse oid text) text)))
+            (cond
+              (#{types/oid-timestamp types/oid-timestamptz} oid) (parse-timestamp-param text oid)
+              (types/array-oid->element-oid oid)
+              (pg-arr/from-pg-text text (types/oid->elem-kw (types/array-oid->element-oid oid)))
+              (input/parser oid) (input/parse oid text)
+              :else text))
           (cast-leaves [tree source-element-oid target-element-oid]
             (mapv (fn [item]
                     (if (sequential? item)
@@ -6354,7 +6350,7 @@
       :else
       (let [source-value (input-value value source-oid)]
         (sql-cast/cast-scalar source-value (types/oid->pg-name target-oid)
-                              {:explicit? false :src-oid source-oid})))))
+                              {:explicit? false :src-oid source-oid :prefer-local-datetime? true})))))
 
 (defn- invoke-sql-prepared
   "Find and revalidate a session plan, then evaluate each SQL EXECUTE argument
@@ -8314,8 +8310,7 @@
                                    (pg-arr/from-pg-text v (types/oid->elem-kw (types/array-oid->element-oid oid)))
 
                                    (contains? #{types/oid-timestamp types/oid-timestamptz} oid)
-                                   (sql-cast/cast-scalar v (types/oid->pg-name oid)
-                                                         {:prefer-local-datetime? true})
+                                   (parse-timestamp-param v oid)
 
                                    :else (input/parse oid v))
                                  (catch clojure.lang.ExceptionInfo e

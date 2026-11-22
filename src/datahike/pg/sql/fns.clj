@@ -3942,7 +3942,15 @@
      (or (sql-null? v) (sql-null? zone)) :__null__
      (types/infinite-datetime v) v
      :else
-     (let [east (when (or interval? (interval-value? zone)) (interval-zone-offset zone))
+     (let [east (cond
+                  (= interval? :time)
+                  (let [time (sql-cast/cast-scalar zone "time" {})]
+                    (if (= time "24:00:00")
+                      86400
+                      (.toSecondOfDay ^java.time.LocalTime time)))
+
+                  (or interval? (interval-value? zone))
+                  (interval-zone-offset zone))
            [zid abbrev] (when-not east (time-zone-and-abbreviation zone))]
        (case kind
          :timestamp
@@ -6509,7 +6517,7 @@
    "justify_hours" #{1} "justify_days" #{1} "justify_interval" #{1}
    "make_date" #{3} "make_time" #{3} "make_timestamp" #{6}
    "make_timestamptz" #{6 7} "make_interval" #{0 1 2 3 4 5 6 7}
-   "to_timestamp" #{1 2} "to_date" #{2} "date_bin" #{3} "age" #{1 2} "timezone" #{2}
+   "to_timestamp" #{1 2} "to_date" #{2} "date_bin" #{3} "age" #{1 2} "timezone" #{1 2}
    "abs"      #{1} "sign"    #{1} "sqrt"  #{1} "cbrt"  #{1}
    "exp"      #{1} "ln"      #{1} "log10" #{1}
    "floor"    #{1} "ceil"    #{1} "ceiling" #{1}

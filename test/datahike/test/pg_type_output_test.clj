@@ -241,6 +241,41 @@
            (rows c "EXECUTE t_conv")))
     (is (= [[nil]] (rows c "SELECT NULL::time AT TIME ZONE INTERVAL '00:00'")))))
 
+(deftest prepared-timezone-overloads
+  (with-open [c (jdbc)]
+    (exec! c "SET TIME ZONE 'America/New_York'")
+    (doseq [[sql expected] [["SELECT timezone((?))" ["timestamptz"]]
+                            ["SELECT timezone((?), (?))" ["text" "timestamptz"]]
+                            ["SELECT (?) AT TIME ZONE (?) AT TIME ZONE (?)" ["timestamptz" "text" "text"]]]]
+      (with-open [st (.prepareStatement c sql)]
+        (let [meta (.getParameterMetaData st)]
+          (is (= expected (mapv #(.getParameterTypeName meta (int %))
+                                (range 1 (inc (.getParameterCount meta)))))))))
+    (exec! c "PREPARE tz_session AS SELECT timezone(($1))")
+    (exec! c "PREPARE tz_named AS SELECT timezone(($1), ($2))")
+    (exec! c "PREPARE tz_chain AS SELECT ($1) AT TIME ZONE ($2) AT TIME ZONE ($3)")
+    (is (= [["2024-03-09 20:30:00.123456"]]
+           (rows c "EXECUTE tz_session ('2024-03-10 03:30:00.123456+02')")))
+    (is (= [["2024-03-10 01:30:00.123456"]]
+           (rows c "EXECUTE tz_named ('UTC', '2024-03-10 03:30:00.123456+02')")))
+    (is (= [["2024-03-09 19:30:00.123456-05"]]
+           (rows c "EXECUTE tz_chain ('2024-03-10 03:30:00.123456+02', 'UTC', 'Europe/Berlin')")))
+    (exec! c "BEGIN")
+    (exec! c "SET LOCAL TIME ZONE 'Asia/Tokyo'")
+    (is (= [["2024-03-10 10:30:00.123456"]]
+           (rows c "EXECUTE tz_session ('2024-03-10 03:30:00.123456+02')")))
+    (exec! c "ROLLBACK")
+    (is (= [["2024-03-09 20:30:00.123456"]]
+           (rows c "EXECUTE tz_session ('2024-03-10 03:30:00.123456+02')")))
+    (is (= [["2023-12-31 17:30:00-05" "2023-12-31 17:30:00-05"]]
+           (rows c (str "SELECT timezone(TIME '01:30', TIMESTAMP '2024-01-01'), "
+                        "TIMESTAMP '2024-01-01' AT TIME ZONE TIME '01:30'"))))
+    (doseq [sql ["SELECT timezone(12, TIMESTAMP '2024-01-01')"
+                 "SELECT timezone('UTC', '2024-01-01'::text)"
+                 "SELECT '2024-01-01'::text AT TIME ZONE 'UTC'"
+                 "SELECT TIMESTAMP '2024-01-01' AT TIME ZONE 12"]]
+      (is (= "42883" (state c sql)) sql))))
+
 (deftest time-expression-metadata
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE empty_times (t time)")

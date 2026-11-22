@@ -1312,14 +1312,27 @@
     (ctx/materialize-arg! ctx (list fn-param))))
 
 (defn- timezone-operand-oid [ctx operand]
+  (first (call-arg-oids ctx [(params/unwrap-scalar-parens operand)])))
+
+(def ^:private timezone-value-oids
+  #{nil types/oid-time types/oid-timetz types/oid-date types/oid-timestamp types/oid-timestamptz})
+
+(defn- timezone-kind! [fname zone-oid value-oid]
+  (when-not (and (contains? timezone-value-oids value-oid)
+                 (or (nil? zone-oid)
+                     (#{types/oid-time types/oid-interval} zone-oid)
+                     (types/implicit-coercible? zone-oid types/oid-text)))
+    (throw (no-such-function fname [zone-oid value-oid])))
   (cond
-    (instance? Parenthesis operand)
-    (recur ctx (.getExpression ^Parenthesis operand))
+    (= value-oid types/oid-timestamp) :timestamp
+    (#{types/oid-time types/oid-timetz} value-oid) :timetz
+    :else :timestamptz))
 
-    (and (instance? ParenthesedExpressionList operand) (= 1 (count operand)))
-    (recur ctx (first operand))
-
-    :else (first (call-arg-oids ctx [operand]))))
+(defn- timezone-interval-kind [zone-oid]
+  (cond
+    (= zone-oid types/oid-time) :time
+    (= zone-oid types/oid-interval) true
+    :else false))
 
 (defn- timezone-value! [ctx v value-oid]
   (cond
@@ -1469,10 +1482,9 @@
           result-var)
 
       (and (= fname "timezone") (= 1 (count args)))
-      (let [value-oid (first (call-arg-oids ctx arg-exprs))]
-        (when-not (contains? #{nil types/oid-time types/oid-timetz types/oid-date
-                               types/oid-timestamp types/oid-timestamptz} value-oid)
-          (undefined-function! ctx fname arg-exprs))
+      (let [value-oid (timezone-operand-oid ctx (first arg-exprs))]
+        (when-not (contains? timezone-value-oids value-oid)
+          (throw (no-such-function fname [value-oid])))
         (let [session (session-temporal-context! ctx)]
           (swap! (:where-clauses ctx) conj
                  [(list 'datahike.pg.query-fns/sql-timezone-local (first args) (or value-oid 0) session)
@@ -1481,15 +1493,13 @@
 
       ;; timezone(zone, value) is `value AT TIME ZONE zone`.
       (and (= fname "timezone") (= 2 (count args)))
-      (let [value-oid (timezone-operand-oid ctx (second arg-exprs))
-            kind (condp contains? value-oid
-                   #{types/oid-timestamp} :timestamp
-                   #{types/oid-time types/oid-timetz} :timetz
-                   :timestamptz)]
+      (let [zone-oid (timezone-operand-oid ctx (first arg-exprs))
+            value-oid (timezone-operand-oid ctx (second arg-exprs))
+            kind (timezone-kind! fname zone-oid value-oid)]
         (swap! (:where-clauses ctx) conj
                [(list 'datahike.pg.query-fns/sql-at-time-zone
                       (timezone-value! ctx (second args) value-oid) (first args) kind
-                      (= types/oid-interval (source-oid ctx (first params))))
+                      (timezone-interval-kind zone-oid))
                 result-var])
         result-var)
 
@@ -8176,27 +8186,16 @@
     ;; timestamptz. JSqlParser nests a chain to the RIGHT (`ts AT ('UTC' AT
     ;; 'EST')`); PostgreSQL is left-associative, so flatten the zones first.
     (instance? TimezoneExpression expr)
-    (let [left (.getLeftExpression ^TimezoneExpression expr)
-          zones (letfn [(flat [z]
-                          (if (instance? TimezoneExpression z)
-                            (cons (.getLeftExpression ^TimezoneExpression z)
-                                  (mapcat flat (.getTimezoneExpressions ^TimezoneExpression z)))
-                            [z]))]
-                  (vec (mapcat flat (.getTimezoneExpressions ^TimezoneExpression expr))))
+    (let [[left zones] (params/timezone-operands expr)
           apply-zone
           (fn [value-var value-oid zone-expr]
-            (let [kind (condp contains? value-oid
-                         #{types/oid-timestamp} :timestamp
-                         #{types/oid-time types/oid-timetz} :timetz
-                         ;; timestamptz, date (implicitly cast to
-                         ;; timestamptz) and an untyped literal (datetime's
-                         ;; preferred type is timestamptz)
-                         :timestamptz)
+            (let [zone-oid (timezone-operand-oid ctx zone-expr)
+                  kind (timezone-kind! "pg_catalog.timezone" zone-oid value-oid)
                   zone-var (let [z (translate-expr ctx zone-expr)]
                              (if (seq? z) (ctx/materialize-arg! ctx z) z))
                   value-var (timezone-value! ctx value-var value-oid)]
               [(list 'datahike.pg.query-fns/sql-at-time-zone value-var zone-var kind
-                     (= types/oid-interval (source-oid ctx zone-expr)))
+                     (timezone-interval-kind zone-oid))
                (case kind :timestamp types/oid-timestamptz
                      :timestamptz types/oid-timestamp
                      :timetz types/oid-timetz)]))

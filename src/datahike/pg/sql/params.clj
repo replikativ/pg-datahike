@@ -39,9 +39,9 @@
            [net.sf.jsqlparser.expression
             AnalyticExpression CastExpression Function JdbcParameter Parenthesis NotExpression
             LongValue StringValue DoubleValue DateValue TimestampValue
-            SignedExpression BinaryExpression]
+            SignedExpression BinaryExpression TimezoneExpression]
            [net.sf.jsqlparser.expression.operators.relational
-            Between InExpression ExpressionList]
+            Between InExpression ExpressionList ParenthesedExpressionList]
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression]
            [net.sf.jsqlparser.statement.insert Insert]
@@ -1400,6 +1400,29 @@
                           acc)))
                     m joins)))))
 
+(defn unwrap-scalar-parens
+  "Remove parentheses around a single expression while preserving row expressions."
+  [expression]
+  (cond
+    (instance? Parenthesis expression)
+    (recur (.getExpression ^Parenthesis expression))
+
+    (and (instance? ParenthesedExpressionList expression)
+         (= 1 (.size ^ParenthesedExpressionList expression)))
+    (recur (.get ^ParenthesedExpressionList expression 0))
+
+    :else expression))
+
+(defn timezone-operands
+  "Return the value and zone operands in PostgreSQL's left-to-right order."
+  [^TimezoneExpression expression]
+  (letfn [(zones [zone]
+            (if (instance? TimezoneExpression zone)
+              (cons (.getLeftExpression ^TimezoneExpression zone)
+                    (mapcat zones (.getTimezoneExpressions ^TimezoneExpression zone)))
+              [zone]))]
+    [(.getLeftExpression expression) (vec (mapcat zones (.getTimezoneExpressions expression)))]))
+
 (defn where-param-oids
   "Walk an expression tree (a WHERE clause) and for each comparison
    `col = ?` / `? = col` / `col IN (?,?)` / `col BETWEEN ? AND ?`,
@@ -1431,6 +1454,10 @@
                            (let [[tns cn] (col-ns-name c)]
                              (when-let [oid (infer-param-oid-for-column schema tns cn)]
                                (.put result (.getIndex p) oid))))
+           record-timezone-param! (fn [operand oid]
+                                    (let [base (unwrap-scalar-parens operand)]
+                                      (when (instance? JdbcParameter base)
+                                        (.putIfAbsent result (.getIndex ^JdbcParameter base) oid))))
            ;; OID of a literal comparand, so `? OP <literal>` (e.g.
            ;; `$1 = 1`, with no column to borrow a type from) still
            ;; resolves the param's type. SignedExpression wraps a
@@ -1627,6 +1654,13 @@
                                 (when-let [oid (cast-target-oid n)]
                                   (.put result (.getIndex ^JdbcParameter inner) oid))))
                             (walk (.getLeftExpression ^CastExpression n)))
+                          (instance? TimezoneExpression n)
+                          (let [[value zones] (timezone-operands n)]
+                            (record-timezone-param! value types/oid-timestamptz)
+                            (walk value)
+                            (doseq [zone zones]
+                              (record-timezone-param! zone types/oid-text)
+                              (walk zone)))
                          ;; COALESCE/GREATEST/LEAST/NULLIF use PostgreSQL's
                          ;; common-type selection. An unknown parameter can
                          ;; therefore borrow a concrete sibling's type, just
@@ -1639,6 +1673,12 @@
                                 name (some-> (.getName f) str/lower-case)
                                 args (vec (or (some-> (.getParameters f) .getExpressions)
                                               []))]
+                            (when (= name "timezone")
+                              (case (count args)
+                                1 (record-timezone-param! (first args) types/oid-timestamptz)
+                                2 (do (record-timezone-param! (first args) types/oid-text)
+                                      (record-timezone-param! (second args) types/oid-timestamptz))
+                                nil))
                             (when (#{"coalesce" "greatest" "least" "nullif"} name)
                               (when-let [comparand
                                          (some (fn [arg]

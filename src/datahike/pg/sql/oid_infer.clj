@@ -39,7 +39,7 @@
            [net.sf.jsqlparser.expression.operators.relational
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
             InExpression IsBooleanExpression IsNullExpression JsonOperator LikeExpression
-            MinorThan MinorThanEquals NotEqualsTo ParenthesedExpressionList
+            MinorThan MinorThanEquals NotEqualsTo
             RegExpMatchOperator Matches GeometryDistance CosineSimilarity]))
 
 ;; ---------------------------------------------------------------------------
@@ -1288,18 +1288,13 @@
       ;; timestamp_zone / timestamptz_zone); a time becomes timetz. Each
       ;; zone in a chain applies to the previous result.
       (instance? net.sf.jsqlparser.expression.TimezoneExpression expr)
-      (let [^net.sf.jsqlparser.expression.TimezoneExpression e expr
-            zones (letfn [(n [z] (if (instance? net.sf.jsqlparser.expression.TimezoneExpression z)
-                                   (+ 1 (reduce + (map n (.getTimezoneExpressions
-                                                          ^net.sf.jsqlparser.expression.TimezoneExpression z))))
-                                   1))]
-                    (reduce + (map n (.getTimezoneExpressions e))))
+      (let [[value zones] (params/timezone-operands expr)
             step (fn [oid]
                    (cond
                      (= oid types/oid-timestamp) types/oid-timestamptz
                      (#{types/oid-time types/oid-timetz} oid) types/oid-timetz
                      :else types/oid-timestamp))]
-        (nth (iterate step (expr-oid (.getLeftExpression e) env)) zones))
+        (nth (iterate step (expr-oid value env)) (count zones)))
 
       (instance? net.sf.jsqlparser.expression.IntervalExpression expr) types/oid-interval
       (instance? net.sf.jsqlparser.expression.OverlapsCondition expr) types/oid-bool
@@ -1346,14 +1341,6 @@
    `ParenthesedExpressionList` (a one-element list) for a select item —
    so both are unwrapped, repeatedly for `SELECT (($1))`."
   [expr]
-  (loop [expr expr]
-    (cond
-      (instance? Parenthesis expr)
-      (recur (.getExpression ^Parenthesis expr))
-
-      (and (instance? ParenthesedExpressionList expr)
-           (= 1 (.size ^ParenthesedExpressionList expr)))
-      (recur (.get ^ParenthesedExpressionList expr 0))
-
-      (instance? JdbcParameter expr)
+  (let [expr (params/unwrap-scalar-parens expr)]
+    (when (instance? JdbcParameter expr)
       (.getIndex ^JdbcParameter expr))))
