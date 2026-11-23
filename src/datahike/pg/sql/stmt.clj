@@ -3719,6 +3719,14 @@
                        (= (str/lower-case (namespace k)) t)))
                 schema)))))
 
+(defn- write-target [schema ^Table table]
+  (let [logical (unquote-ident (.getName table))
+        namespace (some-> (.getSchemaName table) unquote-ident)
+        storage (ctx/table-storage-name logical namespace)]
+    (when-not (stored-relation-known? schema storage)
+      (throw (errors/pg-error :undefined-table {:table logical})))
+    [logical storage]))
+
 (defn correlated-subquery-refs
   "Given a scalar-subquery `inner` (a JSqlParser Select) and the set of
    `outer-aliases` (lowercased outer FROM aliases/table names), return the
@@ -10383,12 +10391,7 @@
   [^Insert insert schema db]
   (let [schema (enrich-schema-with-pg-array-meta schema db)
         table (.getTable insert)
-        raw-table (unquote-ident (.getName ^Table table))
-        _ (when-not (stored-relation-known? schema raw-table)
-            (throw (ex-info (str "relation \"" raw-table "\" does not exist")
-                            {:error :undefined-table
-                             :sqlstate "42P01"
-                             :table raw-table})))
+        [raw-table storage] (write-target schema table)
         columns (.getColumns insert)
         ;; Session temp relations are presented under their logical SQL name,
         ;; while inheritance/order metadata is stored under the unique
@@ -10396,7 +10399,7 @@
         ;; metadata so it cannot be mistaken for a column.
         temp-table-map params/*temp-table-map*
         physical->logical (set/map-invert temp-table-map)
-        db-table (get temp-table-map raw-table raw-table)
+        db-table (get temp-table-map raw-table storage)
         ancestor-db-tables (ctx/inheritance-ancestors db db-table)
         ancestor-tables (mapv #(get physical->logical % %) ancestor-db-tables)
         raw-cols (if (seq columns)
@@ -10410,7 +10413,7 @@
                          ;; intentionally prepended below.
                          own-order (if (or (seq db-order) (seq ancestor-tables))
                                      db-order
-                                     (when-let [cols (pgs/column-info schema raw-table)]
+                                     (when-let [cols (pgs/column-info schema storage)]
                                        (mapv :name (rest cols))))
                          parent-order (mapcat #(pgs/column-order-from-db db %)
                                               (reverse ancestor-db-tables))]
@@ -10429,7 +10432,7 @@
                        (vec (distinct (concat parent-order own-order))))))
         [table-name col-names] (canonical-relation
                                 schema (pgs/schema-hints db)
-                                raw-table raw-cols)
+                                storage raw-cols)
         ns table-name
         sequence-defaults (into {}
                                 (map (fn [[attr sequence-name]]
@@ -10471,7 +10474,8 @@
         conflict-action (.getConflictAction insert)
         ^net.sf.jsqlparser.statement.insert.InsertConflictTarget
         conflict-target (.getConflictTarget insert)
-        target-alias (some-> ^Table table .getAlias .getName unquote-ident)
+        target-alias (or (some-> ^Table table .getAlias .getName unquote-ident)
+                         (when (not= storage raw-table) raw-table))
         _ (when conflict-action
             (reject-hidden-target-name! conflict-action raw-table target-alias))
         _ (when (some (fn [^Column col]
@@ -10849,15 +10853,12 @@
         _ (when-not table
             (throw (ex-info "syntax error at end of input"
                             {:error :syntax-error :sqlstate "42601"})))
-        raw-table (unquote-ident (.getName ^Table table))
-        _ (when-not (stored-relation-known? schema raw-table)
-            (throw (ex-info (str "relation \"" raw-table "\" does not exist")
-                            {:error :undefined-table
-                             :sqlstate "42P01"
-                             :table raw-table})))
-        table-name (first (canonical-relation schema raw-table []))
+        [raw-table storage] (write-target schema table)
+        table-name (first (canonical-relation schema storage []))
         alias-obj (.getAlias ^Table table)
-        alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
+        alias-name (if alias-obj
+                     (unquote-ident (.getName ^Alias alias-obj))
+                     (when (not= storage raw-table) raw-table))
         using (.getUsingList delete)
         from-names (into [] (keep from-item-name) using)
         _ (when-let [dup (some #{(or alias-name raw-table)} from-names)]
@@ -10872,6 +10873,8 @@
                :alias alias-name
                :ns ns
                :where-expr where-expr}
+        (not= storage raw-table)
+        (assoc :logical-target raw-table)
         (seq using)
         (assoc :from-sql (str/join ", " (map str using))
                :from-aliases from-names
@@ -10963,13 +10966,8 @@
    is materialised there like any other relation."
   [^Update update schema db]
   (let [table (.getTable update)
-        raw-table (unquote-ident (.getName ^Table table))
-        _ (when-not (stored-relation-known? schema raw-table)
-            (throw (ex-info (str "relation \"" raw-table "\" does not exist")
-                            {:error :undefined-table
-                             :sqlstate "42P01"
-                             :table raw-table})))
-        table-name (first (canonical-relation schema raw-table []))
+        [raw-table storage] (write-target schema table)
+        table-name (first (canonical-relation schema storage []))
         canonical-target-column
         (fn [col-name]
           (let [ci (pgs/ci-index schema (pgs/schema-hints db))
@@ -10985,7 +10983,9 @@
                                :column col-name}))
               :else col-name)))
         alias-obj (.getAlias ^Table table)
-        alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
+        alias-name (if alias-obj
+                     (unquote-ident (.getName ^Alias alias-obj))
+                     (when (not= storage raw-table) raw-table))
         ;; The name each FROM relation is visible under: its alias, else
         ;; its own name (only a Table has one to clash with).
         from-items (cons (.getFromItem update)
@@ -11090,6 +11090,8 @@
              :declared-param-oids params/*declared-param-oids*
              :where-expr where-expr
              :assignments assignments}
+      (not= storage raw-table)
+      (assoc :logical-target raw-table)
       (.getReturningClause update)
       (assoc :returning (extract-returning (.getReturningClause update))))))
 

@@ -1161,18 +1161,16 @@
                       ;; The raw SQL goes with the tokens: a
                       ;; `COPY ( query ) TO` has to hand its query text
                       ;; to the real parser verbatim.
-                      parsed (copy/parse-copy toks sql)]
-                  (merge base parsed))
+                      {:keys [table ns] :as parsed} (copy/parse-copy toks sql)
+                      storage (when table (ctx/table-storage-name table ns))]
+                  (cond-> (merge base parsed)
+                    (not= table storage) (assoc :table storage :logical-target table)))
                 (catch clojure.lang.ExceptionInfo e
-                  (let [data (ex-data e)
-                        state (or (:sqlstate data)
-                                  (case (:error data)
-                                    :feature-not-supported "0A000"
-                                    :syntax-error "42601"
-                                    "XX000"))]
+                  (let [[state message fields] (errors/classify-exception e)]
                     {:type :error
-                     :message (.getMessage e)
-                     :sqlstate state}))
+                     :message message
+                     :sqlstate state
+                     :error-fields fields}))
                 (catch Throwable e
                   {:type :error
                    :message (.getMessage e)

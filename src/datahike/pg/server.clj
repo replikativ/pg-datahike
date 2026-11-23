@@ -3515,8 +3515,8 @@
             (let [query-schema (or (:schema enriched-db) schema)
                   ;; Build alias map: {alias → table, table → table}
                   default-key (or alias table)
-                  table-aliases (cond-> {table table}
-                                  alias (assoc alias table))
+                  table-aliases (cond-> {default-key table}
+                                  (nil? (:logical-target parsed)) (assoc table table))
                   ctx (#'sql-ctx/make-ctx query-schema table-aliases default-key
                                           {:db query-db
                                            :parse-sql sql/parse-sql
@@ -3683,7 +3683,8 @@
            params/*analysis-only?*]]
     (or (when-not (:execution-materialization? parsed)
           (.get ^java.util.Map update-row-match-cache k))
-        (let [{:keys [table alias assignments where-expr from-sql returning from-aliases]} parsed
+        (let [{:keys [table alias logical-target assignments where-expr from-sql returning from-aliases]} parsed
+              target-name (or logical-target table)
               sources (when (seq returning) from-aliases)
               visible (or alias
                           (when (str/starts-with? table temp-table-prefix)
@@ -3726,12 +3727,12 @@
               ;; named -- schema-qualified.
               shadowed? (and (:with-sql parsed)
                              (re-find (re-pattern (str "(?i)\\bWITH\\s+(RECURSIVE\\s+)?"
-                                                       (java.util.regex.Pattern/quote table)
+                                                       (java.util.regex.Pattern/quote target-name)
                                                        "\\b"))
                                       (:with-sql parsed)))
               from-name (if shadowed?
-                          (str "\"public\"." (quoted table))
-                          (quoted table))
+                          (str "\"public\"." (quoted target-name))
+                          (quoted target-name))
               text (str (:with-sql parsed)
                         "SELECT " (quoted (or visible table)) ".db_id"
                         (apply str (map #(str ", (" (:sql %) ")") assignments))
@@ -3815,7 +3816,7 @@
         ;; instead: a child's row carries its own row marker as well as
         ;; every ancestor's, and that marker is what identifies it.
         rows (if-let [only (and (contains? (or (:only-tables parsed) #{})
-                                           (str/lower-case (str (:table parsed))))
+                                           (str/lower-case (or (:logical-target parsed) (:table parsed))))
                                 (seq (sql-ctx/inheritance-descendants db (:table parsed))))]
                (let [child-markers (mapv pgs/row-marker-attr only)]
                  (filterv (fn [row]
@@ -14144,9 +14145,10 @@
    is encoded like any other row except that FORCE_QUOTE does not
    apply to it, which is what `copyto.c` does."
   [ctx parsed]
-  (let [{:keys [options columns table query ns]} parsed
-        logical-table (get (clojure.set/map-invert @(:temp-tables ctx)) table table)
-        public-shadow? (and (= "public" ns) (not= table logical-table))
+  (let [{:keys [options columns table logical-target query ns]} parsed
+        logical-table (or logical-target
+                          (get (clojure.set/map-invert @(:temp-tables ctx)) table table))
+        public-shadow? (and (= "public" ns) (nil? logical-target) (not= table logical-table))
         db (if (:in-tx? @(:tx-state ctx))
              (:speculative-db @(:tx-state ctx))
              (d/db (:conn ctx)))
@@ -14154,7 +14156,7 @@
                    (catalog-objects/object-by-identity
                     db catalog-objects/pg-class-oid
                     catalog-objects/public-namespace-oid
-                    (if public-shadow? logical-table table)))
+                    (if (or public-shadow? logical-target) logical-table table)))
         _ (when (= :view (:datahike.pg.object/kind relation))
             (throw (ex-info (str "cannot copy from view \"" logical-table "\"")
                             {:sqlstate "42809" :error :wrong-object-type
@@ -14166,9 +14168,8 @@
         ;; name to its physical namespace, and `visible-session-schema`
         ;; deliberately HIDES those -- that is what stops one session
         ;; reaching another's temp table by spelling the storage name.
-        ;; A SELECT built from the physical name therefore cannot see
-        ;; the table this COPY is reading. Map it back.
-        table (get (clojure.set/map-invert @(:temp-tables ctx)) table table)
+        ;; A SELECT built from the physical name cannot see the table.
+        ;; Use the logical name for SELECT and the storage name for columns.
         ;; `CopyGetAttnums` excludes generated columns from the IMPLICIT
         ;; column list, for COPY TO as well as COPY FROM, so `COPY t TO`
         ;; emits only the ordinary ones -- and its output can therefore
@@ -14176,28 +14177,21 @@
         ;; includes them, so the implicit list has to be spelled out.
         ;; Naming one explicitly is 42P10, the same error
         ;; `start-copy-in!` already raises for COPY FROM.
-        gen-cols (when-not query
-                   (let [db (if (:in-tx? @(:tx-state ctx))
-                              (:speculative-db @(:tx-state ctx))
-                              (d/db (:conn ctx)))]
-                     (into #{} (comp (filter #(or (:generated %) (:publisher-generated? %))) (map :name))
-                           (:columns (row-constraint-plan db table)))))
+        table-columns (when-not query (:columns (row-constraint-plan db table)))
+        gen-cols (into #{} (comp (filter #(or (:generated %) (:publisher-generated? %))) (map :name))
+                       table-columns)
         _ (when-let [gen (first (filter gen-cols columns))]
             (throw (ex-info (str "column \"" gen "\" is a generated column")
                             {:sqlstate "42P10"
                              :error :invalid-column-reference
                              :detail "Generated columns cannot be used in COPY."})))
         columns (if (and (empty? columns) (seq gen-cols))
-                  (let [db (if (:in-tx? @(:tx-state ctx))
-                             (:speculative-db @(:tx-state ctx))
-                             (d/db (:conn ctx)))]
-                    (into [] (comp (map :name) (remove gen-cols))
-                          (:columns (row-constraint-plan db table))))
+                  (into [] (comp (map :name) (remove gen-cols)) table-columns)
                   columns)
         sql (or query
                 (str "SELECT "
                      (if (seq columns) (str/join ", " columns) "*")
-                     " FROM " table))
+                     " FROM " (dump/quote-ident logical-table)))
         ;; Through `*statement-handler*`, not the handler directly: the
         ;; caller's `*cached-parsed*` is still in scope here, so a bare
         ;; `.execute` re-runs the OUTER plan -- this COPY -- and

@@ -191,6 +191,34 @@
       (is (nil? (err (run sql))) sql))
     (is (= [["3"] ["4"]] (mapv vec (.rows (run "SELECT detail FROM tasks ORDER BY key")))))))
 
+(deftest writes-resolve-the-logical-table-name
+  (let [run #(.execute *handler* %)
+        data #(mapv vec (.rows (run %)))]
+    (is (nil? (err (run "CREATE TABLE physical_name (id int PRIMARY KEY, amount int)"))))
+    (let [db (d/db *conn*)
+          oid (pgs/table-oid db "physical_name")]
+      (d/transact *conn* (objects/rename-table-tx db oid "visible_name")))
+    (is (= [["1" "10"]]
+           (data "INSERT INTO visible_name VALUES (1, 10) RETURNING visible_name.*")))
+    (is (= [["20"]]
+           (data (str "UPDATE visible_name SET amount = src.amount "
+                      "FROM (VALUES (1, 20)) AS src(id,amount) "
+                      "WHERE visible_name.id = src.id RETURNING visible_name.amount"))))
+    (is (= [["20"]] (data "SELECT amount FROM visible_name")))
+    (is (= [["20"]]
+           (data "DELETE FROM visible_name WHERE visible_name.id = 1 RETURNING visible_name.amount")))
+    (is (= [["0"]] (data "SELECT count(*) FROM visible_name")))
+    (is (.-copyInMode (run "COPY public.visible_name FROM STDIN")))
+    (.copyChunk *handler* (.getBytes "2\t30\n" java.nio.charset.StandardCharsets/UTF_8))
+    (is (nil? (err (.copyComplete *handler*))))
+    (is (= ["2\t30"] (vec (.-copyOutLines (run "COPY visible_name TO STDOUT")))))
+    (doseq [sql ["INSERT INTO physical_name VALUES (2, 30)"
+                 "UPDATE physical_name SET amount = 30"
+                 "DELETE FROM physical_name"
+                 "COPY physical_name FROM STDIN"
+                 "COPY physical_name TO STDOUT"]]
+      (is (= "42P01" (.sqlstate (run sql))) sql))))
+
 (deftest historical-catalogs-and-user-data-share-the-statement-snapshot
   (let [run #(.execute *handler* %)
         rows (fn [query]
