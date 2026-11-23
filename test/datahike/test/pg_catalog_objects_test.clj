@@ -349,3 +349,36 @@
       (finally
         (d/delete-database cfg)
         (Files/deleteIfExists root)))))
+
+(deftest retired-table-generations-survive-a-file-backend-reconnect
+  (let [root (Files/createTempDirectory "pg-datahike-table-history-" (make-array FileAttribute 0))
+        cfg {:store {:backend :file :path (str (.resolve root "store"))
+                     :id (random-uuid)}
+             :schema-flexibility :write :keep-history? true}]
+    (d/create-database cfg)
+    (try
+      (let [conn (d/connect cfg)
+            before (try
+                     (with-open [handler (server/make-query-handler conn)]
+                       (doseq [sql ["CREATE TABLE ledger (id int)" "INSERT INTO ledger VALUES (1)"]]
+                         (is (nil? (.error (.execute handler sql))) sql))
+                       (let [db (d/db conn)
+                             snapshot (.toInstant ^java.util.Date (:db/txInstant (d/entity db (:max-tx db))))]
+                         (doseq [sql ["DROP TABLE ledger"
+                                      "CREATE TABLE ledger (id text)"
+                                      "INSERT INTO ledger VALUES ('current')"]]
+                           (is (nil? (.error (.execute handler sql))) sql))
+                         snapshot))
+                     (finally (d/release conn)))
+            reopened (d/connect cfg)]
+        (try
+          (with-open [handler (server/make-query-handler reopened)]
+            (is (= [["current"]] (mapv vec (.rows (.execute handler "SELECT id FROM ledger")))))
+            (is (nil? (.error (.execute handler (str "SET datahike.as_of = '" before "'")))))
+            (let [result (.execute handler "SELECT id FROM ledger")]
+              (is (= [["1"]] (mapv vec (.rows result))))
+              (is (= [23] (vec (.-columnOids result))))))
+          (finally (d/release reopened))))
+      (finally
+        (d/delete-database cfg)
+        (Files/deleteIfExists root)))))

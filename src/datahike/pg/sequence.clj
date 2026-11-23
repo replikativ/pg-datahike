@@ -43,6 +43,24 @@
            (nil? (:__seq__/owned-by-column legacy)))
       (conj legacy-name))))
 
+(defn addressed-owned-columns
+  "Sequence bindings for columns with a persistent catalog address."
+  [db table]
+  (when (and (contains? (dbi/-schema db) :__seq__/owned-by-column)
+             (contains? (dbi/-schema db) :__seq__/owned-by-table)
+             (contains? (dbi/-schema db) :__seq__/identity-generation))
+    (mapv (fn [[attr seq-name generation]]
+            {:col (name attr) :ns (namespace attr) :seq-name seq-name :generation generation})
+          (d/q '[:find ?attr ?seq-name ?generation
+                 :in $ ?table
+                 :where [?seq :__seq__/owned-by-table ?table]
+                 [?seq :__seq__/owned-by-column ?address]
+                 [?seq :__seq__/name ?seq-name]
+                 [?column :datahike.pg.column/address-key ?address]
+                 [?column :datahike.pg.column/storage-ident ?attr]
+                 [(get-else $ ?seq :__seq__/identity-generation "") ?generation]]
+               db table))))
+
 (defn position
   "Return [last_value is_called]. Older stores distinguish the initial
    position from an advanced one with the start-minus-increment sentinel."

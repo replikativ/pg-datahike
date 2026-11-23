@@ -311,13 +311,15 @@
                     "other bigint DEFAULT nextval('dependency_seq'::regclass) + 10)")]]
     (is (nil? (err sql)) sql))
   (doseq [sql ["ALTER TABLE dependency_owner DROP COLUMN id"
+               "ALTER TABLE dependency_owner DROP COLUMN id RESTRICT"
+               "ALTER TABLE dependency_owner DROP id RESTRICT"
                "DROP TABLE dependency_owner"
                "DROP SEQUENCE dependency_seq"]]
     (is (= "2BP01" (.-sqlstate ^PgWireServer$QueryResult (run sql))) sql))
   (is (= [["public.dependency_seq"]]
          (rows "SELECT pg_get_serial_sequence('dependency_owner', 'id')")))
   (is (= [["1" "12"]] (rows "INSERT INTO consumer DEFAULT VALUES RETURNING id, other")))
-  (is (nil? (err "ALTER TABLE dependency_owner DROP COLUMN id CASCADE")))
+  (is (nil? (err "ALTER TABLE dependency_owner DROP id CASCADE")))
   (is (= [[nil]] (rows "SELECT to_regclass('dependency_seq')")))
   (is (= [[nil nil]] (rows "INSERT INTO consumer DEFAULT VALUES RETURNING id, other")))
   (doseq [sql ["CREATE TABLE multi_owner (id int)"

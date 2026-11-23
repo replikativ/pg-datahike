@@ -9,6 +9,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -326,14 +327,15 @@
           :when (and not-null? (nil? (get attrs attr)))]
     (throw (ex-info "not-null violation"
                     {:error :not-null-violation
-                     :table table-name :column name
+                     :table (catalog-objects/public-relation-name db table-name) :column name
                      :detail (failing-row-detail attrs (:columns plan))})))
   (when (seq (:checks plan))
     (let [logical (logical-row table-name attrs (:columns plan))]
       (doseq [{:keys [constraint ast]} (:checks plan)
               :when (false? (eval-check-fn ast logical table-name (:schema db)))]
         (throw (errors/pg-error :check-violation
-                                {:table table-name :constraint constraint
+                                {:table (catalog-objects/public-relation-name db table-name)
+                                 :constraint constraint
                                  :detail (failing-row-detail
                                           attrs (:columns plan))})))))
   (doseq [[column-name spec] (:domain-enum plan)
@@ -429,12 +431,14 @@
       ;; formatter (which words it as PostgreSQL does) never ran. The
       ;; category supplies 23503 anyway. The DETAIL names the key and
       ;; the table it is not present in, as `ri_ReportViolation` does.
-      (throw (ex-info "foreign key violation"
-                      {:error :foreign-key-violation
-                       :table table-name :constraint constraint
-                       :operation :insert
-                       :parent-table parent-table
-                       :detail (str "Key (" (str/join ", " (mapv name child-attrs))
-                                    ")=(" (str/join ", " (map str child-values))
-                                    ") is not present in table \"" parent-table "\".")}))))
+      (let [parent-name (catalog-objects/public-relation-name db parent-table)]
+        (throw (ex-info "foreign key violation"
+                        {:error :foreign-key-violation
+                         :table (catalog-objects/public-relation-name db table-name)
+                         :constraint constraint
+                         :operation :insert
+                         :parent-table parent-name
+                         :detail (str "Key (" (str/join ", " (mapv name child-attrs))
+                                      ")=(" (str/join ", " (map str child-values))
+                                      ") is not present in table \"" parent-name "\".")})))))
   nil)

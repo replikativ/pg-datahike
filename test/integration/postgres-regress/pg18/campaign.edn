@@ -258,7 +258,12 @@
     {:name "jsonb", :boundaries #{:jsonb}, :mode :unmeasured}
     {:name "jsonpath", :boundaries #{:jsonpath}, :mode :unmeasured}
     {:name "sqljson", :boundaries #{:sql-json}, :mode :unmeasured}
-    {:name "tsearch", :boundaries #{:wire-result-type :full-text :normalization}, :mode :unmeasured}
+    {:name "tsearch", :boundaries #{:wire-result-type :full-text :normalization}, :mode :unmeasured
+     :strict-slices
+     [{:id :sample-column-identifier
+       :source-lines [674 674]
+       :gate "test/datahike/test/pg_catalog_columns_test.clj"
+       :test-var "alter-table-folds-sample-as-an-ordinary-identifier"}]}
     {:name "tsdicts", :boundaries #{:full-text}, :mode :unmeasured}]}
   {:id 4,
    :name "core relational and schema backlog",

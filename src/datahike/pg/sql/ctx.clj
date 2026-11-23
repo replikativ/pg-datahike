@@ -29,6 +29,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
+            [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
@@ -405,6 +406,22 @@
   "Physical and SQL table names visible to the current statement."
   nil)
 
+(defn table-storage-name
+  "Resolve a SQL relation name to storage in the statement's catalog."
+  [name schema]
+  (let [{:keys [logical->storage storage->logical retired-storage]} *table-name-overrides*
+        storage (when (and (or (nil? schema) (= "public" schema))
+                           (or schema (not (contains? params/*temp-table-map* name))))
+                  (or (get logical->storage name)
+                      (when (or (contains? storage->logical name)
+                                (contains? retired-storage name))
+                        (throw (errors/pg-error :undefined-table {:table name})))))
+        storage-name (or storage name)]
+    (when (and (not *physical-table-names?*)
+               (contains? (some-> params/*session-state* deref :private-storage) storage-name))
+      (throw (errors/pg-error :undefined-table {:table name})))
+    storage-name))
+
 (defn extract-table-info
   "Extract table name and alias from a FROM clause Table.
 
@@ -415,19 +432,7 @@
   (let [name (params/unquote-ident (.getName table))
         schema (some-> (.getSchemaName table) params/unquote-ident)
         cte (when-not schema (get *relation-namespaces* name))
-        storage (when (and (nil? cte)
-                           (or (nil? schema) (= "public" schema))
-                           (or schema (not (contains? params/*temp-table-map* name))))
-                  (let [{:keys [logical->storage storage->logical]} *table-name-overrides*]
-                    (or (get logical->storage name)
-                        (when (contains? storage->logical name)
-                          (throw (ex-info (str "relation \"" name "\" does not exist")
-                                          {:sqlstate "42P01" :error :undefined-table :table name}))))))
-        storage-name (or cte storage name)
-        _ (when (and (not *physical-table-names?*)
-                     (contains? (some-> params/*session-state* deref :private-storage) storage-name))
-            (throw (ex-info (str "relation \"" name "\" does not exist")
-                            {:sqlstate "42P01" :error :undefined-table :table name})))
+        storage-name (or cte (table-storage-name name schema))
         alias (.getAlias table)
         alias-name (when alias (params/unquote-ident (.getName ^Alias alias)))]
     {;; A schema-qualified name never names a CTE (PostgreSQL's CTEs

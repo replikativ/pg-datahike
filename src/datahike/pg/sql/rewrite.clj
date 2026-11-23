@@ -525,20 +525,16 @@
 (defn quote-reserved-alias-rule
   "Find `AS <reserved-kw>` outside of `CAST(... AS ...)` contexts and
    replace `<reserved-kw>` with `\"<reserved-kw>\"` so JSqlParser
-   accepts it as an identifier. Also quote `sample.` references: JSqlParser
-   reserves SAMPLE as query syntax even after PostgreSQL has accepted it as a
-   relation alias. PG already treats the quoted lower-case forms equivalently."
+   accepts it as an identifier. Quote every bare SAMPLE token because it
+   is an ordinary PostgreSQL identifier and a JSqlParser keyword."
   [toks]
   (let [n (count toks)]
     (loop [i 0, acc []]
       (if (>= i n)
         acc
-        (let [t (nth toks i)
-              next-t (nth toks (inc i) nil)]
+        (let [t (nth toks i)]
           (cond
-            ;; `sample.col`: once SAMPLE was used as a relation alias,
-            ;; JSqlParser still reads this as its sampling-clause keyword.
-            (and (= "sample" (kw-text t)) (punct? next-t "."))
+            (= "sample" (kw-text t))
             (recur (inc i) (conj acc [(:pos t) (:end t) "\"sample\""]))
 
             (not= "as" (kw-text t))
@@ -728,6 +724,33 @@
 
 (defn type-using-rule [toks]
   (mapcat #(keep % [:type-prefix :using-removal]) (alter-type-clauses toks)))
+
+(defn drop-column-restrict-rule
+  "Remove the explicit default RESTRICT from ALTER TABLE DROP [COLUMN].
+   JSqlParser supports CASCADE here but rejects RESTRICT."
+  [toks]
+  (let [tokens (remove #(= :comment (:type %)) toks)]
+    (when (= ["alter" "table"] (mapv kw-text (take 2 tokens)))
+      (let [tokens (vec tokens)
+            target (if (= ["if" "exists"] (mapv kw-text (take 2 (drop 2 tokens)))) 4 2)
+            target (if (= "only" (kw-text (nth tokens target nil))) (inc target) target)
+            after-target (referenced-relation-end tokens target)
+            actions (cond->> (drop after-target tokens)
+                      (= "*" (:text (nth tokens after-target nil))) rest)]
+        (keep (fn [action]
+                (when (= "drop" (kw-text (first action)))
+                  (let [args (rest action)
+                        constraint? (= "constraint" (kw-text (first args)))
+                        args (if (= "column" (kw-text (first args))) (rest args) args)
+                        args (if (= ["if" "exists"] (mapv kw-text (take 2 args))) (drop 2 args) args)
+                        [column restrict & tail] args]
+                    (when (and (not constraint?)
+                               (contains? #{:ident :quoted} (:type column))
+                               (= "restrict" (kw-text restrict))
+                               (or (empty? tail)
+                                   (and (= 1 (count tail)) (punct? (first tail) ";"))))
+                      [(:pos restrict) (:end restrict) " "]))))
+              (cls/split-top-level-commas actions))))))
 
 ;; ============================================================================
 ;; INDEX/KEY varchar — quote a reserved-word column name. PG accepts
@@ -1427,6 +1450,7 @@
    operator-paren-rule
    primary-key-only-body-rule
    type-using-rule
+   drop-column-restrict-rule
    reserved-column-name-rule
    boolean-is-rule
    default-fn-call-paren-rule

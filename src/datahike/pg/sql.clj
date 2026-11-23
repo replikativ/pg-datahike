@@ -1065,9 +1065,11 @@
             params/*only-table-marker* (params/only-table-marker sql)
             ctx/*table-name-overrides*
             (when-not ctx/*physical-table-names?*
-              (let [names (catalog-objects/table-name-overrides db)]
-                (when (seq names)
-                  {:storage->logical names :logical->storage (set/map-invert names)})))
+              (let [names (catalog-objects/table-name-overrides db)
+                    retired (pgs/retired-table-names db)]
+                (when (or (seq names) (seq retired))
+                  {:storage->logical names :logical->storage (set/map-invert names)
+                   :retired-storage retired})))
             regoid/*db* db
             regoid/*relation-provider* catalog/relation-identity
             regoid/*relation-db* (or regoid/*relation-db* db)
@@ -1161,18 +1163,16 @@
                       ;; The raw SQL goes with the tokens: a
                       ;; `COPY ( query ) TO` has to hand its query text
                       ;; to the real parser verbatim.
-                      parsed (copy/parse-copy toks sql)]
-                  (merge base parsed))
+                      {:keys [table ns] :as parsed} (copy/parse-copy toks sql)
+                      storage (when table (ctx/table-storage-name table ns))]
+                  (cond-> (merge base parsed)
+                    (not= table storage) (assoc :table storage :logical-target table)))
                 (catch clojure.lang.ExceptionInfo e
-                  (let [data (ex-data e)
-                        state (or (:sqlstate data)
-                                  (case (:error data)
-                                    :feature-not-supported "0A000"
-                                    :syntax-error "42601"
-                                    "XX000"))]
+                  (let [[state message fields] (errors/classify-exception e)]
                     {:type :error
-                     :message (.getMessage e)
-                     :sqlstate state}))
+                     :message message
+                     :sqlstate state
+                     :error-fields fields}))
                 (catch Throwable e
                   {:type :error
                    :message (.getMessage e)
@@ -2558,7 +2558,7 @@
                                               (or (ddl/alter-added-constraint exp)
                                                   {:op :add-constraint})))
                                 ;; DROP COLUMN
-                                          (and (= op "DROP") (.hasColumn exp))
+                                          (and (= op "DROP") (.getColumnName exp))
                                           {:op :drop-column
                                            :name (unquote-ident (.getColumnName exp))
                                            :if-exists? (.isUsingIfExists exp)
