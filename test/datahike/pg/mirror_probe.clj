@@ -233,9 +233,8 @@
                                       (map :name))
                             (:tables custom))))
               "Domain check depending on a publisher function or operator was admitted" custom)
-      (check! (and (not (:compatible? other))
-                   (some #(= :table-schema (:reason %)) (-> other :tables first :issues)))
-              "Alternate identity table in a non-public schema was admitted" other))
+      (check! (:compatible? other)
+              "Alternate identity table in a named schema was rejected" other))
     (check! (:compatible? (report "mirror_pub")) "Publication with common type modifiers was rejected" {})
     (check! (= slots-before (rows source "SELECT slot_name FROM pg_replication_slots WHERE database = current_database()"))
             "The catalog check created a slot" {})))
@@ -2722,6 +2721,125 @@
               {:status :passed :store path}
               (finally (mirror/stop! subscriber)))))))))
 
+(defn run-namespace-probe! [source-url _reference-url _source-conninfo]
+  (let [directory (.toFile (Files/createTempDirectory "pgdh-mirror-scoped-store-" (make-array FileAttribute 0)))
+        path (str (io/file directory "store"))
+        config {:source-url source-url :publication "scoped_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        slot (atom nil)
+        left "billing.events"
+        right "\"Archive Data\".events"
+        moved "shipping.arrivals"
+        table-sql (fn [table]
+                    (str "CREATE TABLE " table
+                         " (id bigint, external_id int NOT NULL, label text, CONSTRAINT event_pk PRIMARY KEY (id))"))
+        ids (fn [conn table]
+              (first (rows conn (str "SELECT '"
+                                     table "'::regclass::oid, c.reltype FROM pg_class c WHERE c.oid = '"
+                                     table "'::regclass::oid"))))
+        contents (fn [conn table]
+                   (rows conn (str "SELECT id, external_id, label FROM " table " ORDER BY id")))
+        compare-tables! (fn [source sink tables]
+                          (await! "Scoped publication rows diverged"
+                                  #(let [status (mirror/status @subscriber)]
+                                     (check! (not (#{:failed :paused} (:state status))) "Mirror paused" status)
+                                     (every? (fn [table] (= (contents source table) (contents sink table))) tables))))
+        index-rows (fn [conn]
+                     (rows conn (str "SELECT n.nspname, i.relname, x.indisprimary FROM pg_index x "
+                                     "JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = i.relnamespace "
+                                     "WHERE n.nspname IN ('billing', 'Archive Data', 'shipping') ORDER BY 1, 2")))
+        locators (fn [conn table]
+                   (rows conn (str "SELECT db_id FROM " table " ORDER BY id")))]
+    (with-open [source (DriverManager/getConnection source-url)]
+      (try
+        (sql! source "CREATE SCHEMA billing" "CREATE SCHEMA \"Archive Data\""
+              (table-sql left) (table-sql right)
+              "CREATE UNIQUE INDEX events_external ON billing.events (external_id)"
+              "CREATE UNIQUE INDEX events_external ON \"Archive Data\".events (external_id)"
+              "ALTER TABLE billing.events REPLICA IDENTITY USING INDEX events_external"
+              "ALTER TABLE \"Archive Data\".events REPLICA IDENTITY USING INDEX events_external"
+              "INSERT INTO billing.events VALUES (1, 11, 'billing')"
+              "INSERT INTO \"Archive Data\".events VALUES (1, 11, 'archive'), (2, 22, 'to delete')"
+              "CREATE PUBLICATION scoped_pub FOR TABLE billing.events, \"Archive Data\".events")
+        (let [admission (mirror/publication-report config)]
+          (check! (:compatible? admission) "Scoped publication was rejected" admission))
+        (reset! subscriber (mirror/start! config))
+        (reset! slot (:slot (await-state! @subscriber :following)))
+        (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+          (compare-tables! source sink [left right])
+          (check! (= (index-rows source) (index-rows sink)) "Scoped indexes differ after snapshot" {})
+          (sql! source "BEGIN"
+                "UPDATE billing.events SET id = 3, label = 'billing WAL' WHERE external_id = 11"
+                "UPDATE \"Archive Data\".events SET label = 'archive WAL' WHERE external_id = 11"
+                "DELETE FROM \"Archive Data\".events WHERE external_id = 22"
+                "COMMIT")
+          (compare-tables! source sink [left right])
+          (let [local-ids (ids sink left)
+                billing-rows (contents sink left)
+                billing-locators (locators sink left)
+                before (inspect-db path (fn [db] (.toInstant ^java.util.Date
+                                                  (:db/txInstant (d/entity db (:max-tx db))))))]
+            (check! (= (parse-long (first (ids source left)))
+                       (inspect-db path (fn [db]
+                                          (d/q '[:find ?source .
+                                                 :in $ ?local
+                                                 :where [?table :datahike.pg.object/oid ?local]
+                                                 [?table :datahike.pg.mirror/publisher-relation-oid ?source]]
+                                               db (parse-long (first local-ids))))))
+                    "Publisher relation OID was not retained" {})
+            (sql! source "BEGIN"
+                  "CREATE SCHEMA shipping"
+                  "ALTER TABLE billing.events SET SCHEMA shipping"
+                  "ALTER TABLE shipping.events RENAME TO arrivals"
+                  "ALTER TABLE shipping.arrivals ADD COLUMN received text DEFAULT 'pending'"
+                  "UPDATE shipping.arrivals SET label = 'arrived' WHERE id = 3"
+                  "COMMIT")
+            (await! "Schema move did not reach the mirror"
+                    #(let [status (mirror/status @subscriber)]
+                       (check! (not (#{:failed :paused} (:state status))) "Schema move paused the mirror" status)
+                       (= [["t"]] (rows sink "SELECT to_regclass('shipping.arrivals') IS NOT NULL"))))
+            (compare-tables! source sink [moved right])
+            (check! (= local-ids (ids sink moved)) "Schema move changed the table or row type OID" {})
+            (check! (= billing-locators (locators sink moved)) "Schema move changed record identity" {})
+            (check! (= [["pending"]] (rows sink "SELECT received FROM shipping.arrivals")) "Column addition lost old rows" {})
+            (with-open [historical (DriverManager/getConnection (sink-url @subscriber))]
+              (sql! historical (str "SET datahike.as_of = " (literal before)))
+              (check! (= billing-rows (contents historical left)) "Historical lookup lost the earlier schema" {})))
+          (sql! source "BEGIN"
+                "ALTER TABLE \"Archive Data\".events REPLICA IDENTITY DEFAULT"
+                "DROP INDEX \"Archive Data\".events_external"
+                "CREATE UNIQUE INDEX events_external ON \"Archive Data\".events (external_id, id)"
+                "ALTER TABLE \"Archive Data\".events REPLICA IDENTITY USING INDEX events_external"
+                "UPDATE \"Archive Data\".events SET label = 'replacement index' WHERE external_id = 11"
+                (table-sql left)
+                "INSERT INTO billing.events VALUES (4, 44, 'reused name')"
+                "ALTER PUBLICATION scoped_pub ADD TABLE billing.events"
+                "COMMIT")
+          (await! "Publisher table addition did not reach the mirror"
+                  #(let [status (mirror/status @subscriber)]
+                     (check! (not (#{:failed :paused} (:state status))) "Table addition paused the mirror" status)
+                     (= [["t"]] (rows sink "SELECT to_regclass('billing.events') IS NOT NULL"))))
+          (compare-tables! source sink [left moved right])
+          (check! (= (index-rows source) (index-rows sink)) "Identity index replacement affected a sibling" {}))
+        (mirror/stop! @subscriber)
+        (reset! subscriber (mirror/start! config))
+        (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+          (check! (= @slot (:slot (mirror/status @subscriber))) "Restart replaced the replication slot" {})
+          (sql! source "BEGIN"
+                "TRUNCATE billing.events"
+                "UPDATE \"Archive Data\".events SET label = 'after restart' WHERE id = 1"
+                "UPDATE shipping.arrivals SET label = 'also after restart' WHERE id = 3"
+                "COMMIT")
+          (compare-tables! source sink [left moved right]))
+        {:status :passed :schemas 3}
+        (finally
+          (when @subscriber (mirror/stop! @subscriber))
+          (when (and @slot (= ["false"] (slot-query source @slot "active::text")))
+            (sql! source (str "SELECT pg_drop_replication_slot(" (literal @slot) ")")))
+          (doseq [file (reverse (file-seq directory))]
+            (io/delete-file file)))))))
+
 (defn -main [& [argument mode]]
   (cond
     (= "--failover" argument)
@@ -2756,6 +2874,7 @@
       (check! (every? seq [source reference conninfo])
               "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
       (prn ((case argument
+              "--namespaces" run-namespace-probe!
               "--partitions" run-partition-probe!
               "--root-publication" run-root-publication-probe!
               "--type-refresh" run-type-refresh-probe!

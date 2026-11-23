@@ -5175,7 +5175,8 @@
 
 (defn- new-table-storage-name [db table oid namespace-oid]
   (let [schema (dbi/-schema db)]
-    (if (or (not= namespace-oid catalog-objects/public-namespace-oid)
+    (if (or (and (not sql-ctx/*physical-table-names?*)
+                 (not= namespace-oid catalog-objects/public-namespace-oid))
             (contains? schema (pgs/row-marker-attr table)))
       (let [occupied (into #{} (keep #(when (keyword? %) (namespace %))) (keys schema))]
         (first (remove occupied
@@ -5262,7 +5263,9 @@
         object-data (catalog-objects/create-object-tx
                      db {:class-oid catalog-objects/pg-class-oid
                          :oid oid :kind :table :name table-name
-                         :storage-name (when (not= table-name storage) storage)
+                         :storage-name (when (or (not= table-name storage)
+                                                 (not= namespace-oid catalog-objects/public-namespace-oid))
+                                         storage)
                          :namespace-oid namespace-oid})
         row-type-data (catalog-objects/create-object-tx
                        db {:class-oid catalog-objects/pg-type-oid
@@ -9951,16 +9954,17 @@
 
 (defn- ddl-table-object [db name schema]
   (let [public catalog-objects/public-namespace-oid
-        find-object #(catalog-objects/object-by-identity db catalog-objects/pg-class-oid % name)]
+        find-object #(catalog-objects/object-by-identity db catalog-objects/pg-class-oid % name)
+        find-qualified #(when-let [namespace (catalog-objects/namespace-by-name db schema)]
+                          (find-object (:datahike.pg.object/oid namespace)))]
     (cond
       sql-ctx/*physical-table-names?*
-      (or (catalog-objects/object-by-storage-name db name) (find-object public))
+      (or (catalog-objects/object-by-storage-name db name)
+          (if schema (find-qualified) (find-object public)))
 
       (session-temp-storage? name schema) (find-object public)
 
-      schema
-      (when-let [namespace (catalog-objects/namespace-by-name db schema)]
-        (find-object (:datahike.pg.object/oid namespace)))
+      schema (find-qualified)
 
       :else
       (some #(find-object (:datahike.pg.object/oid %))
@@ -10095,7 +10099,7 @@
                     (catalog-objects/creation-namespace
                      db (effective-search-path session-state) types/pg-role-name))]
     (cond
-      (or sql-ctx/*physical-table-names?* (:temp? parsed)) public
+      (or (:temp? parsed) (and sql-ctx/*physical-table-names?* (nil? schema))) public
       (and schema (nil? namespace))
       (throw (ex-info (str "schema \"" schema "\" does not exist") {:sqlstate "3F000"}))
       :else (or (:datahike.pg.object/oid namespace) public))))
@@ -10560,7 +10564,9 @@
                               {:feature "moving tables into system schemas or moving owned sequences"}))
 
       :else
-      (let [row-type (catalog-objects/object-by-identity db catalog-objects/pg-type-oid old-namespace name)
+      (let [object-name (:datahike.pg.object/name table)
+            row-type (catalog-objects/object-by-identity
+                      db catalog-objects/pg-type-oid old-namespace object-name)
             indexes (when (contains? (dbi/-schema db) :datahike.pg.index/relation)
                       (d/q '[:find [?oid ...]
                              :in $ ?table
@@ -10580,8 +10586,8 @@
                 (throw (ex-info (str "relation \"" object-name "\" already exists in schema \"" new-schema "\"")
                                 {:sqlstate "42P07"})))
             _ (when (and row-type (catalog-objects/object-by-identity
-                                   db catalog-objects/pg-type-oid new-namespace name))
-                (throw (ex-info (str "type \"" name "\" already exists in schema \"" new-schema "\"")
+                                   db catalog-objects/pg-type-oid new-namespace object-name))
+                (throw (ex-info (str "type \"" object-name "\" already exists in schema \"" new-schema "\"")
                                 {:sqlstate "42710"})))]
         (cond-> (into [] (mapcat #(catalog-objects/move-relation-object-tx % new-namespace)) moving)
           (nil? (:datahike.pg.object/storage-name table))
