@@ -341,3 +341,54 @@
   (is (= [["public.view_seq"]] (rows "SELECT pg_get_serial_sequence('owner_view', 'id')")))
   (is (nil? (err "DROP VIEW owner_view")))
   (is (= [[nil]] (rows "SELECT to_regclass('view_seq')"))))
+
+(deftest qualified-sequences-keep-counters-catalogs-and-defaults-separate
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE SCHEMA \"Archive Data\""
+               "CREATE SEQUENCE public.ticket START WITH 7"
+               "CREATE SEQUENCE billing.ticket START WITH 101 INCREMENT BY 2"
+               "CREATE SEQUENCE \"Archive Data\".\"Ticket.Name\" START WITH 901"
+               "SET search_path TO billing, public"
+               "CREATE TABLE billing.invoice (id bigint DEFAULT nextval('ticket'), label text)"
+               "ALTER SEQUENCE billing.ticket OWNED BY billing.invoice.id"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["101" "7" "901"]]
+         (rows "SELECT nextval('ticket'), nextval('public.ticket'), nextval('\"Archive Data\".\"Ticket.Name\"')")))
+  (is (= [["103"]] (rows "SELECT nextval('billing.ticket'::regclass)")))
+  (is (= [["billing.ticket"]] (rows "SELECT pg_get_serial_sequence('billing.invoice','id')")))
+  (is (= [["Archive Data" "Ticket.Name"] ["billing" "ticket"] ["public" "ticket"]]
+         (rows "SELECT sequence_schema, sequence_name FROM information_schema.sequences ORDER BY 1,2")))
+  (is (= [["t"]]
+         (rows "SELECT 'billing.ticket'::regclass::oid <> 'public.ticket'::regclass::oid")))
+  (is (nil? (err "SET search_path TO public")))
+  (is (= [["105"]]
+         (rows "INSERT INTO billing.invoice (label) VALUES ('bound default') RETURNING id")))
+  (is (nil? (err "ALTER SEQUENCE billing.ticket RESTART WITH 201")))
+  (is (= [["201"]]
+         (rows "INSERT INTO billing.invoice (label) VALUES ('restart') RETURNING id")))
+  (is (= "2BP01" (.sqlstate (run "DROP SEQUENCE billing.ticket"))))
+  (is (nil? (err "DROP TABLE billing.invoice")))
+  (is (= [["t" "t"]]
+         (rows "SELECT to_regclass('billing.ticket') IS NULL, to_regclass('public.ticket') IS NOT NULL")))
+  (is (= [["8"]] (rows "SELECT nextval('public.ticket')")))
+  (is (= "42P01" (.sqlstate (run "SELECT nextval('billing.ticket')"))))
+  (is (= "42P01" (.sqlstate (run "DROP SEQUENCE billing.ticket")))))
+
+(deftest dump-style-defaults-retain-the-qualified-sequence-dependency
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE SCHEMA \"Archive Data\""
+               "CREATE SEQUENCE billing.ticket START 11"
+               "CREATE SEQUENCE \"Archive Data\".\"O'Brien.Ticket\" START 51"
+               "SET search_path TO ''"
+               "CREATE TABLE billing.invoice (id bigint DEFAULT nextval('billing.ticket'::regclass))"
+               "CREATE TABLE \"Archive Data\".invoice (id bigint)"
+               (str "ALTER TABLE ONLY \"Archive Data\".invoice ALTER COLUMN id "
+                    "SET DEFAULT nextval('\"Archive Data\".\"O''Brien.Ticket\"'::regclass)")]]
+    (is (nil? (err sql)) sql))
+  (is (= [["11"]] (rows "INSERT INTO billing.invoice DEFAULT VALUES RETURNING id")))
+  (is (= [["51"]] (rows "INSERT INTO \"Archive Data\".invoice DEFAULT VALUES RETURNING id")))
+  (is (= [["nextval('billing.ticket'::regclass)"]]
+         (rows (str "SELECT pg_catalog.pg_get_expr(adbin, adrelid) FROM pg_catalog.pg_attrdef "
+                    "WHERE adrelid = 'billing.invoice'::regclass"))))
+  (is (= "2BP01" (.sqlstate (run "DROP SEQUENCE billing.ticket"))))
+  (is (= "2BP01" (.sqlstate (run "DROP SEQUENCE \"Archive Data\".\"O'Brien.Ticket\"")))))

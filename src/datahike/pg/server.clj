@@ -5296,12 +5296,22 @@
                 (:pg/fk-parent-schema datum) (dissoc :pg/fk-parent-schema))))
           tx-data)))
 
+(defn- bind-scoped-sequence-default [db datum]
+  (if (= :nextval (:pg/default-kind datum))
+    (let [reference (or (:pg/default-arg datum) (:pg/default-value datum))
+          storage (sequence/reference-storage-name db reference)
+          object (when storage (sequence/object-by-storage-name db storage))]
+      (if (:datahike.pg.object/storage-name object)
+        (assoc datum :pg/default-arg (str (:datahike.pg.object/oid object)))
+        datum))
+    datum))
+
 (defn- table-create-tx-data [db parsed]
   (doseq [column (:column-order parsed)]
     (ddl/validate-table-column-name! column))
   (let [table-name (:table-name parsed)
         namespace-oid (get parsed :namespace-oid catalog-objects/public-namespace-oid)
-        raw-ddl-data (ddl-tx-data parsed)
+        raw-ddl-data (mapv #(bind-scoped-sequence-default db %) (ddl-tx-data parsed))
         _ (when (and (not= namespace-oid catalog-objects/public-namespace-oid)
                      (or (seq (:identity-cols parsed)) (seq (:inherits parsed))))
             (throw (errors/pg-error :feature-not-supported
@@ -5659,9 +5669,7 @@
                   :else (classified-error "CREATE VIEW error: " outcome))))))))))
 
 (defn- retract-sequence-tx [db seq-name]
-  (let [object (catalog-objects/object-by-identity
-                db catalog-objects/pg-class-oid
-                catalog-objects/public-namespace-oid seq-name)]
+  (let [object (sequence/object-by-storage-name db seq-name)]
     (into (if-let [eid (sequence/id-by-name db seq-name)] [[:db/retractEntity eid]] [])
           (when (= :sequence (:datahike.pg.object/kind object))
             (catalog-objects/drop-object-tx db catalog-objects/pg-class-oid
@@ -7696,48 +7704,16 @@
    retries even at thousands of qps; 100 is generous."
   100)
 
-(defn- bare-sequence-name [seq-name]
-  (if (and seq-name (str/includes? seq-name "."))
-    (last (str/split seq-name #"\." 2))
-    seq-name))
-
-(defn- sequence-name-by-oid [db spelling]
-  (when (re-matches #"[0-9]+" spelling)
-    (when-let [oid (parse-long spelling)]
-      (when (catalog-objects/valid-user-oid? oid)
-        (let [object (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid)]
-          (when (= :sequence (:datahike.pg.object/kind object))
-            (:datahike.pg.object/name object)))))))
-
-(defn- sequence-reference-name
-  "Resolve a sequence argument to the stored name. Databases created before
-   sequence DDL folded unquoted names may still have a mixed-case spelling."
-  [db spelling]
-  (when spelling
-    (or (sequence-name-by-oid db spelling)
-        (let [canonical (peek (regoid/parse-qualified-name spelling))
-              legacy (bare-sequence-name spelling)]
-          (if (and (not= canonical legacy)
-                   (not (sequence-exists? db canonical))
-                   (sequence-exists? db legacy))
-            legacy
-            canonical)))))
+(defn- sequence-reference-name [db spelling]
+  (or (sequence/reference-storage-name db spelling)
+      (throw (ex-info "sequence does not exist"
+                      {:error :undefined-sequence :sequence spelling}))))
 
 (defn- sequence-descriptor [db seq-name]
   (when (and (string? seq-name) (get (dbi/-schema db) :__seq__/name))
-    (let [lookup #(sequence/entity-by-name db %)
-          bare-name (bare-sequence-name seq-name)
-          entity (or (lookup seq-name)
-                     (some-> (sequence-name-by-oid db seq-name) lookup)
-                     (when (not= bare-name seq-name)
-                       (lookup bare-name))
-                         ;; Defaults and deferred projections may still
-                         ;; carry the spelling from a SQL regclass literal.
-                         ;; Preserve physical names and legacy stored names
-                         ;; before resolving the literal's canonical form.
-                     (let [canonical (peek (regoid/parse-qualified-name seq-name))]
-                       (when (and (not= canonical seq-name) (not= canonical bare-name))
-                         (lookup canonical))))]
+    (let [entity (or (sequence/entity-by-name db seq-name)
+                     (some->> (sequence/reference-storage-name db seq-name)
+                              (sequence/entity-by-name db)))]
       (when entity
         (let [increment (get entity :__seq__/increment 1)]
           {:eid (:db/id entity)
@@ -10141,15 +10117,14 @@
         (catch Exception e
           (classified-error "TRUNCATE error: " e))))))
 
-(defn- table-creation-namespace [db parsed session-state]
+(defn- relation-creation-namespace [db schema temp? session-state]
   (let [public catalog-objects/public-namespace-oid
-        schema (:table-schema parsed)
         namespace (if schema
                     (catalog-objects/namespace-by-name db schema)
                     (catalog-objects/creation-namespace
                      db (effective-search-path session-state) types/pg-role-name))]
     (cond
-      (or (:temp? parsed) (and sql-ctx/*physical-table-names?* (nil? schema))) public
+      (or temp? (and sql-ctx/*physical-table-names?* (nil? schema))) public
       (and schema (nil? namespace))
       (throw (ex-info (str "schema \"" schema "\" does not exist") {:sqlstate "3F000"}))
       :else (or (:datahike.pg.object/oid namespace) public))))
@@ -10172,8 +10147,8 @@
                    (sql/ctas-finish (dissoc parsed :ctas-select) rows aliases oids
                                     (:db ctx)))
                  parsed)
-        parsed (assoc parsed :namespace-oid (table-creation-namespace
-                                             (:db ctx) parsed (:session-state ctx)))
+        parsed (assoc parsed :namespace-oid (relation-creation-namespace
+                                             (:db ctx) (:table-schema parsed) (:temp? parsed) (:session-state ctx)))
         logical (:temp-logical-name parsed)
         [^PgWireServer$QueryResult result created?]
         (execute-ddl-create conn parsed tx-state session-id)]
@@ -10209,7 +10184,7 @@
 
 (declare matview-entity)
 
-(defn- sequence-ownership-tx [db seq-name parts]
+(defn- sequence-ownership-tx [db seq-name sequence-namespace parts]
   (when (seq parts)
     (let [names (mapv params/unquote-ident parts)
           target (when (< 1 (count names))
@@ -10223,7 +10198,7 @@
                                     (matview-entity db name)))
                        (throw (ex-info (str "sequence cannot be owned by relation " (dump/quote-ident name))
                                        {:sqlstate "42809"})))
-                     (when (not= catalog-objects/public-namespace-oid namespace-oid)
+                     (when (not= sequence-namespace namespace-oid)
                        (throw (ex-info "sequence must be in same schema as table it is linked to"
                                        {:sqlstate "55000"})))
                      (if-let [column (catalog-objects/column-by-name db relation-oid column-name)]
@@ -10258,12 +10233,24 @@
    effect after this same statement."
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
-        {:keys [seq-name if-exists? seq-opts]} parsed
+        {logical-name :seq-name :keys [seq-schema if-exists? seq-opts]} parsed
         current-db (if (:in-tx? @tx-state)
                      (:speculative-db @tx-state)
                      (d/db conn))
-        existing (sequence-current-params current-db seq-name)]
+        object (ddl-table-object current-db logical-name seq-schema)
+        seq-name (or (sequence/object-storage-name object) logical-name)
+        namespace-oid (or (catalog-objects/object-namespace-oid current-db object)
+                          catalog-objects/public-namespace-oid)
+        existing (when (or (= :sequence (:datahike.pg.object/kind object))
+                           (and (nil? object) (public-relation-fallback? logical-name seq-schema)
+                                (nil? (catalog-objects/object-by-storage-name current-db logical-name))))
+                   (sequence-current-params current-db seq-name))]
     (cond
+      (and object (not= :sequence (:datahike.pg.object/kind object)))
+      (classified-error ""
+                        (ex-info (str "\"" logical-name "\" is not a sequence")
+                                 {:sqlstate "42809"}))
+
       (and (nil? existing) if-exists?)
       ;; PG emits a notice and succeeds.
       (empty-result "ALTER SEQUENCE")
@@ -10297,7 +10284,7 @@
                         (into (relation-definition-revision-tx current-db [seq-name])))
               tx-data (if-let [owner (:owned-by params)]
                         (guard-catalog-tx
-                         (into tx-data (sequence-ownership-tx current-db seq-name owner))
+                         (into tx-data (sequence-ownership-tx current-db seq-name namespace-oid owner))
                          (catalog-basis/capture current-db))
                         tx-data)]
           (if (:in-tx? @tx-state)
@@ -10310,28 +10297,40 @@
         (catch Exception e
           (classified-error "" e))))))
 
+(defn- fresh-sequence-storage-name [db logical-name oid public?]
+  (if (and public? (not (sequence-exists? db logical-name)))
+    logical-name
+    (let [base (str "__dh_pg_seq_" oid)]
+      (first (remove #(or (sequence-exists? db %)
+                          (catalog-objects/object-by-storage-name db %))
+                     (cons base (map #(str base "_" %) (range 1 Long/MAX_VALUE))))))))
+
 (defn- exec-ddl-create-sequence
   [ctx parsed]
-  (let [{:keys [conn tx-state session-id]} ctx
-        {:keys [seq-name if-not-exists? tx-data seq-params]} parsed]
+  (let [{:keys [conn tx-state session-id session-state]} ctx
+        {:keys [seq-name seq-schema if-not-exists? tx-data seq-params]} parsed]
     (acquire-catalog-allocation-lock! conn tx-state session-id)
     (loop [attempt 0]
       (let [current-db (if (:in-tx? @tx-state)
                          (:speculative-db @tx-state)
                          (d/db conn))
-            existing-relation
-            (catalog-objects/object-by-identity
-             current-db catalog-objects/pg-class-oid
-             catalog-objects/public-namespace-oid seq-name)]
+            namespace-oid (relation-creation-namespace current-db seq-schema false session-state)
+            public? (= namespace-oid catalog-objects/public-namespace-oid)
+            existing-relation (or (catalog-objects/object-by-identity
+                                   current-db catalog-objects/pg-class-oid namespace-oid seq-name)
+                                  (and public? (sequence-exists? current-db seq-name)
+                                       (nil? (catalog-objects/object-by-storage-name current-db seq-name))))]
         (cond
+          (and (not public?) (< namespace-oid catalog-objects/first-user-oid))
+          (classified-error "" (ex-info "cannot create a sequence in a system schema" {:sqlstate "42501"}))
+
       ;; CREATE SEQUENCE on an existing sequence. PG raises 42P07
       ;; duplicate_table (sequences are relations — commands/sequence.c
       ;; goes through heap_create_with_catalog like tables do); IF NOT
       ;; EXISTS downgrades it to a notice + success. Before this check,
       ;; collisions silently re-transacted the init entity, RESETTING
       ;; the counter of a live sequence.
-          (and (or existing-relation (sequence-exists? current-db seq-name))
-               (not if-not-exists?))
+          (and existing-relation (not if-not-exists?))
           (classified-error ""
                             (ex-info (str "relation \"" seq-name "\" already exists")
                                      {:sqlstate "42P07"
@@ -10341,30 +10340,34 @@
       ;; IF NOT EXISTS on an existing sequence: PG emits a notice and
       ;; makes no change. Skipping the transact keeps the live counter
       ;; untouched (re-transacting the init entity would reset it).
-          (or existing-relation (sequence-exists? current-db seq-name))
+          existing-relation
           (empty-result "CREATE SEQUENCE")
 
           :else
           (let [{:keys [oid] allocation-tx :tx-data}
                 (catalog-objects/reserve-user-oid-tx current-db)
+                storage (fresh-sequence-storage-name current-db seq-name oid public?)
                 create-data
                 (into (vec allocation-tx)
                       (concat
-                       tx-data
+                       (map (fn [row]
+                              (if (:__seq__/name row) (assoc row :__seq__/name storage) row))
+                            tx-data)
                        (catalog-objects/create-object-tx
                         current-db
                         {:class-oid catalog-objects/pg-class-oid
                          :oid oid :kind :sequence :name seq-name
-                         :namespace-oid catalog-objects/public-namespace-oid})))
+                         :storage-name (when (not= storage seq-name) storage)
+                         :namespace-oid namespace-oid})))
                 create-data (if-let [owner (:owned-by seq-params)]
                               (guard-catalog-tx
-                               (into create-data (sequence-ownership-tx current-db seq-name owner))
+                               (into create-data (sequence-ownership-tx current-db storage namespace-oid owner))
                                (catalog-basis/capture current-db))
                               create-data)]
             (if (:in-tx? @tx-state)
               (let [result (execute-ddl-in-tx tx-state create-data "CREATE SEQUENCE")]
                 (when (nil? (.error ^PgWireServer$QueryResult result))
-                  (register-local-sequence! tx-state seq-name))
+                  (register-local-sequence! tx-state storage))
                 result)
               (let [outcome (try (transact-recorded! conn create-data)
                                  :committed
@@ -12631,7 +12634,8 @@
         attr (:datahike.pg.column/storage-ident column)
         entity (d/entity db attr)
         eid (:db/id entity)
-        metadata (alter-default-metadata default (types/oid->pg-name (:datahike.pg.column/type-oid column)) name)]
+        metadata (bind-scoped-sequence-default
+                  db (alter-default-metadata default (types/oid->pg-name (:datahike.pg.column/type-oid column)) name))]
     (when (or (:pg/generated entity) (identity-storage-column? db table attr))
       (throw (ex-info (str "column \"" name "\" of relation \"" table "\" "
                            (if (:pg/generated entity) "is a generated column" "is an identity column"))
@@ -13176,7 +13180,8 @@
                                                        :let [{:keys [type storage-ident base-type typmod default
                                                                      type-object normalized-type array-spec]}
                                                              (get add-spec-by-name name)
-                                                             metadata (alter-default-metadata default base-type name)
+                                                             metadata (bind-scoped-sequence-default
+                                                                       db (alter-default-metadata default base-type name))
                                                              raw-type type
                                                              unsupported-base (str/replace raw-type #"\s*\([^)]*\)" "")
                                                              _ (when (types/unsupported-input-type? unsupported-base)
@@ -13646,14 +13651,16 @@
   (drop-owned-sequences-tx db [seq-name] (constantly false) cascade?))
 
 (defn- exec-ddl-drop-sequence
-  [ctx {:keys [seq-name if-exists? cascade?]}]
+  [ctx {:keys [seq-name seq-schema if-exists? cascade?]}]
   (let [{:keys [conn tx-state]} ctx]
     (try
       (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
-            eid (sequence/id-by-name db seq-name)
-            object (catalog-objects/object-by-identity
-                    db catalog-objects/pg-class-oid
-                    catalog-objects/public-namespace-oid seq-name)]
+            object (ddl-table-object db seq-name seq-schema)
+            storage (or (sequence/object-storage-name object) seq-name)
+            eid (when (or (some? object)
+                          (and (public-relation-fallback? seq-name seq-schema)
+                               (nil? (catalog-objects/object-by-storage-name db seq-name))))
+                  (sequence/id-by-name db storage))]
         (cond
           (and (nil? eid) (nil? object) if-exists?)
           (do (params/notice! "NOTICE" (str "sequence \"" seq-name
@@ -13670,7 +13677,7 @@
 
           :else
           (commit-ddl ctx
-                      (guard-catalog-tx [(deferred-drop-op drop-sequence-tx seq-name cascade?)]
+                      (guard-catalog-tx [(deferred-drop-op drop-sequence-tx storage cascade?)]
                                         (catalog-basis/capture db))
                       "DROP SEQUENCE")))
       (catch Exception e

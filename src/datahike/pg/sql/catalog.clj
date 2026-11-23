@@ -1536,7 +1536,8 @@
     (when called? value)))
 
 (defn- sequence-oid [db name]
-  (or (pgs/table-oid db name) (Math/abs (long (.hashCode ^String name)))))
+  (or (:datahike.pg.object/oid (sequence/object-by-storage-name db name))
+      (Math/abs (long (.hashCode ^String name)))))
 
 (defn sequence-position-by-oid
   "The two fields exposed by pg_get_sequence_data. Missing relations and
@@ -1546,7 +1547,7 @@
                  (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid))
         entity (cond
                  (= :sequence (:datahike.pg.object/kind object))
-                 (sequence/entity-by-name db (:datahike.pg.object/name object))
+                 (sequence/entity-by-name db (sequence/object-storage-name object))
 
                  (and oid (nil? object))
                  (some #(when (= oid (sequence-oid db (:__seq__/name %))) %)
@@ -1821,12 +1822,12 @@
 (defn- default-oid [db column]
   (or (:column-eid column) (:db/id (d/entity db (:attr column)))))
 
-(defn- sequence-name [sequences spelling]
+(defn- sequence-name [db sequences spelling]
   (when (string? spelling)
-    (if (contains? sequences spelling)
-      spelling
-      (let [canonical (peek (regoid/parse-qualified-name spelling))]
-        (when (contains? sequences canonical) canonical)))))
+    (let [storage (or (when (contains? sequences spelling) spelling)
+                      (binding [regoid/*search-path* ["public"]]
+                        (sequence/reference-storage-name db spelling)))]
+      (when (contains? sequences storage) storage))))
 
 (defn- sequence-column-defaults [db tables sequences]
   (for [[table columns] tables
@@ -1835,7 +1836,7 @@
         reference (ddl/default-sequence-references (:pg/default-kind entity)
                                                    (:pg/default-value entity)
                                                    (:pg/default-arg entity))
-        :let [name (sequence-name sequences reference)]
+        :let [name (sequence-name db sequences reference)]
         :when name]
     {:table table :column column :entity entity :sequence name}))
 
@@ -2088,8 +2089,8 @@
                    (let [nm (:__seq__/name s)]
                      {:pg_class/oid
                       (sequence-oid cte-db nm)
-                      :pg_class/relname nm
-                      :pg_class/relnamespace 2200
+                      :pg_class/relname (catalog-objects/public-relation-name cte-db nm)
+                      :pg_class/relnamespace (storage-schema-oid cte-db nm)
                       :pg_class/relispartition false
                       :pg_class/relkind "S"
                       :pg_class/reltype 0
@@ -2971,8 +2972,8 @@
             (pgs/table-names user-schema cte-db)))
     "pg_sequences"
     (mapv (fn [s]
-            (cond-> {:pg_sequences/schemaname "public"
-                     :pg_sequences/sequencename (:__seq__/name s)
+            (cond-> {:pg_sequences/schemaname (storage-schema-name cte-db (:__seq__/name s))
+                     :pg_sequences/sequencename (catalog-objects/public-relation-name cte-db (:__seq__/name s))
                      :pg_sequences/sequenceowner "datahike"
                      :pg_sequences/data_type (:__seq__/type s)
                      :pg_sequences/start_value (:__seq__/start s)
@@ -2996,8 +2997,8 @@
     ;; start 1, max 2^63-1.
     (mapv (fn [s]
             {:information_schema_sequences/sequence_catalog "datahike"
-             :information_schema_sequences/sequence_schema "public"
-             :information_schema_sequences/sequence_name (:__seq__/name s)
+             :information_schema_sequences/sequence_schema (storage-schema-name cte-db (:__seq__/name s))
+             :information_schema_sequences/sequence_name (catalog-objects/public-relation-name cte-db (:__seq__/name s))
              :information_schema_sequences/start_value (str (:__seq__/start s))
              :information_schema_sequences/minimum_value (str (:__seq__/minvalue s))
              :information_schema_sequences/maximum_value (str (:__seq__/maxvalue s))
@@ -3115,7 +3116,7 @@
                             "\"bit\""))
                      :nextval
                      (let [spelling (or arg value)
-                           name (sequence-name @sequences spelling)
+                           name (sequence-name cte-db @sequences spelling)
                            path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
                            reference (if name
                                        (binding [regoid/*db* cte-db

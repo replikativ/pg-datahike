@@ -1779,7 +1779,11 @@
                             (throw (errors/pg-error :undefined-column {:table table :column column-name})))
                           (if-let [name (first (sort-by #(sequence/id-by-name db %)
                                                         (sequence/owned-by-column db table column)))]
-                            (str "public." (fns/quote-identifier name))
+                            (let [sequence-object (sequence/object-by-storage-name db name)
+                                  namespace-oid (catalog-objects/object-namespace-oid db sequence-object)
+                                  schema (:datahike.pg.object/name (catalog-objects/namespace-by-oid db namespace-oid))]
+                              (str (fns/quote-identifier (or schema "public")) "."
+                                   (fns/quote-identifier (or (:datahike.pg.object/name sequence-object) name))))
                             :__null__))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)

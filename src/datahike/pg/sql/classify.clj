@@ -1561,14 +1561,15 @@
                   (kw=? (second toks) "not")
                   (kw=? (nth toks 2 nil) "exists"))
         ts (if ine? (drop 3 toks) toks)]
-    (or (when-let [[nm ts1] (read-relation-name ts :text)]
+    (or (when-let [[parts ts1] (read-relation-parts ts)]
           (let [[opts ts2] (read-sequence-options ts1)
                 ts3 (drop-while #(= ";" (:text %)) ts2)]
             (when (empty? ts3)
-              {:kind :create-sequence
-               :seq-name nm
-               :if-not-exists? ine?
-               :seq-opts opts})))
+              (cond-> {:kind :create-sequence
+                       :seq-name (:text (peek parts))
+                       :if-not-exists? ine?
+                       :seq-opts opts}
+                (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2))))))))
         {:kind :generic-sql})))
 
 (defn- classify-alter-sequence
@@ -1581,14 +1582,15 @@
   [toks]
   (let [ie? (and (kw=? (first toks) "if") (kw=? (second toks) "exists"))
         ts (if ie? (drop 2 toks) toks)]
-    (or (when-let [[nm ts1] (read-relation-name ts :text)]
+    (or (when-let [[parts ts1] (read-relation-parts ts)]
           (let [[opts ts2] (read-sequence-options ts1)
                 ts3 (drop-while #(= ";" (:text %)) ts2)]
             (when (and (seq opts) (empty? ts3))
-              {:kind :alter-sequence
-               :seq-name nm
-               :if-exists? ie?
-               :seq-opts opts})))
+              (cond-> {:kind :alter-sequence
+                       :seq-name (:text (peek parts))
+                       :if-exists? ie?
+                       :seq-opts opts}
+                (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2))))))))
         {:kind :generic-sql})))
 
 (defn- classify-truncate

@@ -541,7 +541,8 @@
               collapse-fn-parens #(str/replace %
                                                #"([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)"
                                                "$1()")
-              base (-> peeled strip-cast collapse-fn-parens)]
+              base (-> peeled strip-cast collapse-fn-parens)
+              nextval-match (re-matches #"(?i)\(?\s*(?:pg_catalog\s*\.\s*)?nextval\s*\(\s*'((?:[^']|'')*)'\s*(?:::\s*(?:pg_catalog\s*\.\s*)?regclass)?\s*\)\s*\)?" base)]
           (cond
             (= low "null")  {:kind :literal :value nil}
             (= low "true")  {:kind :literal :value true}
@@ -584,16 +585,9 @@
             (re-matches #"(?i)current_user(?:\(\))?|session_user(?:\(\))?|user"
                         base)
             {:kind :fn :value "current_user"}
-            ;; nextval('seqname') — literal arg. Also accepts:
-            ;;   - schema-qualified seq names: nextval('public.foo_id_seq')
-            ;;     (we drop the schema; sequences live in a flat namespace)
-            ;;   - the ::regclass cast that pg_dump always emits:
-            ;;     nextval('foo_seq'::regclass)
-            ;;   - parens preserved by our DEFAULT-paren rewrite rule:
-            ;;     (nextval('foo_seq'::regclass))
-            (re-matches #"(?i)\(?\s*nextval\s*\(\s*'(?:[^'.]+\.)?([^']+)'\s*(?:::\s*regclass)?\s*\)\s*\)?" base)
-            (let [m (re-matches #"(?i)\(?\s*nextval\s*\(\s*'(?:[^'.]+\.)?([^']+)'\s*(?:::\s*regclass)?\s*\)\s*\)?" base)]
-              {:kind :nextval :value (second m)})
+            ;; Keep the complete regclass spelling for namespace resolution.
+            nextval-match
+            {:kind :nextval :value (str/replace (second nextval-match) "''" "'")}
             ;; Anything else is kept as its own text and evaluated per
             ;; write, through the same expression evaluator a CHECK
             ;; constraint uses. Deferred rather than folded here because

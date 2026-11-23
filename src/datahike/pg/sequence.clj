@@ -1,8 +1,11 @@
 (ns datahike.pg.sequence
   "Stored sequence position shared by execution, catalog reads, and dumps."
-  (:require [datahike.api :as d]
+  (:require [clojure.string :as str]
+            [datahike.api :as d]
             [datahike.db.interface :as dbi]
-            [datahike.db.utils :as dbu]))
+            [datahike.db.utils :as dbu]
+            [datahike.pg.catalog.objects :as objects]
+            [datahike.pg.catalog.regoid :as regoid]))
 
 (def called-attribute
   {:db/ident :__seq__/is-called
@@ -24,6 +27,50 @@
 (defn entity-by-name [db name]
   (when-let [eid (id-by-name db name)]
     (d/pull db '[*] eid)))
+
+(defn object-by-storage-name [db storage]
+  (let [registered (objects/object-by-storage-name db storage)
+        object (if (= :sequence (:datahike.pg.object/kind registered))
+                 registered
+                 (objects/object-by-identity db objects/pg-class-oid objects/public-namespace-oid storage))]
+    (when (= :sequence (:datahike.pg.object/kind object)) object)))
+
+(defn object-storage-name [object]
+  (or (:datahike.pg.object/storage-name object) (:datahike.pg.object/name object)))
+
+(defn reference-storage-name
+  "Resolve a SQL sequence name or numeric regclass value to the counter's name."
+  [db spelling]
+  (when (and db (string? spelling))
+    (if (re-matches #"[0-9]+" spelling)
+      (when-let [oid (parse-long spelling)]
+        (when (objects/valid-user-oid? oid)
+          (let [object (objects/object-by-address db objects/pg-class-oid oid)]
+            (when (= :sequence (:datahike.pg.object/kind object)) (object-storage-name object)))))
+      (let [parts (regoid/parse-qualified-name spelling)
+            schema (when (> (count parts) 1) (nth parts (- (count parts) 2)))
+            legacy (if (= 1 (count parts)) spelling (last (str/split spelling #"\." 2)))
+            oid (try
+                  (binding [regoid/*db* db regoid/*relation-db* db
+                            regoid/*relation-provider* regoid/registry-relation]
+                    (regoid/relation-name-oid spelling))
+                  (catch clojure.lang.ExceptionInfo error
+                    (let [state (:sqlstate (ex-data error))]
+                      (when-not (or (#{"42P01" "3F000"} state)
+                                    (and (= "0A000" state) (= 1 (count parts))
+                                         (str/starts-with? (peek parts) "__dh_pg_temp_")))
+                        (throw error)))))
+            object (when oid (objects/object-by-address db objects/pg-class-oid oid))]
+        (if object
+          (when (= :sequence (:datahike.pg.object/kind object)) (object-storage-name object))
+          ;; Old stores could use the literal spelling and have no catalog
+          ;; object. Such counters belong to public.
+          (when (or (= "public" schema) (and (nil? schema) (some #{"public"} regoid/*search-path*)))
+            (some (fn [candidate]
+                    (when (and (id-by-name db candidate)
+                               (nil? (:datahike.pg.object/storage-name (object-by-storage-name db candidate))))
+                      candidate))
+                  [(peek parts) legacy])))))))
 
 (defn owned-by-column
   "Sequence names owned by a stable catalog column. Older SERIAL and
