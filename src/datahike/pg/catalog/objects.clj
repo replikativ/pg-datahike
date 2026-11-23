@@ -288,6 +288,20 @@
                    [?e :datahike.pg.object/name ?name]]
                  db)))))
 
+(defn scoped-table-name-overrides
+  "Map the SQL [schema name] of each table with a separate storage name."
+  [db]
+  (let [db (catalog-metadata-db db)]
+    (when (and db (get (dbi/-schema db) :datahike.pg.object/storage-name))
+      (into {}
+            (map (fn [[schema name storage]] [[schema name] storage]))
+            (d/q '[:find ?schema ?name ?storage
+                   :where [?e :datahike.pg.object/storage-name ?storage]
+                   [?e :datahike.pg.object/name ?name]
+                   [?e :datahike.pg.object/namespace ?ns]
+                   [?ns :datahike.pg.object/name ?schema]]
+                 db)))))
+
 (defn public-relation-storage-name [db name]
   (or (:datahike.pg.object/storage-name
        (object-by-identity db pg-class-oid public-namespace-oid name))
@@ -300,6 +314,9 @@
 
 (defn public-relation-name [db storage]
   (or (:datahike.pg.object/name (object-by-storage-name db storage)) storage))
+
+(defn scoped-index-ident [oid]
+  (keyword "datahike.pg.index.scoped" (str oid)))
 
 (defn primary-index-oid [db relation-oid]
   (when (get (dbi/-schema db) :datahike.pg.index/primary?)
@@ -557,6 +574,18 @@
           revision (long (or (:datahike.pg.object/revision object) 0))]
       [[:db/cas object-ref :datahike.pg.object/revision
         revision (inc revision)]])))
+
+(defn move-relation-object-tx
+  "Move a table, row type or index to a namespace without changing its OID."
+  [object namespace-oid]
+  (let [{:datahike.pg.object/keys [class-oid name revision]} object
+        ref [:datahike.pg.object/address-key (:datahike.pg.object/address-key object)]]
+    [[:db/cas ref :datahike.pg.object/revision revision (inc revision)]
+     [:db/retract ref :datahike.pg.object/identity-key (:datahike.pg.object/identity-key object)]
+     [:db/add ref :datahike.pg.object/identity-key
+      (identity-key class-oid namespace-oid name)]
+     [:db/add ref :datahike.pg.object/namespace
+      [:datahike.pg.object/address-key (address-key pg-namespace-oid namespace-oid)]]]))
 
 (defn rename-object-tx
   [db class-oid object-oid new-name identity-tail]

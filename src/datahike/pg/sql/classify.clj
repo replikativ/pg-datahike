@@ -762,34 +762,32 @@
 
       :else                 {:kind :generic-sql})))
 
+(defn- read-relation-parts [toks]
+  (let [toks (if (kw=? (first toks) "only") (rest toks) toks)]
+    (when (ident-tok? (first toks))
+      (loop [tokens [(first toks)] remaining (rest toks)]
+        (if (and (= "." (:text (first remaining))) (ident-tok? (second remaining)))
+          (recur (conj tokens (second remaining)) (drop 2 remaining))
+          [tokens (if (= "*" (:text (first remaining))) (rest remaining) remaining)])))))
+
 (defn- read-relation-name
-  "Consume one `[ONLY] [schema.]name [*]` from the token stream.
-   Returns [last-name-segment remaining-toks], or nil when the head is
-   not a relation name. The schema qualifier is dropped for the
-   single-namespace store. The optional token reader can preserve the raw SQL
-   spelling for callers that normalize identifiers after classification."
+  "Consume one [ONLY] [schema.]name [*] and return its last identifier."
   ([toks] (read-relation-name toks ident-text))
   ([toks token-name]
-   (let [toks (if (kw=? (first toks) "only") (rest toks) toks)]
-     (when (ident-tok? (first toks))
-       (loop [nm (token-name (first toks))
-              ts (rest toks)]
-         (if (and (= "." (:text (first ts))) (ident-tok? (second ts)))
-           (recur (token-name (second ts)) (drop 2 ts))
-           [nm (if (= "*" (:text (first ts))) (rest ts) ts)]))))))
+   (when-let [[parts remaining] (read-relation-parts toks)]
+     [(token-name (peek parts)) remaining])))
 
 (defn- read-relation-list
-  "Comma-separated relation names (each per read-relation-name).
-   Returns [names remaining-toks], or nil on a malformed head — the
-   caller falls back to :generic-sql and JSqlParser reports the real
-   syntax error."
-  ([toks] (read-relation-list toks ident-text))
-  ([toks token-name]
+  "Consume a comma-separated relation list, retaining qualifiers when requested."
+  ([toks] (read-relation-list toks ident-text false))
+  ([toks token-name preserve-parts?]
    (loop [names [] ts toks]
-     (when-let [[nm ts'] (read-relation-name ts token-name)]
-       (if (= "," (:text (first ts')))
-         (recur (conj names nm) (rest ts'))
-         [(conj names nm) ts'])))))
+     (when-let [[parts remaining] (read-relation-parts ts)]
+       (let [name (if preserve-parts? (mapv token-name parts) (token-name (peek parts)))
+             names (conj names name)]
+         (if (= "," (:text (first remaining)))
+           (recur names (rest remaining))
+           [names remaining]))))))
 
 (defn- classify-drop-table
   "DROP TABLE with MORE THAN ONE name. JSqlParser 5.2's Drop grammar
@@ -804,13 +802,13 @@
   (let [if-exists? (boolean (and (kw=? (first toks) "if")
                                  (kw=? (second toks) "exists")))
         ts (if if-exists? (drop 2 toks) toks)]
-    (or (when-let [[names ts'] (read-relation-list ts)]
+    (or (when-let [[names ts'] (read-relation-list ts :text true)]
           (let [cascade? (boolean (kw=? (first ts') "cascade"))
                 ts' (if (kw-in? (first ts') #{"cascade" "restrict"})
                       (rest ts') ts')
                 ts' (drop-while #(= ";" (:text %)) ts')]
             (when (and (empty? ts') (> (count names) 1))
-              {:kind :drop-table-multi :tables names :if-exists? if-exists?
+              {:kind :drop-table-multi :relation-parts names :if-exists? if-exists?
                :cascade? cascade?})))
         {:kind :generic-sql})))
 
@@ -1590,9 +1588,8 @@
    children to include/exclude); CASCADE is carried so parse-sql can
    reject it with 0A000."
   [toks]
-  (let [ts (if (kw=? (first toks) "table") (rest toks) toks)
-        table-name #(if (= :ident (:type %)) (str/lower-case (:text %)) (ident-text %))]
-    (or (when-let [[names ts1] (read-relation-list ts table-name)]
+  (let [ts (if (kw=? (first toks) "table") (rest toks) toks)]
+    (or (when-let [[names ts1] (read-relation-list ts :text true)]
           (let [identity? (and (or (kw=? (first ts1) "restart")
                                    (kw=? (first ts1) "continue"))
                                (kw=? (second ts1) "identity"))
@@ -1603,7 +1600,7 @@
                       (rest ts2) ts2)
                 ts4 (drop-while #(= ";" (:text %)) ts3)]
             (when (empty? ts4)
-              {:kind :truncate :tables names
+              {:kind :truncate :relation-parts names
                :restart-identity? restart? :cascade? (boolean cascade?)})))
         {:kind :generic-sql})))
 
@@ -1724,18 +1721,17 @@
       (kw=? t1 "sequence") (classify-alter-sequence rest-toks)
 
       (kw=? t1 "table")
-      ;; Consume optional [ONLY], [IF EXISTS] and the table name (possibly
-      ;; schema.name), then inspect what follows.
       (let [ts (if (kw=? (first rest-toks) "only") (rest rest-toks) rest-toks)
-            ts (if (and (kw=? (first ts) "if") (kw=? (second ts) "exists"))
-                 (drop 2 ts) ts)
-            ;; Consume exactly one (possibly schema-qualified) name.
-            ts (if (ident-tok? (first ts)) (rest ts) ts)
-            ts (if (and (= "." (:text (first ts)))
-                        (ident-tok? (second ts)))
-                 (drop 2 ts)
-                 ts)]
+            if-exists? (and (kw=? (first ts) "if") (kw=? (second ts) "exists"))
+            ts (if if-exists? (drop 2 ts) ts)
+            [parts ts] (read-relation-parts ts)
+            [set-token schema-token target & tail] ts]
         (cond
+          (and parts (kw=? set-token "set") (kw=? schema-token "schema")
+               (ident-tok? target) (every? #(= ";" (:text %)) tail))
+          {:kind :move-table-schema :relation-parts [(mapv :text parts)]
+           :new-schema (:text target) :if-exists? if-exists?}
+
           (alter-table-rls? ts)
           {:kind :rls :reject-kind :rls :tag "ALTER TABLE ROW LEVEL SECURITY"}
 

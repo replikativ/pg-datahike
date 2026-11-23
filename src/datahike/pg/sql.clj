@@ -947,7 +947,7 @@
                  ;; them is a larger change. Tracked separately.
                    [(:db m) (:schema m)
                     (cond-> deferred (:deferred m) (conj (:deferred m)))
-                    ns-map]
+                    (assoc ns-map cte-name cte-name)]
                    ;; Both fixed-point compilers declined the shape. Leaving
                    ;; the CTE unmaterialised lets its outer scan construct an
                    ;; invalid Datalog query ("Query for unknown vars"). Make
@@ -1057,6 +1057,11 @@
           (ex-info (str "parameter number too large at or near \"$" digits "\"")
                    {:error :syntax-error :sqlstate "42601"}))))))
 
+(defn- table-targets [plan]
+  (let [refs (mapv #(regoid/parse-qualified-name (str/join "." %)) (:relation-parts plan))]
+    (assoc plan :tables (mapv peek refs)
+           :table-schemas (mapv #(when (> (count %) 1) (nth % (- (count %) 2))) refs))))
+
 (defn- parse-sql*
   "Inner parse-sql implementation — does the actual work. Public
    parse-sql wraps this with the LRU result cache."
@@ -1065,11 +1070,16 @@
             params/*only-table-marker* (params/only-table-marker sql)
             ctx/*table-name-overrides*
             (when-not ctx/*physical-table-names?*
-              (let [names (catalog-objects/table-name-overrides db)
-                    retired (pgs/retired-table-names db)]
-                (when (or (seq names) (seq retired))
-                  {:storage->logical names :logical->storage (set/map-invert names)
-                   :retired-storage retired})))
+              (let [scoped (catalog-objects/scoped-table-name-overrides db)
+                    retired (pgs/retired-table-names db)
+                    public (into {} (keep (fn [[[schema name] storage]]
+                                            (when (= "public" schema) [name storage]))) scoped)]
+                {:scoped scoped :logical->storage public
+                 :nonpublic-names (into #{} (keep (fn [[[schema name] _]]
+                                                    (when-not (= schema "public") name))) scoped)
+                 :storage-names (set (vals scoped))
+                 :retired-storage retired
+                 :catalog-table? catalog/catalog-table?}))
             regoid/*db* db
             regoid/*relation-provider* catalog/relation-identity
             regoid/*relation-db* (or regoid/*relation-db* db)
@@ -1163,8 +1173,11 @@
                       ;; The raw SQL goes with the tokens: a
                       ;; `COPY ( query ) TO` has to hand its query text
                       ;; to the real parser verbatim.
-                      {:keys [table ns] :as parsed} (copy/parse-copy toks sql)
+                      {:keys [table ns direction] :as parsed} (copy/parse-copy toks sql)
                       storage (when table (ctx/table-storage-name table ns))]
+                  (when (and (= direction :from) (ctx/system-relation-schema? ns))
+                    (throw (errors/pg-error :feature-not-supported
+                                            {:feature "COPY FROM into system relations"})))
                   (cond-> (merge base parsed)
                     (not= table storage) (assoc :table storage :logical-target table)))
                 (catch clojure.lang.ExceptionInfo e
@@ -1254,12 +1267,12 @@
                 {:type :error
                  :message "TRUNCATE ... CASCADE is not supported by datahike pgwire"
                  :sqlstate "0A000"}
-                (assoc base :type :truncate))
+                (table-targets (assoc base :type :truncate)))
 
               ;; DROP TABLE a, b, … — same executor as single-name
               ;; :ddl-drop (exec-ddl-drop loops :tables when present).
               :drop-table-multi
-              (assoc base :type :ddl-drop)
+              (table-targets (assoc base :type :ddl-drop))
 
               ;; CREATE FUNCTION … LANGUAGE sql. The classifier carries
               ;; the whole signature (:fn-name :params :returns :strict?
@@ -1293,6 +1306,10 @@
 
               :drop-role-object
               (assoc base :type :ddl-drop-role)
+
+              :move-table-schema
+              (table-targets (assoc base :type :ddl-move-table-schema
+                                    :new-schema (first (regoid/parse-qualified-name (:new-schema base)))))
 
               :schema-ddl
               (let [identifier (comp first regoid/parse-qualified-name)]
@@ -2462,12 +2479,14 @@
                                     :cascade? cascade?}
                         "index" {:type :ddl-drop-index
                                  :name (unquote-ident obj-name)
+                                 :index-schema (some-> d .getName .getSchemaName unquote-ident)
                                  :if-exists? (.isIfExists d)}
                         "view" {:type :ddl-drop-view
                                 :view-name (unquote-ident obj-name)
                                 :if-exists? (.isIfExists d)
                                 :cascade? cascade?}
                         {:type :ddl-drop :table obj-name
+                         :table-schema (some-> d .getName .getSchemaName unquote-ident)
                          :if-exists? (.isIfExists d)
                          :cascade? cascade?}))
 
@@ -2500,6 +2519,7 @@
                       {:type :ddl-create-index
                        :name (some-> (.getName idx) unquote-ident)
                        :table (some-> (.getTable ci) .getName unquote-ident)
+                       :table-schema (some-> (.getTable ci) .getSchemaName unquote-ident)
                        :method (some-> (.getUsing idx) str/lower-case)
                        :unique? (= "UNIQUE" (some-> (.getType idx) str/upper-case))
                        :if-not-exists? (.isUsingIfNotExists ci)
@@ -2617,7 +2637,9 @@
                                               {:op :other :raw (str exp)})
                                           :else {:op :other :raw (str exp)})))
                                     expressions)]
-                      {:type :ddl-alter :table table-name :operations ops})
+                      {:type :ddl-alter :table table-name
+                       :table-schema (some-> alter-stmt .getTable .getSchemaName unquote-ident)
+                       :operations ops})
 
                     :else
                     {:type :error :message (str "Unsupported SQL statement: " (type stmt))}))]
