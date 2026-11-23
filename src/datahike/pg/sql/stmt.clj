@@ -4247,35 +4247,33 @@
                   view-name (unquote-ident (.getName table))
                   relation-schema (some-> (.getSchemaName table) unquote-ident)
                   [definition columns-str partition?]
-                  ;; Resolve an unqualified owning temp relation before a
-                  ;; persisted view of the same name, as for ordinary tables.
-                  (when (and (or (nil? relation-schema) (= "public" relation-schema))
-                             (not (and (nil? relation-schema)
-                                       (contains? params/*temp-table-map* view-name)))
-                             (or (not (contains? (:nonpublic-names ctx/*table-name-overrides*) view-name))
-                                 (= view-name (ctx/table-storage-name view-name relation-schema false))))
+                  ;; Views and partition parents share relation lookup with tables.
+                  ;; An unqualified CTE or owning temp table shadows either.
+                  (when-not (and (nil? relation-schema)
+                                 (or (contains? params/*temp-table-map* view-name)
+                                     (contains? *cte-namespaces* view-name)))
                     (or
                      (when (and (contains? schema :datahike.pg.partition/definition)
-                                (not (params/only-table-reference? table))
-                                (not (contains? *cte-namespaces* view-name))
-                                (or (nil? (.getSchemaName table))
-                                    (= "public" (unquote-ident (.getSchemaName table)))))
-                       (when-let [oid (pgs/table-oid db view-name)]
-                         (let [query (d/q '[:find ?definition .
-                                            :in $ ?oid
-                                            :where [?e :datahike.pg.object/oid ?oid]
-                                            [?e :datahike.pg.partition/definition ?definition]]
-                                          db oid)]
-                           (when (seq query) [query nil oid]))))
-                     (first
-                      (d/q '{:find [?definition ?columns]
-                             :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
-                             :where [[?e ?name-attr ?view-name]
-                                     [?e ?definition-attr ?definition]
-                                     [?e ?columns-attr ?columns]]}
-                           db :datahike.pg/view-name
-                           :datahike.pg/view-definition
-                           :datahike.pg/view-columns view-name))))]
+                                (not (params/only-table-reference? table)))
+                       (when-let [storage (ctx/table-storage-name view-name relation-schema false)]
+                         (when-let [oid (pgs/storage-table-oid db storage)]
+                           (let [query (d/q '[:find ?definition .
+                                              :in $ ?oid
+                                              :where [?e :datahike.pg.object/oid ?oid]
+                                              [?e :datahike.pg.partition/definition ?definition]]
+                                            db oid)]
+                             (when (seq query) [query nil oid])))))
+                     (when (and (or (nil? relation-schema) (= "public" relation-schema))
+                                (= view-name (ctx/table-storage-name view-name relation-schema false)))
+                       (first
+                        (d/q '{:find [?definition ?columns]
+                               :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
+                               :where [[?e ?name-attr ?view-name]
+                                       [?e ?definition-attr ?definition]
+                                       [?e ?columns-attr ?columns]]}
+                             db :datahike.pg/view-name
+                             :datahike.pg/view-definition
+                             :datahike.pg/view-columns view-name)))))]
               (if definition
                 (let [columns (try (edn/read-string columns-str)
                                    (catch Exception _ nil))

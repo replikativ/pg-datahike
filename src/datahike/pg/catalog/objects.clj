@@ -575,6 +575,21 @@
       [[:db/cas object-ref :datahike.pg.object/revision
         revision (inc revision)]])))
 
+(defn table-namespace-objects
+  "The table and catalog objects that use the table's namespace."
+  [db table]
+  (let [row-type (object-by-identity db pg-type-oid (object-namespace-oid db table)
+                                     (:datahike.pg.object/name table))
+        indexes (when (contains? (dbi/-schema db) :datahike.pg.index/relation)
+                  (d/q '[:find [?oid ...]
+                         :in $ ?table
+                         :where [?index :datahike.pg.index/relation ?table]
+                         [?index :datahike.pg.object/oid ?oid]]
+                       db (:db/id table)))]
+    (into (cond-> [table] row-type (conj row-type))
+          (keep #(object-by-address db pg-class-oid %))
+          indexes)))
+
 (defn move-relation-object-tx
   "Move a table, row type or index to a namespace without changing its OID."
   [object namespace-oid]

@@ -284,8 +284,6 @@
          (.getBoolean row "has_filter") (conj {:reason :row-filter})
          (and (= "p" (.getString row "relkind")) (nil? leaves))
          (conj {:reason :root-partition-routing})
-         (and (not= "public" schema) (or leaves (.getBoolean row "relispartition")))
-         (conj {:reason :partition-schema})
          (.getBoolean row "partition_detach_pending") (conj {:reason :partition-detach-pending})
          (not (#{"r" "p"} (.getString row "relkind"))) (conj {:reason :relation-kind})
          (not= "p" (.getString row "relpersistence")) (conj {:reason :nonpermanent-table})
@@ -1468,14 +1466,15 @@
 
 (defn- plan-publication-removals [previous current removed]
   (let [active (relations-by-id current)
-        active-names (into #{} (map :name) (vals active))
+        relation-key (juxt :schema :name)
+        active-names (into #{} (map relation-key) (vals active))
         frozen (into (:unpublished-tables previous {})
                      (comp (remove partition-relation?) (map (juxt :relation-id identity)))
                      removed)]
     (reduce-kv (fn [plan id table]
                  (cond
                    (contains? active id) plan
-                   (contains? active-names (:name table)) (update plan :retire conj table)
+                   (contains? active-names (relation-key table)) (update plan :retire conj table)
                    :else (assoc-in plan [:retain id] table)))
                {:retain {} :retire (filterv partition-relation? removed)}
                frozen)))
@@ -1573,6 +1572,7 @@
                 ;; layout lets us assign the current attnums before staging.
                 {:table table
                  :storage-name storage
+                 :stage-storage-name (fresh-storage-name #{} table)
                  :previous (if (and prior (not-every? :attnum (:columns prior)))
                              (update prior :columns
                                      (fn [columns]
@@ -1959,11 +1959,11 @@
   (sink-execute! destination "SET DateStyle = 'ISO, YMD'")
   (sink-execute! destination "SET TIME ZONE 'UTC'"))
 
-(defn- with-refresh-storage [{:keys [table storage-name]}]
-  (assoc table :storage-name storage-name))
+(defn- with-stage-storage [{:keys [table stage-storage-name]}]
+  (assoc table :storage-name stage-storage-name))
 
 (defn- copy-snapshot! [source destination changes check-running! on-bytes]
-  (let [relations (mapv with-refresh-storage changes)]
+  (let [relations (mapv with-stage-storage changes)]
     (transaction!
      destination
      (fn []
@@ -1996,7 +1996,7 @@
               expected (into {} (map (juxt :relation-id identity)) tables)
               staged-relations (into {} (map (fn [change]
                                                [(:relation-id (:table change))
-                                                (storage-table (with-refresh-storage change))]))
+                                                (storage-table (with-stage-storage change))]))
                                      changes)
               included? (set (keys expected))]
           (reset! phase :catching-up)
@@ -2136,6 +2136,26 @@
                      (filter retraction? rename-ops)
                      (remove retraction? rename-ops)))))
 
+(defn- move-table-namespaces! [destination changes]
+  (when-let [moves (seq (remove #(= (:from %) (:to %)) changes))]
+    (stage-data!
+     destination
+     (fn [db]
+       (let [operations
+             (mapcat
+              (fn [{:keys [storage to]}]
+                (let [table (catalog-objects/object-by-storage-name db storage)
+                      target (:datahike.pg.object/oid (catalog-objects/namespace-by-name db to))]
+                  (require! (and table target) "Missing local table or schema at cutover"
+                            {:storage storage :schema to})
+                  (mapcat #(catalog-objects/move-relation-object-tx % target)
+                          (catalog-objects/table-namespace-objects db table))))
+              moves)
+             retract? #(= :db/retract (first %))]
+         ;; Publisher transactions can swap tables, including identically
+         ;; named indexes, by moving through a third schema.
+         (into (filterv retract? operations) (remove retract?) operations))))))
+
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
@@ -2179,26 +2199,23 @@
       (doseq [{:keys [previous storage-name]} rekeys :when (seq (key-columns previous))]
         (check-running!)
         (drop-primary-key! destination (assoc previous :name storage-name)))
-      (doseq [{:keys [table previous storage-name]} changes :when previous]
+      (doseq [{:keys [table previous storage-name stage-storage-name]} changes :when previous]
         (check-running!)
-        (let [staged-table (assoc table :name storage-name)
-              live-table (assoc staged-table :schema (:schema previous))]
+        (let [staged-table (assoc table :name stage-storage-name)
+              live-table (assoc table :name storage-name :schema (:schema previous))]
           (adapt-layout! destination stage-db previous live-table staged-table)
           (when-not (:partition-leaves table)
             (reconcile-table! destination stage-db staged-table live-table previous renamed-labels check-running!))
           (set-column-metadata! destination live-table)))
-      (doseq [{:keys [storage name from to]} renames]
-        (when (not= from to)
-          (sink-execute! destination
-                         (str "ALTER TABLE " (relation-name {:schema from :name storage})
-                              " SET SCHEMA " (ident to))))
+      (move-table-namespaces! destination renames)
+      (doseq [{:keys [storage name]} renames]
         (set-table-name! destination storage name))
-      (doseq [{:keys [table previous storage-name]} changes :when (nil? previous)]
+      (doseq [{:keys [table previous storage-name stage-storage-name]} changes :when (nil? previous)]
         (check-running!)
         (let [live-table (assoc table :name storage-name)]
           (create-table! destination live-table)
           (when-not (:partition-leaves table)
-            (transfer-staged-table! staged destination live-table live-table on-bytes))
+            (transfer-staged-table! staged destination (assoc table :name stage-storage-name) live-table on-bytes))
           (when (not= storage-name (:name table))
             (set-table-name! destination storage-name (:name table)))))
       ;; Relation and index names share a PostgreSQL namespace. Install

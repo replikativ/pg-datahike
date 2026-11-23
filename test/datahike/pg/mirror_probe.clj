@@ -2721,16 +2721,18 @@
               {:status :passed :store path}
               (finally (mirror/stop! subscriber)))))))))
 
-(defn run-namespace-probe! [source-url _reference-url _source-conninfo]
+(defn run-namespace-probe! [source-url]
   (let [directory (.toFile (Files/createTempDirectory "pgdh-mirror-scoped-store-" (make-array FileAttribute 0)))
         path (str (io/file directory "store"))
         config {:source-url source-url :publication "scoped_pub" :store-path path
                 :schema-refresh? true :server {:port 0}}
         subscriber (atom nil)
         slot (atom nil)
+        frozen (atom nil)
         left "billing.events"
         right "\"Archive Data\".events"
         moved "shipping.arrivals"
+        public-table "public.external_claim"
         table-sql (fn [table]
                     (str "CREATE TABLE " table
                          " (id bigint, external_id int NOT NULL, label text, CONSTRAINT event_pk PRIMARY KEY (id))"))
@@ -2746,7 +2748,7 @@
                                      (check! (not (#{:failed :paused} (:state status))) "Mirror paused" status)
                                      (every? (fn [table] (= (contents source table) (contents sink table))) tables))))
         index-rows (fn [conn]
-                     (rows conn (str "SELECT n.nspname, i.relname, x.indisprimary FROM pg_index x "
+                     (rows conn (str "SELECT n.nspname, i.relname, x.indisprimary, x.indkey::text FROM pg_index x "
                                      "JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = i.relnamespace "
                                      "WHERE n.nspname IN ('billing', 'Archive Data', 'shipping') ORDER BY 1, 2")))
         locators (fn [conn table]
@@ -2755,13 +2757,18 @@
       (try
         (sql! source "CREATE SCHEMA billing" "CREATE SCHEMA \"Archive Data\""
               (table-sql left) (table-sql right)
+              "CREATE TABLE public.events_external (id int PRIMARY KEY, external_id int, label text)"
+              "CREATE TABLE public.invoices (id int PRIMARY KEY, external_id int, label text)"
+              "INSERT INTO public.events_external VALUES (1, 1, 'public alias')"
+              "INSERT INTO public.invoices VALUES (2, 2, 'prior storage name reused by an index')"
               "CREATE UNIQUE INDEX events_external ON billing.events (external_id)"
               "CREATE UNIQUE INDEX events_external ON \"Archive Data\".events (external_id)"
               "ALTER TABLE billing.events REPLICA IDENTITY USING INDEX events_external"
               "ALTER TABLE \"Archive Data\".events REPLICA IDENTITY USING INDEX events_external"
               "INSERT INTO billing.events VALUES (1, 11, 'billing')"
               "INSERT INTO \"Archive Data\".events VALUES (1, 11, 'archive'), (2, 22, 'to delete')"
-              "CREATE PUBLICATION scoped_pub FOR TABLE billing.events, \"Archive Data\".events")
+              (str "CREATE PUBLICATION scoped_pub FOR TABLE billing.events, "
+                   "\"Archive Data\".events, public.events_external, public.invoices"))
         (let [admission (mirror/publication-report config)]
           (check! (:compatible? admission) "Scoped publication was rejected" admission))
         (reset! subscriber (mirror/start! config))
@@ -2792,6 +2799,8 @@
                   "CREATE SCHEMA shipping"
                   "ALTER TABLE billing.events SET SCHEMA shipping"
                   "ALTER TABLE shipping.events RENAME TO arrivals"
+                  "ALTER TABLE public.events_external RENAME TO external_claim"
+                  "ALTER TABLE public.invoices RENAME CONSTRAINT invoices_pkey TO events_external"
                   "ALTER TABLE shipping.arrivals ADD COLUMN received text DEFAULT 'pending'"
                   "UPDATE shipping.arrivals SET label = 'arrived' WHERE id = 3"
                   "COMMIT")
@@ -2799,7 +2808,9 @@
                     #(let [status (mirror/status @subscriber)]
                        (check! (not (#{:failed :paused} (:state status))) "Schema move paused the mirror" status)
                        (= [["t"]] (rows sink "SELECT to_regclass('shipping.arrivals') IS NOT NULL"))))
-            (compare-tables! source sink [moved right])
+            (compare-tables! source sink [moved right public-table "public.invoices"])
+            (check! (= [["i"]] (rows sink "SELECT relkind FROM pg_class WHERE oid = 'public.events_external'::regclass"))
+                    "An archived storage name hid a new index" {})
             (check! (= local-ids (ids sink moved)) "Schema move changed the table or row type OID" {})
             (check! (= billing-locators (locators sink moved)) "Schema move changed record identity" {})
             (check! (= [["pending"]] (rows sink "SELECT received FROM shipping.arrivals")) "Column addition lost old rows" {})
@@ -2821,18 +2832,61 @@
                      (check! (not (#{:failed :paused} (:state status))) "Table addition paused the mirror" status)
                      (= [["t"]] (rows sink "SELECT to_regclass('billing.events') IS NOT NULL"))))
           (compare-tables! source sink [left moved right])
-          (check! (= (index-rows source) (index-rows sink)) "Identity index replacement affected a sibling" {}))
+          (check! (= (index-rows source) (index-rows sink)) "Identity index replacement affected a sibling" {})
+          (let [left-ids (ids sink left)
+                right-ids (ids sink right)]
+            (sql! source "BEGIN" "CREATE SCHEMA transit"
+                  "ALTER TABLE billing.events SET SCHEMA transit"
+                  "ALTER TABLE \"Archive Data\".events SET SCHEMA billing"
+                  "ALTER TABLE transit.events SET SCHEMA \"Archive Data\""
+                  "DROP SCHEMA transit" "COMMIT")
+            (compare-tables! source sink [left right])
+            (check! (= [right-ids left-ids] [(ids sink left) (ids sink right)])
+                    "Swapping same-named tables changed local identities" {})
+            (check! (= (index-rows source) (index-rows sink)) "Swapping tables changed scoped indexes" {})))
+        (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+          (sql! source "BEGIN"
+                (str "CREATE TABLE shipping.parcels (id int PRIMARY KEY, external_id int, label text) "
+                     "PARTITION BY RANGE (id)")
+                "CREATE TABLE billing.parcel_range PARTITION OF shipping.parcels FOR VALUES FROM (0) TO (100)"
+                (str "CREATE TABLE \"Archive Data\".parcel_range PARTITION OF shipping.parcels "
+                     "FOR VALUES FROM (100) TO (200)")
+                "INSERT INTO shipping.parcels VALUES (1, 11, 'partition left'), (101, 22, 'partition right')"
+                "ALTER PUBLICATION scoped_pub ADD TABLE shipping.parcels"
+                "COMMIT")
+          (await! "The parent partition did not reach the mirror"
+                  #(let [status (mirror/status @subscriber)]
+                     (check! (not (#{:failed :paused} (:state status))) "Named partitions paused the mirror" status)
+                     (= [["t"]] (rows sink "SELECT to_regclass('shipping.parcels') IS NOT NULL"))))
+          (compare-tables! source sink ["shipping.parcels" "billing.parcel_range" "\"Archive Data\".parcel_range"])
+          (let [partition-catalog
+                (str "SELECT n.nspname, c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid "
+                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                     "WHERE i.inhparent = 'shipping.parcels'::regclass ORDER BY 1,2")]
+            (check! (= (rows source partition-catalog) (rows sink partition-catalog))
+                    "Cross-schema partition attachments differ" {}))
+          (check! (= [] (rows sink "SELECT id FROM ONLY shipping.parcels")) "ONLY expanded the named parent" {})
+          (reset! frozen (contents sink right))
+          (let [removed-id (parse-long (first (ids source right)))]
+            (sql! source "ALTER PUBLICATION scoped_pub DROP TABLE \"Archive Data\".events")
+            (await! "Removed table was not recorded as unpublished"
+                    #(contains? (get-in (durable-checkpoint path) [:manifest :unpublished-tables]) removed-id)))
+          (check! (= @frozen (contents sink right)) "An active namesake hid the unpublished table" {}))
         (mirror/stop! @subscriber)
         (reset! subscriber (mirror/start! config))
         (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
           (check! (= @slot (:slot (mirror/status @subscriber))) "Restart replaced the replication slot" {})
           (sql! source "BEGIN"
                 "TRUNCATE billing.events"
-                "UPDATE \"Archive Data\".events SET label = 'after restart' WHERE id = 1"
+                "UPDATE \"Archive Data\".events SET label = 'unpublished after restart' WHERE id = 4"
+                "UPDATE public.external_claim SET label = 'after restart' WHERE id = 1"
                 "UPDATE shipping.arrivals SET label = 'also after restart' WHERE id = 3"
+                "UPDATE shipping.parcels SET id = 102, label = 'moved after restart' WHERE id = 1"
                 "COMMIT")
-          (compare-tables! source sink [left moved right]))
-        {:status :passed :schemas 3}
+          (compare-tables! source sink
+                           [left moved public-table "shipping.parcels" "billing.parcel_range" "\"Archive Data\".parcel_range"])
+          (check! (= @frozen (contents sink right)) "Restart lost the frozen unpublished relation" {}))
+        {:status :passed :schemas 4}
         (finally
           (when @subscriber (mirror/stop! @subscriber))
           (when (and @slot (= ["false"] (slot-query source @slot "active::text")))
@@ -2865,6 +2919,10 @@
     (prn (run-type-lifecycle-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
                                     (System/getenv "PG_MIRROR_SOURCE_URL")
                                     (System/getenv "PG_MIRROR_RECOVERY_DIR")))
+    (= "--namespaces" argument)
+    (let [source (System/getenv "PG_MIRROR_SOURCE_URL")]
+      (check! (seq source) "Set PG_MIRROR_SOURCE_URL to a disposable publisher database" {})
+      (prn (run-namespace-probe! source)))
     (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
     :else
@@ -2874,7 +2932,6 @@
       (check! (every? seq [source reference conninfo])
               "Set PG_MIRROR_SOURCE_URL, PG_MIRROR_REFERENCE_URL and PG_MIRROR_SOURCE_CONNINFO" {})
       (prn ((case argument
-              "--namespaces" run-namespace-probe!
               "--partitions" run-partition-probe!
               "--root-publication" run-root-publication-probe!
               "--type-refresh" run-type-refresh-probe!

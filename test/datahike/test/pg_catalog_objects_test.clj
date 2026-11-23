@@ -184,6 +184,22 @@
           (exec! "DROP TABLE archive.entries, archive.events")
           (is (= [["public"]] (rows "SELECT label FROM public.events"))))))))
 
+(deftest moved-index-identity-is-visible-only-in-the-current-schema
+  (with-catalog
+    (fn [conn]
+      (with-open [handler (server/make-query-handler conn)]
+        (let [run #(.execute handler %)]
+          (doseq [sql ["CREATE SCHEMA billing"
+                       "CREATE TABLE public.events (id int)"
+                       "CREATE UNIQUE INDEX events_id ON public.events (id)"
+                       "ALTER TABLE public.events SET SCHEMA billing"
+                       "SET search_path TO public"]]
+            (is (nil? (.error (run sql))) sql))
+          (is (= "42704" (.sqlstate (run "DROP INDEX public.events_id"))))
+          (is (= "42704" (.sqlstate (run "DROP INDEX events_id"))))
+          (is (= [["t"]] (mapv vec (.rows (run "SELECT to_regclass('billing.events_id') IS NOT NULL")))))
+          (is (nil? (.error (run "DROP INDEX billing.events_id")))))))))
+
 (deftest prepared-parameter-types-follow-the-resolved-relation
   (with-catalog
     (fn [conn]

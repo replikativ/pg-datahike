@@ -9952,19 +9952,22 @@
       (session-temp-storage? name schema)
       (and (nil? schema) (some #{"public"} regoid/*search-path*))))
 
+(defn- qualified-relation-object [db name schema]
+  (when-let [namespace (catalog-objects/namespace-by-name db schema)]
+    (catalog-objects/object-by-identity db catalog-objects/pg-class-oid
+                                        (:datahike.pg.object/oid namespace) name)))
+
 (defn- ddl-table-object [db name schema]
   (let [public catalog-objects/public-namespace-oid
-        find-object #(catalog-objects/object-by-identity db catalog-objects/pg-class-oid % name)
-        find-qualified #(when-let [namespace (catalog-objects/namespace-by-name db schema)]
-                          (find-object (:datahike.pg.object/oid namespace)))]
+        find-object #(catalog-objects/object-by-identity db catalog-objects/pg-class-oid % name)]
     (cond
       sql-ctx/*physical-table-names?*
       (or (catalog-objects/object-by-storage-name db name)
-          (if schema (find-qualified) (find-object public)))
+          (if schema (qualified-relation-object db name schema) (find-object public)))
 
       (session-temp-storage? name schema) (find-object public)
 
-      schema (find-qualified)
+      schema (qualified-relation-object db name schema)
 
       :else
       (some #(find-object (:datahike.pg.object/oid %))
@@ -10565,18 +10568,8 @@
 
       :else
       (let [object-name (:datahike.pg.object/name table)
-            row-type (catalog-objects/object-by-identity
-                      db catalog-objects/pg-type-oid old-namespace object-name)
-            indexes (when (contains? (dbi/-schema db) :datahike.pg.index/relation)
-                      (d/q '[:find [?oid ...]
-                             :in $ ?table
-                             :where [?index :datahike.pg.index/relation ?table]
-                             [?index :datahike.pg.object/oid ?oid]]
-                           db (:db/id table)))
-            moving (into [table row-type]
-                         (keep #(catalog-objects/object-by-address db catalog-objects/pg-class-oid %))
-                         indexes)
-            moving (remove nil? moving)
+            moving (catalog-objects/table-namespace-objects db table)
+            row-type (some #(when (= :row-type (:datahike.pg.object/kind %)) %) moving)
             _ (doseq [object moving
                       :let [class-oid (:datahike.pg.object/class-oid object)
                             object-name (:datahike.pg.object/name object)]
@@ -12333,10 +12326,16 @@
       (let [db (or (:speculative-db @tx-state) (d/db conn))
             schema (dbi/-schema db)
             index-schema (:index-schema parsed)
-            object (ddl-table-object db (:name parsed) index-schema)
+            index-name (:name parsed)
+            object (if index-schema
+                     (qualified-relation-object db index-name index-schema)
+                     (ddl-table-object db index-name nil))
             index-ident (or (when object (:db/ident (d/entity db (:db/id object))))
-                            (when (public-relation-fallback? (:name parsed) index-schema)
-                              (secondary-index-ident (:name parsed))))
+                            (when (and (or (nil? index-schema) (= "public" index-schema))
+                                       (public-relation-fallback? index-name index-schema))
+                              (let [legacy (secondary-index-ident index-name)]
+                                (when-not (:datahike.pg.object/kind (d/entity db legacy))
+                                  legacy))))
             entity-id (when index-ident (:db/id (d/entity db index-ident)))]
         (when (and object
                    (not= :index (:datahike.pg.object/kind object)))

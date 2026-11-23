@@ -11,11 +11,11 @@ Enable `wal_level=logical` on the publisher and create a publication with the
 tables to mirror.
 
 ```sql
-CREATE PUBLICATION analytics FOR TABLE public.accounts, public.events;
+CREATE PUBLICATION analytics FOR TABLE billing.accounts, archive.events;
 ```
 
-Use a publisher role with `LOGIN`, `REPLICATION`, database access, and
-`SELECT` on all published tables. The role needs access to
+Use a publisher role with `LOGIN`, `REPLICATION`, database access,
+`USAGE` on the published tables' schemas, and `SELECT` on those tables. The role needs access to
 `pg_logical_emit_message(boolean, text, text, boolean)` for catch-up barriers.
 Connect to the publisher primary.
 
@@ -59,10 +59,10 @@ publication options.
 
 ## Supported publications
 
-This version accepts whole, unfiltered, permanent tables in `public`.
-The admission report identifies tables in other schemas before any slot
-is created. Default replica identity requires a single or composite
-non-deferrable primary key. Under
+The mirror accepts whole, unfiltered, permanent tables in user schemas.
+Readers can query them by their qualified names. Tables and indexes with
+the same name in different schemas remain separate. Default replica
+identity requires a single or composite non-deferrable primary key. Under
 `REPLICA IDENTITY FULL`, the mirror uses that key when available. Otherwise
 it matches the entire old tuple, including NULL values, and applies the
 change to the matching row with the lowest local entity ID. The current
@@ -113,8 +113,9 @@ renames and changes to a domain's default, nullability, and check.
 ## Mirror partitions
 
 Use the publisher's default leaf routing, with
-`publish_via_partition_root = false`, for declarative partitions in
-`public`. The mirror copies and applies changes to each published leaf.
+`publish_via_partition_root = false`, for declarative partitions.
+A partition tree can span multiple schemas. The mirror copies and applies
+changes to each published leaf.
 When the publication covers all leaves, readers can query the parent or
 any intermediate parent. `ONLY` reads the empty physical parent.
 `pg_class` and `pg_inherits` expose the mirrored table hierarchy.
@@ -186,14 +187,18 @@ from a fresh snapshot. A restart after installation resumes from the durable
 checkpoint. The temporary slot is released when its connection closes.
 The snapshot byte limit also bounds staging input, including replayed data.
 
-Removing published tables pauses the mirror.
+When an ordinary table leaves the publication, the mirror keeps its last
+applied rows queryable under its qualified name. A same-named table in
+another schema continues to apply changes independently. If the publisher
+reuses the qualified name for a different table, the new table receives
+its own local identity. Earlier snapshots retain the old relation.
 
 ## Refresh after a publisher schema change
 
 Set `:schema-refresh? true` in the mirror configuration to support adding,
 renaming, and dropping columns, changing supported types and precision, and
-changing defaults or nullability. It also follows table renames within the
-publisher schema when the table keeps its PostgreSQL relation OID. Group
+changing defaults or nullability. It also follows table renames and schema
+moves when the table keeps its PostgreSQL relation OID. Group
 related DDL in one PostgreSQL transaction and allow each refresh to finish
 before the next schema change.
 Keep this option enabled through restart while a refresh is pending.
@@ -222,9 +227,11 @@ Schema refresh follows the addition, removal, and expression changes of
 published stored generated columns. It preserves the generated status and
 expression in earlier snapshots.
 
-A table rename preserves the mirror's relation OID and Datahike entities.
-The new SQL name becomes visible at cutover. Earlier snapshots keep the
-old name, including when the publisher adds a new table under that name.
+A table rename or schema move preserves the mirror's relation OID and
+Datahike entities. The new qualified name becomes visible at cutover.
+Earlier snapshots keep the old name, including when the publisher adds a
+new table under that name. When a publisher renames a whole schema, the
+mirror moves the published tables and can retain the earlier namespace.
 
 The mirror follows changes to the primary key and changes to the selected
 replica identity. During refresh, it matches rows by a retained primary key
@@ -359,7 +366,10 @@ mirror with a stock PostgreSQL subscriber. It uses two disposable PostgreSQL
 `clojure -M:dev -m datahike.pg.mirror-probe` after `bb prep`. Pass
 `--refresh` to exercise online table addition and its recovery boundaries.
 Pass `--schema-refresh` to exercise publisher DDL, table name reuse, restart,
-and historical row and catalog reads. Pass `--primary-key-refresh` to compare
+and historical row and catalog reads. Run
+`test/integration/postgres-regress/mirror-publisher.sh --namespaces` to
+exercise same-named tables and indexes, cross-schema moves, unpublished
+tables, and partitions on a disposable publisher. Pass `--primary-key-refresh` to compare
 replacement keys, key order, historical constraints, and rejected cutovers
 with PostgreSQL. Pass `--full-identity` to run the key changes with
 `REPLICA IDENTITY FULL`, including mode changes, key-changing updates,
