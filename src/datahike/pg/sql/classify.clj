@@ -789,6 +789,17 @@
            (recur names (rest remaining))
            [names remaining]))))))
 
+(defn- relation-list-fields [targets table-name]
+  (cond-> {:tables (mapv (comp table-name peek) targets)}
+    ;; Bare, already-normalized names can go straight to execution. Keep
+    ;; the raw identifiers whenever lookup must decode or qualify them.
+    (some (fn [[token & qualifiers]]
+            (or (seq qualifiers)
+                (not (and (= :ident (:type token))
+                          (re-matches #"[a-z_0-9$]{1,63}" (:text token))))))
+          targets)
+    (assoc :relation-parts (mapv #(mapv :text %) targets))))
+
 (defn- classify-drop-table
   "DROP TABLE with MORE THAN ONE name. JSqlParser 5.2's Drop grammar
    accepts a single name (ParseException at the comma — it expects
@@ -802,14 +813,14 @@
   (let [if-exists? (boolean (and (kw=? (first toks) "if")
                                  (kw=? (second toks) "exists")))
         ts (if if-exists? (drop 2 toks) toks)]
-    (or (when-let [[names ts'] (read-relation-list ts :text true)]
+    (or (when-let [[names ts'] (read-relation-list ts identity true)]
           (let [cascade? (boolean (kw=? (first ts') "cascade"))
                 ts' (if (kw-in? (first ts') #{"cascade" "restrict"})
                       (rest ts') ts')
                 ts' (drop-while #(= ";" (:text %)) ts')]
             (when (and (empty? ts') (> (count names) 1))
-              {:kind :drop-table-multi :relation-parts names :if-exists? if-exists?
-               :cascade? cascade?})))
+              (assoc (relation-list-fields names ident-text)
+                     :kind :drop-table-multi :if-exists? if-exists? :cascade? cascade?))))
         {:kind :generic-sql})))
 
 ;; ============================================================================
@@ -1588,8 +1599,9 @@
    children to include/exclude); CASCADE is carried so parse-sql can
    reject it with 0A000."
   [toks]
-  (let [ts (if (kw=? (first toks) "table") (rest toks) toks)]
-    (or (when-let [[names ts1] (read-relation-list ts :text true)]
+  (let [ts (if (kw=? (first toks) "table") (rest toks) toks)
+        table-name #(if (= :ident (:type %)) (str/lower-case (:text %)) (ident-text %))]
+    (or (when-let [[names ts1] (read-relation-list ts identity true)]
           (let [identity? (and (or (kw=? (first ts1) "restart")
                                    (kw=? (first ts1) "continue"))
                                (kw=? (second ts1) "identity"))
@@ -1600,8 +1612,8 @@
                       (rest ts2) ts2)
                 ts4 (drop-while #(= ";" (:text %)) ts3)]
             (when (empty? ts4)
-              {:kind :truncate :relation-parts names
-               :restart-identity? restart? :cascade? (boolean cascade?)})))
+              (assoc (relation-list-fields names table-name)
+                     :kind :truncate :restart-identity? restart? :cascade? (boolean cascade?)))))
         {:kind :generic-sql})))
 
 (defn- classify-drop-function

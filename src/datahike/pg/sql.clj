@@ -1058,9 +1058,12 @@
                    {:error :syntax-error :sqlstate "42601"}))))))
 
 (defn- table-targets [plan]
-  (let [refs (mapv #(regoid/parse-qualified-name (str/join "." %)) (:relation-parts plan))]
-    (assoc plan :tables (mapv peek refs)
-           :table-schemas (mapv #(when (> (count %) 1) (nth % (- (count %) 2))) refs))))
+  (if-let [parts (:relation-parts plan)]
+    (let [refs (mapv #(regoid/parse-qualified-name (str/join "." %)) parts)
+          schemas (mapv #(when (> (count %) 1) (nth % (- (count %) 2))) refs)]
+      (cond-> (assoc plan :tables (mapv peek refs))
+        (some some? schemas) (assoc :table-schemas schemas)))
+    plan))
 
 (defn- parse-sql*
   "Inner parse-sql implementation — does the actual work. Public
@@ -2512,26 +2515,27 @@
                     (instance? CreateIndex stmt)
                     (let [^CreateIndex ci stmt
                           idx (.getIndex ci)
+                          table-schema (some-> (.getTable ci) .getSchemaName unquote-ident)
                           column-specs
                           (mapv (fn [^Index$ColumnParams column]
                                   {:name (unquote-ident (.getColumnName column))
                                    :params (mapv (comp str/lower-case str)
                                                  (or (.getParams column) []))})
                                 (or (.getColumnWithParams idx) []))]
-                      {:type :ddl-create-index
-                       :name (some-> (.getName idx) unquote-ident)
-                       :table (some-> (.getTable ci) .getName unquote-ident)
-                       :table-schema (some-> (.getTable ci) .getSchemaName unquote-ident)
-                       :method (some-> (.getUsing idx) str/lower-case)
-                       :unique? (= "UNIQUE" (some-> (.getType idx) str/upper-case))
-                       :if-not-exists? (.isUsingIfNotExists ci)
-                       :columns (if (seq column-specs)
-                                  (mapv :name column-specs)
-                                  (mapv (comp unquote-ident str)
-                                        (or (.getColumnsNames idx) [])))
-                       :column-specs column-specs
-                       :tail-parameters (mapv str (or (.getTailParameters ci) []))
-                       :options (create-index-options ci)})
+                      (cond-> {:type :ddl-create-index
+                               :name (some-> (.getName idx) unquote-ident)
+                               :table (some-> (.getTable ci) .getName unquote-ident)
+                               :method (some-> (.getUsing idx) str/lower-case)
+                               :unique? (= "UNIQUE" (some-> (.getType idx) str/upper-case))
+                               :if-not-exists? (.isUsingIfNotExists ci)
+                               :columns (if (seq column-specs)
+                                          (mapv :name column-specs)
+                                          (mapv (comp unquote-ident str)
+                                                (or (.getColumnsNames idx) [])))
+                               :column-specs column-specs
+                               :tail-parameters (mapv str (or (.getTailParameters ci) []))
+                               :options (create-index-options ci)}
+                        table-schema (assoc :table-schema table-schema)))
 
           ;; ALTER TABLE — extract operations for ADD COLUMN support
                     (instance? Alter stmt)
