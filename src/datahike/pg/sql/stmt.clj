@@ -11660,7 +11660,7 @@
                (let [from-item     (.getFromItem anchor)
                      joins         (.getJoins anchor)
                      default-table (when (instance? Table from-item)
-                                     (unquote-ident (.getName ^Table from-item)))
+                                     (params/inference-table-name from-item))
                      table-aliases (params/collect-table-aliases from-item joins)
                      oid-env {:db db :schema schema
                               :table-aliases table-aliases

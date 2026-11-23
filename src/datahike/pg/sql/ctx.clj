@@ -457,6 +457,13 @@
          (throw (errors/pg-error :undefined-table
                                  {:table (if schema (str schema "." name) name)})))))))
 
+(defn inference-table-name [^Table table]
+  (let [name (params/unquote-ident (.getName table))
+        schema (some-> (.getSchemaName table) params/unquote-ident)]
+    (when name
+      (or (when-not schema (get *relation-namespaces* name))
+          (table-storage-name name schema false)))))
+
 (defn extract-table-info
   "Extract table name and alias from a FROM clause Table.
 

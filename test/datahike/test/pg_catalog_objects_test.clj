@@ -184,6 +184,37 @@
           (exec! "DROP TABLE archive.entries, archive.events")
           (is (= [["public"]] (rows "SELECT label FROM public.events"))))))))
 
+(deftest prepared-parameter-types-follow-the-resolved-relation
+  (with-catalog
+    (fn [conn]
+      (with-open [handler (server/make-query-handler conn)]
+        (let [run #(.execute handler %)
+              rows #(mapv vec (.rows (run %)))]
+          (doseq [sql ["CREATE SCHEMA billing"
+                       "CREATE TABLE public.invoices (id text)"
+                       "CREATE TABLE billing.invoices (id int)"
+                       "PREPARE scoped_insert AS INSERT INTO billing.invoices VALUES ($1)"
+                       "PREPARE scoped_select AS SELECT b.id FROM billing.invoices b WHERE b.id = $1"
+                       "PREPARE scoped_update AS UPDATE billing.invoices SET id = $1 WHERE id = $2"
+                       "PREPARE scoped_delete AS DELETE FROM billing.invoices WHERE id = $1"
+                       "SET search_path TO billing, public"
+                       "PREPARE path_select AS SELECT id FROM invoices WHERE id = $1"
+                       "PREPARE public_select AS SELECT id FROM public.invoices WHERE id = $1"
+                       "EXECUTE scoped_insert(1)"]]
+            (is (nil? (.error (run sql))) sql))
+          (is (= [["path_select" "{integer}"]
+                  ["public_select" "{text}"]
+                  ["scoped_delete" "{integer}"]
+                  ["scoped_insert" "{integer}"]
+                  ["scoped_select" "{integer}"]
+                  ["scoped_update" "{integer,integer}"]]
+                 (rows "SELECT name, parameter_types FROM pg_prepared_statements ORDER BY name")))
+          (is (= [["1"]] (rows "EXECUTE scoped_select(1)")))
+          (is (nil? (.error (run "EXECUTE scoped_update(2, 1)"))))
+          (is (= [["2"]] (rows "EXECUTE path_select(2)")))
+          (is (nil? (.error (run "EXECUTE scoped_delete(2)"))))
+          (is (= [] (rows "SELECT id FROM billing.invoices"))))))))
+
 (deftest speculative-allocations-chain-and-rollback
   (with-catalog
     (fn [conn]

@@ -796,7 +796,7 @@
                                     body))
                  :let [from-item (.getFromItem ps)
                        tns (when (instance? Table from-item)
-                             (unquote-ident (.getName ^Table from-item)))
+                             (params/inference-table-name from-item))
                        aliases (params/collect-table-aliases from-item (.getJoins ps))]]
              (merge (params/where-param-oids (.getWhere ps) schema tns aliases)
                     (apply merge
@@ -1067,6 +1067,7 @@
    parse-sql wraps this with the LRU result cache."
   [^String sql schema db]
   (binding [params/*parse-db* db
+            params/*inference-table-resolver* ctx/inference-table-name
             params/*only-table-marker* (params/only-table-marker sql)
             ctx/*table-name-overrides*
             (when-not ctx/*physical-table-names?*
@@ -1476,44 +1477,45 @@
             ;; empty: unknown params default to 0 (text, any type).
                 inferred-oids
                 (when (pos? param-count)
-                  (cond (instance? Insert stmt)
-                        (binding [assignment-target/*omitted-bounds* target-annotations]
-                          (params/insert-param-oids stmt schema db))
-                        (instance? Update stmt)
-                        (let [from-set (binding [assignment-target/*omitted-bounds* target-annotations]
-                                         (params/update-param-oids stmt schema))
-                              ^Table t (.getTable ^Update stmt)
-                              tns (when t (unquote-ident (.getName t)))
-                              joins (.getJoins ^Update stmt)
-                              aliases (params/collect-table-aliases t joins)
-                              join-oids (try
-                                          (apply merge
-                                                 (for [^Join j (or joins [])]
-                                                   (params/where-param-oids (.getOnExpression j)
-                                                                            schema tns aliases)))
-                                          (catch Throwable _ nil))]
-                          (merge (params/where-param-oids (.getWhere ^Update stmt) schema tns aliases)
-                                 join-oids
-                                 from-set))
-                        (instance? Delete stmt)
-                        (let [^Table t (.getTable ^Delete stmt)
-                              tns (when t (unquote-ident (.getName t)))
-                              aliases (params/collect-table-aliases t nil)]
-                          (params/where-param-oids (.getWhere ^Delete stmt) schema tns aliases))
-                        (instance? PlainSelect stmt)
-                        (let [from-item (.getFromItem ^PlainSelect stmt)
-                              tns (when (instance? Table from-item)
-                                    (unquote-ident (.getName ^Table from-item)))
-                              joins (.getJoins ^PlainSelect stmt)
-                              aliases (params/collect-table-aliases from-item joins)
-                              where-oids (params/where-param-oids (.getWhere ^PlainSelect stmt)
-                                                                  schema tns aliases)
-                              join-oids (try
-                                          (apply merge
-                                                 (for [^Join j (or joins [])]
-                                                   (params/where-param-oids (.getOnExpression j)
-                                                                            schema tns aliases)))
-                                          (catch Throwable _ nil))
+                  (binding [ctx/*relation-namespaces* (merge ctx/*relation-namespaces* cte-ns-map)]
+                    (cond (instance? Insert stmt)
+                          (binding [assignment-target/*omitted-bounds* target-annotations]
+                            (params/insert-param-oids stmt schema db))
+                          (instance? Update stmt)
+                          (let [from-set (binding [assignment-target/*omitted-bounds* target-annotations]
+                                           (params/update-param-oids stmt schema))
+                                ^Table t (.getTable ^Update stmt)
+                                tns (params/inference-table-name t)
+                                joins (.getJoins ^Update stmt)
+                                aliases (params/collect-table-aliases t joins)
+                                join-oids (try
+                                            (apply merge
+                                                   (for [^Join j (or joins [])]
+                                                     (params/where-param-oids (.getOnExpression j)
+                                                                              schema tns aliases)))
+                                            (catch Throwable _ nil))]
+                            (merge (params/where-param-oids (.getWhere ^Update stmt) schema tns aliases)
+                                   join-oids
+                                   from-set))
+                          (instance? Delete stmt)
+                          (let [^Table t (.getTable ^Delete stmt)
+                                tns (params/inference-table-name t)
+                                aliases (params/collect-table-aliases t nil)]
+                            (params/where-param-oids (.getWhere ^Delete stmt) schema tns aliases))
+                          (instance? PlainSelect stmt)
+                          (let [from-item (.getFromItem ^PlainSelect stmt)
+                                tns (when (instance? Table from-item)
+                                      (params/inference-table-name from-item))
+                                joins (.getJoins ^PlainSelect stmt)
+                                aliases (params/collect-table-aliases from-item joins)
+                                where-oids (params/where-param-oids (.getWhere ^PlainSelect stmt)
+                                                                    schema tns aliases)
+                                join-oids (try
+                                            (apply merge
+                                                   (for [^Join j (or joins [])]
+                                                     (params/where-param-oids (.getOnExpression j)
+                                                                              schema tns aliases)))
+                                            (catch Throwable _ nil))
                               ;; SELECT-list expressions can carry params too
                               ;; (e.g. `SELECT 1 = $1`, `SELECT $1::int`,
                               ;; `SELECT col = $1`). where-param-oids walks an
@@ -1522,16 +1524,16 @@
                               ;; reuse it per select item. Without this the
                               ;; param stays undetermined → TEXT, and a client
                               ;; binding e.g. an int fails to encode.
-                              select-oids (try
-                                            (apply merge
-                                                   (for [^SelectItem si (or (.getSelectItems ^PlainSelect stmt) [])]
-                                                     (params/where-param-oids (.getExpression si)
-                                                                              schema tns aliases)))
-                                            (catch Throwable _ nil))
+                                select-oids (try
+                                              (apply merge
+                                                     (for [^SelectItem si (or (.getSelectItems ^PlainSelect stmt) [])]
+                                                       (params/where-param-oids (.getExpression si)
+                                                                                schema tns aliases)))
+                                              (catch Throwable _ nil))
                               ;; params nested in WITH-CTE bodies (asyncpg's
                               ;; `WITH RECURSIVE … oid = ANY($1::oid[])`)
-                              cte-oids (cte-body-param-oids stmt schema)]
-                          (merge cte-oids select-oids where-oids join-oids))))
+                                cte-oids (cte-body-param-oids stmt schema)]
+                            (merge cte-oids select-oids where-oids join-oids)))))
                 attach-params #(cond-> (assoc % :param-count param-count)
                                  (seq inferred-oids) (assoc :param-oids inferred-oids))
                 result
