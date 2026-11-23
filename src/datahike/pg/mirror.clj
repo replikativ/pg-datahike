@@ -1464,20 +1464,58 @@
 (defn- partition-relation? [{:keys [partition-parent partition-leaves]}]
   (or partition-parent partition-leaves))
 
-(defn- plan-publication-removals [previous current removed]
+(defn- mirrored-index-names [table]
+  (cond-> {}
+    (seq (key-columns table))
+    (assoc :primary (or (:primary-key-name table) (str (:name table) "_pkey")))
+
+    (separate-identity-index table)
+    (assoc :replica-identity (:name (:identity-index table)))))
+
+(defn- frozen-index-conflict? [db active-names table kind index-name]
+  (let [schema (:schema table)
+        claimed? #(contains? active-names [schema %])]
+    (if (= :primary kind)
+      (let [native-name (str (:name table) "_pkey")]
+        ;; A native single-column primary key follows the local table name in
+        ;; older stores, even when the publisher kept its original key name.
+        (when (or (claimed? index-name) (claimed? native-name))
+          (if (= native-name index-name)
+            true
+            (let [storage (:name (storage-table table))
+                  relation-oid (pgs/storage-table-oid db storage)
+                  explicit-oid (catalog-objects/primary-index-oid db relation-oid)]
+              (claimed? (if explicit-oid index-name native-name))))))
+      (claimed? index-name))))
+
+(defn- plan-publication-removals [db previous current removed]
   (let [active (relations-by-id current)
-        relation-key (juxt :schema :name)
-        active-names (into #{} (map relation-key) (vals active))
+        active-names (into #{}
+                           (mapcat (fn [{:keys [schema name] :as table}]
+                                     (map #(vector schema %) (cons name (vals (mirrored-index-names table))))))
+                           (vals active))
         frozen (into (:unpublished-tables previous {})
                      (comp (remove partition-relation?) (map (juxt :relation-id identity)))
                      removed)]
-    (reduce-kv (fn [plan id table]
-                 (cond
-                   (contains? active id) plan
-                   (contains? active-names (relation-key table)) (update plan :retire conj table)
-                   :else (assoc-in plan [:retain id] table)))
-               {:retain {} :retire (filterv partition-relation? removed)}
-               frozen)))
+    (reduce-kv
+     (fn [plan id {:keys [schema name released-indexes] :as table}]
+       (cond
+         (contains? active id) plan
+         (contains? active-names [schema name]) (update plan :retire conj table)
+         :else
+         (let [release (into #{}
+                             (keep (fn [[kind index-name]]
+                                     (when (and (not (contains? released-indexes kind))
+                                                (frozen-index-conflict? db active-names table kind index-name))
+                                       kind)))
+                             (mirrored-index-names table))]
+           (if (seq release)
+             (-> plan
+                 (update :release-indexes conj [table release])
+                 (assoc-in [:retain id] (update table :released-indexes (fnil into #{}) release)))
+             (assoc-in plan [:retain id] table)))))
+     {:retain {} :retire (filterv partition-relation? removed) :release-indexes []}
+     frozen)))
 
 (defn- wire-table [table]
   (update (select-keys table [:schema :name :relation-id :columns])
@@ -1521,7 +1559,7 @@
 (defn- same-table? [previous current]
   (if (every? :attnum (:columns previous))
     (let [shape #(dissoc % :storage-name :primary-key-name :partition-leaves :partition-parent
-                         :partition-key :partition-bound :columns)
+                         :partition-key :partition-bound :released-indexes :columns)
           columns (fn [table] (mapv #(dissoc % :key-position :user-type) (:columns table)))]
       (and current (= (shape previous) (shape current))
            (= (columns previous) (columns current))
@@ -2065,7 +2103,8 @@
   ;; to a fresh storage name if the publisher later reuses the SQL name.
   (let [storage (:name (storage-table table))
         retired-name (new-slot-name "pgdh_retired")]
-    (drop-identity-index! destination table)
+    (when-not (contains? (:released-indexes table) :replica-identity)
+      (drop-identity-index! destination table))
     (stage-data!
      destination
      (fn [db]
@@ -2159,17 +2198,21 @@
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
-        {:keys [changes retire installed-manifest refresh-topology? type-plan]} stage
+        {:keys [changes retire release-indexes installed-manifest refresh-topology? type-plan]} stage
         {:keys [additions removals edits]} type-plan
         renamed-labels (enum-renames edits)
         rekeys (filterv (fn [{:keys [table previous]}]
-                          (and previous (primary-key-changed? previous table)))
+                          (and previous
+                               (or (contains? (:released-indexes previous) :primary)
+                                   (primary-key-changed? previous table))))
                         changes)
         index-shape (fn [table]
                       (when-let [index (separate-identity-index table)]
                         [index (mapv #(select-keys % [:name :oid :typmod]) (identity-index-columns table))]))
         identity-index-changes (filterv (fn [{:keys [table previous]}]
-                                          (and previous (not= (index-shape previous) (index-shape table))))
+                                          (and previous
+                                               (or (contains? (:released-indexes previous) :replica-identity)
+                                                   (not= (index-shape previous) (index-shape table)))))
                                         changes)
         renames (into []
                       (keep (fn [{:keys [table previous storage-name]}]
@@ -2179,6 +2222,14 @@
                       changes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
+      (doseq [[table release] release-indexes]
+        (check-running!)
+        ;; Frozen rows and their publisher key metadata remain available for
+        ;; history and republishing. Only the conflicting live indexes go.
+        (when (contains? release :replica-identity)
+          (drop-identity-index! destination table))
+        (when (contains? release :primary)
+          (drop-primary-key! destination (storage-table table))))
       (doseq [table retire]
         (check-running!)
         (retire-table! destination table))
@@ -2193,10 +2244,13 @@
       (doseq [[old current :as change] (vals edits)]
         (when (not= (dissoc old :name) (dissoc current :name))
           (stage-data! destination #(refresh-type-tx % change))))
-      (doseq [{:keys [previous]} identity-index-changes]
+      (doseq [{:keys [previous]} identity-index-changes
+              :when (not (contains? (:released-indexes previous) :replica-identity))]
         (check-running!)
         (drop-identity-index! destination previous))
-      (doseq [{:keys [previous storage-name]} rekeys :when (seq (key-columns previous))]
+      (doseq [{:keys [previous storage-name]} rekeys
+              :when (and (seq (key-columns previous))
+                         (not (contains? (:released-indexes previous) :primary)))]
         (check-running!)
         (drop-primary-key! destination (assoc previous :name storage-name)))
       (doseq [{:keys [table previous storage-name stage-storage-name]} changes :when previous]
@@ -2279,9 +2333,9 @@
             current
             (vals retained-types))))
 
-(defn- installation-plan [previous current affected schema-refresh?]
+(defn- installation-plan [db previous current affected schema-refresh?]
   (let [removed (removed-relations previous current)
-        {:keys [retain retire] :as removal-plan} (plan-publication-removals previous current removed)
+        {:keys [retain retire release-indexes] :as removal-plan} (plan-publication-removals db previous current removed)
         retained (retain-unpublished-types previous current retain)
         retiring-ids (into #{} (map :relation-id) retire)
         active-before (remove #(contains? retiring-ids (:relation-id %)) (all-relations previous))
@@ -2294,6 +2348,7 @@
      :changes changes
      :removed removed
      :retire retire
+     :release-indexes release-indexes
      :type-plan type-plan
      :refresh-topology? (or (seq (:partition-parents previous)) (seq (:partition-parents current)))}))
 
@@ -2352,7 +2407,7 @@
                         {:snapshot position :checkpoint end-lsn})
               (let [current (publication-manifest source config (:types previous) true)
                     affected (into #{} (map :relation-id) (all-relations current))
-                    {:keys [changes] :as plan} (installation-plan previous current affected schema-refresh?)
+                    {:keys [changes] :as plan} (installation-plan (d/db conn) previous current affected schema-refresh?)
                     gap (merge (dissoc pending :slot)
                                (dissoc status :state) {:snapshot-lsn position
                                                        :from-timeline (get-in saved [:origin :timeline])
@@ -2393,7 +2448,7 @@
     (swap! state assoc :last-recovery (peek (get-in saved [:manifest :recovery-gaps])))
     {:saved (retire-replaced-slots! source destination saved state failover?) :info info}))
 
-(defn- consume! [copy source destination saved origin state confirmed-lsn check-running! ready! config]
+(defn- consume! [copy source conn destination saved origin state confirmed-lsn check-running! ready! config]
   (let [{:keys [manifest end-lsn slot]} saved
         {:keys [max-snapshot-bytes schema-refresh? failover?]} config
         origin-update (volatile! (when (not= (:origin saved) origin) origin))
@@ -2418,9 +2473,9 @@
                      (if-let [active @stage]
                        (require-stable-manifest! (:source-manifest active) current)
                        (let [affected (partition-affected @applied current)
-                             {:keys [changes removed type-plan] :as install}
-                             (installation-plan @applied current affected schema-refresh?)]
-                         (when (or (seq changes) (seq removed) (some seq (vals type-plan)))
+                             {:keys [changes removed release-indexes type-plan] :as install}
+                             (installation-plan (d/db conn) @applied current affected schema-refresh?)]
+                         (when (or (seq changes) (seq removed) (seq release-indexes) (some seq (vals type-plan)))
                            (doseq [{:keys [table previous]} changes
                                    :when (and previous (nil? (:partition-leaves table)))]
                              (matching-key-indexes! previous table))
@@ -2612,7 +2667,7 @@
               ;; positions. Recheck once the COPY has exclusive slot ownership.
               (check-slot-confirmation! saved acquired-info)
               (publish-status! state acquired-info)
-              (consume! copy source destination saved origin state (:confirmed-lsn acquired-info)
+              (consume! copy source conn destination saved origin state (:confirmed-lsn acquired-info)
                         check-running! ready! config))
             (catch SQLException error
               ;; Replication can report slot loss before the SQL status poll.

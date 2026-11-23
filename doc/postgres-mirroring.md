@@ -191,7 +191,11 @@ When an ordinary table leaves the publication, the mirror keeps its last
 applied rows queryable under its qualified name. A same-named table in
 another schema continues to apply changes independently. If the publisher
 reuses the qualified name for a different table, the new table receives
-its own local identity. Earlier snapshots retain the old relation.
+its own local identity. Earlier snapshots retain the old relation. If only
+an index name is reused, the frozen table remains readable and releases
+that index from its current catalog. Earlier snapshots retain the index.
+Republishing the frozen table installs its current publisher keys at
+cutover and resumes WAL apply.
 
 ## Refresh after a publisher schema change
 
@@ -369,7 +373,9 @@ Pass `--schema-refresh` to exercise publisher DDL, table name reuse, restart,
 and historical row and catalog reads. Run
 `test/integration/postgres-regress/mirror-publisher.sh --namespaces` to
 exercise same-named tables and indexes, cross-schema moves, unpublished
-tables, and partitions on a disposable publisher. Pass `--primary-key-refresh` to compare
+tables, and partitions on a disposable publisher. Pass `--frozen-index-names`
+to the same script to verify index name transfer, historical reads after
+restart, and key restoration when the frozen tables rejoin the publication. Pass `--primary-key-refresh` to compare
 replacement keys, key order, historical constraints, and rejected cutovers
 with PostgreSQL. Pass `--full-identity` to run the key changes with
 `REPLICA IDENTITY FULL`, including mode changes, key-changing updates,

@@ -2896,6 +2896,126 @@
           (doseq [file (reverse (file-seq directory))]
             (io/delete-file file)))))))
 
+(defn run-frozen-index-probe! [source-url]
+  (let [directory (.toFile (Files/createTempDirectory "pgdh-frozen-index-store-" (make-array FileAttribute 0)))
+        path (str (io/file directory "store"))
+        config {:source-url source-url :publication "freeze_pub" :store-path path
+                :schema-refresh? true :server {:port 0}}
+        subscriber (atom nil)
+        slot (atom nil)
+        public-rows "SELECT id, external_id, label FROM public.frozen_items ORDER BY id"
+        warehouse-rows "SELECT id, external_id, label FROM warehouse.frozen_items ORDER BY id"
+        qualified-indexes ["public.frozen_items_pkey" "public.owner_tag" "warehouse.staging_pk"]
+        index-ids #(mapv (fn [name] (rows % (str "SELECT to_regclass(" (literal name) ")::oid")))
+                         qualified-indexes)
+        snapshot #(mapv (partial rows %) [public-rows warehouse-rows])
+        row-ids #(mapv (partial rows %) ["SELECT db_id FROM public.frozen_items"
+                                         "SELECT db_id FROM warehouse.frozen_items"])
+        live! (fn []
+                (let [status (mirror/status @subscriber)]
+                  (check! (not (#{:failed :paused} (:state status))) "Frozen index refresh paused" status)
+                  true))]
+    (with-open [source (DriverManager/getConnection source-url)]
+      (try
+        (sql! source "CREATE SCHEMA warehouse"
+              "CREATE TABLE public.frozen_input (id bigint PRIMARY KEY, external_id int NOT NULL, label text)"
+              (str "CREATE TABLE warehouse.frozen_items (id bigint, external_id int NOT NULL, label text, "
+                   "CONSTRAINT staging_pk PRIMARY KEY (id))")
+              "CREATE UNIQUE INDEX owner_tag ON public.frozen_input (external_id)"
+              "ALTER TABLE public.frozen_input REPLICA IDENTITY USING INDEX owner_tag"
+              "CREATE TABLE public.active_log (id int PRIMARY KEY, external_id int NOT NULL, label text)"
+              "INSERT INTO public.active_log VALUES (1, 101, 'continuing')"
+              "INSERT INTO public.frozen_input VALUES (1, 11, 'public snapshot')"
+              "INSERT INTO warehouse.frozen_items VALUES (1, 11, 'warehouse snapshot')"
+              "CREATE PUBLICATION freeze_pub FOR TABLE public.active_log, public.frozen_input, warehouse.frozen_items")
+        (reset! subscriber (mirror/start! config))
+        (reset! slot (:slot (await-state! @subscriber :following)))
+        (let [{:keys [before before-at indexes row-identities]}
+              (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+                (sql! source "ALTER TABLE public.frozen_input RENAME TO frozen_items")
+                (await! "Renamed fixture table did not reach the mirror"
+                        #(and (live!) (ffirst (rows sink "SELECT to_regclass('public.frozen_items')::oid"))))
+                (let [before (snapshot sink)
+                      row-identities (row-ids sink)
+                      indexes (index-ids sink)
+                      before-at (inspect-db path (fn [db]
+                                                   (.toInstant ^java.util.Date (:db/txInstant (d/entity db (:max-tx db))))))]
+                  (check! (= (snapshot source) before) "Initial frozen-index fixture rows differ" {})
+                  (check! (every? ffirst indexes) "Initial fixture lacks one of its indexes" {})
+                  (sql! source "ALTER PUBLICATION freeze_pub DROP TABLE public.frozen_items, warehouse.frozen_items")
+                  (await! "Removed relations did not become frozen"
+                          #(and (live!) (= 2 (count (get-in (durable-checkpoint path) [:manifest :unpublished-tables])))))
+                  (sql! source "BEGIN"
+                        "ALTER TABLE public.frozen_items RENAME CONSTRAINT frozen_input_pkey TO archive_pk"
+                        "ALTER INDEX public.owner_tag RENAME TO archive_idx"
+                        "ALTER TABLE warehouse.frozen_items RENAME CONSTRAINT staging_pk TO archive_pk"
+                        "CREATE TABLE public.frozen_items_pkey (id integer PRIMARY KEY)"
+                        "CREATE TABLE warehouse.staging_pk (id integer PRIMARY KEY)"
+                        "CREATE TABLE public.owner_reclaim (id int PRIMARY KEY, external_id int NOT NULL)"
+                        "CREATE UNIQUE INDEX owner_tag ON public.owner_reclaim (external_id)"
+                        "ALTER TABLE public.owner_reclaim REPLICA IDENTITY USING INDEX owner_tag"
+                        "ALTER PUBLICATION freeze_pub ADD TABLE public.frozen_items_pkey, warehouse.staging_pk, public.owner_reclaim"
+                        "COMMIT")
+                  (await! "Mirror did not release its frozen index names"
+                          #(and (live!)
+                                (= [["r"] ["r"]]
+                                   (rows sink (str "SELECT relkind FROM pg_class WHERE oid IN "
+                                                   "(to_regclass('public.frozen_items_pkey'), to_regclass('warehouse.staging_pk'))")))
+                                (= [["t"]]
+                                   (rows sink (str "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid = "
+                                                   "to_regclass('public.owner_tag') AND indrelid = to_regclass('public.owner_reclaim'))")))))
+                  (check! (= before (snapshot sink)) "Index name transfer changed frozen rows" {})
+                  (check! (= row-identities (row-ids sink)) "Index name transfer changed frozen entity IDs" {})
+                  (with-open [old (DriverManager/getConnection (sink-url @subscriber))]
+                    (sql! old (str "SET datahike.as_of = " (literal before-at)))
+                    (check! (= indexes (index-ids old)) "History lost the released index identities" {})
+                    (check! (= before (snapshot old)) "History lost the frozen rows" {}))
+                  {:before before :before-at before-at :indexes indexes :row-identities row-identities}))]
+          (mirror/stop! @subscriber)
+          (await! "Publisher did not release the frozen-index slot"
+                  #(= ["false"] (slot-query source @slot "active::text")))
+          (reset! subscriber (mirror/start! (dissoc config :schema-refresh?)))
+          (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
+            (check! (= @slot (:slot (mirror/status @subscriber))) "Restart replaced the slot" {})
+            (check! (= before (snapshot sink)) "Restart lost the frozen rows" {})
+            (with-open [old (DriverManager/getConnection (sink-url @subscriber))]
+              (sql! old (str "SET datahike.as_of = " (literal before-at)))
+              (check! (= indexes (index-ids old)) "Restart lost historical index identities" {}))
+            ;; Reuse the original names on republish. This also exercises a
+            ;; key whose definition matches the previous frozen manifest.
+            (sql! source "BEGIN"
+                  "ALTER PUBLICATION freeze_pub DROP TABLE public.frozen_items_pkey, warehouse.staging_pk, public.owner_reclaim"
+                  "DROP TABLE public.frozen_items_pkey, warehouse.staging_pk, public.owner_reclaim"
+                  "ALTER TABLE public.frozen_items RENAME CONSTRAINT archive_pk TO frozen_input_pkey"
+                  "ALTER INDEX public.archive_idx RENAME TO owner_tag"
+                  "ALTER TABLE warehouse.frozen_items RENAME CONSTRAINT archive_pk TO staging_pk"
+                  "ALTER PUBLICATION freeze_pub ADD TABLE public.frozen_items, warehouse.frozen_items"
+                  "UPDATE public.frozen_items SET label = 're-published'"
+                  "UPDATE warehouse.frozen_items SET label = 're-published'"
+                  "COMMIT")
+            (await! "Republished tables did not reach the mirror"
+                    #(and (live!) (= (snapshot source) (snapshot sink))))
+            (check! (= row-identities (row-ids sink)) "Republishing reallocated the frozen rows" {})
+            (check! (= [["i"] ["i"] ["i"]]
+                       (rows sink (str "SELECT relkind FROM pg_class WHERE oid IN "
+                                       "(to_regclass('public.frozen_input_pkey'), to_regclass('public.owner_tag'), "
+                                       "to_regclass('warehouse.staging_pk'))")))
+                    "Republishing did not restore the released indexes" {})
+            (sql! source "UPDATE public.frozen_items SET id = 2 WHERE external_id = 11"
+                  "UPDATE warehouse.frozen_items SET id = 3 WHERE id = 1")
+            (await! "Restored keys did not route WAL after republishing"
+                    #(and (live!) (= (snapshot source) (snapshot sink))))))
+        {:status :passed :released 3}
+        (finally
+          (when @subscriber (mirror/stop! @subscriber))
+          (when @slot
+            (await! "Publisher did not release the test slot"
+                    #(not= ["true"] (slot-query source @slot "active::text")))
+            (when (slot-query source @slot "active::text")
+              (sql! source (str "SELECT pg_drop_replication_slot(" (literal @slot) ")"))))
+          (doseq [file (reverse (file-seq directory))]
+            (io/delete-file file)))))))
+
 (defn -main [& [argument mode]]
   (cond
     (= "--failover" argument)
@@ -2921,10 +3041,11 @@
     (prn (run-type-lifecycle-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
                                     (System/getenv "PG_MIRROR_SOURCE_URL")
                                     (System/getenv "PG_MIRROR_RECOVERY_DIR")))
-    (= "--namespaces" argument)
-    (let [source (System/getenv "PG_MIRROR_SOURCE_URL")]
+    (#{"--namespaces" "--frozen-index-names"} argument)
+    (let [source (System/getenv "PG_MIRROR_SOURCE_URL")
+          probe (if (= "--namespaces" argument) run-namespace-probe! run-frozen-index-probe!)]
       (check! (seq source) "Set PG_MIRROR_SOURCE_URL to a disposable publisher database" {})
-      (prn (run-namespace-probe! source)))
+      (prn (probe source)))
     (= "--crash-worker" argument)
     (run-crash-worker! (edn/read (PushbackReader. *in*)))
     :else

@@ -4,7 +4,7 @@ set -eu
 probe=--slot-recovery
 follower=mirror_recovery_reader
 case "${1:-}" in
-  --namespaces) probe=$1; follower=mirror_admin; shift ;;
+  --namespaces|--frozen-index-names) probe=$1; follower=mirror_admin; shift ;;
   --streaming) probe=$1; follower=mirror_stream_reader; shift ;;
   --type-lifecycle) probe=$1; follower=mirror_lifecycle_reader; shift ;;
 esac
