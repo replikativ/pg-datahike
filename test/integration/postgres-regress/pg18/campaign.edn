@@ -284,9 +284,13 @@
        :test-var "postgres-rejects-invalid-foreign-key-definitions"}]}
     {:name "create_view", :boundaries #{:ddl :relational :views}, :mode :unmeasured}
     {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :discovery
-     :blockers #{:alter-reserved-system-column :alter-comment-missing-relation}
+     :blockers #{:alter-comment-missing-relation}
      :strict-slices
-     [{:id :alter-column-nullability
+     [{:id :alter-reserved-system-column
+       :source-lines [22 22]
+       :gate "test/datahike/test/pg_catalog_columns_test.clj"
+       :test-var "table-columns-cannot-shadow-system-columns"}
+      {:id :alter-column-nullability
        :source-lines [876 908]
        :gate "test/datahike/test/pg_constraints_test.clj"
        :test-var "alter-column-nullability"}]}]}
@@ -334,9 +338,13 @@
        :gate "test/datahike/test/pg_matview_test.clj"
        :test-var "postgres-materialized-view-with-no-data"}]}
     {:name "fast_default", :boundaries #{:defaults :ddl :dml}, :mode :discovery
-     :blockers #{:expression-default-backfill :table-rewrite-events}
+     :blockers #{:table-rewrite-events}
      :strict-slices
-     [{:id :alter-table-preserves-existing-default-values
+     [{:id :expression-default-backfill
+       :source-lines [67 67]
+       :gate "test/datahike/test/pg_expression_default_test.clj"
+       :test-var "alter-column-backfills-typed-expressions"}
+      {:id :alter-table-preserves-existing-default-values
        :source-lines [87 98]
        :gate "test/datahike/test/pg_expression_default_test.clj"
        :test-var "fast-default-keeps-old-row-values"}]}
@@ -345,7 +353,20 @@
      :blockers #{:identity-sequence-options :alter-identity}}
     {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :discovery
      :requires ["test_setup"]
-     :blockers #{:sequence-ownership-validation :cached-sequence-position :sequence-privileges}}
+     :blockers #{:sequence-ownership-system-index :cached-sequence-position :sequence-privileges}
+     :strict-slices
+     [{:id :sequence-owner-syntax
+       :source-lines [14 14]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "postgres-rejects-invalid-sequence-owners-atomically"}
+      {:id :sequence-owner-schema-and-column
+       :source-lines [16 18]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "postgres-rejects-invalid-sequence-owners-atomically"}
+      {:id :serial-sequence-discovery
+       :source-lines [63 63]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "serial-and-identity-discovery-uses-existing-ownership"}]}
     {:name "create_schema", :boundaries #{:name-resolution :schemas :ddl}, :mode :unmeasured}
     {:name "drop_if_exists", :boundaries #{:conditional-ddl :errors :ddl}, :mode :unmeasured}
     {:name "create_table_like", :boundaries #{:constraints :ddl :schema-copy}, :mode :discovery

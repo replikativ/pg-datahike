@@ -31,7 +31,7 @@
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector])
   (:import [net.sf.jsqlparser.schema Column Table]
-           [net.sf.jsqlparser.expression Expression Function StringValue]
+           [net.sf.jsqlparser.expression CastExpression Expression Function StringValue]
            [net.sf.jsqlparser.statement.create.table
             CreateTable ColumnDefinition ColDataType Index
             CheckConstraint ForeignKeyIndex]
@@ -102,10 +102,18 @@
                    (when-not (= :db/id attr) [name attr])))
         (pgs/column-info (:schema db) table db)))
 
+(def ^:private system-column-names
+  #{"tableoid" "ctid" "xmin" "xmax" "cmin" "cmax"})
+
+(defn validate-table-column-name! [column]
+  (when (system-column-names column)
+    (throw (ex-info (str "column name \"" column "\" conflicts with a system column name")
+                    {:error :duplicate-column :sqlstate "42701" :column column}))))
+
 (defn- validate-fk-columns! [columns names]
   (doseq [column names]
     (when-not (contains? columns column)
-      (if (contains? #{"tableoid" "ctid" "xmin" "xmax" "cmin" "cmax"} column)
+      (if (system-column-names column)
         (throw (errors/pg-error :feature-not-supported
                                 {:message "system columns cannot be used in foreign keys"}))
         (throw (ex-info (str "column \"" column "\" referenced in foreign key constraint does not exist")
@@ -408,6 +416,36 @@
     (try
       (CCJSqlParserUtil/parseExpression raw)
       (catch Exception _ nil))))
+
+(defn- static-nextval-reference [^Function call]
+  (when (#{"nextval" "pg_catalog.nextval"} (str/lower-case (.getName call)))
+    (let [arg (params/unwrap-scalar-parens (first (.getParameters call)))
+          arg (if (and (instance? CastExpression arg)
+                       (#{"regclass" "pg_catalog.regclass"}
+                        (str/lower-case (str (.getColDataType ^CastExpression arg)))))
+                (params/unwrap-scalar-parens (.getLeftExpression ^CastExpression arg))
+                arg)]
+      (when (instance? StringValue arg)
+        (.getNotExcapedValue ^StringValue arg)))))
+
+(defn default-sequence-references
+  "Static sequence names referenced by a stored column default."
+  [kind value argument]
+  (case kind
+    :nextval [(or argument value)]
+    :expr (when (and value (str/includes? (str/lower-case value) "nextval"))
+            (when-let [^Expression ast (parse-default-expression value)]
+              (let [references (volatile! [])]
+                (.accept ast
+                         (DefaultExpressionVisitor.
+                          (reify Consumer (accept [_ _]))
+                          (reify Consumer
+                            (accept [_ call]
+                              (when-let [reference (static-nextval-reference call)]
+                                (vswap! references conj reference)))))
+                         nil)
+                (distinct @references))))
+    nil))
 
 (defn- reject-default-expression! [kind]
   (let [[error message]

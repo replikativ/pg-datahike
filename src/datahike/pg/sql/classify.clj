@@ -887,11 +887,15 @@
           (kw=? t1 "maxvalue") [[:maxvalue :none] (drop 2 toks)]
           :else nil))
 
-      ;; OWNED BY {table.column | NONE} — accepted and carried; we have
-      ;; no dependency tracking, so it is a no-op semantically.
       (and (kw=? t0 "owned") (kw=? (second toks) "by"))
-      (when-let [[nm ts'] (read-relation-name (drop 2 toks))]
-        [[:owned-by nm] ts'])
+      (let [ts (drop 2 toks)]
+        (when (ident-tok? (first ts))
+          (loop [parts [(:text (first ts))]
+                 remaining (rest ts)]
+            (if (and (= "." (:text (first remaining)))
+                     (ident-tok? (second remaining)))
+              (recur (conj parts (:text (second remaining))) (drop 2 remaining))
+              [[:owned-by parts] remaining]))))
 
       ;; Parse-but-reject forms, so the error is PG's rather than a
       ;; syntax error: SEQUENCE NAME is 42601 and LOGGED/UNLOGGED are

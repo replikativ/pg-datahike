@@ -103,6 +103,61 @@
            (rows c (str "SELECT count(*)::int FROM pg_attribute "
                         "WHERE attrelid = 'task'::regclass AND attname = 'missing'"))))))
 
+(deftest alter-column-backfills-typed-expressions
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE task (id int PRIMARY KEY)")
+    (exec! c "INSERT INTO task VALUES (1), (2)")
+    (exec! c (str "ALTER TABLE task ADD COLUMN priority int DEFAULT (6 * 7), "
+                  "ADD COLUMN random_code int DEFAULT (random() * 10000)::int"))
+    (is (= [[1 42] [2 42]] (rows c "SELECT id, priority FROM task ORDER BY id")))
+    (is (= [[2]] (rows c "SELECT count(*) FROM task WHERE random_code BETWEEN 0 AND 10000")))
+    (exec! c "BEGIN")
+    (exec! c "INSERT INTO task (id) VALUES (3)")
+    (exec! c (str "ALTER TABLE task ADD COLUMN token uuid DEFAULT gen_random_uuid() NOT NULL, "
+                  "ADD COLUMN created timestamptz DEFAULT current_timestamp NOT NULL"))
+    (is (= [[true]] (rows c "SELECT bool_and(created = now()) FROM task")))
+    (let [before (rows c "SELECT token FROM task ORDER BY id")]
+      (is (= 3 (count (distinct before))))
+      (exec! c "COMMIT")
+      (is (= before (rows c "SELECT token FROM task ORDER BY id"))))
+    (is (= "23502"
+           (try
+             (exec! c "ALTER TABLE task ADD COLUMN rejected int DEFAULT (NULL::int + 1) NOT NULL")
+             (catch SQLException e (.getSQLState e)))))
+    (is (= [[0]] (rows c (str "SELECT count(*) FROM pg_attribute WHERE attrelid = 'task'::regclass "
+                              "AND attname = 'rejected'"))))))
+
+(deftest alter-column-backfills-sequences-once-in-row-order
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TABLE task (id int PRIMARY KEY)")
+    (exec! c "INSERT INTO task VALUES (1), (2)")
+    (exec! c "CREATE SEQUENCE task_serial START WITH 10")
+    (exec! c "BEGIN")
+    (exec! c (str "ALTER TABLE task ADD COLUMN sequence_value bigint DEFAULT (nextval('task_serial') + 3), "
+                  "ADD COLUMN sequence_second bigint DEFAULT nextval('task_serial')"))
+    (let [before (rows c "SELECT id, sequence_value, sequence_second FROM task ORDER BY id")]
+      (is (= [[1 13 11] [2 15 13]] before))
+      (exec! c "COMMIT")
+      (is (= before (rows c "SELECT id, sequence_value, sequence_second FROM task ORDER BY id"))))
+    (is (= [[14]] (rows c "SELECT nextval('task_serial')")))
+    (exec! c "BEGIN")
+    (exec! c "CREATE SEQUENCE local_fill START WITH 20")
+    (exec! c "ALTER TABLE task ADD COLUMN local_value bigint DEFAULT nextval('local_fill')")
+    (is (= [[20] [21]] (rows c "SELECT local_value FROM task ORDER BY id")))
+    (exec! c "COMMIT")
+    (is (= [[22]] (rows c "SELECT nextval('local_fill')")))
+    (is (= [[20] [21]] (rows c "SELECT local_value FROM task ORDER BY id")))
+    (exec! c "CREATE SEQUENCE overflow_seq START WITH 32768")
+    (is (= "22003"
+           (try
+             (exec! c (str "ALTER TABLE task ADD COLUMN staged text DEFAULT upper('staged'), "
+                           "ADD COLUMN overflowed smallint DEFAULT nextval('overflow_seq')"))
+             (catch SQLException e (.getSQLState e)))))
+    (is (= [[32769]] (rows c "SELECT nextval('overflow_seq')")))
+    (is (= [[0]]
+           (rows c (str "SELECT count(*) FROM pg_attribute WHERE attrelid = 'task'::regclass "
+                        "AND attname IN ('staged', 'overflowed')"))))))
+
 (deftest fast-default-keeps-old-row-values
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TABLE t (pk int NOT NULL PRIMARY KEY, c_int int DEFAULT 1)")

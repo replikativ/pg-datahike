@@ -93,17 +93,26 @@
    :file "fast_default" :lines [87 98] :state :covered :impact :wrong-result
    :detail "ADD COLUMN with a literal default fills existing rows. SET DEFAULT affects later writes, and short rows in a VALUES list remain separate rows."}
   {:id :expression-default-backfill
-   :file "fast_default" :lines [67 67] :state :open :impact :unsupported
-   :detail "Adding a column with an expression default to a populated table requires backfill evaluation. The volatile default case needs a separate value per existing row."}
+   :file "fast_default" :lines [67 67] :state :covered :impact :unsupported
+   :detail "ADD COLUMN evaluates the typed volatile default per existing row. The gate includes the upstream random expression, transaction-stable timestamps, and UUID values that survive COMMIT."}
   {:id :fast-default-rewrite-event
    :file "fast_default" :lines [59 61] :state :boundary :impact :unsupported
-   :detail "The first difference is CREATE EVENT TRIGGER on table_rewrite. The volatile backfill fails separately because it needs per-row default evaluation."}
+   :detail "CREATE EVENT TRIGGER on table_rewrite is unsupported. A separate gate checks the volatile backfill's row values."}
   {:id :sequence-data-discovery
    :file "sequence" :lines [416 417] :state :open :impact :wrong-result
    :detail "pg_get_sequence_data now gives stock pg_dump both position fields. With CACHE 10 and three calls, native 18.6 reports the reserved upper value 10 and pg-datahike reports the handed-out value 3."}
-  {:id :sequence-ownership-validation
-   :file "sequence" :lines [14 20] :state :open :impact :wrong-result
-   :detail "The invalid OWNED BY clause creates the sequence. Subsequent ownership checks with that name fail as duplicate relations. Replay each ownership case with fresh names before comparing its SQLSTATE."}
+  {:id :sequence-owner-syntax
+   :file "sequence" :lines [14 14] :state :covered :impact :wrong-result
+   :detail "A bare OWNED BY target other than NONE raises 42601. The failed CREATE leaves no sequence."}
+  {:id :sequence-ownership-system-index
+   :file "sequence" :lines [15 15] :state :open :impact :fixture
+   :detail "User index owners raise 42809. This case needs the native pg_class_oid_index system relation in the catalog."}
+  {:id :sequence-owner-schema-and-column
+   :file "sequence" :lines [16 18] :state :covered :impact :wrong-result
+   :detail "OWNED BY rejects cross-schema targets and missing columns with 55000 and 42703. The gate checks that failure leaves the catalog intact."}
+  {:id :serial-sequence-discovery
+   :file "sequence" :lines [63 63] :state :covered :impact :unsupported
+   :detail "pg_get_serial_sequence reads SERIAL and IDENTITY ownership and reflects explicit attach and detach operations."}
   {:id :identity-sequence-options
    :file "identity" :lines [7 8] :state :open :impact :unsupported
    :detail "CREATE TABLE rejects identity START and INCREMENT options, so later probes on itest3 are cascades. ALTER COLUMN ADD GENERATED has a separate parser gap."}
@@ -111,8 +120,8 @@
    :file "alter_table" :lines [18 18] :state :open :impact :wrong-result
    :detail "COMMENT ON a missing relation succeeds on the target. Native 18.6 rejects it before the ordinary-table migration statements."}
   {:id :alter-reserved-system-column
-   :file "alter_table" :lines [22 22] :state :open :impact :wrong-result
-   :detail "ADD COLUMN xmin succeeds and adds a visible column. Native 18.6 rejects the reserved system attribute name."}
+   :file "alter_table" :lines [22 22] :state :covered :impact :wrong-result
+   :detail "The gate checks SQLSTATE 42701 for reserved system column names across CREATE TABLE, CTAS, ADD COLUMN, and RENAME COLUMN. Rejected statements leave the relation and column catalogs intact."}
   {:id :conflict-operator-class-index
    :file "insert_conflict" :lines [13 16] :state :open :impact :unsupported
    :detail "The first independent failure is CREATE UNIQUE INDEX with text_pattern_ops. Later ON CONFLICT arbiter differences depend on those indexes. EXPLAIN INSERT has a separate parser gap."}

@@ -614,6 +614,15 @@
     (is (nil? (err (.execute *handler* "ROLLBACK"))))
     (is (= [["1"]] (rows (.execute *handler* "SELECT 1"))))))
 
+(deftest temp-table-cleanup-allows-an-unrelated-commit
+  (with-open [owner (pg/make-query-handler *conn*)]
+    (is (nil? (err (.execute owner "CREATE TEMP TABLE disposable (id serial)"))))
+    (is (nil? (err (.execute owner "INSERT INTO disposable DEFAULT VALUES"))))
+    (doseq [sql ["BEGIN" "INSERT INTO person (name, age) VALUES ('Independent', 50)"]]
+      (is (nil? (err (.execute *handler* sql))) sql)))
+  (is (nil? (err (.execute *handler* "COMMIT"))))
+  (is (= [["50"]] (rows (.execute *handler* "SELECT age FROM person WHERE name = 'Independent'")))))
+
 (deftest temporary-tables-are-hidden-across-sessions
   (let [h1 (pg/make-query-handler *conn*)
         h2 (pg/make-query-handler *conn*)]

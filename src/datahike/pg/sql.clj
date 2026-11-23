@@ -2448,21 +2448,23 @@
                     (instance? Drop stmt)
                     (let [^Drop d stmt
                           drop-type (when-let [t (.getType d)] (str/lower-case t))
-                          obj-name (-> d .getName .getName)]
+                          obj-name (-> d .getName .getName)
+                          cascade? (boolean (some #(= "cascade" (str/lower-case (str %))) (.getParameters d)))]
                       (case drop-type
                         "sequence" {:type :ddl-drop-sequence
                                     :seq-name (unquote-ident obj-name)
-                                    :if-exists? (.isIfExists d)}
+                                    :if-exists? (.isIfExists d)
+                                    :cascade? cascade?}
                         "index" {:type :ddl-drop-index
                                  :name (unquote-ident obj-name)
                                  :if-exists? (.isIfExists d)}
                         "view" {:type :ddl-drop-view
                                 :view-name (unquote-ident obj-name)
-                                :if-exists? (.isIfExists d)}
+                                :if-exists? (.isIfExists d)
+                                :cascade? cascade?}
                         {:type :ddl-drop :table obj-name
                          :if-exists? (.isIfExists d)
-                         :cascade? (boolean (some #(= "cascade" (str/lower-case (str %)))
-                                                  (.getParameters d)))}))
+                         :cascade? cascade?}))
 
           ;; COMMIT (JSqlParser AST)
                     (instance? Commit stmt)
@@ -2559,7 +2561,10 @@
                                           (and (= op "DROP") (.hasColumn exp))
                                           {:op :drop-column
                                            :name (unquote-ident (.getColumnName exp))
-                                           :if-exists? (.isUsingIfExists exp)}
+                                           :if-exists? (.isUsingIfExists exp)
+                                           :cascade? (boolean
+                                                      (some #(= "cascade" (str/lower-case (str %)))
+                                                            (.getParameters exp)))}
                                           (= op "RENAME_TABLE")
                                           (throw (errors/pg-error
                                                   :feature-not-supported

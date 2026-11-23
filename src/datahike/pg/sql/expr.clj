@@ -58,6 +58,7 @@
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sequence :as sequence]
             [datahike.pg.datetime.carrier :as carrier]
             [datahike.pg.datetime.in :as in]
             [datahike.pg.sql.cast :as sql-cast]
@@ -1752,6 +1753,35 @@
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+        result-var)
+
+      (= fname "pg_get_serial_sequence")
+      (let [oids (call-arg-oids ctx arg-exprs)
+            _ (when-not (and (= 2 (count oids))
+                             (every? #(or (nil? %) (types/implicit-coercible? % types/oid-text)) oids))
+                (throw (no-such-function fname oids)))
+            fn-param (symbol (str "?serial-sequence" (swap! (:var-counter ctx) inc)))
+            db (:db ctx)
+            impl-fn (fn [table-name column-name]
+                      (if (or (fns/sql-null? table-name) (fns/sql-null? column-name))
+                        :__null__
+                        (let [oid (binding [regoid/*db* db regoid/*relation-db* db]
+                                    (regoid/relation-name-oid table-name))
+                              relation (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid)
+                              table (or (:datahike.pg.object/storage-name relation)
+                                        (:datahike.pg.object/name relation)
+                                        (peek (regoid/parse-qualified-name table-name)))
+                              column (catalog-objects/column-by-name db oid column-name)]
+                          (when-not column
+                            (throw (errors/pg-error :undefined-column {:table table :column column-name})))
+                          (if-let [name (first (sort-by #(sequence/id-by-name db %)
+                                                        (sequence/owned-by-column db table column)))]
+                            (str "public." (fns/quote-identifier name))
+                            :__null__))))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
         result-var)
 
       (= fname "pg_get_viewdef")

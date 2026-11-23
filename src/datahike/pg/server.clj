@@ -1423,6 +1423,34 @@
   (when *database-read-only?*
     (throw (errors/pg-error :read-only-sql-transaction {:operation operation}))))
 
+(defn- record-effects-from-report? [op]
+  (and (vector? op)
+       (= :db.fn/call (first op))
+       (::record-effects-from-report (meta (second op)))))
+
+(defn- committed-write-eas
+  "Attribute deferred sequence cleanup from the writer report. Keep explicit
+   entity retractions as row-wide conflicts and preserve opaque operations
+   whose write sets have no such contract."
+  [{:keys [db-before db-after tx-data]} submitted]
+  (let [estimated (tx-buffer-eas submitted db-before)]
+    (if (and (= ::opaque estimated) (some record-effects-from-report? submitted))
+      (let [direct (tx-buffer-eas (remove record-effects-from-report? submitted) db-before)]
+        (if (set? direct)
+          (into direct
+                (keep (fn [^datahike.datom.Datom datom]
+                        (let [attribute (.-a datom)
+                              ident (if (number? attribute)
+                                      (or (dbi/-ident-for db-after attribute)
+                                          (dbi/-ident-for db-before attribute)
+                                          attribute)
+                                      attribute)]
+                          (when-not (= :db/txInstant ident)
+                            [(.-e datom) ident]))))
+                tx-data)
+          direct))
+      estimated)))
+
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
    recent-commit ring. EVERY server-side transact must go through this
@@ -1433,15 +1461,14 @@
    (transact-recorded! conn tx-data nil))
   ([conn tx-data tx-options]
    (assert-database-writable! "write")
-   (let [db-before @conn
-         report (d/transact conn (cond-> {:tx-data (guard-catalog-tx tx-data)}
+   (let [report (d/transact conn (cond-> {:tx-data (guard-catalog-tx tx-data)}
                                    (seq tx-options)
                                    (assoc :tx-options tx-options)))
          db-after (:db-after report)
          eas (if (and (seq tx-data)
                       (every? direct-sequence-value-write? tx-data))
                ::sequence-only
-               (tx-buffer-eas tx-data db-before))]
+               (committed-write-eas report tx-data))]
      (record-commit-writes! (db-ring-key db-after)
                             (:max-tx (:db-before report)) (:max-tx db-after) eas)
      report)))
@@ -5134,6 +5161,8 @@
         "CREATE TABLE")))
 
 (defn- table-create-tx-data [db parsed]
+  (doseq [column (:column-order parsed)]
+    (ddl/validate-table-column-name! column))
   (let [table-name (:table-name parsed)
         raw-ddl-data (ddl-tx-data parsed)
         sequence-names (vec (distinct (keep #(when (map? %) (:__seq__/name %))
@@ -5467,6 +5496,57 @@
                   (recur (inc attempt))
                   :else (classified-error "CREATE VIEW error: " outcome))))))))))
 
+(defn- retract-sequence-tx [db seq-name]
+  (let [object (catalog-objects/object-by-identity
+                db catalog-objects/pg-class-oid
+                catalog-objects/public-namespace-oid seq-name)]
+    (into (if-let [eid (sequence/id-by-name db seq-name)] [[:db/retractEntity eid]] [])
+          (when (= :sequence (:datahike.pg.object/kind object))
+            (catalog-objects/drop-object-tx db catalog-objects/pg-class-oid
+                                            (:datahike.pg.object/oid object))))))
+
+(defn- drop-owned-sequences-tx [db names excluded-default? cascade?]
+  (let [dependencies (remove excluded-default?
+                             (catalog/defaults-depending-on-sequences db names))]
+    (when (and (seq dependencies) (not cascade?))
+      (let [{:keys [table column sequence]} (first dependencies)]
+        (throw (ex-info (str "cannot drop sequence " (fns/quote-identifier sequence)
+                             " because other objects depend on it")
+                        {:sqlstate "2BP01"
+                         :detail (str "default value for column " (:name column)
+                                      " of table " table " depends on sequence " sequence)
+                         :hint "Use DROP ... CASCADE to drop the dependent objects too."}))))
+    (into []
+          (concat
+           (for [{:keys [entity]} dependencies
+                 attr [:pg/default-kind :pg/default-value :pg/default-arg]
+                 :let [value (get entity attr)]
+                 :when (some? value)]
+             [:db/retract (:db/id entity) attr value])
+           (mapcat #(retract-sequence-tx db %) names)))))
+
+(defn- drop-relation-owned-sequences-tx [db table relation-oid dropped-tables cascade?]
+  (let [legacy (when (contains? (dbi/-schema db) :__seq__/owned-by-table)
+                 (map first
+                      (d/q '{:find [?name]
+                             :in [$ ?table]
+                             :where [[?sequence :__seq__/owned-by-table ?table]
+                                     [?sequence :__seq__/name ?name]]}
+                           db table)))
+        columns (when relation-oid
+                  (catalog-objects/columns-by-relation db relation-oid true))
+        names (into (set legacy) (mapcat #(sequence/owned-by-column db table %)) columns)]
+    (drop-owned-sequences-tx db names #(contains? dropped-tables (:table %)) cascade?)))
+
+(defn- sequence-drop-op [f & args]
+  (into [:db.fn/call (with-meta f {::record-effects-from-report true})] args))
+
+(defn- drop-column-owned-sequences-tx [db table column dropping-attributes cascade?]
+  (drop-owned-sequences-tx
+   db (sequence/owned-by-column db table column)
+   #(contains? dropping-attributes (get-in % [:column :attr]))
+   cascade?))
+
 (defn- execute-ddl-drop-view [conn parsed tx-state]
   (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
         view-name (:view-name parsed)
@@ -5497,6 +5577,8 @@
                       (concat
                        (when (= :view (:datahike.pg.object/kind relation))
                          (concat
+                          [(sequence-drop-op drop-relation-owned-sequences-tx view-name
+                                             (:datahike.pg.object/oid relation) #{view-name} (:cascade? parsed))]
                           (catalog-objects/drop-relation-columns-tx
                            db (:datahike.pg.object/oid relation))
                           (catalog-objects/drop-object-tx
@@ -7438,24 +7520,34 @@
     (last (str/split seq-name #"\." 2))
     seq-name))
 
+(defn- sequence-name-by-oid [db spelling]
+  (when (re-matches #"[0-9]+" spelling)
+    (when-let [oid (parse-long spelling)]
+      (when (catalog-objects/valid-user-oid? oid)
+        (let [object (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid)]
+          (when (= :sequence (:datahike.pg.object/kind object))
+            (:datahike.pg.object/name object)))))))
+
 (defn- sequence-reference-name
   "Resolve a sequence argument to the stored name. Databases created before
    sequence DDL folded unquoted names may still have a mixed-case spelling."
   [db spelling]
   (when spelling
-    (let [canonical (peek (regoid/parse-qualified-name spelling))
-          legacy (bare-sequence-name spelling)]
-      (if (and (not= canonical legacy)
-               (not (sequence-exists? db canonical))
-               (sequence-exists? db legacy))
-        legacy
-        canonical))))
+    (or (sequence-name-by-oid db spelling)
+        (let [canonical (peek (regoid/parse-qualified-name spelling))
+              legacy (bare-sequence-name spelling)]
+          (if (and (not= canonical legacy)
+                   (not (sequence-exists? db canonical))
+                   (sequence-exists? db legacy))
+            legacy
+            canonical)))))
 
 (defn- sequence-descriptor [db seq-name]
   (when (and (string? seq-name) (get (dbi/-schema db) :__seq__/name))
     (let [lookup #(sequence/entity-by-name db %)
           bare-name (bare-sequence-name seq-name)
           entity (or (lookup seq-name)
+                     (some-> (sequence-name-by-oid db seq-name) lookup)
                      (when (not= bare-name seq-name)
                        (lookup bare-name))
                          ;; Defaults and deferred projections may still
@@ -9913,6 +10005,48 @@
                           (sequence/position entity))
        :stored-value (:__seq__/value entity)})))
 
+(declare matview-entity)
+
+(defn- sequence-ownership-tx [db seq-name parts]
+  (when (seq parts)
+    (let [names (mapv params/unquote-ident parts)
+          target (when (< 1 (count names))
+                   (let [relation-oid (binding [regoid/*db* db regoid/*relation-db* db
+                                                regoid/*relation-provider* catalog/relation-identity]
+                                        (regoid/relation-name-oid (str/join "." (butlast parts))))
+                         {:keys [name kind namespace-oid]} (catalog/relation-identity db {:oid relation-oid})
+                         column-name (peek names)]
+                     (when (or (not (#{:table :view :foreign-table :partitioned-table "r" "v" "f" "p"} kind))
+                               (and (contains? (dbi/-schema db) :datahike.pg.matview/name)
+                                    (matview-entity db name)))
+                       (throw (ex-info (str "sequence cannot be owned by relation " (dump/quote-ident name))
+                                       {:sqlstate "42809"})))
+                     (when (not= catalog-objects/public-namespace-oid namespace-oid)
+                       (throw (ex-info "sequence must be in same schema as table it is linked to"
+                                       {:sqlstate "55000"})))
+                     (if-let [column (catalog-objects/column-by-name db relation-oid column-name)]
+                       (:datahike.pg.column/address-key column)
+                       (throw (errors/pg-error :undefined-column {:table name :column column-name})))))
+          existing (sequence/entity-by-name db seq-name)
+          seq-ref [:__seq__/name seq-name]]
+      (when (and (nil? target) (not= ["none"] names))
+        (throw (ex-info "invalid OWNED BY option"
+                        {:sqlstate "42601" :hint "Specify OWNED BY table.column or OWNED BY NONE."})))
+      (when (:__seq__/identity-generation existing)
+        (throw (errors/pg-error :feature-not-supported
+                                {:message "cannot change ownership of identity sequence"})))
+      (let [attrs (if target [:__seq__/owned-by-table] [:__seq__/owned-by-table :__seq__/owned-by-column])
+            retract (into []
+                          (keep (fn [attr]
+                                  (when-let [old (get existing attr)]
+                                    [:db/retract seq-ref attr old])))
+                          attrs)]
+        (cond-> retract
+          (and target (not (contains? (dbi/-schema db) :__seq__/owned-by-column)))
+          (conj sequence/ownership-attribute)
+          target
+          (conj [:db/add seq-ref :__seq__/owned-by-column target]))))))
+
 (defn- exec-ddl-alter-sequence
   "ALTER SEQUENCE [IF EXISTS] name options…
 
@@ -9958,7 +10092,12 @@
                         (seq position-tx)
                         (into position-tx)
                         rewrite?
-                        (into (relation-definition-revision-tx current-db [seq-name])))]
+                        (into (relation-definition-revision-tx current-db [seq-name])))
+              tx-data (if-let [owner (:owned-by params)]
+                        (guard-catalog-tx
+                         (into tx-data (sequence-ownership-tx current-db seq-name owner))
+                         (catalog-basis/capture current-db))
+                        tx-data)]
           (if (:in-tx? @tx-state)
             (let [result (execute-ddl-in-tx tx-state tx-data "ALTER SEQUENCE")]
               (when (and rewrite? (nil? (.error ^PgWireServer$QueryResult result)))
@@ -9972,7 +10111,7 @@
 (defn- exec-ddl-create-sequence
   [ctx parsed]
   (let [{:keys [conn tx-state session-id]} ctx
-        {:keys [seq-name if-not-exists? tx-data]} parsed]
+        {:keys [seq-name if-not-exists? tx-data seq-params]} parsed]
     (acquire-catalog-allocation-lock! conn tx-state session-id)
     (loop [attempt 0]
       (let [current-db (if (:in-tx? @tx-state)
@@ -10014,7 +10153,12 @@
                         current-db
                         {:class-oid catalog-objects/pg-class-oid
                          :oid oid :kind :sequence :name seq-name
-                         :namespace-oid catalog-objects/public-namespace-oid})))]
+                         :namespace-oid catalog-objects/public-namespace-oid})))
+                create-data (if-let [owner (:owned-by seq-params)]
+                              (guard-catalog-tx
+                               (into create-data (sequence-ownership-tx current-db seq-name owner))
+                               (catalog-basis/capture current-db))
+                              create-data)]
             (if (:in-tx? @tx-state)
               (let [result (execute-ddl-in-tx tx-state create-data "CREATE SEQUENCE")]
                 (when (nil? (.error ^PgWireServer$QueryResult result))
@@ -11989,7 +12133,7 @@
                        [?index :datahike.pg.object/name ?name]]}
              db table)))
 
-(defn- drop-column-tx-data [db table relation-oid {:keys [name if-exists?]}]
+(defn- drop-column-tx-data [db table relation-oid dropping-attributes {:keys [name if-exists? cascade?]}]
   (let [column (catalog-objects/column-by-name db relation-oid name)
         index-dependents (when column
                            (column-index-dependents db table column))]
@@ -12012,6 +12156,7 @@
             hint-eid (column-hint-eid db attr)]
         (into (column-data-retractions db attr)
               (concat
+               [(sequence-drop-op drop-column-owned-sequences-tx table column dropping-attributes cascade?)]
                (mapcat
                 (fn [{:keys [name]}]
                   (when-let [index-object
@@ -12033,6 +12178,9 @@
     (when-not column
       (throw (errors/pg-error :undefined-column
                               {:column old-name :table table})))
+    (let [relation (catalog-objects/object-by-address db catalog-objects/pg-class-oid relation-oid)]
+      (when-not (= :view (:datahike.pg.object/kind relation))
+        (ddl/validate-table-column-name! new-name)))
     (when (catalog-objects/column-by-name db relation-oid new-name)
       (throw (ex-info (str "column \"" new-name "\" of relation \""
                            table "\" already exists")
@@ -12159,33 +12307,73 @@
           (map (fn [[attr value]] [:db/add eid attr value]))
           metadata)))
 
-(defn- backfill-added-column-tx [db table relation-oid {:keys [name not-null?]}]
-  (let [column (alterable-column db table relation-oid name "ADD COLUMN with a default or NOT NULL")
+(defn- prepare-added-column-backfill
+  [db schema-db table relation-oid {:keys [name not-null?]} resolve-value]
+  (let [column (alterable-column schema-db table relation-oid name "ADD COLUMN with a default or NOT NULL")
         attr (:datahike.pg.column/storage-ident column)
-        entity (d/entity db attr)
+        entity (d/entity schema-db attr)
         kind (:pg/default-kind entity)
-        rows (table-row-eids db table)]
-    (when (and (seq rows) (#{:nextval :expr} kind))
-      (throw (errors/pg-error
-              :feature-not-supported
-              {:message "backfilling an expression default on ADD COLUMN is not supported"})))
-    (let [value (when (#{:literal :bit :bit-coerced :fn} kind)
-                  (stmt/coerce-insert-value
-                   (row-constraints/eval-default kind (:pg/default-value entity))
-                   attr (dbi/-schema db) db))]
-      (when (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))
-        (when-let [spec (get-in (row-constraints/constraint-plan db table) [:domain-enum name])]
-          (when (if (= :enum (:kind spec)) (some? value) (seq rows))
-            (row-constraints/validate-pre-arbiter!
-             db table {attr value} {:domain-enum {name spec}} (row-eval/check-fn db) nil))))
-      (when (and not-null? (seq rows) (nil? value))
-        (throw (ex-info (str "column \"" name "\" of relation \"" table
-                             "\" contains null values")
-                        {:sqlstate "23502" :table table :column name})))
-      (cond-> (if (some? value)
-                (mapv (fn [eid] [:db/add eid attr value]) rows)
-                [])
-        not-null? (conj [:db/add (:db/id entity) :pg/not-null true])))))
+        default (when kind [kind (:pg/default-value entity) (:pg/default-arg entity)])
+        ast (when (= :expr kind)
+              (ddl/parse-default-expression (:pg/default-value entity)))
+        schema (dbi/-schema schema-db)
+        input-schema (dbi/-schema db)
+        _ (when ast (row-eval/row-oids [ast] nil input-schema db))
+        spec (when (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))
+               (get-in (row-constraints/constraint-plan schema-db table) [:domain-enum name]))
+        check-fn (when spec (row-eval/check-fn schema-db))
+        validate #(row-constraints/validate-pre-arbiter!
+                   schema-db table {attr %} {:domain-enum {name spec}} check-fn nil)
+        evaluate (fn []
+                   (let [v (-> (materialize-column-default
+                                default resolve-value ast
+                                (fn [expr]
+                                  (resolve-value (row-eval/default-value expr input-schema db))))
+                               (stmt/coerce-insert-value attr schema schema-db))]
+                     ;; A literal enum input must be valid even for an
+                     ;; empty table. Domain checks apply to backfilled rows.
+                     (when (and (some? v) (= :enum (:kind spec)))
+                       (validate v))
+                     v))
+        value (if (#{:expr :nextval} kind) evaluate (constantly (evaluate)))]
+    (fn [ops eid]
+      (let [v (value)]
+        (when (= :domain (:kind spec))
+          (validate v))
+        (when (and not-null? (nil? v))
+          (throw (ex-info (str "column \"" name "\" of relation \"" table
+                               "\" contains null values")
+                          {:sqlstate "23502" :table table :column name})))
+        (if (some? v) (conj! ops [:db/add eid attr v]) ops)))))
+
+(defn- added-column-backfill-op
+  "Materialize defaults once, before the writer runs. Sequence reservations
+   use the session path, and retry or COMMIT reuses the prepared values."
+  [{:keys [conn tx-state session-state]} db table relation-oid schema-tx columns]
+  (let [schema-db (:db-after (dc/with db schema-tx))
+        resolve-value #(params/resolve-nextvals! % (partial session-nextval! conn tx-state session-state))
+        backfills (mapv #(prepare-added-column-backfill db schema-db table relation-oid % resolve-value)
+                        columns)
+        rows (table-row-eids db table)
+        tick! (params/cancellation-ticker)
+        row-data (persistent!
+                  (reduce (fn [ops eid]
+                            (tick!)
+                            (reduce (fn [ops backfill] (backfill ops eid))
+                                    ops backfills))
+                          (transient []) (sort rows)))
+        ops (into row-data
+                  (keep (fn [{:keys [not-null? storage-ident]}]
+                          (when not-null?
+                            [:db/add [:db/ident storage-ident] :pg/not-null true])))
+                  columns)]
+    [:db.fn/call
+     (fn [current-db]
+       (when-not (= rows (table-row-eids current-db table))
+         (throw (ex-info "could not serialize column default backfill"
+                         {:error :serialization-failure
+                          :detail "table rows changed while ADD COLUMN evaluated defaults"})))
+       ops)]))
 
 (defn- available-column-storage-ident [occupied table name attnum]
   (let [logical (keyword table name)]
@@ -12566,6 +12754,7 @@
             added-column-specs
             (mapv
              (fn [idx {:keys [name type] :as column}]
+               (ddl/validate-table-column-name! name)
                (when (catalog-objects/column-by-name db relation-oid name)
                  (throw (ex-info (str "column \"" name "\" of relation \""
                                       table "\" already exists")
@@ -12762,11 +12951,18 @@
                       {:datahike.pg/for-ident storage-ident
                        :datahike.pg/column name}))
                   added-column-specs)
+            dropping-attributes
+            (into #{}
+                  (keep (fn [{:keys [op name]}]
+                          (when (= :drop-column op)
+                            (:datahike.pg.column/storage-ident
+                             (catalog-objects/column-by-name db relation-oid name)))))
+                  operations)
             lifecycle-data
             (mapcat (fn [{:keys [op] :as operation}]
                       (case op
                         :drop-column
-                        (drop-column-tx-data db table relation-oid operation)
+                        (drop-column-tx-data db table relation-oid dropping-attributes operation)
                         :rename-column
                         (rename-column-tx-data db table relation-oid operation)
                         nil))
@@ -12789,17 +12985,19 @@
                          (map (fn [change]
                                 [:db.fn/call alter-column-default-tx table relation-oid change])
                               (get default-groups before-rewrite?)))
-            backfill-tx (for [{:keys [not-null? default type-object] :as column} added-column-specs
-                              :when (or not-null? (some? (:value default))
-                                        (= :domain (:datahike.pg.object/kind type-object)))]
-                          [:db.fn/call backfill-added-column-tx table relation-oid column])
+            backfill-columns (filterv (fn [{:keys [not-null? default type-object]}]
+                                        (or not-null? (some? (:value default))
+                                            (= :domain (:datahike.pg.object/kind type-object))))
+                                      added-column-specs)
             ;; PostgreSQL drops nullability before adding columns, then
-            ;; validates SET NOT NULL against the resulting table. Run the
-            ;; scan in the writer as well as on a speculative transaction.
-            tx-data (into (nullability-tx :drop-not-null)
-                          (concat schema-and-constraint-data added-constraint-data
-                                  attnum-data inherited-column-data hint-data backfill-tx
-                                  lifecycle-data (default-tx true)
+            ;; validates SET NOT NULL against the resulting table.
+            schema-tx (into (nullability-tx :drop-not-null)
+                            (concat schema-and-constraint-data added-constraint-data
+                                    attnum-data inherited-column-data hint-data))
+            backfill-tx (when (seq backfill-columns)
+                          [(added-column-backfill-op ctx db table relation-oid schema-tx backfill-columns)])
+            tx-data (into schema-tx
+                          (concat backfill-tx lifecycle-data (default-tx true)
                                   (when (seq type-ops) [(type-rewrite-op table relation-oid type-ops)])
                                   (default-tx false)
                                   (nullability-tx :set-not-null)))
@@ -12809,7 +13007,8 @@
                              db catalog-objects/pg-class-oid relation-oid))
                       tx-data)
             tx-data (cond-> tx-data
-                      (some #(= :add-foreign-key (:op %)) operations)
+                      (or (seq backfill-columns)
+                          (some #(= :add-foreign-key (:op %)) operations))
                       (guard-catalog-tx (catalog-basis/capture db)))]
         (if (seq tx-data)
           (try
@@ -12841,8 +13040,9 @@
 (defn- drop-table-tx-data
   "Build the retractions for every row, schema attribute, owned sequence, and
    secondary-index declaration belonging to `table` in `db`."
-  [db table]
+  [db table dropped-tables cascade?]
   (let [db-schema (dbi/-schema db)
+        relation-oid (pgs/table-oid db table)
         ;; All schema attributes in this table's namespace.
         table-attrs (into []
                           (keep (fn [[attr-kw _]]
@@ -12873,28 +13073,9 @@
         ;; SERIAL/IDENTITY creates an owned sequence in PostgreSQL; dropping
         ;; the table drops that sequence too.  Leaving it behind made a later
         ;; CREATE TABLE with the same SERIAL column resume the old counter.
-        owned-sequence-eids
-        (when (get db-schema :__seq__/owned-by-table)
-          (map first
-               (d/q '{:find [?sequence]
-                      :in [$ ?table]
-                      :where [[?sequence :__seq__/owned-by-table ?table]]}
-                    db table)))
-        sequence-tx-data (mapv (fn [eid]
-                                 [:db/retractEntity
-                                  [:__seq__/name (:__seq__/name (d/entity db eid))]])
-                               owned-sequence-eids)
-        sequence-object-tx-data
-        (mapcat (fn [eid]
-                  (let [name (:__seq__/name (d/entity db eid))
-                        object (catalog-objects/object-by-identity
-                                db catalog-objects/pg-class-oid
-                                catalog-objects/public-namespace-oid name)]
-                    (when (= :sequence (:datahike.pg.object/kind object))
-                      (catalog-objects/drop-object-tx
-                       db catalog-objects/pg-class-oid
-                       (:datahike.pg.object/oid object)))))
-                owned-sequence-eids)
+        sequence-tx-data
+        (when (or relation-oid (seq table-attrs))
+          [(sequence-drop-op drop-relation-owned-sequences-tx table relation-oid dropped-tables cascade?)])
         ;; The table's own CHECK and FOREIGN KEY constraints go with it.
         ;; Left behind, they were enforced against a later table of the
         ;; same name: `rv_z_a_check` rejected rows of a table that no
@@ -12963,7 +13144,7 @@
                   (:datahike.pg.object/oid object))))))
          (into declared-index-eids legacy-secondary-eids))
         object-tx-data
-        (when-let [oid (pgs/table-oid db table)]
+        (when-let [oid relation-oid]
           (let [row-type
                 (catalog-objects/object-by-identity
                  db catalog-objects/pg-type-oid
@@ -12981,7 +13162,6 @@
                                        inheritance-eids)
                                   (filter some? schema-tx-data)
                                   sequence-tx-data
-                                  sequence-object-tx-data
                                   constraint-tx-data
                                   secondary-tx-data
                                   index-object-tx-data
@@ -12993,7 +13173,7 @@
    cleanup; SQL DROP goes through exec-ddl-drop so explicit transactions can
    apply the same data to their speculative database."
   [conn table]
-  (let [tx-data (drop-table-tx-data (d/db conn) table)]
+  (let [tx-data (drop-table-tx-data (d/db conn) table #{table} true)]
     (when (seq tx-data)
       (transact-recorded! conn tx-data))))
 
@@ -13081,7 +13261,7 @@
                                                     " depends on table " p)))
                            :hint "Use DROP ... CASCADE to drop the dependent objects too."}))))
             tx-data (into (mapv (fn [[e]] [:db/retractEntity e]) referencing)
-                          (mapcat #(drop-table-tx-data db %))
+                          (mapcat #(drop-table-tx-data db % table-set (:cascade? parsed)))
                           tables)
             result (if (:in-tx? @tx-state)
                      (execute-ddl-in-tx tx-state tx-data "DROP TABLE")
@@ -13100,27 +13280,25 @@
       (catch Exception e
         (classified-error "DROP TABLE error: " e)))))
 
+(defn- drop-sequence-tx [db seq-name cascade?]
+  (when (:__seq__/identity-generation (sequence/entity-by-name db seq-name))
+    (throw (ex-info (str "cannot drop sequence " (fns/quote-identifier seq-name)
+                         " because an identity column requires it")
+                    {:sqlstate "2BP01"})))
+  (drop-owned-sequences-tx db [seq-name] (constantly false) cascade?))
+
 (defn- exec-ddl-drop-sequence
-  [ctx parsed]
+  [ctx {:keys [seq-name if-exists? cascade?]}]
   (let [{:keys [conn tx-state]} ctx]
     (try
-      (let [seq-name (:seq-name parsed)
-            db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
-            seq-eid (ffirst (d/q '{:find [?e]
-                                   :where [[?e :__seq__/name ?n]]
-                                   :in [$ ?n]}
-                                 db seq-name))
+      (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+            eid (sequence/id-by-name db seq-name)
             object (catalog-objects/object-by-identity
                     db catalog-objects/pg-class-oid
-                    catalog-objects/public-namespace-oid seq-name)
-            tx-data (into (cond-> [] seq-eid (conj [:db/retractEntity seq-eid]))
-                          (when (= :sequence (:datahike.pg.object/kind object))
-                            (catalog-objects/drop-object-tx
-                             db catalog-objects/pg-class-oid
-                             (:datahike.pg.object/oid object))))]
+                    catalog-objects/public-namespace-oid seq-name)]
         (cond
-          (and (nil? seq-eid) (nil? object) (:if-exists? parsed))
-          (do (params/notice! "NOTICE" (str "sequence \"" (:seq-name parsed)
+          (and (nil? eid) (nil? object) if-exists?)
+          (do (params/notice! "NOTICE" (str "sequence \"" seq-name
                                             "\" does not exist, skipping"))
               (empty-result "DROP SEQUENCE"))
 
@@ -13128,16 +13306,15 @@
           (throw (ex-info (str "\"" seq-name "\" is not a sequence")
                           {:error :wrong-object-type :sqlstate "42809"}))
 
-          (and (nil? seq-eid) (nil? object))
+          (and (nil? eid) (nil? object))
           (throw (ex-info (str "sequence \"" seq-name "\" does not exist")
                           {:error :undefined-table :sqlstate "42P01"}))
 
-          (:in-tx? @tx-state)
-          (execute-ddl-in-tx tx-state tx-data "DROP SEQUENCE")
-
           :else
-          (do (when (seq tx-data) (transact-recorded! conn tx-data))
-              (empty-result "DROP SEQUENCE"))))
+          (commit-ddl ctx
+                      (guard-catalog-tx [(sequence-drop-op drop-sequence-tx seq-name cascade?)]
+                                        (catalog-basis/capture db))
+                      "DROP SEQUENCE")))
       (catch Exception e
         (classified-error "DROP SEQUENCE error: " e)))))
 
