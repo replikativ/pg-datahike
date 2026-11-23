@@ -1696,18 +1696,6 @@
 (defn- effective-search-path [session-state]
   (or (:search-path @session-state) ["$user" "public"]))
 
-(defn- current-schema-name [session-state]
-  (first (filter #{"public" "pg_catalog"}
-                 (effective-search-path session-state))))
-
-(defn- handle-current-schema [session-state]
-  (PgWireServer$QueryResult.
-   (into-array String ["current_schema"])
-   (int-array [types/oid-name])
-   (into-array (Class/forName "[Ljava.lang.String;")
-               [(into-array String [(current-schema-name session-state)])])
-   "SELECT 1"))
-
 (defn- handle-current-database
   "Return the connection's own database name. In the single-handler
    case the handler was created without a registry and `db-name` is the
@@ -7226,7 +7214,7 @@
     :ddl-create-composite :ddl-create-domain :ddl-drop-domain
     :ddl-create-function :ddl-drop-function
     :ddl-create-trigger :ddl-drop-trigger
-    :ddl-create-role :ddl-drop-role
+    :ddl-create-role :ddl-drop-role :ddl-schema
     ;; Ordinary B-tree CREATE INDEX remains a transaction-compatible
     ;; compatibility declaration. Materialized secondary methods reject a
     ;; buffered/explicit transaction at their narrower execution boundary.
@@ -8008,8 +7996,7 @@
   "Dispatch on (:system-type parsed). System-types are recognised by
    cls/classify (token-driven) and don't go through JSqlParser — most
    delegate to the handle-X defns above; a handful are inline empty-
-   result tags for synthetic success of no-op DDL (CREATE/DROP SCHEMA,
-   COMMENT ON, LOCK TABLE, …)."
+   result tags for compatibility statements such as COMMENT ON and LOCK TABLE."
   [ctx parsed]
   (let [{:keys [conn session-state schema tx-state
                 on-create-database on-delete-database registry-atom
@@ -8069,8 +8056,7 @@
       ;; as :tag already ("VACUUM" / "REINDEX" / "CLUSTER").
       (empty-result (:tag parsed))
       :schema-noop
-      ;; CREATE / DROP / ALTER SCHEMA — classify :tag already
-      ;; encodes the full "CREATE SCHEMA" / "DROP SCHEMA" / etc.
+      ;; Schema ownership follows the server's single-role model.
       (empty-result (:tag parsed))
 
       :privilege-noop
@@ -10400,6 +10386,78 @@
                              " is not supported")
                :detail "The body parses; this server cannot run that construct yet."})))
     ast))
+
+(defn- schema-ddl-tx [db {:keys [names new-name operation if-clause? cascade?]}]
+  (let [name (first names)
+        namespaces (mapv #(catalog-objects/namespace-by-name db %) names)
+        existing (first namespaces)
+        class-oid catalog-objects/pg-namespace-oid
+        oid :datahike.pg.object/oid
+        undefined-schema (fn [name]
+                           (ex-info (str "schema \"" name "\" does not exist")
+                                    {:sqlstate "3F000"}))
+        duplicate-schema (fn [name]
+                           (ex-info (str "schema \"" name "\" already exists")
+                                    {:sqlstate "42P06"}))
+        check-new-name! (fn [name]
+                          (when (str/starts-with? name "pg_")
+                            (throw (ex-info (str "unacceptable schema name \"" name "\"")
+                                            {:sqlstate "42939"
+                                             :detail "The prefix \"pg_\" is reserved for system schemas."}))))
+        check-mutable! (fn [name namespace]
+                         (when (< (oid namespace) catalog-objects/first-user-oid)
+                           (throw (errors/pg-error :feature-not-supported
+                                                   {:feature (str "changing the built-in schema " name)}))))]
+    (case operation
+      :create
+      (if existing
+        (if if-clause?
+          (do (params/notice! "NOTICE" (str "schema \"" name "\" already exists, skipping") "42P06" nil) [])
+          (throw (duplicate-schema name)))
+        (do
+          (check-new-name! name)
+          (let [{new-oid :oid tx-data :tx-data} (catalog-objects/reserve-user-oid-tx db)]
+            (into tx-data (catalog-objects/create-object-tx
+                           db {:class-oid class-oid :oid new-oid :kind :namespace :name name})))))
+
+      :alter
+      (do
+        (when-not existing (throw (undefined-schema name)))
+        (check-mutable! name existing)
+        (check-new-name! new-name)
+        (when (catalog-objects/namespace-by-name db new-name)
+          (throw (duplicate-schema new-name)))
+        (catalog-objects/rename-object-tx db class-oid (oid existing) new-name nil))
+
+      :drop
+      (into []
+            (mapcat (fn [[name namespace]]
+                      (if namespace
+                        (do
+                          (check-mutable! name namespace)
+                          (when (seq (catalog-objects/objects-in-namespace db (oid namespace)))
+                            (throw (if cascade?
+                                     (errors/pg-error :feature-not-supported
+                                                      {:feature "DROP SCHEMA CASCADE with dependent objects"})
+                                     (ex-info (str "cannot drop schema " name " because other objects depend on it")
+                                              {:sqlstate "2BP01"}))))
+                          (catalog-objects/drop-object-tx db class-oid (oid namespace)))
+                        (if if-clause?
+                          (do (params/notice! "NOTICE" (str "schema \"" name "\" does not exist, skipping")) [])
+                          (throw (undefined-schema name))))))
+            (distinct (map vector names namespaces))))))
+
+(defn- exec-ddl-schema [{:keys [conn tx-state session-id]} {:keys [tag] :as parsed}]
+  (try
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
+    (let [db (or (:speculative-db @tx-state) (d/db conn))
+          tx-data (schema-ddl-tx db parsed)]
+      (cond
+        (empty? tx-data) (empty-result tag)
+        (:in-tx? @tx-state) (execute-ddl-in-tx tx-state tx-data tag)
+        :else (do (transact-recorded! conn tx-data) (empty-result tag))))
+    (catch Exception e
+      (classified-error "" e))))
 
 (defn- exec-ddl-create-role
   "CREATE ROLE / USER / GROUP.
@@ -15802,6 +15860,8 @@
                                                       tx-state #(exec-ddl-create-role ctx parsed))
                               :ddl-drop-role         (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-drop-role ctx parsed))
+                              :ddl-schema            (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-schema ctx parsed))
                               :ddl-create-table-as   (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create-table-as ctx parsed))
                               :ddl-create-table-like (execute-ddl-invalidating

@@ -1294,6 +1294,11 @@
               :drop-role-object
               (assoc base :type :ddl-drop-role)
 
+              :schema-ddl
+              (let [identifier (comp first regoid/parse-qualified-name)]
+                (cond-> (assoc base :type :ddl-schema :names (mapv identifier (:names base)))
+                  (:new-name base) (update :new-name identifier)))
+
               ;; CREATE / ALTER SEQUENCE — fully token-classified; the
               ;; option list arrives on cls-info as :seq-opts. Validation
               ;; (defaults, bounds, 42601/22023) runs in ddl and raises,

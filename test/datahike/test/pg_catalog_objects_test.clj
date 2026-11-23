@@ -69,6 +69,45 @@
                (:datahike.pg.catalog/next-oid
                 (objects/catalog-entity (d/db conn)))))))))
 
+(deftest schema-ddl-uses-durable-namespace-identities
+  (with-catalog
+    (fn [conn]
+      (with-open [handler (server/make-query-handler conn)]
+        (let [run #(.execute handler %)
+              exec! (fn [sql] (is (nil? (.error (run sql))) sql))
+              rows #(mapv vec (.rows (run %)))
+              oid-for (fn [name]
+                        (:datahike.pg.object/oid (objects/namespace-by-name (d/db conn) name)))]
+          (exec! "CREATE SCHEMA \"Billing Data\"")
+          (exec! "CREATE SCHEMA archive")
+          (let [oid (oid-for "Billing Data")]
+            (is (>= oid objects/first-user-oid))
+            (is (= [[(str oid)]] (rows "SELECT oid FROM pg_namespace WHERE nspname = 'Billing Data'")))
+            (is (= "42P06" (.sqlstate (run "CREATE SCHEMA \"Billing Data\""))))
+            (is (= "42939" (.sqlstate (run "CREATE SCHEMA pg_reserved"))))
+            (exec! "CREATE SCHEMA IF NOT EXISTS \"Billing Data\"")
+            (exec! "SET search_path TO missing, \"Billing Data\", public")
+            (is (= [["Billing Data" "Billing Data" "{\"Billing Data\",public}"]]
+                   (rows "SELECT current_schema(), current_schema, current_schemas(false)::text")))
+            (is (= [["{pg_catalog,\"Billing Data\",public}"]]
+                   (rows "SELECT current_schemas(true)::text")))
+            (exec! "BEGIN")
+            (exec! "ALTER SCHEMA \"Billing Data\" RENAME TO temporary_billing")
+            (is (= [[(str oid)]] (rows "SELECT oid FROM pg_namespace WHERE nspname = 'temporary_billing'")))
+            (is (= [["public"]] (rows "SELECT current_schema()")))
+            (exec! "ROLLBACK")
+            (is (= oid (oid-for "Billing Data")))
+            (is (nil? (oid-for "temporary_billing")))
+            (exec! "ALTER SCHEMA \"Billing Data\" RENAME TO billing")
+            (is (= oid (oid-for "billing")))
+            (is (= "3F000" (.sqlstate (run "DROP SCHEMA billing, missing"))))
+            (is (= oid (oid-for "billing")))
+            (exec! "DROP SCHEMA IF EXISTS billing, missing, archive RESTRICT")
+            (is (nil? (oid-for "billing")))
+            (is (nil? (oid-for "archive")))
+            (exec! "CREATE SCHEMA ÄMixed")
+            (is (some? (oid-for "Ämixed")))))))))
+
 (deftest speculative-allocations-chain-and-rollback
   (with-catalog
     (fn [conn]

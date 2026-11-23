@@ -631,6 +631,43 @@
          classify-create-trigger classify-role-statement classify-create-matview
          classify-refresh-matview classify-drop-matview classify-create-table)
 
+(defn- schema-name [token]
+  (when (ident-tok? token) (:text token)))
+
+(defn- classify-schema-ddl [verb tokens]
+  (let [tokens (vec tokens)
+        tokens (if (= ";" (:text (peek tokens))) (pop tokens) tokens)
+        [first-token second-token third-token] tokens
+        if-clause? (and (kw=? first-token "if")
+                        (case verb
+                          :create (and (kw=? second-token "not") (kw=? third-token "exists"))
+                          :drop (kw=? second-token "exists")
+                          false))
+        tokens (if if-clause? (subvec tokens (if (= :create verb) 3 2)) tokens)
+        [name-token operation-token target-token new-name-token] tokens
+        schema (schema-name name-token)
+        new-name (schema-name new-name-token)
+        parsed (case verb
+                 :create (when (and schema (= 1 (count tokens)))
+                           {:names [schema]})
+                 :drop (let [cascade? (kw=? (peek tokens) "cascade")
+                             entries (if (or cascade? (kw=? (peek tokens) "restrict"))
+                                       (pop tokens) tokens)
+                             names (mapv schema-name (take-nth 2 entries))]
+                         (when (and (odd? (count entries))
+                                    (every? some? names)
+                                    (every? #(= "," (:text %)) (take-nth 2 (rest entries))))
+                           {:names names :cascade? cascade?}))
+                 :alter (when (and schema new-name (= 4 (count tokens))
+                                   (kw=? operation-token "rename") (kw=? target-token "to"))
+                          {:names [schema] :new-name new-name}))
+        tag (str (str/upper-case (name verb)) " SCHEMA")]
+    (if parsed
+      (assoc parsed :kind :schema-ddl :operation verb :if-clause? if-clause? :tag tag)
+      (if (and (= :alter verb) (kw=? operation-token "owner"))
+        {:kind :schema-noop :tag tag}
+        {:kind :generic-sql}))))
+
 (defn- classify-create [toks]
   ;; toks starts after CREATE. Skip qualifiers (OR REPLACE, UNIQUE,
   ;; TEMPORARY, GLOBAL, LOCAL, UNLOGGED) that don't disambiguate kind.
@@ -648,7 +685,7 @@
       (kw=? t1 "policy")    {:kind :create-policy :reject-kind :policy :tag "CREATE POLICY"}
       (kw=? t1 "extension") {:kind :create-extension :reject-kind :create-extension
                              :tag "CREATE EXTENSION"}
-      (kw=? t1 "schema")    {:kind :schema-noop :tag "CREATE SCHEMA"}
+      (kw=? t1 "schema")    (classify-schema-ddl :create (rest toks))
       (kw-in? t1 #{"role" "user" "group"})
       (classify-role-statement :create (rest toks) (str/upper-case (:text t1)))
       (kw=? t1 "database")  {:kind :create-database :tag "CREATE DATABASE"}
@@ -1619,7 +1656,7 @@
       (kw=? t1 "policy")    {:kind :drop-policy :reject-kind :policy :tag "DROP POLICY"}
       (kw=? t1 "extension") {:kind :drop-extension :reject-kind :create-extension
                              :tag "DROP EXTENSION"}
-      (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
+      (kw=? t1 "schema")    (classify-schema-ddl :drop (rest toks))
       (kw-in? t1 #{"role" "user" "group"})
       (classify-role-statement :drop (rest toks) (str/upper-case (:text t1)))
       (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
@@ -1662,7 +1699,7 @@
   (let [[t1 & rest-toks] toks]
     (cond
       (kw=? t1 "policy")  {:kind :alter-policy :reject-kind :policy :tag "ALTER POLICY"}
-      (kw=? t1 "schema")  {:kind :schema-noop :tag "ALTER SCHEMA"}
+      (kw=? t1 "schema")  (classify-schema-ddl :alter rest-toks)
 
       ;; ALTER <object> ... OWNER TO ... — pg_dump-emitted boilerplate.
       ;; We don't have a role system, so silently accept with the

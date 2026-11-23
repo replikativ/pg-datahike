@@ -430,15 +430,20 @@
          [:db/add column-ref :datahike.pg.column/storage-ident
           new-storage-ident]]))))
 
+(defn explicit-search-namespaces
+  "Resolve explicit search_path entries in order, skipping nonexistent schemas."
+  [db entries user-name]
+  (->> entries
+       (map #(if (= "$user" %) user-name %))
+       distinct
+       (keep #(namespace-by-name db %))))
+
 (defn resolve-search-path
   "Resolve PostgreSQL search_path entries to existing namespace OIDs.
    pg_catalog is implicitly searched first unless explicitly positioned.
    `$user` contributes a schema only when it exists."
   [db entries user-name]
-  (let [expanded (map #(if (= "$user" %) user-name %) entries)
-        explicit (keep #(some-> (namespace-by-name db %) :datahike.pg.object/oid)
-                       expanded)
-        explicit (vec (distinct explicit))]
+  (let [explicit (mapv :datahike.pg.object/oid (explicit-search-namespaces db entries user-name))]
     (if (some #{pg-catalog-namespace-oid} explicit)
       explicit
       (into [pg-catalog-namespace-oid] explicit))))
@@ -447,9 +452,7 @@
   "The first existing explicit search_path entry.  The implicit pg_catalog
    entry used for lookup is deliberately not a creation target."
   [db entries user-name]
-  (some #(let [name (if (= "$user" %) user-name %)]
-           (namespace-by-name db name))
-        entries))
+  (first (explicit-search-namespaces db entries user-name)))
 
 (defn catalog-entity [db]
   (when (get (dbi/-schema db) :datahike.pg.catalog/key)
