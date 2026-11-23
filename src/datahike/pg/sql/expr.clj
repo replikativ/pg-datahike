@@ -408,8 +408,8 @@
                        (let [decl-oid (oid-infer/sql-type-name->oid decl-name db)]
                          (or (nil? decl-oid)
                              (= decl-oid actual-oid)
-                             (= (types/cast-category (types/oid->pg-name decl-oid))
-                                (types/cast-category (types/oid->pg-name actual-oid)))))))
+                             (when-let [category (types/cast-category (types/oid->pg-name decl-oid))]
+                               (= category (types/cast-category (types/oid->pg-name actual-oid))))))))
                  declared actual-oids))))
 
 (defn- all-text-params? [cand]
@@ -421,8 +421,8 @@
   "The stored `LANGUAGE sql` function a call of this name and these
    argument types resolves to, or nil when none does.
 
-   One overload of the arity is used as-is. Several are filtered by
-   whether they can take these arguments; if that still leaves more
+   One overload of the arity is used as-is. An exact declared signature
+   wins among several overloads. Otherwise filter by coercion; if that leaves more
    than one and every argument is an untyped literal, the all-`text`
    overload wins, which is PostgreSQL's unknown-prefers-text rule and
    the case `polymorphism` exercises (`dfunc('Hi','City')` is the
@@ -434,12 +434,18 @@
       (empty? cands) nil
       (= 1 (count cands)) (first cands)
       :else
-      (let [fits (filterv #(candidate-accepts? db % actual-oids) cands)]
-        (cond
-          (= 1 (count fits)) (first fits)
-          (and (> (count fits) 1) (every? nil? actual-oids))
-          (first (filter all-text-params? fits))
-          :else nil)))))
+      (or (when (every? some? actual-oids)
+            (some (fn [cand]
+                    (let [declared (read-string (:datahike.pg.function/arg-types cand))]
+                      (when (= actual-oids (mapv #(oid-infer/sql-type-name->oid % db) declared))
+                        cand)))
+                  cands))
+          (let [fits (filterv #(candidate-accepts? db % actual-oids) cands)]
+            (cond
+              (= 1 (count fits)) (first fits)
+              (and (> (count fits) 1) (every? nil? actual-oids))
+              (first (filter all-text-params? fits))
+              :else nil))))))
 
 (defn- sql-function-body-expr
   "The single expression a `LANGUAGE sql` body returns, when the body is

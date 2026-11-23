@@ -904,8 +904,8 @@
 
 (defn sql-type-name->oid
   "Map a SQL type NAME to its OID: `int` → 23, `character varying` → 1043,
-   `jsonb` → 3802, a composite type declared in this database → its row
-   type. nil when the name resolves to nothing.
+   `jsonb` → 3802, a declared enum or composite → its catalog type OID.
+   Returns nil when the name resolves to nothing.
 
    Uses `types/cast-category` so the set of recognised names stays in one
    place. This is what a CAST target, a function's declared argument and
@@ -959,7 +959,10 @@
      ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
      ;; comprehensive. Without this, `::jsonb` / `::jsonb[]` reported text
      ;; and the binary value mis-decoded.
-     (get types/pg-name->oid type-str))))
+     (get types/pg-name->oid type-str)
+     (let [object (pgs/user-type-object db type-str)]
+       (when (= :enum (:datahike.pg.object/kind object))
+         (:datahike.pg.object/oid object))))))
 
 (defn- cast-oid
   "Map a SQL CAST target type to an OID, wrapping to the array type when
@@ -973,12 +976,7 @@
         type-str (some-> cdt .getDataType str)
         ad       (when cdt (.getArrayData cdt))
         array?   (and ad (pos? (.size ^java.util.List ad)))
-        db (:db env)
-        scalar-oid (or (sql-type-name->oid type-str db)
-                       (when-not array?
-                         (let [object (pgs/user-type-object db type-str)]
-                           (when (= :enum (:datahike.pg.object/kind object))
-                             (:datahike.pg.object/oid object)))))]
+        scalar-oid (sql-type-name->oid type-str (:db env))]
     (cond
       ;; The parser leaves array brackets in getDataType for qualified names.
       (and (not array?) type-str (str/ends-with? type-str "[]"))

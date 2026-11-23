@@ -54,7 +54,16 @@
      :boundaries
      #{:scalar-type :type-inference :input-codec :volatile-functions :operators :temporal-extraction},
      :mode :unmeasured}
-    {:name "enum", :boundaries #{:user-type :ordering :casts :catalog-introspection}, :mode :unmeasured}
+    {:name "enum",
+     :boundaries #{:user-type :ordering :casts :catalog-introspection},
+     :mode :discovery
+     :blockers #{:enum-catalog-sort-positions :enum-duplicate-label-notice :enum-array-subscript-label}
+     :accepted-differences #{:diagnostic-positions}
+     :strict-slices
+     [{:id :enum-overload-precedence
+       :source-lines [229 243]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "concrete-enum-overload-wins-over-polymorphic-argument"}]}
     {:name "domain", :boundaries #{:constraints :user-type :casts}, :mode :unmeasured}
     {:name "create_type", :boundaries #{:type-ddl :type-lookup}, :mode :unmeasured}
     {:name "type_sanity", :boundaries #{:type-registry :catalogs}, :mode :unmeasured}

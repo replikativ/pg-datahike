@@ -293,6 +293,15 @@
       (is (= "rainbow" (.getColumnTypeName (.getMetaData rs) 1)))
       (is (false? (.next rs))))))
 
+(deftest concrete-enum-overload-wins-over-polymorphic-argument
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red')")
+    (exec! c "CREATE TYPE compass AS ENUM ('north')")
+    (exec! c "CREATE FUNCTION label(anyenum) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RETURN $1::text || ' generic'; END $$")
+    (exec! c "CREATE FUNCTION label(rainbow) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RETURN $1::text || ' color'; END $$")
+    (is (= [["red color" "north generic"]]
+           (query-rows c "SELECT label('red'::rainbow), label('north'::compass)")))))
+
 (deftest enum-foreign-keys-use-nominal-types-and-default-primary-key
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'blue')")
