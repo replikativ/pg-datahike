@@ -12810,8 +12810,7 @@
             schema (dbi/-schema db)
             relation-oid (if sql-ctx/*physical-table-names?*
                            (pgs/storage-table-oid db logical-name)
-                           (when (table-exists? db logical-name)
-                             (pgs/table-oid db logical-name)))
+                           (pgs/table-oid db logical-name))
             _ (when-not relation-oid
                 (throw (errors/pg-error :undefined-table {:table logical-name})))
             table (if sql-ctx/*physical-table-names?*

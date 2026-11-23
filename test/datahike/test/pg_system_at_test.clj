@@ -238,7 +238,13 @@
         (is (= "42P01" (.sqlstate (run "ALTER TABLE ledger ADD COLUMN retired int"))))
         (execute "DROP TABLE IF EXISTS ledger")
         (execute "CREATE TABLE ledger (id int PRIMARY KEY, amount text)")
-        (is (not= old-oid (pgs/table-oid (d/db *conn*) "ledger")))
+        (let [db (d/db *conn*)
+              new-oid (pgs/table-oid db "ledger")
+              storage (:datahike.pg.object/storage-name
+                       (objects/object-by-address db objects/pg-class-oid new-oid))]
+          (is (not= old-oid new-oid))
+          (is (string? storage))
+          (is (= "42P01" (.sqlstate (run (str "ALTER TABLE " storage " ADD COLUMN hidden int"))))))
         (execute "ALTER TABLE ledger ADD COLUMN note text DEFAULT 'new'")
         (execute "CREATE INDEX ledger_amount_idx ON ledger (amount)")
         (is (= [["CREATE INDEX ledger_amount_idx ON public.ledger USING btree (amount)"]]

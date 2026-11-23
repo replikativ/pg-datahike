@@ -786,8 +786,10 @@
    and fall back to the row marker for bare or pre-migration databases."
   [db table-name]
   (or (registered-table-oid db table-name)
-      (when-not (contains? (retired-table-names db) table-name)
-        (marker-table-oid db table-name))))
+      (when-let [oid (marker-table-oid db table-name)]
+        (when-not (or (contains? (retired-table-names db) table-name)
+                      (catalog-objects/object-by-storage-name db table-name))
+          oid))))
 
 (defn storage-table-oid
   "Return the relation OID for a physical table namespace, including when
