@@ -12319,19 +12319,27 @@
         schema (dbi/-schema schema-db)
         input-schema (dbi/-schema db)
         _ (when ast (row-eval/row-oids [ast] nil input-schema db))
-        evaluate #(-> (materialize-column-default default resolve-value ast
-                                                  (fn [expr]
-                                                    (resolve-value (row-eval/default-value expr input-schema db))))
-                      (stmt/coerce-insert-value attr schema schema-db))
-        value (if (#{:expr :nextval} kind) evaluate (constantly (evaluate)))
         spec (when (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))
                (get-in (row-constraints/constraint-plan schema-db table) [:domain-enum name]))
-        check-fn (when spec (row-eval/check-fn schema-db))]
+        check-fn (when spec (row-eval/check-fn schema-db))
+        validate #(row-constraints/validate-pre-arbiter!
+                   schema-db table {attr %} {:domain-enum {name spec}} check-fn nil)
+        evaluate (fn []
+                   (let [v (-> (materialize-column-default
+                                default resolve-value ast
+                                (fn [expr]
+                                  (resolve-value (row-eval/default-value expr input-schema db))))
+                               (stmt/coerce-insert-value attr schema schema-db))]
+                     ;; A literal enum input must be valid even for an
+                     ;; empty table. Domain checks apply to backfilled rows.
+                     (when (and (some? v) (= :enum (:kind spec)))
+                       (validate v))
+                     v))
+        value (if (#{:expr :nextval} kind) evaluate (constantly (evaluate)))]
     (fn [ops eid]
       (let [v (value)]
-        (when (and spec (or (some? v) (= :domain (:kind spec))))
-          (row-constraints/validate-pre-arbiter!
-           schema-db table {attr v} {:domain-enum {name spec}} check-fn nil))
+        (when (= :domain (:kind spec))
+          (validate v))
         (when (and not-null? (nil? v))
           (throw (ex-info (str "column \"" name "\" of relation \"" table
                                "\" contains null values")
