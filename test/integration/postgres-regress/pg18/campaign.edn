@@ -353,7 +353,20 @@
      :blockers #{:identity-sequence-options :alter-identity}}
     {:name "sequence", :boundaries #{:sequences :ddl :transactions :privileges}, :mode :discovery
      :requires ["test_setup"]
-     :blockers #{:sequence-ownership-validation :cached-sequence-position :sequence-privileges}}
+     :blockers #{:sequence-ownership-system-index :cached-sequence-position :sequence-privileges}
+     :strict-slices
+     [{:id :sequence-owner-syntax
+       :source-lines [14 14]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "postgres-rejects-invalid-sequence-owners-atomically"}
+      {:id :sequence-owner-schema-and-column
+       :source-lines [16 18]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "postgres-rejects-invalid-sequence-owners-atomically"}
+      {:id :serial-sequence-discovery
+       :source-lines [63 63]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "serial-and-identity-discovery-uses-existing-ownership"}]}
     {:name "create_schema", :boundaries #{:name-resolution :schemas :ddl}, :mode :unmeasured}
     {:name "drop_if_exists", :boundaries #{:conditional-ddl :errors :ddl}, :mode :unmeasured}
     {:name "create_table_like", :boundaries #{:constraints :ddl :schema-copy}, :mode :discovery

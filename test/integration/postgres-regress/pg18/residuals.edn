@@ -101,9 +101,18 @@
   {:id :sequence-data-discovery
    :file "sequence" :lines [416 417] :state :open :impact :wrong-result
    :detail "pg_get_sequence_data now gives stock pg_dump both position fields. With CACHE 10 and three calls, native 18.6 reports the reserved upper value 10 and pg-datahike reports the handed-out value 3."}
-  {:id :sequence-ownership-validation
-   :file "sequence" :lines [14 20] :state :open :impact :wrong-result
-   :detail "The invalid OWNED BY clause creates the sequence. Subsequent ownership checks with that name fail as duplicate relations. Replay each ownership case with fresh names before comparing its SQLSTATE."}
+  {:id :sequence-owner-syntax
+   :file "sequence" :lines [14 14] :state :covered :impact :wrong-result
+   :detail "A bare OWNED BY target other than NONE raises 42601. The failed CREATE leaves no sequence."}
+  {:id :sequence-ownership-system-index
+   :file "sequence" :lines [15 15] :state :open :impact :fixture
+   :detail "User index owners raise 42809. This case needs the native pg_class_oid_index system relation in the catalog."}
+  {:id :sequence-owner-schema-and-column
+   :file "sequence" :lines [16 18] :state :covered :impact :wrong-result
+   :detail "OWNED BY rejects cross-schema targets and missing columns with 55000 and 42703. The gate checks that failure leaves the catalog intact."}
+  {:id :serial-sequence-discovery
+   :file "sequence" :lines [63 63] :state :covered :impact :unsupported
+   :detail "pg_get_serial_sequence reads SERIAL and IDENTITY ownership and reflects explicit attach and detach operations."}
   {:id :identity-sequence-options
    :file "identity" :lines [7 8] :state :open :impact :unsupported
    :detail "CREATE TABLE rejects identity START and INCREMENT options, so later probes on itest3 are cascades. ALTER COLUMN ADD GENERATED has a separate parser gap."}

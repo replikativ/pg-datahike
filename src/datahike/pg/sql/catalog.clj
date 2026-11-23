@@ -1794,6 +1794,23 @@
       (let [canonical (peek (regoid/parse-qualified-name spelling))]
         (when (contains? sequences canonical) canonical)))))
 
+(defn- sequence-column-defaults [db tables sequences]
+  (for [[table columns] tables
+        column columns
+        :let [entity (d/entity db (:attr column))]
+        reference (ddl/default-sequence-references (:pg/default-kind entity)
+                                                   (:pg/default-value entity)
+                                                   (:pg/default-arg entity))
+        :let [name (sequence-name sequences reference)]
+        :when name]
+    {:table table :column column :entity entity :sequence name}))
+
+(defn defaults-depending-on-sequences [db names]
+  (when (seq names)
+    (let [schema (dbi/-schema db)
+          tables (catalog-table-columns db (pgs/derive-virtual-tables schema (pgs/schema-hints db)))]
+      (sequence-column-defaults db tables (set names)))))
+
 (defn- sequence-dependencies [db schema]
   (when-let [seqs (seq (sequence-entities db))]
     (let [sequences (into {} (map (juxt :__seq__/name identity)) seqs)
@@ -1805,20 +1822,24 @@
                         :pg_depend/refclassid class-id :pg_depend/refobjid to :pg_depend/refobjsubid to-column
                         :pg_depend/deptype kind (pgs/row-marker-attr "pg_depend") true})]
       (concat
-       (for [{:__seq__/keys [name owned-by-table identity-generation]} seqs
+       (for [{:__seq__/keys [name owned-by-column identity-generation]} seqs
+             :when owned-by-column
+             :let [column (d/entity db [:datahike.pg.column/address-key owned-by-column])
+                   relation (:datahike.pg.column/relation column)
+                   relation-oid (:datahike.pg.object/oid relation)]
+             :when (and relation-oid (not (:datahike.pg.column/dropped? column)))]
+         (dependency class-id (sequence-oid db name) relation-oid
+                     (:datahike.pg.column/attnum column) (if identity-generation "i" "a")))
+       (for [{:__seq__/keys [name owned-by-table owned-by-column identity-generation]} seqs
+             :when (nil? owned-by-column)
              [idx column] (map-indexed vector (get tables owned-by-table))
              :when (= name (str owned-by-table "_" (clojure.core/name (:attr column)) "_seq"))
              :let [relation-oid (pgs/table-oid db owned-by-table)]
              :when relation-oid]
          (dependency class-id (sequence-oid db name) relation-oid
                      (or (:attnum column) (inc idx)) (if identity-generation "i" "a")))
-       (for [[_ columns] tables
-             column columns
-             :let [entity (d/entity db (:attr column))]
-             :when (= :nextval (:pg/default-kind entity))
-             :let [name (sequence-name sequences (or (:pg/default-arg entity) (:pg/default-value entity)))]
-             :when name]
-         (dependency attribute-default-id (default-oid db column) (sequence-oid db name) 0 "n"))))))
+       (for [{:keys [column sequence]} (sequence-column-defaults db tables sequences)]
+         (dependency attribute-default-id (default-oid db column) (sequence-oid db sequence) 0 "n"))))))
 
 (def ^:private type-io-keys
   [:typinput :typoutput :typreceive :typsend :typmodin :typmodout

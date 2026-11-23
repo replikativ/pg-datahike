@@ -234,3 +234,108 @@
   (is (= [["1" "a"]] (rows "SELECT id, name FROM t")))
   (testing "and a missing relation still raises 42P01"
     (is (re-find #"does not exist" (or (err "SELECT * FROM nope") "")))))
+
+(deftest postgres-rejects-invalid-sequence-owners-atomically
+  (is (nil? (err "CREATE TABLE owner_table (id int)")))
+  (is (nil? (err "CREATE INDEX owner_index ON owner_table (id)")))
+  (is (nil? (err "CREATE MATERIALIZED VIEW owner_matview AS SELECT 1 AS id")))
+  (doseq [[owner state] [["nobody" "42601"]
+                         ["owner_index.oid" "42809"]
+                         ["owner_matview.id" "42809"]
+                         ["pg_catalog.pg_class.relname" "55000"]
+                         ["owner_table.missing" "42703"]
+                         ["missing_schema.owner_table.id" "3F000"]]]
+    (let [sql (str "CREATE SEQUENCE rejected_seq OWNED BY " owner)]
+      (is (= state (.-sqlstate ^PgWireServer$QueryResult (run sql))) sql)
+      (is (= [[nil]] (rows "SELECT to_regclass('rejected_seq')")) sql)))
+  (is (nil? (err "CREATE SEQUENCE rejected_seq OWNED BY owner_table.id")))
+  (is (nil? (err "CREATE SEQUENCE IF NOT EXISTS rejected_seq OWNED BY nobody")))
+  (is (= "42703" (.-sqlstate ^PgWireServer$QueryResult
+                  (run "ALTER SEQUENCE rejected_seq OWNED BY owner_table.missing"))))
+  (is (= [["public.rejected_seq"]] (rows "SELECT pg_get_serial_sequence('owner_table', 'id')")))
+  (is (= [[nil]] (rows "SELECT pg_get_serial_sequence(NULL, 'id')")))
+  (is (= "42703" (.-sqlstate ^PgWireServer$QueryResult
+                  (run "SELECT pg_get_serial_sequence('owner_table', 'ID')"))))
+  (is (= "42883" (.-sqlstate ^PgWireServer$QueryResult
+                  (run "SELECT pg_get_serial_sequence(1, 2)")))))
+
+(deftest sequence-ownership-follows-the-column-catalog
+  (doseq [sql ["CREATE TABLE \"Owner Table\" (\"Col.Dot\" int, replacement int)"
+               "CREATE SEQUENCE public.\"Owned.Seq\" OWNED BY public.\"Owner Table\".\"Col.Dot\""]]
+    (is (nil? (err sql)) sql))
+  (let [owner "SELECT pg_get_serial_sequence('public.\"Owner Table\"', 'Col.Dot')"
+        owned [["public.\"Owned.Seq\""]]]
+    (is (= owned (rows owner)))
+    (is (= [["1" "a"]]
+           (rows (str "SELECT refobjsubid, deptype FROM pg_depend "
+                      "WHERE objid = '\"Owned.Seq\"'::regclass AND refobjid = '\"Owner Table\"'::regclass"))))
+    (doseq [sql ["BEGIN" "ALTER SEQUENCE public.\"Owned.Seq\" OWNED BY NONE"]]
+      (is (nil? (err sql)) sql))
+    (is (= [[nil]] (rows owner)))
+    (is (nil? (err "ROLLBACK")))
+    (is (= owned (rows owner)))
+    (doseq [sql ["ALTER SEQUENCE public.\"Owned.Seq\" OWNED BY public.\"Owner Table\".replacement"
+                 "ALTER TABLE \"Owner Table\" RENAME COLUMN replacement TO renamed"
+                 "ALTER TABLE \"Owner Table\" DROP COLUMN \"Col.Dot\""]]
+      (is (nil? (err sql)) sql))
+    (is (= owned (rows "SELECT pg_get_serial_sequence('\"Owner Table\"', 'renamed')")))
+    (is (= [["2"]] (rows "SELECT refobjsubid FROM pg_depend WHERE objid = '\"Owned.Seq\"'::regclass")))
+    (is (nil? (err "ALTER TABLE \"Owner Table\" DROP COLUMN renamed")))
+    (is (= [[nil]] (rows "SELECT to_regclass('\"Owned.Seq\"')"))))
+  (doseq [sql ["CREATE TABLE table_owned (id int)"
+               "CREATE SEQUENCE table_owned_seq OWNED BY table_owned.id"
+               "DROP TABLE table_owned"]]
+    (is (nil? (err sql)) sql))
+  (is (= [[nil]] (rows "SELECT to_regclass('table_owned_seq')"))))
+
+(deftest serial-and-identity-discovery-uses-existing-ownership
+  (is (nil? (err "CREATE TABLE existing_owners (a serial, b int GENERATED ALWAYS AS IDENTITY)")))
+  (is (= [["public.existing_owners_a_seq" "public.existing_owners_b_seq"]]
+         (rows (str "SELECT pg_get_serial_sequence('existing_owners', 'a'), "
+                    "pg_get_serial_sequence('existing_owners', 'b')"))))
+  (is (= "0A000" (.-sqlstate ^PgWireServer$QueryResult
+                  (run "ALTER SEQUENCE existing_owners_b_seq OWNED BY NONE"))))
+  (is (= "2BP01" (.-sqlstate ^PgWireServer$QueryResult
+                  (run "DROP SEQUENCE existing_owners_b_seq CASCADE"))))
+  (is (nil? (err "ALTER SEQUENCE existing_owners_a_seq OWNED BY NONE")))
+  (is (= [[nil]] (rows "SELECT pg_get_serial_sequence('existing_owners', 'a')")))
+  (is (nil? (err "ALTER TABLE existing_owners DROP COLUMN a")))
+  (is (= [["1"]] (rows "SELECT nextval('existing_owners_a_seq')")))
+  (is (nil? (err "ALTER TABLE existing_owners DROP COLUMN b")))
+  (is (= [[nil]] (rows "SELECT to_regclass('existing_owners_b_seq')"))))
+
+(deftest dropping-sequence-owner-handles-dependent-defaults
+  (doseq [sql ["CREATE TABLE dependency_owner (id int, other int)"
+               "CREATE SEQUENCE dependency_seq OWNED BY dependency_owner.id"
+               (str "CREATE TABLE consumer (id bigint DEFAULT nextval('dependency_seq'), "
+                    "other bigint DEFAULT nextval('dependency_seq'::regclass) + 10)")]]
+    (is (nil? (err sql)) sql))
+  (doseq [sql ["ALTER TABLE dependency_owner DROP COLUMN id"
+               "DROP TABLE dependency_owner"
+               "DROP SEQUENCE dependency_seq"]]
+    (is (= "2BP01" (.-sqlstate ^PgWireServer$QueryResult (run sql))) sql))
+  (is (= [["public.dependency_seq"]]
+         (rows "SELECT pg_get_serial_sequence('dependency_owner', 'id')")))
+  (is (= [["1" "12"]] (rows "INSERT INTO consumer DEFAULT VALUES RETURNING id, other")))
+  (is (nil? (err "ALTER TABLE dependency_owner DROP COLUMN id CASCADE")))
+  (is (= [[nil]] (rows "SELECT to_regclass('dependency_seq')")))
+  (is (= [[nil nil]] (rows "INSERT INTO consumer DEFAULT VALUES RETURNING id, other")))
+  (doseq [sql ["CREATE TABLE multi_owner (id int)"
+               "CREATE SEQUENCE multi_seq OWNED BY multi_owner.id"
+               "CREATE TABLE multi_consumer (id bigint DEFAULT nextval('multi_seq'))"
+               "DROP TABLE multi_owner, multi_consumer"]]
+    (is (nil? (err sql)) sql))
+  (is (= [[nil]] (rows "SELECT to_regclass('multi_seq')")))
+  (doseq [sql ["CREATE SEQUENCE direct_seq"
+               "CREATE TABLE direct_consumer (id bigint DEFAULT nextval('direct_seq'))"
+               "DROP SEQUENCE direct_seq CASCADE"]]
+    (is (nil? (err sql)) sql))
+  (is (= [[nil]] (rows "INSERT INTO direct_consumer DEFAULT VALUES RETURNING id"))))
+
+(deftest owned-sequence-follows-its-view
+  (doseq [sql ["CREATE VIEW owner_view AS SELECT 1 AS id"
+               "CREATE SEQUENCE view_seq OWNED BY owner_view.id"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["public.view_seq"]] (rows "SELECT pg_get_serial_sequence('owner_view', 'id')")))
+  (is (nil? (err "DROP VIEW owner_view")))
+  (is (= [[nil]] (rows "SELECT to_regclass('view_seq')"))))

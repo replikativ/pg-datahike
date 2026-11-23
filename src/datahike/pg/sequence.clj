@@ -9,6 +9,12 @@
    :db/valueType :db.type/boolean
    :db/cardinality :db.cardinality/one})
 
+(def ownership-attribute
+  {:db/ident :__seq__/owned-by-column
+   :db/valueType :db.type/string
+   :db/cardinality :db.cardinality/one
+   :db/index true})
+
 (def position-attributes #{:__seq__/is-called :__seq__/value})
 
 (defn id-by-name [db name]
@@ -18,6 +24,24 @@
 (defn entity-by-name [db name]
   (when-let [eid (id-by-name db name)]
     (d/pull db '[*] eid)))
+
+(defn owned-by-column
+  "Sequence names owned by a stable catalog column. Older SERIAL and
+   IDENTITY declarations store the physical table and conventional name."
+  [db table column]
+  (let [schema (dbi/-schema db)
+        address (:datahike.pg.column/address-key column)
+        storage (:datahike.pg.column/storage-ident column)
+        explicit (when (and address (contains? schema :__seq__/owned-by-column))
+                   (mapv
+                    (fn [datom] (:__seq__/name (d/entity db (:e datom))))
+                    (d/datoms db :avet :__seq__/owned-by-column address)))
+        legacy-name (when storage (str table "_" (name storage) "_seq"))
+        legacy (entity-by-name db legacy-name)]
+    (cond-> explicit
+      (and (= table (:__seq__/owned-by-table legacy))
+           (nil? (:__seq__/owned-by-column legacy)))
+      (conj legacy-name))))
 
 (defn position
   "Return [last_value is_called]. Older stores distinguish the initial
