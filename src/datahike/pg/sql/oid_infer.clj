@@ -555,6 +555,7 @@
                           (get-in from-binding-oids [(first owners) col-name]))))
           valuetype (:db/valueType props)
           cardinality (:db/cardinality props)
+          enum-oid (get-in hints [attr :enum-oid])
           base-oid (when valuetype (pgs/oid-for-valuetype valuetype))
           ;; Native PG array column (Option C): the schema records
           ;; `:pg/type "_T"` on the ident entity. Look it up so the
@@ -572,6 +573,7 @@
         bound-oid bound-oid
         outer-oid outer-oid
         (= "tableoid" (str/lower-case col-name)) types/oid-oid
+        enum-oid enum-oid
         ;; Native PG array column wins over the storage-type fallback.
         pg-name-oid pg-name-oid
         (nil? base-oid) nil
@@ -894,9 +896,7 @@
       :else nil)))
 
 (defn- composite-name->oid
-  "Resolve a named composite type to its persisted OID. Enum values remain
-   text on the wire until pgjdbc's custom-type introspection query is fully
-   supported; their catalog OID is still available through pg_type/pg_enum."
+  "Resolve a named composite type to its persisted OID."
   [type-str db]
   (when (and type-str db)
     (some (fn [{:keys [name oid]}] (when (= name type-str) oid))
@@ -973,7 +973,12 @@
         type-str (some-> cdt .getDataType str)
         ad       (when cdt (.getArrayData cdt))
         array?   (and ad (pos? (.size ^java.util.List ad)))
-        scalar-oid (sql-type-name->oid type-str (:db env))]
+        db (:db env)
+        scalar-oid (or (sql-type-name->oid type-str db)
+                       (when-not array?
+                         (let [object (pgs/user-type-object db type-str)]
+                           (when (= :enum (:datahike.pg.object/kind object))
+                             (:datahike.pg.object/oid object)))))]
     (cond
       ;; The parser leaves array brackets in getDataType for qualified names.
       (and (not array?) type-str (str/ends-with? type-str "[]"))

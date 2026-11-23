@@ -611,6 +611,8 @@
       (conj {:db/ident attr :db/valueType :db.type/string :db/cardinality :db.cardinality/one})
       true (conj {attr storage}))))
 
+(declare enum-types)
+
 (defn- schema-hints*
   [db]
   (let [q-fn d/q
@@ -655,6 +657,17 @@
                          :where [[?e :db/ident ?ident]
                                  [?e :pg/type ?pt]]}
                        db)
+        enum-columns (when (contains? (dbi/-schema db) :datahike.pg/enum-of)
+                       (q-fn '[:find ?ident ?type
+                               :where [?e :datahike.pg/enum-of ?type]
+                               [?e :db/ident ?ident]] db))
+        enum-oids (when (seq enum-columns)
+                    (into {} (map (juxt :name :oid)) (enum-types db)))
+        ident-hints (reduce (fn [hints [ident enum-name]]
+                              (if-let [oid (get enum-oids enum-name)]
+                                (assoc-in hints [ident :enum-oid] oid)
+                                hints))
+                            ident-hints enum-columns)
         ;; `NOT NULL`, recorded the same way and just as invisible in
         ;; `(:schema db)`. The catalog knew only the primary key's
         ;; not-nullness, so `name TEXT NOT NULL` came back with
@@ -1075,9 +1088,10 @@
                                    unique (schema-unique hints ident props)
                                    col {:name        col-name
                                         :attr        ident
-                                        :oid         (declared-col-oid
-                                                      (or (:pg-type h) (:pg/type props))
-                                                      vtype)
+                                        :oid         (or (:enum-oid h)
+                                                         (declared-col-oid
+                                                          (or (:pg-type h) (:pg/type props))
+                                                          vtype))
                                         :valuetype   vtype
                                         :cardinality (:db/cardinality props)
                                         :unique      unique

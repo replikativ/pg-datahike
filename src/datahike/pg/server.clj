@@ -3682,14 +3682,15 @@
   "The source type's name when this assignment has no cast PostgreSQL
    would make (transformAssignedExpr -> can_coerce_type), else nil.
 
-   A user type is checked by NAME, not by OID: DDL lowers an enum column
-   to text and a domain column to its base type, so every enum would
-   otherwise accept any text. An enum takes its own type, and nothing
-   else; a domain takes whatever its base takes. A source we cannot name
-   -- a subquery over an enum column reads as text here -- is left to the
-   base check rather than rejected."
+   An enum takes values of its own declared type. Domain assignments use
+   the base type's casts. Enum values use the text carrier for assignments
+   into ordinary columns, where casting to string types is allowed."
   [db attr-of expr source target user-type]
-  (let [src-type (expression-user-type db attr-of expr)]
+  (let [source-object (when (and source (catalog-objects/valid-user-oid? source))
+                        (catalog-objects/object-by-address db catalog-objects/pg-type-oid source))
+        src-type (if (= :enum (:datahike.pg.object/kind source-object))
+                   [:enum (:datahike.pg.object/name source-object)]
+                   (expression-user-type db attr-of expr))]
     (cond
       (= :enum (first user-type))
       (when-not (= (second src-type) (second user-type))
@@ -3701,7 +3702,8 @@
           (or (second src-type) (types/format-type source -1))))
 
       :else
-      (when-not (types/assignment-cast-exists? source target)
+      (when-not (types/assignment-cast-exists? (if (= :enum (first src-type)) types/oid-text source)
+                                               target)
         (or (second src-type) (types/format-type source -1))))))
 
 (defn- joined-write-source-scopes [plan db aliases]

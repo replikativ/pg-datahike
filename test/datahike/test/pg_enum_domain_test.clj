@@ -265,6 +265,34 @@
                          "WHERE enumtypid = 'rainbow'::regtype "
                          "ORDER BY enumlabel::rainbow")))))))
 
+(deftest prepared-enum-projections-keep-type-and-declaration-order
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'yellow', 'green', 'blue')")
+    (exec! c "CREATE DOMAIN note AS text CHECK (VALUE <> '')")
+    (exec! c "CREATE TABLE palette (color rainbow, caption note)")
+    (exec! c "INSERT INTO palette VALUES ('green', 'g'), ('red', 'r'), ('blue', 'b'), ('yellow', 'y')")
+    (doseq [sql ["SELECT color, caption FROM palette ORDER BY color"
+                 "SELECT * FROM palette ORDER BY color"
+                 "SELECT p.* FROM palette p ORDER BY p.color"
+                 "WITH c AS (SELECT * FROM palette) SELECT * FROM c ORDER BY color"
+                 "SELECT p.* FROM (SELECT color, caption FROM palette) p(shade, note) ORDER BY shade"]]
+      (testing sql
+        (with-open [stmt (.prepareStatement c sql)]
+          (is (= ["rainbow" "text"] (mapv #(.getColumnTypeName (.getMetaData stmt) %) [1 2])))
+          (with-open [rs (.executeQuery stmt)]
+            (is (= ["rainbow" "text"] (mapv #(.getColumnTypeName (.getMetaData rs) %) [1 2])))
+            (is (= [["red" "r"] ["yellow" "y"] ["green" "g"] ["blue" "b"]]
+                   (loop [out []]
+                     (if (.next rs)
+                       (recur (conj out [(.getObject rs 1) (.getObject rs 2)]))
+                       out))))))))
+    (with-open [stmt (.prepareStatement c "SELECT 'red'::rainbow AS shade")]
+      (is (= "rainbow" (.getColumnTypeName (.getMetaData stmt) 1))))
+    (with-open [stmt (.prepareStatement c "SELECT * FROM (SELECT color FROM palette LIMIT 0) p")
+                rs (.executeQuery stmt)]
+      (is (= "rainbow" (.getColumnTypeName (.getMetaData rs) 1)))
+      (is (false? (.next rs))))))
+
 (deftest enum-foreign-keys-use-nominal-types-and-default-primary-key
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'blue')")

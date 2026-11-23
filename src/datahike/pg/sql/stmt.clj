@@ -2850,13 +2850,16 @@
 (defn output-schema-tx
   "Build virtual column metadata shared by analysis and execution."
   [target-name columns db]
-  (let [column-tx
+  (let [enum-names (delay (into {} (map (juxt :oid :name)) (pgs/enum-types db)))
+        column-tx
         (conj
          (mapv (fn [{:keys [name oid typmod vtype pg-type array-elem record-fields enum-name domain-name]}]
-                 (let [element (or array-elem (some-> oid types/array-oid->element-oid types/oid->elem-kw))
-                       pg-type (or pg-type (get types/oid->pg-type-marker oid))
+                 (let [enum-name (or enum-name (when (and oid (not (contains? types/oid->pg-name oid)))
+                                                 (get @enum-names oid)))
+                       element (or array-elem (some-> oid types/array-oid->element-oid types/oid->elem-kw))
+                       pg-type (or pg-type (get types/oid->pg-type-marker oid) (when enum-name "text"))
                        vtype (or vtype
-                                 (when (or element (types/timestamp-type? pg-type)) :db.type/string)
+                                 (when (or enum-name element (types/timestamp-type? pg-type)) :db.type/string)
                                  (types/dh-type-for-oid oid))]
                    (when-not (and vtype pg-type)
                      (throw (errors/pg-error :feature-not-supported
@@ -2886,7 +2889,8 @@
                         [[:pg/type :db.type/string]
                          [:pg/typmod :db.type/long]
                          [:pg/array-elem :db.type/keyword]
-                         [:pg/record-fields :db.type/string]]))]
+                         [:pg/record-fields :db.type/string]
+                         [:datahike.pg/enum-of :db.type/string]]))]
     (into (vec missing) column-tx)))
 
 (defn materialize-output-schema!
