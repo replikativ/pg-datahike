@@ -90,6 +90,20 @@
              (run h "SELECT attname FROM pg_attribute
                      WHERE attrelid = 'ordinary'::regclass AND attnum > 0 ORDER BY attname"))))))
 
+(deftest alter-table-folds-sample-as-an-ordinary-identifier
+  (with-handler
+    (fn [^PgWireServer$QueryHandler h]
+      (doseq [sql ["CREATE TABLE measurements (payload text, baseline int)"
+                   "INSERT INTO measurements VALUES ('word', 2)"
+                   "ALTER TABLE measurements ADD COLUMN SAMPLE tsquery"
+                   "UPDATE measurements SET sample = payload::tsquery"]]
+        (is (nil? (.error (.execute h ^String sql))) sql))
+      (is (= "'word'|2"
+             (run h "SELECT measurements.sample, baseline FROM measurements")))
+      (is (= "sample" (run h "SELECT 'sample'")))
+      (is (nil? (.error (.execute h "ALTER TABLE measurements DROP sample RESTRICT, DROP COLUMN payload RESTRICT;"))))
+      (is (= "2" (run h "SELECT * FROM measurements"))))))
+
 (deftest partition-ancestors-of-ordinary-relations
   (with-handler
     (fn [^PgWireServer$QueryHandler h]

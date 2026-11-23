@@ -2558,7 +2558,7 @@
                                               (or (ddl/alter-added-constraint exp)
                                                   {:op :add-constraint})))
                                 ;; DROP COLUMN
-                                          (and (= op "DROP") (.hasColumn exp))
+                                          (and (= op "DROP") (.getColumnName exp))
                                           {:op :drop-column
                                            :name (unquote-ident (.getColumnName exp))
                                            :if-exists? (.isUsingIfExists exp)

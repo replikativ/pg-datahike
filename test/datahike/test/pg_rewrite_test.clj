@@ -257,6 +257,15 @@
   (is (= "SELECT \"sample\".x FROM t AS \"sample\""
          (quote-alias "SELECT sample.x FROM t AS sample"))))
 
+(deftest drop-column-restrict-rewrite-keeps-other-uses
+  (let [rewrite #(rw/rewrite % [rw/drop-column-restrict-rule])]
+    (is (= "ALTER TABLE public.t DROP COLUMN IF EXISTS c  , DROP COLUMN d CASCADE;"
+           (rewrite "ALTER TABLE public.t DROP COLUMN IF EXISTS c RESTRICT, DROP COLUMN d CASCADE;")))
+    (is (= "ALTER TABLE t DROP CONSTRAINT restrict"
+           (rewrite "ALTER TABLE t DROP CONSTRAINT restrict")))
+    (is (= "ALTER TABLE t ADD COLUMN c text DEFAULT 'DROP COLUMN c RESTRICT'"
+           (rewrite "ALTER TABLE t ADD COLUMN c text DEFAULT 'DROP COLUMN c RESTRICT'")))))
+
 (deftest quote-reserved-alias-folds-case
   ;; This assertion is REVERSED from what it used to be, and the old
   ;; expectation was wrong on its own terms: its inputs are UNQUOTED
