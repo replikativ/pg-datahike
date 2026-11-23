@@ -1423,6 +1423,34 @@
   (when *database-read-only?*
     (throw (errors/pg-error :read-only-sql-transaction {:operation operation}))))
 
+(defn- record-effects-from-report? [op]
+  (and (vector? op)
+       (= :db.fn/call (first op))
+       (::record-effects-from-report (meta (second op)))))
+
+(defn- committed-write-eas
+  "Attribute deferred sequence cleanup from the writer report. Keep explicit
+   entity retractions as row-wide conflicts and preserve opaque operations
+   whose write sets have no such contract."
+  [{:keys [db-before db-after tx-data]} submitted]
+  (let [estimated (tx-buffer-eas submitted db-before)]
+    (if (and (= ::opaque estimated) (some record-effects-from-report? submitted))
+      (let [direct (tx-buffer-eas (remove record-effects-from-report? submitted) db-before)]
+        (if (set? direct)
+          (into direct
+                (keep (fn [^datahike.datom.Datom datom]
+                        (let [attribute (.-a datom)
+                              ident (if (number? attribute)
+                                      (or (dbi/-ident-for db-after attribute)
+                                          (dbi/-ident-for db-before attribute)
+                                          attribute)
+                                      attribute)]
+                          (when-not (= :db/txInstant ident)
+                            [(.-e datom) ident]))))
+                tx-data)
+          direct))
+      estimated)))
+
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
    recent-commit ring. EVERY server-side transact must go through this
@@ -1433,15 +1461,14 @@
    (transact-recorded! conn tx-data nil))
   ([conn tx-data tx-options]
    (assert-database-writable! "write")
-   (let [db-before @conn
-         report (d/transact conn (cond-> {:tx-data (guard-catalog-tx tx-data)}
+   (let [report (d/transact conn (cond-> {:tx-data (guard-catalog-tx tx-data)}
                                    (seq tx-options)
                                    (assoc :tx-options tx-options)))
          db-after (:db-after report)
          eas (if (and (seq tx-data)
                       (every? direct-sequence-value-write? tx-data))
                ::sequence-only
-               (tx-buffer-eas tx-data db-before))]
+               (committed-write-eas report tx-data))]
      (record-commit-writes! (db-ring-key db-after)
                             (:max-tx (:db-before report)) (:max-tx db-after) eas)
      report)))
@@ -5511,6 +5538,9 @@
         names (into (set legacy) (mapcat #(sequence/owned-by-column db table %)) columns)]
     (drop-owned-sequences-tx db names #(contains? dropped-tables (:table %)) cascade?)))
 
+(defn- sequence-drop-op [f & args]
+  (into [:db.fn/call (with-meta f {::record-effects-from-report true})] args))
+
 (defn- drop-column-owned-sequences-tx [db table column dropping-attributes cascade?]
   (drop-owned-sequences-tx
    db (sequence/owned-by-column db table column)
@@ -5547,8 +5577,8 @@
                       (concat
                        (when (= :view (:datahike.pg.object/kind relation))
                          (concat
-                          [[:db.fn/call drop-relation-owned-sequences-tx view-name
-                            (:datahike.pg.object/oid relation) #{view-name} (:cascade? parsed)]]
+                          [(sequence-drop-op drop-relation-owned-sequences-tx view-name
+                                             (:datahike.pg.object/oid relation) #{view-name} (:cascade? parsed))]
                           (catalog-objects/drop-relation-columns-tx
                            db (:datahike.pg.object/oid relation))
                           (catalog-objects/drop-object-tx
@@ -12126,7 +12156,7 @@
             hint-eid (column-hint-eid db attr)]
         (into (column-data-retractions db attr)
               (concat
-               [[:db.fn/call drop-column-owned-sequences-tx table column dropping-attributes cascade?]]
+               [(sequence-drop-op drop-column-owned-sequences-tx table column dropping-attributes cascade?)]
                (mapcat
                 (fn [{:keys [name]}]
                   (when-let [index-object
@@ -13037,7 +13067,7 @@
         ;; CREATE TABLE with the same SERIAL column resume the old counter.
         sequence-tx-data
         (when (or relation-oid (seq table-attrs))
-          [[:db.fn/call drop-relation-owned-sequences-tx table relation-oid dropped-tables cascade?]])
+          [(sequence-drop-op drop-relation-owned-sequences-tx table relation-oid dropped-tables cascade?)])
         ;; The table's own CHECK and FOREIGN KEY constraints go with it.
         ;; Left behind, they were enforced against a later table of the
         ;; same name: `rv_z_a_check` rejected rows of a table that no
@@ -13274,7 +13304,7 @@
 
           :else
           (commit-ddl ctx
-                      (guard-catalog-tx [[:db.fn/call drop-sequence-tx seq-name cascade?]]
+                      (guard-catalog-tx [(sequence-drop-op drop-sequence-tx seq-name cascade?)]
                                         (catalog-basis/capture db))
                       "DROP SEQUENCE")))
       (catch Exception e
