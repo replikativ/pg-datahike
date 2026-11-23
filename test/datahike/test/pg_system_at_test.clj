@@ -219,6 +219,109 @@
                  "COPY physical_name TO STDOUT"]]
       (is (= "42P01" (.sqlstate (run sql))) sql))))
 
+(deftest dropped-table-remains-readable-only-in-its-own-snapshot
+  (let [run #(.execute *handler* %)
+        execute (fn [sql] (is (nil? (err (run sql))) sql))
+        data #(mapv vec (.rows (run %)))
+        pin (fn [instant] (execute (str "SET datahike.as_of = '" instant "'")))
+        snapshot (fn []
+                   (let [db (d/db *conn*)]
+                     (.toInstant ^java.util.Date (:db/txInstant (d/entity db (:max-tx db))))))]
+    (execute "CREATE TABLE ledger (id int PRIMARY KEY, amount int)")
+    (execute "INSERT INTO ledger VALUES (1, 7)")
+    (let [before (snapshot)
+          old-oid (pgs/table-oid (d/db *conn*) "ledger")]
+      (execute "DROP TABLE ledger")
+      (let [between (snapshot)]
+        (is (= [[nil]] (data "SELECT to_regclass('ledger')")))
+        (is (= "42P01" (.sqlstate (run "SELECT * FROM ledger"))))
+        (is (= "42P01" (.sqlstate (run "ALTER TABLE ledger ADD COLUMN retired int"))))
+        (execute "DROP TABLE IF EXISTS ledger")
+        (execute "CREATE TABLE ledger (id int PRIMARY KEY, amount text)")
+        (is (not= old-oid (pgs/table-oid (d/db *conn*) "ledger")))
+        (execute "ALTER TABLE ledger ADD COLUMN note text DEFAULT 'new'")
+        (execute "CREATE INDEX ledger_amount_idx ON ledger (amount)")
+        (is (= [["CREATE INDEX ledger_amount_idx ON public.ledger USING btree (amount)"]]
+               (data "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indexrelid = 'ledger_amount_idx'::regclass")))
+        (is (= [["ledger_id_not_null"] ["ledger_pkey"]]
+               (data "SELECT conname FROM pg_constraint WHERE conrelid = 'ledger'::regclass ORDER BY conname")))
+        (execute "INSERT INTO ledger (id, amount) VALUES (1, 'seven')")
+        (is (= [["1" "seven" "new"]] (data "SELECT id, amount, note FROM ledger")))
+        (pin before)
+        (is (= [["1" "7"]] (data "SELECT * FROM ledger")))
+        (pin between)
+        (is (= "42P01" (.sqlstate (run "SELECT * FROM ledger"))))
+        (execute "RESET datahike.as_of")
+        (execute "TRUNCATE ledger")
+        (is (= [["0"]] (data "SELECT count(*) FROM ledger")))
+        (execute "DROP TABLE ledger")
+        (is (= [[nil]] (data "SELECT to_regclass('ledger')")))))))
+
+(deftest table-retirement-and-recreation-are-transactional
+  (let [run #(.execute *handler* %)
+        execute (fn [sql] (is (nil? (err (run sql))) sql))
+        data #(mapv vec (.rows (run %)))]
+    (execute "CREATE TABLE ledger (id int)")
+    (execute "INSERT INTO ledger VALUES (1)")
+    (doseq [finish ["ROLLBACK" "COMMIT"]]
+      (execute "BEGIN")
+      (execute "DROP TABLE ledger")
+      (is (= [[nil]] (data "SELECT to_regclass('ledger')")))
+      (execute "CREATE TABLE ledger AS SELECT 'current'::text AS id")
+      (is (= [["current"]] (data "SELECT id FROM ledger")))
+      (execute finish)
+      (is (= (if (= "COMMIT" finish) [["current"]] [["1"]])
+             (data "SELECT id FROM ledger"))))))
+
+(deftest recreated-table-dependents-follow-the-current-generation
+  (let [run #(.execute *handler* %)
+        execute (fn [sql] (is (nil? (err (run sql))) sql))
+        data #(mapv vec (.rows (run %)))]
+    (doseq [sql ["CREATE TABLE ledger (id serial PRIMARY KEY)"
+                 "INSERT INTO ledger DEFAULT VALUES"
+                 "DROP TABLE ledger"
+                 "CREATE TABLE ledger (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount int CHECK (amount > 0))"
+                 "CREATE TABLE fired (relation_name text)"
+                 (str "CREATE FUNCTION remember_table() RETURNS trigger LANGUAGE plpgsql AS "
+                      "$$ BEGIN INSERT INTO fired VALUES (TG_TABLE_NAME); RETURN NEW; END; $$")
+                 "CREATE TRIGGER remember AFTER INSERT ON ledger FOR EACH ROW EXECUTE FUNCTION remember_table()"
+                 "CREATE TABLE entry (item int REFERENCES ledger)"
+                 "INSERT INTO ledger (amount) VALUES (5)"
+                 "DROP TRIGGER remember ON ledger"
+                 "INSERT INTO entry VALUES (1)"]]
+      (execute sql))
+    (is (= [["ledger"]] (data "SELECT relation_name FROM fired")))
+    (is (= [["public.ledger_id_seq"]] (data "SELECT pg_get_serial_sequence('ledger', 'id')")))
+    (is (= [["a"]] (data (str "SELECT attidentity FROM pg_attribute "
+                              "WHERE attrelid = 'ledger'::regclass AND attname = 'id'"))))
+    (is (= "428C9" (.sqlstate (run "INSERT INTO ledger VALUES (2, 9)"))))
+    (is (= "23514" (.sqlstate (run "INSERT INTO ledger (amount) VALUES (-1)"))))
+    (is (= "23503" (.sqlstate (run "INSERT INTO entry VALUES (99)"))))
+    (is (= "2BP01" (.sqlstate (run "DROP TABLE ledger"))))
+    (execute "DROP TABLE entry")
+    (execute "TRUNCATE ledger RESTART IDENTITY")
+    (is (= [["1"]] (data "INSERT INTO ledger (amount) VALUES (8) RETURNING id")))
+    (execute "DROP TABLE ledger")
+    (is (= [[nil nil]] (data "SELECT to_regclass('ledger'), to_regclass('ledger_id_seq')")))))
+
+(deftest table-retirement-removes-rows-inserted-after-planning
+  (is (nil? (err (.execute *handler* "CREATE TABLE ledger (id int)"))))
+  (is (nil? (err (.execute *handler* "INSERT INTO ledger VALUES (1)"))))
+  (with-open [writer (pg/make-query-handler *conn*)]
+    (let [plan (resolve 'datahike.pg.server/drop-table-tx-data)
+          original @plan
+          snapshot (atom nil)]
+      (with-redefs-fn
+        {plan (fn [& args]
+                (let [tx-data (apply original args)]
+                  (is (nil? (err (.execute writer "INSERT INTO ledger VALUES (2)"))))
+                  (reset! snapshot (:max-tx (d/db *conn*)))
+                  tx-data))}
+        #(is (nil? (err (.execute *handler* "DROP TABLE ledger")))))
+      (let [db (d/db *conn*)]
+        (is (empty? (d/datoms db :aevt :ledger/id)))
+        (is (= #{1 2} (into #{} (map :v) (d/datoms (d/as-of db @snapshot) :aevt :ledger/id))))))))
+
 (deftest historical-catalogs-and-user-data-share-the-statement-snapshot
   (let [run #(.execute *handler* %)
         rows (fn [query]

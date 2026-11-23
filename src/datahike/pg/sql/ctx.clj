@@ -409,11 +409,12 @@
 (defn table-storage-name
   "Resolve a SQL relation name to storage in the statement's catalog."
   [name schema]
-  (let [{:keys [logical->storage storage->logical]} *table-name-overrides*
+  (let [{:keys [logical->storage storage->logical retired-storage]} *table-name-overrides*
         storage (when (and (or (nil? schema) (= "public" schema))
                            (or schema (not (contains? params/*temp-table-map* name))))
                   (or (get logical->storage name)
-                      (when (contains? storage->logical name)
+                      (when (or (contains? storage->logical name)
+                                (contains? retired-storage name))
                         (throw (errors/pg-error :undefined-table {:table name})))))
         storage-name (or storage name)]
     (when (and (not *physical-table-names?*)

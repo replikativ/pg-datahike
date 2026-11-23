@@ -251,6 +251,7 @@
 (defn- not-null-constraint-rows [rows user-schema db]
   (let [hints (pgs/schema-hints db)
         tables (pgs/derive-virtual-tables user-schema hints)
+        logical-names (catalog-objects/table-name-overrides db)
         by-table (group-by :pg_constraint/conrelid rows)]
     (mapcat
      (fn [[table {:keys [columns]}]]
@@ -262,7 +263,7 @@
              (let [col (:name column)
                    attnum (pgs/column-attnum user-schema table col hints)]
                (if (and attnum (or (:not-null? column) (= :db.unique/identity (:unique column))))
-                 (let [name (ddl/generated-constraint-name names table col "not_null")]
+                 (let [name (ddl/generated-constraint-name names (get logical-names table table) col "not_null")]
                    {:names (conj names name)
                     :rows (conj rows {:pg_constraint/oid (long (constraint-oid "n" name table))
                                       :pg_constraint/conname name
@@ -1484,6 +1485,18 @@
        (sort-by :__seq__/name)
        vec))
 
+(defn- identity-sequences-by-column [db]
+  (into {}
+        (comp
+         (filter :__seq__/identity-generation)
+         (map (fn [{:__seq__/keys [name owned-by-column] :as sequence}]
+                [(or (when owned-by-column
+                       (:datahike.pg.column/storage-ident
+                        (d/entity db [:datahike.pg.column/address-key owned-by-column])))
+                     name)
+                 sequence])))
+        (sequence-entities db)))
+
 (def sequence-backed-catalogs
   "Catalog tables whose rows come from :__seq__/* entities, and whose
    content can therefore change without the user schema changing. The
@@ -1639,7 +1652,7 @@
          "TRIGGER " name " "
          (str/upper-case (clojure.core/name (or timing :after))) " "
          (str/join " OR " evs)
-         " ON public." table
+         " ON public." (fns/quote-identifier (catalog-objects/public-relation-name db table))
          (when (or (:old-table t) (:new-table t))
            (str " REFERENCING"
                 (when-let [o (:old-table t)] (str " OLD TABLE AS " o))
@@ -1666,12 +1679,13 @@
              legacy-incomplete? (:datahike.pg.index/legacy-incomplete? index)
              primary? (true? (:datahike.pg.index/primary? index))
              status (get-in db [:schema ident :db.secondary/status])
+             logical-table (catalog-objects/public-relation-name db table)
              indexdef (str "CREATE " (when unique? "UNIQUE ")
-                           "INDEX " name " ON public." table
+                           "INDEX " (fns/quote-identifier name) " ON public." (fns/quote-identifier logical-table)
                            " USING " method " ("
                            (if legacy-incomplete?
                              "/* legacy key metadata unavailable; DROP and recreate */"
-                             (str/join ", " (map :name keys))) ")")]
+                             (str/join ", " (map (comp fns/quote-identifier :name) keys))) ")")]
          {:oid (long oid) :name name :table table :method method
           :relation-oid (long relation-oid) :keys keys
           :unique? (boolean unique?) :primary? primary?
@@ -1708,6 +1722,7 @@
    pgjdbc's getPrimaryKeys makes, matched nothing."
   [db user-schema hints]
   (let [tables (pgs/derive-virtual-tables user-schema hints)
+        names (catalog-objects/table-name-overrides db)
         oid-of (fn [tname] (long (or (pgs/storage-table-oid db tname)
                                      (Math/abs (.hashCode ^String tname)))))]
     (vec
@@ -1720,13 +1735,14 @@
                  attnum (long (or (pgs/column-attnum user-schema tname (:name col) hints)
                                   (inc idx)))
                  tbl-oid (oid-of tname)
+                 table-name (get names tname tname)
                  ;; PostgreSQL names a primary key's index after the
                  ;; TABLE (`uq_pkey`); only a unique or plain index carries
                  ;; the column (`uq_e_key`, `uq_n_idx`). ChooseIndexName /
                  ;; ChooseConstraintName in indexcmds.c.
-                 idx-name (cond primary? (str tname "_pkey")
-                                unique?  (str tname "_" (:name col) "_key")
-                                :else    (str tname "_" (:name col) "_idx"))]]
+                 idx-name (cond primary? (str table-name "_pkey")
+                                unique?  (str table-name "_" (:name col) "_key")
+                                :else    (str table-name "_" (:name col) "_idx"))]]
        {:table tname
         :column (:name col)
         :attnum attnum
@@ -1738,8 +1754,9 @@
         :name idx-name
         :primary? primary?
         :unique? unique?
-        :indexdef (str "CREATE " (when unique? "UNIQUE ") "INDEX " idx-name
-                       " ON public." tname " USING btree (" (:name col) ")")}))))
+        :indexdef (str "CREATE " (when unique? "UNIQUE ") "INDEX " (fns/quote-identifier idx-name)
+                       " ON public." (fns/quote-identifier table-name)
+                       " USING btree (" (fns/quote-identifier (:name col)) ")")}))))
 
 (defn- attribute-storage [oid]
   (cond
@@ -2235,10 +2252,7 @@
     "pg_attribute"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           table-columns (catalog-table-columns cte-db tables)
-          identity-sequences (into {}
-                                   (comp (filter :__seq__/identity-generation)
-                                         (map (juxt :__seq__/name identity)))
-                                   (sequence-entities cte-db))
+          identity-sequences (identity-sequences-by-column cte-db)
           ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
           ;; column. Returns {attr-ident → typmod-int}.
           q-fn d/q
@@ -2303,8 +2317,8 @@
                                    ;; data still has a stable attrelid.
                                 (Math/abs (.hashCode ^String tname)))
                     pk? (= :db.unique/identity (:unique col))
-                    identity-seq (get identity-sequences
-                                      (str tname "_" (:name col) "_seq"))
+                    identity-seq (or (get identity-sequences (:attr col))
+                                     (get identity-sequences (str tname "_" (:name col) "_seq")))
                     identity-code (cond
                                     identity-seq
                                     (if (= "ALWAYS"
@@ -2769,10 +2783,7 @@
                                             [?e :datahike.pg.domain/base-type ?base]
                                             [?e :datahike.pg.domain/not-null ?not-null]]}
                                   cte-db))
-          identity-sequences (into {}
-                                   (comp (filter :__seq__/identity-generation)
-                                         (map (juxt :__seq__/name identity)))
-                                   (sequence-entities cte-db))
+          identity-sequences (identity-sequences-by-column cte-db)
           ;; udt_name in PG follows the underlying base-type convention from
           ;; pg_type — `int4` / `int8` / `varchar` / `timestamp`, NOT the
           ;; SQL-spelled `data_type` ("integer" / "bigint" / …). Metabase
@@ -2875,8 +2886,8 @@
                        pos       (long (if (zero? idx)
                                          1
                                          (inc (or (:attnum col) idx))))
-                       identity-seq (get identity-sequences
-                                         (str tname "_" (:name col) "_seq"))
+                       identity-seq (or (get identity-sequences (:attr col))
+                                        (get identity-sequences (str tname "_" (:name col) "_seq")))
                        identity? (or identity-seq
                                      (and (= "db_id" (:name col)) (zero? idx)))
                        identity-generation (or (:__seq__/identity-generation identity-seq)
@@ -2975,11 +2986,12 @@
              (pgs/row-marker-attr "information_schema_sequences") true})
           (sequence-entities cte-db))
     "pg_indexes"
-    (let [native
+    (let [names (catalog-objects/table-name-overrides cte-db)
+          native
           (for [{:keys [table name indexdef]}
                 (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db))]
             {:pg_indexes/schemaname "public"
-             :pg_indexes/tablename table
+             :pg_indexes/tablename (get names table table)
              :pg_indexes/indexname name
              :pg_indexes/tablespace "pg_default"
              :pg_indexes/indexdef indexdef
@@ -2987,7 +2999,7 @@
           explicit
           (for [{:keys [table name indexdef]} (explicit-index-descriptors cte-db)]
             {:pg_indexes/schemaname "public"
-             :pg_indexes/tablename table
+             :pg_indexes/tablename (get names table table)
              :pg_indexes/indexname name
              :pg_indexes/tablespace "pg_default"
              :pg_indexes/indexdef indexdef
@@ -3253,6 +3265,7 @@
     "pg_constraint"
     (let [hints (pgs/schema-hints cte-db)
           tables  (pgs/derive-virtual-tables user-schema hints)
+          names (catalog-objects/table-name-overrides cte-db)
           q-fn    d/q
           domains (q-fn '{:find [?type ?name ?expr]
                           :where [[?e :datahike.pg.domain/name ?type]
@@ -3318,9 +3331,10 @@
                     ;; Same naming as the index that backs it: a primary
                     ;; key is `<table>_pkey`, a unique constraint
                     ;; `<table>_<column>_key`.
+                    table-name (get names tname tname)
                     cname    (if primary?
-                               (str tname "_pkey")
-                               (str tname "_" (:name col) "_key"))
+                               (str table-name "_pkey")
+                               (str table-name "_" (:name col) "_key"))
                     condef   (str (if primary? "PRIMARY KEY (" "UNIQUE (")
                                   (:name col) ")")
                     attnum   (attnum-for tname (:name col))]]
@@ -3349,16 +3363,18 @@
         ;; constraint still reports the default name.
         (for [[a props] (sort-by (comp str key) user-schema)
               :let [unique (pgs/schema-unique hints a props)]
-              :when (and (keyword? a)
+              :when (and (qualified-keyword? a)
                          (seq (:db/tupleAttrs props))
-                         unique)
+                         unique
+                         (contains? tables (namespace a)))
               :let [tname (namespace a)
+                    table-name (get names tname tname)
                     cols (mapv #(or (get-in hints [% :column]) (name %)) (:db/tupleAttrs props))
                     primary? (= :db.unique/identity unique)
                     contype (if primary? "p" "u")
                     cname (if primary?
-                            (str tname "_pkey")
-                            (str tname "_" (str/join "_" cols) "_key"))
+                            (str table-name "_pkey")
+                            (str table-name "_" (str/join "_" cols) "_key"))
                     tbl-oid (or (pgs/storage-table-oid cte-db tname)
                                 (Math/abs (.hashCode ^String tname)))
                     attnums (keep #(attnum-for tname %) cols)]]
@@ -3468,13 +3484,14 @@
       (vec
        (concat
         (for [[tname _] (sort-by key tables)
-              :let [pk (get primary-keys tname)]]
+              :let [pk (get primary-keys tname)
+                    table-name (get logical-names tname tname)]]
           {:information_schema_table_constraints/constraint_catalog "datahike"
            :information_schema_table_constraints/constraint_schema "public"
-           :information_schema_table_constraints/constraint_name (or (:name pk) (str tname "_pkey"))
+           :information_schema_table_constraints/constraint_name (or (:name pk) (str table-name "_pkey"))
            :information_schema_table_constraints/table_catalog "datahike"
            :information_schema_table_constraints/table_schema "public"
-           :information_schema_table_constraints/table_name (get logical-names tname tname)
+           :information_schema_table_constraints/table_name table-name
            :information_schema_table_constraints/constraint_type "PRIMARY KEY"
            :information_schema_table_constraints/is_deferrable "NO"
            :information_schema_table_constraints/initially_deferred "NO"
@@ -3482,13 +3499,14 @@
            (pgs/row-marker-attr "information_schema_table_constraints") true})
         (for [[tname {:keys [columns]}] (sort-by key tables)
               col columns
-              :when (:unique col)]
+              :when (:unique col)
+              :let [table-name (get logical-names tname tname)]]
           {:information_schema_table_constraints/constraint_catalog "datahike"
            :information_schema_table_constraints/constraint_schema "public"
-           :information_schema_table_constraints/constraint_name (str tname "_" (:name col) "_key")
+           :information_schema_table_constraints/constraint_name (str table-name "_" (:name col) "_key")
            :information_schema_table_constraints/table_catalog "datahike"
            :information_schema_table_constraints/table_schema "public"
-           :information_schema_table_constraints/table_name tname
+           :information_schema_table_constraints/table_name table-name
            :information_schema_table_constraints/constraint_type "UNIQUE"
            :information_schema_table_constraints/is_deferrable "NO"
            :information_schema_table_constraints/initially_deferred "NO"
@@ -3501,26 +3519,28 @@
       (vec
        (concat
         (for [[tname _] (sort-by key tables)
-              :let [pk (get primary-keys tname)]
+              :let [pk (get primary-keys tname)
+                    table-name (get logical-names tname tname)]
               [position col] (map-indexed vector (or (:keys pk) [{:name "db_id"}]))]
           {:information_schema_key_column_usage/constraint_catalog "datahike"
            :information_schema_key_column_usage/constraint_schema "public"
-           :information_schema_key_column_usage/constraint_name (or (:name pk) (str tname "_pkey"))
+           :information_schema_key_column_usage/constraint_name (or (:name pk) (str table-name "_pkey"))
            :information_schema_key_column_usage/table_catalog "datahike"
            :information_schema_key_column_usage/table_schema "public"
-           :information_schema_key_column_usage/table_name (get logical-names tname tname)
+           :information_schema_key_column_usage/table_name table-name
            :information_schema_key_column_usage/column_name (:name col)
            :information_schema_key_column_usage/ordinal_position (long (inc position))
            (pgs/row-marker-attr "information_schema_key_column_usage") true})
         (for [[tname {:keys [columns]}] (sort-by key tables)
               col columns
-              :when (:unique col)]
+              :when (:unique col)
+              :let [table-name (get logical-names tname tname)]]
           {:information_schema_key_column_usage/constraint_catalog "datahike"
            :information_schema_key_column_usage/constraint_schema "public"
-           :information_schema_key_column_usage/constraint_name (str tname "_" (:name col) "_key")
+           :information_schema_key_column_usage/constraint_name (str table-name "_" (:name col) "_key")
            :information_schema_key_column_usage/table_catalog "datahike"
            :information_schema_key_column_usage/table_schema "public"
-           :information_schema_key_column_usage/table_name tname
+           :information_schema_key_column_usage/table_name table-name
            :information_schema_key_column_usage/column_name (:name col)
            :information_schema_key_column_usage/ordinal_position 1
            :information_schema_key_column_usage/position_in_unique_constraint 1

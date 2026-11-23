@@ -1065,9 +1065,11 @@
             params/*only-table-marker* (params/only-table-marker sql)
             ctx/*table-name-overrides*
             (when-not ctx/*physical-table-names?*
-              (let [names (catalog-objects/table-name-overrides db)]
-                (when (seq names)
-                  {:storage->logical names :logical->storage (set/map-invert names)})))
+              (let [names (catalog-objects/table-name-overrides db)
+                    retired (pgs/retired-table-names db)]
+                (when (or (seq names) (seq retired))
+                  {:storage->logical names :logical->storage (set/map-invert names)
+                   :retired-storage retired})))
             regoid/*db* db
             regoid/*relation-provider* catalog/relation-identity
             regoid/*relation-db* (or regoid/*relation-db* db)

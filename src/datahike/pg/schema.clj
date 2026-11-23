@@ -596,11 +596,20 @@
 (defn- as-of-view? [db]
   (and db (= :as-of (get-in (dbi/-secondary-view db) [:system :mode]))))
 
-(defn- retired-table-names [db]
+(defn retired-table-names
+  "Storage namespaces retired in this snapshot."
+  [db]
   (when (and db (get (dbi/-schema db) :datahike.pg.partition/retired-storage))
     (set (d/q '[:find [?storage ...]
                 :where [_ :datahike.pg.partition/retired-storage ?storage]]
               db))))
+
+(defn retire-table-storage-tx [db storage]
+  (let [attr :datahike.pg.partition/retired-storage]
+    (cond-> []
+      (not (contains? (dbi/-schema db) attr))
+      (conj {:db/ident attr :db/valueType :db.type/string :db/cardinality :db.cardinality/one})
+      true (conj {attr storage}))))
 
 (defn- schema-hints*
   [db]
@@ -776,7 +785,9 @@
   "The table's persistent PostgreSQL OID. Prefer the registry for SQL names
    and fall back to the row marker for bare or pre-migration databases."
   [db table-name]
-  (or (registered-table-oid db table-name) (marker-table-oid db table-name)))
+  (or (registered-table-oid db table-name)
+      (when-not (contains? (retired-table-names db) table-name)
+        (marker-table-oid db table-name))))
 
 (defn storage-table-oid
   "Return the relation OID for a physical table namespace, including when

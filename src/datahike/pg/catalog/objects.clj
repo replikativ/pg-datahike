@@ -288,6 +288,19 @@
                    [?e :datahike.pg.object/name ?name]]
                  db)))))
 
+(defn public-relation-storage-name [db name]
+  (or (:datahike.pg.object/storage-name
+       (object-by-identity db pg-class-oid public-namespace-oid name))
+      name))
+
+(defn object-by-storage-name [db storage]
+  (when (get (dbi/-schema db) :datahike.pg.object/storage-name)
+    (some-> (entity-by-unique db :datahike.pg.object/storage-name storage)
+            object-map)))
+
+(defn public-relation-name [db storage]
+  (or (:datahike.pg.object/name (object-by-storage-name db storage)) storage))
+
 (defn primary-index-oid [db relation-oid]
   (when (get (dbi/-schema db) :datahike.pg.index/primary?)
     (d/q '[:find ?oid .
@@ -502,7 +515,7 @@
    objects; otherwise it must already exist.  The two :db.unique/value keys
    are the atomic stale-reader guard: Datahike rejects duplicates and cannot
    upsert/merge them as it would :db.unique/identity."
-  [db {:keys [class-oid oid kind name namespace-oid owner-oid revision
+  [db {:keys [class-oid oid kind name storage-name namespace-oid owner-oid revision
               legacy-oid? identity-tail]
        :or {owner-oid 10 revision 1}}]
   (let [namespace (when (some? namespace-oid)
@@ -522,6 +535,7 @@
        namespace (assoc :datahike.pg.object/namespace
                         [:datahike.pg.object/address-key
                          (address-key pg-namespace-oid namespace-oid)])
+       storage-name (assoc :datahike.pg.object/storage-name storage-name)
        (some? legacy-oid?) (assoc :datahike.pg.object/legacy-oid?
                                   (boolean legacy-oid?)))]))
 
