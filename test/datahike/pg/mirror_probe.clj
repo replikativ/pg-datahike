@@ -949,6 +949,8 @@
                     #(and (= [["after restart"]] (rows sink "SELECT tag FROM schema_archive WHERE id = 1"))
                           (= [["after restart"]] (rows sink "SELECT body FROM schema_items WHERE id = 1")))))
           (mirror/stop! @subscriber)
+          (await! "Publisher did not release the schema-refresh slot"
+                  #(= ["false"] (slot-query source slot "active::text")))
           (sql! source (str "SELECT pg_drop_replication_slot(" (literal slot) ")"))
           {:status :passed :artifacts directory})
         (finally
