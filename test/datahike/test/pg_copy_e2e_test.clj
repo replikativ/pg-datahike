@@ -110,6 +110,25 @@
                            "3,\"\\D\"\n")))
     (is (= "\\D" (ffirst (query-rows c "SELECT v FROM copy_defaults WHERE id=3"))))))
 
+(deftest copy-preserves-explicit-nulls-in-columns-with-defaults
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (with-open [st (.createStatement c)]
+      (.execute st (str "CREATE TABLE copy_nullable ("
+                        "id int PRIMARY KEY, label text DEFAULT 'fallback', "
+                        "quantity int DEFAULT (20 + 22))")))
+    (is (= 1 (copy-in-text c "COPY copy_nullable FROM STDIN" "1\t\\N\t7\n")))
+    (is (= 1 (copy-in-text c "COPY copy_nullable (id) FROM STDIN" "2\n")))
+    (let [select "SELECT id, label, quantity FROM copy_nullable ORDER BY id"
+          initial [[1 nil 7] [2 "fallback" 42]]
+          finished (conj initial [3 "explicit" nil])]
+      (is (= initial (query-rows c select)))
+      (.setAutoCommit c false)
+      (is (= 1 (copy-in-text c "COPY copy_nullable FROM STDIN" "3\texplicit\t\\N\n")))
+      (is (= finished (query-rows c select)))
+      (.commit c)
+      (with-open [reader (DriverManager/getConnection (jdbc-url *port*))]
+        (is (= finished (query-rows reader select)))))))
+
 (deftest copy-decodes-utf8-across-wire-frame-boundaries
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (let [^CopyIn copy (open-copy c "COPY users(id,name) FROM STDIN")
