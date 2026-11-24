@@ -474,9 +474,11 @@ psql -X --host=127.0.0.1 --port=15432 --username=datahike \
   --dbname=datahike --set=ON_ERROR_STOP=1 --file=beta-store.sql
 ```
 
-Compare row counts and representative queries, then check application
-writes that use constraints, SERIAL, or identity columns. Keep the original
-store available through cutover. For a custom-format archive, use
+Compare row counts and representative queries. Restart with the same data
+directory and database name, then check application writes that use
+constraints, SERIAL, or identity columns. The launcher reopens the saved
+store and its history setting. Keep the original store available through
+cutover. For a custom-format archive, use
 `pg_restore --file` to render SQL for the same `psql` step.
 
 ### pg-datahike → portable PG SQL (the `dump` tool)

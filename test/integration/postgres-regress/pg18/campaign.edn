@@ -54,13 +54,41 @@
      :boundaries
      #{:scalar-type :type-inference :input-codec :volatile-functions :operators :temporal-extraction},
      :mode :unmeasured}
-    {:name "enum", :boundaries #{:user-type :ordering :casts :catalog-introspection}, :mode :unmeasured}
-    {:name "domain", :boundaries #{:constraints :user-type :casts}, :mode :unmeasured}
+    {:name "enum",
+     :boundaries #{:user-type :ordering :casts :catalog-introspection},
+     :mode :discovery
+     :accepted-differences #{:diagnostic-positions}
+     :strict-slices
+     [{:id :enum-catalog-sort-positions
+       :source-lines [30 57]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-catalog-keeps-positions-notices-and-subscript-labels"}
+      {:id :enum-duplicate-label-notice
+       :source-lines [70 71]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-catalog-keeps-positions-notices-and-subscript-labels"}
+      {:id :enum-array-subscript-label
+       :source-lines [208 209]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-catalog-keeps-positions-notices-and-subscript-labels"}
+      {:id :enum-drop-after-table-cleanup
+       :source-lines [336 346]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "dropping-user-types-ignores-retired-tables-and-columns"}
+      {:id :enum-overload-precedence
+       :source-lines [229 243]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "concrete-enum-overload-wins-over-polymorphic-argument"}]}
+    {:name "domain", :boundaries #{:constraints :user-type :casts}, :mode :discovery
+     :blockers #{:domain-definition-validation :domain-dependencies :domain-arrays
+                 :domain-composites :domain-value-coercion}}
     {:name "create_type", :boundaries #{:type-ddl :type-lookup}, :mode :unmeasured}
     {:name "type_sanity", :boundaries #{:type-registry :catalogs}, :mode :unmeasured}
     {:name "opr_sanity", :boundaries #{:catalogs :operator-registry}, :mode :unmeasured}
     {:name "misc_sanity", :boundaries #{:catalogs}, :mode :unmeasured}
-    {:name "namespace", :boundaries #{:name-resolution :schemas}, :mode :unmeasured}
+    {:name "namespace", :boundaries #{:name-resolution :schemas}, :mode :discovery
+     :blockers #{:create-schema-elements :drop-schema-cascade :maintenance-search-path
+                 :expression-indexes}}
     {:name "rangefuncs",
      :boundaries #{:parameter-inference :set-returning-functions :lateral},
      :requires ["test_setup"],

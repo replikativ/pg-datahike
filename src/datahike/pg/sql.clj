@@ -13,7 +13,8 @@
                               | {:type :insert :tx-data [...]}
                               | {:type :system :result QueryResult}
                               | {:type :error :message str}"
-  (:require [clojure.set :as set]
+  (:require [clojure.edn :as edn]
+            [clojure.set :as set]
             [clojure.string :as str]
             [datahike.api :as d]
             [datahike.query :as dq]
@@ -23,6 +24,7 @@
             [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.catalog.regoid :as regoid]
+            [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.cast :as sql-cast]
@@ -75,7 +77,7 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ^:dynamic *parse-cache* ^:dynamic *ast-cache*)
+(declare parse-sql ^:dynamic *parse-cache* ^:dynamic *ast-cache*)
 (def ^:private unquote-ident params/unquote-ident)
 
 (def ^:private view-name-attr :datahike.pg/view-name)
@@ -270,10 +272,26 @@
                       (stmt/translate-select owned-select schema db))
           aliases (:find-aliases validated)
           typmods (view-select-typmods owned-select db aliases)
-          columns (mapv (fn [name oid typmod]
-                          {:name name :oid (long (or oid types/oid-text))
-                           :typmod typmod})
-                        aliases (:select-item-oids validated) typmods)
+          definition (str owned-select)
+          existing-view (when (and replace? existing-eid) (d/entity db existing-eid))
+          existing-definition (get existing-view view-definition-attr)
+          existing-columns (some-> (get existing-view view-columns-attr) edn/read-string)
+          existing-expression-oids
+          (delay (when existing-definition
+                   (if (= definition existing-definition)
+                     (:select-item-oids validated)
+                     (binding [params/*analysis-only?* true]
+                       (:select-item-oids (parse-sql existing-definition schema db))))))
+          columns (mapv (fn [index name oid typmod]
+                          (let [existing (nth existing-columns index nil)
+                                enum-as-text? (and (= name (:name existing))
+                                                   (= types/oid-text (:oid existing))
+                                                   (pgs/enum-name-for-oid db oid)
+                                                   (= oid (nth @existing-expression-oids index nil)))]
+                            {:name name
+                             :oid (long (if enum-as-text? types/oid-text (or oid types/oid-text)))
+                             :typmod typmod}))
+                        (range) aliases (:select-item-oids validated) typmods)
           duplicate-name (some (fn [[name n]] (when (> n 1) name))
                                (frequencies aliases))]
       (when duplicate-name
@@ -304,7 +322,7 @@
                     true
                     (conj {:db/id (or existing-eid (str (gensym "view-")))
                            view-name-attr view-name
-                           view-definition-attr (str owned-select)
+                           view-definition-attr definition
                            view-columns-attr (pr-str columns)}))}))))
 
 ;; Statement-level translation lives in datahike.pg.sql.stmt; parse-sql
@@ -318,11 +336,6 @@
 ;; ============================================================================
 ;; Forward declarations
 ;; ============================================================================
-
-;; parse-sql is called by ctx/make-ctx sites (passed through ctx's
-;; :parse-sql slot so expression translators can recurse on subqueries)
-;; before its own defn runs in load order. Resolves at run time.
-(declare parse-sql)
 
 (def ^:private catalog-cache-max-entries
   "Soft bound on the global catalog cache. A long-running server that
@@ -722,26 +735,39 @@
                                         (or (types/dh-type-for-oid oid) :db.type/string))
                                 attr (keyword table-name alias)
                                 pg-type (get types/oid->pg-type-marker oid)
+                                enum-name (pgs/enum-name-for-oid db oid)
                                 typmod (nth ctas-column-typmods idx nil)]
-                            {:alias alias :attr attr :oid oid :vtype vtype
+                            {:alias alias :attr attr :oid oid :vtype vtype :enum-name enum-name
                              :schema (cond-> {:db/ident attr
                                               :db/valueType vtype
                                               :db/cardinality :db.cardinality/one}
                                        pg-type (assoc :pg/type pg-type)
+                                       enum-name (assoc :datahike.pg/enum-of enum-name)
                                        (and typmod (not= typmod -1)) (assoc :pg/typmod typmod)
                                        (:temp? base) (assoc :db/noHistory true))}))
                         (range) aliases)
         ctas-schema (into {} (map (fn [{:keys [attr schema]}] [attr schema])) col-specs)
+        enum-columns (into {}
+                           (keep (fn [{:keys [alias attr enum-name]}]
+                                   (when enum-name
+                                     [alias {:kind :enum :attr attr :enum-name enum-name
+                                             :values (params/registered-enum-values db enum-name)
+                                             :unsafe-values (params/unsafe-enum-values db enum-name)}])))
+                           col-specs)
+        enum-plan {:domain-enum enum-columns}
         data-tx (mapv (fn [row]
-                        (reduce (fn [entity [idx {:keys [attr]}]]
-                                  (let [v (nth row idx nil)]
-                                    (if (or (nil? v) (= :__null__ v))
-                                      entity
-                                      (assoc entity attr
-                                             (stmt/coerce-insert-value
-                                              v attr ctas-schema db)))))
-                                {:db/id (str (gensym "ctas-")) marker true}
-                                (map-indexed vector col-specs)))
+                        (let [entity (reduce (fn [entity [idx {:keys [attr]}]]
+                                               (let [v (nth row idx nil)]
+                                                 (if (or (nil? v) (= :__null__ v))
+                                                   entity
+                                                   (assoc entity attr
+                                                          (stmt/coerce-insert-value
+                                                           v attr ctas-schema db)))))
+                                             {:db/id (str (gensym "ctas-")) marker true}
+                                             (map-indexed vector col-specs))]
+                          (when (seq enum-columns)
+                            (row-constraints/validate-pre-arbiter! db table-name entity enum-plan nil nil))
+                          entity))
                       visible-rows)]
     (-> base
         (assoc :column-order aliases)

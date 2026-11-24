@@ -5,9 +5,11 @@
    `:datahike.pg.domain/*`). Columns declared with these types lower
    to the appropriate base type for storage but carry the enum/domain
    name in metadata so the dump can re-emit them."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.test :refer [deftest testing is use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.dump :as dump]
             [datahike.pg.server :as pg]
@@ -85,6 +87,41 @@
            (mapv vec
                  (query-rows
                   c "SELECT COUNT(*) FROM pg_enum WHERE enumtypid = 'mood'::regtype"))))))
+
+(deftest enum-catalog-keeps-positions-notices-and-subscript-labels
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))
+              statement (.createStatement c)]
+    (exec! c "CREATE TYPE spectrum AS ENUM ('middle', 'end')")
+    (exec! c "ALTER TYPE spectrum ADD VALUE 'start' BEFORE 'middle'")
+    (exec! c "ALTER TYPE spectrum ADD VALUE 'between' AFTER 'middle'")
+    (exec! c "ALTER TYPE spectrum ADD VALUE 'quarter' BEFORE 'between'")
+    (exec! c "ALTER TYPE spectrum RENAME VALUE 'quarter' TO 'near-middle'")
+    (is (= [["start" 0.0] ["middle" 1.0] ["near-middle" 1.25]
+            ["between" 1.5] ["end" 2.0]]
+           (query-rows c "SELECT enumlabel, enumsortorder FROM pg_enum
+                          WHERE enumtypid = 'spectrum'::regtype ORDER BY enumsortorder")))
+    (.execute statement "ALTER TYPE spectrum ADD VALUE IF NOT EXISTS 'start'")
+    (let [warning (.getWarnings statement)]
+      (is (= "42710" (some-> warning .getSQLState)))
+      (is (some->> warning .getMessage (re-find #"already exists, skipping"))))
+    (with-open [result (.executeQuery statement "SELECT ('{start,middle,end}'::spectrum[])[2]")]
+      (is (= "spectrum" (.getColumnLabel (.getMetaData result) 1)))
+      (is (.next result))
+      (is (= "middle" (.getString result 1))))))
+
+(deftest dropping-user-types-ignores-retired-tables-and-columns
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE ticket_state AS ENUM ('open', 'closed')")
+    (exec! c "CREATE DOMAIN ticket_number AS integer CHECK (VALUE > 0)")
+    (exec! c "CREATE TABLE ticket_ledger (id int, state ticket_state, ticket_no ticket_number)")
+    (doseq [drop-sql ["DROP TYPE ticket_state" "DROP DOMAIN ticket_number"]]
+      (is (= "2BP01" (try (exec! c drop-sql)
+                          (catch java.sql.SQLException e (.getSQLState e))))))
+    (exec! c "ALTER TABLE ticket_ledger DROP COLUMN ticket_no")
+    (exec! c "DROP DOMAIN ticket_number")
+    (exec! c "DROP TABLE ticket_ledger")
+    (exec! c "DROP TYPE ticket_state")
+    (is (= [[0]] (query-rows c "SELECT count(*) FROM pg_type WHERE typname IN ('ticket_state', 'ticket_number')")))))
 
 (deftest enum-catalog-has-no-orphaned-labels
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
@@ -264,6 +301,98 @@
                   c (str "SELECT enumlabel FROM pg_enum "
                          "WHERE enumtypid = 'rainbow'::regtype "
                          "ORDER BY enumlabel::rainbow")))))))
+
+(deftest prepared-enum-projections-keep-type-and-declaration-order
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'yellow', 'green', 'blue')")
+    (exec! c "CREATE DOMAIN note AS text CHECK (VALUE <> '')")
+    (exec! c "CREATE TABLE palette (color rainbow, caption note)")
+    (exec! c "INSERT INTO palette VALUES ('green', 'g'), ('red', 'r'), ('blue', 'b'), ('yellow', 'y')")
+    (doseq [sql ["SELECT color, caption FROM palette ORDER BY color"
+                 "SELECT * FROM palette ORDER BY color"
+                 "SELECT p.* FROM palette p ORDER BY p.color"
+                 "WITH c AS (SELECT * FROM palette) SELECT * FROM c ORDER BY color"
+                 "SELECT p.* FROM (SELECT color, caption FROM palette) p(shade, note) ORDER BY shade"]]
+      (testing sql
+        (with-open [stmt (.prepareStatement c sql)]
+          (is (= ["rainbow" "text"] (mapv #(.getColumnTypeName (.getMetaData stmt) %) [1 2])))
+          (with-open [rs (.executeQuery stmt)]
+            (is (= ["rainbow" "text"] (mapv #(.getColumnTypeName (.getMetaData rs) %) [1 2])))
+            (is (= [["red" "r"] ["yellow" "y"] ["green" "g"] ["blue" "b"]]
+                   (loop [out []]
+                     (if (.next rs)
+                       (recur (conj out [(.getObject rs 1) (.getObject rs 2)]))
+                       out))))))))
+    (with-open [stmt (.prepareStatement c "SELECT 'red'::rainbow AS shade")]
+      (is (= "rainbow" (.getColumnTypeName (.getMetaData stmt) 1))))
+    (with-open [stmt (.prepareStatement c "SELECT * FROM (SELECT color FROM palette LIMIT 0) p")
+                rs (.executeQuery stmt)]
+      (is (= "rainbow" (.getColumnTypeName (.getMetaData rs) 1)))
+      (is (false? (.next rs))))))
+
+(deftest enum-query-results-preserve-write-types-and-catalog-dependencies
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE workflow_state AS ENUM ('7')")
+    (exec! c "CREATE TABLE enum_input (state workflow_state)")
+    (exec! c "INSERT INTO enum_input VALUES ('7'), (NULL)")
+    (exec! c "CREATE TABLE enum_copy AS SELECT state FROM enum_input")
+    (exec! c "CREATE TABLE enum_empty AS SELECT state FROM enum_input WITH NO DATA")
+    (exec! c "CREATE TABLE numeric_output (quantity integer)")
+    (exec! c "PREPARE store_number (integer) AS INSERT INTO numeric_output VALUES ($1)")
+    (doseq [[sql state]
+            [["INSERT INTO numeric_output SELECT state FROM enum_input" "42804"]
+             ["EXECUTE store_number('7'::workflow_state)" "42804"]
+             ["ALTER TABLE numeric_output ALTER COLUMN quantity TYPE bigint USING '7'::workflow_state" "42804"]
+             ["INSERT INTO enum_copy VALUES ('wrong')" "22P02"]
+             ["INSERT INTO enum_empty VALUES ('wrong')" "22P02"]
+             ["SELECT coalesce(state, 'wrong') FROM enum_input" "22P02"]
+             ["SELECT CASE WHEN state IS NULL THEN 'wrong' ELSE state END FROM enum_input" "22P02"]
+             ["CREATE TABLE invalid_enum_copy AS SELECT coalesce(state, 'wrong') AS state FROM enum_input" "22P02"]]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)))
+    (is (empty? (query-rows c "SELECT quantity FROM numeric_output")))
+    (is (= [[nil]] (query-rows c "SELECT to_regclass('invalid_enum_copy')")))
+    (doseq [table ["enum_copy" "enum_empty"]]
+      (with-open [stmt (.prepareStatement c (str "SELECT state FROM " table))]
+        (is (= "workflow_state" (.getColumnTypeName (.getMetaData stmt) 1)))))
+    (exec! c "CREATE VIEW enum_view AS SELECT '7'::workflow_state AS state")
+    (exec! c "DROP TABLE enum_input")
+    (exec! c "DROP TABLE enum_empty")
+    (let [drop-type-error #(try (exec! c "DROP TYPE workflow_state") nil
+                                (catch java.sql.SQLException e (.getSQLState e)))]
+      (is (= "2BP01" (drop-type-error)))
+      (exec! c "DROP TABLE enum_copy")
+      (is (= "2BP01" (drop-type-error)))
+      (exec! c "DROP VIEW enum_view")
+      (is (nil? (drop-type-error))))))
+
+(deftest replacing-an-existing-enum-view-preserves-its-stored-text-type
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE legacy_state AS ENUM ('queued')")
+    (exec! c "CREATE TABLE legacy_input (state legacy_state)")
+    (exec! c "INSERT INTO legacy_input VALUES ('queued')")
+    (exec! c "CREATE VIEW legacy_status AS SELECT state FROM legacy_input")
+    (let [db (d/db *conn*)
+          view (d/entity db [:datahike.pg/view-name "legacy_status"])
+          columns (edn/read-string (:datahike.pg/view-columns view))
+          [[oid]] (query-rows c "SELECT 'legacy_status'::regclass::oid")
+          column (catalog-objects/column-by-attnum db (long oid) 1)]
+      (d/transact *conn* [[:db/add (:db/id view) :datahike.pg/view-columns
+                           (pr-str (assoc-in columns [0 :oid] 25))]
+                          [:db/add (:db/id column) :datahike.pg.column/type-oid 25]]))
+    (exec! c "CREATE OR REPLACE VIEW legacy_status AS SELECT i.state FROM legacy_input i WHERE i.state IS NOT NULL")
+    (with-open [stmt (.prepareStatement c "SELECT state FROM legacy_status")]
+      (is (= "text" (.getColumnTypeName (.getMetaData stmt) 1))))
+    (is (= [["queued"]] (query-rows c "SELECT state FROM legacy_status")))))
+
+(deftest concrete-enum-overload-wins-over-polymorphic-argument
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red')")
+    (exec! c "CREATE TYPE compass AS ENUM ('north')")
+    (exec! c "CREATE FUNCTION label(anyenum) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RETURN $1::text || ' generic'; END $$")
+    (exec! c "CREATE FUNCTION label(rainbow) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RETURN $1::text || ' color'; END $$")
+    (is (= [["red color" "north generic"]]
+           (query-rows c "SELECT label('red'::rainbow), label('north'::compass)")))))
 
 (deftest enum-foreign-keys-use-nominal-types-and-default-primary-key
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]

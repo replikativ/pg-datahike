@@ -3200,14 +3200,15 @@
     "pg_enum"
     (vec
      (for [{:keys [name oid values]} (pgs/enum-types cte-db)
-           :let [members (some-> (d/entity cte-db [:datahike.pg.enum/name name])
-                                 :datahike.pg.enum/publisher-members edn/read-string)]
+           :let [enum (d/entity cte-db [:datahike.pg.enum/name name])
+                 members (some-> enum :datahike.pg.enum/publisher-members edn/read-string)
+                 orders (some-> enum :datahike.pg.enum/sort-orders edn/read-string)]
            [idx label] (map-indexed vector values)
            :let [[member-oid sort-order] (get members idx)]]
        {:pg_enum/oid (or member-oid (long (bit-and 0x7fffffff
                                                    (.hashCode ^String (str oid ":" idx ":" label)))))
         :pg_enum/enumtypid oid
-        :pg_enum/enumsortorder (or sort-order (double (inc idx)))
+        :pg_enum/enumsortorder (or sort-order (get orders idx) (double (inc idx)))
         :pg_enum/enumlabel label
         (pgs/row-marker-attr "pg_enum") true}))
     "pg_policy"

@@ -3682,14 +3682,15 @@
   "The source type's name when this assignment has no cast PostgreSQL
    would make (transformAssignedExpr -> can_coerce_type), else nil.
 
-   A user type is checked by NAME, not by OID: DDL lowers an enum column
-   to text and a domain column to its base type, so every enum would
-   otherwise accept any text. An enum takes its own type, and nothing
-   else; a domain takes whatever its base takes. A source we cannot name
-   -- a subquery over an enum column reads as text here -- is left to the
-   base check rather than rejected."
+   An enum takes values of its own declared type. Domain assignments use
+   the base type's casts. Enum values use the text carrier for assignments
+   into ordinary columns, where casting to string types is allowed."
   [db attr-of expr source target user-type]
-  (let [src-type (expression-user-type db attr-of expr)]
+  (let [source-object (when (and source (catalog-objects/valid-user-oid? source))
+                        (catalog-objects/object-by-address db catalog-objects/pg-type-oid source))
+        src-type (if (= :enum (:datahike.pg.object/kind source-object))
+                   [:enum (:datahike.pg.object/name source-object)]
+                   (expression-user-type db attr-of expr))]
     (cond
       (= :enum (first user-type))
       (when-not (= (second src-type) (second user-type))
@@ -3701,7 +3702,8 @@
           (or (second src-type) (types/format-type source -1))))
 
       :else
-      (when-not (types/assignment-cast-exists? source target)
+      (when-not (types/assignment-cast-exists? (if (= :enum (first src-type)) types/oid-text source)
+                                               target)
         (or (second src-type) (types/format-type source -1))))))
 
 (defn- joined-write-source-scopes [plan db aliases]
@@ -6494,9 +6496,9 @@
       (error-result "PREPARE: syntax error" "42601"))))
 
 (defn- check-prepared-arg-cast!
-  [source-oid target-oid untyped? index]
+  [db source-oid target-oid untyped? index]
   (when (and (not untyped?)
-             (not (types/assignment-cast-exists? source-oid target-oid)))
+             (not (pgs/assignment-cast-exists? db source-oid target-oid)))
     (throw (ex-info (str "parameter $" index " of type "
                          (types/format-type source-oid -1)
                          " cannot be coerced to the expected type "
@@ -6526,7 +6528,7 @@
    and assignment-coerce them left-to-right. A conversion failure stops before
    later volatile expressions, and a repeated template parameter still reuses
    the single value produced for its one argument."
-  [^PgWireServer$QueryHandler handler args target-oids]
+  [db ^PgWireServer$QueryHandler handler args target-oids]
   (when (seq args)
     (when (some (fn [arg]
                   (some #(and (= :ident (:type %))
@@ -6561,7 +6563,7 @@
           shapes (mapv prepared-arg-shape plans args)
           _ (doseq [i (range (count args))]
               (let [{:keys [source-oid unknown?]} (nth shapes i)]
-                (check-prepared-arg-cast! source-oid
+                (check-prepared-arg-cast! db source-oid
                                           (nth target-oids i types/oid-text)
                                           unknown? (inc i))))]
       (loop [i 0, values []]
@@ -6583,7 +6585,7 @@
                 (let [{:keys [source-oid unknown?]} (nth shapes i)
                       value (aget ^objects (aget rows 0) 0)
                       coerced (coerce-prepared-arg
-                               value source-oid
+                               db value source-oid
                                (nth target-oids i types/oid-text)
                                unknown? (inc i))]
                   (recur (inc i) (conj values coerced)))))))))))
@@ -6594,9 +6596,9 @@
 (defn- coerce-prepared-arg
   "Read one evaluated EXECUTE argument through its prepared parameter type's
    text input function after checking PostgreSQL assignment compatibility."
-  [value source-oid target-oid untyped? index]
+  [db value source-oid target-oid untyped? index]
   (when (some? value)
-    (check-prepared-arg-cast! source-oid target-oid untyped? index))
+    (check-prepared-arg-cast! db source-oid target-oid untyped? index))
   (letfn [(input-value [text oid]
             (cond
               (#{types/oid-timestamp types/oid-timestamptz} oid) (parse-timestamp-param text oid)
@@ -6631,7 +6633,7 @@
 (defn- invoke-sql-prepared
   "Find and revalidate a session plan, then evaluate each SQL EXECUTE argument
    once before passing the plan and coerced values to the caller."
-  [{:keys [sql-prepared handler]} parsed execute]
+  [{:keys [db sql-prepared handler]} parsed execute]
   (let [pname (:name parsed)
         args-text (:args-text parsed)
         rec (when pname (get @sql-prepared pname))]
@@ -6656,7 +6658,7 @@
                         "42601")
           (let [{^PgWireServer$QueryResult evaluated :result
                  values :values}
-                (evaluate-prepared-args handler args (:effective-param-oids rec))]
+                (evaluate-prepared-args db handler args (:effective-param-oids rec))]
             (if (and evaluated (.error evaluated))
               evaluated
               (execute rec (or values [])))))))))
@@ -11496,6 +11498,28 @@
                     {:error :name-too-long :sqlstate "42622"
                      :detail "Labels must be 63 bytes or less."}))))
 
+(defn- insert-enum-sort-order [orders idx]
+  (loop [orders orders]
+    (let [lower (when (pos? idx) (nth orders (dec idx)))
+          upper (get orders idx)
+          position (double (float (cond
+                                    (nil? lower) (if upper (dec upper) 1.0)
+                                    (nil? upper) (inc lower)
+                                    :else (* 0.5 (float (+ lower upper))))))]
+      (if (or (= position lower) (= position upper))
+        (recur (mapv double (range 1 (inc (count orders)))))
+        (into (conj (subvec orders 0 idx) position)
+              (subvec orders idx))))))
+
+(defn- enum-sort-order-tx [db eid size idx]
+  (let [attr :datahike.pg.enum/sort-orders
+        positions (or (some-> (get (d/entity db eid) attr) edn/read-string)
+                      (mapv double (range 1 (inc size))))]
+    (cond-> []
+      (not (contains? (dbi/-schema db) attr))
+      (conj {:db/ident attr :db/valueType :db.type/string :db/cardinality :db.cardinality/one})
+      true (conj [:db/add eid attr (pr-str (insert-enum-sort-order positions idx))]))))
+
 (defn- exec-ddl-alter-enum
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
@@ -11519,7 +11543,10 @@
                 (validate-enum-label! label)
                 (if (some #{label} values)
                   (if if-not-exists?
-                    [values []]
+                    (do
+                      (params/notice! "NOTICE" (str "enum label " (pr-str label) " already exists, skipping")
+                                      "42710" nil)
+                      [values []])
                     (throw (ex-info (str "enum label " (pr-str label) " already exists")
                                     {:error :duplicate-object :sqlstate "42710"})))
                   (let [neighbor-idx (when neighbor (.indexOf ^java.util.List values neighbor))
@@ -11534,7 +11561,8 @@
                               (count values))
                         updated (vec (concat (subvec values 0 idx) [label]
                                              (subvec values idx)))]
-                    [updated [[:db/add eid :datahike.pg.enum/values label]]])))
+                    [updated (into [[:db/add eid :datahike.pg.enum/values label]]
+                                   (enum-sort-order-tx db eid (count values) idx))])))
 
               :rename-value
               (do
@@ -11618,6 +11646,17 @@
       (catch Exception e
         (classified-error "ALTER TYPE error: " e)))))
 
+(defn- live-type-dependents [db type-attribute type-name]
+  (when-let [columns
+             (seq (d/q {:find '[[?ident ...]]
+                        :in '[$ ?type-name]
+                        :where [['?column type-attribute '?type-name]
+                                '[?column :db/ident ?ident]]}
+                       db type-name))]
+    (let [tables (pgs/derive-virtual-tables (dbi/-schema db) (pgs/schema-hints db))
+          live-columns (into #{} (comp (mapcat :columns) (map :attr)) (vals tables))]
+      (filter live-columns columns))))
+
 (defn- exec-ddl-drop-enum
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
@@ -11630,21 +11669,23 @@
             type-object (catalog-objects/object-by-identity
                          db catalog-objects/pg-type-oid
                          catalog-objects/public-namespace-oid type-name)
-            dependents (when enum-eid
-                         (map first
-                              (d/q '{:find [?col]
-                                     :in [$ ?name]
-                                     :where [[?col :datahike.pg/enum-of ?name]]}
-                                   db type-name)))]
+            dependents? (when enum-eid
+                          (or (seq (live-type-dependents db :datahike.pg/enum-of type-name))
+                              (when-let [oid (:datahike.pg.object/oid type-object)]
+                                (d/q '[:find ?column .
+                                       :in $ ?oid
+                                       :where [?column :datahike.pg.column/type-oid ?oid]
+                                       [?column :datahike.pg.column/dropped? false]]
+                                     db oid))))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP TYPE")
           (nil? eid)
           (throw (ex-info (str "type " (pr-str type-name) " does not exist")
                           {:error :undefined-object :sqlstate "42704"}))
-          (and (seq dependents) cascade?)
+          (and dependents? cascade?)
           (throw (errors/pg-error :feature-not-supported
                                   {:feature "DROP TYPE CASCADE with dependent columns"}))
-          (seq dependents)
+          dependents?
           (throw (ex-info (str "cannot drop type " type-name
                                " because other objects depend on it")
                           {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
@@ -11848,11 +11889,7 @@
                         :where [[?e :datahike.pg.domain/name ?name]]}
                       db domain-name))
             dependents (when eid
-                         (map first
-                              (d/q '{:find [?col]
-                                     :in [$ ?name]
-                                     :where [[?col :datahike.pg/domain-of ?name]]}
-                                   db domain-name)))]
+                         (live-type-dependents db :datahike.pg/domain-of domain-name))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP DOMAIN")
           (nil? eid)
@@ -12896,8 +12933,8 @@
                               {:message (str "ALTER COLUMN TYPE with dependencies on column "
                                              (dump/quote-ident name) " is not supported")})))))
 
-(defn- require-alter-assignment! [source target name type]
-  (when-not (types/assignment-cast-exists? source target)
+(defn- require-alter-assignment! [db source target name type]
+  (when-not (pgs/assignment-cast-exists? db source target)
     (throw (ex-info (str "column " (dump/quote-ident name)
                          " cannot be cast automatically to type " type)
                     {:error :datatype-mismatch :sqlstate "42804"}))))
@@ -13006,7 +13043,7 @@
                     source-oid)
         using-oid (when-not (oid/untyped-literal? using-ast)
                     using-oid)
-        _ (require-alter-assignment! using-oid oid name type)
+        _ (require-alter-assignment! db using-oid oid name type)
         ;; The base cast handles conversions such as numeric to integer or
         ;; timestamps crossing TimeZone. The column assignment handles typmods,
         ;; including rejecting strings that would need truncation.
@@ -13016,7 +13053,7 @@
                       (str "CAST(" using-ast " AS " base ")")))
         default-kind (:pg/default-kind old-entity)
         _ (when (and default-kind (not= source-oid oid))
-            (require-alter-assignment! source-oid oid name type)
+            (require-alter-assignment! db source-oid oid name type)
             (when-not (#{:literal :bit :bit-coerced} default-kind)
               (throw (errors/pg-error :feature-not-supported
                                       {:message "ALTER COLUMN TYPE with an expression DEFAULT is not supported"}))))

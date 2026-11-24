@@ -408,8 +408,8 @@
                        (let [decl-oid (oid-infer/sql-type-name->oid decl-name db)]
                          (or (nil? decl-oid)
                              (= decl-oid actual-oid)
-                             (= (types/cast-category (types/oid->pg-name decl-oid))
-                                (types/cast-category (types/oid->pg-name actual-oid)))))))
+                             (when-let [category (types/cast-category (types/oid->pg-name decl-oid))]
+                               (= category (types/cast-category (types/oid->pg-name actual-oid))))))))
                  declared actual-oids))))
 
 (defn- all-text-params? [cand]
@@ -421,8 +421,8 @@
   "The stored `LANGUAGE sql` function a call of this name and these
    argument types resolves to, or nil when none does.
 
-   One overload of the arity is used as-is. Several are filtered by
-   whether they can take these arguments; if that still leaves more
+   One overload of the arity is used as-is. An exact declared signature
+   wins among several overloads. Otherwise filter by coercion; if that leaves more
    than one and every argument is an untyped literal, the all-`text`
    overload wins, which is PostgreSQL's unknown-prefers-text rule and
    the case `polymorphism` exercises (`dfunc('Hi','City')` is the
@@ -434,12 +434,18 @@
       (empty? cands) nil
       (= 1 (count cands)) (first cands)
       :else
-      (let [fits (filterv #(candidate-accepts? db % actual-oids) cands)]
-        (cond
-          (= 1 (count fits)) (first fits)
-          (and (> (count fits) 1) (every? nil? actual-oids))
-          (first (filter all-text-params? fits))
-          :else nil)))))
+      (or (when (every? some? actual-oids)
+            (some (fn [cand]
+                    (let [declared (read-string (:datahike.pg.function/arg-types cand))]
+                      (when (= actual-oids (mapv #(oid-infer/sql-type-name->oid % db) declared))
+                        cand)))
+                  cands))
+          (let [fits (filterv #(candidate-accepts? db % actual-oids) cands)]
+            (cond
+              (= 1 (count fits)) (first fits)
+              (and (> (count fits) 1) (every? nil? actual-oids))
+              (first (filter all-text-params? fits))
+              :else nil))))))
 
 (defn- sql-function-body-expr
   "The single expression a `LANGUAGE sql` body returns, when the body is
@@ -1128,6 +1134,20 @@
    first one's."
   #{"coalesce" "nullif" "greatest" "least"})
 
+(defn- validate-common-enum-literals! [ctx expressions construct]
+  (when-let [literals (seq (filter #(instance? StringValue %) expressions))]
+    (let [db (:db ctx)
+          oids (mapv #(when-not (oid-infer/untyped-literal? %) (source-oid ctx %)) expressions)]
+      (when (some #(pgs/enum-name-for-oid db %) oids)
+        (when-let [type-name (pgs/enum-name-for-oid db (types/select-common-type oids construct false))]
+          (let [labels (params/registered-enum-values db type-name)]
+            (doseq [literal literals
+                    :let [label (string-value-text literal)]]
+              (when-not (contains? labels label)
+                (throw (errors/pg-error :invalid-text-representation
+                                        {:type type-name :value label :enum? true})))
+              (params/assert-enum-label-safe! db type-name label))))))))
+
 (defn coerce-to-common!
   "Coerce `v` to the common type of `arg-exprs`, per PostgreSQL's
    `select_common_type`, and return the coerced variable -- or `v`
@@ -1425,6 +1445,8 @@
         arg-exprs (when params (vec params))
         arg-exprs (named-args->positional fname arg-exprs)
         _ (validate-function-argument-types! ctx fname arg-exprs)
+        _ (when (common-type-fns fname)
+            (validate-common-enum-literals! ctx arg-exprs (str/upper-case fname)))
         arg-exprs (coerce-function-unknowns ctx fname arg-exprs)
         lazy-args? (= fname "coalesce")
         raw-args (when arg-exprs
@@ -3258,8 +3280,8 @@
         (doseq [{:keys [expression]} bounds
                 :when (instance? net.sf.jsqlparser.expression.Expression expression)]
           (when (and (not (oid-infer/untyped-literal? expression))
-                     (not (types/assignment-cast-exists?
-                           (source-oid ctx expression) types/oid-int4)))
+                     (not (pgs/assignment-cast-exists?
+                           (:db ctx) (source-oid ctx expression) types/oid-int4)))
             (throw (ex-info "array subscript must have type integer"
                             {:error :datatype-mismatch :sqlstate "42804"}))))
         compiled-bounds
@@ -3374,6 +3396,10 @@
   [ctx ^CaseExpression case-expr]
   (let [when-clauses (.getWhenClauses case-expr)
         else-expr (.getElseExpression case-expr)
+        _ (validate-common-enum-literals! ctx
+                                          (into (cond-> [] else-expr (conj else-expr))
+                                                (map #(.getThenExpression ^WhenClause %) when-clauses))
+                                          "CASE")
         switch-expr (.getSwitchExpression case-expr)
         result-var (ctx/fresh-var! ctx)
         ;; For simple CASE (CASE x WHEN v THEN r), translate the switch expression
@@ -6977,7 +7003,7 @@
 (defn- assignment-source-type!
   [ctx expression target-oid description]
   (when (and (not (oid-infer/untyped-literal? expression))
-             (not (types/assignment-cast-exists? (source-oid ctx expression) target-oid)))
+             (not (pgs/assignment-cast-exists? (:db ctx) (source-oid ctx expression) target-oid)))
     (throw (ex-info (str description " has an incompatible expression type")
                     {:error :datatype-mismatch :sqlstate "42804"}))))
 

@@ -2875,9 +2875,20 @@
                     #(contains? (get-in (durable-checkpoint path) [:manifest :unpublished-tables]) removed-id)))
           (check! (= @frozen (contents sink right)) "An active namesake hid the unpublished table" {}))
         (mirror/stop! @subscriber)
+        (let [conn (#'mirror/open-store path)]
+          (try
+            (let [manifest (:manifest (#'mirror/checkpoint (d/db conn)))
+                  legacy (#'mirror/map-manifest-relations manifest #(dissoc % :schema-oid))]
+              (d/transact conn [[:db/add @#'mirror/checkpoint-id (#'mirror/checkpoint-attr :manifest)
+                                 (pr-str legacy)]]))
+            (finally (d/release conn))))
         (reset! subscriber (mirror/start! config))
         (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
           (check! (= @slot (:slot (mirror/status @subscriber))) "Restart replaced the replication slot" {})
+          (await! "Older checkpoint did not acquire publisher namespace identities"
+                  #(let [{:keys [tables partition-parents unpublished-tables]} (:manifest (durable-checkpoint path))]
+                     (and (seq tables) (seq unpublished-tables)
+                          (every? :schema-oid (concat tables partition-parents (vals unpublished-tables))))))
           (sql! source "BEGIN"
                 "TRUNCATE billing.events"
                 "UPDATE \"Archive Data\".events SET label = 'unpublished after restart' WHERE id = 4"
@@ -2887,7 +2898,96 @@
                 "COMMIT")
           (compare-tables! source sink
                            [left moved public-table "shipping.parcels" "billing.parcel_range" "\"Archive Data\".parcel_range"])
-          (check! (= @frozen (contents sink right)) "Restart lost the frozen unpublished relation" {}))
+          (check! (= @frozen (contents sink right)) "Restart lost the frozen unpublished relation" {})
+          (let [namespaces (fn [conn]
+                             (into {} (rows conn (str "SELECT nspname, oid FROM pg_namespace "
+                                                      "WHERE nspname IN ('billing', 'Archive Data')"))))
+                publisher-before (namespaces source)
+                sink-before (namespaces sink)
+                frozen-ids (ids sink right)
+                active-ids (ids sink left)
+                before (inspect-db path (fn [db] (.toInstant ^java.util.Date
+                                                  (:db/txInstant (d/entity db (:max-tx db))))))
+                swapped (fn [by-name] {"billing" (get by-name "Archive Data")
+                                       "Archive Data" (get by-name "billing")})]
+            (sql! source "BEGIN"
+                  "ALTER SCHEMA billing RENAME TO transit"
+                  "ALTER SCHEMA \"Archive Data\" RENAME TO billing"
+                  "ALTER SCHEMA transit RENAME TO \"Archive Data\""
+                  "INSERT INTO \"Archive Data\".events VALUES (5, 55, 'renamed namespace')"
+                  "COMMIT")
+            (compare-tables! source sink [right moved "shipping.parcels"
+                                          "billing.parcel_range" "\"Archive Data\".parcel_range"])
+            (check! (= (swapped publisher-before) (namespaces source)) "Publisher schema OIDs changed" {})
+            (check! (= (swapped sink-before) (namespaces sink)) "Mirror schema rename changed namespace OIDs" {})
+            (check! (= [frozen-ids active-ids] [(ids sink left) (ids sink right)])
+                    "Schema rename changed relation identities" {})
+            (check! (= @frozen (contents sink left)) "Schema rename lost the frozen table" {})
+            (with-open [historical (DriverManager/getConnection (sink-url @subscriber))]
+              (sql! historical (str "SET datahike.as_of = " (literal before)))
+              (check! (= sink-before (namespaces historical)) "Schema rename changed historical namespace names" {})
+              (check! (= @frozen (contents historical right)) "Schema rename lost historical access to frozen rows" {})))
+          (let [public-oids (ids sink public-table)
+                renamed "moved_public.external_claim"]
+            (sql! source "BEGIN"
+                  "ALTER SCHEMA public RENAME TO moved_public"
+                  "UPDATE moved_public.external_claim SET label = 'outside public' WHERE id = 1"
+                  "COMMIT")
+            (await! "Public schema rename did not reach the mirror"
+                    #(= [["t"]] (rows sink "SELECT to_regclass('moved_public.external_claim') IS NOT NULL")))
+            (compare-tables! source sink [renamed])
+            (check! (= public-oids (ids sink renamed)) "Moving out of public changed relation identity" {})
+            (check! (= [["2200"]] (rows sink "SELECT 'public'::regnamespace::oid"))
+                    "Publisher rename moved the mirror's built-in namespace" {})
+            (sql! source "BEGIN"
+                  "ALTER SCHEMA moved_public RENAME TO public"
+                  "UPDATE public.external_claim SET label = 'back in public' WHERE id = 1"
+                  "COMMIT")
+            (await! "Rename back to public did not reach the mirror"
+                    #(= [["t"]] (rows sink "SELECT to_regclass('public.external_claim') IS NOT NULL")))
+            (compare-tables! source sink [public-table])
+            (check! (= public-oids (ids sink public-table)) "Moving back to public changed relation identity" {}))
+          (sql! source "BEGIN"
+                "CREATE SCHEMA boundary_probe"
+                "CREATE TABLE boundary_probe.boundary_live (id bigint PRIMARY KEY, external_id int, label text)"
+                "CREATE TABLE boundary_probe.boundary_frozen (id bigint PRIMARY KEY, external_id int, label text)"
+                "INSERT INTO boundary_probe.boundary_live VALUES (1, 11, 'live')"
+                "INSERT INTO boundary_probe.boundary_frozen VALUES (2, 22, 'frozen')"
+                "ALTER PUBLICATION scoped_pub ADD TABLE boundary_probe.boundary_live, boundary_probe.boundary_frozen"
+                "COMMIT")
+          (let [frozen-name "boundary_probe.boundary_frozen"
+                active-name "boundary_probe.boundary_live"
+                relation-exists? (fn [table]
+                                   (= [["t"]] (rows sink (str "SELECT to_regclass(" (literal table) ") IS NOT NULL"))))]
+            (await! "Boundary tables were not installed" #(every? relation-exists? [active-name frozen-name]))
+            (let [active-ids (ids sink active-name)
+                  frozen-ids (ids sink frozen-name)
+                  frozen-rows (contents sink frozen-name)]
+              (sql! source "ALTER PUBLICATION scoped_pub DROP TABLE boundary_probe.boundary_frozen")
+              (await! "Boundary table did not freeze"
+                      #(some (fn [table] (= "boundary_frozen" (:name table)))
+                             (vals (get-in (durable-checkpoint path) [:manifest :unpublished-tables]))))
+              (sql! source "BEGIN"
+                    "ALTER SCHEMA public RENAME TO previous_public"
+                    "ALTER SCHEMA boundary_probe RENAME TO public"
+                    "UPDATE public.boundary_live SET label='in public'"
+                    "COMMIT")
+              (await! "Boundary table did not enter public" #(relation-exists? "public.boundary_live"))
+              (compare-tables! source sink ["public.boundary_live"])
+              (sql! source "BEGIN"
+                    "ALTER SCHEMA public RENAME TO boundary_after"
+                    "ALTER SCHEMA previous_public RENAME TO public"
+                    "UPDATE boundary_after.boundary_live SET label='outside public'"
+                    "COMMIT")
+              (await! "Boundary table did not leave public" #(relation-exists? "boundary_after.boundary_live"))
+              (compare-tables! source sink ["boundary_after.boundary_live" public-table])
+              (sql! source "ALTER SCHEMA boundary_after RENAME TO boundary_renamed")
+              (await! "Named rename after public did not reach the mirror"
+                      #(relation-exists? "boundary_renamed.boundary_live"))
+              (check! (= active-ids (ids sink "boundary_renamed.boundary_live"))
+                      "Public boundary changed the active relation identities" {})
+              (check! (= [frozen-ids frozen-rows] [(ids sink frozen-name) (contents sink frozen-name)])
+                      "Public boundary changed the frozen relation" {}))))
         {:status :passed :schemas 4}
         (finally
           (when @subscriber (mirror/stop! @subscriber))

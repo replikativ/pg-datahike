@@ -555,6 +555,7 @@
                           (get-in from-binding-oids [(first owners) col-name]))))
           valuetype (:db/valueType props)
           cardinality (:db/cardinality props)
+          enum-oid (get-in hints [attr :enum-oid])
           base-oid (when valuetype (pgs/oid-for-valuetype valuetype))
           ;; Native PG array column (Option C): the schema records
           ;; `:pg/type "_T"` on the ident entity. Look it up so the
@@ -572,6 +573,7 @@
         bound-oid bound-oid
         outer-oid outer-oid
         (= "tableoid" (str/lower-case col-name)) types/oid-oid
+        enum-oid enum-oid
         ;; Native PG array column wins over the storage-type fallback.
         pg-name-oid pg-name-oid
         (nil? base-oid) nil
@@ -894,9 +896,7 @@
       :else nil)))
 
 (defn- composite-name->oid
-  "Resolve a named composite type to its persisted OID. Enum values remain
-   text on the wire until pgjdbc's custom-type introspection query is fully
-   supported; their catalog OID is still available through pg_type/pg_enum."
+  "Resolve a named composite type to its persisted OID."
   [type-str db]
   (when (and type-str db)
     (some (fn [{:keys [name oid]}] (when (= name type-str) oid))
@@ -904,8 +904,8 @@
 
 (defn sql-type-name->oid
   "Map a SQL type NAME to its OID: `int` → 23, `character varying` → 1043,
-   `jsonb` → 3802, a composite type declared in this database → its row
-   type. nil when the name resolves to nothing.
+   `jsonb` → 3802, a declared enum or composite → its catalog type OID.
+   Returns nil when the name resolves to nothing.
 
    Uses `types/cast-category` so the set of recognised names stays in one
    place. This is what a CAST target, a function's declared argument and
@@ -959,7 +959,10 @@
      ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
      ;; comprehensive. Without this, `::jsonb` / `::jsonb[]` reported text
      ;; and the binary value mis-decoded.
-     (get types/pg-name->oid type-str))))
+     (get types/pg-name->oid type-str)
+     (let [object (pgs/user-type-object db type-str)]
+       (when (= :enum (:datahike.pg.object/kind object))
+         (:datahike.pg.object/oid object))))))
 
 (defn- cast-oid
   "Map a SQL CAST target type to an OID, wrapping to the array type when

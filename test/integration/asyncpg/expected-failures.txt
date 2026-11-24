@@ -39,7 +39,6 @@ tests/test_codecs.py::TestCodecs::test_composites
 tests/test_codecs.py::TestCodecs::test_composites_in_arrays
 tests/test_codecs.py::TestCodecs::test_custom_codec_binary
 tests/test_codecs.py::TestCodecs::test_custom_codec_composite_tuple
-tests/test_codecs.py::TestCodecs::test_custom_codec_on_enum
 tests/test_codecs.py::TestCodecs::test_custom_codec_on_enum_array
 tests/test_codecs.py::TestCodecs::test_custom_codec_override_text
 # Tuple-codec cases need binary/tuple codec support. Their permanent scratch

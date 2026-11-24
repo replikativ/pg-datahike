@@ -1297,7 +1297,7 @@
     (let [declared (get *declared-param-oids* index)
           declared (when (and declared (pos? declared)) declared)
           actual (or declared expected)]
-      (when (and declared (not (types/assignment-cast-exists? declared expected)))
+      (when (and declared (not (pgs/assignment-cast-exists? *parse-db* declared expected)))
         (throw (ex-info "parameter type cannot be assigned to this target"
                         {:error :datatype-mismatch :sqlstate "42804"})))
       (when-let [previous (.get ^java.util.Map result index)]
