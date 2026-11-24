@@ -309,15 +309,16 @@
          (when name2 (str "_" (subs name2 0 n2)))
          "_" label)))
 
-(defn- choose-constraint-name
-  "PostgreSQL's ChooseConstraintName: name1_name2_label if no other
-   constraint of the table has it, else with the first free number
-   appended to the label (`t_check`, `t_check1`, ...), re-shortened to
-   fit."
-  [taken name1 name2 label]
+(defn available-object-name
+  "Use PostgreSQL's name1_name2_label, adding a number and shortening
+   the components again if a candidate is occupied."
+  [occupied? name1 name2 label]
   (some #(let [n (make-object-name name1 name2 (str label %))]
-           (when-not (contains? taken n) n))
+           (when-not (occupied? n) n))
         (cons "" (iterate inc 1))))
+
+(defn- choose-constraint-name [taken name1 name2 label]
+  (available-object-name #(contains? taken %) name1 name2 label))
 
 (defn generated-constraint-name
   "PostgreSQL's name for a constraint the statement did not name:

@@ -1503,12 +1503,12 @@
   (into {}
         (comp
          (filter :__seq__/identity-generation)
-         (map (fn [{:__seq__/keys [name owned-by-column] :as sequence}]
-                [(or (when owned-by-column
-                       (:datahike.pg.column/storage-ident
-                        (d/entity db [:datahike.pg.column/address-key owned-by-column])))
-                     name)
-                 sequence])))
+         (keep (fn [{:__seq__/keys [owned-by-column] :as counter}]
+                 (when-let [ident (if owned-by-column
+                                    (:datahike.pg.column/storage-ident
+                                     (d/entity db [:datahike.pg.column/address-key owned-by-column]))
+                                    (sequence/legacy-owned-ident counter))]
+                   [ident counter]))))
         (sequence-entities db)))
 
 (def sequence-backed-catalogs
@@ -2338,8 +2338,7 @@
                                    ;; data still has a stable attrelid.
                                 (Math/abs (.hashCode ^String tname)))
                     pk? (= :db.unique/identity (:unique col))
-                    identity-seq (or (get identity-sequences (:attr col))
-                                     (get identity-sequences (str tname "_" (:name col) "_seq")))
+                    identity-seq (get identity-sequences (:attr col))
                     identity-code (cond
                                     identity-seq
                                     (if (= "ALWAYS"
@@ -2907,8 +2906,7 @@
                        pos       (long (if (zero? idx)
                                          1
                                          (inc (or (:attnum col) idx))))
-                       identity-seq (or (get identity-sequences (:attr col))
-                                        (get identity-sequences (str tname "_" (:name col) "_seq")))
+                       identity-seq (get identity-sequences (:attr col))
                        identity? (or identity-seq
                                      (and (= "db_id" (:name col)) (zero? idx)))
                        identity-generation (or (:__seq__/identity-generation identity-seq)

@@ -38,15 +38,17 @@
   (when-let [eid (id-by-name db name)]
     (d/pull db '[*] eid)))
 
+(defn object-storage-name [object]
+  (or (:datahike.pg.object/storage-name object) (:datahike.pg.object/name object)))
+
 (defn object-by-storage-name [db storage]
   (let [registered (objects/object-by-storage-name db storage)
         object (if (= :sequence (:datahike.pg.object/kind registered))
                  registered
                  (objects/object-by-identity db objects/pg-class-oid objects/public-namespace-oid storage))]
-    (when (= :sequence (:datahike.pg.object/kind object)) object)))
-
-(defn object-storage-name [object]
-  (or (:datahike.pg.object/storage-name object) (:datahike.pg.object/name object)))
+    (when (and (= :sequence (:datahike.pg.object/kind object))
+               (= storage (object-storage-name object)))
+      object)))
 
 (defn counter-reference
   "Return a supported default reference to a known counter."
@@ -62,15 +64,15 @@
      :namespace-oid namespace-oid}))
 
 (defn stored-counter-reference
-  "Bind a legacy default that stored the public counter name. Numeric and
-   qualified references already carry their own identity."
+  "Bind an older default that stored an exact physical counter name.
+   A string of digits is a regclass OID, even if a counter has that name."
   [db reference]
   (if (and (string? reference)
-           (re-matches #"[a-z_][a-z0-9_$]*" reference)
+           (not (re-matches #"[0-9]+" reference))
            (id-by-name db reference))
     (if-let [object (object-by-storage-name db reference)]
       (str (:datahike.pg.object/oid object))
-      (str "public." reference))
+      (str "public.\"" (str/replace reference "\"" "\"\"") "\""))
     reference))
 
 (defn reference-storage-name
@@ -125,7 +127,7 @@
            (nil? (:__seq__/owned-by-column legacy)))
       (conj legacy-name))))
 
-(defn addressed-owned-columns
+(defn- addressed-owned-columns
   "Sequence bindings for columns with a persistent catalog address."
   [db table]
   (when (and (contains? (dbi/-schema db) :__seq__/owned-by-column)
@@ -142,6 +144,31 @@
                  [?column :datahike.pg.column/storage-ident ?attr]
                  [(get-else $ ?seq :__seq__/identity-generation "") ?generation]]
                db table))))
+
+(defn legacy-owned-ident [{:__seq__/keys [name owned-by-table owned-by-column]}]
+  (when (and name owned-by-table (nil? owned-by-column))
+    (let [prefix (str owned-by-table "_")
+          end (- (count name) 4)]
+      (when (and (str/starts-with? name prefix) (str/ends-with? name "_seq")
+                 (< (count prefix) end))
+        (keyword owned-by-table (subs name (count prefix) end))))))
+
+(defn owned-columns
+  "Resolve sequence ownership by column address or by a recorded legacy owner."
+  [db table]
+  (let [schema (dbi/-schema db)]
+    (when (and (contains? schema :__seq__/owned-by-table)
+               (contains? schema :__seq__/name))
+      (into (or (addressed-owned-columns db table) [])
+            (keep (fn [[eid]]
+                    (let [entity (d/entity db eid)
+                          attr (legacy-owned-ident entity)]
+                      (when (contains? schema attr)
+                        {:col (name attr) :ns (namespace attr) :seq-name (:__seq__/name entity)
+                         :generation (:__seq__/identity-generation entity)}))))
+            (d/q '[:find ?sequence :in $ ?table
+                   :where [?sequence :__seq__/owned-by-table ?table]]
+                 db table)))))
 
 (defn position
   "Return [last_value is_called]. Older stores distinguish the initial

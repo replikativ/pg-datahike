@@ -497,7 +497,10 @@
       (is (= [["9"]] (rows "INSERT INTO public.default_holder DEFAULT VALUES RETURNING id")))
       (d/transact *conn* [[:db/add :default_holder/id :pg/default-kind :expr]
                           [:db/add :default_holder/id :pg/default-value "100 + nextval('ticket')"]])
-      (is (= [["110"]] (rows "INSERT INTO public.default_holder DEFAULT VALUES RETURNING id"))))))
+      (is (= [["110"]] (rows "INSERT INTO public.default_holder DEFAULT VALUES RETURNING id")))
+      (is (nil? (err "CREATE TABLE public.\"Order.Year Draft\" (id serial)")))
+      (d/transact *conn* [[:db/add (keyword "Order.Year Draft" "id") :pg/default-arg "Order.Year Draft_id_seq"]])
+      (is (= [["1"]] (rows "INSERT INTO public.\"Order.Year Draft\" DEFAULT VALUES RETURNING id"))))))
 
 (deftest generated-and-explicit-sequence-defaults-bind-independently
   (doseq [sql ["CREATE SCHEMA billing"
@@ -584,3 +587,44 @@
          (is (nil? (err statement)) statement))
        (is (= [["21"]] (rows "INSERT INTO simple_sink DEFAULT VALUES RETURNING id")))
        (is (= [["24"]] (rows "INSERT INTO compound_sink DEFAULT VALUES RETURNING id")))))))
+
+(deftest generated-counters-respect-unregistered-public-sequences
+  (d/transact *conn*
+              (into (vec ddl/sequence-schema)
+                    [{:__seq__/name "collision_id_seq" :__seq__/value 60
+                      :__seq__/start 60 :__seq__/is-called false}
+                     {:__seq__/name "attached_id_seq" :__seq__/value 70
+                      :__seq__/start 70 :__seq__/is-called false}]))
+  (doseq [sql ["CREATE TABLE collision (id serial)"
+               "CREATE TABLE attached (id int NOT NULL)"
+               "ALTER TABLE attached ALTER id ADD GENERATED ALWAYS AS IDENTITY"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["public.collision_id_seq1" "public.attached_id_seq1"]]
+         (rows "SELECT pg_get_serial_sequence('collision','id'), pg_get_serial_sequence('attached','id')")))
+  (is (= [["2" "2"]]
+         (rows "SELECT count(*), count(DISTINCT oid) FROM pg_class WHERE relname IN ('collision_id_seq', 'collision_id_seq1')")))
+  (is (= [["60" "70"]] (rows "SELECT nextval('collision_id_seq'),nextval('attached_id_seq')")))
+  (is (= [["1"]] (rows "INSERT INTO collision DEFAULT VALUES RETURNING id")))
+  (is (= [["1"]] (rows "INSERT INTO attached DEFAULT VALUES RETURNING id"))))
+
+(deftest scoped-counter-storage-skips-existing-table-keys
+  ;; A namespace uses one OID and the public table and its row type use
+  ;; the next two. The subsequent sequence would start with this key.
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE TABLE public.__dh_pg_seq_16387 (id int)"
+               "CREATE SEQUENCE billing.scoped START 12"
+               "ALTER TABLE public.__dh_pg_seq_16387 SET SCHEMA billing"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["12"]] (rows "SELECT last_value FROM billing.scoped")))
+  (is (= [["1"]] (rows "INSERT INTO billing.__dh_pg_seq_16387 VALUES (1) RETURNING id"))))
+
+(deftest sequence-ownership-does-not-follow-a-matching-name
+  (doseq [sql ["CREATE TABLE a_b (c bigint GENERATED ALWAYS AS IDENTITY)"
+               "CREATE TABLE a (b_c bigint)"]]
+    (is (nil? (err sql)) sql))
+  (is (= [[nil]] (rows "INSERT INTO a DEFAULT VALUES RETURNING b_c")))
+  (is (= [[""]]
+         (rows "SELECT attidentity FROM pg_attribute WHERE attrelid='a'::regclass AND attname='b_c'")))
+  (is (nil? (err "ALTER TABLE a ALTER b_c SET DEFAULT 8")))
+  (is (= [["8"]] (rows "INSERT INTO a DEFAULT VALUES RETURNING b_c")))
+  (is (= [["1"]] (rows "INSERT INTO a_b DEFAULT VALUES RETURNING c"))))

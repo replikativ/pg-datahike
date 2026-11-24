@@ -1809,7 +1809,7 @@
 ;; ----------------------------------------------------------------------------
 ;; Per-schema memoisation for constraint metadata.
 ;;
-;; `read-{column,check,fk}-constraints`, `compute-identity-cols`, and
+;; `read-{column,check,fk}-constraints`, `sequence/owned-columns`, and
 ;; `enrich-schema-with-pg-array-meta` are pure functions of the schema —
 ;; same (schema, table) pair always yields the same result, until DDL
 ;; transacts a change. The CPU profile of a Pagila pg_dump replay
@@ -1847,7 +1847,7 @@
   ;; Identity-keyed LRU (see datahike.pg.cache): WeakHashMap compared
   ;; schema maps with .equals, so two DATABASES with structurally equal
   ;; schemas shared FK/CHECK/NOT-NULL/identity metadata — and
-  ;; compute-identity-cols reads per-database :__seq__/:__inherit__
+  ;; sequence/owned-columns reads per-database :__seq__/:__inherit__
   ;; datoms, so that sharing returned another database's answers.
   (pg-cache/bounded-cache 64))
 
@@ -1908,38 +1908,12 @@
           (.putIfAbsent inner cache-key (if (nil? v) ::nil v))
           v)))))
 
-(defn- compute-identity-cols
-  "Discover local identity columns. Regular INHERITS does not inherit
-   identity generation (PostgreSQL tablecmds.c, MergeAttributes)."
-  [db table-name]
-  (let [prefix (str table-name "_")
-        prefix-length (count prefix)
-        schema (dbi/-schema db)
-        sequences (d/q '[:find ?e ?name :where [?e :__seq__/name ?name]] db)]
-    (into (or (sequence/addressed-owned-columns db table-name) [])
-          (keep (fn [[eid sequence-name]]
-                  (let [suffix (- (count sequence-name) 4)]
-                    (when (and (str/starts-with? sequence-name prefix)
-                               (str/ends-with? sequence-name "_seq")
-                               (< prefix-length suffix))
-                      (let [col (subs sequence-name prefix-length suffix)
-                            sequence (d/entity db eid)]
-                        (when (and (contains? schema (keyword table-name col))
-                                   (= table-name (:__seq__/owned-by-table sequence))
-                                   (nil? (:__seq__/owned-by-column sequence)))
-                          {:col col
-                           :ns table-name
-                           :seq-name sequence-name
-                           :generation (or (:__seq__/identity-generation sequence)
-                                           "BY DEFAULT")}))))))
-          sequences)))
-
 (defn- reject-explicit-always-identities!
   "Reject explicit INSERT values for GENERATED ALWAYS identity columns.
    COPY intentionally does not use this check: PostgreSQL treats COPY like
    OVERRIDING SYSTEM VALUE."
   [tx-data table-name db]
-  (doseq [{:keys [col ns generation]} (compute-identity-cols db table-name)
+  (doseq [{:keys [col ns generation]} (sequence/owned-columns db table-name)
           :when (= "ALWAYS" generation)
           :let [attr (keyword ns col)]
           :when (some #(and (map? %)
@@ -5301,15 +5275,28 @@
                 (:pg/fk-parent-schema datum) (dissoc :pg/fk-parent-schema))))
           tx-data)))
 
+(defn- legacy-public-counter? [db name]
+  (and (sequence-exists? db name)
+       (nil? (sequence/object-by-storage-name db name))))
+
+(defn- generated-sequence-name [db namespace-oid table column reserved]
+  (ddl/available-object-name
+   (fn [name]
+     (or (contains? reserved name)
+         (catalog-objects/object-by-identity db catalog-objects/pg-class-oid namespace-oid name)
+         (and (= catalog-objects/public-namespace-oid namespace-oid)
+              (legacy-public-counter? db name))))
+   table column "seq"))
+
 (defn- fresh-sequence-storage-name [db logical-name oid public?]
-  (if (and public?
-           (not (sequence-exists? db logical-name))
-           (not (catalog-objects/object-by-storage-name db logical-name)))
-    logical-name
-    (let [base (str "__dh_pg_seq_" oid)]
-      (first (remove #(or (sequence-exists? db %)
-                          (catalog-objects/object-by-storage-name db %))
-                     (cons base (map #(str base "_" %) (range 1 Long/MAX_VALUE))))))))
+  (let [available? (fn [name]
+                     (and (not (sequence-exists? db name))
+                          (not (contains? (dbi/-schema db) (pgs/row-marker-attr name)))
+                          (not (catalog-objects/object-by-storage-name db name))))]
+    (if (and public? (available? logical-name))
+      logical-name
+      (let [base (str "__dh_pg_seq_" oid)]
+        (first (filter available? (cons base (map #(str base "_" %) (range 1 Long/MAX_VALUE)))))))))
 
 (defn- bind-sequence-default [db datum]
   (let [resolve-reference
@@ -5340,20 +5327,14 @@
         {:keys [oids tx-data]}
         (catalog-objects/reserve-user-oids-tx db (+ 2 (count generated-columns)))
         [oid row-type-oid & sequence-oids] oids
-        occupied-relations (when (seq generated-columns)
-                             (into #{table-name}
-                                   (keep (fn [object]
-                                           (when (= catalog-objects/pg-class-oid (:datahike.pg.object/class-oid object))
-                                             (:datahike.pg.object/name object))))
-                                   (catalog-objects/objects-in-namespace db namespace-oid)))
         sequence-addresses
         (first (reduce (fn [[addresses occupied] [column sequence-oid]]
-                         (let [name (ddl/generated-constraint-name occupied table-name column "seq")
+                         (let [name (generated-sequence-name db namespace-oid table-name column occupied)
                                counter {:column column :name name :oid sequence-oid
                                         :storage (fresh-sequence-storage-name db name sequence-oid public?)}]
                            [(assoc addresses (str table-name "_" column "_seq") counter)
                             (conj occupied name)]))
-                       [{} occupied-relations] (map vector generated-columns sequence-oids)))
+                       [{} #{table-name}] (map vector generated-columns sequence-oids)))
         sequence-object-data
         (into []
               (mapcat (fn [{:keys [name oid storage]}]
@@ -5528,7 +5509,8 @@
              namespace-oid table-name)
             name-conflict? (or existing-relation existing-type
                                (and (= namespace-oid catalog-objects/public-namespace-oid)
-                                    (table-exists? current-db table-name)))]
+                                    (or (table-exists? current-db table-name)
+                                        (legacy-public-counter? current-db table-name))))]
         (cond
       ;; CREATE TABLE on an existing table. PG raises 42P07
       ;; duplicate_table; IF NOT EXISTS downgrades it to a notice +
@@ -10056,7 +10038,7 @@
   "TRUNCATE … RESTART IDENTITY resets each owned sequence to its START."
   [db tables]
   (when (get (dbi/-schema db) :__seq__/name)
-    (let [names (distinct (mapcat #(map :seq-name (compute-identity-cols db %)) tables))]
+    (let [names (distinct (mapcat #(map :seq-name (sequence/owned-columns db %)) tables))]
       (into (sequence/install-called-attribute db)
             (mapcat (fn [seq-name]
                       (let [ref [:__seq__/name seq-name]
@@ -10112,7 +10094,7 @@
                                 (assoc :speculative-db (:db-after spec-report)))))
           (when (:restart-identity? parsed)
             (doseq [table tables
-                    {:keys [seq-name]} (compute-identity-cols (:speculative-db @tx-state) table)]
+                    {:keys [seq-name]} (sequence/owned-columns (:speculative-db @tx-state) table)]
               (bump-local-sequence-generation! tx-state seq-name)))
           (doseq [t tables]
             (fire-statement-triggers! (:speculative-db @tx-state) t :truncate :after))
@@ -12617,11 +12599,9 @@
     column))
 
 (defn- identity-storage-column? [db table attr]
-  (when (get (dbi/-schema db) :__seq__/identity-generation)
-    (or (:__seq__/identity-generation
-         (d/entity db [:__seq__/name (str table "_" (name attr) "_seq")]))
-        (some #(and (= (name attr) (:col %)) (seq (:generation %)))
-              (sequence/addressed-owned-columns db table)))))
+  (some (fn [{:keys [col ns generation]}]
+          (and (seq generation) (= attr (keyword ns col))))
+        (sequence/owned-columns db table)))
 
 (defn- identity-sequence-name [db namespace-oid table column options]
   (let [names (keep (fn [[key value]] (when (= :sequence-name key) value)) options)]
@@ -12640,12 +12620,7 @@
               (throw (ex-info "sequence must be in same schema as table it is linked to"
                               {:sqlstate "55000"})))))
         (peek reference))
-      (ddl/generated-constraint-name
-       (keep (fn [object]
-               (when (= catalog-objects/pg-class-oid (:datahike.pg.object/class-oid object))
-                 (:datahike.pg.object/name object)))
-             (catalog-objects/objects-in-namespace db namespace-oid))
-       table column "seq"))))
+      (generated-sequence-name db namespace-oid table column #{}))))
 
 (defn- exec-add-column-identity
   [{:keys [conn tx-state session-id] :as ctx}
@@ -12692,8 +12667,7 @@
                     (throw (errors/pg-error :syntax-error
                                             {:detail "conflicting or redundant options"})))
                 _ (when (or (catalog-objects/object-by-identity db catalog-objects/pg-class-oid namespace-oid name)
-                            (and public? (sequence-exists? db name)
-                                 (nil? (catalog-objects/object-by-storage-name db name))))
+                            (and public? (legacy-public-counter? db name)))
                     (throw (ex-info (str "relation \"" name "\" already exists") {:sqlstate "42P07"})))
                 {oid :oid allocation :tx-data} (catalog-objects/reserve-user-oid-tx db)
                 storage (fresh-sequence-storage-name db name oid public?)

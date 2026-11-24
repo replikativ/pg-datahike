@@ -2554,10 +2554,11 @@
   "Expose a sequence's current position as a one-row relation. log_cnt
    describes PostgreSQL WAL preallocation and is zero in this store."
   [^Table tbl db]
-  (let [tname (unquote-ident (.getName tbl))
-        talias (when-let [a (.getAlias tbl)]
-                 (unquote-ident (str/trim (.getName ^Alias a))))]
-    (when-let [eid (sequence/id-by-name db tname)]
+  (let [tname (ctx/inference-table-name tbl)
+        talias (or (when-let [a (.getAlias tbl)]
+                     (unquote-ident (str/trim (.getName ^Alias a))))
+                   (unquote-ident (.getName tbl)))]
+    (when-let [eid (when tname (sequence/id-by-name db tname))]
       (if params/*analysis-only?*
         (materialize-output-schema!
          db tname talias [{:name "last_value" :oid types/oid-int8}
@@ -2578,7 +2579,7 @@
                          {:db/ident marker :db/valueType :db.type/boolean
                           :db/cardinality :db.cardinality/one}])
               result (virtual-db/with-data spec-db [{value-attr value log-attr 0 called-attr called? marker true}])]
-          {:db result :schema (:schema result) :name tname :alias (or talias tname)})))))
+          {:db result :schema (:schema result) :name tname :alias talias})))))
 
 (defn materialize-derived-select!
   "Given a ParenthesedSelect in FROM/JOIN position, return an enriched db
@@ -9935,53 +9936,22 @@
       results)))
 
 (defn insert-sequence-defaults
-  "Return storage-attr -> sequence-name for INSERT defaults which must reserve
-   a value before the surrounding statement transaction runs. Identity
-   sequences are distinguished by their durable generation metadata, so a
-   user-created sequence which merely follows the table_column_seq naming
-   convention is not treated as an identity."
+  "Return the sequence references for defaults that reserve before a write."
   [db table-name]
   (if-not (and db (get (:schema db) :__seq__/name))
     {}
-    (let [schema (:schema db)
-          tables [table-name]
-          nextval-defaults
+    (let [nextval-defaults
           (into {}
                 (keep (fn [{:keys [attr default]}]
                         (let [[kind _ sequence-name] default]
                           (when (= :nextval kind)
                             [attr sequence-name]))))
-                (row-constraints/column-specs db table-name))
-          identity-sequences
-          (if (get schema :__seq__/identity-generation)
-            (d/q '{:find [?name]
-                   :where [[?sequence :__seq__/name ?name]
-                           [?sequence :__seq__/identity-generation ?generation]]}
-                 db)
-            [])
-          identity-defaults
-          (into {}
-                (mapcat
-                 (fn [table]
-                   (let [prefix (str table "_")]
-                     (keep (fn [[sequence-name]]
-                             (let [suffix-start (- (count sequence-name) 4)]
-                               (when (and (str/starts-with? sequence-name prefix)
-                                          (str/ends-with? sequence-name "_seq")
-                                          (< (count prefix) suffix-start))
-                                 (let [attr (keyword
-                                             table
-                                             (subs sequence-name
-                                                   (count prefix) suffix-start))]
-                                   (when (get schema attr)
-                                     [attr sequence-name])))))
-                           identity-sequences)))
-                 tables))]
-      (into (merge identity-defaults nextval-defaults)
+                (row-constraints/column-specs db table-name))]
+      (into nextval-defaults
             (keep (fn [{:keys [col ns seq-name generation]}]
                     (when (seq generation)
-                      [(keyword ns col) (sequence/counter-reference db seq-name)])))
-            (sequence/addressed-owned-columns db table-name)))))
+                      [(keyword ns col) (sequence/stored-counter-reference db seq-name)])))
+            (sequence/owned-columns db table-name)))))
 
 (defn- populate-insert-sequence-defaults [attrs defaults]
   (reduce-kv (fn [row attr sequence-name]
