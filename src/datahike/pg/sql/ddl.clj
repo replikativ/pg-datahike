@@ -468,6 +468,16 @@
             (distinct @references))
     nil))
 
+(defn stored-column-default [db kind value argument]
+  (when kind
+    (let [resolve-reference (partial sequence/stored-counter-reference db)]
+      (case kind
+        :nextval [kind value (resolve-reference (or argument value))]
+        :expr [kind (if (and (string? value) (re-find #"(?i)\bnextval\s*\(" value))
+                      (rewrite-default-sequence-references value resolve-reference)
+                      value) argument]
+        [kind value argument]))))
+
 (defn- reject-default-expression! [kind]
   (let [[error message]
         (case kind

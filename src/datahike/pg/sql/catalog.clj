@@ -1824,9 +1824,9 @@
 
 (defn- sequence-name [db sequences spelling]
   (when (string? spelling)
-    (let [storage (or (when (contains? sequences spelling) spelling)
-                      (binding [regoid/*search-path* ["public"]]
-                        (sequence/reference-storage-name db spelling)))]
+    (let [reference (sequence/stored-counter-reference db spelling)
+          storage (binding [regoid/*search-path* ["public"]]
+                    (sequence/reference-storage-name db reference))]
       (when (contains? sequences storage) storage))))
 
 (defn- sequence-column-defaults [db tables sequences]
@@ -2086,11 +2086,12 @@
       ;; walks pg_class (issue #26).
           (into
            (mapv (fn [s]
-                   (let [nm (:__seq__/name s)]
-                     {:pg_class/oid
-                      (sequence-oid cte-db nm)
-                      :pg_class/relname (catalog-objects/public-relation-name cte-db nm)
-                      :pg_class/relnamespace (storage-schema-oid cte-db nm)
+                   (let [nm (:__seq__/name s)
+                         {:keys [name namespace-oid]} (sequence/catalog-name cte-db nm)]
+                     {:pg_class/oid (sequence-oid cte-db nm)
+                      :pg_class/relname name
+                      :pg_class/relnamespace namespace-oid
+                      :pg_class/relpersistence (get s :__seq__/persistence "p")
                       :pg_class/relispartition false
                       :pg_class/relkind "S"
                       :pg_class/reltype 0
@@ -2972,22 +2973,23 @@
             (pgs/table-names user-schema cte-db)))
     "pg_sequences"
     (mapv (fn [s]
-            (cond-> {:pg_sequences/schemaname (storage-schema-name cte-db (:__seq__/name s))
-                     :pg_sequences/sequencename (catalog-objects/public-relation-name cte-db (:__seq__/name s))
-                     :pg_sequences/sequenceowner "datahike"
-                     :pg_sequences/data_type (:__seq__/type s)
-                     :pg_sequences/start_value (:__seq__/start s)
-                     :pg_sequences/min_value (:__seq__/minvalue s)
-                     :pg_sequences/max_value (:__seq__/maxvalue s)
-                     :pg_sequences/increment_by (:__seq__/increment s)
-                     :pg_sequences/cycle (:__seq__/cycle s)
-                     :pg_sequences/cache_size (:__seq__/cache s)
-                     (pgs/row-marker-attr "pg_sequences") true}
+            (let [{:keys [schema name]} (sequence/catalog-name cte-db (:__seq__/name s))]
+              (cond-> {:pg_sequences/schemaname schema
+                       :pg_sequences/sequencename name
+                       :pg_sequences/sequenceowner "datahike"
+                       :pg_sequences/data_type (:__seq__/type s)
+                       :pg_sequences/start_value (:__seq__/start s)
+                       :pg_sequences/min_value (:__seq__/minvalue s)
+                       :pg_sequences/max_value (:__seq__/maxvalue s)
+                       :pg_sequences/increment_by (:__seq__/increment s)
+                       :pg_sequences/cycle (:__seq__/cycle s)
+                       :pg_sequences/cache_size (:__seq__/cache s)
+                       (pgs/row-marker-attr "pg_sequences") true}
               ;; Omit rather than store nil — an absent attribute is how
               ;; this layer spells SQL NULL, and last_value is NULL until
               ;; the sequence has been advanced.
-              (sequence-last-value s)
-              (assoc :pg_sequences/last_value (sequence-last-value s))))
+                (sequence-last-value s)
+                (assoc :pg_sequences/last_value (sequence-last-value s)))))
           (sequence-entities cte-db))
     "information_schema_sequences"
     ;; Same source as pg_sequences. This used to hardcode
@@ -2996,14 +2998,15 @@
     ;; (issue #21) — `CREATE SEQUENCE s START 5 MAXVALUE 100` reported
     ;; start 1, max 2^63-1.
     (mapv (fn [s]
-            {:information_schema_sequences/sequence_catalog "datahike"
-             :information_schema_sequences/sequence_schema (storage-schema-name cte-db (:__seq__/name s))
-             :information_schema_sequences/sequence_name (catalog-objects/public-relation-name cte-db (:__seq__/name s))
-             :information_schema_sequences/start_value (str (:__seq__/start s))
-             :information_schema_sequences/minimum_value (str (:__seq__/minvalue s))
-             :information_schema_sequences/maximum_value (str (:__seq__/maxvalue s))
-             :information_schema_sequences/increment (str (:__seq__/increment s))
-             (pgs/row-marker-attr "information_schema_sequences") true})
+            (let [{:keys [schema name]} (sequence/catalog-name cte-db (:__seq__/name s))]
+              {:information_schema_sequences/sequence_catalog "datahike"
+               :information_schema_sequences/sequence_schema schema
+               :information_schema_sequences/sequence_name name
+               :information_schema_sequences/start_value (str (:__seq__/start s))
+               :information_schema_sequences/minimum_value (str (:__seq__/minvalue s))
+               :information_schema_sequences/maximum_value (str (:__seq__/maxvalue s))
+               :information_schema_sequences/increment (str (:__seq__/increment s))
+               (pgs/row-marker-attr "information_schema_sequences") true}))
           (sequence-entities cte-db))
     "pg_indexes"
     (let [names (catalog-objects/table-name-overrides cte-db)

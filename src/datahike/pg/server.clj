@@ -1925,6 +1925,7 @@
                       (let [col (subs sequence-name prefix-length suffix)
                             sequence (d/entity db eid)]
                         (when (and (contains? schema (keyword table-name col))
+                                   (= table-name (:__seq__/owned-by-table sequence))
                                    (nil? (:__seq__/owned-by-column sequence)))
                           {:col col
                            :ns table-name
@@ -2379,7 +2380,7 @@
                                         :where [[?e :db/ident ?i]
                                                 [?e :pg/default-arg ?a]]}
                                       db ident))]
-                  [ident [dk dv da]])))
+                  [ident (ddl/stored-column-default db dk dv da)])))
         not-null-idents (reduce disj not-null-idents hidden-idents)
         ident->default (apply dissoc ident->default hidden-idents)
         all-idents (into not-null-idents (keys ident->default))]
@@ -5241,9 +5242,13 @@
   (let [schema (dbi/-schema db)]
     (if (or (and (not sql-ctx/*physical-table-names?*)
                  (not= namespace-oid catalog-objects/public-namespace-oid))
-            (contains? schema (pgs/row-marker-attr table)))
+            (contains? schema (pgs/row-marker-attr table))
+            (sequence-exists? db table)
+            (catalog-objects/object-by-storage-name db table))
       (let [occupied (into #{} (keep #(when (keyword? %) (namespace %))) (keys schema))]
-        (first (remove occupied
+        (first (remove #(or (contains? occupied %)
+                            (sequence-exists? db %)
+                            (catalog-objects/object-by-storage-name db %))
                        (cons (str "__dh_pg_table_" oid)
                              (map #(str "__dh_pg_table_" oid "_" %) (range 1 Long/MAX_VALUE))))))
       table)))
@@ -5297,7 +5302,9 @@
           tx-data)))
 
 (defn- fresh-sequence-storage-name [db logical-name oid public?]
-  (if (and public? (not (sequence-exists? db logical-name)))
+  (if (and public?
+           (not (sequence-exists? db logical-name))
+           (not (catalog-objects/object-by-storage-name db logical-name)))
     logical-name
     (let [base (str "__dh_pg_seq_" oid)]
       (first (remove #(or (sequence-exists? db %)
@@ -5329,29 +5336,55 @@
         _ (when (and (not public?) (seq (:inherits parsed)))
             (throw (errors/pg-error :feature-not-supported
                                     {:feature "inheritance in non-public schemas"})))
-        sequence-names (vec (distinct (keep #(when (map? %) (:__seq__/name %))
-                                            raw-ddl-data)))
+        generated-columns (:identity-cols parsed)
         {:keys [oids tx-data]}
-        (catalog-objects/reserve-user-oids-tx db (+ 2 (count sequence-names)))
+        (catalog-objects/reserve-user-oids-tx db (+ 2 (count generated-columns)))
         [oid row-type-oid & sequence-oids] oids
-        sequence-addresses (into {}
-                                 (map (fn [name sequence-oid]
-                                        [name {:oid sequence-oid
-                                               :storage (fresh-sequence-storage-name
-                                                         db name sequence-oid public?)}])
-                                      sequence-names sequence-oids))
+        occupied-relations (when (seq generated-columns)
+                             (into #{table-name}
+                                   (keep (fn [object]
+                                           (when (= catalog-objects/pg-class-oid (:datahike.pg.object/class-oid object))
+                                             (:datahike.pg.object/name object))))
+                                   (catalog-objects/objects-in-namespace db namespace-oid)))
+        sequence-addresses
+        (first (reduce (fn [[addresses occupied] [column sequence-oid]]
+                         (let [name (ddl/generated-constraint-name occupied table-name column "seq")
+                               counter {:column column :name name :oid sequence-oid
+                                        :storage (fresh-sequence-storage-name db name sequence-oid public?)}]
+                           [(assoc addresses (str table-name "_" column "_seq") counter)
+                            (conj occupied name)]))
+                       [{} occupied-relations] (map vector generated-columns sequence-oids)))
+        sequence-object-data
+        (into []
+              (mapcat (fn [{:keys [name oid storage]}]
+                        (catalog-objects/create-object-tx
+                         db {:class-oid catalog-objects/pg-class-oid
+                             :oid oid :kind :sequence :name name
+                             :storage-name (when (not= name storage) storage)
+                             :namespace-oid namespace-oid})))
+              (vals sequence-addresses))
         storage (new-table-storage-name db table-name oid namespace-oid)
         storage-ddl-data (table-storage-tx-data db raw-ddl-data table-name storage namespace-oid)
         marker (pgs/row-marker-attr storage)
+        column-counters (into {} (map (juxt #(keyword storage (:column %)) identity)) (vals sequence-addresses))
+        explicit-sequence-defaults?
+        (some (fn [datum]
+                (and (not (contains? column-counters (:db/ident datum)))
+                     (seq (ddl/default-sequence-references (:pg/default-kind datum)
+                                                           (:pg/default-value datum)
+                                                           (:pg/default-arg datum)))))
+              storage-ddl-data)
+        default-db (if (and (seq sequence-object-data) explicit-sequence-defaults?)
+                     (:db-after (dc/with db sequence-object-data))
+                     db)
         ddl-data (mapv (fn [datum]
                          (let [name (:__seq__/name datum)
-                               generated (when (= :nextval (:pg/default-kind datum))
-                                           (get sequence-addresses (:pg/default-arg datum)))]
+                               generated (get column-counters (:db/ident datum))]
                            (cond
                              (= marker (:db/ident datum)) (assoc datum :pg/table-oid oid)
                              name (assoc datum :__seq__/name (get-in sequence-addresses [name :storage]))
                              generated (assoc datum :pg/default-arg (str (:oid generated)))
-                             :else (bind-sequence-default db datum))))
+                             :else (bind-sequence-default default-db datum))))
                        storage-ddl-data)
         ddl-by-ident (into {}
                            (keep (fn [datum]
@@ -5369,15 +5402,6 @@
                        db {:class-oid catalog-objects/pg-type-oid
                            :oid row-type-oid :kind :row-type :name table-name
                            :namespace-oid namespace-oid})
-        sequence-object-data
-        (mapcat (fn [name]
-                  (let [{:keys [oid storage]} (get sequence-addresses name)]
-                    (catalog-objects/create-object-tx
-                     db {:class-oid catalog-objects/pg-class-oid
-                         :oid oid :kind :sequence :name name
-                         :storage-name (when (not= name storage) storage)
-                         :namespace-oid namespace-oid})))
-                sequence-names)
         local-names (vec (:column-order parsed))
         local-name-set (set local-names)
         ;; PostgreSQL walks the INHERITS list in order and MERGES columns
@@ -5448,20 +5472,16 @@
         (catalog-objects/create-columns-tx
          oid (map-indexed #(assoc %2 :attnum (inc %1)) effective-columns))
         sequence-ownership
-        (when (and (seq sequence-names)
-                   (or (not= table-name storage)
-                       (some (fn [[name {:keys [storage]}]] (not= name storage)) sequence-addresses)))
-          (let [seq-columns (set (:identity-cols parsed))]
-            (into (cond-> []
-                    (not (contains? (dbi/-schema db) :__seq__/owned-by-column))
-                    (conj sequence/ownership-attribute))
-                  (keep-indexed
-                   (fn [idx {:keys [name]}]
-                     (when (contains? seq-columns name)
-                       (let [counter (get-in sequence-addresses [(str table-name "_" name "_seq") :storage])]
-                         [:db/add [:__seq__/name counter] :__seq__/owned-by-column
-                          (catalog-objects/column-address-key oid (inc idx))]))))
-                  effective-columns)))
+        (when (seq column-counters)
+          (into (cond-> []
+                  (not (contains? (dbi/-schema db) :__seq__/owned-by-column))
+                  (conj sequence/ownership-attribute))
+                (keep-indexed
+                 (fn [idx {:keys [storage-ident]}]
+                   (when-let [counter (:storage (get column-counters storage-ident))]
+                     [:db/add [:__seq__/name counter] :__seq__/owned-by-column
+                      (catalog-objects/column-address-key oid (inc idx))])))
+                effective-columns))
         foreign-key? #(and (map? %) (contains? % :pg/fk-parent-table))
         has-foreign-keys? (some foreign-key? ddl-data)
         ddl-data
@@ -5486,7 +5506,8 @@
                       (concat ddl-data object-data row-type-data sequence-object-data
                               column-data sequence-ownership))]
     (cond-> tx-data
-      has-foreign-keys? (guard-catalog-tx (catalog-basis/capture db)))))
+      (or has-foreign-keys? explicit-sequence-defaults?)
+      (guard-catalog-tx (catalog-basis/capture db)))))
 
 (defn- execute-ddl-create [conn parsed tx-state session-id]
   (let [table-name (:table-name parsed)
@@ -5507,18 +5528,7 @@
              namespace-oid table-name)
             name-conflict? (or existing-relation existing-type
                                (and (= namespace-oid catalog-objects/public-namespace-oid)
-                                    (table-exists? current-db table-name)))
-            sequence-conflict
-            (when-not name-conflict?
-              (some (fn [column]
-                      (let [sequence-name (str table-name "_" column "_seq")]
-                        (when (or (catalog-objects/object-by-identity
-                                   current-db catalog-objects/pg-class-oid namespace-oid sequence-name)
-                                  (and (= namespace-oid catalog-objects/public-namespace-oid)
-                                       (sequence-exists? current-db sequence-name)
-                                       (nil? (catalog-objects/object-by-storage-name current-db sequence-name))))
-                          sequence-name)))
-                    (:identity-cols parsed)))]
+                                    (table-exists? current-db table-name)))]
         (cond
       ;; CREATE TABLE on an existing table. PG raises 42P07
       ;; duplicate_table; IF NOT EXISTS downgrades it to a notice +
@@ -5544,20 +5554,6 @@
           (do (params/notice! "NOTICE" (str "relation \"" table-name "\" already exists, skipping"))
               [(empty-result (or (:create-tag parsed)
                                  (if (:ctas? parsed) "CREATE TABLE AS" "CREATE TABLE"))) false])
-
-          ;; The current identity lowering uses PostgreSQL's conventional
-          ;; table_column_seq name directly.  Until it allocates a numbered
-          ;; suffix like PostgreSQL, reject a collision rather than letting
-          ;; Datahike's unique-identity upsert adopt an independent sequence
-          ;; and attach destructive table ownership to it.
-          sequence-conflict
-          [(classified-error ""
-                             (ex-info (str "relation \"" sequence-conflict
-                                           "\" already exists")
-                                      {:sqlstate "42P07"
-                                       :table sequence-conflict
-                                       :constraint sequence-conflict}))
-           false]
 
           (:in-tx? @tx-state)
           [(execute-ddl-in-tx tx-state
@@ -6244,7 +6240,7 @@
         (update :insert-candidates #(mapv coerce-entity %))))
     parsed))
 
-(declare nextval! nextval-for-tx! restore-local-sequence-reservations!)
+(declare session-nextval! restore-local-sequence-reservations!)
 
 (defn- resolve-nextval-markers
   "Sibling pass to `resolve-param-refs`: walk `parsed`'s tx-data /
@@ -6258,9 +6254,9 @@
    live CAS-retry path.  A sequence created by the current transaction is not
    globally addressable yet, so its reservations stay with that sequence
    generation and are committed atomically with its creation."
-  [parsed conn tx-state]
-  (let [resolver #(nextval-for-tx! conn tx-state %)
-        resolve  #(params/resolve-nextvals! % resolver)]
+  [parsed conn tx-state session-state]
+  (let [resolver (partial session-nextval! conn tx-state session-state)
+        resolve #(params/resolve-nextvals! % resolver)]
     (cond-> parsed
       (contains? parsed :in-args)     (update :in-args resolve)
       (contains? parsed :tx-data)     (update :tx-data resolve)
@@ -7735,26 +7731,23 @@
   100)
 
 (defn- sequence-reference-name [db spelling]
-  (or (sequence/reference-storage-name db spelling)
+  (or (sequence/reference-storage-name db (if (integer? spelling) (str spelling) spelling))
       (throw (ex-info "sequence does not exist"
                       {:error :undefined-sequence :sequence spelling}))))
 
 (defn- sequence-descriptor [db seq-name]
   (when (and (string? seq-name) (get (dbi/-schema db) :__seq__/name))
-    (let [entity (or (sequence/entity-by-name db seq-name)
-                     (some->> (sequence/reference-storage-name db seq-name)
-                              (sequence/entity-by-name db)))]
-      (when entity
-        (let [increment (get entity :__seq__/increment 1)]
-          {:eid (:db/id entity)
-           :name (:__seq__/name entity)
-           :increment increment
-           :stored-value (:__seq__/value entity)
-           :stored-called? (:__seq__/is-called entity)
-           :position (sequence/position entity)
-           :maximum (get entity :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
-           :minimum (get entity :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
-           :cycle? (get entity :__seq__/cycle false)})))))
+    (when-let [entity (sequence/entity-by-name db seq-name)]
+      (let [increment (get entity :__seq__/increment 1)]
+        {:eid (:db/id entity)
+         :name (:__seq__/name entity)
+         :increment increment
+         :stored-value (:__seq__/value entity)
+         :stored-called? (:__seq__/is-called entity)
+         :position (sequence/position entity)
+         :maximum (get entity :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
+         :minimum (get entity :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
+         :cycle? (get entity :__seq__/cycle false)}))))
 
 (defn- advance-sequence-value
   [{:keys [position increment maximum minimum cycle?]} seq-name]
@@ -7775,7 +7768,7 @@
                                 (if ascending? maximum minimum) ")")})))))))
 
 (defn nextval!
-  "Reserve a committed sequence value outside the surrounding SQL transaction.
+  "Reserve a value by physical sequence name outside the SQL transaction.
    CAS both fields because SETVAL can change is_called at the same value.
    Return the reserved value directly since batched writer reports can
    share the batch's final database."
@@ -9700,7 +9693,7 @@
 
 (defn- exec-insert
   [ctx parsed]
-  (let [{:keys [conn tx-state batch-state]} ctx]
+  (let [{:keys [conn tx-state session-state]} ctx]
     (cond
       (:in-tx? @tx-state)
       (try
@@ -9708,8 +9701,7 @@
               spec-db (:speculative-db initial-state)
               source? (contains? parsed :insert-source)
               call-seen (java.util.IdentityHashMap.)
-              nextval-resolver (fn [sequence-name]
-                                 (nextval-for-tx! conn tx-state sequence-name))
+              nextval-resolver (partial session-nextval! conn tx-state session-state)
               resolver #(params/resolve-nextvals! % nextval-resolver nil call-seen)
               source-db (or (:enriched-db parsed)
                             (get-in parsed [:insert-source :source :enriched-db])
@@ -9843,8 +9835,7 @@
       (let [source? (contains? parsed :insert-source)
             db (d/db conn)
             call-seen (java.util.IdentityHashMap.)
-            nextval-resolver (fn [sequence-name]
-                               (nextval-for-tx! conn tx-state sequence-name))
+            nextval-resolver (partial session-nextval! conn tx-state session-state)
             resolver #(params/resolve-nextvals! % nextval-resolver nil call-seen)
             source-db (or (:enriched-db parsed)
                           (get-in parsed [:insert-source :source :enriched-db])
@@ -11132,7 +11123,7 @@
       (exec-ddl-create ctx result-plan))))
 
 (defn- prepared-ctas-output
-  [{:keys [schema db temp-tables session-id conn tx-state] :as ctx} source values]
+  [{:keys [schema db temp-tables session-id conn tx-state session-state] :as ctx} source values]
   (let [bound (into [nil] values)]
     (binding [*cached-bound* bound
               params/*bound-params* values
@@ -11142,7 +11133,7 @@
                      source)
             source (-> source
                        (resolve-param-refs bound)
-                       (resolve-nextval-markers conn tx-state))]
+                       (resolve-nextval-markers conn tx-state session-state))]
         (query-output ctx source)))))
 
 (defn- create-as-execute
@@ -12692,7 +12683,10 @@
           (let [namespace-oid (catalog-objects/object-namespace-oid db relation)
                 public? (= namespace-oid catalog-objects/public-namespace-oid)
                 name (identity-sequence-name db namespace-oid logical-table column seq-opts)
-                opts (remove #(= :sequence-name (first %)) seq-opts)
+                persistence (filter #(#{:logged :unlogged} (first %)) seq-opts)
+                _ (when (> (count persistence) 1)
+                    (throw (errors/pg-error :syntax-error {:detail "conflicting or redundant options"})))
+                opts (remove #(#{:sequence-name :logged :unlogged} (first %)) seq-opts)
                 position (ddl/sequence-params (cons [:as column-type] opts) {})
                 _ (when (:owned-by position)
                     (throw (errors/pg-error :syntax-error
@@ -12707,6 +12701,7 @@
                                        :__seq__/identity-generation generation
                                        :__seq__/owned-by-table table
                                        :__seq__/owned-by-column (:datahike.pg.column/address-key col))
+                          (= :unlogged (ffirst persistence)) (assoc :__seq__/persistence "u")
                           (:restart position) (assoc :__seq__/value (:restart position)))
                 object (catalog-objects/create-object-tx
                         db {:class-oid catalog-objects/pg-class-oid
@@ -12715,7 +12710,8 @@
                             :namespace-oid namespace-oid})
                 data (into (vec allocation)
                            (concat ddl/sequence-schema
-                                   [sequence/identity-generation-attribute sequence/ownership-attribute counter]
+                                   [sequence/identity-generation-attribute sequence/ownership-attribute
+                                    sequence/persistence-attribute counter]
                                    object
                                    (catalog-objects/bump-revision-tx db catalog-objects/pg-class-oid relation-oid)))
                 result (commit-ddl ctx (guard-catalog-tx data (catalog-basis/capture db)) "ALTER TABLE")]
@@ -12774,14 +12770,15 @@
                :pg/default-value (str value)}
         (= kind :nextval) (assoc :pg/default-arg value)))))
 
-(defn- alter-column-default-tx [db table relation-oid {:keys [name default]}]
+(defn- alter-column-default-tx [db table relation-oid {:keys [name default search-path]}]
   (let [action (if default "SET DEFAULT" "DROP DEFAULT")
         column (alterable-column db table relation-oid name action)
         attr (:datahike.pg.column/storage-ident column)
         entity (d/entity db attr)
         eid (:db/id entity)
-        metadata (bind-sequence-default
-                  db (alter-default-metadata default (types/oid->pg-name (:datahike.pg.column/type-oid column)) name))]
+        metadata (binding [regoid/*search-path* search-path]
+                   (bind-sequence-default
+                    db (alter-default-metadata default (types/oid->pg-name (:datahike.pg.column/type-oid column)) name)))]
     (when (or (:pg/generated entity) (identity-storage-column? db table attr))
       (throw (ex-info (str "column \"" name "\" of relation \"" table "\" "
                            (if (:pg/generated entity) "is a generated column" "is an identity column"))
@@ -13476,7 +13473,8 @@
                                      default-ops)
             default-tx (fn [before-rewrite?]
                          (map (fn [change]
-                                [:db.fn/call alter-column-default-tx table relation-oid change])
+                                [:db.fn/call alter-column-default-tx table relation-oid
+                                 (assoc change :search-path regoid/*search-path*)])
                               (get default-groups before-rewrite?)))
             backfill-columns (filterv (fn [{:keys [not-null? default type-object]}]
                                         (or not-null? (some? (:value default))
@@ -13501,6 +13499,9 @@
                       tx-data)
             tx-data (cond-> tx-data
                       (or (seq backfill-columns)
+                          (some (fn [{:keys [default]}]
+                                  (seq (ddl/default-sequence-references (:kind default) (:value default) nil)))
+                                default-ops)
                           (some #(= :add-foreign-key (:op %)) operations))
                       (guard-catalog-tx (catalog-basis/capture db)))]
         (if (seq tx-data)
@@ -14247,7 +14248,8 @@
   "Prepare decoded rows completely in source order, then append the already
    materialized candidates to the bounded speculative executor batch."
   [ctx rows]
-  (let [{:keys [conn copy-state schema tx-state]} ctx
+  (let [{:keys [conn copy-state schema tx-state session-state]} ctx
+        nextval-resolver (partial session-nextval! conn tx-state session-state)
         copy-db (:speculative-db @copy-state)
         schema (stmt/enrich-schema-with-pg-array-meta
                 (or (:schema copy-db) schema) copy-db)
@@ -14306,14 +14308,7 @@
                              :row (inc next-idx)
                              :expected-columns (count columns)
                              :actual-columns (count row)})))
-                resolve-value
-                (fn [value]
-                  (params/resolve-nextvals!
-                   value
-                   (fn [sequence-name]
-                     (if (:in-tx? @tx-state)
-                       (nextval-for-tx! conn tx-state sequence-name)
-                       (nextval! conn sequence-name)))))
+                resolve-value #(params/resolve-nextvals! % nextval-resolver)
                 ;; PostgreSQL processes supplied fields in COPY column-list
                 ;; order. A DEFAULT marker therefore executes at this point,
                 ;; before coercion (or failure) of the next supplied field.
@@ -16032,7 +16027,7 @@
                             ;; first would defeat the dedup and double-bump.
                             parsed (if (= :insert (:type parsed))
                                      parsed
-                                     (resolve-nextval-markers parsed conn tx-state))
+                                     (resolve-nextval-markers parsed conn tx-state session-state))
                             ;; Give a reused INSERT a fresh tempid per
                             ;; execution. parse-sql is LRU-cached and
                             ;; prepared statements are reused, so the cached

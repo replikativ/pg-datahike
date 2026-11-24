@@ -120,12 +120,12 @@
   (is (= "1" (v "SELECT nextval('unowned_pattern_id_seq')"))))
 
 (deftest serial-creation-does-not-adopt-an-existing-same-pattern-sequence
-  (.execute *handler* "CREATE SEQUENCE collision_id_seq")
-  (is (= "relation \"collision_id_seq\" already exists"
-         (err "CREATE TABLE collision (id serial)")))
-  (is (= "1" (v "SELECT nextval('collision_id_seq')")))
-  (is (= "relation \"collision\" does not exist"
-         (err "SELECT * FROM collision"))))
+  (.execute *handler* "CREATE SEQUENCE collision_id_seq START WITH 50")
+  (is (nil? (err "CREATE TABLE collision (id serial)")))
+  (is (= "public.collision_id_seq1" (v "SELECT pg_get_serial_sequence('collision', 'id')")))
+  (is (= "1" (v "INSERT INTO collision DEFAULT VALUES RETURNING id")))
+  (is (nil? (err "DROP TABLE collision")))
+  (is (= "50" (v "SELECT nextval('collision_id_seq')"))))
 
 (deftest savepoint-rollback-preserves-new-sequence-reservations
   (.execute *handler* "BEGIN")

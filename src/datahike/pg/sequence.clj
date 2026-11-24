@@ -17,6 +17,11 @@
    :db/valueType :db.type/string
    :db/cardinality :db.cardinality/one})
 
+(def persistence-attribute
+  {:db/ident :__seq__/persistence
+   :db/valueType :db.type/string
+   :db/cardinality :db.cardinality/one})
+
 (def ownership-attribute
   {:db/ident :__seq__/owned-by-column
    :db/valueType :db.type/string
@@ -48,6 +53,25 @@
   [db storage]
   (let [sequence (object-by-storage-name db storage)]
     (if sequence (str (:datahike.pg.object/oid sequence)) storage)))
+
+(defn catalog-name [db storage]
+  (let [object (object-by-storage-name db storage)
+        namespace-oid (or (objects/object-namespace-oid db object) objects/public-namespace-oid)]
+    {:name (or (:datahike.pg.object/name object) storage)
+     :schema (or (:datahike.pg.object/name (objects/namespace-by-oid db namespace-oid)) "public")
+     :namespace-oid namespace-oid}))
+
+(defn stored-counter-reference
+  "Bind a legacy default that stored the public counter name. Numeric and
+   qualified references already carry their own identity."
+  [db reference]
+  (if (and (string? reference)
+           (re-matches #"[a-z_][a-z0-9_$]*" reference)
+           (id-by-name db reference))
+    (if-let [object (object-by-storage-name db reference)]
+      (str (:datahike.pg.object/oid object))
+      (str "public." reference))
+    reference))
 
 (defn reference-storage-name
   "Resolve a SQL sequence name or numeric regclass value to the counter's name."

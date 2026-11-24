@@ -71,7 +71,8 @@
             [datahike.db.interface :as dbi]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sequence :as sequence]
-            [datahike.pg.sql.catalog :as pcat]))
+            [datahike.pg.sql.catalog :as pcat]
+            [datahike.pg.sql.ddl :as ddl]))
 
 ;; ----------------------------------------------------------------------------
 ;; Schema introspection
@@ -245,9 +246,23 @@
 ;; CREATE TABLE
 ;; ----------------------------------------------------------------------------
 
+(defn- sequence-sql-name [{:keys [schema name]} render-ident]
+  (str (when (not= "public" schema) (str (render-ident schema) "."))
+       (render-ident name)))
+
+(defn- sequence-regclass-name [sequence-name]
+  (sequence-sql-name sequence-name
+                     #(if (re-matches #"[a-z_][a-z0-9_$]*" %) % (quote-ident %))))
+
+(defn- portable-counter-reference [db reference]
+  (some->> (sequence/stored-counter-reference db reference)
+           (sequence/reference-storage-name db)
+           (sequence/catalog-name db)
+           sequence-regclass-name))
+
 (defn- column-clause
   "Render a single column definition for CREATE TABLE."
-  [{:keys [name spec ent] :as col}]
+  [db {:keys [name spec ent] :as col}]
   (let [type-str (vtype->sql-type col)
         unique-id? (= :db.unique/identity (:db/unique spec))
         unique-val? (= :db.unique/value (:db/unique spec))
@@ -267,8 +282,13 @@
                     ;; every `DEFAULT now()` was dropped from the dump.
                     :fn (let [v (:pg/default-value ent)]
                           (if (= "now" v) "now()" v))
-                    :expr (:pg/default-value ent)
-                    :nextval (str "nextval('" (:pg/default-arg ent) "')")
+                    :expr (let [value (:pg/default-value ent)
+                                portable (ddl/rewrite-default-sequence-references
+                                          value (partial portable-counter-reference db))]
+                            (if (= value portable) value (str "(" portable ")")))
+                    :nextval (let [reference (or (:pg/default-arg ent) (:pg/default-value ent))
+                                   rendered (or (portable-counter-reference db reference) reference)]
+                               (str "nextval('" (str/replace rendered "'" "''") "'::regclass)"))
                     nil))]
     (str (quote-ident name)
          " " type-str
@@ -280,11 +300,11 @@
 (defn- emit-create-table
   "Emit a single CREATE TABLE statement (string) without trailing
    constraints — those go in the post-data ALTER TABLE section."
-  [{:keys [table columns]}]
+  [db {:keys [table columns]}]
   (str "CREATE TABLE " (quote-ident table) " (\n"
        (str/join ",\n"
                  (for [col columns]
-                   (str "    " (column-clause col))))
+                   (str "    " (column-clause db col))))
        "\n);"))
 
 ;; ----------------------------------------------------------------------------
@@ -292,15 +312,15 @@
 ;; ----------------------------------------------------------------------------
 
 (defn- emit-create-sequence
-  [{:__seq__/keys [name type increment minvalue maxvalue start cache cycle]}]
-  (str "CREATE SEQUENCE " (quote-ident name)
+  [{:keys [sql-name] :__seq__/keys [type increment minvalue maxvalue start cache cycle]}]
+  (str "CREATE SEQUENCE " (sequence-sql-name sql-name quote-ident)
        " AS " type " INCREMENT BY " increment " MINVALUE " minvalue
        " MAXVALUE " maxvalue " START WITH " start " CACHE " cache
        (when cycle " CYCLE") ";"))
 
-(defn- emit-setval [{:__seq__/keys [name] :as entity}]
+(defn- emit-setval [{:keys [sql-name] :as entity}]
   (let [[value called?] (sequence/position entity)
-        regclass-name (if (re-matches #"[a-z_][a-z0-9_$]*" name) name (quote-ident name))]
+        regclass-name (sequence-regclass-name sql-name)]
     (str "SELECT pg_catalog.setval('" (str/replace regclass-name "'" "''")
          "', " value ", " called? ");")))
 
@@ -559,7 +579,10 @@
          tables (cond->> (collect-tables db)
                   (seq exclude-tables)
                   (remove #(contains? exclude-tables (:table %))))
-         seqs (pcat/sequence-entities db)
+         seqs (mapv (fn [{:__seq__/keys [name] :as entity}]
+                      (assoc entity :sql-name (sequence/catalog-name db name)))
+                    (pcat/sequence-entities db))
+         sequence-schemas (disj (into #{} (map #(get-in % [:sql-name :schema])) seqs) "public")
          fks (collect-fks tables)
          schema? (contains? sections :schema)
          data?   (contains? sections :data)]
@@ -579,15 +602,16 @@
            (when (seq domains)
              (concat [""] (map emit-create-domain domains))))))
 
-      ;; CREATE TABLE
+      ;; Defaults can bind to sequences while CREATE TABLE is running.
       (when schema?
         (concat
+         (map #(str "CREATE SCHEMA IF NOT EXISTS " (quote-ident %) ";") (sort sequence-schemas))
+         (when (seq seqs)
+           (concat [""] (map emit-create-sequence seqs)))
          (mapcat (fn [t]
                    ["" (str "-- Table: " (quote-ident (:table t)))
-                    (emit-create-table t)])
-                 tables)
-         (when (seq seqs)
-           (concat [""] (map emit-create-sequence seqs)))))
+                    (emit-create-table db t)])
+                 tables)))
 
       ;; Data
       (when data?
