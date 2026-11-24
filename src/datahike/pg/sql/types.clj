@@ -210,9 +210,10 @@
         names (regoid/parse-qualified-name (apply str (map :text name-tokens)))
         _ (when (> (count names) 2)
             (throw (ex-info "cross-database type names are not supported" {:sqlstate "0A000"})))
-        modifier (some-> (first rest-tokens) :text str/lower-case)]
-    (when-not (contains? #{nil ";" "cascade" "restrict"} modifier)
-      (throw (ex-info "expected CASCADE or RESTRICT" {:sqlstate "42601"})))
+        suffix (cond-> (vec rest-tokens) (= ";" (:text (last rest-tokens))) pop)
+        modifier (some-> (first suffix) :text str/lower-case)]
+    (when-not (and (<= (count suffix) 1) (contains? #{nil "cascade" "restrict"} modifier))
+      (throw (ex-info "expected CASCADE or RESTRICT at the end of DROP" {:sqlstate "42601"})))
     {:type-name (peek names) :type-schema (when (= 2 (count names)) (first names))
      :if-exists? if-exists? :cascade? (= "cascade" modifier)}))
 

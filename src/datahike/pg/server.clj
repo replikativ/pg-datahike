@@ -11665,6 +11665,27 @@
            [?column :datahike.pg.column/dropped? false]]
          db oid)))
 
+(defn- registered-routine-uses-types? [db oids]
+  (let [oids (into #{} (keep identity) oids)]
+    (when (and (seq oids) (get (dbi/-schema db) :datahike.pg.function/arg-types))
+      ;; Legacy routine signatures store type spellings in the public
+      ;; context. A pre-existing unknown type must not block an unrelated
+      ;; drop, so check the resolvable signature members individually.
+      (binding [regoid/*search-path* ["public"]
+                regoid/*temp-tables* nil]
+        (some (fn [[args result]]
+                (let [{:keys [type columns]} (edn/read-string result)
+                      types (into (edn/read-string args) (keep :type) (cons {:type type} columns))]
+                  (some (fn [type-name]
+                          (try
+                            (contains? oids (regoid/type-oid db type-name))
+                            (catch clojure.lang.ExceptionInfo _ false)))
+                        types)))
+              (d/q '[:find ?args ?result
+                     :where [?routine :datahike.pg.function/arg-types ?args]
+                     [?routine :datahike.pg.function/return-type ?result]]
+                   db))))))
+
 (defn- domain-drop-entry [db name eid]
   (let [object (catalog-objects/object-by-identity
                 db catalog-objects/pg-type-oid catalog-objects/public-namespace-oid name)]
@@ -11716,7 +11737,8 @@
             dependent-columns? (or (when enum-eid
                                      (seq (live-type-dependents db :datahike.pg/enum-of type-name)))
                                    (catalog-type-in-use? db oid)
-                                   (some #(domain-column-dependents? db %) domains))]
+                                   (some #(domain-column-dependents? db %) domains))
+            dependent-routines? (registered-routine-uses-types? db (cons oid (map :oid domains)))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP TYPE")
           (and type-schema (not public-type?)
@@ -11728,7 +11750,10 @@
           (and dependent-columns? cascade?)
           (throw (errors/pg-error :feature-not-supported
                                   {:feature "DROP TYPE CASCADE with dependent columns"}))
-          (and (not cascade?) (or dependent-columns? (seq (get graph oid))))
+          (and dependent-routines? cascade?)
+          (throw (errors/pg-error :feature-not-supported
+                                  {:feature "DROP TYPE CASCADE with dependent routines"}))
+          (and (not cascade?) (or dependent-columns? dependent-routines? (seq (get graph oid))))
           (throw (ex-info (str "cannot drop type " type-name
                                " because other objects depend on it")
                           {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
@@ -11976,12 +12001,16 @@
           (let [{:keys [oid] :as root} (domain-drop-entry db domain-name eid)
                 graph (dependent-domain-graph db)
                 domains (cons root (when cascade? (dependent-domains graph oid)))
-                dependent-columns? (some #(domain-column-dependents? db %) domains)]
+                dependent-columns? (some #(domain-column-dependents? db %) domains)
+                dependent-routines? (registered-routine-uses-types? db (map :oid domains))]
             (cond
               (and cascade? dependent-columns?)
               (throw (errors/pg-error :feature-not-supported
                                       {:feature "DROP DOMAIN CASCADE with dependent columns"}))
-              (and (not cascade?) (or dependent-columns? (seq (get graph oid))))
+              (and cascade? dependent-routines?)
+              (throw (errors/pg-error :feature-not-supported
+                                      {:feature "DROP DOMAIN CASCADE with dependent routines"}))
+              (and (not cascade?) (or dependent-columns? dependent-routines? (seq (get graph oid))))
               (throw (ex-info (str "cannot drop type " domain-name
                                    " because other objects depend on it")
                               {:error :dependent-objects-still-exist :sqlstate "2BP01"}))

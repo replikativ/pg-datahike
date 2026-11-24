@@ -1278,7 +1278,7 @@
                 (merge base {:type :ddl-drop-enum}
                        (user-types/parse-drop-type sql))
                 (catch Throwable e
-                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+                  {:type :error :message (.getMessage e) :sqlstate (or (:sqlstate (ex-data e)) "42601")}))
 
               :drop-domain
               (try

@@ -614,6 +614,39 @@
            (query-rows c (str "SELECT CAST(typbasetype::regtype AS text) FROM pg_type "
                               "WHERE typname = 'pair_domain'"))))))
 
+(deftest dropping-domains-refuses-trailing-syntax-and-dependent-routines
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [sql ["CREATE DOMAIN parent_type AS integer"
+                 "CREATE DOMAIN child_type AS parent_type"
+                 "CREATE FUNCTION child_key(v child_type) RETURNS integer LANGUAGE sql AS 'SELECT v::integer'"
+                 "CREATE FUNCTION child_value() RETURNS child_type LANGUAGE sql AS 'SELECT 1'"]]
+      (exec! c sql))
+    (doseq [[sql state]
+            [["DROP DOMAIN parent_type CASCADE unexpected" "42601"]
+             ["DROP DOMAIN child_type" "2BP01"]
+             ["DROP DOMAIN parent_type CASCADE" "0A000"]]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)))
+    (is (= [[true true]] (query-rows c
+                                     "SELECT to_regtype('child_type') IS NOT NULL, to_regprocedure('child_key(child_type)') IS NOT NULL")))
+    (exec! c "DROP FUNCTION child_key(child_type)")
+    (exec! c "DROP FUNCTION child_value()")
+    (exec! c "DROP DOMAIN parent_type CASCADE")
+    (is (= [[true]] (query-rows c "SELECT to_regtype('child_type') IS NULL")))))
+
+(deftest legacy-domain-bases-ignore-temporary-relations
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN legacy_parent AS integer CHECK (VALUE > 5)")
+    (exec! c "CREATE DOMAIN legacy_child AS legacy_parent")
+    (let [id [:datahike.pg.domain/name "legacy_child"]
+          oid (:datahike.pg.domain/base-oid (d/entity (d/db *conn*) id))]
+      (d/transact *conn* [[:db/retract id :datahike.pg.domain/base-oid oid]]))
+    (exec! c "CREATE TEMP TABLE legacy_parent (v text)")
+    (doseq [[sql state] [["SELECT 2::legacy_child" "23514"]
+                         ["DROP DOMAIN legacy_parent" "2BP01"]]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)))))
+
 (deftest create-domain-bare-alias
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN big AS bigint")

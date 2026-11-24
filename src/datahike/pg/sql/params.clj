@@ -462,7 +462,8 @@
         ;; Old definitions recorded only a name and were stored in public.
         ;; Use the original default path, independent of the caller's path.
         (try
-          (binding [regoid/*search-path* ["public"]]
+          (binding [regoid/*search-path* ["public"]
+                    regoid/*temp-tables* nil]
             (regoid/type-oid db base))
           (catch clojure.lang.ExceptionInfo _ nil)))))
 
