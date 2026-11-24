@@ -196,22 +196,7 @@
         [new-name _] (consume-name toks)]
     {:type-name type-name :new-name new-name}))
 
-(defn parse-drop-type
-  "Parse a single-name `DROP TYPE [IF EXISTS] name [CASCADE|RESTRICT]`."
-  [original-sql]
-  (let [toks (database/tokenize original-sql)
-        toks (skip-kw toks "drop")
-        toks (skip-kw toks "type")
-        if-exists? (and (ident-eq? (first toks) "if")
-                        (ident-eq? (second toks) "exists"))
-        toks (if if-exists? (drop 2 toks) toks)
-        [type-name toks] (consume-name toks)]
-    {:type-name type-name :if-exists? if-exists?
-     :cascade? (ident-eq? (first toks) "cascade")}))
-
-(defn parse-drop-domain
-  "Parse a single-name `DROP DOMAIN [IF EXISTS] name [CASCADE|RESTRICT]`."
-  [original-sql]
+(defn- parse-type-drop [original-sql]
   (let [tokens (drop 2 (classify/tokenize original-sql))
         if-exists? (= ["if" "exists"] (mapv (comp str/lower-case :text) (take 2 tokens)))
         tokens (if if-exists? (drop 2 tokens) tokens)
@@ -221,15 +206,25 @@
             (recur (into parts (take 2 remaining)) (nnext remaining))
             [parts remaining]))
         _ (when-not (every? #(contains? #{:ident :quoted} (:type %)) (take-nth 2 name-tokens))
-            (throw (ex-info "expected domain name" {:sqlstate "42601"})))
+            (throw (ex-info "expected type name" {:sqlstate "42601"})))
         names (regoid/parse-qualified-name (apply str (map :text name-tokens)))
         _ (when (> (count names) 2)
-            (throw (ex-info "cross-database domain names are not supported" {:sqlstate "0A000"})))
+            (throw (ex-info "cross-database type names are not supported" {:sqlstate "0A000"})))
         modifier (some-> (first rest-tokens) :text str/lower-case)]
     (when-not (contains? #{nil ";" "cascade" "restrict"} modifier)
       (throw (ex-info "expected CASCADE or RESTRICT" {:sqlstate "42601"})))
-    {:domain-name (peek names) :domain-schema (when (= 2 (count names)) (first names))
+    {:type-name (peek names) :type-schema (when (= 2 (count names)) (first names))
      :if-exists? if-exists? :cascade? (= "cascade" modifier)}))
+
+(defn parse-drop-type
+  "Parse a single-name DROP TYPE statement."
+  [original-sql]
+  (parse-type-drop original-sql))
+
+(defn parse-drop-domain
+  "Parse a single-name DROP DOMAIN statement."
+  [original-sql]
+  (parse-type-drop original-sql))
 
 ;; ============================================================================
 ;; CREATE TYPE … AS (composite)

@@ -566,6 +566,33 @@
     (is (= [[true true]] (query-rows c (str "SELECT to_regtype('actual_child') IS NULL, "
                                             "to_regtype('builtin_child') IS NOT NULL"))))))
 
+(deftest dropping-a-base-type-keeps-the-domain-catalog-consistent
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [sql ["CREATE TYPE base_pair AS (x int, y int)"
+                 "CREATE DOMAIN pair_domain AS base_pair"
+                 "CREATE DOMAIN leaf_pair AS pair_domain"
+                 "CREATE TABLE keep_pair (v leaf_pair)"
+                 "CREATE SCHEMA unrelated_schema"]]
+      (exec! c sql))
+    (doseq [[sql state]
+            [["DROP TYPE base_pair" "2BP01"]
+             ["DROP TYPE unrelated_schema.base_pair CASCADE" "42704"]
+             ["DROP TYPE base_pair CASCADE" "0A000"]]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)))
+    (is (= [["base_pair"] ["leaf_pair"] ["pair_domain"]]
+           (query-rows c (str "SELECT typname FROM pg_type WHERE typname IN "
+                              "('base_pair', 'pair_domain', 'leaf_pair') ORDER BY typname"))))
+    (exec! c "DROP TABLE keep_pair")
+    (exec! c "DROP TYPE public.base_pair CASCADE")
+    (is (empty? (query-rows c (str "SELECT typname FROM pg_type WHERE typname IN "
+                                   "('base_pair', 'pair_domain', 'leaf_pair')"))))
+    (exec! c "CREATE TYPE base_pair AS (x bigint)")
+    (exec! c "CREATE DOMAIN pair_domain AS base_pair")
+    (is (= [["base_pair"]]
+           (query-rows c (str "SELECT CAST(typbasetype::regtype AS text) FROM pg_type "
+                              "WHERE typname = 'pair_domain'"))))))
+
 (deftest create-domain-bare-alias
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN big AS bigint")
