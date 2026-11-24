@@ -249,8 +249,8 @@
                          :default-id (.getLong row "partition_default")
                          :definition (.getString row "partition_key_definition")})
         relation (when schema
-                   (cond-> {:schema schema :name (.getString row "tablename")
-                            :relation-id (.getLong row "relation_id")}
+                   (cond-> {:schema schema :schema-oid (.getLong row "schema_oid")
+                            :name (.getString row "tablename") :relation-id (.getLong row "relation_id")}
                      (= "f" replica-identity) (assoc :replica-identity \f)
                      identity-index (assoc :replica-identity \i :identity-index identity-index)
                      (pos? parent-id) (assoc :partition-parent parent-id)
@@ -371,7 +371,8 @@
                          "  JOIN pg_catalog.pg_class c ON c.oid = p.oid "
                          "  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace) "
                          "SELECT pub.oid AS publication_oid, pub.pubinsert, pub.pubupdate, pub.pubdelete, pub.pubtruncate, "
-                         "       p.schemaname, p.tablename, c.oid AS relation_id, p.rowfilter IS NOT NULL AS has_filter, "
+                         "       p.schemaname, p.tablename, c.oid AS relation_id, c.relnamespace AS schema_oid, "
+                         "       p.rowfilter IS NOT NULL AS has_filter, "
                          "       c.relkind, c.relpersistence, c.relreplident, c.relispartition, "
                          "       parent.inhparent AS partition_parent, p.partition_leaves, "
                          "       (coalesce(parent.inhdetachpending, false) OR EXISTS "
@@ -1556,12 +1557,57 @@
                         [name [installed definition]])))]
     {:additions additions :removals removals :edits edits}))
 
+(defn- namespace-names [manifest]
+  (into {} (keep (fn [{:keys [schema-oid schema]}]
+                   (when schema-oid [schema-oid schema])))
+        (concat (all-relations manifest) (vals (:unpublished-tables manifest)))))
+
+(defn- namespace-renames [previous current]
+  (let [previous-names (namespace-names previous)]
+    (into {}
+          (keep (fn [[oid new-name]]
+                  (when-let [old-name (get previous-names oid)]
+                    (when (not= old-name new-name)
+                      [oid {:from old-name :to new-name}]))))
+          (namespace-names current))))
+
+(defn- map-manifest-relations [manifest f]
+  (cond-> (update manifest :tables #(mapv f %))
+    (:partition-parents manifest) (update :partition-parents #(mapv f %))
+    (:unpublished-tables manifest) (update :unpublished-tables update-vals f)))
+
+(defn- adopt-namespace-identities [previous current]
+  (let [current-relations (relations-by-id current)
+        identities (into {}
+                         (keep (fn [{:keys [relation-id schema schema-oid]}]
+                                 (let [live (get current-relations relation-id)]
+                                   (when-let [oid (or schema-oid (when (= schema (:schema live)) (:schema-oid live)))]
+                                     [schema oid]))))
+                         (all-relations previous))]
+    ;; An unchanged published relation anchors the namespace for older
+    ;; checkpoints and for previously unpublished relations in that namespace.
+    (map-manifest-relations previous
+                            (fn [{:keys [schema schema-oid] :as table}]
+                              (if-let [oid (and (nil? schema-oid) (get identities schema))]
+                                (assoc table :schema-oid oid)
+                                table)))))
+
+(defn- rename-manifest-namespaces [manifest renames]
+  (if (empty? renames)
+    manifest
+    (map-manifest-relations manifest
+                            (fn [{:keys [schema-oid] :as table}]
+                              (if-let [name (get-in renames [schema-oid :to])]
+                                (assoc table :schema name)
+                                table)))))
+
 (defn- same-table? [previous current]
   (if (every? :attnum (:columns previous))
     (let [shape #(dissoc % :storage-name :primary-key-name :partition-leaves :partition-parent
-                         :partition-key :partition-bound :released-indexes :columns)
+                         :partition-key :partition-bound :released-indexes :columns :schema-oid)
           columns (fn [table] (mapv #(dissoc % :key-position :user-type) (:columns table)))]
       (and current (= (shape previous) (shape current))
+           (or (nil? (:schema-oid previous)) (= (:schema-oid previous) (:schema-oid current)))
            (= (columns previous) (columns current))
            (every? true? (map #(same-type-definition? (:user-type %1) (:user-type %2))
                               (:columns previous) (:columns current)))
@@ -2195,10 +2241,33 @@
          ;; named indexes, by moving through a third schema.
          (into (filterv retract? operations) (remove retract?) operations))))))
 
+(defn- rename-namespaces! [destination renames]
+  (when (seq renames)
+    (stage-data!
+     destination
+     (fn [db]
+       (let [old-names (into #{} (map :from) (vals renames))
+             operations (mapcat
+                         (fn [[publisher-oid {:keys [from to]}]]
+                           (let [old (catalog-objects/namespace-by-name db from)
+                                 oid (:datahike.pg.object/oid old)
+                                 context {:reason :namespace-identity :publisher-oid publisher-oid
+                                          :from from :to to}]
+                             (require! (and oid (>= oid catalog-objects/first-user-oid))
+                                       "Cannot rename a built-in or unknown mirror namespace" context)
+                             (require! (or (contains? old-names to)
+                                           (nil? (catalog-objects/namespace-by-name db to)))
+                                       "Publisher namespace rename would overwrite a local namespace" context)
+                             (catalog-objects/rename-object-tx db catalog-objects/pg-namespace-oid oid to nil)))
+                         renames)
+             retract? #(= :db/retract (first %))]
+         ;; Free every old name before claiming new names, including swaps.
+         (into (filterv retract? operations) (remove retract?) operations))))))
+
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
-        {:keys [changes retire release-indexes installed-manifest refresh-topology? type-plan]} stage
+        {:keys [changes retire release-indexes installed-manifest refresh-topology? type-plan namespace-renames]} stage
         {:keys [additions removals edits]} type-plan
         renamed-labels (enum-renames edits)
         rekeys (filterv (fn [{:keys [table previous]}]
@@ -2222,6 +2291,7 @@
                       changes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
+      (rename-namespaces! destination namespace-renames)
       (doseq [[table release] release-indexes]
         (check-running!)
         ;; Frozen rows and their publisher key metadata remain available for
@@ -2302,7 +2372,11 @@
                     (:types current))
         retired (into (or (:retired-storage previous) #{})
                       (map (comp :name storage-table)) retire)
-        layouts (fn [tables] (mapv #(or (get installed (:relation-id %)) (get prior (:relation-id %))) tables))]
+        layouts (fn [tables]
+                  (mapv (fn [{:keys [relation-id schema-oid]}]
+                          (or (get installed relation-id)
+                              (assoc (get prior relation-id) :schema-oid schema-oid)))
+                        tables))]
     (cond-> (merge (select-keys previous [:last-schema-refresh :recovery-gaps :slots-to-retire])
                    (update current :tables layouts))
       (seq (:partition-parents current)) (update :partition-parents layouts)
@@ -2334,16 +2408,29 @@
             (vals retained-types))))
 
 (defn- installation-plan [db previous current affected schema-refresh?]
-  (let [removed (removed-relations previous current)
-        {:keys [retain retire release-indexes] :as removal-plan} (plan-publication-removals db previous current removed)
+  (let [namespace-upgrade? (some #(nil? (:schema-oid %)) (all-relations previous))
+        previous (if namespace-upgrade? (adopt-namespace-identities previous current) previous)
+        renames (namespace-renames previous current)
+        renamed-previous (rename-manifest-namespaces previous renames)
+        removed (removed-relations renamed-previous current)
+        {:keys [retain retire release-indexes] :as removal-plan}
+        (plan-publication-removals db renamed-previous current removed)
         retained (retain-unpublished-types previous current retain)
         retiring-ids (into #{} (map :relation-id) retire)
         active-before (remove #(contains? retiring-ids (:relation-id %)) (all-relations previous))
         active-type-oids (into #{} (map :oid) (vals (publisher-types active-before)))
         retired-type-oids (into #{} (comp (map :oid) (remove active-type-oids)) (vals (publisher-types retire)))
         type-plan (type-plan! previous retained retired-type-oids schema-refresh?)
-        changes (changed-tables! previous current affected (:edits type-plan) schema-refresh?)]
-    {:installed-manifest (installed-manifest retained previous changes removal-plan type-plan)
+        changes (changed-tables! previous current affected (:edits type-plan) schema-refresh?)
+        renamed-before (merge (:unpublished-tables renamed-previous) (relations-by-id renamed-previous))
+        changes (mapv (fn [{:keys [previous] :as change}]
+                        (if-let [renamed (get renamed-before (:relation-id previous))]
+                          (assoc-in change [:previous :schema] (:schema renamed))
+                          change))
+                      changes)]
+    {:installed-manifest (installed-manifest retained renamed-previous changes removal-plan type-plan)
+     :namespace-renames renames
+     :namespace-upgrade? namespace-upgrade?
      :source-manifest current
      :changes changes
      :removed removed
@@ -2473,9 +2560,10 @@
                      (if-let [active @stage]
                        (require-stable-manifest! (:source-manifest active) current)
                        (let [affected (partition-affected @applied current)
-                             {:keys [changes removed release-indexes type-plan] :as install}
+                             {:keys [changes removed release-indexes type-plan namespace-upgrade?] :as install}
                              (installation-plan (d/db conn) @applied current affected schema-refresh?)]
-                         (when (or (seq changes) (seq removed) (seq release-indexes) (some seq (vals type-plan)))
+                         (when (or (seq changes) (seq removed) (seq release-indexes)
+                                   (some seq (vals type-plan)) namespace-upgrade?)
                            (doseq [{:keys [table previous]} changes
                                    :when (and previous (nil? (:partition-leaves table)))]
                              (matching-key-indexes! previous table))

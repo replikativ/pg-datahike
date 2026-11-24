@@ -2875,9 +2875,20 @@
                     #(contains? (get-in (durable-checkpoint path) [:manifest :unpublished-tables]) removed-id)))
           (check! (= @frozen (contents sink right)) "An active namesake hid the unpublished table" {}))
         (mirror/stop! @subscriber)
+        (let [conn (#'mirror/open-store path)]
+          (try
+            (let [manifest (:manifest (#'mirror/checkpoint (d/db conn)))
+                  legacy (#'mirror/map-manifest-relations manifest #(dissoc % :schema-oid))]
+              (d/transact conn [[:db/add @#'mirror/checkpoint-id (#'mirror/checkpoint-attr :manifest)
+                                 (pr-str legacy)]]))
+            (finally (d/release conn))))
         (reset! subscriber (mirror/start! config))
         (with-open [sink (DriverManager/getConnection (sink-url @subscriber))]
           (check! (= @slot (:slot (mirror/status @subscriber))) "Restart replaced the replication slot" {})
+          (await! "Older checkpoint did not acquire publisher namespace identities"
+                  #(let [{:keys [tables partition-parents unpublished-tables]} (:manifest (durable-checkpoint path))]
+                     (and (seq tables) (seq unpublished-tables)
+                          (every? :schema-oid (concat tables partition-parents (vals unpublished-tables))))))
           (sql! source "BEGIN"
                 "TRUNCATE billing.events"
                 "UPDATE \"Archive Data\".events SET label = 'unpublished after restart' WHERE id = 4"
@@ -2887,7 +2898,35 @@
                 "COMMIT")
           (compare-tables! source sink
                            [left moved public-table "shipping.parcels" "billing.parcel_range" "\"Archive Data\".parcel_range"])
-          (check! (= @frozen (contents sink right)) "Restart lost the frozen unpublished relation" {}))
+          (check! (= @frozen (contents sink right)) "Restart lost the frozen unpublished relation" {})
+          (let [namespaces (fn [conn]
+                             (into {} (rows conn (str "SELECT nspname, oid FROM pg_namespace "
+                                                      "WHERE nspname IN ('billing', 'Archive Data')"))))
+                publisher-before (namespaces source)
+                sink-before (namespaces sink)
+                frozen-ids (ids sink right)
+                active-ids (ids sink left)
+                before (inspect-db path (fn [db] (.toInstant ^java.util.Date
+                                                  (:db/txInstant (d/entity db (:max-tx db))))))
+                swapped (fn [by-name] {"billing" (get by-name "Archive Data")
+                                       "Archive Data" (get by-name "billing")})]
+            (sql! source "BEGIN"
+                  "ALTER SCHEMA billing RENAME TO transit"
+                  "ALTER SCHEMA \"Archive Data\" RENAME TO billing"
+                  "ALTER SCHEMA transit RENAME TO \"Archive Data\""
+                  "INSERT INTO \"Archive Data\".events VALUES (5, 55, 'renamed namespace')"
+                  "COMMIT")
+            (compare-tables! source sink [right moved "shipping.parcels"
+                                          "billing.parcel_range" "\"Archive Data\".parcel_range"])
+            (check! (= (swapped publisher-before) (namespaces source)) "Publisher schema OIDs changed" {})
+            (check! (= (swapped sink-before) (namespaces sink)) "Mirror schema rename changed namespace OIDs" {})
+            (check! (= [frozen-ids active-ids] [(ids sink left) (ids sink right)])
+                    "Schema rename changed relation identities" {})
+            (check! (= @frozen (contents sink left)) "Schema rename lost the frozen table" {})
+            (with-open [historical (DriverManager/getConnection (sink-url @subscriber))]
+              (sql! historical (str "SET datahike.as_of = " (literal before)))
+              (check! (= sink-before (namespaces historical)) "Schema rename changed historical namespace names" {})
+              (check! (= @frozen (contents historical right)) "Schema rename lost historical access to frozen rows" {}))))
         {:status :passed :schemas 4}
         (finally
           (when @subscriber (mirror/stop! @subscriber))
