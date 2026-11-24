@@ -133,8 +133,8 @@
   --memory             Use in-memory backend (no persistence; overrides
                        --data-dir for the template)
   --db NAME            Pre-create / pin a database named NAME.
-                       Repeatable. Defaults to a single 'datahike' if
-                       no --db is given.
+                       Repeatable. Existing stores are reopened.
+                       Defaults to 'datahike' if no --db is given.
   --no-create-database Disable SQL CREATE/DROP DATABASE (clients see
                        0A000 feature_not_supported). Default: enabled.
   --history            Keep transaction history in pre-created
@@ -200,15 +200,23 @@
     (assoc :store {:backend :file
                    :path (str data-dir "/{{name}}")})))
 
-(defn- pre-create-dbs!
-  "Materialise the --db NAME entries by calling the template hook
-   (same code path SQL `CREATE DATABASE` uses). Returns the
-   {name → conn} registry seed."
-  [hook db-names]
-  (into {}
-        (map (fn [name]
-               [name (hook name [])])
-             db-names)))
+(declare discover-store-config)
+
+(defn- startup-dbs!
+  "Open the named file stores or create them with the server template."
+  [template create! db-names]
+  (let [file? (= :file (get-in template [:store :backend]))]
+    (into {}
+          (map (fn [name]
+                 (let [path (when file? (str/replace (get-in template [:store :path]) "{{name}}" name))]
+                   [name (if (and path (.exists (File. ^String path)))
+                           (let [stored (discover-store-config {:backend :file :path path})]
+                             (when-not (get-in stored [:store :id])
+                               (throw (ex-info (str "Cannot open Datahike database at " path)
+                                               {:database name :path path})))
+                             (d/connect (assoc-in stored [:store :path] path)))
+                           (create! name []))])))
+          (distinct db-names))))
 
 ;; ----------------------------------------------------------------------------
 ;; Subcommand: serve
@@ -226,13 +234,13 @@
       :else
       (let [{:keys [port host data-dir memory? create-database? dbs]} opts
             template (build-template opts)
-            on-create (when create-database?
-                        (database/db-from-template template))
+            create! (database/db-from-template template)
+            on-create (when create-database? create!)
             on-delete (when create-database?
                         (database/db-delete-from-template template))]
         (when-not memory?
           (.mkdirs (File. ^String data-dir)))
-        (let [registry (pre-create-dbs! (database/db-from-template template) dbs)
+        (let [registry (startup-dbs! template create! dbs)
               srv (pg/start-server registry
                                    (cond-> {:port port :host host}
                                      on-create (assoc :on-create-database on-create)
@@ -241,7 +249,7 @@
           (println (str "pg-datahike " (read-version) " ready on " host ":" port))
           (println (str "  backend:  " (if memory? "memory (ephemeral)"
                                            (str "file (" data-dir ")"))))
-          (println (str "  history:  " (if (:history? opts) "on" "off")))
+          (println (str "  history for new databases:  " (if (:history? opts) "on" "off")))
           (println (str "  CREATE DATABASE:  " (if create-database? "enabled" "disabled")))
           (println (str "  databases: " (vec (keys registry))))
           (println)
@@ -256,11 +264,9 @@
 ;; Subcommand: dump
 ;; ----------------------------------------------------------------------------
 
-(defn- discover-store-id
-  "Connect to a konserve store via the backend-agnostic
-   `konserve.store/connect-store` and read the `:db` branch's
-   persisted config to recover the datahike store-id. Returns nil
-   if the store can't be opened or has no `:db` key.
+(defn- discover-store-config
+  "Read the config persisted under the store's `:db` branch.
+   Returns nil if the store can't be opened or has no `:db` key.
 
    This sidesteps having to know the UUID up-front — datahike
    always persists its full config (including the store-id) under
@@ -287,7 +293,7 @@
     (when store
       (try
         (let [db (<!! (k/get store :db))]
-          (get-in db [:config :store :id]))
+          (:config db))
         (finally
           (try (<!! (ks/release-store probe-cfg store)) (catch Throwable _)))))))
 
@@ -314,7 +320,7 @@
                       :allow-index-backfill? true
                       :keep-history? false})
           store-id (or (get-in base-cfg [:store :id])
-                       (discover-store-id (:store base-cfg)))
+                       (get-in (discover-store-config (:store base-cfg)) [:store :id]))
           _ (when (nil? store-id)
               (binding [*out* *err*]
                 (println (str "ERROR: no datahike database found at "
