@@ -524,6 +524,32 @@
     (is (= [[nil nil nil]] (query-rows c (str "SELECT to_regtype('base_level'), "
                                               "to_regtype('middle_level'), to_regtype('derived_level')"))))))
 
+(deftest domain-cascade-and-validation-use-the-bound-base-type
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [sql ["CREATE DOMAIN int4 AS bigint CHECK (VALUE > 10)"
+                 "CREATE DOMAIN builtin_child AS pg_catalog.int4"
+                 "CREATE DOMAIN actual_child AS public.int4"
+                 "CREATE TYPE holder AS (value actual_child)"
+                 "CREATE DOMAIN \"CamelParent\" AS integer NOT NULL CHECK (VALUE > 10)"
+                 "CREATE DOMAIN camel_child AS \"CamelParent\""]]
+      (exec! c sql))
+    (is (= [["23"]] (query-rows c "SELECT typbasetype::text FROM pg_type WHERE typname = 'builtin_child'")))
+    (is (= "5" (str (ffirst (query-rows c "SELECT 5::builtin_child")))))
+    (doseq [[sql state]
+            [["SELECT 5::actual_child" "23514"]
+             ["SELECT 5::camel_child" "23514"]
+             ["SELECT NULL::camel_child" "23502"]
+             ["DROP DOMAIN missing_schema.int4 CASCADE" "3F000"]
+             ["DROP DOMAIN public.int4 CASCADE" "0A000"]]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)))
+    (exec! c "DROP DOMAIN IF EXISTS missing_schema.int4 CASCADE")
+    (is (= [[true]] (query-rows c "SELECT to_regtype('actual_child') IS NOT NULL")))
+    (exec! c "DROP TYPE holder")
+    (exec! c "DROP DOMAIN public.int4 CASCADE")
+    (is (= [[true true]] (query-rows c (str "SELECT to_regtype('actual_child') IS NULL, "
+                                            "to_regtype('builtin_child') IS NOT NULL"))))))
+
 (deftest create-domain-bare-alias
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN big AS bigint")
@@ -741,7 +767,8 @@
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
     (exec! c "CREATE DOMAIN year AS integer CHECK (VALUE >= 1900)")
-    (exec! c "CREATE TABLE film (id int PRIMARY KEY, m mood, y year)")
+    (exec! c "CREATE DOMAIN a_year AS year")
+    (exec! c "CREATE TABLE film (id int PRIMARY KEY, m mood, y a_year)")
     (exec! c "INSERT INTO film VALUES (1, 'happy', 2020)")
     (exec! c "INSERT INTO film VALUES (2, 'sad',   1990)")
     (let [src-rows (query-rows c "SELECT id, m, y FROM film ORDER BY id")

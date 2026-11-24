@@ -1285,7 +1285,7 @@
                 (merge base {:type :ddl-drop-domain}
                        (user-types/parse-drop-domain sql))
                 (catch Throwable e
-                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+                  {:type :error :message (.getMessage e) :sqlstate (or (:sqlstate (ex-data e)) "42601")}))
 
               ;; TRUNCATE — fully token-classified (base carries
               ;; :tables / :restart-identity? / :cascade? from

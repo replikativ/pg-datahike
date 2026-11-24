@@ -70,6 +70,7 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.params :as params]
             [datahike.pg.sequence :as sequence]
             [datahike.pg.sql.catalog :as pcat]
             [datahike.pg.sql.ddl :as ddl]))
@@ -358,16 +359,18 @@
                        :where [[?e :datahike.pg.domain/name ?n]]}
                      db)]
     (->> results
-         (sort-by second)
-         (mapv (fn [[eid n]]
-                 (let [ent (into {} (d/entity db eid))]
-                   {:name n
-                    :base-type (:datahike.pg.domain/base-type ent)
-                    :base-args (some-> (:datahike.pg.domain/base-args ent) sort vec)
-                    :check-name (:datahike.pg.domain/check-name ent)
-                    :check-expr (:datahike.pg.domain/check-expr ent)
-                    :not-null (:datahike.pg.domain/not-null ent)
-                    :default-raw (:datahike.pg.domain/default-raw ent)}))))))
+         (map (fn [[eid n]]
+                (let [ent (into {} (d/entity db eid))]
+                  {:name n
+                   :depth (:depth (params/domain-spec-by-name db n))
+                   :base-type (:datahike.pg.domain/base-type ent)
+                   :base-args (some-> (:datahike.pg.domain/base-args ent) sort vec)
+                   :check-name (:datahike.pg.domain/check-name ent)
+                   :check-expr (:datahike.pg.domain/check-expr ent)
+                   :not-null (:datahike.pg.domain/not-null ent)
+                   :default-raw (:datahike.pg.domain/default-raw ent)})))
+         (sort-by (juxt :depth :name))
+         vec)))
 
 (defn- emit-create-domain
   [{:keys [name base-type base-args check-name check-expr not-null default-raw]}]

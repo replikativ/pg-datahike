@@ -120,7 +120,7 @@
                        enum-name (:datahike.pg/enum-of column)]
                    (cond
                      domain-name
-                     (when-let [{:keys [checks not-null?]} (params/registered-domain-spec db domain-name)]
+                     (when-let [{:keys [checks not-null?]} (params/domain-spec-by-name db domain-name)]
                        [name {:kind :domain :attr attr :domain-name domain-name
                               :not-null? not-null? :checks checks
                               :array-elem (:pg/array-elem column)}])

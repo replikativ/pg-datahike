@@ -1111,7 +1111,7 @@
                                                             :in [$ ?n]}
                                                           db type-no-schema)))
                                domain-match (when (and (not enum-match) type-no-schema)
-                                              (params/registered-domain-spec db type-no-schema))
+                                              (params/domain-spec-by-name db type-no-schema))
                                ;; Resolve every domain in the chain to the physical base type.
                                raw-type (cond
                                           enum-match "text"

@@ -27,6 +27,8 @@
    (:schema db) doesn't surface."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
@@ -454,39 +456,66 @@
                        :hint "New enum values must be committed before they can be used."})))
     label))
 
-(defn- declared-domain [db type-name]
-  (let [name (-> (str type-name) (str/split #"\.") last unquote-ident)]
-    (when-let [[eid base check-name expression not-null?]
-               (first (d/q '{:find [?e ?base ?check-name ?expr ?not-null]
-                             :in [$ ?name]
-                             :where [[?e :datahike.pg.domain/name ?name]
-                                     [?e :datahike.pg.domain/base-type ?base]
-                                     [(get-else $ ?e :datahike.pg.domain/check-name :__null__) ?check-name]
-                                     [(get-else $ ?e :datahike.pg.domain/check-expr :__null__) ?expr]
-                                     [(get-else $ ?e :datahike.pg.domain/not-null false) ?not-null]]}
-                           db name))]
-      {:eid eid :name name :base-type base :not-null? (boolean not-null?)
+(defn domain-base-type-oid [db domain]
+  (or (:datahike.pg.domain/base-oid domain)
+      (when-let [base (:datahike.pg.domain/base-type domain)]
+        ;; Old definitions recorded only a name and were stored in public.
+        ;; Use the original default path, independent of the caller's path.
+        (try
+          (binding [regoid/*search-path* ["public"]]
+            (regoid/type-oid db base))
+          (catch clojure.lang.ExceptionInfo _ nil)))))
+
+(defn domain-base-parent-name [db base-oid]
+  (when (and base-oid (>= base-oid catalog-objects/first-user-oid))
+    (let [type (catalog-objects/object-by-address db catalog-objects/pg-type-oid base-oid)]
+      (when (= :domain (:datahike.pg.object/kind type))
+        (:datahike.pg.object/name type)))))
+
+(defn- declared-domain [db name]
+  (when-let [[eid base check-name expression not-null?]
+             (first (d/q '{:find [?e ?base ?check-name ?expr ?not-null]
+                           :in [$ ?name]
+                           :where [[?e :datahike.pg.domain/name ?name]
+                                   [?e :datahike.pg.domain/base-type ?base]
+                                   [(get-else $ ?e :datahike.pg.domain/check-name :__null__) ?check-name]
+                                   [(get-else $ ?e :datahike.pg.domain/check-expr :__null__) ?expr]
+                                   [(get-else $ ?e :datahike.pg.domain/not-null false) ?not-null]]}
+                         db name))]
+    (let [domain (d/entity db eid)]
+      {:eid eid :name name :base-type base
+       :base-oid (domain-base-type-oid db domain)
+       :base-args (:datahike.pg.domain/base-args domain)
+       :not-null? (boolean not-null?)
        :check (when (not= :__null__ expression)
                 {:constraint (if (= :__null__ check-name) (str name "_check") check-name)
                  :expression expression})})))
 
+(defn domain-spec-by-name
+  "Resolve a catalog domain name to its storage type and inherited checks."
+  [db name]
+  (when (and db name)
+    (when-let [leaf (declared-domain db name)]
+      (loop [current leaf, ancestors (), seen #{}]
+        (when (contains? seen (:eid current))
+          (throw (ex-info "circular domain base type" {:sqlstate "42P17" :domain (:name leaf)})))
+        (let [chain (conj ancestors current)
+              parent-name (domain-base-parent-name db (:base-oid current))]
+          (if-let [parent (when parent-name (declared-domain db parent-name))]
+            (recur parent chain (conj seen (:eid current)))
+            {:name (:name leaf)
+             :base-type (:base-type current)
+             :base-args (:base-args current)
+             :depth (count chain)
+             :not-null? (boolean (some :not-null? chain))
+             :checks (into [] (keep :check) chain)}))))))
+
 (defn registered-domain-spec
-  "Resolve a domain to its storage type and its checks in base-to-derived order."
+  "Resolve the domain named by a SQL type spelling."
   ([type-name] (registered-domain-spec *parse-db* type-name))
   ([db type-name]
-   (when (and db type-name)
-     (when-let [leaf (declared-domain db type-name)]
-       (loop [current leaf, ancestors (), seen #{}]
-         (when (contains? seen (:eid current))
-           (throw (ex-info "circular domain base type" {:sqlstate "42P17" :domain (:name leaf)})))
-         (let [chain (conj ancestors current)]
-           (if-let [parent (declared-domain db (:base-type current))]
-             (recur parent chain (conj seen (:eid current)))
-             {:name (:name leaf)
-              :base-type (:base-type current)
-              :base-args (:datahike.pg.domain/base-args (d/entity db (:eid current)))
-              :not-null? (boolean (some :not-null? chain))
-              :checks (into [] (keep :check) chain)})))))))
+   (when type-name
+     (domain-spec-by-name db (-> (str type-name) (str/split #"\.") last unquote-ident)))))
 
 (defn cast-domain-value
   "Coerce to the underlying type and apply all domain constraints."
