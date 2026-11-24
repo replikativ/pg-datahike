@@ -334,7 +334,7 @@
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE workflow_state AS ENUM ('7')")
     (exec! c "CREATE TABLE enum_input (state workflow_state)")
-    (exec! c "INSERT INTO enum_input VALUES ('7')")
+    (exec! c "INSERT INTO enum_input VALUES ('7'), (NULL)")
     (exec! c "CREATE TABLE enum_copy AS SELECT state FROM enum_input")
     (exec! c "CREATE TABLE enum_empty AS SELECT state FROM enum_input WITH NO DATA")
     (exec! c "CREATE TABLE numeric_output (quantity integer)")
@@ -344,10 +344,14 @@
              ["EXECUTE store_number('7'::workflow_state)" "42804"]
              ["ALTER TABLE numeric_output ALTER COLUMN quantity TYPE bigint USING '7'::workflow_state" "42804"]
              ["INSERT INTO enum_copy VALUES ('wrong')" "22P02"]
-             ["INSERT INTO enum_empty VALUES ('wrong')" "22P02"]]]
+             ["INSERT INTO enum_empty VALUES ('wrong')" "22P02"]
+             ["SELECT coalesce(state, 'wrong') FROM enum_input" "22P02"]
+             ["SELECT CASE WHEN state IS NULL THEN 'wrong' ELSE state END FROM enum_input" "22P02"]
+             ["CREATE TABLE invalid_enum_copy AS SELECT coalesce(state, 'wrong') AS state FROM enum_input" "22P02"]]]
       (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
         (is (= state (some-> error .getSQLState)) sql)))
     (is (empty? (query-rows c "SELECT quantity FROM numeric_output")))
+    (is (= [[nil]] (query-rows c "SELECT to_regclass('invalid_enum_copy')")))
     (doseq [table ["enum_copy" "enum_empty"]]
       (with-open [stmt (.prepareStatement c (str "SELECT state FROM " table))]
         (is (= "workflow_state" (.getColumnTypeName (.getMetaData stmt) 1)))))
@@ -376,7 +380,7 @@
       (d/transact *conn* [[:db/add (:db/id view) :datahike.pg/view-columns
                            (pr-str (assoc-in columns [0 :oid] 25))]
                           [:db/add (:db/id column) :datahike.pg.column/type-oid 25]]))
-    (exec! c "CREATE OR REPLACE VIEW legacy_status AS SELECT state FROM legacy_input")
+    (exec! c "CREATE OR REPLACE VIEW legacy_status AS SELECT i.state FROM legacy_input i WHERE i.state IS NOT NULL")
     (with-open [stmt (.prepareStatement c "SELECT state FROM legacy_status")]
       (is (= "text" (.getColumnTypeName (.getMetaData stmt) 1))))
     (is (= [["queued"]] (query-rows c "SELECT state FROM legacy_status")))))

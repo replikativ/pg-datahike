@@ -1134,6 +1134,20 @@
    first one's."
   #{"coalesce" "nullif" "greatest" "least"})
 
+(defn- validate-common-enum-literals! [ctx expressions construct]
+  (when-let [literals (seq (filter #(instance? StringValue %) expressions))]
+    (let [db (:db ctx)
+          oids (mapv #(when-not (oid-infer/untyped-literal? %) (source-oid ctx %)) expressions)]
+      (when (some #(pgs/enum-name-for-oid db %) oids)
+        (when-let [type-name (pgs/enum-name-for-oid db (types/select-common-type oids construct false))]
+          (let [labels (params/registered-enum-values db type-name)]
+            (doseq [literal literals
+                    :let [label (string-value-text literal)]]
+              (when-not (contains? labels label)
+                (throw (errors/pg-error :invalid-text-representation
+                                        {:type type-name :value label :enum? true})))
+              (params/assert-enum-label-safe! db type-name label))))))))
+
 (defn coerce-to-common!
   "Coerce `v` to the common type of `arg-exprs`, per PostgreSQL's
    `select_common_type`, and return the coerced variable -- or `v`
@@ -1431,6 +1445,8 @@
         arg-exprs (when params (vec params))
         arg-exprs (named-args->positional fname arg-exprs)
         _ (validate-function-argument-types! ctx fname arg-exprs)
+        _ (when (common-type-fns fname)
+            (validate-common-enum-literals! ctx arg-exprs (str/upper-case fname)))
         arg-exprs (coerce-function-unknowns ctx fname arg-exprs)
         lazy-args? (= fname "coalesce")
         raw-args (when arg-exprs
@@ -3380,6 +3396,10 @@
   [ctx ^CaseExpression case-expr]
   (let [when-clauses (.getWhenClauses case-expr)
         else-expr (.getElseExpression case-expr)
+        _ (validate-common-enum-literals! ctx
+                                          (into (cond-> [] else-expr (conj else-expr))
+                                                (map #(.getThenExpression ^WhenClause %) when-clauses))
+                                          "CASE")
         switch-expr (.getSwitchExpression case-expr)
         result-var (ctx/fresh-var! ctx)
         ;; For simple CASE (CASE x WHEN v THEN r), translate the switch expression
