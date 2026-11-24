@@ -3726,7 +3726,7 @@
     :nextval :currval :lastval :setval
     :pg-backend-pid :txid-current
     :comment-on :lock-table :create-index
-    :maintenance-noop :schema-noop :schema-ddl :move-table-schema
+    :maintenance-noop :schema-noop :schema-ddl :move-table-schema :add-column-identity
     :create-database :drop-database
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
     ;; (which can't / won't parse them) and run our own parsers.

@@ -1311,6 +1311,10 @@
               :drop-role-object
               (assoc base :type :ddl-drop-role)
 
+              :add-column-identity
+              (table-targets (assoc base :type :ddl-add-column-identity
+                                    :column (unquote-ident (:column base))))
+
               :move-table-schema
               (table-targets (assoc base :type :ddl-move-table-schema
                                     :new-schema (first (regoid/parse-qualified-name (:new-schema base)))))

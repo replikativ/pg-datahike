@@ -12,6 +12,11 @@
    :db/valueType :db.type/boolean
    :db/cardinality :db.cardinality/one})
 
+(def identity-generation-attribute
+  {:db/ident :__seq__/identity-generation
+   :db/valueType :db.type/string
+   :db/cardinality :db.cardinality/one})
+
 (def ownership-attribute
   {:db/ident :__seq__/owned-by-column
    :db/valueType :db.type/string

@@ -1420,8 +1420,7 @@
                                   :db/cardinality :db.cardinality/one}
                                  {:db/ident :__seq__/type :db/valueType :db.type/string
                                   :db/cardinality :db.cardinality/one}
-                                 {:db/ident :__seq__/identity-generation :db/valueType :db.type/string
-                                  :db/cardinality :db.cardinality/one}
+                                 sequence/identity-generation-attribute
                                  {:db/ident :__seq__/owned-by-table :db/valueType :db.type/string
                                   :db/cardinality :db.cardinality/one}
                                  (cond-> {:__seq__/name seq-name
