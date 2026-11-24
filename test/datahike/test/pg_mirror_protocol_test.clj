@@ -1,7 +1,16 @@
 (ns datahike.test.pg-mirror-protocol-test
   (:require [clojure.test :refer [deftest is]]
             [datahike.pg.mirror :as mirror])
-  (:import [java.nio ByteBuffer]))
+  (:import [java.nio ByteBuffer]
+           [java.sql SQLException]))
+
+(deftest publication-cli-hides-publisher-error-detail
+  (with-redefs [mirror/publication-report (fn [_] (throw (SQLException. "private details" "28P01")))]
+    (let [output (with-out-str
+                   (is (= 1 (mirror/run-cli! {} true))))]
+      (is (= {:compatible? false
+              :last-error {:reason :publisher-error :sqlstate "28P01"}}
+             (read-string output))))))
 
 (deftest ordinary-transaction-limit-precedes-change-decode
   (let [begin (doto (ByteBuffer/allocate 21)

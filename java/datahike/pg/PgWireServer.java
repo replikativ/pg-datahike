@@ -7,7 +7,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
@@ -868,6 +870,7 @@ public final class PgWireServer {
     private final boolean requireTls;
     private ServerSocket serverSocket;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final Map<Socket, Thread> clients = new HashMap<>();
     private Thread acceptThread;
 
     /**
@@ -1054,9 +1057,23 @@ public final class PgWireServer {
                     // counts via DATAHIKE_CONN_THREADS=virtual.
                     String connThreads = System.getenv("DATAHIKE_CONN_THREADS");
                     String connName = "pgwire-conn-" + client.getRemoteSocketAddress();
-                    startNamedThread(connName,
-                        "virtual".equalsIgnoreCase(connThreads),
-                        () -> handleConnection(client));
+                    synchronized (clients) {
+                        if (!running.get()) {
+                            client.close();
+                            continue;
+                        }
+                        clients.put(client, startNamedThread(connName,
+                            "virtual".equalsIgnoreCase(connThreads), () -> {
+                                try {
+                                    handleConnection(client);
+                                } finally {
+                                    synchronized (clients) {
+                                        clients.remove(client);
+                                        clients.notifyAll();
+                                    }
+                                }
+                            }));
+                    }
                 } catch (IOException e) {
                     if (running.get()) {
                         System.err.println("PgWire accept error: " + e.getMessage());
@@ -1076,6 +1093,18 @@ public final class PgWireServer {
                 serverSocket.close();
             }
         } catch (IOException ignored) {}
+    }
+
+    /** Stop admission and wait for the existing sessions to release their handlers. */
+    public void stopAndDrain() throws InterruptedException {
+        stop();
+        synchronized (clients) {
+            for (Map.Entry<Socket, Thread> client : clients.entrySet()) {
+                try { client.getKey().close(); } catch (IOException ignored) {}
+                client.getValue().interrupt();
+            }
+            while (!clients.isEmpty()) clients.wait();
+        }
     }
 
     public int getPort() {

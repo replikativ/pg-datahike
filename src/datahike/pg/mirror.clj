@@ -17,13 +17,14 @@
             [datahike.pg.types :as types])
   (:import [datahike.pg PgWireServer PgWireServer$QueryHandler PgWireServer$QueryResult]
            [java.io ByteArrayOutputStream IOException]
+           [java.net BindException]
            [java.nio ByteBuffer]
            [java.nio.channels FileChannel OverlappingFileLockException]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files StandardOpenOption]
            [java.sql Connection DriverManager PreparedStatement ResultSet SQLException Types]
            [java.util Properties UUID]
-           [java.util.concurrent TimeUnit]
+           [java.util.concurrent Executor TimeUnit]
            [org.postgresql PGConnection]
            [org.postgresql.copy CopyDual]
            [org.postgresql.core BaseConnection]
@@ -83,9 +84,39 @@
       (when-not (instance? IOException (ex-cause error))
         (throw error)))))
 
-(defn- connect [url replication? primary?]
+(def ^:private abort-executor
+  (reify Executor
+    (execute [_ task] (.run ^Runnable task))))
+
+(defn- publisher-transport []
+  (atom {:stopping? false :connections #{}}))
+
+(defn- abort-publisher! [^Connection connection]
+  (try
+    (.abort connection abort-executor)
+    (catch SQLException _)))
+
+(defn- stop-transport! [transport]
+  (let [[before _] (swap-vals! transport assoc :stopping? true)]
+    (run! abort-publisher! (:connections before))))
+
+(defn- track-publisher! [transport connection]
+  (let [[before _]
+        (swap-vals! transport
+                    (fn [state]
+                      (if (:stopping? state) state (update state :connections conj connection))))]
+    (when (:stopping? before)
+      (abort-publisher! connection)
+      (throw (ex-info "Mirror stopped" {})))))
+
+(defn- release-publisher! [transport connection]
+  (when transport (swap! transport update :connections disj connection))
+  (close-publisher! connection))
+
+(defn- connect [url replication? primary? transport]
   (let [properties (doto (Properties.)
                      (.setProperty "connectTimeout" "10")
+                     (.setProperty "loginTimeout" "10")
                      (.setProperty "socketTimeout" "30"))]
     (when primary?
       (.setProperty properties "targetServerType" "primary"))
@@ -95,6 +126,7 @@
       (.setProperty properties "preferQueryMode" "simple"))
     (let [connection (DriverManager/getConnection url properties)]
       (try
+        (when transport (track-publisher! transport connection))
         (when-not replication?
           ;; A default expression can contain timestamp literals or objects
           ;; resolved through search_path. Keep catalog comparison stable.
@@ -103,16 +135,16 @@
           (command! connection "SET search_path = pg_catalog"))
         connection
         (catch Throwable error
-          (close-publisher! connection)
+          (release-publisher! transport connection)
           (throw error))))))
 
-(defn- with-publisher [url f]
-  (let [replication (connect url true true)]
+(defn- with-publisher [url transport f]
+  (let [replication (connect url true true transport)]
     (try
-      (let [source (connect url false true)]
+      (let [source (connect url false true transport)]
         (try (f replication source)
-             (finally (close-publisher! source))))
-      (finally (close-publisher! replication)))))
+             (finally (release-publisher! transport source))))
+      (finally (release-publisher! transport replication)))))
 
 (defn- publisher-session [connection]
   (first (query connection
@@ -564,7 +596,7 @@
    Returns publication-wide issues and the issues for every table."
   [{:keys [source-url leaf-publication] :as config}]
   (validate-source-options! config)
-  (with-open [source (connect source-url false false)]
+  (with-open [source (connect source-url false false nil)]
     (let [version (first (query source "SHOW server_version_num" [] #(.getInt ^ResultSet % 1)))]
       (require! (and version (<= 180000 version 189999))
                 "Expected a PostgreSQL 18 publication database" {:version version})
@@ -1428,7 +1460,9 @@
    barrier))
 
 (defn- publish-status! [state info]
-  (swap! state merge (select-keys info [:confirmed-lsn :restart-lsn :retained-wal-bytes :unconfirmed-wal-bytes])))
+  (swap! state merge
+         (assoc (select-keys info [:confirmed-lsn :restart-lsn :retained-wal-bytes :unconfirmed-wal-bytes])
+                :last-publisher-poll-ms (System/currentTimeMillis))))
 
 (defn- checked-running-slot! [source slot state failover?]
   (publish-status! state (usable-slot! source slot failover?)))
@@ -2071,6 +2105,7 @@
                       origin manifest {:keys [conn changes tables barrier phase]} check-running!]
   (with-publisher
     source-url
+    (:transport config)
     (fn [replication source]
       (with-open [destination (pg/make-query-handler conn)]
         (when (not= origin (source-identity replication source))
@@ -2123,6 +2158,7 @@
   (let [tables (into [] (comp (map :table) (remove :partition-leaves)) changes)
         local-store (open-stage-store)
         stopped? (atom false)
+        transport (publisher-transport)
         done (promise)
         stage (assoc local-store :tables tables :changes changes :manifest manifest
                      :phase (atom :copying) :barrier (str (UUID/randomUUID))
@@ -2131,14 +2167,17 @@
                       (require! (not @stopped?) "Table refresh stopped" {}))
         worker (Thread. (fn []
                           (deliver done
-                                   (try {:position (stage-tables! config origin manifest stage running!)}
-                                        (catch Throwable error {:error error}))))
+                                   (try
+                                     {:position (stage-tables! (assoc config :transport transport)
+                                                               origin manifest stage running!)}
+                                     (catch Throwable error {:error error}))))
                         "pg-datahike-table-refresh")]
     (.start worker)
-    (assoc stage :worker worker)))
+    (assoc stage :worker worker :transport transport)))
 
-(defn- stop-refresh! [{:keys [worker stopped?] :as stage}]
+(defn- stop-refresh! [{:keys [worker stopped? transport] :as stage}]
   (reset! stopped? true)
+  (stop-transport! transport)
   (.join ^Thread worker)
   (close-stage-store! stage))
 
@@ -2724,6 +2763,7 @@
                    conn destination state check-running! ready!]
   (with-publisher
     source-url
+    (:transport config)
     (fn [replication source]
       (let [origin (source-identity replication source)
             saved (or (checkpoint (d/db conn))
@@ -2787,6 +2827,8 @@
                      (ex-message error))}
          (when (instance? SQLException error)
            {:sqlstate (.getSQLState ^SQLException error)})
+         (when (instance? BindException error)
+           {:reason :listener-bind-failed})
          (ex-data error)))
 
 (defn- open-store [directory]
@@ -2830,8 +2872,8 @@
                     (while (not @stopping?)
                       (Thread/sleep 100)))))))))
       (finally
-        (when @listener
-          (pg/stop-server @listener))))))
+        (when-let [^PgWireServer server (:server @listener)]
+          (.stopAndDrain server))))))
 
 (defn- acquire-store-lock [directory]
   (let [file (io/file (str directory ".mirror-lock"))
@@ -2886,8 +2928,10 @@
             "Mirror listeners do not support database provisioning" {})
   (let [directory (.getCanonicalPath (io/file store-path))
         spool-store (spool/store directory max-stream-spool-bytes)
+        transport (publisher-transport)
         config (assoc config :slot-prefix slot-prefix :max-snapshot-bytes max-snapshot-bytes
-                      :max-transaction-bytes max-transaction-bytes :spool-store spool-store)
+                      :max-transaction-bytes max-transaction-bytes :spool-store spool-store
+                      :transport transport)
         state (atom (cond-> {:state :starting :publication publication}
                       leaf-publication (assoc :leaf-publication leaf-publication)))
         stopping? (atom false)]
@@ -2906,32 +2950,60 @@
                         (swap! state assoc :state :failed :port nil :last-error (mirror-error e)))))
                   "pg-datahike-logical-subscriber")]
       (.start worker)
-      {:state state :stopping? stopping? :worker worker :spool-bytes (:bytes spool-store)})))
+      {:state state :stopping? stopping? :worker worker :spool-bytes (:bytes spool-store)
+       :transport transport})))
 
 (defn status
   "Return the mirror's current state and progress. The source timestamp is
    measured in microseconds since PostgreSQL's 2000-01-01 UTC epoch."
   [{:keys [state spool-bytes]}]
-  (assoc @state :spooled-bytes @spool-bytes))
+  (let [current @state]
+    (assoc current :spooled-bytes @spool-bytes :serving? (some? (:port current)))))
+
+(defn- request-stop! [{:keys [stopping? transport]}]
+  (reset! stopping? true)
+  (stop-transport! transport))
 
 (defn stop!
   "Stop following and close the read-only listener. The durable checkpoint
    and publisher slot are kept for the next start."
-  [{:keys [stopping? ^Thread worker] :as mirror}]
-  (reset! stopping? true)
+  [{:keys [^Thread worker] :as mirror}]
+  (request-stop! mirror)
   (.join worker)
   (status mirror))
 
+(defn- cli-error [{:keys [reason type sqlstate]}]
+  (cond-> {:reason (or reason type (if sqlstate :publisher-error :worker-error))}
+    sqlstate (assoc :sqlstate sqlstate)))
+
 (defn- run-mirror! [config]
-  (let [mirror (start! config)]
-    (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable #(stop! mirror)))
+  (let [{:keys [^Thread worker] :as mirror} (start! config)
+        finish! (fn []
+                  (request-stop! mirror)
+                  (.join worker 30000)
+                  (when (.isAlive worker)
+                    (binding [*out* *err*] (println "Timed out waiting for mirror shutdown"))))]
+    (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable finish!))
     (loop [previous nil]
-      (let [current (status mirror)]
+      (let [current (update (status mirror) :last-error #(some-> % cli-error))]
         (when (not= previous current) (prn current) (flush))
         (if (or (= :failed (:state current))
                 (and (= :paused (:state current)) (nil? (:port current))))
-          (do (stop! mirror) (System/exit 1))
+          (do (finish!) 1)
           (do (Thread/sleep 1000) (recur current)))))))
+
+(defn run-cli!
+  "Run the mirror CLI with a resolved configuration. Return its exit status."
+  [config check?]
+  (if check?
+    (let [report (try
+                   (publication-report config)
+                   (catch SQLException error
+                     {:compatible? false :last-error (cli-error (mirror-error error))}))]
+      (prn report)
+      (flush)
+      (if (:compatible? report) 0 1))
+    (run-mirror! config)))
 
 (defn -main [& args]
   (let [check? (= "--check" (first args))
@@ -2940,10 +3012,6 @@
               "Usage: clojure -M -m datahike.pg.mirror [--check] path-to-mirror.edn" {})
     (let [source-url (System/getenv "PG_MIRROR_SOURCE_URL")
           config (cond-> (edn/read-string (slurp (first paths)))
-                   source-url (assoc :source-url source-url))]
-      (if check?
-        (let [report (publication-report config)]
-          (prn report)
-          (flush)
-          (when-not (:compatible? report) (System/exit 1)))
-        (run-mirror! config)))))
+                   source-url (assoc :source-url source-url))
+          code (run-cli! config check?)]
+      (when-not (zero? code) (System/exit code)))))
