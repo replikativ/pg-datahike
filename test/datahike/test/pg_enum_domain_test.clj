@@ -5,9 +5,11 @@
    `:datahike.pg.domain/*`). Columns declared with these types lower
    to the appropriate base type for storage but carry the enum/domain
    name in metadata so the dump can re-emit them."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.test :refer [deftest testing is use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.dump :as dump]
             [datahike.pg.server :as pg]
@@ -327,6 +329,57 @@
                 rs (.executeQuery stmt)]
       (is (= "rainbow" (.getColumnTypeName (.getMetaData rs) 1)))
       (is (false? (.next rs))))))
+
+(deftest enum-query-results-preserve-write-types-and-catalog-dependencies
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE workflow_state AS ENUM ('7')")
+    (exec! c "CREATE TABLE enum_input (state workflow_state)")
+    (exec! c "INSERT INTO enum_input VALUES ('7')")
+    (exec! c "CREATE TABLE enum_copy AS SELECT state FROM enum_input")
+    (exec! c "CREATE TABLE enum_empty AS SELECT state FROM enum_input WITH NO DATA")
+    (exec! c "CREATE TABLE numeric_output (quantity integer)")
+    (exec! c "PREPARE store_number (integer) AS INSERT INTO numeric_output VALUES ($1)")
+    (doseq [[sql state]
+            [["INSERT INTO numeric_output SELECT state FROM enum_input" "42804"]
+             ["EXECUTE store_number('7'::workflow_state)" "42804"]
+             ["ALTER TABLE numeric_output ALTER COLUMN quantity TYPE bigint USING '7'::workflow_state" "42804"]
+             ["INSERT INTO enum_copy VALUES ('wrong')" "22P02"]
+             ["INSERT INTO enum_empty VALUES ('wrong')" "22P02"]]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)))
+    (is (empty? (query-rows c "SELECT quantity FROM numeric_output")))
+    (doseq [table ["enum_copy" "enum_empty"]]
+      (with-open [stmt (.prepareStatement c (str "SELECT state FROM " table))]
+        (is (= "workflow_state" (.getColumnTypeName (.getMetaData stmt) 1)))))
+    (exec! c "CREATE VIEW enum_view AS SELECT '7'::workflow_state AS state")
+    (exec! c "DROP TABLE enum_input")
+    (exec! c "DROP TABLE enum_empty")
+    (let [drop-type-error #(try (exec! c "DROP TYPE workflow_state") nil
+                                (catch java.sql.SQLException e (.getSQLState e)))]
+      (is (= "2BP01" (drop-type-error)))
+      (exec! c "DROP TABLE enum_copy")
+      (is (= "2BP01" (drop-type-error)))
+      (exec! c "DROP VIEW enum_view")
+      (is (nil? (drop-type-error))))))
+
+(deftest replacing-an-existing-enum-view-preserves-its-stored-text-type
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE legacy_state AS ENUM ('queued')")
+    (exec! c "CREATE TABLE legacy_input (state legacy_state)")
+    (exec! c "INSERT INTO legacy_input VALUES ('queued')")
+    (exec! c "CREATE VIEW legacy_status AS SELECT state FROM legacy_input")
+    (let [db (d/db *conn*)
+          view (d/entity db [:datahike.pg/view-name "legacy_status"])
+          columns (edn/read-string (:datahike.pg/view-columns view))
+          [[oid]] (query-rows c "SELECT 'legacy_status'::regclass::oid")
+          column (catalog-objects/column-by-attnum db (long oid) 1)]
+      (d/transact *conn* [[:db/add (:db/id view) :datahike.pg/view-columns
+                           (pr-str (assoc-in columns [0 :oid] 25))]
+                          [:db/add (:db/id column) :datahike.pg.column/type-oid 25]]))
+    (exec! c "CREATE OR REPLACE VIEW legacy_status AS SELECT state FROM legacy_input")
+    (with-open [stmt (.prepareStatement c "SELECT state FROM legacy_status")]
+      (is (= "text" (.getColumnTypeName (.getMetaData stmt) 1))))
+    (is (= [["queued"]] (query-rows c "SELECT state FROM legacy_status")))))
 
 (deftest concrete-enum-overload-wins-over-polymorphic-argument
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]

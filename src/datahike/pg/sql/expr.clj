@@ -3264,8 +3264,8 @@
         (doseq [{:keys [expression]} bounds
                 :when (instance? net.sf.jsqlparser.expression.Expression expression)]
           (when (and (not (oid-infer/untyped-literal? expression))
-                     (not (types/assignment-cast-exists?
-                           (source-oid ctx expression) types/oid-int4)))
+                     (not (pgs/assignment-cast-exists?
+                           (:db ctx) (source-oid ctx expression) types/oid-int4)))
             (throw (ex-info "array subscript must have type integer"
                             {:error :datatype-mismatch :sqlstate "42804"}))))
         compiled-bounds
@@ -6983,7 +6983,7 @@
 (defn- assignment-source-type!
   [ctx expression target-oid description]
   (when (and (not (oid-infer/untyped-literal? expression))
-             (not (types/assignment-cast-exists? (source-oid ctx expression) target-oid)))
+             (not (pgs/assignment-cast-exists? (:db ctx) (source-oid ctx expression) target-oid)))
     (throw (ex-info (str description " has an incompatible expression type")
                     {:error :datatype-mismatch :sqlstate "42804"}))))
 

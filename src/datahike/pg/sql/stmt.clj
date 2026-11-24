@@ -4290,9 +4290,15 @@
                       projection (if (seq columns)
                                    (str/join
                                     ", "
-                                    (map (fn [{:keys [name]}]
-                                           (let [q (quote-ident name)]
-                                             (str "__view_source." q " AS " q)))
+                                    (map (fn [{:keys [name oid]}]
+                                           (let [q (quote-ident name)
+                                                 source (str "__view_source." q)
+                                                 ;; Views declared by older versions can expose enum
+                                                 ;; expressions as text. Preserve the saved type.
+                                                 value (if (= oid types/oid-text)
+                                                         (str "CAST(" source " AS text)")
+                                                         source)]
+                                             (str value " AS " q)))
                                          columns))
                                    "*")
                       ^net.sf.jsqlparser.statement.select.Select wrapper
@@ -10125,8 +10131,8 @@
                                     :error-fields (:error-fields plan)})))
                  (when (and (not partial?)
                             (not (oid/untyped-literal? (unwrap-parens original-expression)))
-                            (not (types/assignment-cast-exists?
-                                  (first (:select-item-oids plan))
+                            (not (pgs/assignment-cast-exists?
+                                  db (first (:select-item-oids plan))
                                   (params/infer-param-oid-for-column
                                    schema (namespace attr) (:column target) db))))
                    (throw (ex-info (str "column \"" (:column target)
@@ -10154,7 +10160,7 @@
                             schema (namespace (:attr target)) (:column target) db)
                 expected (assignment-target/value-oid target column-oid)]
           :when (and (not unknown?)
-                     (not (types/assignment-cast-exists? source expected)))]
+                     (not (pgs/assignment-cast-exists? db source expected)))]
     (throw (ex-info (str "column \"" (:column target)
                          "\" has an incompatible expression type")
                     {:sqlstate "42804" :error :datatype-mismatch}))))

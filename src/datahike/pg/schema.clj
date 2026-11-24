@@ -831,6 +831,19 @@
   ;; not collide with the sequential allocator used by new objects.
   (+ 1000000000 (mod (long (.hashCode ^String name)) 1000000000)))
 
+(defn enum-name-for-oid [db oid]
+  (when (and db oid (>= oid catalog-objects/first-user-oid))
+    (let [object (catalog-objects/object-by-address db catalog-objects/pg-type-oid oid)]
+      (when (= :enum (:datahike.pg.object/kind object))
+        (:datahike.pg.object/name object)))))
+
+(defn assignment-cast-exists?
+  "Resolve registered enum sources before falling back to built-in casts."
+  [db source target]
+  (if (enum-name-for-oid db source)
+    (or (nil? target) (= source target) (= :S (types/oid->category target)))
+    (types/assignment-cast-exists? source target)))
+
 (defn enum-types
   "Read the user enum registry. Returns declaration-ordered labels and a
    stable type OID. Older registry entries without an explicit OID receive a

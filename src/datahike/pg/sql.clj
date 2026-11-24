@@ -13,7 +13,8 @@
                               | {:type :insert :tx-data [...]}
                               | {:type :system :result QueryResult}
                               | {:type :error :message str}"
-  (:require [clojure.set :as set]
+  (:require [clojure.edn :as edn]
+            [clojure.set :as set]
             [clojure.string :as str]
             [datahike.api :as d]
             [datahike.query :as dq]
@@ -270,10 +271,19 @@
                       (stmt/translate-select owned-select schema db))
           aliases (:find-aliases validated)
           typmods (view-select-typmods owned-select db aliases)
-          columns (mapv (fn [name oid typmod]
-                          {:name name :oid (long (or oid types/oid-text))
-                           :typmod typmod})
-                        aliases (:select-item-oids validated) typmods)
+          definition (str owned-select)
+          existing-view (when (and replace? existing-eid) (d/entity db existing-eid))
+          existing-columns (when (= definition (get existing-view view-definition-attr))
+                             (some-> (get existing-view view-columns-attr) edn/read-string))
+          columns (mapv (fn [index name oid typmod]
+                          (let [existing (nth existing-columns index nil)
+                                enum-as-text? (and (= name (:name existing))
+                                                   (= types/oid-text (:oid existing))
+                                                   (pgs/enum-name-for-oid db oid))]
+                            {:name name
+                             :oid (long (if enum-as-text? types/oid-text (or oid types/oid-text)))
+                             :typmod typmod}))
+                        (range) aliases (:select-item-oids validated) typmods)
           duplicate-name (some (fn [[name n]] (when (> n 1) name))
                                (frequencies aliases))]
       (when duplicate-name
@@ -304,7 +314,7 @@
                     true
                     (conj {:db/id (or existing-eid (str (gensym "view-")))
                            view-name-attr view-name
-                           view-definition-attr (str owned-select)
+                           view-definition-attr definition
                            view-columns-attr (pr-str columns)}))}))))
 
 ;; Statement-level translation lives in datahike.pg.sql.stmt; parse-sql
@@ -722,12 +732,14 @@
                                         (or (types/dh-type-for-oid oid) :db.type/string))
                                 attr (keyword table-name alias)
                                 pg-type (get types/oid->pg-type-marker oid)
+                                enum-name (pgs/enum-name-for-oid db oid)
                                 typmod (nth ctas-column-typmods idx nil)]
                             {:alias alias :attr attr :oid oid :vtype vtype
                              :schema (cond-> {:db/ident attr
                                               :db/valueType vtype
                                               :db/cardinality :db.cardinality/one}
                                        pg-type (assoc :pg/type pg-type)
+                                       enum-name (assoc :datahike.pg/enum-of enum-name)
                                        (and typmod (not= typmod -1)) (assoc :pg/typmod typmod)
                                        (:temp? base) (assoc :db/noHistory true))}))
                         (range) aliases)
