@@ -477,6 +477,23 @@
     (is (empty? (query-rows c "SELECT typname FROM pg_type WHERE typname = 'rejected_domain'")))
     (is (false? (exec! c "CREATE DOMAIN rejected_domain AS integer DEFAULT NULL CHECK (VALUE > 0)")))))
 
+(deftest a-domain-requires-a-real-base-type-before-it-is-registered
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [[base state] [["no_such_type" "42704"]
+                          ["anyelement" "42804"]
+                          ["integer COLLATE \"C\"" "42804"]
+                          ["numeric(0, 3)" "22023"]]]
+      (let [sql (str "CREATE DOMAIN tested_base AS " base)
+            error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)))
+    (is (= [[nil]] (query-rows c "SELECT to_regtype('tested_base')")))
+    (exec! c "CREATE DOMAIN tested_base AS pg_catalog.int4 CHECK (VALUE > 0)")
+    (exec! c "CREATE DOMAIN tested_float AS double precision")
+    (exec! c "CREATE TABLE typed_domains (a tested_base, b tested_float)")
+    (exec! c "INSERT INTO typed_domains VALUES (1, 1.5)")
+    (is (= [["2" "2.5"]]
+           (mapv #(mapv str %) (query-rows c "SELECT a + 1, b + 1 FROM typed_domains"))))))
+
 (deftest derived-domains-keep-the-scalar-storage-and-inherited-constraints
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN base_level AS integer NOT NULL CHECK (VALUE > 0)")

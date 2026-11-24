@@ -18,6 +18,7 @@
    DOMAIN headers before tables, so the round trip preserves the
    full schema."
   (:require [clojure.string :as str]
+            [datahike.pg.sql.classify :as classify]
             [datahike.pg.sql.database :as database]))
 
 ;; ============================================================================
@@ -360,6 +361,27 @@
                (case kw "case" (inc cases) "end" (dec cases) cases)
                (conj expression tok))))))
 
+(defn- domain-base-sql [sql]
+  (let [after-name (loop [tokens (drop 3 (classify/tokenize sql))]
+                     (if (= "." (:text (first tokens)))
+                       (recur (nnext tokens))
+                       tokens))
+        tokens (if (= "as" (some-> (first after-name) :text str/lower-case))
+                 (next after-name)
+                 after-name)
+        start (:pos (first tokens))]
+    (when start
+      (loop [[token & more] tokens, depth 0]
+        (let [word (when (= :ident (:type token)) (str/lower-case (:text token)))
+              text (:text token)]
+          (if (or (nil? token)
+                  (and (zero? depth)
+                       (or (= ";" text)
+                           (contains? #{"constraint" "check" "not" "null" "default" "collate"} word)
+                           (contains? invalid-domain-clauses word))))
+            (str/trim (subs sql start (or (:pos token) (count sql))))
+            (recur more (case text "(" (inc depth) ")" (dec depth) depth))))))))
+
 (defn parse-create-domain
   "Parse `CREATE DOMAIN [schema.]name AS <base-type> [<modifiers>...]`.
 
@@ -404,6 +426,7 @@
            seen-default? false
            out {:domain-name domain-name
                 :base-type   base-type
+                :base-sql    (domain-base-sql original-sql)
                 :base-args   base-args
                 :original-sql original-sql
                 :not-null    false}]
@@ -424,6 +447,10 @@
           (let [[name-tok & rest-ts] rest-ts
                 check-name (when (= :ident (first name-tok)) (second name-tok))]
             (recur rest-ts seen-nullability? seen-default? (assoc out :check-name check-name)))
+
+          (= "collate" kw)
+          (let [[collation after] (consume-name rest-ts)]
+            (recur after seen-nullability? seen-default? (assoc out :collation collation)))
 
           (= "check" kw)
           (let [[inside after] (collect-balanced-parens rest-ts)]

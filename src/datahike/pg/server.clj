@@ -11841,6 +11841,27 @@
      check-expr              (assoc :datahike.pg.domain/check-expr check-expr)
      default-raw             (assoc :datahike.pg.domain/default-raw default-raw))])
 
+(defn- resolve-domain-base [db {:keys [base-sql base-type collation] :as domain}]
+  (let [oid (regoid/type-oid db base-sql)
+        {:keys [typname typtype typcollation typcategory namespace-oid]}
+        (regoid/type-identity db {:oid oid})]
+    (when (= "p" typtype)
+      (throw (ex-info (str "\"" base-sql "\" is not a valid base type for a domain")
+                      {:sqlstate "42804" :error :datatype-mismatch})))
+    (when (and collation (= 0 typcollation))
+      (throw (ex-info (str "collations are not supported by type " (types/format-type oid -1))
+                      {:sqlstate "42804" :error :datatype-mismatch})))
+    ;; Canonicalize a built-in scalar when the short legacy parser would
+    ;; otherwise store a qualifier or omit part of a multiword type.
+    (if (and (= 11 namespace-oid) (not= "A" typcategory)
+             (or (str/includes? base-type ".")
+                 (not= oid (pgs/resolve-type-oid db base-type))))
+      (let [[_ raw-args] (re-find #"\(([^()]*)\)" base-sql)
+            args (when (and raw-args (not= "float" base-type))
+                   (mapv str/trim (str/split raw-args #",")))]
+        (assoc domain :base-type typname :base-args args))
+      domain)))
+
 (defn- exec-ddl-create-domain
   [ctx parsed]
   (let [{:keys [conn tx-state session-id]} ctx
@@ -11856,7 +11877,8 @@
           (classified-error ""
                             (ex-info (str "type " (pr-str domain-name) " already exists")
                                      {:error :duplicate-object :sqlstate "42710"}))
-          (let [{:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
+          (let [domain (resolve-domain-base db domain)
+                {:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
                 create-data
                 (into (vec tx-data)
                       (concat
