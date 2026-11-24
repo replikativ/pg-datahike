@@ -279,13 +279,11 @@
      (when relation
        (cond-> []
          (not (.getBoolean row "schema_usage")) (conj {:reason :missing-schema-usage})
-         (= "pgdh_mirror" schema) (conj {:reason :reserved-schema})
+         (or (#{"pgdh_mirror" "information_schema"} schema) (str/starts-with? schema "pg_"))
+         (conj {:reason :reserved-schema})
          (.getBoolean row "has_filter") (conj {:reason :row-filter})
          (and (= "p" (.getString row "relkind")) (nil? leaves))
          (conj {:reason :root-partition-routing})
-         (and (not= "public" schema) (not= "pgdh_mirror" schema))
-         (conj {:reason (if (or leaves (.getBoolean row "relispartition"))
-                          :partition-schema :table-schema)})
          (.getBoolean row "partition_detach_pending") (conj {:reason :partition-detach-pending})
          (not (#{"r" "p"} (.getString row "relkind"))) (conj {:reason :relation-kind})
          (not= "p" (.getString row "relpersistence")) (conj {:reason :nonpermanent-table})
@@ -775,8 +773,28 @@
                 db catalog-objects/pg-class-oid (pgs/storage-table-oid db (:name table))))
       tx)))
 
+(def ^:private publisher-relation-attr :datahike.pg.mirror/publisher-relation-oid)
+
+(defn- publisher-relation-tx [db {:keys [name relation-id] :as table}]
+  (let [oid (pgs/storage-table-oid db name)
+        object (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid)
+        eid (:db/id object)
+        previous (when eid (get (d/entity db eid) publisher-relation-attr))]
+    (require! (and eid (or (nil? previous) (= relation-id previous)))
+              "Local relation does not match the publisher relation"
+              {:table (relation-name table) :publisher-oid relation-id :previous previous})
+    (cond-> []
+      (not (contains? (dbi/-schema db) publisher-relation-attr))
+      (conj {:db/ident publisher-relation-attr :db/valueType :db.type/long
+             :db/cardinality :db.cardinality/one})
+
+      (nil? previous)
+      (conj [:db/add eid publisher-relation-attr relation-id]))))
+
 (defn- set-column-metadata! [destination table]
-  (stage-data! destination #(column-metadata-tx % table)))
+  (stage-data! destination (fn [db]
+                             (into (publisher-relation-tx db table)
+                                   (column-metadata-tx db table)))))
 
 (defn- key-columns [table]
   (sort-by #(or (:key-position %) (:attnum %)) (filter :key? (:columns table))))
@@ -802,15 +820,16 @@
 
 (defn- drop-identity-index! [destination table]
   (when-let [index (separate-identity-index table)]
-    (sink-execute! destination (str "DROP INDEX " (ident (:name index))))))
+    (sink-execute! destination (str "DROP INDEX " (relation-name (assoc table :name (:name index)))))))
 
 (defn- install-primary-key! [destination table]
   (let [name (:primary-key-name table)]
     (create-unique-index! destination table name (key-columns table))
     (stage-data! destination
                  (fn [db]
-                   (let [object (catalog-objects/object-by-identity
-                                 db catalog-objects/pg-class-oid catalog-objects/public-namespace-oid name)]
+                   (let [namespace (catalog-objects/namespace-by-name db (:schema table))
+                         object (catalog-objects/object-by-identity db catalog-objects/pg-class-oid
+                                                                    (:datahike.pg.object/oid namespace) name)]
                      (require! (= :index (:datahike.pg.object/kind object))
                                "Missing replacement primary index" {:table (relation-name table)})
                      [[:db/add (:db/id object) :datahike.pg.index/primary? true]])))))
@@ -1001,6 +1020,15 @@
 (defn- new-slot-name [prefix]
   (str prefix "_" (str/replace (str (UUID/randomUUID)) "-" "")))
 
+(defn- install-schemas! [destination tables]
+  (doseq [schema (distinct (map :schema tables)) :when (not= "public" schema)]
+    (sink-execute! destination (str "CREATE SCHEMA IF NOT EXISTS " (ident schema)))))
+
+(defn- fresh-storage-name [occupied {:keys [schema name]}]
+  (if (or (not= "public" schema) (contains? occupied name))
+    (new-slot-name "pgdh_relation")
+    name))
+
 (defn- set-table-name! [destination storage-name logical-name]
   (stage-data! destination
                (fn [db]
@@ -1014,9 +1042,9 @@
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         retired (:retired-storage manifest)
         place (fn [table]
-                (cond-> table
-                  (contains? retired (:name table))
-                  (assoc :storage-name (new-slot-name "pgdh_relation"))))]
+                (let [storage (fresh-storage-name retired table)]
+                  (cond-> table
+                    (not= storage (:name table)) (assoc :storage-name storage))))]
     (with-slot-snapshot!
       replication source slot false failover?
       (fn [end-lsn]
@@ -1029,6 +1057,7 @@
           (transaction!
            destination
            (fn []
+             (install-schemas! destination (concat tables parents))
              (install-types! destination (:types manifest))
              (doseq [table tables]
                (check-running!)
@@ -1435,19 +1464,58 @@
 (defn- partition-relation? [{:keys [partition-parent partition-leaves]}]
   (or partition-parent partition-leaves))
 
-(defn- plan-publication-removals [previous current removed]
+(defn- mirrored-index-names [table]
+  (cond-> {}
+    (seq (key-columns table))
+    (assoc :primary (or (:primary-key-name table) (str (:name table) "_pkey")))
+
+    (separate-identity-index table)
+    (assoc :replica-identity (:name (:identity-index table)))))
+
+(defn- frozen-index-conflict? [db active-names table kind index-name]
+  (let [schema (:schema table)
+        claimed? #(contains? active-names [schema %])]
+    (if (= :primary kind)
+      (let [native-name (str (:name table) "_pkey")]
+        ;; A native single-column primary key follows the local table name in
+        ;; older stores, even when the publisher kept its original key name.
+        (when (or (claimed? index-name) (claimed? native-name))
+          (if (= native-name index-name)
+            true
+            (let [storage (:name (storage-table table))
+                  relation-oid (pgs/storage-table-oid db storage)
+                  explicit-oid (catalog-objects/primary-index-oid db relation-oid)]
+              (claimed? (if explicit-oid index-name native-name))))))
+      (claimed? index-name))))
+
+(defn- plan-publication-removals [db previous current removed]
   (let [active (relations-by-id current)
-        active-names (into #{} (map :name) (vals active))
+        active-names (into #{}
+                           (mapcat (fn [{:keys [schema name] :as table}]
+                                     (map #(vector schema %) (cons name (vals (mirrored-index-names table))))))
+                           (vals active))
         frozen (into (:unpublished-tables previous {})
                      (comp (remove partition-relation?) (map (juxt :relation-id identity)))
                      removed)]
-    (reduce-kv (fn [plan id table]
-                 (cond
-                   (contains? active id) plan
-                   (contains? active-names (:name table)) (update plan :retire conj table)
-                   :else (assoc-in plan [:retain id] table)))
-               {:retain {} :retire (filterv partition-relation? removed)}
-               frozen)))
+    (reduce-kv
+     (fn [plan id {:keys [schema name released-indexes] :as table}]
+       (cond
+         (contains? active id) plan
+         (contains? active-names [schema name]) (update plan :retire conj table)
+         :else
+         (let [release (into #{}
+                             (keep (fn [[kind index-name]]
+                                     (when (and (not (contains? released-indexes kind))
+                                                (frozen-index-conflict? db active-names table kind index-name))
+                                       kind)))
+                             (mirrored-index-names table))]
+           (if (seq release)
+             (-> plan
+                 (update :release-indexes conj [table release])
+                 (assoc-in [:retain id] (update table :released-indexes (fnil into #{}) release)))
+             (assoc-in plan [:retain id] table)))))
+     {:retain {} :retire (filterv partition-relation? removed) :release-indexes []}
+     frozen)))
 
 (defn- wire-table [table]
   (update (select-keys table [:schema :name :relation-id :columns])
@@ -1491,7 +1559,7 @@
 (defn- same-table? [previous current]
   (if (every? :attnum (:columns previous))
     (let [shape #(dissoc % :storage-name :primary-key-name :partition-leaves :partition-parent
-                         :partition-key :partition-bound :columns)
+                         :partition-key :partition-bound :released-indexes :columns)
           columns (fn [table] (mapv #(dissoc % :key-position :user-type) (:columns table)))]
       (and current (= (shape previous) (shape current))
            (= (columns previous) (columns current))
@@ -1531,22 +1599,18 @@
                            (all-relations current))]
       (mapv (fn [table]
               (let [prior (get before (:relation-id table))
-                    storage (if prior
-                              (:name (storage-table prior))
-                              (if (contains? occupied (:name table))
-                                (new-slot-name "pgdh_relation")
-                                (:name table)))]
+                    storage (if prior (:name (storage-table prior)) (fresh-storage-name occupied table))]
                 (when (and prior (not (same-table? prior table)))
                   (require! allow-schema-refresh?
                             "Publication schema or membership changed" {:table (relation-name prior)})
-                  (require! (and (or (every? :attnum (:columns prior)) (same-table? prior table))
-                                 (= (:schema prior) (:schema table)))
-                            "Schema refresh requires a known column layout and the same schema"
+                  (require! (or (every? :attnum (:columns prior)) (same-table? prior table))
+                            "Schema refresh requires a known column layout"
                             {:table (relation-name table)}))
                 ;; A legacy checkpoint knows the wire order. Identical wire
                 ;; layout lets us assign the current attnums before staging.
                 {:table table
                  :storage-name storage
+                 :stage-storage-name (fresh-storage-name #{} table)
                  :previous (if (and prior (not-every? :attnum (:columns prior)))
                              (update prior :columns
                                      (fn [columns]
@@ -1933,15 +1997,19 @@
   (sink-execute! destination "SET DateStyle = 'ISO, YMD'")
   (sink-execute! destination "SET TIME ZONE 'UTC'"))
 
+(defn- with-stage-storage [{:keys [table stage-storage-name]}]
+  (assoc table :storage-name stage-storage-name))
+
 (defn- copy-snapshot! [source destination changes check-running! on-bytes]
-  (let [relations (mapv :table changes)]
+  (let [relations (mapv with-stage-storage changes)]
     (transaction!
      destination
      (fn []
+       (install-schemas! destination relations)
        (install-types! destination (publisher-types relations))
        (doseq [table relations]
          (check-running!)
-         (create-table! destination table))
+         (create-table! destination (storage-table table)))
        (doseq [table relations :when (nil? (:partition-leaves table))]
          (check-running!)
          (copy-table! source destination table on-bytes))))))
@@ -1964,6 +2032,10 @@
                           (copy-snapshot! source destination changes check-running! on-bytes)
                           position))
               expected (into {} (map (juxt :relation-id identity)) tables)
+              staged-relations (into {} (map (fn [change]
+                                               [(:relation-id (:table change))
+                                                (storage-table (with-stage-storage change))]))
+                                     changes)
               included? (set (keys expected))]
           (reset! phase :catching-up)
           (stream! (replication-copy replication slot (or leaf-publication publication) end-lsn)
@@ -1979,7 +2051,7 @@
                                (when (seq relation-ids)
                                  (on-bytes bytes)
                                  (transaction! destination
-                                               #(run! (fn [change] (apply-change! destination expected change)) changes)))
+                                               #(run! (fn [change] (apply-change! destination staged-relations change)) changes)))
                                (contains? barriers barrier))}))))))
 
 (defn- open-stage-store []
@@ -2031,7 +2103,8 @@
   ;; to a fresh storage name if the publisher later reuses the SQL name.
   (let [storage (:name (storage-table table))
         retired-name (new-slot-name "pgdh_retired")]
-    (drop-identity-index! destination table)
+    (when-not (contains? (:released-indexes table) :replica-identity)
+      (drop-identity-index! destination table))
     (stage-data!
      destination
      (fn [db]
@@ -2039,7 +2112,9 @@
              object (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid)
              eid (:db/id object)
              row-type (catalog-objects/object-by-identity
-                       db catalog-objects/pg-type-oid catalog-objects/public-namespace-oid (:name table))
+                       db catalog-objects/pg-type-oid
+                       (catalog-objects/object-namespace-oid db object)
+                       (:datahike.pg.object/name object))
              primary (catalog-objects/primary-index-oid db oid)
              entity (d/entity db eid)
              attr :datahike.pg.partition/retired-storage
@@ -2100,62 +2175,101 @@
                      (filter retraction? rename-ops)
                      (remove retraction? rename-ops)))))
 
+(defn- move-table-namespaces! [destination changes]
+  (when-let [moves (seq (remove #(= (:from %) (:to %)) changes))]
+    (stage-data!
+     destination
+     (fn [db]
+       (let [operations
+             (mapcat
+              (fn [{:keys [storage to]}]
+                (let [table (catalog-objects/object-by-storage-name db storage)
+                      target (:datahike.pg.object/oid (catalog-objects/namespace-by-name db to))]
+                  (require! (and table target) "Missing local table or schema at cutover"
+                            {:storage storage :schema to})
+                  (mapcat #(catalog-objects/move-relation-object-tx % target)
+                          (catalog-objects/table-namespace-objects db table))))
+              moves)
+             retract? #(= :db/retract (first %))]
+         ;; Publisher transactions can swap tables, including identically
+         ;; named indexes, by moving through a third schema.
+         (into (filterv retract? operations) (remove retract?) operations))))))
+
 (defn- install-staged-tables! [stage destination check-running! max-snapshot-bytes]
   (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
         stage-db (d/db (:conn stage))
-        {:keys [changes retire installed-manifest refresh-topology? type-plan]} stage
+        {:keys [changes retire release-indexes installed-manifest refresh-topology? type-plan]} stage
         {:keys [additions removals edits]} type-plan
         renamed-labels (enum-renames edits)
         rekeys (filterv (fn [{:keys [table previous]}]
-                          (and previous (primary-key-changed? previous table)))
+                          (and previous
+                               (or (contains? (:released-indexes previous) :primary)
+                                   (primary-key-changed? previous table))))
                         changes)
         index-shape (fn [table]
                       (when-let [index (separate-identity-index table)]
                         [index (mapv #(select-keys % [:name :oid :typmod]) (identity-index-columns table))]))
         identity-index-changes (filterv (fn [{:keys [table previous]}]
-                                          (and previous (not= (index-shape previous) (index-shape table))))
+                                          (and previous
+                                               (or (contains? (:released-indexes previous) :replica-identity)
+                                                   (not= (index-shape previous) (index-shape table)))))
                                         changes)
         renames (into []
                       (keep (fn [{:keys [table previous storage-name]}]
-                              (when (and previous (not= (:name previous) (:name table)))
-                                [storage-name (:name table)])))
+                              (when (and previous (not= (relation-name previous) (relation-name table)))
+                                {:storage storage-name :name (:name table)
+                                 :from (:schema previous) :to (:schema table)})))
                       changes)]
     (with-open [staged (pg/make-query-handler (:conn stage))]
       (set-copy-format! staged)
+      (doseq [[table release] release-indexes]
+        (check-running!)
+        ;; Frozen rows and their publisher key metadata remain available for
+        ;; history and republishing. Only the conflicting live indexes go.
+        (when (contains? release :replica-identity)
+          (drop-identity-index! destination table))
+        (when (contains? release :primary)
+          (drop-primary-key! destination (storage-table table))))
       (doseq [table retire]
         (check-running!)
         (retire-table! destination table))
       ;; A table's row type also occupies a type name. Free the old table
       ;; names before installing types while using storage names for apply.
-      (doseq [[storage] renames]
+      (doseq [{:keys [storage]} renames]
         (set-table-name! destination storage (new-slot-name "pgdh_rename")))
+      (install-schemas! destination (map :table changes))
       (when (or (seq removals) (some (fn [[old current]] (not= (:name old) (:name current))) (vals edits)))
         (stage-data! destination #(update-type-names-tx % removals edits)))
       (install-types! destination additions)
       (doseq [[old current :as change] (vals edits)]
         (when (not= (dissoc old :name) (dissoc current :name))
           (stage-data! destination #(refresh-type-tx % change))))
-      (doseq [{:keys [previous]} identity-index-changes]
+      (doseq [{:keys [previous]} identity-index-changes
+              :when (not (contains? (:released-indexes previous) :replica-identity))]
         (check-running!)
         (drop-identity-index! destination previous))
-      (doseq [{:keys [previous storage-name]} rekeys :when (seq (key-columns previous))]
+      (doseq [{:keys [previous storage-name]} rekeys
+              :when (and (seq (key-columns previous))
+                         (not (contains? (:released-indexes previous) :primary)))]
         (check-running!)
         (drop-primary-key! destination (assoc previous :name storage-name)))
-      (doseq [{:keys [table previous storage-name]} changes :when previous]
+      (doseq [{:keys [table previous storage-name stage-storage-name]} changes :when previous]
         (check-running!)
-        (let [live-table (assoc table :name storage-name)]
-          (adapt-layout! destination stage-db previous live-table table)
+        (let [staged-table (assoc table :name stage-storage-name)
+              live-table (assoc table :name storage-name :schema (:schema previous))]
+          (adapt-layout! destination stage-db previous live-table staged-table)
           (when-not (:partition-leaves table)
-            (reconcile-table! destination stage-db table live-table previous renamed-labels check-running!))
+            (reconcile-table! destination stage-db staged-table live-table previous renamed-labels check-running!))
           (set-column-metadata! destination live-table)))
-      (doseq [[storage logical] renames]
-        (set-table-name! destination storage logical))
-      (doseq [{:keys [table previous storage-name]} changes :when (nil? previous)]
+      (move-table-namespaces! destination renames)
+      (doseq [{:keys [storage name]} renames]
+        (set-table-name! destination storage name))
+      (doseq [{:keys [table previous storage-name stage-storage-name]} changes :when (nil? previous)]
         (check-running!)
         (let [live-table (assoc table :name storage-name)]
           (create-table! destination live-table)
           (when-not (:partition-leaves table)
-            (transfer-staged-table! staged destination table live-table on-bytes))
+            (transfer-staged-table! staged destination (assoc table :name stage-storage-name) live-table on-bytes))
           (when (not= storage-name (:name table))
             (set-table-name! destination storage-name (:name table)))))
       ;; Relation and index names share a PostgreSQL namespace. Install
@@ -2219,9 +2333,9 @@
             current
             (vals retained-types))))
 
-(defn- installation-plan [previous current affected schema-refresh?]
+(defn- installation-plan [db previous current affected schema-refresh?]
   (let [removed (removed-relations previous current)
-        {:keys [retain retire] :as removal-plan} (plan-publication-removals previous current removed)
+        {:keys [retain retire release-indexes] :as removal-plan} (plan-publication-removals db previous current removed)
         retained (retain-unpublished-types previous current retain)
         retiring-ids (into #{} (map :relation-id) retire)
         active-before (remove #(contains? retiring-ids (:relation-id %)) (all-relations previous))
@@ -2234,6 +2348,7 @@
      :changes changes
      :removed removed
      :retire retire
+     :release-indexes release-indexes
      :type-plan type-plan
      :refresh-topology? (or (seq (:partition-parents previous)) (seq (:partition-parents current)))}))
 
@@ -2292,7 +2407,7 @@
                         {:snapshot position :checkpoint end-lsn})
               (let [current (publication-manifest source config (:types previous) true)
                     affected (into #{} (map :relation-id) (all-relations current))
-                    {:keys [changes] :as plan} (installation-plan previous current affected schema-refresh?)
+                    {:keys [changes] :as plan} (installation-plan (d/db conn) previous current affected schema-refresh?)
                     gap (merge (dissoc pending :slot)
                                (dissoc status :state) {:snapshot-lsn position
                                                        :from-timeline (get-in saved [:origin :timeline])
@@ -2333,7 +2448,7 @@
     (swap! state assoc :last-recovery (peek (get-in saved [:manifest :recovery-gaps])))
     {:saved (retire-replaced-slots! source destination saved state failover?) :info info}))
 
-(defn- consume! [copy source destination saved origin state confirmed-lsn check-running! ready! config]
+(defn- consume! [copy source conn destination saved origin state confirmed-lsn check-running! ready! config]
   (let [{:keys [manifest end-lsn slot]} saved
         {:keys [max-snapshot-bytes schema-refresh? failover?]} config
         origin-update (volatile! (when (not= (:origin saved) origin) origin))
@@ -2358,9 +2473,9 @@
                      (if-let [active @stage]
                        (require-stable-manifest! (:source-manifest active) current)
                        (let [affected (partition-affected @applied current)
-                             {:keys [changes removed type-plan] :as install}
-                             (installation-plan @applied current affected schema-refresh?)]
-                         (when (or (seq changes) (seq removed) (some seq (vals type-plan)))
+                             {:keys [changes removed release-indexes type-plan] :as install}
+                             (installation-plan (d/db conn) @applied current affected schema-refresh?)]
+                         (when (or (seq changes) (seq removed) (seq release-indexes) (some seq (vals type-plan)))
                            (doseq [{:keys [table previous]} changes
                                    :when (and previous (nil? (:partition-leaves table)))]
                              (matching-key-indexes! previous table))
@@ -2552,7 +2667,7 @@
               ;; positions. Recheck once the COPY has exclusive slot ownership.
               (check-slot-confirmation! saved acquired-info)
               (publish-status! state acquired-info)
-              (consume! copy source destination saved origin state (:confirmed-lsn acquired-info)
+              (consume! copy source conn destination saved origin state (:confirmed-lsn acquired-info)
                         check-running! ready! config))
             (catch SQLException error
               ;; Replication can report slot loss before the SQL status poll.

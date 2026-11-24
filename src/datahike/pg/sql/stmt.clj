@@ -3723,6 +3723,9 @@
   (let [logical (unquote-ident (.getName table))
         namespace (some-> (.getSchemaName table) unquote-ident)
         storage (ctx/table-storage-name logical namespace)]
+    (when (ctx/system-relation-schema? namespace)
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "writes to system relations"})))
     (when-not (stored-relation-known? schema storage)
       (throw (errors/pg-error :undefined-table {:table logical})))
     [logical storage]))
@@ -4242,34 +4245,35 @@
           (if (and db (instance? Table item))
             (let [^Table table item
                   view-name (unquote-ident (.getName table))
+                  relation-schema (some-> (.getSchemaName table) unquote-ident)
                   [definition columns-str partition?]
-                  ;; Resolve an unqualified owning temp relation before a
-                  ;; persisted view of the same name, as for ordinary tables.
-                  (when-not (and (contains? params/*temp-table-map* view-name)
-                                 (or (nil? (.getSchemaName table))
-                                     (= "pg_temp" (.getSchemaName table))))
+                  ;; Views and partition parents share relation lookup with tables.
+                  ;; An unqualified CTE or owning temp table shadows either.
+                  (when-not (and (nil? relation-schema)
+                                 (or (contains? params/*temp-table-map* view-name)
+                                     (contains? *cte-namespaces* view-name)))
                     (or
                      (when (and (contains? schema :datahike.pg.partition/definition)
-                                (not (params/only-table-reference? table))
-                                (not (contains? *cte-namespaces* view-name))
-                                (or (nil? (.getSchemaName table))
-                                    (= "public" (unquote-ident (.getSchemaName table)))))
-                       (when-let [oid (pgs/table-oid db view-name)]
-                         (let [query (d/q '[:find ?definition .
-                                            :in $ ?oid
-                                            :where [?e :datahike.pg.object/oid ?oid]
-                                            [?e :datahike.pg.partition/definition ?definition]]
-                                          db oid)]
-                           (when (seq query) [query nil oid]))))
-                     (first
-                      (d/q '{:find [?definition ?columns]
-                             :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
-                             :where [[?e ?name-attr ?view-name]
-                                     [?e ?definition-attr ?definition]
-                                     [?e ?columns-attr ?columns]]}
-                           db :datahike.pg/view-name
-                           :datahike.pg/view-definition
-                           :datahike.pg/view-columns view-name))))]
+                                (not (params/only-table-reference? table)))
+                       (when-let [storage (ctx/table-storage-name view-name relation-schema false)]
+                         (when-let [oid (pgs/storage-table-oid db storage)]
+                           (let [query (d/q '[:find ?definition .
+                                              :in $ ?oid
+                                              :where [?e :datahike.pg.object/oid ?oid]
+                                              [?e :datahike.pg.partition/definition ?definition]]
+                                            db oid)]
+                             (when (seq query) [query nil oid])))))
+                     (when (and (or (nil? relation-schema) (= "public" relation-schema))
+                                (= view-name (ctx/table-storage-name view-name relation-schema false)))
+                       (first
+                        (d/q '{:find [?definition ?columns]
+                               :in [$ ?name-attr ?definition-attr ?columns-attr ?view-name]
+                               :where [[?e ?name-attr ?view-name]
+                                       [?e ?definition-attr ?definition]
+                                       [?e ?columns-attr ?columns]]}
+                             db :datahike.pg/view-name
+                             :datahike.pg/view-definition
+                             :datahike.pg/view-columns view-name)))))]
               (if definition
                 (let [columns (try (edn/read-string columns-str)
                                    (catch Exception _ nil))
@@ -10879,6 +10883,8 @@
                :where-expr where-expr}
         (not= storage raw-table)
         (assoc :logical-target raw-table)
+        (.getSchemaName ^Table table)
+        (assoc :target-schema (unquote-ident (.getSchemaName ^Table table)))
         (seq using)
         (assoc :from-sql (str/join ", " (map str using))
                :from-aliases from-names
@@ -11096,6 +11102,8 @@
              :assignments assignments}
       (not= storage raw-table)
       (assoc :logical-target raw-table)
+      (.getSchemaName ^Table table)
+      (assoc :target-schema (unquote-ident (.getSchemaName ^Table table)))
       (.getReturningClause update)
       (assoc :returning (extract-returning (.getReturningClause update))))))
 
@@ -11443,8 +11451,10 @@
                         (translate-cte-branch anchor cte-name col-names rule-vars
                                               rule-name schema db nil))
         recursive-result (when recursive
-                           (translate-cte-branch recursive cte-name col-names rule-vars
-                                                 rule-name schema db virtual-cte-schema))
+                           (binding [ctx/*relation-namespaces* (assoc ctx/*relation-namespaces*
+                                                                      (unquote-ident cte-name) cte-name)]
+                             (translate-cte-branch recursive cte-name col-names rule-vars
+                                                   rule-name schema db virtual-cte-schema)))
         rule-head (apply list rule-name rule-vars)
         rule (cond-> []
                anchor-result    (conj (into [rule-head] (:clauses anchor-result)))
@@ -11591,7 +11601,9 @@
           materialized (materialize-output-schema!
                         db target-name target-name anchor-columns)
           recursive-parsed
-          (binding [*cte-relations* #{(str/lower-case target-name)}]
+          (binding [*cte-relations* #{(str/lower-case target-name)}
+                    ctx/*relation-namespaces* (assoc ctx/*relation-namespaces*
+                                                     target-name target-name)]
             (translate-select recursive (:schema materialized) (:db materialized)))
           recursive-columns
           (visible-output-columns recursive-parsed (mapv :name anchor-columns))]
@@ -11646,7 +11658,7 @@
                (let [from-item     (.getFromItem anchor)
                      joins         (.getJoins anchor)
                      default-table (when (instance? Table from-item)
-                                     (unquote-ident (.getName ^Table from-item)))
+                                     (params/inference-table-name from-item))
                      table-aliases (params/collect-table-aliases from-item joins)
                      oid-env {:db db :schema schema
                               :table-aliases table-aliases
@@ -11892,7 +11904,9 @@
                                    (range (count col-names)))
                 schema-tx (recursive-schema-tx target-name col-names col-types row-marker col-array-elems col-pg-types)
                 spec0 (checked-db-with db schema-tx)
-                rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
+                rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}
+                                     ctx/*relation-namespaces* (assoc ctx/*relation-namespaces*
+                                                                      target-name target-name)]
                              (translate-select recursive (:schema spec0) spec0))]
             {:db spec0 :schema (:schema spec0) :name target-name
              :alias target-name :aliases col-names
@@ -11922,7 +11936,9 @@
                 coercions (mapv recursive-coercion col-types)
                 schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
                 spec0 (checked-db-with (checked-db-with db schema-tx) (mk-data-tx coercions anchor-rows))
-                rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
+                rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}
+                                     ctx/*relation-namespaces* (assoc ctx/*relation-namespaces*
+                                                                      target-name target-name)]
                              (translate-select recursive (:schema spec0) spec0))]
             (loop [cur spec0, seen (set anchor-rows), i 0]
               (params/check-cancel!)

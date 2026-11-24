@@ -166,6 +166,10 @@
   []
   (into built-in-catalog-tables (keys @extra-catalog-tables)))
 
+(defn catalog-table? [name]
+  (or (contains? built-in-catalog-tables name)
+      (contains? @extra-catalog-tables name)))
+
 (defn catalog-table-name
   "Normalize a JSqlParser Table node to the internal catalog key used
    by `catalog-tables` / `catalog-schema-for` / `catalog-data-for`.
@@ -188,9 +192,8 @@
                    (str/lower-case (unquote-ident s)))
           normalized (cond
                        (= schema "information_schema") (str "information_schema_" raw)
-                       (= schema "pg_catalog")          raw
-                       :else                            raw)]
-      (when (contains? (catalog-tables) normalized) normalized))))
+                       (or (nil? schema) (= schema "pg_catalog")) raw)]
+      (when (catalog-table? normalized) normalized))))
 
 ;; ============================================================================
 ;; Catalog registry
@@ -243,6 +246,17 @@
 
 (declare catalog-schema-for* catalog-data-for* built-in-catalog-tables)
 
+(defn- storage-schema-oid [db storage]
+  (or (some->> (catalog-objects/object-by-storage-name db storage)
+               (catalog-objects/object-namespace-oid db))
+      catalog-objects/public-namespace-oid))
+
+(defn- storage-schema-name [db storage]
+  (let [oid (storage-schema-oid db storage)]
+    (if (= oid catalog-objects/public-namespace-oid)
+      "public"
+      (:datahike.pg.object/name (catalog-objects/namespace-by-oid db oid)))))
+
 (defn- constraint-oid [kind name table]
   ;; Tag the high bit to avoid collisions with table OIDs.
   (bit-or 0x50000000
@@ -270,7 +284,7 @@
                                       :pg_constraint/contype "n"
                                       :pg_constraint/conindid 0
                                       :pg_constraint/conrelid relid
-                                      :pg_constraint/connamespace 2200
+                                      :pg_constraint/connamespace (storage-schema-oid db table)
                                       :pg_constraint/confrelid 0
                                       :pg_constraint/condeferrable false
                                       :pg_constraint/condeferred false
@@ -1681,7 +1695,9 @@
              status (get-in db [:schema ident :db.secondary/status])
              logical-table (catalog-objects/public-relation-name db table)
              indexdef (str "CREATE " (when unique? "UNIQUE ")
-                           "INDEX " (fns/quote-identifier name) " ON public." (fns/quote-identifier logical-table)
+                           "INDEX " (fns/quote-identifier name) " ON "
+                           (fns/quote-identifier (storage-schema-name db table)) "."
+                           (fns/quote-identifier logical-table)
                            " USING " method " ("
                            (if legacy-incomplete?
                              "/* legacy key metadata unavailable; DROP and recreate */"
@@ -1755,7 +1771,8 @@
         :primary? primary?
         :unique? unique?
         :indexdef (str "CREATE " (when unique? "UNIQUE ") "INDEX " (fns/quote-identifier idx-name)
-                       " ON public." (fns/quote-identifier table-name)
+                       " ON " (fns/quote-identifier (storage-schema-name db tname)) "."
+                       (fns/quote-identifier table-name)
                        " USING btree (" (fns/quote-identifier (:name col)) ")")}))))
 
 (defn- attribute-storage [oid]
@@ -2028,7 +2045,8 @@
                            logical-name (or (:name identity) t)
                            row-type (catalog-objects/object-by-identity
                                      cte-db catalog-objects/pg-type-oid
-                                     catalog-objects/public-namespace-oid logical-name)]
+                                     (or (:namespace-oid identity) catalog-objects/public-namespace-oid)
+                                     logical-name)]
                        (cond-> {:pg_class/oid (long tbl-oid)
                                 :pg_class/relname logical-name
                                 :pg_class/relnamespace (or (:namespace-oid identity) 2200)
@@ -2100,7 +2118,7 @@
             (mapv (fn [object]
                     {:pg_class/oid (:datahike.pg.object/oid object)
                      :pg_class/relname (:datahike.pg.object/name object)
-                     :pg_class/relnamespace 2200
+                     :pg_class/relnamespace (catalog-objects/object-namespace-oid cte-db object)
                      :pg_class/relispartition false
                      :pg_class/relkind "i"
                      :pg_class/reltype 0
@@ -2111,10 +2129,10 @@
         ;; joins pg_class a second time to read the index's name out of
         ;; them. Same descriptors pg_index and pg_indexes use, so the oid
         ;; it joins on and the name it reports cannot drift apart.
-            (mapv (fn [{:keys [oid name]}]
+            (mapv (fn [{:keys [oid name table]}]
                     {:pg_class/oid oid
                      :pg_class/relname name
-                     :pg_class/relnamespace 2200
+                     :pg_class/relnamespace (storage-schema-oid cte-db table)
                      :pg_class/relispartition false
                      :pg_class/relkind "i"
                      :pg_class/reltype 0
@@ -2210,9 +2228,10 @@
           row-types
           (mapv (fn [object]
                   (let [name (:datahike.pg.object/name object)
+                        namespace-oid (catalog-objects/object-namespace-oid cte-db object)
                         relation (catalog-objects/object-by-identity
                                   cte-db catalog-objects/pg-class-oid
-                                  catalog-objects/public-namespace-oid name)]
+                                  namespace-oid name)]
                     (merge
                      {:pg_type/oid (:datahike.pg.object/oid object)
                       :pg_type/typname name
@@ -2220,7 +2239,7 @@
                       :pg_type/typcategory "C" :pg_type/typispreferred false
                       :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid
                       (long (or (:datahike.pg.object/oid relation) 0))
-                      :pg_type/typdelim "," :pg_type/typnamespace 2200
+                      :pg_type/typdelim "," :pg_type/typnamespace namespace-oid
                       (pgs/row-marker-attr "pg_type") true}
                      record-type-io)))
                 (catalog-objects/objects-by-kind cte-db :row-type))
@@ -2532,7 +2551,7 @@
     (let [triggered (into #{} (map :table) (trigger-entities cte-db))
           names (catalog-objects/table-name-overrides cte-db)]
       (mapv (fn [t]
-              {:pg_tables/schemaname "public"
+              {:pg_tables/schemaname (storage-schema-name cte-db t)
                :pg_tables/tablename (get names t t)
                :pg_tables/tableowner "datahike"
                :pg_tables/tablespace "pg_default"
@@ -2894,7 +2913,7 @@
                                                (when identity? "BY DEFAULT"))]]
              (drop-nils
               {:information_schema_columns/table_catalog          "datahike"
-               :information_schema_columns/table_schema           "public"
+               :information_schema_columns/table_schema           (storage-schema-name cte-db tname)
                :information_schema_columns/table_name             (get names tname tname)
                :information_schema_columns/column_name            (:name col)
                :information_schema_columns/ordinal_position       pos
@@ -2945,7 +2964,7 @@
     (let [names (catalog-objects/table-name-overrides cte-db)]
       (mapv (fn [t]
               {:information_schema_tables/table_catalog "datahike"
-               :information_schema_tables/table_schema "public"
+               :information_schema_tables/table_schema (storage-schema-name cte-db t)
                :information_schema_tables/table_name (get names t t)
                :information_schema_tables/table_type "BASE TABLE"
                (pgs/row-marker-attr "information_schema_tables") true})
@@ -2990,7 +3009,7 @@
           native
           (for [{:keys [table name indexdef]}
                 (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db))]
-            {:pg_indexes/schemaname "public"
+            {:pg_indexes/schemaname (storage-schema-name cte-db table)
              :pg_indexes/tablename (get names table table)
              :pg_indexes/indexname name
              :pg_indexes/tablespace "pg_default"
@@ -2998,7 +3017,7 @@
              (pgs/row-marker-attr "pg_indexes") true})
           explicit
           (for [{:keys [table name indexdef]} (explicit-index-descriptors cte-db)]
-            {:pg_indexes/schemaname "public"
+            {:pg_indexes/schemaname (storage-schema-name cte-db table)
              :pg_indexes/tablename (get names table table)
              :pg_indexes/indexname name
              :pg_indexes/tablespace "pg_default"
@@ -3120,7 +3139,7 @@
              [idx col] (map-indexed vector columns)
              :let [default (get defaults (:attr col))]
              :when default
-             :let [tbl-oid (or (pgs/table-oid cte-db tname)
+             :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
                                (Math/abs (.hashCode ^String tname)))
                    attnum (or (:attnum col) (inc idx))
                    ;; Use the durable column subobject rather than a name
@@ -3283,12 +3302,14 @@
                     (catch Throwable _ []))
           ;; FK constraints persisted via :pg/fk-* attrs.
           fks (try
-                (q-fn '{:find  [?n ?ct ?cc ?pt ?pc]
-                        :keys  [name child-table child-cols parent-table parent-cols]
+                (q-fn '{:find  [?n ?ct ?cc ?pt ?pc ?on-update ?on-delete]
+                        :keys  [name child-table child-cols parent-table parent-cols on-update on-delete]
                         :where [[?e :pg/fk-child-table ?ct]
                                 [?e :pg/fk-child-cols ?cc]
                                 [?e :pg/fk-parent-table ?pt]
                                 [?e :pg/fk-parent-cols ?pc]
+                                [(get-else $ ?e :pg/fk-on-update :no-action) ?on-update]
+                                [(get-else $ ?e :pg/fk-on-delete :no-action) ?on-delete]
                                 (or-join [?e ?n] [?e :pg/fk-conname ?n] [?e :pg/fk-name ?n])]}
                       cte-db)
                 (catch Throwable _ []))
@@ -3343,7 +3364,7 @@
            :pg_constraint/contype       contype
            :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
            :pg_constraint/conrelid      (long tbl-oid)
-           :pg_constraint/connamespace  2200
+           :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
            :pg_constraint/confrelid     0
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
@@ -3383,7 +3404,7 @@
            :pg_constraint/contype       contype
            :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
            :pg_constraint/conrelid      (long tbl-oid)
-           :pg_constraint/connamespace  2200
+           :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
            :pg_constraint/confrelid     0
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
@@ -3400,7 +3421,7 @@
            :pg_constraint/contype       "p"
            :pg_constraint/conindid      oid
            :pg_constraint/conrelid      relation-oid
-           :pg_constraint/connamespace  2200
+           :pg_constraint/connamespace  (storage-schema-oid cte-db table)
            :pg_constraint/confrelid     0
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
@@ -3413,14 +3434,14 @@
            (pgs/row-marker-attr "pg_constraint") true})
         ;; CHECK constraints — one row per persisted :pg/check-*.
         (for [{cname :name tname :table cexpr :expr} checks
-              :let [tbl-oid (or (pgs/table-oid cte-db tname)
+              :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
                                 (Math/abs (.hashCode ^String tname)))]]
           {:pg_constraint/oid           (long (constraint-oid "c" cname tname))
            :pg_constraint/conname       cname
            :pg_constraint/contype       "c"
            :pg_constraint/conindid      0
            :pg_constraint/conrelid      (long tbl-oid)
-           :pg_constraint/connamespace  2200
+           :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
            :pg_constraint/confrelid     0
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
@@ -3437,10 +3458,11 @@
         ;; JSON-serialized strings; render them as comma-joined
         ;; identifiers in the condef (matches PG's pg_get_constraintdef).
         (for [{cname :name child :child-table child-cols :child-cols
-               parent :parent-table parent-cols :parent-cols} fks
-              :let [tbl-oid (or (pgs/table-oid cte-db child)
+               parent :parent-table parent-cols :parent-cols
+               :keys [on-update on-delete]} fks
+              :let [tbl-oid (or (pgs/storage-table-oid cte-db child)
                                 (Math/abs (.hashCode ^String child)))
-                    parent-oid (or (pgs/table-oid cte-db parent)
+                    parent-oid (or (pgs/storage-table-oid cte-db parent)
                                    (Math/abs (.hashCode ^String parent)))
                     parse-cols (fn [s]
                                  (try
@@ -3457,7 +3479,7 @@
            :pg_constraint/conname       cname
            :pg_constraint/contype       "f"
            :pg_constraint/conrelid      (long tbl-oid)
-           :pg_constraint/connamespace  2200
+           :pg_constraint/connamespace  (storage-schema-oid cte-db child)
            :pg_constraint/confrelid     (long parent-oid)
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
@@ -3470,12 +3492,17 @@
                                      regoid/*relation-db* cte-db
                                      regoid/*relation-provider* relation-identity
                                      regoid/*search-path* path]
-                             (regoid/output types/oid-regclass parent-oid types/format-type))]
+                             (regoid/output types/oid-regclass parent-oid types/format-type))
+                 action-text (fn [clause action]
+                               (when (not= :no-action action)
+                                 (str clause (-> action name (str/replace "-" " ") str/upper-case))))]
              (str "FOREIGN KEY (" (str/join ", " (map fns/quote-identifier cs))
                   ") REFERENCES " (if (= reference (str parent-oid))
                                     (fns/quote-identifier parent)
                                     reference)
-                  " (" (str/join ", " (map fns/quote-identifier ps)) ")"))
+                  " (" (str/join ", " (map fns/quote-identifier ps)) ")"
+                  (action-text " ON UPDATE " on-update)
+                  (action-text " ON DELETE " on-delete)))
            (pgs/row-marker-attr "pg_constraint") true}))))
     "information_schema_table_constraints"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
@@ -3487,10 +3514,10 @@
               :let [pk (get primary-keys tname)
                     table-name (get logical-names tname tname)]]
           {:information_schema_table_constraints/constraint_catalog "datahike"
-           :information_schema_table_constraints/constraint_schema "public"
+           :information_schema_table_constraints/constraint_schema (storage-schema-name cte-db tname)
            :information_schema_table_constraints/constraint_name (or (:name pk) (str table-name "_pkey"))
            :information_schema_table_constraints/table_catalog "datahike"
-           :information_schema_table_constraints/table_schema "public"
+           :information_schema_table_constraints/table_schema (storage-schema-name cte-db tname)
            :information_schema_table_constraints/table_name table-name
            :information_schema_table_constraints/constraint_type "PRIMARY KEY"
            :information_schema_table_constraints/is_deferrable "NO"
@@ -3502,10 +3529,10 @@
               :when (:unique col)
               :let [table-name (get logical-names tname tname)]]
           {:information_schema_table_constraints/constraint_catalog "datahike"
-           :information_schema_table_constraints/constraint_schema "public"
+           :information_schema_table_constraints/constraint_schema (storage-schema-name cte-db tname)
            :information_schema_table_constraints/constraint_name (str table-name "_" (:name col) "_key")
            :information_schema_table_constraints/table_catalog "datahike"
-           :information_schema_table_constraints/table_schema "public"
+           :information_schema_table_constraints/table_schema (storage-schema-name cte-db tname)
            :information_schema_table_constraints/table_name table-name
            :information_schema_table_constraints/constraint_type "UNIQUE"
            :information_schema_table_constraints/is_deferrable "NO"
@@ -3523,10 +3550,10 @@
                     table-name (get logical-names tname tname)]
               [position col] (map-indexed vector (or (:keys pk) [{:name "db_id"}]))]
           {:information_schema_key_column_usage/constraint_catalog "datahike"
-           :information_schema_key_column_usage/constraint_schema "public"
+           :information_schema_key_column_usage/constraint_schema (storage-schema-name cte-db tname)
            :information_schema_key_column_usage/constraint_name (or (:name pk) (str table-name "_pkey"))
            :information_schema_key_column_usage/table_catalog "datahike"
-           :information_schema_key_column_usage/table_schema "public"
+           :information_schema_key_column_usage/table_schema (storage-schema-name cte-db tname)
            :information_schema_key_column_usage/table_name table-name
            :information_schema_key_column_usage/column_name (:name col)
            :information_schema_key_column_usage/ordinal_position (long (inc position))
@@ -3536,10 +3563,10 @@
               :when (:unique col)
               :let [table-name (get logical-names tname tname)]]
           {:information_schema_key_column_usage/constraint_catalog "datahike"
-           :information_schema_key_column_usage/constraint_schema "public"
+           :information_schema_key_column_usage/constraint_schema (storage-schema-name cte-db tname)
            :information_schema_key_column_usage/constraint_name (str table-name "_" (:name col) "_key")
            :information_schema_key_column_usage/table_catalog "datahike"
-           :information_schema_key_column_usage/table_schema "public"
+           :information_schema_key_column_usage/table_schema (storage-schema-name cte-db tname)
            :information_schema_key_column_usage/table_name table-name
            :information_schema_key_column_usage/column_name (:name col)
            :information_schema_key_column_usage/ordinal_position 1
@@ -3569,9 +3596,10 @@
                (cond
                  (instance? Table item)
                  (if-let [tn (catalog-table-name ^Table item)]
-                   (do (.setName ^Table item tn)
-                       (.setSchemaName ^Table item nil)
-                       (conj acc tn))
+                   (let [qualified? (some? (.getSchemaName ^Table item))]
+                     (.setName ^Table item tn)
+                     (.setSchemaName ^Table item (when qualified? "pg_catalog"))
+                     (conj acc tn))
                    acc)
                  (instance? ParenthesedSelect item)
                  (collect-in-stmt! acc (.getSelect ^ParenthesedSelect item))
@@ -3697,7 +3725,7 @@
     :nextval :currval :lastval :setval
     :pg-backend-pid :txid-current
     :comment-on :lock-table :create-index
-    :maintenance-noop :schema-noop
+    :maintenance-noop :schema-noop :schema-ddl :move-table-schema
     :create-database :drop-database
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
     ;; (which can't / won't parse them) and run our own parsers.

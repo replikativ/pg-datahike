@@ -288,6 +288,20 @@
                    [?e :datahike.pg.object/name ?name]]
                  db)))))
 
+(defn scoped-table-name-overrides
+  "Map the SQL [schema name] of each table with a separate storage name."
+  [db]
+  (let [db (catalog-metadata-db db)]
+    (when (and db (get (dbi/-schema db) :datahike.pg.object/storage-name))
+      (into {}
+            (map (fn [[schema name storage]] [[schema name] storage]))
+            (d/q '[:find ?schema ?name ?storage
+                   :where [?e :datahike.pg.object/storage-name ?storage]
+                   [?e :datahike.pg.object/name ?name]
+                   [?e :datahike.pg.object/namespace ?ns]
+                   [?ns :datahike.pg.object/name ?schema]]
+                 db)))))
+
 (defn public-relation-storage-name [db name]
   (or (:datahike.pg.object/storage-name
        (object-by-identity db pg-class-oid public-namespace-oid name))
@@ -300,6 +314,9 @@
 
 (defn public-relation-name [db storage]
   (or (:datahike.pg.object/name (object-by-storage-name db storage)) storage))
+
+(defn scoped-index-ident [oid]
+  (keyword "datahike.pg.index.scoped" (str oid)))
 
 (defn primary-index-oid [db relation-oid]
   (when (get (dbi/-schema db) :datahike.pg.index/primary?)
@@ -430,15 +447,20 @@
          [:db/add column-ref :datahike.pg.column/storage-ident
           new-storage-ident]]))))
 
+(defn explicit-search-namespaces
+  "Resolve explicit search_path entries in order, skipping nonexistent schemas."
+  [db entries user-name]
+  (->> entries
+       (map #(if (= "$user" %) user-name %))
+       distinct
+       (keep #(namespace-by-name db %))))
+
 (defn resolve-search-path
   "Resolve PostgreSQL search_path entries to existing namespace OIDs.
    pg_catalog is implicitly searched first unless explicitly positioned.
    `$user` contributes a schema only when it exists."
   [db entries user-name]
-  (let [expanded (map #(if (= "$user" %) user-name %) entries)
-        explicit (keep #(some-> (namespace-by-name db %) :datahike.pg.object/oid)
-                       expanded)
-        explicit (vec (distinct explicit))]
+  (let [explicit (mapv :datahike.pg.object/oid (explicit-search-namespaces db entries user-name))]
     (if (some #{pg-catalog-namespace-oid} explicit)
       explicit
       (into [pg-catalog-namespace-oid] explicit))))
@@ -447,9 +469,7 @@
   "The first existing explicit search_path entry.  The implicit pg_catalog
    entry used for lookup is deliberately not a creation target."
   [db entries user-name]
-  (some #(let [name (if (= "$user" %) user-name %)]
-           (namespace-by-name db name))
-        entries))
+  (first (explicit-search-namespaces db entries user-name)))
 
 (defn catalog-entity [db]
   (when (get (dbi/-schema db) :datahike.pg.catalog/key)
@@ -554,6 +574,33 @@
           revision (long (or (:datahike.pg.object/revision object) 0))]
       [[:db/cas object-ref :datahike.pg.object/revision
         revision (inc revision)]])))
+
+(defn table-namespace-objects
+  "The table and catalog objects that use the table's namespace."
+  [db table]
+  (let [row-type (object-by-identity db pg-type-oid (object-namespace-oid db table)
+                                     (:datahike.pg.object/name table))
+        indexes (when (contains? (dbi/-schema db) :datahike.pg.index/relation)
+                  (d/q '[:find [?oid ...]
+                         :in $ ?table
+                         :where [?index :datahike.pg.index/relation ?table]
+                         [?index :datahike.pg.object/oid ?oid]]
+                       db (:db/id table)))]
+    (into (cond-> [table] row-type (conj row-type))
+          (keep #(object-by-address db pg-class-oid %))
+          indexes)))
+
+(defn move-relation-object-tx
+  "Move a table, row type or index to a namespace without changing its OID."
+  [object namespace-oid]
+  (let [{:datahike.pg.object/keys [class-oid name revision]} object
+        ref [:datahike.pg.object/address-key (:datahike.pg.object/address-key object)]]
+    [[:db/cas ref :datahike.pg.object/revision revision (inc revision)]
+     [:db/retract ref :datahike.pg.object/identity-key (:datahike.pg.object/identity-key object)]
+     [:db/add ref :datahike.pg.object/identity-key
+      (identity-key class-oid namespace-oid name)]
+     [:db/add ref :datahike.pg.object/namespace
+      [:datahike.pg.object/address-key (address-key pg-namespace-oid namespace-oid)]]]))
 
 (defn rename-object-tx
   [db class-oid object-oid new-name identity-tail]

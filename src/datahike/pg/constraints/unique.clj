@@ -110,10 +110,7 @@
                            :where [['?entity attr '_]]}
                           db))
                eids))
-           object-eids index-attrs)
-          public-namespace (objects/object-by-address
-                            db objects/pg-namespace-oid
-                            objects/public-namespace-oid)]
+           object-eids index-attrs)]
       (->> candidate-eids
            (mapv
             (fn [entity]
@@ -139,6 +136,7 @@
                     (if (map? relation-namespace-ref)
                       (:db/id relation-namespace-ref)
                       relation-namespace-ref)
+                    namespace-oid (objects/object-namespace-oid db object)
                     relation-oid (:datahike.pg.object/oid relation)
                     _ (when-not (and (= :index (:datahike.pg.object/kind object))
                                      (= objects/pg-class-oid
@@ -149,11 +147,13 @@
                                         (:datahike.pg.object/address-key object))
                                      (= (objects/identity-key
                                          objects/pg-class-oid
-                                         objects/public-namespace-oid name)
+                                         namespace-oid name)
                                         (:datahike.pg.object/identity-key object))
-                                     (= (:db/id public-namespace) namespace-eid)
-                                     (= (keyword "datahike.pg.index" name)
-                                        (:db/ident object))
+                                     (integer? namespace-oid)
+                                     (= namespace-eid relation-namespace-eid)
+                                     (contains? #{(keyword "datahike.pg.index" name)
+                                                  (objects/scoped-index-ident oid)}
+                                                (:db/ident object))
                                      (string? table)
                                      relation
                                      (= :table (:datahike.pg.object/kind relation))
@@ -165,11 +165,9 @@
                                         (:datahike.pg.object/address-key relation))
                                      (= (objects/identity-key
                                          objects/pg-class-oid
-                                         objects/public-namespace-oid
+                                         namespace-oid
                                          (:datahike.pg.object/name relation))
                                         (:datahike.pg.object/identity-key relation))
-                                     (= (:db/id public-namespace)
-                                        relation-namespace-eid)
                                      (= table (or (:datahike.pg.object/storage-name relation)
                                                   (:datahike.pg.object/name relation)))
                                      (string? method)

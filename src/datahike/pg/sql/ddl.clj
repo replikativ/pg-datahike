@@ -23,6 +23,7 @@
             [datahike.api :as d]
             [datahike.pg.constraints.unique :as unique]
             [datahike.pg.errors :as errors]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.pg-catalog :as pg-catalog]
             [datahike.pg.schema :as pgs]
@@ -628,6 +629,7 @@
   {:name (some-> (.getName fk) params/unquote-ident)
    :cols (mapv (comp params/unquote-ident str) (.getColumnsNames fk))
    :parent-table (some-> (.getTable fk) .getName params/unquote-ident)
+   :parent-schema (some-> (.getTable fk) .getSchemaName params/unquote-ident)
    :parent-cols (referenced-columns (.getReferencedColumnNames fk))
    :on-delete (some-> (.getOnDeleteReferenceOption fk) str/lower-case)
    :on-update (some-> (.getOnUpdateReferenceOption fk) str/lower-case)})
@@ -663,11 +665,13 @@
                      ;; as " ON DELETE CASCADE" -- the action alone.
                      (some-> (.getReferentialAction exp t)
                              .getAction str str/lower-case
-                             (str/replace "_" " ")))]
+                             (str/replace "_" " ")))
+            parent (some-> (.getFkSourceTable exp) regoid/parse-qualified-name)]
         {:op :add-foreign-key
          :name nil
          :cols (mapv params/unquote-ident (.getFkColumns exp))
-         :parent-table (some-> (.getFkSourceTable exp) params/unquote-ident)
+         :parent-table (peek parent)
+         :parent-schema (when (> (count parent) 1) (nth parent (- (count parent) 2)))
          :parent-cols (referenced-columns (.getFkSourceColumns exp))
          :on-delete (action net.sf.jsqlparser.statement.ReferentialAction$Type/DELETE)
          :on-update (action net.sf.jsqlparser.statement.ReferentialAction$Type/UPDATE)})
@@ -738,27 +742,10 @@
                                    :expr et}))
                               columns))
         ;; Table-level FOREIGN KEY — ForeignKeyIndex is also an Index.
-        table-fks (vec (keep (fn [^Index idx]
-                               (when (instance? ForeignKeyIndex idx)
-                                 (let [^ForeignKeyIndex fk idx
-                                       cols (mapv (comp params/unquote-ident str)
-                                                  (.getColumnsNames fk))
-                                       ref-tbl (some-> (.getTable fk) .getName params/unquote-ident)
-                                       parsed-ref-cols
-                                       (mapv (comp params/unquote-ident str)
-                                             (or (.getReferencedColumnNames fk) []))
-                                       ref-cols (if (= ["__pg_default_pk__"] parsed-ref-cols)
-                                                  []
-                                                  parsed-ref-cols)]
-                                   {:name (some-> (.getName fk) params/unquote-ident)
-                                    :cols cols
-                                    :parent-table ref-tbl
-                                    :parent-cols ref-cols
-                                    :on-delete (some-> (.getOnDeleteReferenceOption fk)
-                                                       str/lower-case)
-                                    :on-update (some-> (.getOnUpdateReferenceOption fk)
-                                                       str/lower-case)})))
-                             indexes))]
+        table-fks (into []
+                        (comp (filter #(instance? ForeignKeyIndex %))
+                              (map foreign-key-index->spec))
+                        indexes)]
     {:pk-cols  (or (not-empty index-pk-cols) col-pk-cols)
      :pk-name  index-pk-name
      :uniques  (into (mapv (fn [c] {:cols [c] :name nil}) col-unique-cols)
@@ -1360,7 +1347,7 @@
         ;; Store the referenced column list as written. Omitted columns
         ;; resolve against the current catalog when CREATE commits.
         fk-entities
-        (vec (for [{:keys [name cols parent-table parent-cols on-delete on-update]} (:fks constraints)
+        (vec (for [{:keys [name cols parent-table parent-schema parent-cols on-delete on-update]} (:fks constraints)
                    :let [cname (choose! name (str/join "_" cols) "fkey")
                          ->action (fn [s]
                                     (when s
@@ -1380,6 +1367,7 @@
                         :pg/fk-child-cols   (jb/serialize-jsonb cols)
                         :pg/fk-parent-table parent-table
                         :pg/fk-parent-cols  (jb/serialize-jsonb parent-cols)}
+                 parent-schema (assoc :pg/fk-parent-schema parent-schema)
                  od (assoc :pg/fk-on-delete od)
                  ou (assoc :pg/fk-on-update ou))))
         schema-tx (into schema-tx (into check-entities fk-entities))
@@ -1459,6 +1447,7 @@
                             identity-cols))]
     (cond-> {:type :ddl-create
              :table-name table-name
+             :table-schema (some-> (.getSchemaName ^Table table) params/unquote-ident)
              :temp? temp?
              :if-not-exists? (.isIfNotExists ct)
              :column-order col-names

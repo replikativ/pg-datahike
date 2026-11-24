@@ -69,6 +69,168 @@
                (:datahike.pg.catalog/next-oid
                 (objects/catalog-entity (d/db conn)))))))))
 
+(deftest schema-ddl-uses-durable-namespace-identities
+  (with-catalog
+    (fn [conn]
+      (with-open [handler (server/make-query-handler conn)]
+        (let [run #(.execute handler %)
+              exec! (fn [sql] (is (nil? (.error (run sql))) sql))
+              rows #(mapv vec (.rows (run %)))
+              oid-for (fn [name]
+                        (:datahike.pg.object/oid (objects/namespace-by-name (d/db conn) name)))]
+          (exec! "CREATE SCHEMA \"Billing Data\"")
+          (exec! "CREATE SCHEMA archive")
+          (let [oid (oid-for "Billing Data")]
+            (is (>= oid objects/first-user-oid))
+            (is (= [[(str oid)]] (rows "SELECT oid FROM pg_namespace WHERE nspname = 'Billing Data'")))
+            (is (= "42P06" (.sqlstate (run "CREATE SCHEMA \"Billing Data\""))))
+            (is (= "42939" (.sqlstate (run "CREATE SCHEMA pg_reserved"))))
+            (exec! "CREATE SCHEMA IF NOT EXISTS \"Billing Data\"")
+            (exec! "SET search_path TO missing, \"Billing Data\", public")
+            (is (= [["Billing Data" "Billing Data" "{\"Billing Data\",public}"]]
+                   (rows "SELECT current_schema(), current_schema, current_schemas(false)::text")))
+            (is (= [["{pg_catalog,\"Billing Data\",public}"]]
+                   (rows "SELECT current_schemas(true)::text")))
+            (exec! "BEGIN")
+            (exec! "ALTER SCHEMA \"Billing Data\" RENAME TO temporary_billing")
+            (is (= [[(str oid)]] (rows "SELECT oid FROM pg_namespace WHERE nspname = 'temporary_billing'")))
+            (is (= [["public"]] (rows "SELECT current_schema()")))
+            (exec! "ROLLBACK")
+            (is (= oid (oid-for "Billing Data")))
+            (is (nil? (oid-for "temporary_billing")))
+            (exec! "ALTER SCHEMA \"Billing Data\" RENAME TO billing")
+            (is (= oid (oid-for "billing")))
+            (is (= "3F000" (.sqlstate (run "DROP SCHEMA billing, missing"))))
+            (is (= oid (oid-for "billing")))
+            (exec! "DROP SCHEMA IF EXISTS billing, missing, archive RESTRICT")
+            (is (nil? (oid-for "billing")))
+            (is (nil? (oid-for "archive")))
+            (exec! "CREATE SCHEMA ÄMixed")
+            (is (some? (oid-for "Ämixed")))))))))
+
+(deftest scoped-relations-preserve-namespace-and-storage-identity
+  (with-catalog
+    (fn [conn]
+      (with-open [handler (server/make-query-handler conn)]
+        (let [run #(.execute handler %)
+              exec! (fn [sql] (is (nil? (.error (run sql))) sql))
+              rows #(mapv vec (.rows (run %)))]
+          (doseq [sql ["CREATE SCHEMA billing"
+                       "CREATE SCHEMA archive"
+                       "CREATE TABLE billing.pg_namespace (label text)"
+                       "INSERT INTO billing.pg_namespace VALUES ('customer catalog')"
+                       "CREATE TABLE public.events (id int PRIMARY KEY, label text)"
+                       "CREATE TABLE billing.events (id int PRIMARY KEY, label text)"
+                       "INSERT INTO public.events VALUES (1, 'public')"
+                       "INSERT INTO billing.events VALUES (1, 'billing')"
+                       "CREATE UNIQUE INDEX events_label ON public.events (label)"
+                       "CREATE UNIQUE INDEX events_label ON billing.events (label)"
+                       "CREATE TABLE archive.entries (id int REFERENCES billing.events ON DELETE CASCADE)"
+                       "INSERT INTO archive.entries VALUES (1)"
+                       "SET search_path TO billing, public"]]
+            (exec! sql))
+          (is (= [["billing"]] (rows "SELECT label FROM events")))
+          (is (= [["customer catalog"]] (rows "SELECT label FROM billing.pg_namespace")))
+          (exec! "SET search_path TO billing, pg_catalog, public")
+          (is (= [["customer catalog"]] (rows "SELECT label FROM pg_namespace")))
+          (exec! "SET search_path TO billing, public")
+          (is (= [["public"]] (rows "SELECT label FROM public.events")))
+          (is (= [["t"]] (rows "SELECT 'billing.events_label'::regclass::oid <> 'public.events_label'::regclass::oid")))
+          (is (= "23505" (.sqlstate (run "INSERT INTO billing.events VALUES (2, 'billing')"))))
+          (is (= "23503" (.sqlstate (run "INSERT INTO archive.entries VALUES (2)"))))
+          (is (= [["archive" "FOREIGN KEY (id) REFERENCES events (id) ON DELETE CASCADE"]]
+                 (rows "SELECT n.nspname, pg_catalog.pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c
+                          JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace
+                         WHERE c.conrelid = 'archive.entries'::regclass::oid AND c.contype = 'f'")))
+          (doseq [sql ["SELECT * FROM pg_catalog.events"
+                       "INSERT INTO information_schema.events VALUES (2, 'wrong')"
+                       "COPY pg_catalog.events FROM STDIN"
+                       "COPY pg_temp.events FROM STDIN"]]
+            (is (= "42P01" (.sqlstate (run sql))) sql))
+          (exec! "SET search_path TO archive")
+          (doseq [sql ["SELECT * FROM events"
+                       "UPDATE events SET label = 'wrong'"
+                       "ALTER TABLE events ADD COLUMN wrong int"
+                       "DROP TABLE events"
+                       "TRUNCATE events"]]
+            (is (= "42P01" (.sqlstate (run sql))) sql))
+          (is (= [["public"]] (rows "SELECT label FROM public.events")))
+          (is (= [["public"]] (rows "SELECT nspname FROM pg_namespace WHERE nspname = 'public'")))
+          (is (= [["1"] ["2"] ["3"]]
+                 (rows "WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM nums WHERE n < 3)
+                        SELECT n FROM nums ORDER BY n")))
+          (let [[[table-oid index-oid]]
+                (rows "SELECT 'billing.events'::regclass::oid, 'billing.events_label'::regclass::oid")]
+            (exec! "ALTER TABLE billing.events SET SCHEMA archive")
+            (is (= [[table-oid index-oid]]
+                   (rows "SELECT 'archive.events'::regclass::oid, 'archive.events_label'::regclass::oid")))
+            (is (= "42P01" (.sqlstate (run "SELECT * FROM billing.events"))))
+            (is (= [["billing"]] (rows "SELECT label FROM archive.events")))
+            (is (= [["billing"]] (rows "SELECT label FROM events"))))
+          (exec! "SET search_path TO billing, public")
+          (is (= [["public"]] (rows "SELECT label FROM events")))
+          (is (= [["archive" "FOREIGN KEY (id) REFERENCES archive.events (id) ON DELETE CASCADE"]]
+                 (rows "SELECT n.nspname, pg_catalog.pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c
+                          JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace
+                         WHERE c.conrelid = 'archive.entries'::regclass::oid AND c.contype = 'f'")))
+          (exec! "ALTER TABLE archive.events ADD COLUMN amount int DEFAULT 5")
+          (is (= [["billing" "5"]] (rows "SELECT label, amount FROM archive.events")))
+          (is (= [["billing" "7"]]
+                 (rows "UPDATE archive.events SET amount = 7 WHERE id = 1 RETURNING label, amount")))
+          (exec! "DELETE FROM archive.events WHERE id = 1")
+          (is (= [["0"]] (rows "SELECT count(*) FROM archive.entries")))
+          (exec! "DROP INDEX archive.events_label")
+          (is (= [["t"]] (rows "SELECT to_regclass('public.events_label') IS NOT NULL")))
+          (exec! "DROP TABLE archive.entries, archive.events")
+          (is (= [["public"]] (rows "SELECT label FROM public.events"))))))))
+
+(deftest moved-index-identity-is-visible-only-in-the-current-schema
+  (with-catalog
+    (fn [conn]
+      (with-open [handler (server/make-query-handler conn)]
+        (let [run #(.execute handler %)]
+          (doseq [sql ["CREATE SCHEMA billing"
+                       "CREATE TABLE public.events (id int)"
+                       "CREATE UNIQUE INDEX events_id ON public.events (id)"
+                       "ALTER TABLE public.events SET SCHEMA billing"
+                       "SET search_path TO public"]]
+            (is (nil? (.error (run sql))) sql))
+          (is (= "42704" (.sqlstate (run "DROP INDEX public.events_id"))))
+          (is (= "42704" (.sqlstate (run "DROP INDEX events_id"))))
+          (is (= [["t"]] (mapv vec (.rows (run "SELECT to_regclass('billing.events_id') IS NOT NULL")))))
+          (is (nil? (.error (run "DROP INDEX billing.events_id")))))))))
+
+(deftest prepared-parameter-types-follow-the-resolved-relation
+  (with-catalog
+    (fn [conn]
+      (with-open [handler (server/make-query-handler conn)]
+        (let [run #(.execute handler %)
+              rows #(mapv vec (.rows (run %)))]
+          (doseq [sql ["CREATE SCHEMA billing"
+                       "CREATE TABLE public.invoices (id text)"
+                       "CREATE TABLE billing.invoices (id int)"
+                       "PREPARE scoped_insert AS INSERT INTO billing.invoices VALUES ($1)"
+                       "PREPARE scoped_select AS SELECT b.id FROM billing.invoices b WHERE b.id = $1"
+                       "PREPARE scoped_update AS UPDATE billing.invoices SET id = $1 WHERE id = $2"
+                       "PREPARE scoped_delete AS DELETE FROM billing.invoices WHERE id = $1"
+                       "SET search_path TO billing, public"
+                       "PREPARE path_select AS SELECT id FROM invoices WHERE id = $1"
+                       "PREPARE public_select AS SELECT id FROM public.invoices WHERE id = $1"
+                       "EXECUTE scoped_insert(1)"]]
+            (is (nil? (.error (run sql))) sql))
+          (is (= [["path_select" "{integer}"]
+                  ["public_select" "{text}"]
+                  ["scoped_delete" "{integer}"]
+                  ["scoped_insert" "{integer}"]
+                  ["scoped_select" "{integer}"]
+                  ["scoped_update" "{integer,integer}"]]
+                 (rows "SELECT name, parameter_types FROM pg_prepared_statements ORDER BY name")))
+          (is (= [["1"]] (rows "EXECUTE scoped_select(1)")))
+          (is (nil? (.error (run "EXECUTE scoped_update(2, 1)"))))
+          (is (= [["2"]] (rows "EXECUTE path_select(2)")))
+          (is (nil? (.error (run "EXECUTE scoped_delete(2)"))))
+          (is (= [] (rows "SELECT id FROM billing.invoices"))))))))
+
 (deftest speculative-allocations-chain-and-rollback
   (with-catalog
     (fn [conn]
@@ -378,6 +540,44 @@
             (let [result (.execute handler "SELECT id FROM ledger")]
               (is (= [["1"]] (mapv vec (.rows result))))
               (is (= [23] (vec (.-columnOids result))))))
+          (finally (d/release reopened))))
+      (finally
+        (d/delete-database cfg)
+        (Files/deleteIfExists root)))))
+
+(deftest table-schema-move-preserves-historical-namespace-after-reopen
+  (let [root (Files/createTempDirectory "pg-datahike-schema-history-" (make-array FileAttribute 0))
+        cfg {:store {:backend :file :path (str (.resolve root "store")) :id (random-uuid)}
+             :schema-flexibility :write :keep-history? true}]
+    (d/create-database cfg)
+    (try
+      (let [conn (d/connect cfg)
+            [snapshot oid]
+            (try
+              (with-open [handler (server/make-query-handler conn)]
+                (doseq [sql ["CREATE SCHEMA billing"
+                             "CREATE SCHEMA archive"
+                             "CREATE TABLE billing.invoices (id int PRIMARY KEY)"
+                             "INSERT INTO billing.invoices VALUES (1)"]]
+                  (is (nil? (.error (.execute handler sql))) sql))
+                (let [db (d/db conn)
+                      snapshot (.toInstant ^java.util.Date (:db/txInstant (d/entity db (:max-tx db))))
+                      oid (ffirst (.rows (.execute handler "SELECT 'billing.invoices'::regclass::oid")))]
+                  (doseq [sql ["ALTER TABLE billing.invoices SET SCHEMA archive"
+                               "UPDATE archive.invoices SET id = 2"]]
+                    (is (nil? (.error (.execute handler sql))) sql))
+                  [snapshot oid]))
+              (finally (d/release conn)))
+            reopened (d/connect cfg)]
+        (try
+          (with-open [handler (server/make-query-handler reopened)]
+            (let [run #(.execute handler %)
+                  rows #(mapv vec (.rows (run %)))]
+              (is (= [[oid "2"]] (rows "SELECT 'archive.invoices'::regclass::oid, id FROM archive.invoices")))
+              (is (= "42P01" (.sqlstate (run "SELECT id FROM billing.invoices"))))
+              (is (nil? (.error (run (str "SET datahike.as_of = '" snapshot "'")))))
+              (is (= [[oid "1"]] (rows "SELECT 'billing.invoices'::regclass::oid, id FROM billing.invoices")))
+              (is (= "42P01" (.sqlstate (run "SELECT id FROM archive.invoices"))))))
           (finally (d/release reopened))))
       (finally
         (d/delete-database cfg)

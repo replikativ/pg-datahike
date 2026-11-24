@@ -796,7 +796,7 @@
                                     body))
                  :let [from-item (.getFromItem ps)
                        tns (when (instance? Table from-item)
-                             (unquote-ident (.getName ^Table from-item)))
+                             (params/inference-table-name from-item))
                        aliases (params/collect-table-aliases from-item (.getJoins ps))]]
              (merge (params/where-param-oids (.getWhere ps) schema tns aliases)
                     (apply merge
@@ -947,7 +947,7 @@
                  ;; them is a larger change. Tracked separately.
                    [(:db m) (:schema m)
                     (cond-> deferred (:deferred m) (conj (:deferred m)))
-                    ns-map]
+                    (assoc ns-map cte-name cte-name)]
                    ;; Both fixed-point compilers declined the shape. Leaving
                    ;; the CTE unmaterialised lets its outer scan construct an
                    ;; invalid Datalog query ("Query for unknown vars"). Make
@@ -1057,19 +1057,33 @@
           (ex-info (str "parameter number too large at or near \"$" digits "\"")
                    {:error :syntax-error :sqlstate "42601"}))))))
 
+(defn- table-targets [plan]
+  (if-let [parts (:relation-parts plan)]
+    (let [refs (mapv #(regoid/parse-qualified-name (str/join "." %)) parts)
+          schemas (mapv #(when (> (count %) 1) (nth % (- (count %) 2))) refs)]
+      (cond-> (assoc plan :tables (mapv peek refs))
+        (some some? schemas) (assoc :table-schemas schemas)))
+    plan))
+
 (defn- parse-sql*
   "Inner parse-sql implementation — does the actual work. Public
    parse-sql wraps this with the LRU result cache."
   [^String sql schema db]
   (binding [params/*parse-db* db
+            params/*inference-table-resolver* ctx/inference-table-name
             params/*only-table-marker* (params/only-table-marker sql)
             ctx/*table-name-overrides*
             (when-not ctx/*physical-table-names?*
-              (let [names (catalog-objects/table-name-overrides db)
-                    retired (pgs/retired-table-names db)]
-                (when (or (seq names) (seq retired))
-                  {:storage->logical names :logical->storage (set/map-invert names)
-                   :retired-storage retired})))
+              (let [scoped (catalog-objects/scoped-table-name-overrides db)
+                    retired (pgs/retired-table-names db)
+                    public (into {} (keep (fn [[[schema name] storage]]
+                                            (when (= "public" schema) [name storage]))) scoped)]
+                {:scoped scoped :logical->storage public
+                 :nonpublic-names (into #{} (keep (fn [[[schema name] _]]
+                                                    (when-not (= schema "public") name))) scoped)
+                 :storage-names (set (vals scoped))
+                 :retired-storage retired
+                 :catalog-table? catalog/catalog-table?}))
             regoid/*db* db
             regoid/*relation-provider* catalog/relation-identity
             regoid/*relation-db* (or regoid/*relation-db* db)
@@ -1163,8 +1177,11 @@
                       ;; The raw SQL goes with the tokens: a
                       ;; `COPY ( query ) TO` has to hand its query text
                       ;; to the real parser verbatim.
-                      {:keys [table ns] :as parsed} (copy/parse-copy toks sql)
+                      {:keys [table ns direction] :as parsed} (copy/parse-copy toks sql)
                       storage (when table (ctx/table-storage-name table ns))]
+                  (when (and (= direction :from) (ctx/system-relation-schema? ns))
+                    (throw (errors/pg-error :feature-not-supported
+                                            {:feature "COPY FROM into system relations"})))
                   (cond-> (merge base parsed)
                     (not= table storage) (assoc :table storage :logical-target table)))
                 (catch clojure.lang.ExceptionInfo e
@@ -1254,12 +1271,12 @@
                 {:type :error
                  :message "TRUNCATE ... CASCADE is not supported by datahike pgwire"
                  :sqlstate "0A000"}
-                (assoc base :type :truncate))
+                (table-targets (assoc base :type :truncate)))
 
               ;; DROP TABLE a, b, … — same executor as single-name
               ;; :ddl-drop (exec-ddl-drop loops :tables when present).
               :drop-table-multi
-              (assoc base :type :ddl-drop)
+              (table-targets (assoc base :type :ddl-drop))
 
               ;; CREATE FUNCTION … LANGUAGE sql. The classifier carries
               ;; the whole signature (:fn-name :params :returns :strict?
@@ -1293,6 +1310,15 @@
 
               :drop-role-object
               (assoc base :type :ddl-drop-role)
+
+              :move-table-schema
+              (table-targets (assoc base :type :ddl-move-table-schema
+                                    :new-schema (first (regoid/parse-qualified-name (:new-schema base)))))
+
+              :schema-ddl
+              (let [identifier (comp first regoid/parse-qualified-name)]
+                (cond-> (assoc base :type :ddl-schema :names (mapv identifier (:names base)))
+                  (:new-name base) (update :new-name identifier)))
 
               ;; CREATE / ALTER SEQUENCE — fully token-classified; the
               ;; option list arrives on cls-info as :seq-opts. Validation
@@ -1454,44 +1480,45 @@
             ;; empty: unknown params default to 0 (text, any type).
                 inferred-oids
                 (when (pos? param-count)
-                  (cond (instance? Insert stmt)
-                        (binding [assignment-target/*omitted-bounds* target-annotations]
-                          (params/insert-param-oids stmt schema db))
-                        (instance? Update stmt)
-                        (let [from-set (binding [assignment-target/*omitted-bounds* target-annotations]
-                                         (params/update-param-oids stmt schema))
-                              ^Table t (.getTable ^Update stmt)
-                              tns (when t (unquote-ident (.getName t)))
-                              joins (.getJoins ^Update stmt)
-                              aliases (params/collect-table-aliases t joins)
-                              join-oids (try
-                                          (apply merge
-                                                 (for [^Join j (or joins [])]
-                                                   (params/where-param-oids (.getOnExpression j)
-                                                                            schema tns aliases)))
-                                          (catch Throwable _ nil))]
-                          (merge (params/where-param-oids (.getWhere ^Update stmt) schema tns aliases)
-                                 join-oids
-                                 from-set))
-                        (instance? Delete stmt)
-                        (let [^Table t (.getTable ^Delete stmt)
-                              tns (when t (unquote-ident (.getName t)))
-                              aliases (params/collect-table-aliases t nil)]
-                          (params/where-param-oids (.getWhere ^Delete stmt) schema tns aliases))
-                        (instance? PlainSelect stmt)
-                        (let [from-item (.getFromItem ^PlainSelect stmt)
-                              tns (when (instance? Table from-item)
-                                    (unquote-ident (.getName ^Table from-item)))
-                              joins (.getJoins ^PlainSelect stmt)
-                              aliases (params/collect-table-aliases from-item joins)
-                              where-oids (params/where-param-oids (.getWhere ^PlainSelect stmt)
-                                                                  schema tns aliases)
-                              join-oids (try
-                                          (apply merge
-                                                 (for [^Join j (or joins [])]
-                                                   (params/where-param-oids (.getOnExpression j)
-                                                                            schema tns aliases)))
-                                          (catch Throwable _ nil))
+                  (binding [ctx/*relation-namespaces* (merge ctx/*relation-namespaces* cte-ns-map)]
+                    (cond (instance? Insert stmt)
+                          (binding [assignment-target/*omitted-bounds* target-annotations]
+                            (params/insert-param-oids stmt schema db))
+                          (instance? Update stmt)
+                          (let [from-set (binding [assignment-target/*omitted-bounds* target-annotations]
+                                           (params/update-param-oids stmt schema))
+                                ^Table t (.getTable ^Update stmt)
+                                tns (params/inference-table-name t)
+                                joins (.getJoins ^Update stmt)
+                                aliases (params/collect-table-aliases t joins)
+                                join-oids (try
+                                            (apply merge
+                                                   (for [^Join j (or joins [])]
+                                                     (params/where-param-oids (.getOnExpression j)
+                                                                              schema tns aliases)))
+                                            (catch Throwable _ nil))]
+                            (merge (params/where-param-oids (.getWhere ^Update stmt) schema tns aliases)
+                                   join-oids
+                                   from-set))
+                          (instance? Delete stmt)
+                          (let [^Table t (.getTable ^Delete stmt)
+                                tns (params/inference-table-name t)
+                                aliases (params/collect-table-aliases t nil)]
+                            (params/where-param-oids (.getWhere ^Delete stmt) schema tns aliases))
+                          (instance? PlainSelect stmt)
+                          (let [from-item (.getFromItem ^PlainSelect stmt)
+                                tns (when (instance? Table from-item)
+                                      (params/inference-table-name from-item))
+                                joins (.getJoins ^PlainSelect stmt)
+                                aliases (params/collect-table-aliases from-item joins)
+                                where-oids (params/where-param-oids (.getWhere ^PlainSelect stmt)
+                                                                    schema tns aliases)
+                                join-oids (try
+                                            (apply merge
+                                                   (for [^Join j (or joins [])]
+                                                     (params/where-param-oids (.getOnExpression j)
+                                                                              schema tns aliases)))
+                                            (catch Throwable _ nil))
                               ;; SELECT-list expressions can carry params too
                               ;; (e.g. `SELECT 1 = $1`, `SELECT $1::int`,
                               ;; `SELECT col = $1`). where-param-oids walks an
@@ -1500,16 +1527,16 @@
                               ;; reuse it per select item. Without this the
                               ;; param stays undetermined → TEXT, and a client
                               ;; binding e.g. an int fails to encode.
-                              select-oids (try
-                                            (apply merge
-                                                   (for [^SelectItem si (or (.getSelectItems ^PlainSelect stmt) [])]
-                                                     (params/where-param-oids (.getExpression si)
-                                                                              schema tns aliases)))
-                                            (catch Throwable _ nil))
+                                select-oids (try
+                                              (apply merge
+                                                     (for [^SelectItem si (or (.getSelectItems ^PlainSelect stmt) [])]
+                                                       (params/where-param-oids (.getExpression si)
+                                                                                schema tns aliases)))
+                                              (catch Throwable _ nil))
                               ;; params nested in WITH-CTE bodies (asyncpg's
                               ;; `WITH RECURSIVE … oid = ANY($1::oid[])`)
-                              cte-oids (cte-body-param-oids stmt schema)]
-                          (merge cte-oids select-oids where-oids join-oids))))
+                                cte-oids (cte-body-param-oids stmt schema)]
+                            (merge cte-oids select-oids where-oids join-oids)))))
                 attach-params #(cond-> (assoc % :param-count param-count)
                                  (seq inferred-oids) (assoc :param-oids inferred-oids))
                 result
@@ -2457,12 +2484,14 @@
                                     :cascade? cascade?}
                         "index" {:type :ddl-drop-index
                                  :name (unquote-ident obj-name)
+                                 :index-schema (some-> d .getName .getSchemaName unquote-ident)
                                  :if-exists? (.isIfExists d)}
                         "view" {:type :ddl-drop-view
                                 :view-name (unquote-ident obj-name)
                                 :if-exists? (.isIfExists d)
                                 :cascade? cascade?}
                         {:type :ddl-drop :table obj-name
+                         :table-schema (some-> d .getName .getSchemaName unquote-ident)
                          :if-exists? (.isIfExists d)
                          :cascade? cascade?}))
 
@@ -2486,25 +2515,27 @@
                     (instance? CreateIndex stmt)
                     (let [^CreateIndex ci stmt
                           idx (.getIndex ci)
+                          table-schema (some-> (.getTable ci) .getSchemaName unquote-ident)
                           column-specs
                           (mapv (fn [^Index$ColumnParams column]
                                   {:name (unquote-ident (.getColumnName column))
                                    :params (mapv (comp str/lower-case str)
                                                  (or (.getParams column) []))})
                                 (or (.getColumnWithParams idx) []))]
-                      {:type :ddl-create-index
-                       :name (some-> (.getName idx) unquote-ident)
-                       :table (some-> (.getTable ci) .getName unquote-ident)
-                       :method (some-> (.getUsing idx) str/lower-case)
-                       :unique? (= "UNIQUE" (some-> (.getType idx) str/upper-case))
-                       :if-not-exists? (.isUsingIfNotExists ci)
-                       :columns (if (seq column-specs)
-                                  (mapv :name column-specs)
-                                  (mapv (comp unquote-ident str)
-                                        (or (.getColumnsNames idx) [])))
-                       :column-specs column-specs
-                       :tail-parameters (mapv str (or (.getTailParameters ci) []))
-                       :options (create-index-options ci)})
+                      (cond-> {:type :ddl-create-index
+                               :name (some-> (.getName idx) unquote-ident)
+                               :table (some-> (.getTable ci) .getName unquote-ident)
+                               :method (some-> (.getUsing idx) str/lower-case)
+                               :unique? (= "UNIQUE" (some-> (.getType idx) str/upper-case))
+                               :if-not-exists? (.isUsingIfNotExists ci)
+                               :columns (if (seq column-specs)
+                                          (mapv :name column-specs)
+                                          (mapv (comp unquote-ident str)
+                                                (or (.getColumnsNames idx) [])))
+                               :column-specs column-specs
+                               :tail-parameters (mapv str (or (.getTailParameters ci) []))
+                               :options (create-index-options ci)}
+                        table-schema (assoc :table-schema table-schema)))
 
           ;; ALTER TABLE — extract operations for ADD COLUMN support
                     (instance? Alter stmt)
@@ -2612,7 +2643,9 @@
                                               {:op :other :raw (str exp)})
                                           :else {:op :other :raw (str exp)})))
                                     expressions)]
-                      {:type :ddl-alter :table table-name :operations ops})
+                      {:type :ddl-alter :table table-name
+                       :table-schema (some-> alter-stmt .getTable .getSchemaName unquote-ident)
+                       :operations ops})
 
                     :else
                     {:type :error :message (str "Unsupported SQL statement: " (type stmt))}))]

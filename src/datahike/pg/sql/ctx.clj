@@ -29,6 +29,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
@@ -406,21 +407,62 @@
   "Physical and SQL table names visible to the current statement."
   nil)
 
+(defn system-relation-schema? [schema]
+  (contains? #{"pg_catalog" "information_schema"} schema))
+
 (defn table-storage-name
   "Resolve a SQL relation name to storage in the statement's catalog."
-  [name schema]
-  (let [{:keys [logical->storage storage->logical retired-storage]} *table-name-overrides*
-        storage (when (and (or (nil? schema) (= "public" schema))
-                           (or schema (not (contains? params/*temp-table-map* name))))
-                  (or (get logical->storage name)
-                      (when (or (contains? storage->logical name)
-                                (contains? retired-storage name))
-                        (throw (errors/pg-error :undefined-table {:table name})))))
-        storage-name (or storage name)]
-    (when (and (not *physical-table-names?*)
-               (contains? (some-> params/*session-state* deref :private-storage) storage-name))
-      (throw (errors/pg-error :undefined-table {:table name})))
-    storage-name))
+  ([name schema] (table-storage-name name schema true))
+  ([name schema required?]
+   (let [{:keys [scoped logical->storage nonpublic-names storage-names retired-storage catalog-table?]}
+         *table-name-overrides*
+         db params/*parse-db*
+         temp? (and (or (nil? schema) (= "pg_temp" schema))
+                    (contains? params/*temp-table-map* name))
+         path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+         virtual-catalog? (and (nil? schema) catalog-table? (catalog-table? name))
+         public-storage (or (get logical->storage name)
+                            (when-not (or (contains? storage-names name)
+                                          (contains? retired-storage name))
+                              name))
+         storage
+         (cond
+           (or *physical-table-names?* temp?) name
+           (= "public" schema) public-storage
+           (system-relation-schema? schema)
+           (when (and catalog-table?
+                      (catalog-table? (if (= "information_schema" schema)
+                                        (str "information_schema_" name)
+                                        name)))
+             name)
+           schema (get scoped [schema name])
+           :else
+           (or (when (and virtual-catalog? (not (some #{"pg_catalog"} path))) name)
+               (some (fn [entry]
+                       (let [entry (if (= "$user" entry) types/pg-role-name entry)]
+                         (or (get scoped [entry name])
+                             (when (and virtual-catalog? (= "pg_catalog" entry)) name)
+                             (when (and db (= "public" entry)
+                                        (catalog-objects/object-by-identity
+                                         db catalog-objects/pg-class-oid
+                                         catalog-objects/public-namespace-oid name))
+                               name))))
+                     (when (or virtual-catalog? (contains? nonpublic-names name)) path))
+               (when (some #{"public"} path) public-storage)))]
+     (if (and storage
+              (or *physical-table-names?*
+                  (not (contains? (some-> params/*session-state* deref :private-storage) storage))))
+       storage
+       (when required?
+         (throw (errors/pg-error :undefined-table
+                                 {:table (if schema (str schema "." name) name)})))))))
+
+(defn inference-table-name [^Table table]
+  (let [name (params/unquote-ident (.getName table))
+        schema (some-> (.getSchemaName table) params/unquote-ident)]
+    (when name
+      (or (when-not schema (get *relation-namespaces* name))
+          (table-storage-name name schema false)))))
 
 (defn extract-table-info
   "Extract table name and alias from a FROM clause Table.

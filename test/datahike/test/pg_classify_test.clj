@@ -248,10 +248,15 @@
   (is (= :maintenance-noop (kind "CLUSTER")))
   (is (= :maintenance-noop (kind "ANALYZE"))))
 
-(deftest classify-schema-noops
-  (is (= :schema-noop (kind "CREATE SCHEMA foo")))
+(deftest classify-schema-ddl
+  (is (= [:schema-ddl :create ["\"Billing Data\""] true]
+         ((juxt :kind :operation :names :if-clause?)
+          (c/classify "CREATE SCHEMA IF NOT EXISTS \"Billing Data\";"))))
+  (is (= [:alter ["FOO"] "BAR"]
+         ((juxt :operation :names :new-name) (c/classify "ALTER SCHEMA FOO RENAME TO BAR"))))
   (is (= :schema-noop (kind "ALTER SCHEMA foo OWNER TO bar")))
-  (is (= :schema-noop (kind "DROP SCHEMA foo"))))
+  (is (= [:drop ["foo" "\"Bar\""] true]
+         ((juxt :operation :names :cascade?) (c/classify "DROP SCHEMA foo, \"Bar\" CASCADE")))))
 
 (deftest classify-copy-rejected
   ;; Tier 2 of pgdump-import wired COPY through to a real parser; the

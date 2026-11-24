@@ -307,6 +307,16 @@
    execute path."
   nil)
 
+(def ^:dynamic *inference-table-resolver*
+  "Resolve a Table node to its storage namespace during type inference."
+  nil)
+
+(defn inference-table-name [^Table table]
+  (when table
+    (if *inference-table-resolver*
+      (*inference-table-resolver* table)
+      (unquote-ident (.getName table)))))
+
 (def ^:dynamic *runtime-db*
   "The live statement snapshot while a translated query executes.
 
@@ -1339,7 +1349,7 @@
   ([^Insert insert schema] (insert-param-oids insert schema nil))
   ([^Insert insert schema db]
    (try
-     (let [table (some-> (.getTable insert) .getName unquote-ident)
+     (let [table (inference-table-name (.getTable insert))
            targets (if (seq (.getColumns insert))
                      (mapv #(update (assignment-target/describe %) :column unquote-ident)
                            (.getColumns insert))
@@ -1386,7 +1396,7 @@
   "Infer SET value and index/bound parameter types without losing indirection."
   [^Update update schema]
   (try
-    (let [table (some-> (.getTable update) .getName unquote-ident)
+    (let [table (inference-table-name (.getTable update))
           result (java.util.HashMap.)]
       (doseq [^UpdateSet update-set (.getUpdateSets update)
               [^Column column expression] (map vector (.getColumns update-set)
@@ -1399,20 +1409,20 @@
     (catch Throwable _ nil)))
 
 (defn collect-table-aliases
-  "Given a FROM item and a sequence of JOINs, build a map
-   `{alias-name → real-table-name}`. Tables without an alias still get
-   an entry mapping the table name to itself (so lookup is uniform)."
+  "Map visible table names and aliases to the storage namespaces of the
+   FROM item and JOINs."
   [from-item joins]
   (let [add-pair (fn [m ^Table t alias-obj]
                    (when t
-                     (let [real (unquote-ident (.getName t))
+                     (let [logical (unquote-ident (.getName t))
+                           storage (inference-table-name t)
                            alias-name (when alias-obj
                                         (unquote-ident
                                          (.getName ^net.sf.jsqlparser.expression.Alias
                                           alias-obj)))]
                        (cond-> m
-                         real (assoc real real)
-                         alias-name (assoc alias-name real)))))]
+                         logical (assoc logical storage)
+                         alias-name (assoc alias-name storage)))))]
     (cond->
      (if (instance? Table from-item)
        (add-pair {} ^Table from-item (.getAlias ^Table from-item))
@@ -1466,15 +1476,15 @@
            result (java.util.HashMap.)
            col-ns-name (fn [^Column c]
                          (let [cn (unquote-ident (.getColumnName c))
-                               tab (when-let [t (.getTable c)] (.getName ^Table t))
-                               tab-unq (when tab (unquote-ident tab))
+                               ^Table table (.getTable c)
+                               tab-unq (some-> table .getName unquote-ident)
                               ;; Alias → real table if known, else the
                               ;; identifier itself (handles both cases:
                               ;; `person.col` where `person` is the
                               ;; table, and `p.col` where `p` is an alias).
-                               tns (or (get aliases tab-unq)
-                                       tab-unq
-                                       default-table-ns)]
+                               tns (if (some-> table .getSchemaName)
+                                     (inference-table-name table)
+                                     (or (get aliases tab-unq) tab-unq default-table-ns))]
                            [tns cn]))
            record-param! (fn [^JdbcParameter p ^Column c]
                            (let [[tns cn] (col-ns-name c)]

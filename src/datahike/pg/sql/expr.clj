@@ -137,6 +137,13 @@
   4096)
 (declare source-oid string-value-text op-sym->sql render-view-definition)
 
+(defn- session-schema-path [ctx state]
+  (let [db (or params/*runtime-db* (:db ctx))
+        path (or (some-> state deref :search-path) ["$user" "public"])]
+    (if (and db (contains? (dbi/-schema db) :datahike.pg.object/identity-key))
+      (mapv :datahike.pg.object/name (catalog-objects/explicit-search-namespaces db path types/pg-role-name))
+      (into [] (comp (filter #{"public" "pg_catalog"}) (distinct)) path))))
+
 (declare translate-expr
          column-value!
          translate-predicate
@@ -1745,11 +1752,7 @@
       (let [_ (params/session-dependent!)
             fn-param (symbol (str "?cur-sch" (swap! (:var-counter ctx) inc)))
             state params/*session-state*
-            impl-fn (fn []
-                      (let [path (or (some-> state deref :search-path)
-                                     ["$user" "public"])]
-                        (or (first (filter #{"public" "pg_catalog"} path))
-                            :__null__)))]
+            impl-fn (fn [] (or (first (session-schema-path ctx state)) :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -2142,9 +2145,7 @@
             impl-fn (fn [include-implicit]
                       (if (or (nil? include-implicit) (= :__null__ include-implicit))
                         :__null__
-                        (let [path (vec (distinct (filter #{"public" "pg_catalog"}
-                                                          (or (some-> state deref :search-path)
-                                                              ["$user" "public"]))))]
+                        (let [path (session-schema-path ctx state)]
                           (pg-arr/array :name
                                         (if (and include-implicit (not (some #{"pg_catalog"} path)))
                                           (into ["pg_catalog"] path) path)))))]
@@ -7286,10 +7287,6 @@
     (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
     result-var))
 
-(defn- session-current-schema [state]
-  (let [path (or (some-> state deref :search-path) ["$user" "public"])]
-    (first (filter #{"public" "pg_catalog"} path))))
-
 (defn- bare-session-value-column? [expr]
   (and (instance? Column expr)
        (nil? (.getTable ^Column expr))
@@ -7429,11 +7426,10 @@
    Returns a Datalog-compatible value or variable symbol."
   [ctx expr]
   (cond
-    ;; current_schema (no parens) used as column reference — return 'public' constant
     (and (instance? Column expr)
          (= "current_schema" (.getColumnName ^Column expr))
          (nil? (.getTable ^Column expr)))
-    (session-value-expr! ctx "cur-sch" session-current-schema)
+    (session-value-expr! ctx "cur-sch" #(first (session-schema-path ctx %)))
 
     ;; CURRENT_CATALOG is the bare SQL-value spelling paired with
     ;; current_database(). Generic expressions need both operands; the

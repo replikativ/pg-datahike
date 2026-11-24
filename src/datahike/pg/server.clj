@@ -1696,18 +1696,6 @@
 (defn- effective-search-path [session-state]
   (or (:search-path @session-state) ["$user" "public"]))
 
-(defn- current-schema-name [session-state]
-  (first (filter #{"public" "pg_catalog"}
-                 (effective-search-path session-state))))
-
-(defn- handle-current-schema [session-state]
-  (PgWireServer$QueryResult.
-   (into-array String ["current_schema"])
-   (int-array [types/oid-name])
-   (into-array (Class/forName "[Ljava.lang.String;")
-               [(into-array String [(current-schema-name session-state)])])
-   "SELECT 1"))
-
 (defn- handle-current-database
   "Return the connection's own database name. In the single-handler
    case the handler was created without a registry and `db-name` is the
@@ -2090,21 +2078,26 @@
                                  table "\" does not exist")
                             {:error :undefined-object :sqlstate "42704"})))))
 
-(defn- referenced-table-storage [db name]
-  (if sql-ctx/*physical-table-names?*
-    name
-    (let [storage (catalog-objects/public-relation-storage-name db name)]
-      (when (and (= name storage)
-                 (or (contains? (pgs/retired-table-names db) name)
-                     (catalog-objects/object-by-storage-name db name)))
-        (throw (errors/pg-error :undefined-table {:table name})))
-      storage)))
+(declare ddl-table-object public-relation-fallback?)
+
+(defn- referenced-table-storage
+  ([db name] (referenced-table-storage db name nil))
+  ([db name schema]
+   (if sql-ctx/*physical-table-names?*
+     name
+     (if-let [object (ddl-table-object db name schema)]
+       (or (:datahike.pg.object/storage-name object) name)
+       (if (or (not (public-relation-fallback? name schema))
+               (contains? (pgs/retired-table-names db) name)
+               (catalog-objects/object-by-storage-name db name))
+         (throw (errors/pg-error :undefined-table {:table (if schema (str schema "." name) name)}))
+         name)))))
 
 (defn- added-constraint-tx
   "The constraint entity an `ALTER TABLE ... ADD` writes -- the same shape
    CREATE TABLE writes, so the two spellings cannot drift apart -- after
    validating the rows already in the table."
-  [db table taken added-columns {:keys [op name expr cols parent-table parent-cols
+  [db table taken added-columns {:keys [op name expr cols parent-table parent-schema parent-cols
                                         on-delete on-update]}]
   (case op
     :add-check
@@ -2126,7 +2119,7 @@
         :pg/check-expr expr}])
 
     :add-foreign-key
-    (let [parent-table (referenced-table-storage db parent-table)
+    (let [parent-table (referenced-table-storage db parent-table parent-schema)
           cname (or name (ddl/generated-constraint-name
                           taken table (str/join "_" cols) "fkey"))
           parent-cols (ddl/resolve-foreign-key!
@@ -3699,7 +3692,7 @@
            params/*analysis-only?*]]
     (or (when-not (:execution-materialization? parsed)
           (.get ^java.util.Map update-row-match-cache k))
-        (let [{:keys [table alias logical-target assignments where-expr from-sql returning from-aliases]} parsed
+        (let [{:keys [table alias logical-target target-schema assignments where-expr from-sql returning from-aliases]} parsed
               target-name (or logical-target table)
               sources (when (seq returning) from-aliases)
               visible (or alias
@@ -3746,9 +3739,9 @@
                                                        (java.util.regex.Pattern/quote target-name)
                                                        "\\b"))
                                       (:with-sql parsed)))
-              from-name (if shadowed?
-                          (str "\"public\"." (quoted target-name))
-                          (quoted target-name))
+              from-schema (or target-schema (when shadowed? "public"))
+              from-name (str (when from-schema (str (quoted from-schema) "."))
+                             (quoted target-name))
               text (str (:with-sql parsed)
                         "SELECT " (quoted (or visible table)) ".db_id"
                         (apply str (map #(str ", (" (:sql %) ")") assignments))
@@ -5180,16 +5173,18 @@
         (str "SELECT " (long (or (:ctas-rows parsed) 0)))
         "CREATE TABLE")))
 
-(defn- new-table-storage-name [db table oid]
+(defn- new-table-storage-name [db table oid namespace-oid]
   (let [schema (dbi/-schema db)]
-    (if (contains? schema (pgs/row-marker-attr table))
+    (if (or (and (not sql-ctx/*physical-table-names?*)
+                 (not= namespace-oid catalog-objects/public-namespace-oid))
+            (contains? schema (pgs/row-marker-attr table)))
       (let [occupied (into #{} (keep #(when (keyword? %) (namespace %))) (keys schema))]
         (first (remove occupied
                        (cons (str "__dh_pg_table_" oid)
                              (map #(str "__dh_pg_table_" oid "_" %) (range 1 Long/MAX_VALUE))))))
       table)))
 
-(defn- table-storage-tx-data [db tx-data table storage]
+(defn- table-storage-tx-data [db tx-data table storage namespace-oid]
   (let [attr-for (fn [attr]
                    (if (and (keyword? attr) (= table (namespace attr)))
                      (keyword storage (name attr))
@@ -5197,7 +5192,23 @@
         storage-for (fn [name]
                       (if (= table name)
                         storage
-                        (referenced-table-storage db name)))]
+                        (referenced-table-storage db name)))
+        fk-storage (fn [name schema]
+                     (let [self? (and (= name table)
+                                      (or sql-ctx/*physical-table-names?*
+                                          (= namespace-oid
+                                             (if schema
+                                               (:datahike.pg.object/oid
+                                                (catalog-objects/namespace-by-name db schema))
+                                               (some (fn [namespace]
+                                                       (let [oid (:datahike.pg.object/oid namespace)]
+                                                         (when (or (= oid namespace-oid)
+                                                                   (catalog-objects/object-by-identity
+                                                                    db catalog-objects/pg-class-oid oid name))
+                                                           oid)))
+                                                     (catalog-objects/explicit-search-namespaces
+                                                      db regoid/*search-path* types/pg-role-name))))))]
+                       (if self? storage (referenced-table-storage db name schema))))]
     (mapv (fn [datum]
             (let [mapped (if (= table storage)
                            datum
@@ -5215,21 +5226,29 @@
                                                                     (:pg/fk-conname datum))))))]
               (cond-> mapped
                 (:__inherit__/parent datum) (update :__inherit__/parent storage-for)
-                (:pg/fk-parent-table datum) (update :pg/fk-parent-table storage-for))))
+                (:pg/fk-parent-table datum)
+                (assoc :pg/fk-parent-table (fk-storage (:pg/fk-parent-table datum)
+                                                       (:pg/fk-parent-schema datum)))
+                (:pg/fk-parent-schema datum) (dissoc :pg/fk-parent-schema))))
           tx-data)))
 
 (defn- table-create-tx-data [db parsed]
   (doseq [column (:column-order parsed)]
     (ddl/validate-table-column-name! column))
   (let [table-name (:table-name parsed)
+        namespace-oid (get parsed :namespace-oid catalog-objects/public-namespace-oid)
         raw-ddl-data (ddl-tx-data parsed)
+        _ (when (and (not= namespace-oid catalog-objects/public-namespace-oid)
+                     (or (seq (:identity-cols parsed)) (seq (:inherits parsed))))
+            (throw (errors/pg-error :feature-not-supported
+                                    {:feature "identity sequences and inheritance in non-public schemas"})))
         sequence-names (vec (distinct (keep #(when (map? %) (:__seq__/name %))
                                             raw-ddl-data)))
         {:keys [oids tx-data]}
         (catalog-objects/reserve-user-oids-tx db (+ 2 (count sequence-names)))
         [oid row-type-oid & sequence-oids] oids
-        storage (new-table-storage-name db table-name oid)
-        storage-ddl-data (table-storage-tx-data db raw-ddl-data table-name storage)
+        storage (new-table-storage-name db table-name oid namespace-oid)
+        storage-ddl-data (table-storage-tx-data db raw-ddl-data table-name storage namespace-oid)
         marker (pgs/row-marker-attr storage)
         ddl-data (mapv (fn [datum]
                          (if (and (map? datum) (= marker (:db/ident datum)))
@@ -5244,12 +5263,14 @@
         object-data (catalog-objects/create-object-tx
                      db {:class-oid catalog-objects/pg-class-oid
                          :oid oid :kind :table :name table-name
-                         :storage-name (when (not= table-name storage) storage)
-                         :namespace-oid catalog-objects/public-namespace-oid})
+                         :storage-name (when (or (not= table-name storage)
+                                                 (not= namespace-oid catalog-objects/public-namespace-oid))
+                                         storage)
+                         :namespace-oid namespace-oid})
         row-type-data (catalog-objects/create-object-tx
                        db {:class-oid catalog-objects/pg-type-oid
                            :oid row-type-oid :kind :row-type :name table-name
-                           :namespace-oid catalog-objects/public-namespace-oid})
+                           :namespace-oid namespace-oid})
         sequence-object-data
         (mapcat (fn [name sequence-oid]
                   (catalog-objects/create-object-tx
@@ -5373,16 +5394,18 @@
       (let [current-db (if (:in-tx? @tx-state)
                          (:speculative-db @tx-state)
                          (d/db conn))
+            namespace-oid (get parsed :namespace-oid catalog-objects/public-namespace-oid)
             existing-relation
             (catalog-objects/object-by-identity
              current-db catalog-objects/pg-class-oid
-             catalog-objects/public-namespace-oid table-name)
+             namespace-oid table-name)
             existing-type
             (catalog-objects/object-by-identity
              current-db catalog-objects/pg-type-oid
-             catalog-objects/public-namespace-oid table-name)
+             namespace-oid table-name)
             name-conflict? (or existing-relation existing-type
-                               (table-exists? current-db table-name))
+                               (and (= namespace-oid catalog-objects/public-namespace-oid)
+                                    (table-exists? current-db table-name)))
             sequence-conflict
             (when-not name-conflict?
               (some (fn [column]
@@ -5600,7 +5623,7 @@
              [:db/retract (:db/id entity) attr value])
            (mapcat #(retract-sequence-tx db %) names)))))
 
-(defn- drop-relation-owned-sequences-tx [db table relation-oid dropped-tables cascade?]
+(defn- relation-owned-sequences [db table relation-oid]
   (let [legacy (when (contains? (dbi/-schema db) :__seq__/owned-by-table)
                  (map first
                       (d/q '{:find [?name]
@@ -5611,7 +5634,11 @@
         columns (when relation-oid
                   (catalog-objects/columns-by-relation db relation-oid true))
         names (into (set legacy) (mapcat #(sequence/owned-by-column db table %)) columns)]
-    (drop-owned-sequences-tx db names #(contains? dropped-tables (:table %)) cascade?)))
+    names))
+
+(defn- drop-relation-owned-sequences-tx [db table relation-oid dropped-tables cascade?]
+  (drop-owned-sequences-tx db (relation-owned-sequences db table relation-oid)
+                           #(contains? dropped-tables (:table %)) cascade?))
 
 (defn- deferred-drop-op [f & args]
   (into [:db.fn/call (with-meta f {::record-effects-from-report true})] args))
@@ -7226,7 +7253,7 @@
     :ddl-create-composite :ddl-create-domain :ddl-drop-domain
     :ddl-create-function :ddl-drop-function
     :ddl-create-trigger :ddl-drop-trigger
-    :ddl-create-role :ddl-drop-role
+    :ddl-create-role :ddl-drop-role :ddl-schema :ddl-move-table-schema
     ;; Ordinary B-tree CREATE INDEX remains a transaction-compatible
     ;; compatibility declaration. Materialized secondary methods reject a
     ;; buffered/explicit transaction at their narrower execution boundary.
@@ -8008,8 +8035,7 @@
   "Dispatch on (:system-type parsed). System-types are recognised by
    cls/classify (token-driven) and don't go through JSqlParser — most
    delegate to the handle-X defns above; a handful are inline empty-
-   result tags for synthetic success of no-op DDL (CREATE/DROP SCHEMA,
-   COMMENT ON, LOCK TABLE, …)."
+   result tags for compatibility statements such as COMMENT ON and LOCK TABLE."
   [ctx parsed]
   (let [{:keys [conn session-state schema tx-state
                 on-create-database on-delete-database registry-atom
@@ -8069,8 +8095,7 @@
       ;; as :tag already ("VACUUM" / "REINDEX" / "CLUSTER").
       (empty-result (:tag parsed))
       :schema-noop
-      ;; CREATE / DROP / ALTER SCHEMA — classify :tag already
-      ;; encodes the full "CREATE SCHEMA" / "DROP SCHEMA" / etc.
+      ;; Schema ownership follows the server's single-role model.
       (empty-result (:tag parsed))
 
       :privilege-noop
@@ -9916,15 +9941,46 @@
                               db))))
           table-attrs)))
 
+(defn- session-temp-storage? [name schema]
+  (and (or (nil? schema) (= "pg_temp" schema))
+       (str/starts-with? name temp-table-prefix)
+       (some #{name} (vals (some-> regoid/*temp-tables* deref)))))
+
+(defn- public-relation-fallback? [name schema]
+  (or sql-ctx/*physical-table-names?*
+      (= "public" schema)
+      (session-temp-storage? name schema)
+      (and (nil? schema) (some #{"public"} regoid/*search-path*))))
+
+(defn- qualified-relation-object [db name schema]
+  (when-let [namespace (catalog-objects/namespace-by-name db schema)]
+    (catalog-objects/object-by-identity db catalog-objects/pg-class-oid
+                                        (:datahike.pg.object/oid namespace) name)))
+
+(defn- ddl-table-object [db name schema]
+  (let [public catalog-objects/public-namespace-oid
+        find-object #(catalog-objects/object-by-identity db catalog-objects/pg-class-oid % name)]
+    (cond
+      sql-ctx/*physical-table-names?*
+      (or (catalog-objects/object-by-storage-name db name)
+          (if schema (qualified-relation-object db name schema) (find-object public)))
+
+      (session-temp-storage? name schema) (find-object public)
+
+      schema (qualified-relation-object db name schema)
+
+      :else
+      (some #(find-object (:datahike.pg.object/oid %))
+            (catalog-objects/explicit-search-namespaces db regoid/*search-path* types/pg-role-name)))))
+
 (defn- relation-definition-revision-tx
   "Record relation-storage rewrites independently of row/sequence values."
   [db names]
   (into []
         (mapcat (fn [name]
                   (when-let [object
-                             (catalog-objects/object-by-identity
-                              db catalog-objects/pg-class-oid
-                              catalog-objects/public-namespace-oid name)]
+                             (binding [sql-ctx/*physical-table-names?* true]
+                               (ddl-table-object db name nil))]
                     (catalog-objects/bump-revision-tx
                      db catalog-objects/pg-class-oid
                      (:datahike.pg.object/oid object)))))
@@ -9955,10 +10011,15 @@
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
         db (or (:speculative-db @tx-state) (d/db conn))
-        tables (if sql-ctx/*physical-table-names?*
-                 (:tables parsed)
-                 (mapv #(catalog-objects/public-relation-storage-name db %) (:tables parsed)))
-        relation-names (mapv #(catalog-objects/public-relation-name db %) tables)
+        tables (mapv (fn [name schema]
+                       (if-let [object (ddl-table-object db name schema)]
+                         (or (:datahike.pg.object/storage-name object) name)
+                         (if (and (public-relation-fallback? name schema)
+                                  (not (catalog-objects/object-by-storage-name db name)))
+                           name
+                           (throw (errors/pg-error :undefined-table
+                                                   {:table (if schema (str schema "." name) name)})))))
+                     (:tables parsed) (or (:table-schemas parsed) (repeat nil)))
         table-set (set tables)]
     (if (:in-tx? @tx-state)
       (try
@@ -9967,7 +10028,7 @@
               eids (into [] (mapcat #(table-row-eids spec-db %)) tables)
               restart-tx (when (:restart-identity? parsed)
                            (restart-identity-tx-data spec-db tables))
-              definition-tx (relation-definition-revision-tx spec-db relation-names)
+              definition-tx (relation-definition-revision-tx spec-db tables)
               ;; Speculative db keeps ORIGINAL entity IDs …
               spec-tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
                                  (concat restart-tx definition-tx))
@@ -10021,7 +10082,7 @@
               restart-tx (when (:restart-identity? parsed)
                            (restart-identity-tx-data db tables))
               tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
-                            (concat restart-tx (relation-definition-revision-tx db relation-names)))
+                            (concat restart-tx (relation-definition-revision-tx db tables)))
               tx-data ((:tx-wrap ctx identity) tx-data)]
           (doseq [t tables]
             (fire-statement-triggers! db t :truncate :before))
@@ -10032,6 +10093,19 @@
           (empty-result "TRUNCATE TABLE"))
         (catch Exception e
           (classified-error "TRUNCATE error: " e))))))
+
+(defn- table-creation-namespace [db parsed session-state]
+  (let [public catalog-objects/public-namespace-oid
+        schema (:table-schema parsed)
+        namespace (if schema
+                    (catalog-objects/namespace-by-name db schema)
+                    (catalog-objects/creation-namespace
+                     db (effective-search-path session-state) types/pg-role-name))]
+    (cond
+      (or (:temp? parsed) (and sql-ctx/*physical-table-names?* (nil? schema))) public
+      (and schema (nil? namespace))
+      (throw (ex-info (str "schema \"" schema "\" does not exist") {:sqlstate "3F000"}))
+      :else (or (:datahike.pg.object/oid namespace) public))))
 
 (defn- exec-ddl-create
   [ctx parsed]
@@ -10051,6 +10125,8 @@
                    (sql/ctas-finish (dissoc parsed :ctas-select) rows aliases oids
                                     (:db ctx)))
                  parsed)
+        parsed (assoc parsed :namespace-oid (table-creation-namespace
+                                             (:db ctx) parsed (:session-state ctx)))
         logical (:temp-logical-name parsed)
         [^PgWireServer$QueryResult result created?]
         (execute-ddl-create conn parsed tx-state session-id)]
@@ -10400,6 +10476,130 @@
                              " is not supported")
                :detail "The body parses; this server cannot run that construct yet."})))
     ast))
+
+(defn- schema-ddl-tx [db {:keys [names new-name operation if-clause? cascade?]}]
+  (let [name (first names)
+        namespaces (mapv #(catalog-objects/namespace-by-name db %) names)
+        existing (first namespaces)
+        class-oid catalog-objects/pg-namespace-oid
+        oid :datahike.pg.object/oid
+        undefined-schema (fn [name]
+                           (ex-info (str "schema \"" name "\" does not exist")
+                                    {:sqlstate "3F000"}))
+        duplicate-schema (fn [name]
+                           (ex-info (str "schema \"" name "\" already exists")
+                                    {:sqlstate "42P06"}))
+        check-new-name! (fn [name]
+                          (when (str/starts-with? name "pg_")
+                            (throw (ex-info (str "unacceptable schema name \"" name "\"")
+                                            {:sqlstate "42939"
+                                             :detail "The prefix \"pg_\" is reserved for system schemas."}))))
+        check-mutable! (fn [name namespace]
+                         (when (< (oid namespace) catalog-objects/first-user-oid)
+                           (throw (errors/pg-error :feature-not-supported
+                                                   {:feature (str "changing the built-in schema " name)}))))]
+    (case operation
+      :create
+      (if existing
+        (if if-clause?
+          (do (params/notice! "NOTICE" (str "schema \"" name "\" already exists, skipping") "42P06" nil) [])
+          (throw (duplicate-schema name)))
+        (do
+          (check-new-name! name)
+          (let [{new-oid :oid tx-data :tx-data} (catalog-objects/reserve-user-oid-tx db)]
+            (into tx-data (catalog-objects/create-object-tx
+                           db {:class-oid class-oid :oid new-oid :kind :namespace :name name})))))
+
+      :alter
+      (do
+        (when-not existing (throw (undefined-schema name)))
+        (check-mutable! name existing)
+        (check-new-name! new-name)
+        (when (catalog-objects/namespace-by-name db new-name)
+          (throw (duplicate-schema new-name)))
+        (catalog-objects/rename-object-tx db class-oid (oid existing) new-name nil))
+
+      :drop
+      (into []
+            (mapcat (fn [[name namespace]]
+                      (if namespace
+                        (do
+                          (check-mutable! name namespace)
+                          (when (seq (catalog-objects/objects-in-namespace db (oid namespace)))
+                            (throw (if cascade?
+                                     (errors/pg-error :feature-not-supported
+                                                      {:feature "DROP SCHEMA CASCADE with dependent objects"})
+                                     (ex-info (str "cannot drop schema " name " because other objects depend on it")
+                                              {:sqlstate "2BP01"}))))
+                          (catalog-objects/drop-object-tx db class-oid (oid namespace)))
+                        (if if-clause?
+                          (do (params/notice! "NOTICE" (str "schema \"" name "\" does not exist, skipping")) [])
+                          (throw (undefined-schema name))))))
+            (distinct (map vector names namespaces))))))
+
+(defn- move-table-schema-tx [db {:keys [tables table-schemas new-schema if-exists?]}]
+  (let [name (first tables)
+        table (ddl-table-object db name (first table-schemas))
+        target (catalog-objects/namespace-by-name db new-schema)
+        old-namespace (catalog-objects/object-namespace-oid db table)
+        new-namespace (:datahike.pg.object/oid target)
+        relation-oid (:datahike.pg.object/oid table)
+        storage (or (:datahike.pg.object/storage-name table) name)]
+    (cond
+      (and (nil? table) if-exists?)
+      (do (params/notice! "NOTICE" (str "relation \"" name "\" does not exist, skipping") "42P01" nil) [])
+
+      (nil? table)
+      (throw (errors/pg-error :undefined-table {:table name}))
+
+      (not= :table (:datahike.pg.object/kind table))
+      (throw (ex-info (str "relation \"" name "\" is not a table") {:sqlstate "42809"}))
+
+      (nil? target)
+      (throw (ex-info (str "schema \"" new-schema "\" does not exist") {:sqlstate "3F000"}))
+
+      (= old-namespace new-namespace) []
+
+      (or (and (not= new-namespace catalog-objects/public-namespace-oid)
+               (< new-namespace catalog-objects/first-user-oid))
+          (seq (relation-owned-sequences db storage relation-oid)))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "moving tables into system schemas or moving owned sequences"}))
+
+      :else
+      (let [object-name (:datahike.pg.object/name table)
+            moving (catalog-objects/table-namespace-objects db table)
+            row-type (some #(when (= :row-type (:datahike.pg.object/kind %)) %) moving)
+            _ (doseq [object moving
+                      :let [class-oid (:datahike.pg.object/class-oid object)
+                            object-name (:datahike.pg.object/name object)]
+                      :when (catalog/relation-identity db {:namespace-oid new-namespace
+                                                           :name object-name})
+                      :when (= class-oid catalog-objects/pg-class-oid)]
+                (throw (ex-info (str "relation \"" object-name "\" already exists in schema \"" new-schema "\"")
+                                {:sqlstate "42P07"})))
+            _ (when (and row-type (catalog-objects/object-by-identity
+                                   db catalog-objects/pg-type-oid new-namespace object-name))
+                (throw (ex-info (str "type \"" object-name "\" already exists in schema \"" new-schema "\"")
+                                {:sqlstate "42710"})))]
+        (cond-> (into [] (mapcat #(catalog-objects/move-relation-object-tx % new-namespace)) moving)
+          (nil? (:datahike.pg.object/storage-name table))
+          (conj [:db/add (:db/id table) :datahike.pg.object/storage-name storage]))))))
+
+(defn- exec-ddl-schema [{:keys [conn tx-state session-id]} {:keys [tag] :as parsed}]
+  (try
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
+    (let [db (or (:speculative-db @tx-state) (d/db conn))
+          tag (or tag "ALTER TABLE")
+          tx-data (if (= :ddl-move-table-schema (:type parsed))
+                    (move-table-schema-tx db parsed)
+                    (schema-ddl-tx db parsed))]
+      (cond
+        (empty? tx-data) (empty-result tag)
+        (:in-tx? @tx-state) (execute-ddl-in-tx tx-state tx-data tag)
+        :else (do (transact-recorded! conn tx-data) (empty-result tag))))
+    (catch Exception e
+      (classified-error "" e))))
 
 (defn- exec-ddl-create-role
   "CREATE ROLE / USER / GROUP.
@@ -11813,7 +12013,7 @@
   (let [{:keys [conn tx-state secondary-index-build-timeout-ms]} ctx
         tx @tx-state
         method (or (:method parsed) "btree")
-        index-ident (secondary-index-ident (:name parsed))]
+        index-ident (:index-ident parsed)]
     ;; The declaration and its initial generation are published through the
     ;; connection writer, not speculative db-with state. A standalone CREATE
     ;; INDEX may have opened an empty implicit wire transaction; that is safe.
@@ -11876,7 +12076,6 @@
           _ (acquire-catalog-allocation-lock! conn tx-state session-id)
           db (or (:speculative-db @tx-state) (d/db conn))
           schema (dbi/-schema db)
-          index-ident (secondary-index-ident (:name parsed))
           method (or (:method parsed) "btree")
           _ (when (:unique? parsed)
               (when-not (= "btree" method)
@@ -11903,18 +12102,14 @@
                   (throw (errors/pg-error
                           :feature-not-supported
                           {:message "partial and extended unique indexes are not supported"})))))
-          table-object (if sql-ctx/*physical-table-names?*
-                         (when-let [oid (pgs/storage-table-oid db (:table parsed))]
-                           (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid))
-                         (catalog-objects/object-by-identity
-                          db catalog-objects/pg-class-oid
-                          catalog-objects/public-namespace-oid (:table parsed)))
+          table-object (ddl-table-object db (:table parsed) (:table-schema parsed))
+          namespace-oid (catalog-objects/object-namespace-oid db table-object)
           _ (when-not (= :table (:datahike.pg.object/kind table-object))
               (throw (errors/pg-error :undefined-table
                                       {:table (:table parsed)})))
           existing-object (catalog-objects/object-by-identity
                            db catalog-objects/pg-class-oid
-                           catalog-objects/public-namespace-oid (:name parsed))
+                           namespace-oid (:name parsed))
           _ (when existing-object
               (if (:if-not-exists? parsed)
                 (throw (ex-info "index already exists"
@@ -11947,13 +12142,19 @@
           pg-hints (pgs/schema-hints db)
           pg-type (get-in pg-hints [attr :pg-type])
           {:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
+          legacy-ident (secondary-index-ident (:name parsed))
+          index-ident (if (and (= namespace-oid catalog-objects/public-namespace-oid)
+                               (nil? (d/entity db legacy-ident)))
+                        legacy-ident
+                        (catalog-objects/scoped-index-ident oid))
+          parsed (assoc parsed :index-ident index-ident)
           catalog-tx
           (into (vec tx-data)
                 (concat
                  (catalog-objects/create-object-tx
                   db {:class-oid catalog-objects/pg-class-oid
                       :oid oid :kind :index :name (:name parsed)
-                      :namespace-oid catalog-objects/public-namespace-oid})
+                      :namespace-oid namespace-oid})
                  [{:db/id [:datahike.pg.object/address-key
                            (catalog-objects/address-key
                             catalog-objects/pg-class-oid oid)]
@@ -12122,16 +12323,20 @@
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx]
     (try
-      (let [index-ident (secondary-index-ident (:name parsed))
-            db (or (:speculative-db @tx-state) (d/db conn))
+      (let [db (or (:speculative-db @tx-state) (d/db conn))
             schema (dbi/-schema db)
-            entity-id (d/q '{:find [?entity .]
-                             :in [$ ?ident]
-                             :where [[?entity :db/ident ?ident]]}
-                           db index-ident)
-            object (catalog-objects/object-by-identity
-                    db catalog-objects/pg-class-oid
-                    catalog-objects/public-namespace-oid (:name parsed))]
+            index-schema (:index-schema parsed)
+            index-name (:name parsed)
+            object (if index-schema
+                     (qualified-relation-object db index-name index-schema)
+                     (ddl-table-object db index-name nil))
+            index-ident (or (when object (:db/ident (d/entity db (:db/id object))))
+                            (when (and (or (nil? index-schema) (= "public" index-schema))
+                                       (public-relation-fallback? index-name index-schema))
+                              (let [legacy (secondary-index-ident index-name)]
+                                (when-not (:datahike.pg.object/kind (d/entity db legacy))
+                                  legacy))))
+            entity-id (when index-ident (:db/id (d/entity db index-ident)))]
         (when (and object
                    (not= :index (:datahike.pg.object/kind object)))
           (throw (ex-info (str "\"" (:name parsed) "\" is not an index")
@@ -12805,17 +13010,18 @@
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx]
     (try
-      (let [{logical-name :table :keys [operations]} parsed
+      (let [{logical-name :table :keys [operations table-schema]} parsed
             db (or (:speculative-db @tx-state) (d/db conn))
             schema (dbi/-schema db)
-            relation-oid (if sql-ctx/*physical-table-names?*
-                           (pgs/storage-table-oid db logical-name)
-                           (pgs/table-oid db logical-name))
+            object (ddl-table-object db logical-name table-schema)
+            relation-oid (or (:datahike.pg.object/oid object)
+                             (when (public-relation-fallback? logical-name table-schema)
+                               (if sql-ctx/*physical-table-names?*
+                                 (pgs/storage-table-oid db logical-name)
+                                 (pgs/table-oid db logical-name))))
             _ (when-not relation-oid
                 (throw (errors/pg-error :undefined-table {:table logical-name})))
-            table (if sql-ctx/*physical-table-names?*
-                    logical-name
-                    (catalog-objects/public-relation-storage-name db logical-name))
+            table (or (:datahike.pg.object/storage-name object) logical-name)
             added-columns
             (into []
                   (comp (filter #(= :add-column (:op %)))
@@ -13135,6 +13341,10 @@
   [db logical-name table dropped-tables cascade?]
   (let [db-schema (dbi/-schema db)
         relation-oid (pgs/storage-table-oid db table)
+        relation (when relation-oid
+                   (catalog-objects/object-by-address db catalog-objects/pg-class-oid relation-oid))
+        namespace-oid (or (catalog-objects/object-namespace-oid db relation)
+                          catalog-objects/public-namespace-oid)
         retain-storage? (and (:keep-history? (dbi/-config db))
                              (contains? db-schema (pgs/row-marker-attr table))
                              (not (get-in db-schema [(pgs/row-marker-attr table) :db/noHistory])))
@@ -13219,34 +13429,27 @@
                                :where [[?entity :db/ident ?ident]]}
                              db ident))))
               db-schema)
-        secondary-tx-data
-        (keep (fn [entity-id]
-                (let [ident (:db/ident (d/entity db entity-id))
-                      object (when ident
-                               (catalog-objects/object-by-identity
-                                db catalog-objects/pg-class-oid
-                                catalog-objects/public-namespace-oid (name ident)))]
-                  (when (not= entity-id (:db/id object))
-                    [:db/retractEntity entity-id])))
-              (into declared-index-eids legacy-secondary-eids))
+        index-eids (into declared-index-eids legacy-secondary-eids)
         index-object-tx-data
-        (mapcat
-         (fn [entity-id]
-           (when-let [ident (:db/ident (d/entity db entity-id))]
-             (let [object (catalog-objects/object-by-identity
-                           db catalog-objects/pg-class-oid
-                           catalog-objects/public-namespace-oid (name ident))]
-               (when (= :index (:datahike.pg.object/kind object))
-                 (catalog-objects/drop-object-tx
-                  db catalog-objects/pg-class-oid
-                  (:datahike.pg.object/oid object))))))
-         (into declared-index-eids legacy-secondary-eids))
+        (mapcat (fn [eid]
+                  (let [entity (d/entity db eid)
+                        object (if (= :index (:datahike.pg.object/kind entity))
+                                 entity
+                                 (when-let [ident (:db/ident entity)]
+                                   (catalog-objects/object-by-identity
+                                    db catalog-objects/pg-class-oid namespace-oid (name ident))))
+                        drop-object (when (= :index (:datahike.pg.object/kind object))
+                                      (catalog-objects/drop-object-tx
+                                       db catalog-objects/pg-class-oid (:datahike.pg.object/oid object)))]
+                    (cond-> (vec drop-object)
+                      (not= eid (:db/id object)) (conj [:db/retractEntity eid]))))
+                index-eids)
         object-tx-data
         (when-let [oid relation-oid]
           (let [row-type
                 (catalog-objects/object-by-identity
                  db catalog-objects/pg-type-oid
-                 catalog-objects/public-namespace-oid logical-name)]
+                 namespace-oid logical-name)]
             (concat
              (catalog-objects/drop-relation-columns-tx db oid)
              (when (= :row-type (:datahike.pg.object/kind row-type))
@@ -13261,7 +13464,6 @@
                                   schema-tx-data
                                   sequence-tx-data
                                   constraint-tx-data
-                                  secondary-tx-data
                                   index-object-tx-data
                                   object-tx-data))]
     all-tx-data))
@@ -13275,12 +13477,11 @@
     (when (seq tx-data)
       (transact-recorded! conn tx-data))))
 
-(defn- resolve-drop-table [db table if-exists?]
-  (let [object (catalog-objects/object-by-identity
-                db catalog-objects/pg-class-oid
-                catalog-objects/public-namespace-oid table)]
+(defn- resolve-drop-table [db table schema if-exists?]
+  (let [object (ddl-table-object db table schema)
+        public? (public-relation-fallback? table schema)]
     (cond
-      (and (not *dropping-matview*) (matview-entity db table))
+      (and public? (not *dropping-matview*) (matview-entity db table))
       (throw (ex-info (str "\"" table "\" is not a table")
                       {:error :wrong-object-type :sqlstate "42809"
                        :hint "Use DROP MATERIALIZED VIEW to remove a materialized view."}))
@@ -13289,8 +13490,9 @@
       (throw (ex-info (str "\"" table "\" is not a table")
                       {:error :wrong-object-type :sqlstate "42809"}))
 
-      (or object (table-exists? db table))
-      [table (or (:datahike.pg.object/storage-name object) table)]
+      (or object (and public? (table-exists? db table)))
+      [(or (:datahike.pg.object/name object) table)
+       (or (:datahike.pg.object/storage-name object) table)]
 
       if-exists?
       (do (params/notice! "NOTICE" (str "table \"" table "\" does not exist, skipping"))
@@ -13315,11 +13517,14 @@
       (let [db (if (:in-tx? @tx-state)
                  (:speculative-db @tx-state)
                  (d/db conn))
+            names (or (:tables parsed) [(:table parsed)])
+            schemas (or (:table-schemas parsed) [(:table-schema parsed)])
             targets (into []
-                          (comp (map params/unquote-ident)
-                                (distinct)
-                                (keep #(resolve-drop-table db % (:if-exists? parsed))))
-                          (or (:tables parsed) [(:table parsed)]))
+                          (comp (distinct)
+                                (keep (fn [[table schema]]
+                                        (resolve-drop-table db table schema (:if-exists? parsed)))))
+                          (map vector (if (:relation-parts parsed) names (map params/unquote-ident names))
+                               (concat schemas (repeat nil))))
             tables (mapv second targets)
             table-set (set tables)
             _ (doseq [table tables
@@ -13643,19 +13848,6 @@
   [ctx parsed]
   (let [{:keys [schema copy-state conn tx-state]} ctx
         {:keys [ns table columns options]} parsed
-        ;; The attribute namespace is the TABLE name, never the schema
-        ;; qualifier. This read `(or ns table)`, so `COPY public.emp`
-        ;; built `:public/id` instead of `:emp/id` and the transaction
-        ;; failed with "Bad entity attribute" — while `:row-marker` on
-        ;; the next line already used `table`, so the two disagreed.
-        ;;
-        ;; It matters because pg_dump ALWAYS emits the qualified form:
-        ;; restoring a real PostgreSQL dump into us failed on its first
-        ;; COPY block. We serve one schema, so the qualifier carries no
-        ;; information — SELECT/INSERT/UPDATE/DELETE already ignore it.
-        _ (when (and ns (not= ns "public") (not= ns (str/lower-case (or table ""))))
-            (throw (ex-info (str "schema \"" ns "\" does not exist")
-                            {:error :undefined-table :table (str ns "." table)})))
         ns table
         db-now (when conn
                  (if (:in-tx? @tx-state)
@@ -14295,8 +14487,9 @@
                   columns)
         sql (or query
                 (str "SELECT "
-                     (if (seq columns) (str/join ", " columns) "*")
-                     " FROM " (dump/quote-ident logical-table)))
+                     (if (seq columns) (str/join ", " (map dump/quote-ident columns)) "*")
+                     " FROM " (when ns (str (dump/quote-ident ns) "."))
+                     (dump/quote-ident logical-table)))
         ;; Through `*statement-handler*`, not the handler directly: the
         ;; caller's `*cached-parsed*` is still in scope here, so a bare
         ;; `.execute` re-runs the OUTER plan -- this COPY -- and
@@ -15802,6 +15995,10 @@
                                                       tx-state #(exec-ddl-create-role ctx parsed))
                               :ddl-drop-role         (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-drop-role ctx parsed))
+                              :ddl-schema            (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-schema ctx parsed))
+                              :ddl-move-table-schema (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-schema ctx parsed))
                               :ddl-create-table-as   (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create-table-as ctx parsed))
                               :ddl-create-table-like (execute-ddl-invalidating

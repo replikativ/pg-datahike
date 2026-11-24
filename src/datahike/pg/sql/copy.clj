@@ -173,11 +173,24 @@
                       {:error :syntax-error :got t1})))
     (let [first-name (second t1)]
       (cond
+        (and (:quoted? (meta t1))
+             (ident-token? (second toks))
+             (str/starts-with? (second (second toks)) ".")
+             (> (count (second (second toks))) 1))
+        [{:ns first-name :table (subs (second (second toks)) 1)} (drop 2 toks)]
+
+        (and (not (:quoted? (meta t1)))
+             (str/ends-with? first-name ".")
+             (:quoted? (meta (second toks))))
+        [{:ns (str/lower-case (subs first-name 0 (dec (count first-name))))
+          :table (second (second toks))}
+         (drop 2 toks)]
+
         ;; schema.name form
         (and (= :ident (first (second toks)) (first (nth toks 2 nil)))
              (= "." (second (second toks))))
         ;; Looks like table.column ($schema.$name)
-        [{:ns (str/lower-case first-name)
+        [{:ns (if (:quoted? (meta t1)) first-name (str/lower-case first-name))
           :table (second (nth toks 2 nil))}
          (drop 3 toks)]
 
@@ -186,7 +199,7 @@
         ;; ident if the surrounding chars are word chars. So
         ;; `public.users` lexes as a single ident "public.users".)
         (let [s first-name]
-          (and (ident-token? t1) (str/includes? s ".")))
+          (and (not (:quoted? (meta t1))) (str/includes? s ".")))
         (let [[ns nm] (str/split first-name #"\." 2)]
           [{:ns (str/lower-case ns) :table nm} (rest toks)])
 
@@ -207,7 +220,7 @@
           [cols (rest t)]
 
           (ident-token? head)
-          (recur (rest t) (conj cols (str/lower-case (second head))))
+          (recur (rest t) (conj cols (if (:quoted? (meta head)) (second head) (str/lower-case (second head)))))
 
           :else
           (throw (ex-info (str "expected column name in COPY column list, got: "
@@ -320,7 +333,7 @@
         (when-not (and (ident-token? head) (not (ident-eq? head "*")))
           (throw (ex-info "expected column name in COPY FORCE column list"
                           {:error :syntax-error :got head})))
-        (let [cols (conj cols (str/lower-case (second head)))]
+        (let [cols (conj cols (if (:quoted? (meta head)) (second head) (str/lower-case (second head))))]
           (if (= :comma (ffirst tail))
             (recur (rest tail) cols)
             [cols tail]))))))

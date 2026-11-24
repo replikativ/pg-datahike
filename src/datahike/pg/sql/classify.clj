@@ -631,6 +631,43 @@
          classify-create-trigger classify-role-statement classify-create-matview
          classify-refresh-matview classify-drop-matview classify-create-table)
 
+(defn- schema-name [token]
+  (when (ident-tok? token) (:text token)))
+
+(defn- classify-schema-ddl [verb tokens]
+  (let [tokens (vec tokens)
+        tokens (if (= ";" (:text (peek tokens))) (pop tokens) tokens)
+        [first-token second-token third-token] tokens
+        if-clause? (and (kw=? first-token "if")
+                        (case verb
+                          :create (and (kw=? second-token "not") (kw=? third-token "exists"))
+                          :drop (kw=? second-token "exists")
+                          false))
+        tokens (if if-clause? (subvec tokens (if (= :create verb) 3 2)) tokens)
+        [name-token operation-token target-token new-name-token] tokens
+        schema (schema-name name-token)
+        new-name (schema-name new-name-token)
+        parsed (case verb
+                 :create (when (and schema (= 1 (count tokens)))
+                           {:names [schema]})
+                 :drop (let [cascade? (kw=? (peek tokens) "cascade")
+                             entries (if (or cascade? (kw=? (peek tokens) "restrict"))
+                                       (pop tokens) tokens)
+                             names (mapv schema-name (take-nth 2 entries))]
+                         (when (and (odd? (count entries))
+                                    (every? some? names)
+                                    (every? #(= "," (:text %)) (take-nth 2 (rest entries))))
+                           {:names names :cascade? cascade?}))
+                 :alter (when (and schema new-name (= 4 (count tokens))
+                                   (kw=? operation-token "rename") (kw=? target-token "to"))
+                          {:names [schema] :new-name new-name}))
+        tag (str (str/upper-case (name verb)) " SCHEMA")]
+    (if parsed
+      (assoc parsed :kind :schema-ddl :operation verb :if-clause? if-clause? :tag tag)
+      (if (and (= :alter verb) (kw=? operation-token "owner"))
+        {:kind :schema-noop :tag tag}
+        {:kind :generic-sql}))))
+
 (defn- classify-create [toks]
   ;; toks starts after CREATE. Skip qualifiers (OR REPLACE, UNIQUE,
   ;; TEMPORARY, GLOBAL, LOCAL, UNLOGGED) that don't disambiguate kind.
@@ -648,7 +685,7 @@
       (kw=? t1 "policy")    {:kind :create-policy :reject-kind :policy :tag "CREATE POLICY"}
       (kw=? t1 "extension") {:kind :create-extension :reject-kind :create-extension
                              :tag "CREATE EXTENSION"}
-      (kw=? t1 "schema")    {:kind :schema-noop :tag "CREATE SCHEMA"}
+      (kw=? t1 "schema")    (classify-schema-ddl :create (rest toks))
       (kw-in? t1 #{"role" "user" "group"})
       (classify-role-statement :create (rest toks) (str/upper-case (:text t1)))
       (kw=? t1 "database")  {:kind :create-database :tag "CREATE DATABASE"}
@@ -725,34 +762,43 @@
 
       :else                 {:kind :generic-sql})))
 
+(defn- read-relation-parts [toks]
+  (let [toks (if (kw=? (first toks) "only") (rest toks) toks)]
+    (when (ident-tok? (first toks))
+      (loop [tokens [(first toks)] remaining (rest toks)]
+        (if (and (= "." (:text (first remaining))) (ident-tok? (second remaining)))
+          (recur (conj tokens (second remaining)) (drop 2 remaining))
+          [tokens (if (= "*" (:text (first remaining))) (rest remaining) remaining)])))))
+
 (defn- read-relation-name
-  "Consume one `[ONLY] [schema.]name [*]` from the token stream.
-   Returns [last-name-segment remaining-toks], or nil when the head is
-   not a relation name. The schema qualifier is dropped for the
-   single-namespace store. The optional token reader can preserve the raw SQL
-   spelling for callers that normalize identifiers after classification."
+  "Consume one [ONLY] [schema.]name [*] and return its last identifier."
   ([toks] (read-relation-name toks ident-text))
   ([toks token-name]
-   (let [toks (if (kw=? (first toks) "only") (rest toks) toks)]
-     (when (ident-tok? (first toks))
-       (loop [nm (token-name (first toks))
-              ts (rest toks)]
-         (if (and (= "." (:text (first ts))) (ident-tok? (second ts)))
-           (recur (token-name (second ts)) (drop 2 ts))
-           [nm (if (= "*" (:text (first ts))) (rest ts) ts)]))))))
+   (when-let [[parts remaining] (read-relation-parts toks)]
+     [(token-name (peek parts)) remaining])))
 
 (defn- read-relation-list
-  "Comma-separated relation names (each per read-relation-name).
-   Returns [names remaining-toks], or nil on a malformed head — the
-   caller falls back to :generic-sql and JSqlParser reports the real
-   syntax error."
-  ([toks] (read-relation-list toks ident-text))
-  ([toks token-name]
+  "Consume a comma-separated relation list, retaining qualifiers when requested."
+  ([toks] (read-relation-list toks ident-text false))
+  ([toks token-name preserve-parts?]
    (loop [names [] ts toks]
-     (when-let [[nm ts'] (read-relation-name ts token-name)]
-       (if (= "," (:text (first ts')))
-         (recur (conj names nm) (rest ts'))
-         [(conj names nm) ts'])))))
+     (when-let [[parts remaining] (read-relation-parts ts)]
+       (let [name (if preserve-parts? (mapv token-name parts) (token-name (peek parts)))
+             names (conj names name)]
+         (if (= "," (:text (first remaining)))
+           (recur names (rest remaining))
+           [names remaining]))))))
+
+(defn- relation-list-fields [targets table-name]
+  (cond-> {:tables (mapv (comp table-name peek) targets)}
+    ;; Bare, already-normalized names can go straight to execution. Keep
+    ;; the raw identifiers whenever lookup must decode or qualify them.
+    (some (fn [[token & qualifiers]]
+            (or (seq qualifiers)
+                (not (and (= :ident (:type token))
+                          (re-matches #"[a-z_0-9$]{1,63}" (:text token))))))
+          targets)
+    (assoc :relation-parts (mapv #(mapv :text %) targets))))
 
 (defn- classify-drop-table
   "DROP TABLE with MORE THAN ONE name. JSqlParser 5.2's Drop grammar
@@ -767,14 +813,14 @@
   (let [if-exists? (boolean (and (kw=? (first toks) "if")
                                  (kw=? (second toks) "exists")))
         ts (if if-exists? (drop 2 toks) toks)]
-    (or (when-let [[names ts'] (read-relation-list ts)]
+    (or (when-let [[names ts'] (read-relation-list ts identity true)]
           (let [cascade? (boolean (kw=? (first ts') "cascade"))
                 ts' (if (kw-in? (first ts') #{"cascade" "restrict"})
                       (rest ts') ts')
                 ts' (drop-while #(= ";" (:text %)) ts')]
             (when (and (empty? ts') (> (count names) 1))
-              {:kind :drop-table-multi :tables names :if-exists? if-exists?
-               :cascade? cascade?})))
+              (assoc (relation-list-fields names ident-text)
+                     :kind :drop-table-multi :if-exists? if-exists? :cascade? cascade?))))
         {:kind :generic-sql})))
 
 ;; ============================================================================
@@ -1555,7 +1601,7 @@
   [toks]
   (let [ts (if (kw=? (first toks) "table") (rest toks) toks)
         table-name #(if (= :ident (:type %)) (str/lower-case (:text %)) (ident-text %))]
-    (or (when-let [[names ts1] (read-relation-list ts table-name)]
+    (or (when-let [[names ts1] (read-relation-list ts identity true)]
           (let [identity? (and (or (kw=? (first ts1) "restart")
                                    (kw=? (first ts1) "continue"))
                                (kw=? (second ts1) "identity"))
@@ -1566,8 +1612,8 @@
                       (rest ts2) ts2)
                 ts4 (drop-while #(= ";" (:text %)) ts3)]
             (when (empty? ts4)
-              {:kind :truncate :tables names
-               :restart-identity? restart? :cascade? (boolean cascade?)})))
+              (assoc (relation-list-fields names table-name)
+                     :kind :truncate :restart-identity? restart? :cascade? (boolean cascade?)))))
         {:kind :generic-sql})))
 
 (defn- classify-drop-function
@@ -1619,7 +1665,7 @@
       (kw=? t1 "policy")    {:kind :drop-policy :reject-kind :policy :tag "DROP POLICY"}
       (kw=? t1 "extension") {:kind :drop-extension :reject-kind :create-extension
                              :tag "DROP EXTENSION"}
-      (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
+      (kw=? t1 "schema")    (classify-schema-ddl :drop (rest toks))
       (kw-in? t1 #{"role" "user" "group"})
       (classify-role-statement :drop (rest toks) (str/upper-case (:text t1)))
       (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
@@ -1662,7 +1708,7 @@
   (let [[t1 & rest-toks] toks]
     (cond
       (kw=? t1 "policy")  {:kind :alter-policy :reject-kind :policy :tag "ALTER POLICY"}
-      (kw=? t1 "schema")  {:kind :schema-noop :tag "ALTER SCHEMA"}
+      (kw=? t1 "schema")  (classify-schema-ddl :alter rest-toks)
 
       ;; ALTER <object> ... OWNER TO ... — pg_dump-emitted boilerplate.
       ;; We don't have a role system, so silently accept with the
@@ -1687,18 +1733,17 @@
       (kw=? t1 "sequence") (classify-alter-sequence rest-toks)
 
       (kw=? t1 "table")
-      ;; Consume optional [ONLY], [IF EXISTS] and the table name (possibly
-      ;; schema.name), then inspect what follows.
       (let [ts (if (kw=? (first rest-toks) "only") (rest rest-toks) rest-toks)
-            ts (if (and (kw=? (first ts) "if") (kw=? (second ts) "exists"))
-                 (drop 2 ts) ts)
-            ;; Consume exactly one (possibly schema-qualified) name.
-            ts (if (ident-tok? (first ts)) (rest ts) ts)
-            ts (if (and (= "." (:text (first ts)))
-                        (ident-tok? (second ts)))
-                 (drop 2 ts)
-                 ts)]
+            if-exists? (and (kw=? (first ts) "if") (kw=? (second ts) "exists"))
+            ts (if if-exists? (drop 2 ts) ts)
+            [parts ts] (read-relation-parts ts)
+            [set-token schema-token target & tail] ts]
         (cond
+          (and parts (kw=? set-token "set") (kw=? schema-token "schema")
+               (ident-tok? target) (every? #(= ";" (:text %)) tail))
+          {:kind :move-table-schema :relation-parts [(mapv :text parts)]
+           :new-schema (:text target) :if-exists? if-exists?}
+
           (alter-table-rls? ts)
           {:kind :rls :reject-kind :rls :tag "ALTER TABLE ROW LEVEL SECURITY"}
 
