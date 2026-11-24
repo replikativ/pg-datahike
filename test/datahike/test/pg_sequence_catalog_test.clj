@@ -628,3 +628,22 @@
   (is (nil? (err "ALTER TABLE a ALTER b_c SET DEFAULT 8")))
   (is (= [["8"]] (rows "INSERT INTO a DEFAULT VALUES RETURNING b_c")))
   (is (= [["1"]] (rows "INSERT INTO a_b DEFAULT VALUES RETURNING c"))))
+
+(deftest generated-sequence-names-fit-utf8-and-retain-the-numbered-suffix
+  (let [table (apply str (repeat 16 "é"))
+        column (apply str (repeat 11 "🍋"))
+        stem (str (apply str (repeat 14 "é")) "_" (apply str (repeat 7 "🍋")))
+        occupied (str stem "_seq")
+        generated (str stem "_seq1")
+        relation (str "billing.\"" table "\"")
+        allocator (str "pg_get_serial_sequence('" relation "','" column "')")]
+    (doseq [sql ["CREATE SCHEMA billing"
+                 (str "CREATE SEQUENCE billing.\"" occupied "\" START 50")
+                 (str "CREATE TABLE " relation " (\"" column "\" serial)")]]
+      (is (nil? (err sql)) sql))
+    (let [sequence-reference (ffirst (rows (str "SELECT " allocator)))]
+      (is (= (str "billing.\"" generated "\"") sequence-reference))
+      (is (= [["62"]] (rows (str "SELECT octet_length(relname) FROM pg_class WHERE oid=" allocator "::regclass"))))
+      (is (= [["1"]] (rows (str "INSERT INTO " relation " DEFAULT VALUES RETURNING \"" column "\""))))
+      (is (= [["2"]] (rows (str "SELECT nextval('" sequence-reference "')")))))
+    (is (= [["50"]] (rows (str "SELECT nextval('billing.\"" occupied "\"')"))))))

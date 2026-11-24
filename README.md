@@ -630,8 +630,9 @@ stages. `EXPLAIN ANALYZE` raises `0A000`, as do shapes whose output metadata
 cannot be established without execution, including correlated LATERAL queries
 and some routine or user-defined-type outputs.
 
-Generated identity and SERIAL sequence names use `<table>_<column>_seq`.
-Existing names raise `42P07`; automatic suffix selection is not yet supported.
+Generated identity and SERIAL sequence names use `<table>_<column>_seq`,
+shortened to fit PostgreSQL's 63-byte identifier limit. An existing name
+in the same schema causes PostgreSQL-style numbered suffixes such as `seq1`.
 
 Arrays with supported built-in element types support element and slice
 assignments in `UPDATE`, `INSERT` and `ON CONFLICT DO UPDATE`: for example, `UPDATE samples SET readings[2]=42`

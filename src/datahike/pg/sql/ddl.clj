@@ -38,6 +38,7 @@
             CheckConstraint ForeignKeyIndex]
            [net.sf.jsqlparser.statement.create.sequence CreateSequence]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
+           [java.nio.charset StandardCharsets]
            [java.util.function Consumer]
            [datahike.pg ColumnSubstitutingDeParser ColumnSubstitutingDeParser$Unsupported
             DefaultExpressionVisitor]))
@@ -296,17 +297,30 @@
         (vec cols))
       (catch ColumnSubstitutingDeParser$Unsupported _ nil))))
 
+(defn- utf8-prefix [^bytes encoded length]
+  (let [end (loop [end (long length)]
+              (if (and (< end (alength encoded))
+                       ;; Continuation bytes are 10xxxxxx. Back up to the
+                       ;; current character's start before decoding.
+                       (= 0x80 (bit-and 0xc0 (aget encoded end))))
+                (recur (dec end))
+                end))]
+    (String. encoded 0 (int end) StandardCharsets/UTF_8)))
+
 (defn- make-object-name
-  "PostgreSQL's makeObjectName: `name1_name2_label`, shortening the longer
-   of name1 and name2 until the whole fits NAMEDATALEN - 1 (63) bytes."
+  "Allocate PostgreSQL's byte budget, then clip each part at a UTF-8 boundary."
   [^String name1 ^String name2 ^String label]
-  (let [avail (- 63 (inc (count label)) (if name2 1 0))
-        [n1 n2] (loop [n1 (count name1) n2 (count (or name2 ""))]
+  (let [part1 (.getBytes name1 StandardCharsets/UTF_8)
+        part2 (when name2 (.getBytes name2 StandardCharsets/UTF_8))
+        avail (- params/max-identifier-bytes
+                 (inc (alength (.getBytes label StandardCharsets/UTF_8)))
+                 (if part2 1 0))
+        [n1 n2] (loop [n1 (alength part1) n2 (if part2 (alength part2) 0)]
                   (if (<= (+ n1 n2) avail)
                     [n1 n2]
                     (if (> n1 n2) (recur (dec n1) n2) (recur n1 (dec n2)))))]
-    (str (subs name1 0 n1)
-         (when name2 (str "_" (subs name2 0 n2)))
+    (str (utf8-prefix part1 n1)
+         (when part2 (str "_" (utf8-prefix part2 n2)))
          "_" label)))
 
 (defn available-object-name
