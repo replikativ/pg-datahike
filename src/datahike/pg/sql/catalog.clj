@@ -1838,7 +1838,7 @@
                                                    (:pg/default-arg entity))
         :let [name (sequence-name db sequences reference)]
         :when name]
-    {:table table :column column :entity entity :sequence name}))
+    {:table table :column column :entity entity :sequence name :reference reference}))
 
 (defn defaults-depending-on-sequences [db names]
   (when (seq names)
@@ -1869,7 +1869,7 @@
              :when (nil? owned-by-column)
              [idx column] (map-indexed vector (get tables owned-by-table))
              :when (= name (str owned-by-table "_" (clojure.core/name (:attr column)) "_seq"))
-             :let [relation-oid (pgs/table-oid db owned-by-table)]
+             :let [relation-oid (pgs/storage-table-oid db owned-by-table)]
              :when relation-oid]
          (dependency class-id (sequence-oid db name) relation-oid
                      (or (:attnum column) (inc idx)) (if identity-generation "i" "a")))
@@ -3103,6 +3103,16 @@
                                 (assoc m ident {:kind :generated :value expr}))
                               defaults
                               (or generated-exprs {}))
+          path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+          sequence-reference
+          (fn [spelling]
+            (when-let [name (sequence-name cte-db @sequences spelling)]
+              (binding [regoid/*db* cte-db
+                        regoid/*relation-db* cte-db
+                        regoid/*relation-provider* relation-identity
+                        regoid/*search-path* path]
+                (regoid/output types/oid-regclass (sequence-oid cte-db name)
+                               types/format-type))))
           render (fn [{:keys [kind value arg]} col]
                    (case kind
                      ;; Already parenthesised by the DDL lowering, which
@@ -3116,17 +3126,10 @@
                             "\"bit\""))
                      :nextval
                      (let [spelling (or arg value)
-                           name (sequence-name cte-db @sequences spelling)
-                           path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
-                           reference (if name
-                                       (binding [regoid/*db* cte-db
-                                                 regoid/*relation-db* cte-db
-                                                 regoid/*relation-provider* relation-identity
-                                                 regoid/*search-path* path]
-                                         (regoid/output types/oid-regclass (sequence-oid cte-db name)
-                                                        types/format-type))
-                                       spelling)]
+                           reference (or (sequence-reference spelling) spelling)]
                        (str "nextval('" (str/replace reference "'" "''") "'::regclass)"))
+                     :expr (ddl/rewrite-default-sequence-references
+                            value #(when (re-matches #"[0-9]+" %) (sequence-reference %)))
                      :fn (str value "()")
                      :literal
                      (cond

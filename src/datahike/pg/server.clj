@@ -5305,14 +5305,19 @@
                      (cons base (map #(str base "_" %) (range 1 Long/MAX_VALUE))))))))
 
 (defn- bind-sequence-default [db datum]
-  (if (= :nextval (:pg/default-kind datum))
-    (let [reference (or (:pg/default-arg datum) (:pg/default-value datum))
-          storage (sequence/reference-storage-name db reference)
-          object (when storage (sequence/object-by-storage-name db storage))]
-      (if object
-        (assoc datum :pg/default-arg (str (:datahike.pg.object/oid object)))
-        datum))
-    datum))
+  (let [resolve-reference
+        (fn [reference]
+          (when-let [storage (sequence/reference-storage-name db reference)]
+            (when-let [object (sequence/object-by-storage-name db storage)]
+              (str (:datahike.pg.object/oid object)))))]
+    (case (:pg/default-kind datum)
+      :nextval (let [reference (or (:pg/default-arg datum) (:pg/default-value datum))]
+                 (if-let [counter (resolve-reference reference)]
+                   (assoc datum :pg/default-arg counter)
+                   datum))
+      :expr (update datum :pg/default-value
+                    ddl/rewrite-default-sequence-references resolve-reference)
+      datum)))
 
 (defn- table-create-tx-data [db parsed]
   (doseq [column (:column-order parsed)]
@@ -10607,6 +10612,20 @@
                           (throw (undefined-schema name))))))
             (distinct (map vector names namespaces))))))
 
+(defn- pin-defaults-for-moving-sequences [db sequence-objects]
+  (let [counter-oid (into {} (map (fn [[storage object]]
+                                    [storage (str (:datahike.pg.object/oid object))]))
+                          sequence-objects)
+        dependencies (catalog/defaults-depending-on-sequences db (keys counter-oid))]
+    (mapv (fn [[eid references]]
+            (let [entity (:entity (first references))
+                  by-reference (into {} (map (juxt :reference (comp counter-oid :sequence))) references)]
+              (if (= :nextval (:pg/default-kind entity))
+                [:db/add eid :pg/default-arg (counter-oid (:sequence (first references)))]
+                [:db/add eid :pg/default-value
+                 (ddl/rewrite-default-sequence-references (:pg/default-value entity) by-reference)])))
+          (group-by (comp :db/id :entity) dependencies))))
+
 (defn- move-table-schema-tx [db {:keys [tables table-schemas new-schema if-exists?]}]
   (let [name (first tables)
         table (ddl-table-object db name (first table-schemas))
@@ -10630,15 +10649,21 @@
 
       (= old-namespace new-namespace) []
 
-      (or (and (not= new-namespace catalog-objects/public-namespace-oid)
-               (< new-namespace catalog-objects/first-user-oid))
-          (seq (relation-owned-sequences db storage relation-oid)))
+      (and (not= new-namespace catalog-objects/public-namespace-oid)
+           (< new-namespace catalog-objects/first-user-oid))
       (throw (errors/pg-error :feature-not-supported
-                              {:feature "moving tables into system schemas or moving owned sequences"}))
+                              {:feature "moving tables into system schemas"}))
 
       :else
       (let [object-name (:datahike.pg.object/name table)
-            moving (catalog-objects/table-namespace-objects db table)
+            sequence-objects (mapv (fn [counter]
+                                     (let [object (sequence/object-by-storage-name db counter)]
+                                       (when-not object
+                                         (throw (errors/pg-error :feature-not-supported
+                                                                 {:feature "moving an unregistered sequence"})))
+                                       [counter object]))
+                                   (relation-owned-sequences db storage relation-oid))
+            moving (into (catalog-objects/table-namespace-objects db table) (map second) sequence-objects)
             row-type (some #(when (= :row-type (:datahike.pg.object/kind %)) %) moving)
             _ (doseq [object moving
                       :let [class-oid (:datahike.pg.object/class-oid object)
@@ -10652,9 +10677,17 @@
                                    db catalog-objects/pg-type-oid new-namespace object-name))
                 (throw (ex-info (str "type \"" object-name "\" already exists in schema \"" new-schema "\"")
                                 {:sqlstate "42710"})))]
-        (cond-> (into [] (mapcat #(catalog-objects/move-relation-object-tx % new-namespace)) moving)
-          (nil? (:datahike.pg.object/storage-name table))
-          (conj [:db/add (:db/id table) :datahike.pg.object/storage-name storage]))))))
+        (let [sequence-storage (for [[counter object] sequence-objects
+                                     :when (nil? (:datahike.pg.object/storage-name object))]
+                                 [:db/add (:db/id object) :datahike.pg.object/storage-name counter])
+              move-data (into [] (mapcat #(catalog-objects/move-relation-object-tx % new-namespace)) moving)
+              data (cond-> (into move-data sequence-storage)
+                     (nil? (:datahike.pg.object/storage-name table))
+                     (conj [:db/add (:db/id table) :datahike.pg.object/storage-name storage]))]
+          (if (seq sequence-objects)
+            (guard-catalog-tx (into data (pin-defaults-for-moving-sequences db sequence-objects))
+                              (catalog-basis/capture db))
+            data))))))
 
 (defn- exec-ddl-schema [{:keys [conn tx-state session-id]} {:keys [tag] :as parsed}]
   (try

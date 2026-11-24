@@ -418,7 +418,7 @@
       (CCJSqlParserUtil/parseExpression raw)
       (catch Exception _ nil))))
 
-(defn- static-nextval-reference [^Function call]
+(defn- static-nextval-argument [^Function call]
   (when (#{"nextval" "pg_catalog.nextval"} (str/lower-case (.getName call)))
     (let [arg (params/unwrap-scalar-parens (first (.getParameters call)))
           arg (if (and (instance? CastExpression arg)
@@ -427,25 +427,45 @@
                 (params/unwrap-scalar-parens (.getLeftExpression ^CastExpression arg))
                 arg)]
       (when (instance? StringValue arg)
-        (.getNotExcapedValue ^StringValue arg)))))
+        arg))))
+
+(defn- visit-default-sequence-arguments [value visit]
+  (when (and value (str/includes? (str/lower-case value) "nextval"))
+    (when-let [^Expression ast (parse-default-expression value)]
+      (.accept ast
+               (DefaultExpressionVisitor.
+                (reify Consumer (accept [_ _]))
+                (reify Consumer
+                  (accept [_ call]
+                    (when-let [arg (static-nextval-argument call)]
+                      (visit arg)))))
+               nil)
+      ast)))
+
+(defn rewrite-default-sequence-references
+  "Rewrite literal nextval arguments in a stored expression."
+  [value replace-reference]
+  (let [changed? (volatile! false)
+        rewritten
+        (visit-default-sequence-arguments
+         value (fn [^StringValue arg]
+                 (let [reference (.getNotExcapedValue arg)]
+                   (when-let [replacement (replace-reference reference)]
+                     (when-not (= reference replacement)
+                       (.setValue arg (str/replace replacement "'" "''"))
+                       (vreset! changed? true))))))]
+    (if @changed? (str rewritten) value)))
 
 (defn default-sequence-references
   "Static sequence names referenced by a stored column default."
   [kind value argument]
   (case kind
     :nextval [(or argument value)]
-    :expr (when (and value (str/includes? (str/lower-case value) "nextval"))
-            (when-let [^Expression ast (parse-default-expression value)]
-              (let [references (volatile! [])]
-                (.accept ast
-                         (DefaultExpressionVisitor.
-                          (reify Consumer (accept [_ _]))
-                          (reify Consumer
-                            (accept [_ call]
-                              (when-let [reference (static-nextval-reference call)]
-                                (vswap! references conj reference)))))
-                         nil)
-                (distinct @references))))
+    :expr (let [references (volatile! [])]
+            (visit-default-sequence-arguments
+             value (fn [^StringValue arg]
+                     (vswap! references conj (.getNotExcapedValue arg))))
+            (distinct @references))
     nil))
 
 (defn- reject-default-expression! [kind]
