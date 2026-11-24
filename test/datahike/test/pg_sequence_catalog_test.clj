@@ -392,3 +392,25 @@
                     "WHERE adrelid = 'billing.invoice'::regclass"))))
   (is (= "2BP01" (.sqlstate (run "DROP SEQUENCE billing.ticket"))))
   (is (= "2BP01" (.sqlstate (run "DROP SEQUENCE \"Archive Data\".\"O'Brien.Ticket\"")))))
+
+(deftest generated-sequences-belong-to-their-table-namespace
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE TABLE public.invoice (serial_id serial, identity_id bigint GENERATED ALWAYS AS IDENTITY, label text)"
+               "BEGIN"
+               "CREATE TABLE billing.invoice (serial_id serial, identity_id bigint GENERATED ALWAYS AS IDENTITY, label text)"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["1" "1"]] (rows "INSERT INTO billing.invoice (label) VALUES ('named') RETURNING serial_id, identity_id")))
+  (is (nil? (err "COMMIT")))
+  (is (= [["1" "1"]] (rows "INSERT INTO public.invoice (label) VALUES ('public') RETURNING serial_id, identity_id")))
+  (is (= [["2" "2"]] (rows "INSERT INTO billing.invoice (label) VALUES ('next') RETURNING serial_id, identity_id")))
+  (is (= "428C9" (.sqlstate (run "INSERT INTO billing.invoice (identity_id) VALUES (10)"))))
+  (is (= [["billing.invoice_serial_id_seq" "billing.invoice_identity_id_seq"]]
+         (rows (str "SELECT pg_get_serial_sequence('billing.invoice', 'serial_id'), "
+                    "pg_get_serial_sequence('billing.invoice', 'identity_id')"))))
+  (is (nil? (err "TRUNCATE TABLE billing.invoice RESTART IDENTITY")))
+  (is (= [["1" "1"]] (rows "INSERT INTO billing.invoice DEFAULT VALUES RETURNING serial_id, identity_id")))
+  (is (nil? (err "DROP TABLE billing.invoice")))
+  (is (= [["t" "t"]]
+         (rows (str "SELECT to_regclass('billing.invoice_identity_id_seq') IS NULL, "
+                    "to_regclass('billing.invoice_serial_id_seq') IS NULL"))))
+  (is (= [["2" "2"]] (rows "INSERT INTO public.invoice DEFAULT VALUES RETURNING serial_id, identity_id"))))

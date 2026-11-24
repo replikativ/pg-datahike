@@ -5296,12 +5296,20 @@
                 (:pg/fk-parent-schema datum) (dissoc :pg/fk-parent-schema))))
           tx-data)))
 
-(defn- bind-scoped-sequence-default [db datum]
+(defn- fresh-sequence-storage-name [db logical-name oid public?]
+  (if (and public? (not (sequence-exists? db logical-name)))
+    logical-name
+    (let [base (str "__dh_pg_seq_" oid)]
+      (first (remove #(or (sequence-exists? db %)
+                          (catalog-objects/object-by-storage-name db %))
+                     (cons base (map #(str base "_" %) (range 1 Long/MAX_VALUE))))))))
+
+(defn- bind-sequence-default [db datum]
   (if (= :nextval (:pg/default-kind datum))
     (let [reference (or (:pg/default-arg datum) (:pg/default-value datum))
           storage (sequence/reference-storage-name db reference)
           object (when storage (sequence/object-by-storage-name db storage))]
-      (if (:datahike.pg.object/storage-name object)
+      (if object
         (assoc datum :pg/default-arg (str (:datahike.pg.object/oid object)))
         datum))
     datum))
@@ -5311,23 +5319,34 @@
     (ddl/validate-table-column-name! column))
   (let [table-name (:table-name parsed)
         namespace-oid (get parsed :namespace-oid catalog-objects/public-namespace-oid)
-        raw-ddl-data (mapv #(bind-scoped-sequence-default db %) (ddl-tx-data parsed))
-        _ (when (and (not= namespace-oid catalog-objects/public-namespace-oid)
-                     (or (seq (:identity-cols parsed)) (seq (:inherits parsed))))
+        public? (= namespace-oid catalog-objects/public-namespace-oid)
+        raw-ddl-data (ddl-tx-data parsed)
+        _ (when (and (not public?) (seq (:inherits parsed)))
             (throw (errors/pg-error :feature-not-supported
-                                    {:feature "identity sequences and inheritance in non-public schemas"})))
+                                    {:feature "inheritance in non-public schemas"})))
         sequence-names (vec (distinct (keep #(when (map? %) (:__seq__/name %))
                                             raw-ddl-data)))
         {:keys [oids tx-data]}
         (catalog-objects/reserve-user-oids-tx db (+ 2 (count sequence-names)))
         [oid row-type-oid & sequence-oids] oids
+        sequence-addresses (into {}
+                                 (map (fn [name sequence-oid]
+                                        [name {:oid sequence-oid
+                                               :storage (fresh-sequence-storage-name
+                                                         db name sequence-oid public?)}])
+                                      sequence-names sequence-oids))
         storage (new-table-storage-name db table-name oid namespace-oid)
         storage-ddl-data (table-storage-tx-data db raw-ddl-data table-name storage namespace-oid)
         marker (pgs/row-marker-attr storage)
         ddl-data (mapv (fn [datum]
-                         (if (and (map? datum) (= marker (:db/ident datum)))
-                           (assoc datum :pg/table-oid oid)
-                           datum))
+                         (let [name (:__seq__/name datum)
+                               generated (when (= :nextval (:pg/default-kind datum))
+                                           (get sequence-addresses (:pg/default-arg datum)))]
+                           (cond
+                             (= marker (:db/ident datum)) (assoc datum :pg/table-oid oid)
+                             name (assoc datum :__seq__/name (get-in sequence-addresses [name :storage]))
+                             generated (assoc datum :pg/default-arg (str (:oid generated)))
+                             :else (bind-sequence-default db datum))))
                        storage-ddl-data)
         ddl-by-ident (into {}
                            (keep (fn [datum]
@@ -5346,12 +5365,14 @@
                            :oid row-type-oid :kind :row-type :name table-name
                            :namespace-oid namespace-oid})
         sequence-object-data
-        (mapcat (fn [name sequence-oid]
-                  (catalog-objects/create-object-tx
-                   db {:class-oid catalog-objects/pg-class-oid
-                       :oid sequence-oid :kind :sequence :name name
-                       :namespace-oid catalog-objects/public-namespace-oid}))
-                sequence-names sequence-oids)
+        (mapcat (fn [name]
+                  (let [{:keys [oid storage]} (get sequence-addresses name)]
+                    (catalog-objects/create-object-tx
+                     db {:class-oid catalog-objects/pg-class-oid
+                         :oid oid :kind :sequence :name name
+                         :storage-name (when (not= name storage) storage)
+                         :namespace-oid namespace-oid})))
+                sequence-names)
         local-names (vec (:column-order parsed))
         local-name-set (set local-names)
         ;; PostgreSQL walks the INHERITS list in order and MERGES columns
@@ -5422,7 +5443,9 @@
         (catalog-objects/create-columns-tx
          oid (map-indexed #(assoc %2 :attnum (inc %1)) effective-columns))
         sequence-ownership
-        (when (and (not= table-name storage) (seq sequence-names))
+        (when (and (seq sequence-names)
+                   (or (not= table-name storage)
+                       (some (fn [[name {:keys [storage]}]] (not= name storage)) sequence-addresses)))
           (let [seq-columns (set (:identity-cols parsed))]
             (into (cond-> []
                     (not (contains? (dbi/-schema db) :__seq__/owned-by-column))
@@ -5430,9 +5453,9 @@
                   (keep-indexed
                    (fn [idx {:keys [name]}]
                      (when (contains? seq-columns name)
-                       [:db/add [:__seq__/name (str table-name "_" name "_seq")]
-                        :__seq__/owned-by-column
-                        (catalog-objects/column-address-key oid (inc idx))])))
+                       (let [counter (get-in sequence-addresses [(str table-name "_" name "_seq") :storage])]
+                         [:db/add [:__seq__/name counter] :__seq__/owned-by-column
+                          (catalog-objects/column-address-key oid (inc idx))]))))
                   effective-columns)))
         foreign-key? #(and (map? %) (contains? % :pg/fk-parent-table))
         has-foreign-keys? (some foreign-key? ddl-data)
@@ -5484,10 +5507,11 @@
             (when-not name-conflict?
               (some (fn [column]
                       (let [sequence-name (str table-name "_" column "_seq")]
-                        (when (or (sequence-exists? current-db sequence-name)
-                                  (catalog-objects/object-by-identity
-                                   current-db catalog-objects/pg-class-oid
-                                   catalog-objects/public-namespace-oid sequence-name))
+                        (when (or (catalog-objects/object-by-identity
+                                   current-db catalog-objects/pg-class-oid namespace-oid sequence-name)
+                                  (and (= namespace-oid catalog-objects/public-namespace-oid)
+                                       (sequence-exists? current-db sequence-name)
+                                       (nil? (catalog-objects/object-by-storage-name current-db sequence-name))))
                           sequence-name)))
                     (:identity-cols parsed)))]
         (cond
@@ -10158,10 +10182,13 @@
     ;; schedule a spurious drop.
     (when (and temp-tables (:new-temp-mapping? parsed) (nil? (.-error result)))
       (swap! temp-tables assoc logical (:table-name parsed)))
-    (when (and (:in-tx? @tx-state) created? (nil? (.-error result)))
-      (doseq [column (:identity-cols parsed)]
-        (register-local-sequence! tx-state
-                                  (str (:table-name parsed) "_" column "_seq"))))
+    (when (and (:in-tx? @tx-state) created? (seq (:identity-cols parsed)) (nil? (.-error result)))
+      (let [db (:speculative-db @tx-state)
+            table (catalog-objects/object-by-identity
+                   db catalog-objects/pg-class-oid (:namespace-oid parsed) (:table-name parsed))
+            storage (or (:datahike.pg.object/storage-name table) (:table-name parsed))]
+        (doseq [counter (relation-owned-sequences db storage (:datahike.pg.object/oid table))]
+          (register-local-sequence! tx-state counter))))
     result))
 
 (defn- sequence-current-params
@@ -10296,14 +10323,6 @@
                 (empty-result "ALTER SEQUENCE"))))
         (catch Exception e
           (classified-error "" e))))))
-
-(defn- fresh-sequence-storage-name [db logical-name oid public?]
-  (if (and public? (not (sequence-exists? db logical-name)))
-    logical-name
-    (let [base (str "__dh_pg_seq_" oid)]
-      (first (remove #(or (sequence-exists? db %)
-                          (catalog-objects/object-by-storage-name db %))
-                     (cons base (map #(str base "_" %) (range 1 Long/MAX_VALUE))))))))
 
 (defn- exec-ddl-create-sequence
   [ctx parsed]
@@ -12634,7 +12653,7 @@
         attr (:datahike.pg.column/storage-ident column)
         entity (d/entity db attr)
         eid (:db/id entity)
-        metadata (bind-scoped-sequence-default
+        metadata (bind-sequence-default
                   db (alter-default-metadata default (types/oid->pg-name (:datahike.pg.column/type-oid column)) name))]
     (when (or (:pg/generated entity) (identity-storage-column? db table attr))
       (throw (ex-info (str "column \"" name "\" of relation \"" table "\" "
@@ -13180,7 +13199,7 @@
                                                        :let [{:keys [type storage-ident base-type typmod default
                                                                      type-object normalized-type array-spec]}
                                                              (get add-spec-by-name name)
-                                                             metadata (bind-scoped-sequence-default
+                                                             metadata (bind-sequence-default
                                                                        db (alter-default-metadata default base-type name))
                                                              raw-type type
                                                              unsupported-base (str/replace raw-type #"\s*\([^)]*\)" "")

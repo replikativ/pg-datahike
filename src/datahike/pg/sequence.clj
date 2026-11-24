@@ -38,6 +38,12 @@
 (defn object-storage-name [object]
   (or (:datahike.pg.object/storage-name object) (:datahike.pg.object/name object)))
 
+(defn counter-reference
+  "Return a supported default reference to a known counter."
+  [db storage]
+  (let [sequence (object-by-storage-name db storage)]
+    (if sequence (str (:datahike.pg.object/oid sequence)) storage)))
+
 (defn reference-storage-name
   "Resolve a SQL sequence name or numeric regclass value to the counter's name."
   [db spelling]

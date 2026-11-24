@@ -9980,7 +9980,7 @@
       (into (merge identity-defaults nextval-defaults)
             (keep (fn [{:keys [col ns seq-name generation]}]
                     (when (seq generation)
-                      [(keyword ns col) seq-name])))
+                      [(keyword ns col) (sequence/counter-reference db seq-name)])))
             (sequence/addressed-owned-columns db table-name)))))
 
 (defn- populate-insert-sequence-defaults [attrs defaults]
