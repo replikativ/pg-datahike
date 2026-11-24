@@ -365,6 +365,7 @@
                    :depth (:depth (params/domain-spec-by-name db n))
                    :base-type (:datahike.pg.domain/base-type ent)
                    :base-args (some-> (:datahike.pg.domain/base-args ent) sort vec)
+                   :base-typmods (:datahike.pg.domain/base-typmods ent)
                    :check-name (:datahike.pg.domain/check-name ent)
                    :check-expr (:datahike.pg.domain/check-expr ent)
                    :not-null (:datahike.pg.domain/not-null ent)
@@ -373,10 +374,8 @@
          vec)))
 
 (defn- emit-create-domain
-  [{:keys [name base-type base-args check-name check-expr not-null default-raw]}]
-  (let [base (str base-type
-                  (when (seq base-args)
-                    (str "(" (str/join "," base-args) ")")))]
+  [{:keys [name check-name check-expr not-null default-raw] :as domain}]
+  (let [base (params/domain-storage-type domain)]
     (str "CREATE DOMAIN " (quote-ident name) " AS " base
          (when not-null " NOT NULL")
          (when default-raw (str " DEFAULT " default-raw))

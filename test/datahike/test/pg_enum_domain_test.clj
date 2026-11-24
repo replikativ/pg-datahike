@@ -493,6 +493,27 @@
       (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
         (is (= state (some-> error .getSQLState)) sql)))))
 
+(deftest domain-typmods-survive-casts-writes-and-dump
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [sql ["CREATE DOMAIN dollars AS numeric(8,2)"
+                 "CREATE DOMAIN short_label AS varchar(4)"
+                 "CREATE DOMAIN short_label_array AS varchar(4)[2]"
+                 "CREATE TABLE domain_modifiers (amount dollars)"
+                 "ALTER TABLE domain_modifiers ADD COLUMN label short_label"
+                 "ALTER TABLE domain_modifiers ADD COLUMN labels short_label_array"]]
+      (exec! c sql))
+    (is (= [["12345.68" "over"]] (query-rows c
+                                             "SELECT (12345.678::dollars)::text, ('oversize'::short_label)::text")))
+    (exec! c "INSERT INTO domain_modifiers VALUES (12345.678, 'fine', '{one,two}')")
+    (is (= [["12345.68" "fine" "two"]]
+           (query-rows c "SELECT amount::text, label, labels[2] FROM domain_modifiers")))
+    (doseq [sql ["UPDATE domain_modifiers SET label = 'oversize'"
+                 "UPDATE domain_modifiers SET labels = '{oversize}'"]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= "22001" (some-> error .getSQLState)) sql)))
+    (is (str/includes? (dump/dump-to-string *conn*)
+                       "CREATE DOMAIN \"dollars\" AS numeric(8, 2);"))))
+
 (deftest a-domain-requires-a-real-base-type-before-it-is-registered
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (doseq [[base state] [["no_such_type" "42704"]

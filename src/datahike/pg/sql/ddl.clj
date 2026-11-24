@@ -872,6 +872,10 @@
       (#{:bit :varbit} (types/cast-category bt))
       (if (= :varbit (types/cast-category bt)) "varbit" "bit")
 
+      (contains? #{"char" "character" "bpchar"} bt) "bpchar"
+      (contains? #{"varchar" "character varying"} bt) "varchar"
+      (= "name" bt) "name"
+
       (#{"smallint" "int2" "smallserial" "serial2"} bt) "int2"
       (#{"integer" "int" "int4" "serial" "serial4"} bt) "int4"
       (= "oid" bt) "oid"
@@ -1117,10 +1121,7 @@
                                           enum-match "text"
                                           (:array-type domain-match)
                                           (params/domain-array-element-sql (:base-type domain-match))
-                                          domain-match
-                                          (let [{:keys [base-type base-args]} domain-match]
-                                            (str base-type (when (seq base-args)
-                                                             (str "(" (str/join "," base-args) ")"))))
+                                          domain-match (params/domain-storage-type domain-match)
                                           :else raw-type-orig)
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
                                _ (when (types/unsupported-input-type? base-type)
@@ -1194,21 +1195,15 @@
                                  ;; plus a separate argument list. `str` on
                                  ;; ColDataType faithfully includes both.
                                  (some-> (or (types/parse-bit-length
-                                              (str/replace (str cdt) #"(?:\s*\[[^\]]*\])+$" ""))
+                                              (if domain-match
+                                                raw-type
+                                                (str/replace (str cdt) #"(?:\s*\[[^\]]*\])+$" "")))
                                              (when (and array-spec (= "bit" base-type)) 1))
                                          long))
                                vector-typmod
                                (when (= dh-type :db.type/float-array)
                                  (pg-vector/parse-typmod
                                   (types/normalize-sql-type-name (str cdt))))
-                               char-pg-type
-                               (when-not array-spec
-                                 (let [b (types/base-type-name-of raw-type)]
-                                   (cond
-                                     (contains? #{"char" "character" "bpchar"} b) "bpchar"
-                                     (contains? #{"varchar" "character varying"} b) "varchar"
-                                     (= "name" b) "name"
-                                     :else nil)))
                                pk-here? (or (and single-pk-col (= col-name single-pk-col))
                                             (contains? pk-cols-set col-name))
                                ;; PRIMARY KEY is implicitly NOT NULL.  The SQL
@@ -1270,7 +1265,6 @@
                        bit-typmod (assoc :pg/typmod bit-typmod)
                        vector-typmod (assoc :pg/typmod vector-typmod)
                        (= dh-type :db.type/float-array) (assoc :pg/type "vector")
-                       char-pg-type (assoc :pg/type char-pg-type)
                        not-null-here? (assoc :pg/not-null true)
                        ;; A STORED generated column: `attgenerated = 's'`
                        ;; plus the expression. It is NOT a default --

@@ -486,6 +486,7 @@
       {:eid eid :name name :base-type base
        :base-oid (domain-base-type-oid db domain)
        :base-args (:datahike.pg.domain/base-args domain)
+       :base-typmods (:datahike.pg.domain/base-typmods domain)
        :not-null? (boolean not-null?)
        :check (when (not= :__null__ expression)
                 {:constraint (if (= :__null__ check-name) (str name "_check") check-name)
@@ -506,6 +507,7 @@
             {:name (:name leaf)
              :base-type (:base-type current)
              :base-args (:base-args current)
+             :base-typmods (:base-typmods current)
              :array-type (types/parse-array-type-name (:base-type current))
              :depth (count chain)
              :not-null? (boolean (some :not-null? chain))
@@ -518,6 +520,12 @@
    (when type-name
      (domain-spec-by-name db (-> (str type-name) (str/split #"\.") last unquote-ident)))))
 
+(defn domain-storage-type
+  "Spell the effective database type accepted by the physical column or cast."
+  [{:keys [base-type base-args base-typmods]}]
+  (let [typmods (or base-typmods (when (seq base-args) (str/join ", " base-args)))]
+    (if typmods (str base-type "(" typmods ")") base-type)))
+
 (defn domain-array-element-sql
   "Strip array decorations from an already resolved domain base declaration."
   [base-type]
@@ -528,7 +536,7 @@
 
 (defn cast-domain-value
   "Coerce to the underlying type and apply all domain constraints."
-  [db {:keys [name base-type array-type not-null? checks]} value]
+  [db {:keys [name base-type array-type not-null? checks] :as domain} value]
   (let [null? (or (nil? value) (= :__null__ value))
         _ (when (and null? not-null?)
             (throw (ex-info "domain not-null violation"
@@ -547,7 +555,7 @@
                       (assert-enum-label-safe! db base-type label)
                       (throw (errors/pg-error :invalid-text-representation
                                               {:enum? true :type base-type :value label}))))
-                  :else (sql-cast/cast-scalar value base-type {:explicit? true}))]
+                  :else (sql-cast/cast-scalar value (domain-storage-type domain) {:explicit? true}))]
     (doseq [{:keys [constraint expression]} checks]
       (let [ast (try
                   (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression expression)

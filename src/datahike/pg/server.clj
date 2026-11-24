@@ -11870,6 +11870,8 @@
     :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
    {:db/ident :datahike.pg.domain/base-args
     :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+   {:db/ident :datahike.pg.domain/base-typmods
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :datahike.pg.domain/check-name
     :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :datahike.pg.domain/check-expr
@@ -11882,7 +11884,8 @@
             :datahike.pg.domain/base-type base-type
             :datahike.pg.domain/base-oid (long base-oid)
             :datahike.pg.domain/not-null (boolean not-null)}
-     (seq base-args)         (assoc :datahike.pg.domain/base-args (set base-args))
+     (seq base-args)         (assoc :datahike.pg.domain/base-args (set base-args)
+                                    :datahike.pg.domain/base-typmods (str/join ", " base-args))
      check-name              (assoc :datahike.pg.domain/check-name check-name)
      check-expr              (assoc :datahike.pg.domain/check-expr check-expr)
      default-raw             (assoc :datahike.pg.domain/default-raw default-raw))])
@@ -13337,21 +13340,25 @@
                      user-type (pgs/user-type-object db type)
                      domain (when (= :domain (:datahike.pg.object/kind user-type))
                               (params/domain-spec-by-name db (:datahike.pg.object/name user-type)))
-                     normalized (types/normalize-sql-type-name (or (:base-type domain) type))
-                     base-type (str/replace normalized #"\s*\([^)]*\)" "")
+                     storage-type (or (some-> domain params/domain-storage-type) type)
+                     normalized (types/normalize-sql-type-name storage-type)
                      array-spec (types/parse-array-type-name normalized)
+                     scalar-type (if (:array-type domain)
+                                   (params/domain-array-element-sql normalized)
+                                   normalized)
+                     base-type (str/replace scalar-type #"\s*\([^)]*\)" "")
                      vector-typmod (when (= "vector" base-type)
                                      (pg-vector/parse-typmod normalized))
                      numeric-typmod
                      (when (or (= :numeric (:elem array-spec)) (= :numeric (types/cast-category base-type)))
-                       (let [[precision scale] (types/parse-numeric-args normalized)]
+                       (let [[precision scale] (types/parse-numeric-args scalar-type)]
                          (when (or precision scale)
                            (types/encode-numeric-typmod precision scale))))
-                     char-typmod (when-let [length (types/parse-char-length normalized)]
+                     char-typmod (when-let [length (types/parse-char-length scalar-type)]
                                    (+ length 4))
-                     temporal-typmod (or (types/parse-timestamp-precision normalized)
-                                         (types/parse-time-precision normalized))
-                     bit-typmod (some-> (types/parse-bit-length normalized) long)]
+                     temporal-typmod (or (types/parse-timestamp-precision scalar-type)
+                                         (types/parse-time-precision scalar-type))
+                     bit-typmod (some-> (types/parse-bit-length scalar-type) long)]
                  (assoc column
                         :attnum attnum
                         :storage-ident storage-ident
