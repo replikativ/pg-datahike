@@ -79,12 +79,16 @@
        :source-lines [229 243]
        :gate "test/datahike/test/pg_enum_domain_test.clj"
        :test-var "concrete-enum-overload-wins-over-polymorphic-argument"}]}
-    {:name "domain", :boundaries #{:constraints :user-type :casts}, :mode :unmeasured}
+    {:name "domain", :boundaries #{:constraints :user-type :casts}, :mode :discovery
+     :blockers #{:domain-definition-validation :domain-dependencies :domain-arrays
+                 :domain-composites :domain-value-coercion}}
     {:name "create_type", :boundaries #{:type-ddl :type-lookup}, :mode :unmeasured}
     {:name "type_sanity", :boundaries #{:type-registry :catalogs}, :mode :unmeasured}
     {:name "opr_sanity", :boundaries #{:catalogs :operator-registry}, :mode :unmeasured}
     {:name "misc_sanity", :boundaries #{:catalogs}, :mode :unmeasured}
-    {:name "namespace", :boundaries #{:name-resolution :schemas}, :mode :unmeasured}
+    {:name "namespace", :boundaries #{:name-resolution :schemas}, :mode :discovery
+     :blockers #{:create-schema-elements :drop-schema-cascade :maintenance-search-path
+                 :expression-indexes}}
     {:name "rangefuncs",
      :boundaries #{:parameter-inference :set-returning-functions :lateral},
      :requires ["test_setup"],
