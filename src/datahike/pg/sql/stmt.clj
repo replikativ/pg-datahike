@@ -8641,13 +8641,13 @@
 (defn coerce-array-element
   "Apply a scalar assignment cast while retaining the SQL/query carrier.
    Array text must never contain scalar Datahike storage sentinels."
-  [value {:keys [element-oid typmod]}]
+  [value {:keys [element-oid typmod target-type explicit?]}]
   (when-not (or (nil? value) (= :__null__ value))
-    (let [target (types/format-type element-oid (or typmod -1))]
+    (let [target (or target-type (types/format-type element-oid (or typmod -1)))]
       (when-not (types/cast-category target)
         (throw (errors/pg-error :feature-not-supported
                                 {:feature "assignment to this array element type"})))
-      (sql-cast/cast-scalar value target {:explicit? false :prefer-local-datetime? true}))))
+      (sql-cast/cast-scalar value target {:explicit? explicit? :prefer-local-datetime? true}))))
 
 (defn coerce-array-value
   "Canonicalize every array leaf through its assignment codec, retaining

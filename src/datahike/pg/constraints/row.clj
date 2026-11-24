@@ -120,10 +120,11 @@
                        enum-name (:datahike.pg/enum-of column)]
                    (cond
                      domain-name
-                     (when-let [{:keys [checks not-null?]} (params/domain-spec-by-name db domain-name)]
+                     (when-let [{:keys [checks not-null? array-type]} (params/domain-spec-by-name db domain-name)]
                        [name {:kind :domain :attr attr :domain-name domain-name
                               :not-null? not-null? :checks checks
-                              :array-elem (:pg/array-elem column)}])
+                              :value-type (or (:pg-name array-type) attr)
+                              :array-elem (when-not array-type (:pg/array-elem column))}])
 
                      enum-name
                      [name {:kind :enum :attr attr :enum-name enum-name
@@ -342,7 +343,7 @@
           (doseq [{:keys [constraint ast]} checks
                   v values
                   :when (false? (eval-check-fn ast {(keyword "" "value") v}
-                                               "" (:schema db) {"value" (:attr spec)}))]
+                                               "" (:schema db) {"value" (:value-type spec)}))]
             (throw (errors/pg-error :check-violation
                                     {:table table-name :column column-name
                                      :domain (:domain-name spec) :constraint constraint})))))

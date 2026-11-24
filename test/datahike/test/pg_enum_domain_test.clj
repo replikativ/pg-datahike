@@ -477,6 +477,22 @@
     (is (empty? (query-rows c "SELECT typname FROM pg_type WHERE typname = 'rejected_domain'")))
     (is (false? (exec! c "CREATE DOMAIN rejected_domain AS integer DEFAULT NULL CHECK (VALUE > 0)")))))
 
+(deftest domains-over-arrays-use-the-array-storage-and-element-types
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN int_list AS integer[2] CHECK (VALUE[1] > 0)")
+    (exec! c "CREATE DOMAIN short_labels AS varchar(4)[2][3]")
+    (exec! c "CREATE TABLE domain_arrays (items int_list, labels short_labels)")
+    (exec! c "INSERT INTO domain_arrays VALUES ('{1,2,3}', '{{a,b},{c,d}}')")
+    (is (= [[3 "d"]] (query-rows c "SELECT items[3], labels[2][2] FROM domain_arrays")))
+    (is (= "{1,2}" (str (ffirst (query-rows c "SELECT '{1,2}'::int_list")))))
+    (is (= "{{over}}" (str (ffirst (query-rows c "SELECT '{{oversize}}'::short_labels")))))
+    (doseq [[sql state]
+            [["INSERT INTO domain_arrays (items) VALUES ('{-1,2}')" "23514"]
+             ["SELECT '{-1,2}'::int_list" "23514"]
+             ["INSERT INTO domain_arrays (labels) VALUES ('{{oversize}}')" "22001"]]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)))))
+
 (deftest a-domain-requires-a-real-base-type-before-it-is-registered
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (doseq [[base state] [["no_such_type" "42704"]

@@ -506,6 +506,7 @@
             {:name (:name leaf)
              :base-type (:base-type current)
              :base-args (:base-args current)
+             :array-type (types/parse-array-type-name (:base-type current))
              :depth (count chain)
              :not-null? (boolean (some :not-null? chain))
              :checks (into [] (keep :check) chain)}))))))
@@ -517,9 +518,17 @@
    (when type-name
      (domain-spec-by-name db (-> (str type-name) (str/split #"\.") last unquote-ident)))))
 
+(defn domain-array-element-sql
+  "Strip array decorations from an already resolved domain base declaration."
+  [base-type]
+  (-> base-type
+      (str/replace #"(?i)\s+array(?=\s*(?:\[|$))" "")
+      (str/replace #"(?:\s*\[\s*\d*\s*\])+\s*$" "")
+      str/trim))
+
 (defn cast-domain-value
   "Coerce to the underlying type and apply all domain constraints."
-  [db {:keys [name base-type not-null? checks]} value]
+  [db {:keys [name base-type array-type not-null? checks]} value]
   (let [null? (or (nil? value) (= :__null__ value))
         _ (when (and null? not-null?)
             (throw (ex-info "domain not-null violation"
@@ -527,6 +536,11 @@
         enum-values (when-not null? (registered-enum-values db base-type))
         coerced (cond
                   null? nil
+                  array-type
+                  (let [coerce-array-value (requiring-resolve 'datahike.pg.sql.stmt/coerce-array-value)]
+                    (coerce-array-value value {:elem-type (:elem array-type)
+                                               :target-type (domain-array-element-sql base-type)
+                                               :explicit? true}))
                   enum-values
                   (let [label (str value)]
                     (if (contains? enum-values label)
@@ -541,7 +555,7 @@
                     (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression expression)))
             check-result (requiring-resolve 'datahike.pg.sql.row-eval/check-result)]
         (when (false? (check-result ast {(keyword "" "value") coerced} "" (:schema db) db
-                                    {:column-types {"value" base-type}}))
+                                    {:column-types {"value" (or (:pg-name array-type) base-type)}}))
           (throw (errors/pg-error :check-violation
                                   {:constraint constraint :domain name :value coerced})))))
     (if null? :__null__ coerced)))

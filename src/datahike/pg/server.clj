@@ -11862,6 +11862,7 @@
     ;; otherwise store a qualifier or omit part of a multiword type.
     (cond
       user? (assoc domain :base-type base-sql)
+      (types/parse-array-type-name base-sql) (assoc domain :base-type base-sql :base-args nil)
       (and (= 11 namespace-oid) (not= "A" typcategory)
            (or (str/includes? base-type ".")
                (not= oid (pgs/resolve-type-oid db base-type))))

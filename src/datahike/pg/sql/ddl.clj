@@ -1115,6 +1115,8 @@
                                ;; Resolve every domain in the chain to the physical base type.
                                raw-type (cond
                                           enum-match "text"
+                                          (:array-type domain-match)
+                                          (params/domain-array-element-sql (:base-type domain-match))
                                           domain-match
                                           (let [{:keys [base-type base-args]} domain-match]
                                             (str base-type (when (seq base-args)
@@ -1140,11 +1142,12 @@
                                array-data (try (.getArrayData cdt)
                                                (catch Throwable _ nil))
                                ndim       (when (seq array-data) (count array-data))
-                               array-spec (when ndim
-                                            (when-let [elem (get types/sql-name->elem-kw base-type)]
-                                              {:elem    elem
-                                               :pg-name (str "_" (name elem))
-                                               :ndim    ndim}))
+                               array-spec (or (:array-type domain-match)
+                                              (when ndim
+                                                (when-let [elem (get types/sql-name->elem-kw base-type)]
+                                                  {:elem    elem
+                                                   :pg-name (str "_" (name elem))
+                                                   :ndim    ndim})))
                                ;; Array columns: store as serialized
                                ;; canonical text in :db.type/string.
                                ;; Round-trip via to-pg-text/from-pg-text.

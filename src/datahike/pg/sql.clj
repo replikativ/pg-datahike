@@ -1372,15 +1372,7 @@
 
               :create-domain
               (try
-                (let [toks (database/tokenize sql)
-                      toks (drop-while (fn [t]
-                                         (or (not= :ident (first t))
-                                             (not= "create"
-                                                   (clojure.string/lower-case
-                                                    (second t)))))
-                                       toks)
-                      toks (rest toks)
-                      parsed (user-types/parse-create-domain toks sql)]
+                (let [parsed (user-types/parse-create-domain sql)]
                   (assoc base :type :ddl-create-domain :domain parsed))
                 (catch Throwable e
                   {:type :error

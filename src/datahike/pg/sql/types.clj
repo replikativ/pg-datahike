@@ -312,25 +312,25 @@
         :else
         (recur (rest ts) depth (conj acc t))))))
 
-(defn- toks->raw-text
-  "Reassemble a token sub-sequence back to a SQL fragment for storage.
-   We don't try to reproduce exact whitespace — just enough that
-   re-parsing on dump emit yields an equivalent expression."
-  [toks]
-  (->> toks
-       (map (fn [[k t]]
-              (case k
-                :string (str "'" (str/replace t "'" "''") "'")
-                :ident  t
-                :num    t
-                :bool   t
-                :comma  ","
-                :lparen "("
-                :rparen ")"
-                :eq     "="
-                t)))
-       (interpose " ")
-       (apply str)))
+(defn- domain-token [{:keys [type text value pos end]}]
+  (with-meta
+    (case type
+      :ident [:ident text]
+      :quoted [:ident value]
+      (case text
+        "(" [:lparen text]
+        ")" [:rparen text]
+        "[" [:lbracket text]
+        "]" [:rbracket text]
+        "," [:comma text]
+        ";" [:semicolon text]
+        "." [:ident text]
+        [type text]))
+    {:pos pos :end end :quoted? (= :quoted type)}))
+
+(defn- token-source [sql tokens]
+  (when (seq tokens)
+    (subs sql (:pos (meta (first tokens))) (:end (meta (peek tokens))))))
 
 (def ^:private invalid-domain-clauses
   {"references" ["42601" "foreign key constraints not possible for domains"]
@@ -367,12 +367,12 @@
                        (and (= "null" kw) (seq expression)))))
         [expression remaining]
         (recur (rest remaining)
-               (case kind :lparen (inc depth) :rparen (dec depth) depth)
+               (case kind (:lparen :lbracket) (inc depth) (:rparen :rbracket) (dec depth) depth)
                (case kw "case" (inc cases) "end" (dec cases) cases)
                (conj expression tok))))))
 
-(defn- domain-base-sql [sql]
-  (let [after-name (loop [tokens (drop 3 (classify/tokenize sql))]
+(defn- domain-base-sql [sql tokens]
+  (let [after-name (loop [tokens (drop 3 tokens)]
                      (if (= "." (:text (first tokens)))
                        (recur (nnext tokens))
                        tokens))
@@ -412,8 +412,10 @@
       :original-sql str}
 
    Multiple constraints are not supported — first wins."
-  [toks original-sql]
-  (let [toks (skip-kw toks "domain")
+  [original-sql]
+  (let [source-tokens (classify/tokenize original-sql)
+        tokens (map domain-token source-tokens)
+        toks (skip-kw (skip-kw tokens "create") "domain")
         [domain-name toks] (consume-name toks)
         ;; optional AS
         toks (cond-> toks (ident-eq? (first toks) "as") rest)
@@ -436,7 +438,7 @@
            seen-default? false
            out {:domain-name domain-name
                 :base-type   base-type
-                :base-sql    (domain-base-sql original-sql)
+                :base-sql    (domain-base-sql original-sql source-tokens)
                 :base-args   base-args
                 :original-sql original-sql
                 :not-null    false}]
@@ -465,7 +467,7 @@
           (= "check" kw)
           (let [[inside after] (collect-balanced-parens rest-ts)]
             (reject-domain-no-inherit! after "check")
-            (recur after seen-nullability? seen-default? (assoc out :check-expr (toks->raw-text inside))))
+            (recur after seen-nullability? seen-default? (assoc out :check-expr (token-source original-sql inside))))
 
           (and (= "not" kw) (= "null" next-kw))
           (do
@@ -489,7 +491,7 @@
             (when (empty? expression)
               (domain-definition-error! "42601" "expected a domain default expression"))
             (recur left seen-nullability? true
-                   (assoc out :default-raw (toks->raw-text expression))))
+                   (assoc out :default-raw (token-source original-sql expression))))
 
           :else
           (recur rest-ts seen-nullability? seen-default? out))))))
