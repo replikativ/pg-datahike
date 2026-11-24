@@ -86,6 +86,41 @@
                  (query-rows
                   c "SELECT COUNT(*) FROM pg_enum WHERE enumtypid = 'mood'::regtype"))))))
 
+(deftest enum-catalog-keeps-positions-notices-and-subscript-labels
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))
+              statement (.createStatement c)]
+    (exec! c "CREATE TYPE spectrum AS ENUM ('middle', 'end')")
+    (exec! c "ALTER TYPE spectrum ADD VALUE 'start' BEFORE 'middle'")
+    (exec! c "ALTER TYPE spectrum ADD VALUE 'between' AFTER 'middle'")
+    (exec! c "ALTER TYPE spectrum ADD VALUE 'quarter' BEFORE 'between'")
+    (exec! c "ALTER TYPE spectrum RENAME VALUE 'quarter' TO 'near-middle'")
+    (is (= [["start" 0.0] ["middle" 1.0] ["near-middle" 1.25]
+            ["between" 1.5] ["end" 2.0]]
+           (query-rows c "SELECT enumlabel, enumsortorder FROM pg_enum
+                          WHERE enumtypid = 'spectrum'::regtype ORDER BY enumsortorder")))
+    (.execute statement "ALTER TYPE spectrum ADD VALUE IF NOT EXISTS 'start'")
+    (let [warning (.getWarnings statement)]
+      (is (= "42710" (some-> warning .getSQLState)))
+      (is (some->> warning .getMessage (re-find #"already exists, skipping"))))
+    (with-open [result (.executeQuery statement "SELECT ('{start,middle,end}'::spectrum[])[2]")]
+      (is (= "spectrum" (.getColumnLabel (.getMetaData result) 1)))
+      (is (.next result))
+      (is (= "middle" (.getString result 1))))))
+
+(deftest dropping-user-types-ignores-retired-tables-and-columns
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE ticket_state AS ENUM ('open', 'closed')")
+    (exec! c "CREATE DOMAIN ticket_number AS integer CHECK (VALUE > 0)")
+    (exec! c "CREATE TABLE ticket_ledger (id int, state ticket_state, ticket_no ticket_number)")
+    (doseq [drop-sql ["DROP TYPE ticket_state" "DROP DOMAIN ticket_number"]]
+      (is (= "2BP01" (try (exec! c drop-sql)
+                          (catch java.sql.SQLException e (.getSQLState e))))))
+    (exec! c "ALTER TABLE ticket_ledger DROP COLUMN ticket_no")
+    (exec! c "DROP DOMAIN ticket_number")
+    (exec! c "DROP TABLE ticket_ledger")
+    (exec! c "DROP TYPE ticket_state")
+    (is (= [[0]] (query-rows c "SELECT count(*) FROM pg_type WHERE typname IN ('ticket_state', 'ticket_number')")))))
+
 (deftest enum-catalog-has-no-orphaned-labels
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")

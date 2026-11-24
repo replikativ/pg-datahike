@@ -57,10 +57,25 @@
     {:name "enum",
      :boundaries #{:user-type :ordering :casts :catalog-introspection},
      :mode :discovery
-     :blockers #{:enum-catalog-sort-positions :enum-duplicate-label-notice :enum-array-subscript-label}
      :accepted-differences #{:diagnostic-positions}
      :strict-slices
-     [{:id :enum-overload-precedence
+     [{:id :enum-catalog-sort-positions
+       :source-lines [30 57]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-catalog-keeps-positions-notices-and-subscript-labels"}
+      {:id :enum-duplicate-label-notice
+       :source-lines [70 71]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-catalog-keeps-positions-notices-and-subscript-labels"}
+      {:id :enum-array-subscript-label
+       :source-lines [208 209]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-catalog-keeps-positions-notices-and-subscript-labels"}
+      {:id :enum-drop-after-table-cleanup
+       :source-lines [336 346]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "dropping-user-types-ignores-retired-tables-and-columns"}
+      {:id :enum-overload-precedence
        :source-lines [229 243]
        :gate "test/datahike/test/pg_enum_domain_test.clj"
        :test-var "concrete-enum-overload-wins-over-polymorphic-argument"}]}

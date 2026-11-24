@@ -946,6 +946,9 @@
          (= 1 (count ^ParenthesedExpressionList expr)))
     (figure-colname* (first ^ParenthesedExpressionList expr))
 
+    (instance? ArrayExpression expr)
+    (figure-colname* (.getObjExpression ^ArrayExpression expr))
+
     ;; A scalar subquery is named after its own single output column —
     ;; `SELECT (SELECT id FROM t)` is `id`, and a subquery whose column
     ;; is itself unnamed propagates `?column?`.

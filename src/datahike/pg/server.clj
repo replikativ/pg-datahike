@@ -11498,6 +11498,28 @@
                     {:error :name-too-long :sqlstate "42622"
                      :detail "Labels must be 63 bytes or less."}))))
 
+(defn- insert-enum-sort-order [orders idx]
+  (loop [orders orders]
+    (let [lower (when (pos? idx) (nth orders (dec idx)))
+          upper (get orders idx)
+          position (double (float (cond
+                                    (nil? lower) (if upper (dec upper) 1.0)
+                                    (nil? upper) (inc lower)
+                                    :else (* 0.5 (float (+ lower upper))))))]
+      (if (or (= position lower) (= position upper))
+        (recur (mapv double (range 1 (inc (count orders)))))
+        (into (conj (subvec orders 0 idx) position)
+              (subvec orders idx))))))
+
+(defn- enum-sort-order-tx [db eid size idx]
+  (let [attr :datahike.pg.enum/sort-orders
+        positions (or (some-> (get (d/entity db eid) attr) edn/read-string)
+                      (mapv double (range 1 (inc size))))]
+    (cond-> []
+      (not (contains? (dbi/-schema db) attr))
+      (conj {:db/ident attr :db/valueType :db.type/string :db/cardinality :db.cardinality/one})
+      true (conj [:db/add eid attr (pr-str (insert-enum-sort-order positions idx))]))))
+
 (defn- exec-ddl-alter-enum
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
@@ -11521,7 +11543,10 @@
                 (validate-enum-label! label)
                 (if (some #{label} values)
                   (if if-not-exists?
-                    [values []]
+                    (do
+                      (params/notice! "NOTICE" (str "enum label " (pr-str label) " already exists, skipping")
+                                      "42710" nil)
+                      [values []])
                     (throw (ex-info (str "enum label " (pr-str label) " already exists")
                                     {:error :duplicate-object :sqlstate "42710"})))
                   (let [neighbor-idx (when neighbor (.indexOf ^java.util.List values neighbor))
@@ -11536,7 +11561,8 @@
                               (count values))
                         updated (vec (concat (subvec values 0 idx) [label]
                                              (subvec values idx)))]
-                    [updated [[:db/add eid :datahike.pg.enum/values label]]])))
+                    [updated (into [[:db/add eid :datahike.pg.enum/values label]]
+                                   (enum-sort-order-tx db eid (count values) idx))])))
 
               :rename-value
               (do
@@ -11620,6 +11646,17 @@
       (catch Exception e
         (classified-error "ALTER TYPE error: " e)))))
 
+(defn- live-type-dependents [db type-attribute type-name]
+  (when-let [columns
+             (seq (d/q {:find '[[?ident ...]]
+                        :in '[$ ?type-name]
+                        :where [['?column type-attribute '?type-name]
+                                '[?column :db/ident ?ident]]}
+                       db type-name))]
+    (let [tables (pgs/derive-virtual-tables (dbi/-schema db) (pgs/schema-hints db))
+          live-columns (into #{} (comp (mapcat :columns) (map :attr)) (vals tables))]
+      (filter live-columns columns))))
+
 (defn- exec-ddl-drop-enum
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
@@ -11633,11 +11670,7 @@
                          db catalog-objects/pg-type-oid
                          catalog-objects/public-namespace-oid type-name)
             dependents (when enum-eid
-                         (map first
-                              (d/q '{:find [?col]
-                                     :in [$ ?name]
-                                     :where [[?col :datahike.pg/enum-of ?name]]}
-                                   db type-name)))]
+                         (live-type-dependents db :datahike.pg/enum-of type-name))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP TYPE")
           (nil? eid)
@@ -11850,11 +11883,7 @@
                         :where [[?e :datahike.pg.domain/name ?name]]}
                       db domain-name))
             dependents (when eid
-                         (map first
-                              (d/q '{:find [?col]
-                                     :in [$ ?name]
-                                     :where [[?col :datahike.pg/domain-of ?name]]}
-                                   db domain-name)))]
+                         (live-type-dependents db :datahike.pg/domain-of domain-name))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP DOMAIN")
           (nil? eid)
