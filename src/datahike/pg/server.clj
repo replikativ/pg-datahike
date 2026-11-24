@@ -14339,7 +14339,9 @@
                   ;; explicitly rather than leaking Datahike schema internals.
                   (throw (errors/pg-error :undefined-table
                                           {:table (:table s)})))
-              prepared rows
+              ;; Strip NULLs only for Datahike storage. Publication still
+              ;; needs them to distinguish supplied NULLs from defaults.
+              storage-rows (mapv #(into {} (remove (comp nil? val)) %) rows)
               ;; nextval-for-tx! buffers reservations for a sequence created
               ;; inside the surrounding transaction.  Mirror just those new
               ;; operations into COPY's private snapshot; otherwise publishing
@@ -14351,7 +14353,7 @@
                            (:tx-buffer @tx-state))
                      (filter direct-sequence-value-write?)
                      vec))
-              spec-report (dc/with db-now (into local-sequence-ops prepared))
+              spec-report (dc/with db-now (into local-sequence-ops storage-rows))
               _ (unique-constraints/validate-report! spec-report)]
           (swap! copy-state #(-> %
                                  (assoc :pending-rows [])
@@ -14359,9 +14361,9 @@
                                  (assoc :speculative-db (:db-after spec-report))
                                  (assoc :local-sequence-op-offset
                                         (count (:tx-buffer @tx-state)))
-                                 (update :tx-data into prepared)
+                                 (update :tx-data into rows)
                                  (update :tempids merge (:tempids spec-report))
-                                 (update :rows-processed + (count prepared)))))
+                                 (update :rows-processed + (count rows)))))
         (catch Throwable e
           ;; Latch the original throwable so CopyDone can preserve SQLSTATE.
           ;; Later chunks are ignored, which also preserves volatile/default
@@ -14489,8 +14491,7 @@
                 ;; them. See doc/review-backlog.md.
                 seen (validate-plain-candidate-unique!
                       db-now (:table s) (:unique-specs s)
-                      (:pending-unique s #{}) candidate)
-                candidate (into {} (remove (comp nil? val)) candidate)]
+                      (:pending-unique s #{}) candidate)]
             (swap! copy-state
                    #(-> %
                         (update :pending-rows conj candidate)
