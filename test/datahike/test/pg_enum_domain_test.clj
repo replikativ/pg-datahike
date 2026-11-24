@@ -477,6 +477,36 @@
     (is (empty? (query-rows c "SELECT typname FROM pg_type WHERE typname = 'rejected_domain'")))
     (is (false? (exec! c "CREATE DOMAIN rejected_domain AS integer DEFAULT NULL CHECK (VALUE > 0)")))))
 
+(deftest derived-domains-keep-the-scalar-storage-and-inherited-constraints
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN base_level AS integer NOT NULL CHECK (VALUE > 0)")
+    (exec! c "CREATE DOMAIN middle_level AS base_level")
+    (exec! c "CREATE DOMAIN derived_level AS middle_level CHECK (VALUE < 10)")
+    (exec! c "CREATE TABLE domain_levels (level derived_level)")
+    (exec! c "INSERT INTO domain_levels VALUES (3)")
+    (is (= [[4]] (query-rows c "SELECT level + 1 FROM domain_levels")))
+    (with-open [stmt (.createStatement c)
+                result (.executeQuery stmt "SELECT 3::derived_level")]
+      (is (.next result))
+      (is (= 3 (.getInt result 1))))
+    (doseq [[sql state constraint]
+            [["SELECT (-1)::derived_level" "23514" "base_level_check"]
+             ["SELECT 10::derived_level" "23514" "derived_level_check"]
+             ["SELECT NULL::derived_level" "23502" nil]
+             ["INSERT INTO domain_levels VALUES (-1)" "23514" "base_level_check"]
+             ["UPDATE domain_levels SET level = 10" "23514" "derived_level_check"]
+             ["INSERT INTO domain_levels VALUES (NULL)" "23502" nil]
+             ["DROP DOMAIN base_level" "2BP01" nil]
+             ["DROP DOMAIN base_level CASCADE" "0A000" nil]]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) sql)
+        (when constraint
+          (is (str/includes? (or (some-> error .getMessage) "") constraint) sql))))
+    (exec! c "DROP TABLE domain_levels")
+    (exec! c "DROP DOMAIN base_level CASCADE")
+    (is (= [[nil nil nil]] (query-rows c (str "SELECT to_regtype('base_level'), "
+                                              "to_regtype('middle_level'), to_regtype('derived_level')"))))))
+
 (deftest create-domain-bare-alias
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN big AS bigint")

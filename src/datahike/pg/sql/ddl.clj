@@ -1110,31 +1110,15 @@
                                                                     [?e :datahike.pg.enum/values-ordered ?vs-ord]]
                                                             :in [$ ?n]}
                                                           db type-no-schema)))
-                               ;; Query rather than a lookup-ref d/entity:
-                               ;; :datahike.pg.domain/name isn't :db/unique,
-                               ;; so a lookup ref makes datahike log an
-                               ;; :error line for every non-domain type name
-                               ;; (i.e. every ordinary CREATE TABLE column).
-                               domain-match (when (and db (not enum-match)
-                                                       (some? type-no-schema))
-                                              (when-let [eid (ffirst
-                                                              (q-fn '{:find [?e]
-                                                                      :where [[?e :datahike.pg.domain/name ?n]]
-                                                                      :in [$ ?n]}
-                                                                    db type-no-schema))]
-                                                (let [e (d/entity db eid)]
-                                                  (when (:datahike.pg.domain/base-type e)
-                                                    (into {} e)))))
-                               ;; Resolved raw-type: enum → 'text', domain →
-                               ;; its base-type + any args. Otherwise pass
-                               ;; through.
+                               domain-match (when (and (not enum-match) type-no-schema)
+                                              (params/registered-domain-spec db type-no-schema))
+                               ;; Resolve every domain in the chain to the physical base type.
                                raw-type (cond
                                           enum-match "text"
                                           domain-match
-                                          (let [b (:datahike.pg.domain/base-type domain-match)
-                                                args (some->> (:datahike.pg.domain/base-args domain-match)
-                                                              seq (str/join ",") (#(str "(" % ")")))]
-                                            (str b args))
+                                          (let [{:keys [base-type base-args]} domain-match]
+                                            (str base-type (when (seq base-args)
+                                                             (str "(" (str/join "," base-args) ")"))))
                                           :else raw-type-orig)
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
                                _ (when (types/unsupported-input-type? base-type)

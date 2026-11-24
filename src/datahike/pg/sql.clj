@@ -2017,10 +2017,10 @@
                                                                  (if (or (nil? raw) (= :__null__ raw))
                                                                    :__null__
                                                                    (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
-                                                                 (or (nil? raw) (= :__null__ raw))
-                                                                 :__null__
                                                                  domain-spec
                                                                  (params/cast-domain-value cte-db domain-spec raw)
+                                                                 (or (nil? raw) (= :__null__ raw))
+                                                                 :__null__
                                                                  enum-values
                                                                  (let [label (str raw)]
                                                                    (if (contains? enum-values label)

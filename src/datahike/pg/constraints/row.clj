@@ -120,27 +120,10 @@
                        enum-name (:datahike.pg/enum-of column)]
                    (cond
                      domain-name
-                     (when-let [domain-eid
-                                (ffirst
-                                 (d/q '{:find [?domain]
-                                        :in [$ ?name]
-                                        :where [[?domain :datahike.pg.domain/name ?name]]}
-                                      db domain-name))]
-                       (let [domain (d/entity db domain-eid)
-                             expression (:datahike.pg.domain/check-expr domain)]
-                         [name {:kind :domain :attr attr :domain-name domain-name
-                                :check-name (:datahike.pg.domain/check-name domain)
-                                :not-null? (true? (:datahike.pg.domain/not-null domain))
-                                ;; An ARRAY of a domain checks each
-                                ;; element, not the array. Without the
-                                ;; element type here the check bound
-                                ;; `value` to the array's own text and
-                                ;; `value > 0` compared a String to 0 --
-                                ;; a ClassCastException at the client,
-                                ;; for `posint[]`, even when every
-                                ;; element satisfied the domain.
-                                :array-elem (:pg/array-elem column)
-                                :check-expression expression}]))
+                     (when-let [{:keys [checks not-null?]} (params/registered-domain-spec db domain-name)]
+                       [name {:kind :domain :attr attr :domain-name domain-name
+                              :not-null? not-null? :checks checks
+                              :array-elem (:pg/array-elem column)}])
 
                      enum-name
                      [name {:kind :enum :attr attr :enum-name enum-name
@@ -200,11 +183,11 @@
          (into {}
                (map (fn [[name spec]]
                       [name (if (= :domain (:kind spec))
-                              (-> spec
-                                  (dissoc :check-expression)
-                                  (assoc :check-ast
-                                         (when-let [expression (:check-expression spec)]
-                                           (parse-constraint-expression expression))))
+                              (update spec :checks
+                                      (fn [checks]
+                                        (mapv (fn [{:keys [constraint expression]}]
+                                                {:constraint constraint :ast (parse-constraint-expression expression)})
+                                              checks)))
                               spec)]))
                domain-enum)))
 
@@ -347,31 +330,22 @@
                        :table table-name :column column-name
                        :domain (:domain-name spec)}))
 
-      (and (= :domain (:kind spec)) (:check-ast spec)
-           (let [check1 (fn [v]
-                          (false? (eval-check-fn (:check-ast spec)
-                                                 {(keyword "" "value") v}
-                                                 "" (:schema db)
-                                                 {"value" (:attr spec)})))]
-             (if-let [elem (:array-elem spec)]
-               ;; PostgreSQL applies a domain's constraint to every
-               ;; element of an array over it (execQual's
-               ;; ExecEvalArrayCoerce), and NULL elements are exempt
-               ;; the same way a NULL scalar is.
-               (and (some? value)
-                    (boolean
-                     (some check1
-                           (remove nil?
-                                   (pg-arr/flat-elements
-                                    (if (pg-arr/array? value)
-                                      value
-                                      (pg-arr/from-pg-text (str value) elem)))))))
-               (check1 value))))
-      (throw (errors/pg-error :check-violation
-                              {:table table-name :column column-name
-                               :domain (:domain-name spec)
-                               :constraint (or (:check-name spec)
-                                               (str (:domain-name spec) "_check"))}))
+      (= :domain (:kind spec))
+      (when-let [checks (seq (:checks spec))]
+        (let [values (if-let [elem (:array-elem spec)]
+                       (when (some? value)
+                         (remove nil? (pg-arr/flat-elements
+                                       (if (pg-arr/array? value)
+                                         value
+                                         (pg-arr/from-pg-text (str value) elem)))))
+                       [value])]
+          (doseq [{:keys [constraint ast]} checks
+                  v values
+                  :when (false? (eval-check-fn ast {(keyword "" "value") v}
+                                               "" (:schema db) {"value" (:attr spec)}))]
+            (throw (errors/pg-error :check-violation
+                                    {:table table-name :column column-name
+                                     :domain (:domain-name spec) :constraint constraint})))))
 
       (and (= :enum (:kind spec)) (some? value)
            (not (contains? (:values spec) (str value))))

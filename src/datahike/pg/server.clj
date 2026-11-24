@@ -11877,44 +11877,71 @@
                   (recur (inc attempt))
                   :else (classified-error "CREATE DOMAIN error: " outcome))))))))))
 
+(defn- dependent-domain-graph [db]
+  (reduce (fn [result [eid name base]]
+            (update result (-> (str/split base #"\.") last params/unquote-ident)
+                    (fnil conj []) [name eid]))
+          {}
+          (d/q '[:find ?eid ?name ?base
+                 :where [?eid :datahike.pg.domain/name ?name]
+                 [?eid :datahike.pg.domain/base-type ?base]] db)))
+
+(defn- domains-to-remove [graph root]
+  (loop [[entry & pending] [root], found {}]
+    (if-let [[name eid] entry]
+      (if (contains? found name)
+        (recur pending found)
+        (recur (concat pending (get graph name)) (assoc found name eid)))
+      found)))
+
 (defn- exec-ddl-drop-domain
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx
-        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+  (let [{:keys [conn tx-state session-id]} ctx
         {:keys [domain-name if-exists? cascade?]} parsed]
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
     (try
-      (let [eid (ffirst
+      (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+            eid (ffirst
                  (d/q '{:find [?e]
                         :in [$ ?name]
                         :where [[?e :datahike.pg.domain/name ?name]]}
-                      db domain-name))
-            dependents (when eid
-                         (live-type-dependents db :datahike.pg/domain-of domain-name))]
+                      db domain-name))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP DOMAIN")
           (nil? eid)
           (throw (ex-info (str "type " (pr-str domain-name) " does not exist")
                           {:error :undefined-object :sqlstate "42704"}))
-          (and (seq dependents) cascade?)
-          (throw (errors/pg-error :feature-not-supported
-                                  {:feature "DROP DOMAIN CASCADE with dependent columns"}))
-          (seq dependents)
-          (throw (ex-info (str "cannot drop type " domain-name
-                               " because other objects depend on it")
-                          {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
           :else
-          (let [object (catalog-objects/object-by-identity
-                        db catalog-objects/pg-type-oid
-                        catalog-objects/public-namespace-oid domain-name)
-                tx-data (into [[:db/retractEntity eid]]
-                              (when (= :domain (:datahike.pg.object/kind object))
-                                (catalog-objects/drop-object-tx
-                                 db catalog-objects/pg-type-oid
-                                 (:datahike.pg.object/oid object))))]
-            (if (:in-tx? @tx-state)
-              (execute-ddl-in-tx tx-state tx-data "DROP DOMAIN")
-              (do (transact-recorded! conn tx-data)
-                  (empty-result "DROP DOMAIN"))))))
+          (let [graph (dependent-domain-graph db)
+                domains (if cascade?
+                          (domains-to-remove graph [domain-name eid])
+                          {domain-name eid})
+                dependent-columns? (some #(seq (live-type-dependents db :datahike.pg/domain-of %))
+                                         (keys domains))]
+            (cond
+              (and cascade? dependent-columns?)
+              (throw (errors/pg-error :feature-not-supported
+                                      {:feature "DROP DOMAIN CASCADE with dependent columns"}))
+              (and (not cascade?) (or dependent-columns? (seq (get graph domain-name))))
+              (throw (ex-info (str "cannot drop type " domain-name
+                                   " because other objects depend on it")
+                              {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
+              :else
+              (let [tx-data (into []
+                                  (mapcat (fn [[name domain-eid]]
+                                            (let [object (catalog-objects/object-by-identity
+                                                          db catalog-objects/pg-type-oid
+                                                          catalog-objects/public-namespace-oid name)]
+                                              (cons [:db/retractEntity domain-eid]
+                                                    (when (= :domain (:datahike.pg.object/kind object))
+                                                      (catalog-objects/drop-object-tx
+                                                       db catalog-objects/pg-type-oid
+                                                       (:datahike.pg.object/oid object)))))))
+                                  domains)]
+                (if (:in-tx? @tx-state)
+                  (execute-ddl-in-tx tx-state tx-data "DROP DOMAIN")
+                  (do (transact-recorded! conn tx-data)
+                      (empty-result "DROP DOMAIN"))))))))
       (catch Exception e
         (classified-error "DROP DOMAIN error: " e)))))
 
