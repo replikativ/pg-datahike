@@ -1567,7 +1567,11 @@
     (into {}
           (keep (fn [[oid new-name]]
                   (when-let [old-name (get previous-names oid)]
-                    (when (not= old-name new-name)
+                    ;; The mirror always has its own public namespace. Move
+                    ;; the published relations individually across that boundary.
+                    (when (and (not= old-name new-name)
+                               (not= "public" old-name)
+                               (not= "public" new-name))
                       [oid {:from old-name :to new-name}]))))
           (namespace-names current))))
 
@@ -2408,8 +2412,11 @@
             (vals retained-types))))
 
 (defn- installation-plan [db previous current affected schema-refresh?]
-  (let [namespace-upgrade? (some #(nil? (:schema-oid %)) (all-relations previous))
-        previous (if namespace-upgrade? (adopt-namespace-identities previous current) previous)
+  (let [legacy? (some #(nil? (:schema-oid %))
+                      (concat (all-relations previous) (vals (:unpublished-tables previous))))
+        adopted (if legacy? (adopt-namespace-identities previous current) previous)
+        namespace-upgrade? (not= previous adopted)
+        previous adopted
         renames (namespace-renames previous current)
         renamed-previous (rename-manifest-namespaces previous renames)
         removed (removed-relations renamed-previous current)

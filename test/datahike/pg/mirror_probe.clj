@@ -2926,7 +2926,27 @@
             (with-open [historical (DriverManager/getConnection (sink-url @subscriber))]
               (sql! historical (str "SET datahike.as_of = " (literal before)))
               (check! (= sink-before (namespaces historical)) "Schema rename changed historical namespace names" {})
-              (check! (= @frozen (contents historical right)) "Schema rename lost historical access to frozen rows" {}))))
+              (check! (= @frozen (contents historical right)) "Schema rename lost historical access to frozen rows" {})))
+          (let [public-oids (ids sink public-table)
+                renamed "moved_public.external_claim"]
+            (sql! source "BEGIN"
+                  "ALTER SCHEMA public RENAME TO moved_public"
+                  "UPDATE moved_public.external_claim SET label = 'outside public' WHERE id = 1"
+                  "COMMIT")
+            (await! "Public schema rename did not reach the mirror"
+                    #(= [["t"]] (rows sink "SELECT to_regclass('moved_public.external_claim') IS NOT NULL")))
+            (compare-tables! source sink [renamed])
+            (check! (= public-oids (ids sink renamed)) "Moving out of public changed relation identity" {})
+            (check! (= [["2200"]] (rows sink "SELECT 'public'::regnamespace::oid"))
+                    "Publisher rename moved the mirror's built-in namespace" {})
+            (sql! source "BEGIN"
+                  "ALTER SCHEMA moved_public RENAME TO public"
+                  "UPDATE public.external_claim SET label = 'back in public' WHERE id = 1"
+                  "COMMIT")
+            (await! "Rename back to public did not reach the mirror"
+                    #(= [["t"]] (rows sink "SELECT to_regclass('public.external_claim') IS NOT NULL")))
+            (compare-tables! source sink [public-table])
+            (check! (= public-oids (ids sink public-table)) "Moving back to public changed relation identity" {})))
         {:status :passed :schemas 4}
         (finally
           (when @subscriber (mirror/stop! @subscriber))
