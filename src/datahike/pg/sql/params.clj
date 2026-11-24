@@ -27,6 +27,8 @@
    (:schema db) doesn't surface."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.datetime.in :as datetime-in]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
@@ -406,114 +408,183 @@
         (check-cancel!))
       (vswap! operations unchecked-inc))))
 
+(defn- enum-values-by-name [db name]
+  (when (and db name)
+    (let [values (d/q '{:find [?value]
+                        :in [$ ?name]
+                        :where [[?enum :datahike.pg.enum/name ?name]
+                                [?enum :datahike.pg.enum/values ?value]]}
+                      db name)]
+      (when (seq values)
+        (into #{} (map (comp str first)) values)))))
+
 (defn registered-enum-values
-  "Return the declared label set for a CREATE TYPE ... AS ENUM registry
-   entry, or nil when `type-name` is not a registered enum."
+  "Return the declared labels for a SQL enum type spelling, or nil."
   ([type-name] (registered-enum-values *parse-db* type-name))
   ([db type-name]
-   (when (and db type-name)
-     (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)
-           values (d/q '{:find [?value]
-                         :in [$ ?name]
-                         :where [[?enum :datahike.pg.enum/name ?name]
-                                 [?enum :datahike.pg.enum/values ?value]]}
-                       db bare)]
-       (when (seq values)
-         (into #{} (map (comp str first)) values))))))
+   (enum-values-by-name db (some-> type-name str (str/split #"\.") last unquote-ident))))
 
-(defn unsafe-enum-values
-  "Return labels added to an existing enum in the current speculative
-   transaction.  The pgwire transaction layer removes these marker facts at
-   commit, so a committed database normally returns the empty set."
-  [db type-name]
-  (if (and db type-name
-           ;; Databases created before transactional enum-label tracking do
-           ;; not have this schema attr until their first ALTER TYPE. Avoid
-           ;; querying an unknown attr; the ALTER transaction installs it
-           ;; immediately before adding its first marker.
-           (get (:schema db) :datahike.pg.enum/unsafe-values))
-    (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)]
-      (into #{}
-            (map (comp str first))
-            (d/q '{:find [?value]
-                   :in [$ ?name]
-                   :where [[?enum :datahike.pg.enum/name ?name]
-                           [?enum :datahike.pg.enum/unsafe-values ?value]]}
-                 db bare)))
+(defn- unsafe-enum-values-by-name [db name]
+  (if (and db name (get (:schema db) :datahike.pg.enum/unsafe-values))
+    (into #{} (map (comp str first))
+          (d/q '{:find [?value]
+                 :in [$ ?name]
+                 :where [[?enum :datahike.pg.enum/name ?name]
+                         [?enum :datahike.pg.enum/unsafe-values ?value]]}
+               db name))
     #{}))
 
-(defn assert-enum-label-safe!
-  "Raise PostgreSQL's unsafe-new-enum-value error when `label` was added to
-   an already-committed enum in this transaction. Returns the string label."
-  [db type-name label]
+(defn unsafe-enum-values
+  "Return labels added to an existing enum in the speculative transaction."
+  [db type-name]
+  (unsafe-enum-values-by-name db (some-> type-name str (str/split #"\.") last unquote-ident)))
+
+(defn- assert-enum-label-safe-by-name! [db name label]
   (let [label (str label)]
-    (when (contains? (unsafe-enum-values db type-name) label)
-      (throw (ex-info (str "unsafe use of new value " (pr-str label)
-                           " of enum type " type-name)
+    (when (contains? (unsafe-enum-values-by-name db name) label)
+      (throw (ex-info (str "unsafe use of new value " (pr-str label) " of enum type " name)
                       {:sqlstate "55P04"
                        :hint "New enum values must be committed before they can be used."})))
     label))
 
+(defn assert-enum-label-safe!
+  "Raise PostgreSQL's unsafe-new-enum-value error and otherwise return the label."
+  [db type-name label]
+  (assert-enum-label-safe-by-name!
+   db (some-> type-name str (str/split #"\.") last unquote-ident) label))
+
+(defn domain-base-type-oid [db domain]
+  (or (:datahike.pg.domain/base-oid domain)
+      (when-let [base (:datahike.pg.domain/base-type domain)]
+        ;; Old definitions recorded only a name and were stored in public.
+        ;; Use the original default path, independent of the caller's path.
+        (try
+          (binding [regoid/*search-path* ["public"]
+                    regoid/*temp-tables* nil]
+            (regoid/type-oid db base))
+          (catch clojure.lang.ExceptionInfo _ nil)))))
+
+(defn domain-base-object
+  "Resolve the registered user type addressed by a domain's base OID."
+  [db oid]
+  (when (and oid (>= oid catalog-objects/first-user-oid))
+    (catalog-objects/object-by-address db catalog-objects/pg-type-oid oid)))
+
+(defn- domain-base-parent-name [db base-oid]
+  (let [type (domain-base-object db base-oid)]
+    (when (= :domain (:datahike.pg.object/kind type))
+      (:datahike.pg.object/name type))))
+
+(defn- declared-domain [db name]
+  (when-let [[eid base check-name expression not-null?]
+             (first (d/q '{:find [?e ?base ?check-name ?expr ?not-null]
+                           :in [$ ?name]
+                           :where [[?e :datahike.pg.domain/name ?name]
+                                   [?e :datahike.pg.domain/base-type ?base]
+                                   [(get-else $ ?e :datahike.pg.domain/check-name :__null__) ?check-name]
+                                   [(get-else $ ?e :datahike.pg.domain/check-expr :__null__) ?expr]
+                                   [(get-else $ ?e :datahike.pg.domain/not-null false) ?not-null]]}
+                         db name))]
+    (let [domain (d/entity db eid)]
+      {:eid eid :name name :base-type base
+       :base-oid (domain-base-type-oid db domain)
+       :base-args (:datahike.pg.domain/base-args domain)
+       :base-typmods (:datahike.pg.domain/base-typmods domain)
+       :not-null? (boolean not-null?)
+       :check (when (not= :__null__ expression)
+                {:constraint (if (= :__null__ check-name) (str name "_check") check-name)
+                 :expression expression})})))
+
+(defn- domain-array-element-sql
+  "Strip array decorations from an already resolved domain base declaration."
+  [base-type]
+  (-> base-type
+      (str/replace #"(?i)\s+array(?=\s*(?:\[|$))" "")
+      (str/replace #"(?:\s*\[\s*\d*\s*\])+\s*$" "")
+      str/trim))
+
+(defn- domain-array-type [base-type base-oid]
+  (let [syntax (types/parse-array-type-name base-type)
+        element-oid (types/array-oid->element-oid base-oid)]
+    (when-let [elem (types/oid->elem-kw element-oid)]
+      {:elem elem
+       :pg-name (str "_" (name elem))
+       :ndim (or (:ndim syntax) 1)
+       :element-sql (if (= elem (:elem syntax))
+                      (domain-array-element-sql base-type)
+                      (types/format-type element-oid -1))})))
+
+(defn domain-spec-by-name
+  "Resolve a catalog domain name to its storage type and inherited checks."
+  [db name]
+  (when (and db name)
+    (when-let [leaf (declared-domain db name)]
+      (loop [current leaf, ancestors (), seen #{}]
+        (when (contains? seen (:eid current))
+          (throw (ex-info "circular domain base type" {:sqlstate "42P17" :domain (:name leaf)})))
+        (let [chain (conj ancestors current)
+              parent-name (domain-base-parent-name db (:base-oid current))]
+          (if-let [parent (when parent-name (declared-domain db parent-name))]
+            (recur parent chain (conj seen (:eid current)))
+            {:name (:name leaf)
+             :base-type (:base-type current)
+             :base-args (:base-args current)
+             :base-typmods (:base-typmods current)
+             :array-type (domain-array-type (:base-type current) (:base-oid current))
+             :base-oid (:base-oid current)
+             :depth (count chain)
+             :not-null? (boolean (some :not-null? chain))
+             :checks (into [] (keep :check) chain)}))))))
+
 (defn registered-domain-spec
-  "Return the persisted definition of a user domain, or nil. Optional fields
-   are normalized away from Datahike's null sentinel."
+  "Resolve the domain named by a SQL type spelling."
   ([type-name] (registered-domain-spec *parse-db* type-name))
   ([db type-name]
-   (when (and db type-name)
-     (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)
-           row (first
-                (d/q '{:find [?base ?check-name ?check-expr ?not-null]
-                       :in [$ ?name]
-                       :where [[?e :datahike.pg.domain/name ?name]
-                               [?e :datahike.pg.domain/base-type ?base]
-                               [(get-else $ ?e :datahike.pg.domain/check-name :__null__) ?check-name]
-                               [(get-else $ ?e :datahike.pg.domain/check-expr :__null__) ?check-expr]
-                               [(get-else $ ?e :datahike.pg.domain/not-null false) ?not-null]]}
-                     db bare))]
-       (when row
-         (let [[base check-name check-expr not-null] row
-               present #(when (not= :__null__ %) %)]
-           {:name bare :base-type base :check-name (present check-name)
-            :check-expr (present check-expr) :not-null? (boolean not-null)}))))))
+   (when type-name
+     (domain-spec-by-name db (-> (str type-name) (str/split #"\.") last unquote-ident)))))
+
+(defn domain-storage-type
+  "Spell the effective database type accepted by the physical column or cast."
+  [{:keys [base-type base-args base-typmods]}]
+  (let [typmods (or base-typmods (when (seq base-args) (str/join ", " base-args)))]
+    (if typmods (str base-type "(" typmods ")") base-type)))
 
 (defn cast-domain-value
-  "Coerce and validate one value against a persisted domain definition.
-   The CHECK runs through row-eval, as column writes' do, so casts and
-   writes share one CHECK semantics."
-  [db spec value]
-  (cond
-    (or (nil? value) (= :__null__ value))
-    (if (:not-null? spec)
-      (throw (ex-info "domain not-null violation"
-                      {:error :not-null-violation :sqlstate "23502"
-                       :domain (:name spec)}))
-      :__null__)
-
-    :else
-    (let [base (:base-type spec)
-          enum-values (registered-enum-values db base)
-          coerced (if enum-values
-                    (let [label (str value)]
-                      (if (contains? enum-values label)
-                        (assert-enum-label-safe! db base label)
-                        (throw (ex-info "invalid input value for enum"
-                                        {:error :invalid-text-representation
-                                         :enum? true :type base :value label}))))
-                    (sql-cast/cast-scalar value base {:explicit? true}))]
-      (when-let [check-expr (:check-expr spec)]
-        (let [ast (try
-                    (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression check-expr)
-                    (catch Exception _
-                      (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression check-expr)))
-              check-result (requiring-resolve 'datahike.pg.sql.row-eval/check-result)
-              ok? (check-result ast {(keyword "" "value") coerced} "" (:schema db) db
-                                {:column-types {"value" base}})]
-          (when (false? ok?)
-            (throw (errors/pg-error :check-violation
-                                    {:constraint (or (:check-name spec)
-                                                     (str (:name spec) "_check"))
-                                     :domain (:name spec) :value coerced})))))
-      coerced)))
+  "Coerce to the underlying type and apply all domain constraints."
+  [db {:keys [name base-type base-oid array-type not-null? checks] :as domain} value]
+  (let [null? (or (nil? value) (= :__null__ value))
+        _ (when (and null? not-null?)
+            (throw (ex-info "domain not-null violation"
+                            {:error :not-null-violation :sqlstate "23502" :domain name})))
+        base (when-not null? (domain-base-object db base-oid))
+        enum-name (when (= :enum (:datahike.pg.object/kind base))
+                    (:datahike.pg.object/name base))
+        enum-values (enum-values-by-name db enum-name)
+        coerced (cond
+                  null? nil
+                  array-type
+                  (let [coerce-array-value (requiring-resolve 'datahike.pg.sql.stmt/coerce-array-value)]
+                    (coerce-array-value value {:elem-type (:elem array-type)
+                                               :target-type (:element-sql array-type)
+                                               :explicit? true}))
+                  enum-values
+                  (let [label (str value)]
+                    (if (contains? enum-values label)
+                      (assert-enum-label-safe-by-name! db enum-name label)
+                      (throw (errors/pg-error :invalid-text-representation
+                                              {:enum? true :type enum-name :value label}))))
+                  :else (sql-cast/cast-scalar value (domain-storage-type domain) {:explicit? true}))]
+    (doseq [{:keys [constraint expression]} checks]
+      (let [ast (try
+                  (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression expression)
+                  (catch Exception _
+                    (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression expression)))
+            check-result (requiring-resolve 'datahike.pg.sql.row-eval/check-result)]
+        (when (false? (check-result ast {(keyword "" "value") coerced} "" (:schema db) db
+                                    {:column-types {"value" (or (:pg-name array-type) base-type)}}))
+          (throw (errors/pg-error :check-violation
+                                  {:constraint constraint :domain name :value coerced})))))
+    (if null? :__null__ coerced)))
 
 (def ^:dynamic *parse-sql*
   "Bound by parse-sql to itself so top-level translate-* entries in

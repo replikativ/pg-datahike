@@ -872,6 +872,10 @@
       (#{:bit :varbit} (types/cast-category bt))
       (if (= :varbit (types/cast-category bt)) "varbit" "bit")
 
+      (contains? #{"char" "character" "bpchar"} bt) "bpchar"
+      (contains? #{"varchar" "character varying"} bt) "varchar"
+      (= "name" bt) "name"
+
       (#{"smallint" "int2" "smallserial" "serial2"} bt) "int2"
       (#{"integer" "int" "int4" "serial" "serial4"} bt) "int4"
       (= "oid" bt) "oid"
@@ -1110,31 +1114,14 @@
                                                                     [?e :datahike.pg.enum/values-ordered ?vs-ord]]
                                                             :in [$ ?n]}
                                                           db type-no-schema)))
-                               ;; Query rather than a lookup-ref d/entity:
-                               ;; :datahike.pg.domain/name isn't :db/unique,
-                               ;; so a lookup ref makes datahike log an
-                               ;; :error line for every non-domain type name
-                               ;; (i.e. every ordinary CREATE TABLE column).
-                               domain-match (when (and db (not enum-match)
-                                                       (some? type-no-schema))
-                                              (when-let [eid (ffirst
-                                                              (q-fn '{:find [?e]
-                                                                      :where [[?e :datahike.pg.domain/name ?n]]
-                                                                      :in [$ ?n]}
-                                                                    db type-no-schema))]
-                                                (let [e (d/entity db eid)]
-                                                  (when (:datahike.pg.domain/base-type e)
-                                                    (into {} e)))))
-                               ;; Resolved raw-type: enum → 'text', domain →
-                               ;; its base-type + any args. Otherwise pass
-                               ;; through.
+                               domain-match (when (and (not enum-match) type-no-schema)
+                                              (params/domain-spec-by-name db type-no-schema))
+                               ;; Resolve every domain in the chain to the physical base type.
                                raw-type (cond
                                           enum-match "text"
-                                          domain-match
-                                          (let [b (:datahike.pg.domain/base-type domain-match)
-                                                args (some->> (:datahike.pg.domain/base-args domain-match)
-                                                              seq (str/join ",") (#(str "(" % ")")))]
-                                            (str b args))
+                                          (:array-type domain-match)
+                                          (get-in domain-match [:array-type :element-sql])
+                                          domain-match (params/domain-storage-type domain-match)
                                           :else raw-type-orig)
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
                                _ (when (types/unsupported-input-type? base-type)
@@ -1156,11 +1143,12 @@
                                array-data (try (.getArrayData cdt)
                                                (catch Throwable _ nil))
                                ndim       (when (seq array-data) (count array-data))
-                               array-spec (when ndim
-                                            (when-let [elem (get types/sql-name->elem-kw base-type)]
-                                              {:elem    elem
-                                               :pg-name (str "_" (name elem))
-                                               :ndim    ndim}))
+                               array-spec (or (:array-type domain-match)
+                                              (when ndim
+                                                (when-let [elem (get types/sql-name->elem-kw base-type)]
+                                                  {:elem    elem
+                                                   :pg-name (str "_" (name elem))
+                                                   :ndim    ndim})))
                                ;; Array columns: store as serialized
                                ;; canonical text in :db.type/string.
                                ;; Round-trip via to-pg-text/from-pg-text.
@@ -1207,21 +1195,15 @@
                                  ;; plus a separate argument list. `str` on
                                  ;; ColDataType faithfully includes both.
                                  (some-> (or (types/parse-bit-length
-                                              (str/replace (str cdt) #"(?:\s*\[[^\]]*\])+$" ""))
+                                              (if domain-match
+                                                raw-type
+                                                (str/replace (str cdt) #"(?:\s*\[[^\]]*\])+$" "")))
                                              (when (and array-spec (= "bit" base-type)) 1))
                                          long))
                                vector-typmod
                                (when (= dh-type :db.type/float-array)
                                  (pg-vector/parse-typmod
                                   (types/normalize-sql-type-name (str cdt))))
-                               char-pg-type
-                               (when-not array-spec
-                                 (let [b (types/base-type-name-of raw-type)]
-                                   (cond
-                                     (contains? #{"char" "character" "bpchar"} b) "bpchar"
-                                     (contains? #{"varchar" "character varying"} b) "varchar"
-                                     (= "name" b) "name"
-                                     :else nil)))
                                pk-here? (or (and single-pk-col (= col-name single-pk-col))
                                             (contains? pk-cols-set col-name))
                                ;; PRIMARY KEY is implicitly NOT NULL.  The SQL
@@ -1283,7 +1265,6 @@
                        bit-typmod (assoc :pg/typmod bit-typmod)
                        vector-typmod (assoc :pg/typmod vector-typmod)
                        (= dh-type :db.type/float-array) (assoc :pg/type "vector")
-                       char-pg-type (assoc :pg/type char-pg-type)
                        not-null-here? (assoc :pg/not-null true)
                        ;; A STORED generated column: `attgenerated = 's'`
                        ;; plus the expression. It is NOT a default --

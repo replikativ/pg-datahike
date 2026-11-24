@@ -26,7 +26,7 @@
           :pg/fk-name :pg/fk-child-table :pg/fk-child-cols
           :pg/fk-parent-table :pg/fk-parent-cols
           :datahike.pg/domain-of :datahike.pg/enum-of
-          :datahike.pg.domain/name :datahike.pg.domain/check-name
+          :datahike.pg.domain/name :datahike.pg.domain/base-type :datahike.pg.domain/check-name
           :datahike.pg.domain/check-expr :datahike.pg.enum/name])
     [(declaration :pg/not-null :db.type/boolean)
      (declaration :pg/default-kind :db.type/keyword)
@@ -46,6 +46,7 @@
         :pg/fk-child-cols "[\"a\"]" :pg/fk-parent-table "parent"
         :pg/fk-parent-cols "[\"id\"]"}
        {:db/id 1002 :datahike.pg.domain/name "positive"
+        :datahike.pg.domain/base-type "int8"
         :datahike.pg.domain/check-name "positive_value"
         :datahike.pg.domain/check-expr "VALUE > 0"
         :datahike.pg.domain/not-null true}
@@ -66,7 +67,8 @@
              :parent-definition "[\"id\"]" :child-attrs [:t/a]
              :parent-table "parent" :parent-attrs [:parent/id]}]
            (:fks metadata)))
-    (is (= "VALUE > 0" (get-in metadata [:domain-enum "a" :check-expression])))
+    (is (= [{:constraint "positive_value" :expression "VALUE > 0"}]
+           (get-in metadata [:domain-enum "a" :checks])))
     (is (true? (get-in metadata [:domain-enum "a" :not-null?])))
     (is (= #{"old" "new"} (get-in metadata [:domain-enum "b" :values])))
     (is (= #{"new"} (get-in metadata [:domain-enum "b" :unsafe-values])))
@@ -75,7 +77,7 @@
       (is (= [:t/a] (get-in plan [:fks 0 :child-attrs])))
       (is (not (contains? (first (:fks plan)) :child-definition)))
       (is (= "a > 0" (str (get-in plan [:checks 0 :ast]))))
-      (is (some? (get-in plan [:domain-enum "a" :check-ast]))))))
+      (is (= "VALUE > 0" (str (get-in plan [:domain-enum "a" :checks 0 :ast])))))))
 
 (deftest malformed-sql-is-read-raw-and-fails-only-during-compilation
   (let [db (tx (constrained-db) [[:db/add 1000 :pg/check-expr "("]])

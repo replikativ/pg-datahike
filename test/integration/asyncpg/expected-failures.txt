@@ -83,7 +83,6 @@ tests/test_exceptions.py::TestExceptions::test_exceptions_unpacking
 tests/test_execute.py::TestExecuteScript::test_execute_script_interrupted_close
 
 # --- tests/test_introspection.py ---
-tests/test_introspection.py::TestIntrospection::test_introspection_loads_basetypes_of_domains
 tests/test_introspection.py::TestIntrospection::test_introspection_no_stmt_cache_01
 tests/test_introspection.py::TestIntrospection::test_introspection_no_stmt_cache_02
 tests/test_introspection.py::TestIntrospection::test_introspection_on_large_db

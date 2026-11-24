@@ -11657,47 +11657,121 @@
           live-columns (into #{} (comp (mapcat :columns) (map :attr)) (vals tables))]
       (filter live-columns columns))))
 
+(defn- catalog-type-in-use? [db oid]
+  (when oid
+    (d/q '[:find ?column .
+           :in $ ?oid
+           :where [?column :datahike.pg.column/type-oid ?oid]
+           [?column :datahike.pg.column/dropped? false]]
+         db oid)))
+
+(defn- registered-routine-uses-types? [db oids]
+  (let [oids (into #{} (keep identity) oids)]
+    (when (and (seq oids) (get (dbi/-schema db) :datahike.pg.function/arg-types))
+      ;; Legacy routine signatures store type spellings in the public
+      ;; context. A pre-existing unknown type must not block an unrelated
+      ;; drop, so check the resolvable signature members individually.
+      (binding [regoid/*search-path* ["public"]
+                regoid/*temp-tables* nil]
+        (some (fn [[args result]]
+                (let [{:keys [type columns]} (edn/read-string result)
+                      types (into (edn/read-string args) (keep :type) (cons {:type type} columns))]
+                  (some (fn [type-name]
+                          (try
+                            (contains? oids (regoid/type-oid db type-name))
+                            (catch clojure.lang.ExceptionInfo _ false)))
+                        types)))
+              (d/q '[:find ?args ?result
+                     :where [?routine :datahike.pg.function/arg-types ?args]
+                     [?routine :datahike.pg.function/return-type ?result]]
+                   db))))))
+
+(defn- domain-drop-entry [db name eid]
+  (let [object (catalog-objects/object-by-identity
+                db catalog-objects/pg-type-oid catalog-objects/public-namespace-oid name)]
+    {:name name :eid eid :oid (:datahike.pg.object/oid object)}))
+
+(defn- dependent-domain-graph [db]
+  (when (get (dbi/-schema db) :datahike.pg.domain/name)
+    (reduce (fn [result [eid name]]
+              (if-let [base-oid (params/domain-base-type-oid db (d/entity db eid))]
+                (update result base-oid (fnil conj []) (domain-drop-entry db name eid))
+                result))
+            {}
+            (d/q '[:find ?eid ?name :where [?eid :datahike.pg.domain/name ?name]] db))))
+
+(defn- dependent-domains [graph base-oid]
+  (loop [[entry & pending] (get graph base-oid), found {}]
+    (if-let [{:keys [oid eid]} entry]
+      (if (contains? found eid)
+        (recur pending found)
+        (recur (concat pending (get graph oid)) (assoc found eid entry)))
+      (vals found))))
+
+(defn- domain-column-dependents? [db {:keys [name oid]}]
+  (or (seq (live-type-dependents db :datahike.pg/domain-of name))
+      (catalog-type-in-use? db oid)))
+
+(defn- drop-domain-entry-tx [db {:keys [eid oid]}]
+  (cons [:db/retractEntity eid]
+        (when oid (catalog-objects/drop-object-tx db catalog-objects/pg-type-oid oid))))
+
+(defn- resolve-drop-type [db spelling if-exists?]
+  (try
+    (let [oid (regoid/type-oid db spelling)
+          object (catalog-objects/object-by-address db catalog-objects/pg-type-oid oid)]
+      (when (= catalog-objects/public-namespace-oid
+               (some->> object (catalog-objects/object-namespace-oid db)))
+        object))
+    (catch clojure.lang.ExceptionInfo e
+      (when-not (or (= "42704" (:sqlstate (ex-data e)))
+                    (and if-exists? (= "3F000" (:sqlstate (ex-data e)))))
+        (throw e)))))
+
 (defn- exec-ddl-drop-enum
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx
-        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
-        {:keys [type-name if-exists? cascade?]} parsed]
+  (let [{:keys [conn tx-state session-id]} ctx
+        {:keys [type-name type-spelling if-exists? cascade?]} parsed]
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
     (try
-      (let [enum-eid (enum-registry-eid db type-name)
-            composite-eid (composite-registry-eid db type-name)
+      (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+            type-object (resolve-drop-type db type-spelling if-exists?)
+            kind (:datahike.pg.object/kind type-object)
+            enum-eid (when (= :enum kind) (enum-registry-eid db type-name))
+            composite-eid (when (= :composite-type kind) (composite-registry-eid db type-name))
             eid (or enum-eid composite-eid)
-            type-object (catalog-objects/object-by-identity
-                         db catalog-objects/pg-type-oid
-                         catalog-objects/public-namespace-oid type-name)
-            dependents? (when enum-eid
-                          (or (seq (live-type-dependents db :datahike.pg/enum-of type-name))
-                              (when-let [oid (:datahike.pg.object/oid type-object)]
-                                (d/q '[:find ?column .
-                                       :in $ ?oid
-                                       :where [?column :datahike.pg.column/type-oid ?oid]
-                                       [?column :datahike.pg.column/dropped? false]]
-                                     db oid))))]
+            oid (:datahike.pg.object/oid type-object)
+            graph (when oid (dependent-domain-graph db))
+            domains (when cascade? (dependent-domains graph oid))
+            dependent-columns? (or (when enum-eid
+                                     (seq (live-type-dependents db :datahike.pg/enum-of type-name)))
+                                   (catalog-type-in-use? db oid)
+                                   (some #(domain-column-dependents? db %) domains))
+            dependent-routines? (registered-routine-uses-types? db (cons oid (map :oid domains)))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP TYPE")
           (nil? eid)
           (throw (ex-info (str "type " (pr-str type-name) " does not exist")
                           {:error :undefined-object :sqlstate "42704"}))
-          (and dependents? cascade?)
+          (and dependent-columns? cascade?)
           (throw (errors/pg-error :feature-not-supported
                                   {:feature "DROP TYPE CASCADE with dependent columns"}))
-          dependents?
+          (and dependent-routines? cascade?)
+          (throw (errors/pg-error :feature-not-supported
+                                  {:feature "DROP TYPE CASCADE with dependent routines"}))
+          (and (not cascade?) (or dependent-columns? dependent-routines? (seq (get graph oid))))
           (throw (ex-info (str "cannot drop type " type-name
                                " because other objects depend on it")
                           {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
           :else
-          (let [oid (:datahike.pg.object/oid type-object)
-                relation (when composite-eid
+          (let [relation (when composite-eid
                            (catalog-objects/object-by-identity
                             db catalog-objects/pg-class-oid
                             catalog-objects/public-namespace-oid type-name))
                 tx-data
                 (into [[:db/retractEntity eid]]
                       (concat
+                       (mapcat #(drop-domain-entry-tx db %) domains)
                        (when (= :composite-relation
                                 (:datahike.pg.object/kind relation))
                          (concat
@@ -11815,7 +11889,7 @@
    entity under `:datahike.pg.domain/*`. Optional attrs (check-name,
    check-expr, default-raw) are dissoc'd when nil so we don't write
    `nil`s as datoms."
-  [{:keys [domain-name base-type base-args
+  [{:keys [domain-name base-type base-oid base-args
            check-name check-expr not-null default-raw]}]
   (when check-expr (ddl/reject-check-subquery! check-expr))
   [{:db/ident :datahike.pg.domain/name
@@ -11823,8 +11897,12 @@
     :db/unique :db.unique/identity}
    {:db/ident :datahike.pg.domain/base-type
     :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/base-oid
+    :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
    {:db/ident :datahike.pg.domain/base-args
     :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+   {:db/ident :datahike.pg.domain/base-typmods
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :datahike.pg.domain/check-name
     :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :datahike.pg.domain/check-expr
@@ -11835,11 +11913,38 @@
     :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    (cond-> {:datahike.pg.domain/name domain-name
             :datahike.pg.domain/base-type base-type
+            :datahike.pg.domain/base-oid (long base-oid)
             :datahike.pg.domain/not-null (boolean not-null)}
-     (seq base-args)         (assoc :datahike.pg.domain/base-args (set base-args))
+     (seq base-args)         (assoc :datahike.pg.domain/base-args (set base-args)
+                                    :datahike.pg.domain/base-typmods (str/join ", " base-args))
      check-name              (assoc :datahike.pg.domain/check-name check-name)
      check-expr              (assoc :datahike.pg.domain/check-expr check-expr)
      default-raw             (assoc :datahike.pg.domain/default-raw default-raw))])
+
+(defn- resolve-domain-base [db {:keys [base-sql base-type collation] :as domain}]
+  (let [oid (regoid/type-oid db base-sql)
+        domain (assoc domain :base-oid oid)
+        {:keys [typname typtype typcollation typcategory namespace-oid user?]}
+        (regoid/type-identity db {:oid oid})]
+    (when (= "p" typtype)
+      (throw (ex-info (str "\"" base-sql "\" is not a valid base type for a domain")
+                      {:sqlstate "42804" :error :datatype-mismatch})))
+    (when (and collation (= 0 typcollation))
+      (throw (ex-info (str "collations are not supported by type " (types/format-type oid -1))
+                      {:sqlstate "42804" :error :datatype-mismatch})))
+    ;; Canonicalize a built-in scalar when the short legacy parser would
+    ;; otherwise store a qualifier or omit part of a multiword type.
+    (cond
+      user? (assoc domain :base-type base-sql)
+      (= "A" typcategory) (assoc domain :base-type base-sql :base-args nil)
+      (and (= 11 namespace-oid) (not= "A" typcategory)
+           (or (str/includes? base-type ".")
+               (not= oid (pgs/resolve-type-oid db base-type))))
+      (let [[_ raw-args] (re-find #"\(([^()]*)\)" base-sql)
+            args (when (and raw-args (not= "float" base-type))
+                   (mapv str/trim (str/split raw-args #",")))]
+        (assoc domain :base-type typname :base-args args))
+      :else domain)))
 
 (defn- exec-ddl-create-domain
   [ctx parsed]
@@ -11856,7 +11961,8 @@
           (classified-error ""
                             (ex-info (str "type " (pr-str domain-name) " already exists")
                                      {:error :duplicate-object :sqlstate "42710"}))
-          (let [{:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
+          (let [domain (resolve-domain-base db domain)
+                {:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
                 create-data
                 (into (vec tx-data)
                       (concat
@@ -11879,42 +11985,45 @@
 
 (defn- exec-ddl-drop-domain
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx
-        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
-        {:keys [domain-name if-exists? cascade?]} parsed]
+  (let [{:keys [conn tx-state session-id]} ctx
+        {:keys [if-exists? cascade? type-spelling] domain-name :type-name} parsed]
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
     (try
-      (let [eid (ffirst
-                 (d/q '{:find [?e]
-                        :in [$ ?name]
-                        :where [[?e :datahike.pg.domain/name ?name]]}
-                      db domain-name))
-            dependents (when eid
-                         (live-type-dependents db :datahike.pg/domain-of domain-name))]
+      (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+            object (resolve-drop-type db type-spelling if-exists?)
+            eid (when (= :domain (:datahike.pg.object/kind object))
+                  (ffirst (d/q '{:find [?e]
+                                 :in [$ ?name]
+                                 :where [[?e :datahike.pg.domain/name ?name]]}
+                               db domain-name)))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP DOMAIN")
           (nil? eid)
           (throw (ex-info (str "type " (pr-str domain-name) " does not exist")
                           {:error :undefined-object :sqlstate "42704"}))
-          (and (seq dependents) cascade?)
-          (throw (errors/pg-error :feature-not-supported
-                                  {:feature "DROP DOMAIN CASCADE with dependent columns"}))
-          (seq dependents)
-          (throw (ex-info (str "cannot drop type " domain-name
-                               " because other objects depend on it")
-                          {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
           :else
-          (let [object (catalog-objects/object-by-identity
-                        db catalog-objects/pg-type-oid
-                        catalog-objects/public-namespace-oid domain-name)
-                tx-data (into [[:db/retractEntity eid]]
-                              (when (= :domain (:datahike.pg.object/kind object))
-                                (catalog-objects/drop-object-tx
-                                 db catalog-objects/pg-type-oid
-                                 (:datahike.pg.object/oid object))))]
-            (if (:in-tx? @tx-state)
-              (execute-ddl-in-tx tx-state tx-data "DROP DOMAIN")
-              (do (transact-recorded! conn tx-data)
-                  (empty-result "DROP DOMAIN"))))))
+          (let [{:keys [oid] :as root} (domain-drop-entry db domain-name eid)
+                graph (dependent-domain-graph db)
+                domains (cons root (when cascade? (dependent-domains graph oid)))
+                dependent-columns? (some #(domain-column-dependents? db %) domains)
+                dependent-routines? (registered-routine-uses-types? db (map :oid domains))]
+            (cond
+              (and cascade? dependent-columns?)
+              (throw (errors/pg-error :feature-not-supported
+                                      {:feature "DROP DOMAIN CASCADE with dependent columns"}))
+              (and cascade? dependent-routines?)
+              (throw (errors/pg-error :feature-not-supported
+                                      {:feature "DROP DOMAIN CASCADE with dependent routines"}))
+              (and (not cascade?) (or dependent-columns? dependent-routines? (seq (get graph oid))))
+              (throw (ex-info (str "cannot drop type " domain-name
+                                   " because other objects depend on it")
+                              {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
+              :else
+              (let [tx-data (into [] (mapcat #(drop-domain-entry-tx db %)) domains)]
+                (if (:in-tx? @tx-state)
+                  (execute-ddl-in-tx tx-state tx-data "DROP DOMAIN")
+                  (do (transact-recorded! conn tx-data)
+                      (empty-result "DROP DOMAIN"))))))))
       (catch Exception e
         (classified-error "DROP DOMAIN error: " e)))))
 
@@ -13263,22 +13372,26 @@
                      storage-ident (fresh-storage-ident! name attnum)
                      user-type (pgs/user-type-object db type)
                      domain (when (= :domain (:datahike.pg.object/kind user-type))
-                              (params/registered-domain-spec db (:datahike.pg.object/name user-type)))
-                     normalized (types/normalize-sql-type-name (or (:base-type domain) type))
-                     base-type (str/replace normalized #"\s*\([^)]*\)" "")
-                     array-spec (types/parse-array-type-name normalized)
+                              (params/domain-spec-by-name db (:datahike.pg.object/name user-type)))
+                     storage-type (or (some-> domain params/domain-storage-type) type)
+                     normalized (types/normalize-sql-type-name storage-type)
+                     domain-array (:array-type domain)
+                     array-spec (or domain-array (types/parse-array-type-name normalized))
+                     scalar-type (or (some-> domain-array :element-sql types/normalize-sql-type-name)
+                                     normalized)
+                     base-type (str/replace scalar-type #"\s*\([^)]*\)" "")
                      vector-typmod (when (= "vector" base-type)
                                      (pg-vector/parse-typmod normalized))
                      numeric-typmod
                      (when (or (= :numeric (:elem array-spec)) (= :numeric (types/cast-category base-type)))
-                       (let [[precision scale] (types/parse-numeric-args normalized)]
+                       (let [[precision scale] (types/parse-numeric-args scalar-type)]
                          (when (or precision scale)
                            (types/encode-numeric-typmod precision scale))))
-                     char-typmod (when-let [length (types/parse-char-length normalized)]
+                     char-typmod (when-let [length (types/parse-char-length scalar-type)]
                                    (+ length 4))
-                     temporal-typmod (or (types/parse-timestamp-precision normalized)
-                                         (types/parse-time-precision normalized))
-                     bit-typmod (some-> (types/parse-bit-length normalized) long)]
+                     temporal-typmod (or (types/parse-timestamp-precision scalar-type)
+                                         (types/parse-time-precision scalar-type))
+                     bit-typmod (some-> (types/parse-bit-length scalar-type) long)]
                  (assoc column
                         :attnum attnum
                         :storage-ident storage-ident

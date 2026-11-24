@@ -2253,13 +2253,15 @@
                (let [object (catalog-objects/object-by-identity
                              cte-db catalog-objects/pg-type-oid
                              catalog-objects/public-namespace-oid name)
-                     default (:datahike.pg.domain/default-raw (d/entity cte-db eid))]
+                     domain (d/entity cte-db eid)
+                     default (:datahike.pg.domain/default-raw domain)]
                  (cond-> {:pg_type/oid (:datahike.pg.object/oid object)
                           :pg_type/typname name
                           :pg_type/typlen -1 :pg_type/typtype "d"
                           :pg_type/typcategory "U" :pg_type/typispreferred false
                           :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
-                          :pg_type/typbasetype (long (pgs/resolve-type-oid cte-db base-type))
+                          :pg_type/typbasetype (long (or (params/domain-base-type-oid cte-db domain)
+                                                         (pgs/resolve-type-oid cte-db base-type)))
                           :pg_type/typnotnull (boolean not-null)
                           :pg_type/typdelim "," :pg_type/typnamespace 2200
                           (pgs/row-marker-attr "pg_type") true}

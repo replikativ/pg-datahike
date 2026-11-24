@@ -1278,14 +1278,14 @@
                 (merge base {:type :ddl-drop-enum}
                        (user-types/parse-drop-type sql))
                 (catch Throwable e
-                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+                  {:type :error :message (.getMessage e) :sqlstate (or (:sqlstate (ex-data e)) "42601")}))
 
               :drop-domain
               (try
                 (merge base {:type :ddl-drop-domain}
                        (user-types/parse-drop-domain sql))
                 (catch Throwable e
-                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+                  {:type :error :message (.getMessage e) :sqlstate (or (:sqlstate (ex-data e)) "42601")}))
 
               ;; TRUNCATE — fully token-classified (base carries
               ;; :tables / :restart-identity? / :cascade? from
@@ -1372,20 +1372,12 @@
 
               :create-domain
               (try
-                (let [toks (database/tokenize sql)
-                      toks (drop-while (fn [t]
-                                         (or (not= :ident (first t))
-                                             (not= "create"
-                                                   (clojure.string/lower-case
-                                                    (second t)))))
-                                       toks)
-                      toks (rest toks)
-                      parsed (user-types/parse-create-domain toks sql)]
+                (let [parsed (user-types/parse-create-domain sql)]
                   (assoc base :type :ddl-create-domain :domain parsed))
                 (catch Throwable e
                   {:type :error
                    :message (.getMessage e)
-                   :sqlstate "42601"}))
+                   :sqlstate (or (:sqlstate (ex-data e)) "42601")}))
 
               base))
 
@@ -2017,10 +2009,10 @@
                                                                  (if (or (nil? raw) (= :__null__ raw))
                                                                    :__null__
                                                                    (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
-                                                                 (or (nil? raw) (= :__null__ raw))
-                                                                 :__null__
                                                                  domain-spec
                                                                  (params/cast-domain-value cte-db domain-spec raw)
+                                                                 (or (nil? raw) (= :__null__ raw))
+                                                                 :__null__
                                                                  enum-values
                                                                  (let [label (str raw)]
                                                                    (if (contains? enum-values label)
