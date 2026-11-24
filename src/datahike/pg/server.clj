@@ -2549,7 +2549,8 @@
                            (when-let [tempid (get tempid-by-operand [attr eid])]
                              (or (get tempids tempid)
                                  (throw (errors/pg-error
-                                         :serialization-failure))))))))]
+                                         :serialization-failure
+                                         {:detail "writer did not allocate an entity ID for an earlier SQL row"}))))))))]
           [:db.fn/call-with-tempids
            (if fresh? (fresh-insert-fn replay) replay)])))))
 

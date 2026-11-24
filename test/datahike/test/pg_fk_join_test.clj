@@ -175,6 +175,15 @@
              (pairs a (str "SELECT d.id, t.id FROM replay_doc d JOIN replay_target t "
                            "ON d.link = t.db_id WHERE d.id = 1")))))))
 
+(deftest replay-rejects-a-missing-writer-tempid
+  (let [[op replay] (#'pg/replay-insert-ids @*conn* {101 "earlier-row"} {}
+                                            [{:db/id 101}] identity false)]
+    (is (= :db.fn/call-with-tempids op))
+    (is (= [{:db/id 205}] (replay @*conn* {"earlier-row" 205})))
+    (is (= :serialization-failure
+           (try (replay @*conn* {})
+                (catch clojure.lang.ExceptionInfo e (:error (ex-data e))))))))
+
 (deftest insert-and-copy-resolve-native-reference-keys-on-the-writer
   (d/transact *conn* [{:db/ident :replay_doc/id :db/valueType :db.type/long
                        :db/cardinality :db.cardinality/one}
