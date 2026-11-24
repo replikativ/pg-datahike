@@ -591,7 +591,7 @@
           indexes)))
 
 (defn move-relation-object-tx
-  "Move a table, row type or index to a namespace without changing its OID."
+  "Move a relation or its row type to a namespace without changing its OID."
   [object namespace-oid]
   (let [{:datahike.pg.object/keys [class-oid name revision]} object
         ref [:datahike.pg.object/address-key (:datahike.pg.object/address-key object)]]

@@ -7,17 +7,29 @@ Datahike history from the snapshot onward. PostgreSQL remains the write endpoint
 
 ## Start a mirror
 
-Enable `wal_level=logical` on the publisher and create a publication with the
-tables to mirror.
+On the PostgreSQL primary, set `wal_level = logical` and restart PostgreSQL
+if the setting changes. Leave room in `max_replication_slots` and
+`max_wal_senders` for the mirror. A schema refresh uses an additional
+logical slot while it stages its snapshot.
+
+In the source database, create a publication and grant a dedicated login
+access to the published tables. This example uses the database `production`.
+Run `CREATE PUBLICATION` as a role that owns the tables and can create
+publications. Run the role setup as a database administrator.
 
 ```sql
 CREATE PUBLICATION analytics FOR TABLE billing.accounts, archive.events;
+
+CREATE ROLE mirror LOGIN REPLICATION;
+GRANT CONNECT ON DATABASE production TO mirror;
+GRANT USAGE ON SCHEMA billing, archive TO mirror;
+GRANT SELECT ON billing.accounts, archive.events TO mirror;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text, boolean) TO mirror;
 ```
 
-Use a publisher role with `LOGIN`, `REPLICATION`, database access,
-`USAGE` on the published tables' schemas, and `SELECT` on those tables. The role needs access to
-`pg_logical_emit_message(boolean, text, text, boolean)` for catch-up barriers.
-Connect to the publisher primary.
+Configure authentication for that role in `pg_hba.conf` using the source
+database name. Supply the publisher credentials to the mirror process via
+its JDBC connection settings.
 
 Save a configuration as `mirror.edn`.
 
@@ -29,6 +41,7 @@ Save a configuration as `mirror.edn`.
 
 ```bash
 export PG_MIRROR_SOURCE_URL='jdbc:postgresql://publisher.example/production?user=mirror&sslmode=verify-full'
+java -jar pg-datahike-standalone.jar mirror --check mirror.edn
 java -jar pg-datahike-standalone.jar mirror mirror.edn
 ```
 
@@ -40,7 +53,13 @@ The listener uses the ordinary pgwire authentication and TLS options.
 Use a dedicated store path. Keep its adjacent `.mirror-lock` file with the
 store. One worker owns the store and a generated permanent `pgoutput` slot.
 The SQL listener opens after snapshot copy and catch-up. Client writes return
-SQLSTATE `25006`.
+SQLSTATE `25006`. Verify a representative read and compare it with the
+publisher while writes are quiet.
+
+```bash
+psql -X --host=127.0.0.1 --port=15432 --username=datahike \
+  --dbname=analytics --command='SELECT count(*) FROM billing.accounts;'
+```
 
 ## Check a publication
 

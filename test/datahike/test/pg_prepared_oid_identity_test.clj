@@ -744,13 +744,15 @@
   (with-open [c (connect :sql)]
     (execute! c "CREATE TABLE poi_catalog_owner_id_seq (v integer)")
     (let [old (object-oid c "regclass" "poi_catalog_owner_id_seq")]
-      (is (= {:sqlstate "42P07"}
-             (query c "CREATE TABLE poi_catalog_owner (id integer GENERATED ALWAYS AS IDENTITY)")))
+      (execute! c "CREATE TABLE poi_catalog_owner (id integer GENERATED ALWAYS AS IDENTITY)")
       (is (= old (object-oid c "regclass" "poi_catalog_owner_id_seq")))
       (is (= {:rows [["r"]]}
              (query c (str "SELECT relkind FROM pg_class WHERE oid = " old))))
-      (is (= {:rows [[nil]]}
-             (query c "SELECT to_regclass('poi_catalog_owner')::oid"))))))
+      (is (= {:rows [["public.poi_catalog_owner_id_seq1"]]}
+             (query c "SELECT pg_get_serial_sequence('poi_catalog_owner','id')")))
+      (is (not= old (object-oid c "regclass" "poi_catalog_owner_id_seq1")))
+      (is (= {:rows [["1"]]}
+             (query c "INSERT INTO poi_catalog_owner DEFAULT VALUES RETURNING id"))))))
 
 (deftest owned-sequence-catalog-identities-follow-table-lifecycle
   (doseq [mode [:sql :wire]

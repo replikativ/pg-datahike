@@ -1,12 +1,25 @@
 (ns datahike.pg.sequence
   "Stored sequence position shared by execution, catalog reads, and dumps."
-  (:require [datahike.api :as d]
+  (:require [clojure.string :as str]
+            [datahike.api :as d]
             [datahike.db.interface :as dbi]
-            [datahike.db.utils :as dbu]))
+            [datahike.db.utils :as dbu]
+            [datahike.pg.catalog.objects :as objects]
+            [datahike.pg.catalog.regoid :as regoid]))
 
 (def called-attribute
   {:db/ident :__seq__/is-called
    :db/valueType :db.type/boolean
+   :db/cardinality :db.cardinality/one})
+
+(def identity-generation-attribute
+  {:db/ident :__seq__/identity-generation
+   :db/valueType :db.type/string
+   :db/cardinality :db.cardinality/one})
+
+(def persistence-attribute
+  {:db/ident :__seq__/persistence
+   :db/valueType :db.type/string
    :db/cardinality :db.cardinality/one})
 
 (def ownership-attribute
@@ -24,6 +37,77 @@
 (defn entity-by-name [db name]
   (when-let [eid (id-by-name db name)]
     (d/pull db '[*] eid)))
+
+(defn object-storage-name [object]
+  (or (:datahike.pg.object/storage-name object) (:datahike.pg.object/name object)))
+
+(defn object-by-storage-name [db storage]
+  (let [registered (objects/object-by-storage-name db storage)
+        object (if (= :sequence (:datahike.pg.object/kind registered))
+                 registered
+                 (objects/object-by-identity db objects/pg-class-oid objects/public-namespace-oid storage))]
+    (when (and (= :sequence (:datahike.pg.object/kind object))
+               (= storage (object-storage-name object)))
+      object)))
+
+(defn counter-reference
+  "Return a supported default reference to a known counter."
+  [db storage]
+  (let [sequence (object-by-storage-name db storage)]
+    (if sequence (str (:datahike.pg.object/oid sequence)) storage)))
+
+(defn catalog-name [db storage]
+  (let [object (object-by-storage-name db storage)
+        namespace-oid (or (objects/object-namespace-oid db object) objects/public-namespace-oid)]
+    {:name (or (:datahike.pg.object/name object) storage)
+     :schema (or (:datahike.pg.object/name (objects/namespace-by-oid db namespace-oid)) "public")
+     :namespace-oid namespace-oid}))
+
+(defn stored-counter-reference
+  "Bind an older default that stored an exact physical counter name.
+   A string of digits is a regclass OID, even if a counter has that name."
+  [db reference]
+  (if (and (string? reference)
+           (not (re-matches #"[0-9]+" reference))
+           (id-by-name db reference))
+    (if-let [object (object-by-storage-name db reference)]
+      (str (:datahike.pg.object/oid object))
+      (str "public.\"" (str/replace reference "\"" "\"\"") "\""))
+    reference))
+
+(defn reference-storage-name
+  "Resolve a SQL sequence name or numeric regclass value to the counter's name."
+  [db spelling]
+  (when (and db (string? spelling))
+    (if (re-matches #"[0-9]+" spelling)
+      (when-let [oid (parse-long spelling)]
+        (when (objects/valid-user-oid? oid)
+          (let [object (objects/object-by-address db objects/pg-class-oid oid)]
+            (when (= :sequence (:datahike.pg.object/kind object)) (object-storage-name object)))))
+      (let [parts (regoid/parse-qualified-name spelling)
+            schema (when (> (count parts) 1) (nth parts (- (count parts) 2)))
+            legacy (if (= 1 (count parts)) spelling (last (str/split spelling #"\." 2)))
+            oid (try
+                  (binding [regoid/*db* db regoid/*relation-db* db
+                            regoid/*relation-provider* regoid/registry-relation]
+                    (regoid/relation-name-oid spelling))
+                  (catch clojure.lang.ExceptionInfo error
+                    (let [state (:sqlstate (ex-data error))]
+                      (when-not (or (#{"42P01" "3F000"} state)
+                                    (and (= "0A000" state) (= 1 (count parts))
+                                         (str/starts-with? (peek parts) "__dh_pg_temp_")))
+                        (throw error)))))
+            object (when oid (objects/object-by-address db objects/pg-class-oid oid))]
+        (if object
+          (when (= :sequence (:datahike.pg.object/kind object)) (object-storage-name object))
+          ;; Old stores could use the literal spelling and have no catalog
+          ;; object. Such counters belong to public.
+          (when (or (= "public" schema) (and (nil? schema) (some #{"public"} regoid/*search-path*)))
+            (some (fn [candidate]
+                    (when (and (id-by-name db candidate)
+                               (nil? (:datahike.pg.object/storage-name (object-by-storage-name db candidate))))
+                      candidate))
+                  [(peek parts) legacy])))))))
 
 (defn owned-by-column
   "Sequence names owned by a stable catalog column. Older SERIAL and
@@ -43,7 +127,7 @@
            (nil? (:__seq__/owned-by-column legacy)))
       (conj legacy-name))))
 
-(defn addressed-owned-columns
+(defn- addressed-owned-columns
   "Sequence bindings for columns with a persistent catalog address."
   [db table]
   (when (and (contains? (dbi/-schema db) :__seq__/owned-by-column)
@@ -60,6 +144,31 @@
                  [?column :datahike.pg.column/storage-ident ?attr]
                  [(get-else $ ?seq :__seq__/identity-generation "") ?generation]]
                db table))))
+
+(defn legacy-owned-ident [{:__seq__/keys [name owned-by-table owned-by-column]}]
+  (when (and name owned-by-table (nil? owned-by-column))
+    (let [prefix (str owned-by-table "_")
+          end (- (count name) 4)]
+      (when (and (str/starts-with? name prefix) (str/ends-with? name "_seq")
+                 (< (count prefix) end))
+        (keyword owned-by-table (subs name (count prefix) end))))))
+
+(defn owned-columns
+  "Resolve sequence ownership by column address or by a recorded legacy owner."
+  [db table]
+  (let [schema (dbi/-schema db)]
+    (when (and (contains? schema :__seq__/owned-by-table)
+               (contains? schema :__seq__/name))
+      (into (or (addressed-owned-columns db table) [])
+            (keep (fn [[eid]]
+                    (let [entity (d/entity db eid)
+                          attr (legacy-owned-ident entity)]
+                      (when (contains? schema attr)
+                        {:col (name attr) :ns (namespace attr) :seq-name (:__seq__/name entity)
+                         :generation (:__seq__/identity-generation entity)}))))
+            (d/q '[:find ?sequence :in $ ?table
+                   :where [?sequence :__seq__/owned-by-table ?table]]
+                 db table)))))
 
 (defn position
   "Return [last_value is_called]. Older stores distinguish the initial

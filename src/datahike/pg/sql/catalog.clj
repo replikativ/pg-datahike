@@ -1503,12 +1503,12 @@
   (into {}
         (comp
          (filter :__seq__/identity-generation)
-         (map (fn [{:__seq__/keys [name owned-by-column] :as sequence}]
-                [(or (when owned-by-column
-                       (:datahike.pg.column/storage-ident
-                        (d/entity db [:datahike.pg.column/address-key owned-by-column])))
-                     name)
-                 sequence])))
+         (keep (fn [{:__seq__/keys [owned-by-column] :as counter}]
+                 (when-let [ident (if owned-by-column
+                                    (:datahike.pg.column/storage-ident
+                                     (d/entity db [:datahike.pg.column/address-key owned-by-column]))
+                                    (sequence/legacy-owned-ident counter))]
+                   [ident counter]))))
         (sequence-entities db)))
 
 (def sequence-backed-catalogs
@@ -1536,7 +1536,8 @@
     (when called? value)))
 
 (defn- sequence-oid [db name]
-  (or (pgs/table-oid db name) (Math/abs (long (.hashCode ^String name)))))
+  (or (:datahike.pg.object/oid (sequence/object-by-storage-name db name))
+      (Math/abs (long (.hashCode ^String name)))))
 
 (defn sequence-position-by-oid
   "The two fields exposed by pg_get_sequence_data. Missing relations and
@@ -1546,7 +1547,7 @@
                  (catalog-objects/object-by-address db catalog-objects/pg-class-oid oid))
         entity (cond
                  (= :sequence (:datahike.pg.object/kind object))
-                 (sequence/entity-by-name db (:datahike.pg.object/name object))
+                 (sequence/entity-by-name db (sequence/object-storage-name object))
 
                  (and oid (nil? object))
                  (some #(when (= oid (sequence-oid db (:__seq__/name %))) %)
@@ -1821,12 +1822,12 @@
 (defn- default-oid [db column]
   (or (:column-eid column) (:db/id (d/entity db (:attr column)))))
 
-(defn- sequence-name [sequences spelling]
+(defn- sequence-name [db sequences spelling]
   (when (string? spelling)
-    (if (contains? sequences spelling)
-      spelling
-      (let [canonical (peek (regoid/parse-qualified-name spelling))]
-        (when (contains? sequences canonical) canonical)))))
+    (let [reference (sequence/stored-counter-reference db spelling)
+          storage (binding [regoid/*search-path* ["public"]]
+                    (sequence/reference-storage-name db reference))]
+      (when (contains? sequences storage) storage))))
 
 (defn- sequence-column-defaults [db tables sequences]
   (for [[table columns] tables
@@ -1835,9 +1836,9 @@
         reference (ddl/default-sequence-references (:pg/default-kind entity)
                                                    (:pg/default-value entity)
                                                    (:pg/default-arg entity))
-        :let [name (sequence-name sequences reference)]
+        :let [name (sequence-name db sequences reference)]
         :when name]
-    {:table table :column column :entity entity :sequence name}))
+    {:table table :column column :entity entity :sequence name :reference reference}))
 
 (defn defaults-depending-on-sequences [db names]
   (when (seq names)
@@ -1868,7 +1869,7 @@
              :when (nil? owned-by-column)
              [idx column] (map-indexed vector (get tables owned-by-table))
              :when (= name (str owned-by-table "_" (clojure.core/name (:attr column)) "_seq"))
-             :let [relation-oid (pgs/table-oid db owned-by-table)]
+             :let [relation-oid (pgs/storage-table-oid db owned-by-table)]
              :when relation-oid]
          (dependency class-id (sequence-oid db name) relation-oid
                      (or (:attnum column) (inc idx)) (if identity-generation "i" "a")))
@@ -2085,11 +2086,12 @@
       ;; walks pg_class (issue #26).
           (into
            (mapv (fn [s]
-                   (let [nm (:__seq__/name s)]
-                     {:pg_class/oid
-                      (sequence-oid cte-db nm)
-                      :pg_class/relname nm
-                      :pg_class/relnamespace 2200
+                   (let [nm (:__seq__/name s)
+                         {:keys [name namespace-oid]} (sequence/catalog-name cte-db nm)]
+                     {:pg_class/oid (sequence-oid cte-db nm)
+                      :pg_class/relname name
+                      :pg_class/relnamespace namespace-oid
+                      :pg_class/relpersistence (get s :__seq__/persistence "p")
                       :pg_class/relispartition false
                       :pg_class/relkind "S"
                       :pg_class/reltype 0
@@ -2336,8 +2338,7 @@
                                    ;; data still has a stable attrelid.
                                 (Math/abs (.hashCode ^String tname)))
                     pk? (= :db.unique/identity (:unique col))
-                    identity-seq (or (get identity-sequences (:attr col))
-                                     (get identity-sequences (str tname "_" (:name col) "_seq")))
+                    identity-seq (get identity-sequences (:attr col))
                     identity-code (cond
                                     identity-seq
                                     (if (= "ALWAYS"
@@ -2905,8 +2906,7 @@
                        pos       (long (if (zero? idx)
                                          1
                                          (inc (or (:attnum col) idx))))
-                       identity-seq (or (get identity-sequences (:attr col))
-                                        (get identity-sequences (str tname "_" (:name col) "_seq")))
+                       identity-seq (get identity-sequences (:attr col))
                        identity? (or identity-seq
                                      (and (= "db_id" (:name col)) (zero? idx)))
                        identity-generation (or (:__seq__/identity-generation identity-seq)
@@ -2971,22 +2971,23 @@
             (pgs/table-names user-schema cte-db)))
     "pg_sequences"
     (mapv (fn [s]
-            (cond-> {:pg_sequences/schemaname "public"
-                     :pg_sequences/sequencename (:__seq__/name s)
-                     :pg_sequences/sequenceowner "datahike"
-                     :pg_sequences/data_type (:__seq__/type s)
-                     :pg_sequences/start_value (:__seq__/start s)
-                     :pg_sequences/min_value (:__seq__/minvalue s)
-                     :pg_sequences/max_value (:__seq__/maxvalue s)
-                     :pg_sequences/increment_by (:__seq__/increment s)
-                     :pg_sequences/cycle (:__seq__/cycle s)
-                     :pg_sequences/cache_size (:__seq__/cache s)
-                     (pgs/row-marker-attr "pg_sequences") true}
+            (let [{:keys [schema name]} (sequence/catalog-name cte-db (:__seq__/name s))]
+              (cond-> {:pg_sequences/schemaname schema
+                       :pg_sequences/sequencename name
+                       :pg_sequences/sequenceowner "datahike"
+                       :pg_sequences/data_type (:__seq__/type s)
+                       :pg_sequences/start_value (:__seq__/start s)
+                       :pg_sequences/min_value (:__seq__/minvalue s)
+                       :pg_sequences/max_value (:__seq__/maxvalue s)
+                       :pg_sequences/increment_by (:__seq__/increment s)
+                       :pg_sequences/cycle (:__seq__/cycle s)
+                       :pg_sequences/cache_size (:__seq__/cache s)
+                       (pgs/row-marker-attr "pg_sequences") true}
               ;; Omit rather than store nil — an absent attribute is how
               ;; this layer spells SQL NULL, and last_value is NULL until
               ;; the sequence has been advanced.
-              (sequence-last-value s)
-              (assoc :pg_sequences/last_value (sequence-last-value s))))
+                (sequence-last-value s)
+                (assoc :pg_sequences/last_value (sequence-last-value s)))))
           (sequence-entities cte-db))
     "information_schema_sequences"
     ;; Same source as pg_sequences. This used to hardcode
@@ -2995,14 +2996,15 @@
     ;; (issue #21) — `CREATE SEQUENCE s START 5 MAXVALUE 100` reported
     ;; start 1, max 2^63-1.
     (mapv (fn [s]
-            {:information_schema_sequences/sequence_catalog "datahike"
-             :information_schema_sequences/sequence_schema "public"
-             :information_schema_sequences/sequence_name (:__seq__/name s)
-             :information_schema_sequences/start_value (str (:__seq__/start s))
-             :information_schema_sequences/minimum_value (str (:__seq__/minvalue s))
-             :information_schema_sequences/maximum_value (str (:__seq__/maxvalue s))
-             :information_schema_sequences/increment (str (:__seq__/increment s))
-             (pgs/row-marker-attr "information_schema_sequences") true})
+            (let [{:keys [schema name]} (sequence/catalog-name cte-db (:__seq__/name s))]
+              {:information_schema_sequences/sequence_catalog "datahike"
+               :information_schema_sequences/sequence_schema schema
+               :information_schema_sequences/sequence_name name
+               :information_schema_sequences/start_value (str (:__seq__/start s))
+               :information_schema_sequences/minimum_value (str (:__seq__/minvalue s))
+               :information_schema_sequences/maximum_value (str (:__seq__/maxvalue s))
+               :information_schema_sequences/increment (str (:__seq__/increment s))
+               (pgs/row-marker-attr "information_schema_sequences") true}))
           (sequence-entities cte-db))
     "pg_indexes"
     (let [names (catalog-objects/table-name-overrides cte-db)
@@ -3102,6 +3104,16 @@
                                 (assoc m ident {:kind :generated :value expr}))
                               defaults
                               (or generated-exprs {}))
+          path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+          sequence-reference
+          (fn [spelling]
+            (when-let [name (sequence-name cte-db @sequences spelling)]
+              (binding [regoid/*db* cte-db
+                        regoid/*relation-db* cte-db
+                        regoid/*relation-provider* relation-identity
+                        regoid/*search-path* path]
+                (regoid/output types/oid-regclass (sequence-oid cte-db name)
+                               types/format-type))))
           render (fn [{:keys [kind value arg]} col]
                    (case kind
                      ;; Already parenthesised by the DDL lowering, which
@@ -3115,17 +3127,10 @@
                             "\"bit\""))
                      :nextval
                      (let [spelling (or arg value)
-                           name (sequence-name @sequences spelling)
-                           path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
-                           reference (if name
-                                       (binding [regoid/*db* cte-db
-                                                 regoid/*relation-db* cte-db
-                                                 regoid/*relation-provider* relation-identity
-                                                 regoid/*search-path* path]
-                                         (regoid/output types/oid-regclass (sequence-oid cte-db name)
-                                                        types/format-type))
-                                       spelling)]
+                           reference (or (sequence-reference spelling) spelling)]
                        (str "nextval('" (str/replace reference "'" "''") "'::regclass)"))
+                     :expr (ddl/rewrite-default-sequence-references
+                            value #(when (re-matches #"[0-9]+" %) (sequence-reference %)))
                      :fn (str value "()")
                      :literal
                      (cond
@@ -3725,7 +3730,7 @@
     :nextval :currval :lastval :setval
     :pg-backend-pid :txid-current
     :comment-on :lock-table :create-index
-    :maintenance-noop :schema-noop :schema-ddl :move-table-schema
+    :maintenance-noop :schema-noop :schema-ddl :move-table-schema :add-column-identity
     :create-database :drop-database
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
     ;; (which can't / won't parse them) and run our own parsers.

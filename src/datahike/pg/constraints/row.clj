@@ -13,6 +13,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.params :as params])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]))
 
@@ -51,7 +52,8 @@
                                        attr))
                             entity (d/entity db attr)
                             publisher-generated? (:pg/publisher-generated? entity)
-                            kind (:pg/default-kind entity)]
+                            kind (:pg/default-kind entity)
+                            argument (:pg/default-arg entity)]
                         {:name name :attr attr
                          :not-null? (true? (:pg/not-null entity))
                          ;; GENERATED ALWAYS AS (expr) STORED. Carried
@@ -62,9 +64,7 @@
                          :publisher-generated? publisher-generated?
                          :generated (when-not publisher-generated? (:pg/generated entity))
                          :generated-expr (when-not publisher-generated? (:pg/generated-expr entity))
-                         :default (when kind
-                                    [kind (:pg/default-value entity)
-                                     (:pg/default-arg entity)])}))))
+                         :default (ddl/stored-column-default db kind (:pg/default-value entity) argument)}))))
             ordered-columns))))
 
 (defn constraint-metadata

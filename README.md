@@ -395,8 +395,8 @@ that need explicit branch administration.
 
 ## Migration & pg_dump interop
 
-pg-datahike round-trips with real PostgreSQL via `pg_dump` SQL on both
-sides. Three concrete workflows:
+Use logical replication for a read-only mirror, or `pg_dump` and `psql`
+to move a SQL snapshot into a writable store.
 
 ### Live PostgreSQL → pg-datahike
 
@@ -441,6 +441,43 @@ JDBC `PreparedStatement.executeBatch`, and explicit transactions —
 all of which commit batched rows through one underlying transact
 instead of per-row. Each-INSERT-its-own-roundtrip clients are bound
 by per-call commit cost (~370 r/s).
+
+### Optional beta upgrade to a fresh store
+
+Keep using your existing store or use PostgreSQL 18's client tools to
+copy the SQL schema and rows into a separate pg-datahike store. The fresh
+store starts its own history. Keep the source store to retain earlier
+transaction history, Datahike entity IDs, and branches.
+
+Dump the database through its current pg-datahike listener. Quiesce writes
+before taking the dump if you intend to switch applications to the copy.
+The example omits ownership, grants and comments, and uses the destination's
+built-in vector type.
+
+```bash
+pg_dump --host=127.0.0.1 --port=5432 --username=datahike \
+  --no-owner --no-privileges --no-comments --exclude-extension=vector \
+  --format=plain --file=beta-store.sql datahike
+```
+
+Start the new version in a separate terminal on another port, with an
+unused data directory. Use `--history` to retain history in the new store
+from restore onward.
+
+```bash
+java -jar pg-datahike-standalone.jar --port 15432 \
+  --data-dir ./beta-fresh --db datahike --history
+```
+
+```bash
+psql -X --host=127.0.0.1 --port=15432 --username=datahike \
+  --dbname=datahike --set=ON_ERROR_STOP=1 --file=beta-store.sql
+```
+
+Compare row counts and representative queries, then check application
+writes that use constraints, SERIAL, or identity columns. Keep the original
+store available through cutover. For a custom-format archive, use
+`pg_restore --file` to render SQL for the same `psql` step.
 
 ### pg-datahike → portable PG SQL (the `dump` tool)
 
@@ -593,8 +630,9 @@ stages. `EXPLAIN ANALYZE` raises `0A000`, as do shapes whose output metadata
 cannot be established without execution, including correlated LATERAL queries
 and some routine or user-defined-type outputs.
 
-Generated identity and SERIAL sequence names use `<table>_<column>_seq`.
-Existing names raise `42P07`; automatic suffix selection is not yet supported.
+Generated identity and SERIAL sequence names use `<table>_<column>_seq`,
+shortened to fit PostgreSQL's 63-byte identifier limit. An existing name
+in the same schema causes PostgreSQL-style numbered suffixes such as `seq1`.
 
 Arrays with supported built-in element types support element and slice
 assignments in `UPDATE`, `INSERT` and `ON CONFLICT DO UPDATE`: for example, `UPDATE samples SET readings[2]=42`

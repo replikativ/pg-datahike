@@ -947,8 +947,8 @@
       ;; syntax error: SEQUENCE NAME is 42601 and LOGGED/UNLOGGED are
       ;; "option not recognized" when used as sequence options.
       (and (kw=? t0 "sequence") (kw=? (second toks) "name"))
-      (when-let [[nm ts'] (read-relation-name (drop 2 toks))]
-        [[:sequence-name nm] ts'])
+      (when-let [[parts ts'] (read-relation-parts (drop 2 toks))]
+        [[:sequence-name (mapv :text parts)] ts'])
 
       (kw=? t0 "logged")   [[:logged true] (rest toks)]
       (kw=? t0 "unlogged") [[:unlogged true] (rest toks)]
@@ -1561,14 +1561,15 @@
                   (kw=? (second toks) "not")
                   (kw=? (nth toks 2 nil) "exists"))
         ts (if ine? (drop 3 toks) toks)]
-    (or (when-let [[nm ts1] (read-relation-name ts :text)]
+    (or (when-let [[parts ts1] (read-relation-parts ts)]
           (let [[opts ts2] (read-sequence-options ts1)
                 ts3 (drop-while #(= ";" (:text %)) ts2)]
             (when (empty? ts3)
-              {:kind :create-sequence
-               :seq-name nm
-               :if-not-exists? ine?
-               :seq-opts opts})))
+              (cond-> {:kind :create-sequence
+                       :seq-name (:text (peek parts))
+                       :if-not-exists? ine?
+                       :seq-opts opts}
+                (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2))))))))
         {:kind :generic-sql})))
 
 (defn- classify-alter-sequence
@@ -1581,14 +1582,15 @@
   [toks]
   (let [ie? (and (kw=? (first toks) "if") (kw=? (second toks) "exists"))
         ts (if ie? (drop 2 toks) toks)]
-    (or (when-let [[nm ts1] (read-relation-name ts :text)]
+    (or (when-let [[parts ts1] (read-relation-parts ts)]
           (let [[opts ts2] (read-sequence-options ts1)
                 ts3 (drop-while #(= ";" (:text %)) ts2)]
             (when (and (seq opts) (empty? ts3))
-              {:kind :alter-sequence
-               :seq-name nm
-               :if-exists? ie?
-               :seq-opts opts})))
+              (cond-> {:kind :alter-sequence
+                       :seq-name (:text (peek parts))
+                       :if-exists? ie?
+                       :seq-opts opts}
+                (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2))))))))
         {:kind :generic-sql})))
 
 (defn- classify-truncate
@@ -1704,6 +1706,26 @@
       true
       :else (recur (next ts)))))
 
+(defn- alter-column-add-identity [tokens]
+  (when (kw=? (first tokens) "alter")
+    (let [tail (rest tokens)
+          [column add generated & tail] (if (kw=? (first tail) "column") (rest tail) tail)]
+      (when (and (ident-tok? column) (kw=? add "add") (kw=? generated "generated"))
+        (let [[mode tail]
+              (cond
+                (kw=? (first tail) "always") ["ALWAYS" (rest tail)]
+                (and (kw=? (first tail) "by") (kw=? (second tail) "default"))
+                ["BY DEFAULT" (drop 2 tail)])
+              [as identity & tail] tail]
+          (when (and mode (kw=? as "as") (kw=? identity "identity"))
+            (let [[options tokens] (if (= "(" (:text (first tail)))
+                                     (read-balanced tail)
+                                     [[] (or tail [])])
+                  [options unparsed] (read-sequence-options options)]
+              (when (and (some? tokens) (empty? unparsed)
+                         (every? #(= ";" (:text %)) tokens))
+                {:column (:text column) :generation mode :seq-opts options}))))))))
+
 (defn- classify-alter [toks]
   (let [[t1 & rest-toks] toks]
     (cond
@@ -1737,12 +1759,17 @@
             if-exists? (and (kw=? (first ts) "if") (kw=? (second ts) "exists"))
             ts (if if-exists? (drop 2 ts) ts)
             [parts ts] (read-relation-parts ts)
+            identity (when parts (alter-column-add-identity ts))
             [set-token schema-token target & tail] ts]
         (cond
           (and parts (kw=? set-token "set") (kw=? schema-token "schema")
                (ident-tok? target) (every? #(= ";" (:text %)) tail))
           {:kind :move-table-schema :relation-parts [(mapv :text parts)]
            :new-schema (:text target) :if-exists? if-exists?}
+
+          identity
+          (assoc identity :kind :add-column-identity
+                 :relation-parts [(mapv :text parts)] :if-exists? if-exists?)
 
           (alter-table-rls? ts)
           {:kind :rls :reject-kind :rls :tag "ALTER TABLE ROW LEVEL SECURITY"}

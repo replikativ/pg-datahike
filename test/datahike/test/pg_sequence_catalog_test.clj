@@ -16,8 +16,10 @@
    defaults.
 
    Expectations captured from PostgreSQL 17 by differential testing."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.dump :as dump]
             [datahike.pg.server :as pg]
             [datahike.pg.sql.ddl :as ddl])
   (:import [datahike.pg PgWireServer$QueryResult]))
@@ -341,3 +343,307 @@
   (is (= [["public.view_seq"]] (rows "SELECT pg_get_serial_sequence('owner_view', 'id')")))
   (is (nil? (err "DROP VIEW owner_view")))
   (is (= [[nil]] (rows "SELECT to_regclass('view_seq')"))))
+
+(deftest qualified-sequences-keep-counters-catalogs-and-defaults-separate
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE SCHEMA \"Archive Data\""
+               "CREATE SEQUENCE public.ticket START WITH 7"
+               "CREATE SEQUENCE billing.ticket START WITH 101 INCREMENT BY 2"
+               "CREATE SEQUENCE \"Archive Data\".\"Ticket.Name\" START WITH 901"
+               "SET search_path TO billing, public"
+               "CREATE TABLE billing.invoice (id bigint DEFAULT nextval('ticket'), label text)"
+               "ALTER SEQUENCE billing.ticket OWNED BY billing.invoice.id"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["101" "7" "901"]]
+         (rows "SELECT nextval('ticket'), nextval('public.ticket'), nextval('\"Archive Data\".\"Ticket.Name\"')")))
+  (is (= [["103"]] (rows "SELECT nextval('billing.ticket'::regclass)")))
+  (is (= [["billing.ticket"]] (rows "SELECT pg_get_serial_sequence('billing.invoice','id')")))
+  (is (= [["Archive Data" "Ticket.Name"] ["billing" "ticket"] ["public" "ticket"]]
+         (rows "SELECT sequence_schema, sequence_name FROM information_schema.sequences ORDER BY 1,2")))
+  (is (= [["t"]]
+         (rows "SELECT 'billing.ticket'::regclass::oid <> 'public.ticket'::regclass::oid")))
+  (is (nil? (err "SET search_path TO public")))
+  (is (= [["105"]]
+         (rows "INSERT INTO billing.invoice (label) VALUES ('bound default') RETURNING id")))
+  (is (nil? (err "ALTER SEQUENCE billing.ticket RESTART WITH 201")))
+  (is (= [["201"]]
+         (rows "INSERT INTO billing.invoice (label) VALUES ('restart') RETURNING id")))
+  (is (= "2BP01" (.sqlstate (run "DROP SEQUENCE billing.ticket"))))
+  (is (nil? (err "DROP TABLE billing.invoice")))
+  (is (= [["t" "t"]]
+         (rows "SELECT to_regclass('billing.ticket') IS NULL, to_regclass('public.ticket') IS NOT NULL")))
+  (is (= [["8"]] (rows "SELECT nextval('public.ticket')")))
+  (is (= "42P01" (.sqlstate (run "SELECT nextval('billing.ticket')"))))
+  (is (= "42P01" (.sqlstate (run "DROP SEQUENCE billing.ticket")))))
+
+(deftest dump-style-defaults-retain-the-qualified-sequence-dependency
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE SCHEMA \"Archive Data\""
+               "CREATE SEQUENCE billing.ticket START 11"
+               "CREATE SEQUENCE \"Archive Data\".\"O'Brien.Ticket\" START 51"
+               "SET search_path TO ''"
+               "CREATE TABLE billing.invoice (id bigint DEFAULT nextval('billing.ticket'::regclass))"
+               "CREATE TABLE \"Archive Data\".invoice (id bigint)"
+               (str "ALTER TABLE ONLY \"Archive Data\".invoice ALTER COLUMN id "
+                    "SET DEFAULT nextval('\"Archive Data\".\"O''Brien.Ticket\"'::regclass)")]]
+    (is (nil? (err sql)) sql))
+  (is (= [["11"]] (rows "INSERT INTO billing.invoice DEFAULT VALUES RETURNING id")))
+  (is (= [["51"]] (rows "INSERT INTO \"Archive Data\".invoice DEFAULT VALUES RETURNING id")))
+  (is (= [["nextval('billing.ticket'::regclass)"]]
+         (rows (str "SELECT pg_catalog.pg_get_expr(adbin, adrelid) FROM pg_catalog.pg_attrdef "
+                    "WHERE adrelid = 'billing.invoice'::regclass"))))
+  (is (= "2BP01" (.sqlstate (run "DROP SEQUENCE billing.ticket"))))
+  (is (= "2BP01" (.sqlstate (run "DROP SEQUENCE \"Archive Data\".\"O'Brien.Ticket\"")))))
+
+(deftest generated-sequences-belong-to-their-table-namespace
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE TABLE public.invoice (serial_id serial, identity_id bigint GENERATED ALWAYS AS IDENTITY, label text)"
+               "BEGIN"
+               "CREATE TABLE billing.invoice (serial_id serial, identity_id bigint GENERATED ALWAYS AS IDENTITY, label text)"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["1" "1"]] (rows "INSERT INTO billing.invoice (label) VALUES ('named') RETURNING serial_id, identity_id")))
+  (is (nil? (err "COMMIT")))
+  (is (= [["1" "1"]] (rows "INSERT INTO public.invoice (label) VALUES ('public') RETURNING serial_id, identity_id")))
+  (is (= [["2" "2"]] (rows "INSERT INTO billing.invoice (label) VALUES ('next') RETURNING serial_id, identity_id")))
+  (is (= "428C9" (.sqlstate (run "INSERT INTO billing.invoice (identity_id) VALUES (10)"))))
+  (is (= [["billing.invoice_serial_id_seq" "billing.invoice_identity_id_seq"]]
+         (rows (str "SELECT pg_get_serial_sequence('billing.invoice', 'serial_id'), "
+                    "pg_get_serial_sequence('billing.invoice', 'identity_id')"))))
+  (is (nil? (err "TRUNCATE TABLE billing.invoice RESTART IDENTITY")))
+  (is (= [["1" "1"]] (rows "INSERT INTO billing.invoice DEFAULT VALUES RETURNING serial_id, identity_id")))
+  (is (nil? (err "DROP TABLE billing.invoice")))
+  (is (= [["t" "t"]]
+         (rows (str "SELECT to_regclass('billing.invoice_identity_id_seq') IS NULL, "
+                    "to_regclass('billing.invoice_serial_id_seq') IS NULL"))))
+  (is (= [["2" "2"]] (rows "INSERT INTO public.invoice DEFAULT VALUES RETURNING serial_id, identity_id"))))
+
+(deftest dump-can-attach-an-identity-sequence-to-an-existing-column
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE TABLE billing.payments (id integer NOT NULL, draft_id integer, memo text)"
+               "CREATE TABLE public.payments (id integer NOT NULL, memo text)"
+               "CREATE SEQUENCE public.payment_ids START WITH 400"
+               "SELECT pg_catalog.set_config('search_path', '', false)"
+               "BEGIN"
+               (str "ALTER TABLE ONLY billing.payments ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY "
+                    "(SEQUENCE NAME billing.payment_ids START WITH 7 INCREMENT BY 5 NO MINVALUE NO MAXVALUE CACHE 1)")]]
+    (is (nil? (err sql)) sql))
+  (is (= [["7"]] (rows "INSERT INTO billing.payments (memo) VALUES ('first') RETURNING id")))
+  (is (nil? (err "COMMIT")))
+  (is (= [["12"]] (rows "INSERT INTO billing.payments (memo) VALUES ('second') RETURNING id")))
+  (is (= [["42"]] (rows "INSERT INTO billing.payments (id) VALUES (42) RETURNING id")))
+  (is (= [["billing.payment_ids" nil]]
+         (rows (str "SELECT pg_catalog.pg_get_serial_sequence('billing.payments','id'), "
+                    "pg_catalog.pg_get_serial_sequence('public.payments','id')"))))
+  (is (= "55000" (.sqlstate (run "ALTER TABLE billing.payments ALTER id ADD GENERATED ALWAYS AS IDENTITY"))))
+  (is (= "55000" (.sqlstate (run "ALTER TABLE billing.payments ALTER draft_id ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME billing.draft_ids)"))))
+  (is (nil? (err "DROP TABLE billing.payments")))
+  (is (= [["t" "400"]]
+         (rows "SELECT to_regclass('billing.payment_ids') IS NULL, nextval('public.payment_ids')"))))
+
+(deftest table-schema-move-keeps-owned-sequences-and-existing-defaults
+  (doseq [sql ["CREATE SCHEMA archive"
+               "CREATE TABLE public.move_owner (a serial PRIMARY KEY, b int GENERATED BY DEFAULT AS IDENTITY)"
+               "CREATE SEQUENCE public.side_counter START WITH 100"
+               "CREATE TABLE public.move_consumer (
+                  plain bigint DEFAULT nextval('public.move_owner_a_seq'::regclass),
+                  compound bigint DEFAULT (nextval('public.move_owner_b_seq'::regclass) * 10 + nextval('public.side_counter')))"
+               "CREATE SEQUENCE archive.move_owner_b_seq"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["1" "1"]] (rows "INSERT INTO public.move_owner DEFAULT VALUES RETURNING a,b")))
+  (is (= "42P07" (.sqlstate (run "ALTER TABLE public.move_owner SET SCHEMA archive"))))
+  (is (nil? (err "DROP SEQUENCE archive.move_owner_b_seq")))
+  (let [before (rows "SELECT 'public.move_owner_a_seq'::regclass::oid, 'public.move_owner_b_seq'::regclass::oid")]
+    ;; Emulate defaults stored before DDL bound sequence references to catalog OIDs.
+    (d/transact *conn* [[:db/add :move_consumer/plain :pg/default-arg "public.move_owner_a_seq"]
+                        [:db/add :move_consumer/compound :pg/default-value
+                         "nextval('public.move_owner_b_seq'::regclass) * 10 + nextval('public.side_counter')"]])
+    (is (nil? (err "ALTER TABLE public.move_owner SET SCHEMA archive")))
+    (is (= before (rows "SELECT 'archive.move_owner_a_seq'::regclass::oid, 'archive.move_owner_b_seq'::regclass::oid")))
+    (is (= [[nil nil]] (rows "SELECT to_regclass('public.move_owner_a_seq'), to_regclass('public.move_owner_b_seq')")))
+    (is (nil? (err "CREATE SEQUENCE public.move_owner_b_seq START WITH 700")))
+    (is (= [["700"]] (rows "SELECT nextval('public.move_owner_b_seq')")))
+    (is (= [["archive.move_owner_a_seq" "archive.move_owner_b_seq"]]
+           (rows "SELECT pg_get_serial_sequence('archive.move_owner','a'), pg_get_serial_sequence('archive.move_owner','b')")))
+    (is (= (mapv vector (first before) ["a" "i"])
+           (rows "SELECT objid, deptype FROM pg_catalog.pg_depend
+                  WHERE classid = 1259 AND refobjid = 'archive.move_owner'::regclass
+                  ORDER BY refobjsubid")))
+    (is (= [["2" "120"]]
+           (rows "INSERT INTO public.move_consumer DEFAULT VALUES RETURNING plain,compound")))
+    (is (= [["3" "3"]] (rows "INSERT INTO archive.move_owner DEFAULT VALUES RETURNING a,b")))
+    (is (some #(re-find #"archive\.move_owner_b_seq" (first %))
+              (rows "SELECT adbin FROM pg_catalog.pg_attrdef WHERE adrelid = 'public.move_consumer'::regclass")))
+    (is (= "2BP01" (.sqlstate (run "DROP TABLE archive.move_owner"))))))
+
+(deftest sequence-references-resolve-before-physical-counter-lookup
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE SEQUENCE public.ticket START 7"
+               "CREATE SEQUENCE billing.ticket START 101"
+               "CREATE TABLE billing.ledger (id bigint)"
+               "SET search_path TO billing, public"
+               "CREATE TABLE public.default_holder (id bigint DEFAULT nextval('public.ticket'))"]]
+    (is (nil? (err sql)) sql))
+  (let [oid (ffirst (rows "SELECT 'public.ticket'::regclass::oid"))]
+    (is (nil? (err (str "CREATE SEQUENCE public.\"" oid "\" START 900"))))
+    (is (= [["101"]] (rows "INSERT INTO billing.ledger VALUES (nextval('ticket')) RETURNING id")))
+    (is (= [["102"]] (rows "INSERT INTO billing.ledger VALUES (nextval('billing.ticket'::regclass)) RETURNING id")))
+    (is (= [["102"]] (rows "SELECT currval('ticket')")))
+    (is (= [["7"]] (rows "INSERT INTO public.default_holder DEFAULT VALUES RETURNING id")))
+    (is (= [["900"]] (rows (str "SELECT nextval('\"" oid "\"')"))))
+    (is (nil? (err (str "DROP SEQUENCE public.\"" oid "\""))))
+    (is (= [["8"]] (rows "INSERT INTO public.default_holder DEFAULT VALUES RETURNING id")))
+    (testing "pre-existing stores kept the public counter name in default metadata"
+      (d/transact *conn* [[:db/add :default_holder/id :pg/default-arg "ticket"]])
+      (is (= [["9"]] (rows "INSERT INTO public.default_holder DEFAULT VALUES RETURNING id")))
+      (d/transact *conn* [[:db/add :default_holder/id :pg/default-kind :expr]
+                          [:db/add :default_holder/id :pg/default-value "100 + nextval('ticket')"]])
+      (is (= [["110"]] (rows "INSERT INTO public.default_holder DEFAULT VALUES RETURNING id")))
+      (is (nil? (err "CREATE TABLE public.\"Order.Year Draft\" (id serial)")))
+      (d/transact *conn* [[:db/add (keyword "Order.Year Draft" "id") :pg/default-arg "Order.Year Draft_id_seq"]])
+      (is (= [["1"]] (rows "INSERT INTO public.\"Order.Year Draft\" DEFAULT VALUES RETURNING id"))))))
+
+(deftest generated-and-explicit-sequence-defaults-bind-independently
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE SEQUENCE billing.invoice_id_seq START 109"
+               "SET search_path TO billing, public"
+               (str "CREATE TABLE public.invoice (id serial, "
+                    "billed bigint DEFAULT nextval('invoice_id_seq'))")
+               "CREATE SEQUENCE billing.reserved_id_seq START 30"
+               "CREATE TABLE billing.reserved (id serial)"
+               (str "CREATE TABLE billing.generated (id serial, "
+                    "offset_id bigint DEFAULT (nextval('generated_id_seq') + 10))")
+               "SET search_path TO public"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["1" "109"]] (rows "INSERT INTO public.invoice DEFAULT VALUES RETURNING id,billed")))
+  (is (= [["1" "12"]] (rows "INSERT INTO billing.generated DEFAULT VALUES RETURNING id,offset_id")))
+  (is (= [["billing.reserved_id_seq1"]] (rows "SELECT pg_get_serial_sequence('billing.reserved','id')")))
+  (is (= [["1" "30"]] (rows "SELECT nextval('billing.reserved_id_seq1'), nextval('billing.reserved_id_seq')"))))
+
+(deftest defaults-keep-statement-resolution-at-commit
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE SEQUENCE public.counter START 3"
+               "CREATE SEQUENCE billing.counter START 12"
+               "CREATE TABLE billing.ledger (id bigint)"
+               "BEGIN"
+               "SET search_path TO billing, public"
+               "ALTER TABLE billing.ledger ALTER id SET DEFAULT nextval('counter')"
+               "SET search_path TO public"
+               "COMMIT"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["12"]] (rows "INSERT INTO billing.ledger DEFAULT VALUES RETURNING id")))
+  (doseq [[statement published?]
+          [["CREATE TABLE candidate (id bigint DEFAULT nextval('live_counter'))" false]
+           ["ALTER TABLE billing.ledger ALTER id SET DEFAULT nextval('live_counter')" true]]]
+    (is (nil? (err "CREATE SEQUENCE live_counter")))
+    (is (nil? (err "BEGIN")))
+    (is (nil? (err statement)))
+    (with-open [other (pg/make-query-handler *conn*)]
+      (is (nil? (.error ^PgWireServer$QueryResult (.execute other "DROP SEQUENCE live_counter")))))
+    (is (= "40001" (.sqlstate (run "COMMIT"))))
+    (is (= [[nil]] (rows "SELECT to_regclass('candidate')")))
+    (when published?
+      (is (= [["13"]] (rows "INSERT INTO billing.ledger DEFAULT VALUES RETURNING id"))))))
+
+(deftest schema-moves-keep-table-and-counter-storage-distinct
+  (doseq [sql ["CREATE SCHEMA archive"
+               "CREATE SCHEMA later"
+               "CREATE TABLE public.ticket (id int)"
+               "ALTER TABLE public.ticket SET SCHEMA archive"
+               "CREATE SEQUENCE public.ticket START 30"
+               "CREATE TABLE public.packet (id serial)"
+               "ALTER TABLE public.packet SET SCHEMA archive"
+               "CREATE TABLE public.packet_id_seq (id int)"
+               "ALTER TABLE public.packet_id_seq SET SCHEMA later"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["public" "ticket"]]
+         (rows "SELECT sequence_schema, sequence_name FROM information_schema.sequences WHERE sequence_name='ticket'")))
+  (is (= [["r" "S"]]
+         (rows (str "SELECT a.relkind,p.relkind FROM pg_class a CROSS JOIN pg_class p "
+                    "WHERE a.oid='archive.ticket'::regclass AND p.oid='public.ticket'::regclass"))))
+  (is (= [["30" "1"]] (rows "SELECT nextval('public.ticket'), nextval('archive.packet_id_seq')")))
+  (is (= [["1"]] (rows "INSERT INTO later.packet_id_seq VALUES (1) RETURNING id"))))
+
+(deftest dump-restores-identity-sequence-persistence-option
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE TABLE billing.ledger (id int NOT NULL)"
+               (str "ALTER TABLE ONLY billing.ledger ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY "
+                    "(SEQUENCE NAME billing.ledger_gen UNLOGGED START WITH 50)")]]
+    (is (nil? (err sql)) sql))
+  (is (= [["u"]] (rows "SELECT relpersistence FROM pg_class WHERE oid='billing.ledger_gen'::regclass")))
+  (is (= [["50"]] (rows "INSERT INTO billing.ledger DEFAULT VALUES RETURNING id"))))
+
+(deftest sql-dump-rebinds-sequence-defaults-on-the-destination
+  (doseq [sql ["CREATE SEQUENCE startup START 21"
+               "CREATE TABLE simple_sink (id bigint DEFAULT nextval('startup'::regclass))"
+               "CREATE TABLE compound_sink (id bigint DEFAULT (2 + nextval('startup'::regclass)))"]]
+    (is (nil? (err sql)) sql))
+  (let [statements (vec (dump/dump *conn*))]
+    (fixture
+     (fn []
+       (is (nil? (err "CREATE TABLE unrelated (id int)")))
+       (doseq [statement statements
+               :when (and (not (str/blank? statement))
+                          (not (str/starts-with? statement "--")))]
+         (is (nil? (err statement)) statement))
+       (is (= [["21"]] (rows "INSERT INTO simple_sink DEFAULT VALUES RETURNING id")))
+       (is (= [["24"]] (rows "INSERT INTO compound_sink DEFAULT VALUES RETURNING id")))))))
+
+(deftest generated-counters-respect-unregistered-public-sequences
+  (d/transact *conn*
+              (into (vec ddl/sequence-schema)
+                    [{:__seq__/name "collision_id_seq" :__seq__/value 60
+                      :__seq__/start 60 :__seq__/is-called false}
+                     {:__seq__/name "attached_id_seq" :__seq__/value 70
+                      :__seq__/start 70 :__seq__/is-called false}]))
+  (doseq [sql ["CREATE TABLE collision (id serial)"
+               "CREATE TABLE attached (id int NOT NULL)"
+               "ALTER TABLE attached ALTER id ADD GENERATED ALWAYS AS IDENTITY"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["public.collision_id_seq1" "public.attached_id_seq1"]]
+         (rows "SELECT pg_get_serial_sequence('collision','id'), pg_get_serial_sequence('attached','id')")))
+  (is (= [["2" "2"]]
+         (rows "SELECT count(*), count(DISTINCT oid) FROM pg_class WHERE relname IN ('collision_id_seq', 'collision_id_seq1')")))
+  (is (= [["60" "70"]] (rows "SELECT nextval('collision_id_seq'),nextval('attached_id_seq')")))
+  (is (= [["1"]] (rows "INSERT INTO collision DEFAULT VALUES RETURNING id")))
+  (is (= [["1"]] (rows "INSERT INTO attached DEFAULT VALUES RETURNING id"))))
+
+(deftest scoped-counter-storage-skips-existing-table-keys
+  ;; A namespace uses one OID and the public table and its row type use
+  ;; the next two. The subsequent sequence would start with this key.
+  (doseq [sql ["CREATE SCHEMA billing"
+               "CREATE TABLE public.__dh_pg_seq_16387 (id int)"
+               "CREATE SEQUENCE billing.scoped START 12"
+               "ALTER TABLE public.__dh_pg_seq_16387 SET SCHEMA billing"]]
+    (is (nil? (err sql)) sql))
+  (is (= [["12"]] (rows "SELECT last_value FROM billing.scoped")))
+  (is (= [["1"]] (rows "INSERT INTO billing.__dh_pg_seq_16387 VALUES (1) RETURNING id"))))
+
+(deftest sequence-ownership-does-not-follow-a-matching-name
+  (doseq [sql ["CREATE TABLE a_b (c bigint GENERATED ALWAYS AS IDENTITY)"
+               "CREATE TABLE a (b_c bigint)"]]
+    (is (nil? (err sql)) sql))
+  (is (= [[nil]] (rows "INSERT INTO a DEFAULT VALUES RETURNING b_c")))
+  (is (= [[""]]
+         (rows "SELECT attidentity FROM pg_attribute WHERE attrelid='a'::regclass AND attname='b_c'")))
+  (is (nil? (err "ALTER TABLE a ALTER b_c SET DEFAULT 8")))
+  (is (= [["8"]] (rows "INSERT INTO a DEFAULT VALUES RETURNING b_c")))
+  (is (= [["1"]] (rows "INSERT INTO a_b DEFAULT VALUES RETURNING c"))))
+
+(deftest generated-sequence-names-fit-utf8-and-retain-the-numbered-suffix
+  (let [table (apply str (repeat 16 "é"))
+        column (apply str (repeat 11 "🍋"))
+        stem (str (apply str (repeat 14 "é")) "_" (apply str (repeat 7 "🍋")))
+        occupied (str stem "_seq")
+        generated (str stem "_seq1")
+        relation (str "billing.\"" table "\"")
+        allocator (str "pg_get_serial_sequence('" relation "','" column "')")]
+    (doseq [sql ["CREATE SCHEMA billing"
+                 (str "CREATE SEQUENCE billing.\"" occupied "\" START 50")
+                 (str "CREATE TABLE " relation " (\"" column "\" serial)")]]
+      (is (nil? (err sql)) sql))
+    (let [sequence-reference (ffirst (rows (str "SELECT " allocator)))]
+      (is (= (str "billing.\"" generated "\"") sequence-reference))
+      (is (= [["62"]] (rows (str "SELECT octet_length(relname) FROM pg_class WHERE oid=" allocator "::regclass"))))
+      (is (= [["1"]] (rows (str "INSERT INTO " relation " DEFAULT VALUES RETURNING \"" column "\""))))
+      (is (= [["2"]] (rows (str "SELECT nextval('" sequence-reference "')")))))
+    (is (= [["50"]] (rows (str "SELECT nextval('billing.\"" occupied "\"')"))))))

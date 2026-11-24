@@ -1311,6 +1311,10 @@
               :drop-role-object
               (assoc base :type :ddl-drop-role)
 
+              :add-column-identity
+              (table-targets (assoc base :type :ddl-add-column-identity
+                                    :column (unquote-ident (:column base))))
+
               :move-table-schema
               (table-targets (assoc base :type :ddl-move-table-schema
                                     :new-schema (first (regoid/parse-qualified-name (:new-schema base)))))
@@ -1326,7 +1330,8 @@
               ;; so it is caught here and surfaced with its own SQLSTATE.
               :create-sequence
               (try
-                (merge base (ddl/translate-create-sequence cls-info))
+                (cond-> (merge base (ddl/translate-create-sequence cls-info))
+                  (:seq-schema cls-info) (update :seq-schema unquote-ident))
                 (catch Throwable e
                   (let [[state msg _] (errors/classify-exception e)]
                     {:type :error :message msg :sqlstate state})))
@@ -1335,8 +1340,9 @@
               ;; which live in the db — so it only carries the options here
               ;; and the executor resolves them.
               :alter-sequence
-              (assoc base :type :ddl-alter-sequence
-                     :seq-name (unquote-ident (:seq-name cls-info)))
+              (cond-> (assoc base :type :ddl-alter-sequence
+                             :seq-name (unquote-ident (:seq-name cls-info)))
+                (:seq-schema cls-info) (update :seq-schema unquote-ident))
 
               :create-domain
               (try
@@ -2478,10 +2484,12 @@
                           obj-name (-> d .getName .getName)
                           cascade? (boolean (some #(= "cascade" (str/lower-case (str %))) (.getParameters d)))]
                       (case drop-type
-                        "sequence" {:type :ddl-drop-sequence
-                                    :seq-name (unquote-ident obj-name)
-                                    :if-exists? (.isIfExists d)
-                                    :cascade? cascade?}
+                        "sequence" (let [schema (some-> d .getName .getSchemaName unquote-ident)]
+                                     (cond-> {:type :ddl-drop-sequence
+                                              :seq-name (unquote-ident obj-name)
+                                              :if-exists? (.isIfExists d)
+                                              :cascade? cascade?}
+                                       schema (assoc :seq-schema schema)))
                         "index" {:type :ddl-drop-index
                                  :name (unquote-ident obj-name)
                                  :index-schema (some-> d .getName .getSchemaName unquote-ident)

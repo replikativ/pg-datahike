@@ -38,6 +38,7 @@
             CheckConstraint ForeignKeyIndex]
            [net.sf.jsqlparser.statement.create.sequence CreateSequence]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
+           [java.nio.charset StandardCharsets]
            [java.util.function Consumer]
            [datahike.pg ColumnSubstitutingDeParser ColumnSubstitutingDeParser$Unsupported
             DefaultExpressionVisitor]))
@@ -296,28 +297,42 @@
         (vec cols))
       (catch ColumnSubstitutingDeParser$Unsupported _ nil))))
 
+(defn- utf8-prefix [^bytes encoded length]
+  (let [end (loop [end (long length)]
+              (if (and (< end (alength encoded))
+                       ;; Continuation bytes are 10xxxxxx. Back up to the
+                       ;; current character's start before decoding.
+                       (= 0x80 (bit-and 0xc0 (aget encoded end))))
+                (recur (dec end))
+                end))]
+    (String. encoded 0 (int end) StandardCharsets/UTF_8)))
+
 (defn- make-object-name
-  "PostgreSQL's makeObjectName: `name1_name2_label`, shortening the longer
-   of name1 and name2 until the whole fits NAMEDATALEN - 1 (63) bytes."
+  "Allocate PostgreSQL's byte budget, then clip each part at a UTF-8 boundary."
   [^String name1 ^String name2 ^String label]
-  (let [avail (- 63 (inc (count label)) (if name2 1 0))
-        [n1 n2] (loop [n1 (count name1) n2 (count (or name2 ""))]
+  (let [part1 (.getBytes name1 StandardCharsets/UTF_8)
+        part2 (when name2 (.getBytes name2 StandardCharsets/UTF_8))
+        avail (- params/max-identifier-bytes
+                 (inc (alength (.getBytes label StandardCharsets/UTF_8)))
+                 (if part2 1 0))
+        [n1 n2] (loop [n1 (alength part1) n2 (if part2 (alength part2) 0)]
                   (if (<= (+ n1 n2) avail)
                     [n1 n2]
                     (if (> n1 n2) (recur (dec n1) n2) (recur n1 (dec n2)))))]
-    (str (subs name1 0 n1)
-         (when name2 (str "_" (subs name2 0 n2)))
+    (str (utf8-prefix part1 n1)
+         (when part2 (str "_" (utf8-prefix part2 n2)))
          "_" label)))
 
-(defn- choose-constraint-name
-  "PostgreSQL's ChooseConstraintName: name1_name2_label if no other
-   constraint of the table has it, else with the first free number
-   appended to the label (`t_check`, `t_check1`, ...), re-shortened to
-   fit."
-  [taken name1 name2 label]
+(defn available-object-name
+  "Use PostgreSQL's name1_name2_label, adding a number and shortening
+   the components again if a candidate is occupied."
+  [occupied? name1 name2 label]
   (some #(let [n (make-object-name name1 name2 (str label %))]
-           (when-not (contains? taken n) n))
+           (when-not (occupied? n) n))
         (cons "" (iterate inc 1))))
+
+(defn- choose-constraint-name [taken name1 name2 label]
+  (available-object-name #(contains? taken %) name1 name2 label))
 
 (defn generated-constraint-name
   "PostgreSQL's name for a constraint the statement did not name:
@@ -418,7 +433,7 @@
       (CCJSqlParserUtil/parseExpression raw)
       (catch Exception _ nil))))
 
-(defn- static-nextval-reference [^Function call]
+(defn- static-nextval-argument [^Function call]
   (when (#{"nextval" "pg_catalog.nextval"} (str/lower-case (.getName call)))
     (let [arg (params/unwrap-scalar-parens (first (.getParameters call)))
           arg (if (and (instance? CastExpression arg)
@@ -427,26 +442,56 @@
                 (params/unwrap-scalar-parens (.getLeftExpression ^CastExpression arg))
                 arg)]
       (when (instance? StringValue arg)
-        (.getNotExcapedValue ^StringValue arg)))))
+        arg))))
+
+(defn- visit-default-sequence-arguments [value visit]
+  (when (and value (str/includes? (str/lower-case value) "nextval"))
+    (when-let [^Expression ast (parse-default-expression value)]
+      (.accept ast
+               (DefaultExpressionVisitor.
+                (reify Consumer (accept [_ _]))
+                (reify Consumer
+                  (accept [_ call]
+                    (when-let [arg (static-nextval-argument call)]
+                      (visit arg)))))
+               nil)
+      ast)))
+
+(defn rewrite-default-sequence-references
+  "Rewrite literal nextval arguments in a stored expression."
+  [value replace-reference]
+  (let [changed? (volatile! false)
+        rewritten
+        (visit-default-sequence-arguments
+         value (fn [^StringValue arg]
+                 (let [reference (.getNotExcapedValue arg)]
+                   (when-let [replacement (replace-reference reference)]
+                     (when-not (= reference replacement)
+                       (.setValue arg (str/replace replacement "'" "''"))
+                       (vreset! changed? true))))))]
+    (if @changed? (str rewritten) value)))
 
 (defn default-sequence-references
   "Static sequence names referenced by a stored column default."
   [kind value argument]
   (case kind
     :nextval [(or argument value)]
-    :expr (when (and value (str/includes? (str/lower-case value) "nextval"))
-            (when-let [^Expression ast (parse-default-expression value)]
-              (let [references (volatile! [])]
-                (.accept ast
-                         (DefaultExpressionVisitor.
-                          (reify Consumer (accept [_ _]))
-                          (reify Consumer
-                            (accept [_ call]
-                              (when-let [reference (static-nextval-reference call)]
-                                (vswap! references conj reference)))))
-                         nil)
-                (distinct @references))))
+    :expr (let [references (volatile! [])]
+            (visit-default-sequence-arguments
+             value (fn [^StringValue arg]
+                     (vswap! references conj (.getNotExcapedValue arg))))
+            (distinct @references))
     nil))
+
+(defn stored-column-default [db kind value argument]
+  (when kind
+    (let [resolve-reference (partial sequence/stored-counter-reference db)]
+      (case kind
+        :nextval [kind value (resolve-reference (or argument value))]
+        :expr [kind (if (and (string? value) (re-find #"(?i)\bnextval\s*\(" value))
+                      (rewrite-default-sequence-references value resolve-reference)
+                      value) argument]
+        [kind value argument]))))
 
 (defn- reject-default-expression! [kind]
   (let [[error message]
@@ -541,7 +586,8 @@
               collapse-fn-parens #(str/replace %
                                                #"([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)"
                                                "$1()")
-              base (-> peeled strip-cast collapse-fn-parens)]
+              base (-> peeled strip-cast collapse-fn-parens)
+              nextval-match (re-matches #"(?i)\(?\s*(?:pg_catalog\s*\.\s*)?nextval\s*\(\s*'((?:[^']|'')*)'\s*(?:::\s*(?:pg_catalog\s*\.\s*)?regclass)?\s*\)\s*\)?" base)]
           (cond
             (= low "null")  {:kind :literal :value nil}
             (= low "true")  {:kind :literal :value true}
@@ -584,16 +630,9 @@
             (re-matches #"(?i)current_user(?:\(\))?|session_user(?:\(\))?|user"
                         base)
             {:kind :fn :value "current_user"}
-            ;; nextval('seqname') — literal arg. Also accepts:
-            ;;   - schema-qualified seq names: nextval('public.foo_id_seq')
-            ;;     (we drop the schema; sequences live in a flat namespace)
-            ;;   - the ::regclass cast that pg_dump always emits:
-            ;;     nextval('foo_seq'::regclass)
-            ;;   - parens preserved by our DEFAULT-paren rewrite rule:
-            ;;     (nextval('foo_seq'::regclass))
-            (re-matches #"(?i)\(?\s*nextval\s*\(\s*'(?:[^'.]+\.)?([^']+)'\s*(?:::\s*regclass)?\s*\)\s*\)?" base)
-            (let [m (re-matches #"(?i)\(?\s*nextval\s*\(\s*'(?:[^'.]+\.)?([^']+)'\s*(?:::\s*regclass)?\s*\)\s*\)?" base)]
-              {:kind :nextval :value (second m)})
+            ;; Keep the complete regclass spelling for namespace resolution.
+            nextval-match
+            {:kind :nextval :value (str/replace (second nextval-match) "''" "'")}
             ;; Anything else is kept as its own text and evaluated per
             ;; write, through the same expression evaluator a CHECK
             ;; constraint uses. Deferred rather than folded here because
@@ -1426,8 +1465,7 @@
                                   :db/cardinality :db.cardinality/one}
                                  {:db/ident :__seq__/type :db/valueType :db.type/string
                                   :db/cardinality :db.cardinality/one}
-                                 {:db/ident :__seq__/identity-generation :db/valueType :db.type/string
-                                  :db/cardinality :db.cardinality/one}
+                                 sequence/identity-generation-attribute
                                  {:db/ident :__seq__/owned-by-table :db/valueType :db.type/string
                                   :db/cardinality :db.cardinality/one}
                                  (cond-> {:__seq__/name seq-name
