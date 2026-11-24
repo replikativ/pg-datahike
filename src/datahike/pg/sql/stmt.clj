@@ -10814,7 +10814,8 @@
                               (raise! attr tuple-val cname))
                             (vswap! seen update attr (fnil conj #{}) tuple-val)))
                         []))
-                    {:datahike.pg/fresh-insert true})
+                    {:datahike.pg/fresh-insert true
+                     :datahike.pg/insert-unique-check true})
                   row-attrs]]
                 (vec (mapcat
                       (fn [attrs]

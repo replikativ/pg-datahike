@@ -716,6 +716,34 @@
           (is (.next rs))
           (is (= "Eve" (.getString rs 1))))))))
 
+(deftest transaction-local-retractions-survive-rebase
+  (with-conn [c {}]
+    (with-conn [other {}]
+      (with-open [st (.createStatement c)
+                  concurrent (.createStatement other)]
+        (.execute st "CREATE TABLE replay_parent (id int PRIMARY KEY)")
+        (.execute st (str "CREATE TABLE replay_child (id int PRIMARY KEY, note text, "
+                          "pid int REFERENCES replay_parent(id) ON DELETE CASCADE)"))
+        (.execute st "INSERT INTO replay_parent VALUES (1),(2)")
+        (.execute st "BEGIN")
+        (.executeUpdate st "INSERT INTO replay_child VALUES (1,'direct',1),(2,'kept',2),(3,'cascade',1)")
+        (.execute st "SAVEPOINT before_delete")
+        (is (= 1 (.executeUpdate st "DELETE FROM replay_child WHERE id = 2")))
+        (.execute st "ROLLBACK TO SAVEPOINT before_delete")
+        (is (= 1 (.executeUpdate st "DELETE FROM replay_child WHERE id = 1")))
+        (is (= 1 (.executeUpdate st "DELETE FROM replay_parent WHERE id = 1")))
+        (.executeUpdate concurrent "INSERT INTO t (id, name) VALUES (100, 'unrelated')")
+        (is (= 1 (.executeUpdate st "UPDATE replay_child SET note = NULL WHERE id = 2")))
+        (.execute st "COMMIT")
+        (with-open [rs (.executeQuery st "SELECT id, note FROM replay_child ORDER BY id")]
+          (is (.next rs))
+          (is (= 2 (.getInt rs 1)))
+          (is (nil? (.getString rs 2)))
+          (is (not (.next rs))))
+        (let [db (d/db *datahike-conn*)]
+          (is (= #{[2]} (d/q '[:find ?id :where [_ :replay_child/id ?id]]
+                             (d/as-of db (:max-tx db))))))))))
+
 (deftest test-rollback-discards
   (testing "Explicit rollback discards INSERT"
     (with-conn [c {:preferQueryMode "simple"}]

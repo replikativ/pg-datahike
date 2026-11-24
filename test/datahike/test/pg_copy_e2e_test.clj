@@ -390,6 +390,38 @@
     (is (= [[1] [2] [3] [4]]
            (query-rows c "SELECT id FROM copy_twice ORDER BY id")))))
 
+(deftest transaction-local-copy-replays-delete-and-truncate-in-order
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))
+              st (.createStatement c)]
+    (.execute st "CREATE TABLE copy_parent (id int PRIMARY KEY)")
+    (.execute st "CREATE TABLE copy_child (id int REFERENCES copy_parent(id))")
+    (.execute st "BEGIN")
+    (.executeUpdate st "INSERT INTO copy_parent VALUES (1),(2)")
+    (is (= 2 (copy-in-text c "COPY copy_child(id) FROM STDIN" "1\n2\n")))
+    (is (= 1 (.executeUpdate st "DELETE FROM copy_child WHERE id = 1")))
+    (.execute st "COMMIT")
+    (is (= [[2]] (query-rows c "SELECT id FROM copy_child")))
+    (.execute st "BEGIN")
+    (is (= 1 (copy-in-text c "COPY copy_child(id) FROM STDIN" "1\n")))
+    (.execute st "TRUNCATE copy_parent, copy_child")
+    (.execute st "COMMIT")
+    (is (= [] (query-rows c "SELECT id FROM copy_parent")))
+    (is (= [] (query-rows c "SELECT id FROM copy_child")))))
+
+(deftest qualified-truncate-replays-copy-without-touching-the-public-table
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))
+              st (.createStatement c)]
+    (.execute st "CREATE SCHEMA replay_scope")
+    (.execute st "CREATE TABLE replay_scope.users (id int PRIMARY KEY)")
+    (.execute st "INSERT INTO public.users (id) VALUES (99)")
+    (.execute st "BEGIN")
+    (is (= 1 (copy-in-text c "COPY replay_scope.users (id) FROM STDIN" "10\n")))
+    (.execute st "TRUNCATE replay_scope.users")
+    (is (= 1 (copy-in-text c "COPY replay_scope.users (id) FROM STDIN" "20\n")))
+    (.execute st "COMMIT")
+    (is (= [[20]] (query-rows c "SELECT id FROM replay_scope.users")))
+    (is (= [[99]] (query-rows c "SELECT id FROM public.users")))))
+
 (deftest copy-rolls-back-to-savepoint
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (with-open [st (.createStatement c)]
@@ -952,3 +984,14 @@
     (is (= [["survived"]] (query-rows c "SELECT 'survived'")))
     (is (= "42601" (state-of c "COPY cw FROM stdin WITH (FORMAT bogus)")))
     (is (= [["survived"]] (query-rows c "SELECT 'survived'")))))
+
+(deftest copy-into-a-native-table-keeps-existing-row-membership
+  (d/transact *conn* [{:db/ident :native_copy/id :db/valueType :db.type/long
+                       :db/cardinality :db.cardinality/one}
+                      {:db/ident :native_copy/note :db/valueType :db.type/string
+                       :db/cardinality :db.cardinality/one}])
+  (d/transact *conn* [{:native_copy/id 1}])
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (is (= 1 (copy-in-text c "COPY native_copy (id, note) FROM STDIN" "2\tloaded\n")))
+    (is (= [[1 nil] [2 "loaded"]]
+           (query-rows c "SELECT id, note FROM native_copy ORDER BY id")))))

@@ -769,11 +769,10 @@
      columns     — vector of lower-case column-name strings (length
                     must match row)
      ns          — table namespace (string)
-     row-marker  — row-existence marker keyword (e.g.
-                    `:users/db-row-exists`) — set true on every
-                    entity so `SELECT *` row-marker filtering finds
-                    them, matching the convention pg-datahike's INSERT
-                    translator uses (stmt.clj:856).
+     row-marker  — installed row-existence attribute such as
+                    `:users/db-row-exists`. Pass nil for native
+                    Datahike tables that derive row membership from
+                    user attributes.
      schema      — Datahike :schema map
      row-idx     — sequential row index
      tempid-prefix — statement-unique prefix; two COPY commands buffered in
