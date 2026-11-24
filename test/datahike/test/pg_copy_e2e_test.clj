@@ -408,6 +408,20 @@
     (is (= [] (query-rows c "SELECT id FROM copy_parent")))
     (is (= [] (query-rows c "SELECT id FROM copy_child")))))
 
+(deftest qualified-truncate-replays-copy-without-touching-the-public-table
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))
+              st (.createStatement c)]
+    (.execute st "CREATE SCHEMA replay_scope")
+    (.execute st "CREATE TABLE replay_scope.users (id int PRIMARY KEY)")
+    (.execute st "INSERT INTO public.users (id) VALUES (99)")
+    (.execute st "BEGIN")
+    (is (= 1 (copy-in-text c "COPY replay_scope.users (id) FROM STDIN" "10\n")))
+    (.execute st "TRUNCATE replay_scope.users")
+    (is (= 1 (copy-in-text c "COPY replay_scope.users (id) FROM STDIN" "20\n")))
+    (.execute st "COMMIT")
+    (is (= [[20]] (query-rows c "SELECT id FROM replay_scope.users")))
+    (is (= [[99]] (query-rows c "SELECT id FROM public.users")))))
+
 (deftest copy-rolls-back-to-savepoint
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (with-open [st (.createStatement c)]
