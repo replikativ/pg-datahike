@@ -1560,7 +1560,9 @@
 (defn- namespace-names [manifest]
   (into {} (keep (fn [{:keys [schema-oid schema]}]
                    (when schema-oid [schema-oid schema])))
-        (concat (all-relations manifest) (vals (:unpublished-tables manifest)))))
+        ;; A frozen table can retain its last published local schema across
+        ;; a move through public. The active name is authoritative.
+        (concat (vals (:unpublished-tables manifest)) (all-relations manifest))))
 
 (defn- namespace-renames [previous current]
   (let [previous-names (namespace-names previous)]
@@ -1600,10 +1602,11 @@
   (if (empty? renames)
     manifest
     (map-manifest-relations manifest
-                            (fn [{:keys [schema-oid] :as table}]
-                              (if-let [name (get-in renames [schema-oid :to])]
-                                (assoc table :schema name)
-                                table)))))
+                            (fn [{:keys [schema-oid schema] :as table}]
+                              (let [{:keys [from to]} (get renames schema-oid)]
+                                (if (and to (= schema from))
+                                  (assoc table :schema to)
+                                  table))))))
 
 (defn- same-table? [previous current]
   (if (every? :attnum (:columns previous))

@@ -2946,7 +2946,48 @@
             (await! "Rename back to public did not reach the mirror"
                     #(= [["t"]] (rows sink "SELECT to_regclass('public.external_claim') IS NOT NULL")))
             (compare-tables! source sink [public-table])
-            (check! (= public-oids (ids sink public-table)) "Moving back to public changed relation identity" {})))
+            (check! (= public-oids (ids sink public-table)) "Moving back to public changed relation identity" {}))
+          (sql! source "BEGIN"
+                "CREATE SCHEMA boundary_probe"
+                "CREATE TABLE boundary_probe.boundary_live (id bigint PRIMARY KEY, external_id int, label text)"
+                "CREATE TABLE boundary_probe.boundary_frozen (id bigint PRIMARY KEY, external_id int, label text)"
+                "INSERT INTO boundary_probe.boundary_live VALUES (1, 11, 'live')"
+                "INSERT INTO boundary_probe.boundary_frozen VALUES (2, 22, 'frozen')"
+                "ALTER PUBLICATION scoped_pub ADD TABLE boundary_probe.boundary_live, boundary_probe.boundary_frozen"
+                "COMMIT")
+          (let [frozen-name "boundary_probe.boundary_frozen"
+                active-name "boundary_probe.boundary_live"
+                relation-exists? (fn [table]
+                                   (= [["t"]] (rows sink (str "SELECT to_regclass(" (literal table) ") IS NOT NULL"))))]
+            (await! "Boundary tables were not installed" #(every? relation-exists? [active-name frozen-name]))
+            (let [active-ids (ids sink active-name)
+                  frozen-ids (ids sink frozen-name)
+                  frozen-rows (contents sink frozen-name)]
+              (sql! source "ALTER PUBLICATION scoped_pub DROP TABLE boundary_probe.boundary_frozen")
+              (await! "Boundary table did not freeze"
+                      #(some (fn [table] (= "boundary_frozen" (:name table)))
+                             (vals (get-in (durable-checkpoint path) [:manifest :unpublished-tables]))))
+              (sql! source "BEGIN"
+                    "ALTER SCHEMA public RENAME TO previous_public"
+                    "ALTER SCHEMA boundary_probe RENAME TO public"
+                    "UPDATE public.boundary_live SET label='in public'"
+                    "COMMIT")
+              (await! "Boundary table did not enter public" #(relation-exists? "public.boundary_live"))
+              (compare-tables! source sink ["public.boundary_live"])
+              (sql! source "BEGIN"
+                    "ALTER SCHEMA public RENAME TO boundary_after"
+                    "ALTER SCHEMA previous_public RENAME TO public"
+                    "UPDATE boundary_after.boundary_live SET label='outside public'"
+                    "COMMIT")
+              (await! "Boundary table did not leave public" #(relation-exists? "boundary_after.boundary_live"))
+              (compare-tables! source sink ["boundary_after.boundary_live" public-table])
+              (sql! source "ALTER SCHEMA boundary_after RENAME TO boundary_renamed")
+              (await! "Named rename after public did not reach the mirror"
+                      #(relation-exists? "boundary_renamed.boundary_live"))
+              (check! (= active-ids (ids sink "boundary_renamed.boundary_live"))
+                      "Public boundary changed the active relation identities" {})
+              (check! (= [frozen-ids frozen-rows] [(ids sink frozen-name) (contents sink frozen-name)])
+                      "Public boundary changed the frozen relation" {}))))
         {:status :passed :schemas 4}
         (finally
           (when @subscriber (mirror/stop! @subscriber))
