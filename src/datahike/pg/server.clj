@@ -14846,6 +14846,8 @@
   [ctx parsed]
   (let [{:keys [target options query]} parsed
         file (when-let [path (:file target)] (java.io.File. ^String path))]
+    (when file
+      (assert-database-writable! "COPY TO file"))
     (when (= :binary (:format options))
       (throw (ex-info "COPY BINARY is not supported by datahike pgwire"
                       {:error :feature-not-supported :feature "COPY BINARY"})))
