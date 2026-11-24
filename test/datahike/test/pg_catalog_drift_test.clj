@@ -94,25 +94,25 @@
 (defn- after-planning [run-query change-catalog]
   (let [entered (promise)
         proceed (promise)
-        original @#'pg/apply-column-constraints]
+        original @#'pg/column-constraint-operations]
     (with-redefs-fn
-      {#'pg/apply-column-constraints
+      {#'pg/column-constraint-operations
        (fn [& args]
          (let [planned (apply original args)]
            (deliver entered true)
            (when (= ::timeout (deref proceed 30000 ::timeout))
-             (throw (ex-info "Test did not release planned INSERT" {})))
+             (throw (ex-info "Test did not release the planned write" {})))
            planned))}
       (fn []
         (let [pending (future (run-query))]
           (try
             (when-not (= true (deref entered 30000 ::timeout))
-              (throw (ex-info "INSERT did not reach constraint planning" {})))
+              (throw (ex-info "Write did not reach constraint planning" {})))
             (change-catalog)
             (deliver proceed true)
             (let [result (deref pending 30000 ::timeout)]
               (when (= ::timeout result)
-                (throw (ex-info "Planned INSERT did not finish" {})))
+                (throw (ex-info "Planned write did not finish" {})))
               result)
             (finally
               (deliver proceed true)
