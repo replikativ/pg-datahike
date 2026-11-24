@@ -131,6 +131,31 @@
     (let [r (.execute *handler* "RESET datahike.system_at")]
       (is (nil? (err r))))))
 
+(deftest history-keeps-a-value-reasserted-within-one-transaction
+  (let [run #(.execute *handler* %)
+        checked (fn [sql]
+                  (let [result (run sql)]
+                    (is (nil? (err result)) sql)
+                    result))
+        row (fn [sql] (mapv vec (.rows (checked sql))))]
+    (doseq [sql ["CREATE TABLE audit_values (id integer PRIMARY KEY, v text, step integer)"
+                 "INSERT INTO audit_values VALUES (1, 'steady', 0)"
+                 "BEGIN"
+                 "UPDATE audit_values SET v = NULL, step = 1 WHERE id = 1"
+                 "UPDATE audit_values SET v = 'steady' WHERE id = 1"
+                 "COMMIT"]]
+      (checked sql))
+    (let [query "SELECT v, step FROM audit_values WHERE id = 1"
+          db (d/db *conn*)
+          snapshot (.toInstant ^java.util.Date (:db/txInstant (d/entity db (:max-tx db))))]
+      (is (= [["steady" "1"]] (row query)))
+      ;; Transaction instants use millisecond precision.
+      (Thread/sleep 5)
+      (checked "UPDATE audit_values SET v = 'later', step = 2 WHERE id = 1")
+      (is (= [["later" "2"]] (row query)))
+      (checked (str "SET datahike.system_at = '" snapshot "'"))
+      (is (= [["steady" "1"]] (row query))))))
+
 (deftest column-type-rewrites-preserve-rows-and-catalog-addresses
   (let [run #(.execute *handler* %)
         rows (fn [sql]
