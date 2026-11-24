@@ -321,6 +321,45 @@
        (interpose " ")
        (apply str)))
 
+(def ^:private invalid-domain-clauses
+  {"references" ["42601" "foreign key constraints not possible for domains"]
+   "unique" ["42601" "unique constraints not possible for domains"]
+   "primary" ["42601" "primary key constraints not possible for domains"]
+   "exclude" ["42601" "exclusion constraints not possible for domains"]
+   "generated" ["0A000" "specifying GENERATED not supported for domains"]
+   "deferrable" ["0A000" "specifying constraint deferrability not supported for domains"]
+   "initially" ["0A000" "specifying constraint deferrability not supported for domains"]
+   "enforced" ["42P17" "specifying constraint enforceability not supported for domains"]})
+
+(defn- domain-keyword [tok]
+  (when (and (= :ident (first tok)) (not (:quoted? (meta tok))))
+    (str/lower-case (second tok))))
+
+(defn- domain-definition-error! [sqlstate message]
+  (throw (ex-info message {:sqlstate sqlstate})))
+
+(defn- reject-domain-no-inherit! [toks constraint]
+  (when (= ["no" "inherit"] (mapv domain-keyword (take 2 toks)))
+    (domain-definition-error! "42P17" (str constraint " constraints for domains cannot be marked NO INHERIT"))))
+
+(defn- domain-default-tokens [toks]
+  (loop [remaining toks, depth 0, cases 0, expression []]
+    (let [[tok next-tok] remaining
+          kind (first tok)
+          kw (domain-keyword tok)
+          next-kw (domain-keyword next-tok)]
+      (if (or (nil? tok) (= :semicolon kind)
+              (and (zero? depth) (zero? cases)
+                   (or (contains? #{"constraint" "check" "default" "collate"} kw)
+                       (contains? invalid-domain-clauses kw)
+                       (and (= "not" kw) (contains? #{"null" "deferrable" "enforced"} next-kw))
+                       (and (= "null" kw) (seq expression)))))
+        [expression remaining]
+        (recur (rest remaining)
+               (case kind :lparen (inc depth) :rparen (dec depth) depth)
+               (case kw "case" (inc cases) "end" (dec cases) cases)
+               (conj expression tok))))))
+
 (defn parse-create-domain
   "Parse `CREATE DOMAIN [schema.]name AS <base-type> [<modifiers>...]`.
 
@@ -361,42 +400,59 @@
           [[] toks])]
     ;; Walk modifiers: CONSTRAINT <name> CHECK (...), CHECK (...), NOT NULL, DEFAULT ...
     (loop [ts toks
+           seen-nullability? false
+           seen-default? false
            out {:domain-name domain-name
                 :base-type   base-type
                 :base-args   base-args
                 :original-sql original-sql
                 :not-null    false}]
-      (let [[t & rest-ts] ts]
+      (let [[t & rest-ts] ts
+            kw (domain-keyword t)
+            next-kw (domain-keyword (first rest-ts))
+            disallowed (get invalid-domain-clauses
+                            (if (and (= "not" kw) (contains? #{"deferrable" "enforced"} next-kw))
+                              next-kw kw))]
         (cond
           (or (nil? t) (= :semicolon (first t)))
           out
 
-          (ident-eq? t "constraint")
+          disallowed
+          (apply domain-definition-error! disallowed)
+
+          (= "constraint" kw)
           (let [[name-tok & rest-ts] rest-ts
                 check-name (when (= :ident (first name-tok)) (second name-tok))]
-            (recur rest-ts (assoc out :check-name check-name)))
+            (recur rest-ts seen-nullability? seen-default? (assoc out :check-name check-name)))
 
-          (ident-eq? t "check")
+          (= "check" kw)
           (let [[inside after] (collect-balanced-parens rest-ts)]
-            (recur after (assoc out :check-expr (toks->raw-text inside))))
+            (reject-domain-no-inherit! after "check")
+            (recur after seen-nullability? seen-default? (assoc out :check-expr (toks->raw-text inside))))
 
-          (and (ident-eq? t "not") (ident-eq? (first rest-ts) "null"))
-          (recur (rest rest-ts) (assoc out :not-null true))
+          (and (= "not" kw) (= "null" next-kw))
+          (do
+            (when seen-nullability?
+              (if (:not-null out)
+                (domain-definition-error! "42P17" "redundant NOT NULL constraint definition")
+                (domain-definition-error! "42601" "conflicting NULL/NOT NULL constraints")))
+            (reject-domain-no-inherit! (rest rest-ts) "not-null")
+            (recur (rest rest-ts) true seen-default? (assoc out :not-null true)))
 
-          (ident-eq? t "null")
-          (recur rest-ts (assoc out :not-null false))
+          (= "null" kw)
+          (do
+            (when (:not-null out)
+              (domain-definition-error! "42601" "conflicting NULL/NOT NULL constraints"))
+            (recur rest-ts true seen-default? out))
 
-          (ident-eq? t "default")
-          ;; consume tokens until next top-level keyword or end
-          (let [stop? #{"constraint" "check" "not" "null"}
-                [taken left] (split-with
-                              (fn [tk]
-                                (not (and (= :ident (first tk))
-                                          (stop? (str/lower-case (second tk))))))
-                              rest-ts)]
-            (recur left (assoc out :default-raw (toks->raw-text taken))))
+          (= "default" kw)
+          (let [[expression left] (domain-default-tokens rest-ts)]
+            (when seen-default?
+              (domain-definition-error! "42601" "multiple default expressions"))
+            (when (empty? expression)
+              (domain-definition-error! "42601" "expected a domain default expression"))
+            (recur left seen-nullability? true
+                   (assoc out :default-raw (toks->raw-text expression))))
 
           :else
-          ;; unknown token — skip silently rather than error so future
-          ;; PG additions don't block ingestion
-          (recur rest-ts out))))))
+          (recur rest-ts seen-nullability? seen-default? out))))))

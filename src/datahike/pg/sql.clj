@@ -1385,7 +1385,7 @@
                 (catch Throwable e
                   {:type :error
                    :message (.getMessage e)
-                   :sqlstate "42601"}))
+                   :sqlstate (or (:sqlstate (ex-data e)) "42601")}))
 
               base))
 
