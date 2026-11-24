@@ -11716,21 +11716,30 @@
   (cons [:db/retractEntity eid]
         (when oid (catalog-objects/drop-object-tx db catalog-objects/pg-type-oid oid))))
 
+(defn- resolve-drop-type [db spelling if-exists?]
+  (try
+    (let [oid (regoid/type-oid db spelling)
+          object (catalog-objects/object-by-address db catalog-objects/pg-type-oid oid)]
+      (when (= catalog-objects/public-namespace-oid
+               (some->> object (catalog-objects/object-namespace-oid db)))
+        object))
+    (catch clojure.lang.ExceptionInfo e
+      (when-not (or (= "42704" (:sqlstate (ex-data e)))
+                    (and if-exists? (= "3F000" (:sqlstate (ex-data e)))))
+        (throw e)))))
+
 (defn- exec-ddl-drop-enum
   [ctx parsed]
   (let [{:keys [conn tx-state session-id]} ctx
-        {:keys [type-name type-schema if-exists? cascade?]} parsed]
+        {:keys [type-name type-spelling if-exists? cascade?]} parsed]
     (acquire-catalog-allocation-lock! conn tx-state session-id)
     (try
       (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
-            public-type? (or (nil? type-schema) (= "public" type-schema))
-            enum-eid (when public-type? (enum-registry-eid db type-name))
-            composite-eid (when public-type? (composite-registry-eid db type-name))
+            type-object (resolve-drop-type db type-spelling if-exists?)
+            kind (:datahike.pg.object/kind type-object)
+            enum-eid (when (= :enum kind) (enum-registry-eid db type-name))
+            composite-eid (when (= :composite-type kind) (composite-registry-eid db type-name))
             eid (or enum-eid composite-eid)
-            type-object (when eid
-                          (catalog-objects/object-by-identity
-                           db catalog-objects/pg-type-oid
-                           catalog-objects/public-namespace-oid type-name))
             oid (:datahike.pg.object/oid type-object)
             graph (when oid (dependent-domain-graph db))
             domains (when cascade? (dependent-domains graph oid))
@@ -11741,9 +11750,6 @@
             dependent-routines? (registered-routine-uses-types? db (cons oid (map :oid domains)))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP TYPE")
-          (and type-schema (not public-type?)
-               (nil? (catalog-objects/namespace-by-name db type-schema)))
-          (throw (ex-info (str "schema " (pr-str type-schema) " does not exist") {:sqlstate "3F000"}))
           (nil? eid)
           (throw (ex-info (str "type " (pr-str type-name) " does not exist")
                           {:error :undefined-object :sqlstate "42704"}))
@@ -11930,7 +11936,7 @@
     ;; otherwise store a qualifier or omit part of a multiword type.
     (cond
       user? (assoc domain :base-type base-sql)
-      (types/parse-array-type-name base-sql) (assoc domain :base-type base-sql :base-args nil)
+      (= "A" typcategory) (assoc domain :base-type base-sql :base-args nil)
       (and (= 11 namespace-oid) (not= "A" typcategory)
            (or (str/includes? base-type ".")
                (not= oid (pgs/resolve-type-oid db base-type))))
@@ -11980,20 +11986,18 @@
 (defn- exec-ddl-drop-domain
   [ctx parsed]
   (let [{:keys [conn tx-state session-id]} ctx
-        {:keys [if-exists? cascade?] domain-name :type-name domain-schema :type-schema} parsed]
+        {:keys [if-exists? cascade? type-spelling] domain-name :type-name} parsed]
     (acquire-catalog-allocation-lock! conn tx-state session-id)
     (try
       (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
-            eid (when (or (nil? domain-schema) (= "public" domain-schema))
+            object (resolve-drop-type db type-spelling if-exists?)
+            eid (when (= :domain (:datahike.pg.object/kind object))
                   (ffirst (d/q '{:find [?e]
                                  :in [$ ?name]
                                  :where [[?e :datahike.pg.domain/name ?name]]}
                                db domain-name)))]
         (cond
           (and (nil? eid) if-exists?) (empty-result "DROP DOMAIN")
-          (and domain-schema (not= "public" domain-schema)
-               (nil? (catalog-objects/namespace-by-name db domain-schema)))
-          (throw (ex-info (str "schema " (pr-str domain-schema) " does not exist") {:sqlstate "3F000"}))
           (nil? eid)
           (throw (ex-info (str "type " (pr-str domain-name) " does not exist")
                           {:error :undefined-object :sqlstate "42704"}))
@@ -13371,10 +13375,10 @@
                               (params/domain-spec-by-name db (:datahike.pg.object/name user-type)))
                      storage-type (or (some-> domain params/domain-storage-type) type)
                      normalized (types/normalize-sql-type-name storage-type)
-                     array-spec (types/parse-array-type-name normalized)
-                     scalar-type (if (:array-type domain)
-                                   (params/domain-array-element-sql normalized)
-                                   normalized)
+                     domain-array (:array-type domain)
+                     array-spec (or domain-array (types/parse-array-type-name normalized))
+                     scalar-type (or (some-> domain-array :element-sql types/normalize-sql-type-name)
+                                     normalized)
                      base-type (str/replace scalar-type #"\s*\([^)]*\)" "")
                      vector-typmod (when (= "vector" base-type)
                                      (pg-vector/parse-typmod normalized))

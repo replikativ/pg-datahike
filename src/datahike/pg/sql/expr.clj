@@ -1085,8 +1085,14 @@
                (let [resolved (ctx/resolve-column expr (:table-aliases ctx) (:default-table ctx)
                                                   (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
                      attr (ctx/attr-of ctx resolved)
-                     entity (when attr (d/entity db attr))]
-                 (or (:datahike.pg/domain-of entity) (:datahike.pg/enum-of entity))))]
+                     entity (when attr (d/entity db attr))
+                     domain (:datahike.pg/domain-of entity)]
+                 ;; Subscripting a domain over an array yields the base
+                 ;; array's element or slice type.
+                 (or (when-not (and domain (.getArrayConstructor ^Column expr)
+                                    (:array-type (params/domain-spec-by-name db domain)))
+                       domain)
+                     (:datahike.pg/enum-of entity))))]
     (when type
       (:datahike.pg.object/oid (pgs/user-type-object db type)))))
 

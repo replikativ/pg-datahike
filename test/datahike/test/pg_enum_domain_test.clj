@@ -643,9 +643,49 @@
       (d/transact *conn* [[:db/retract id :datahike.pg.domain/base-oid oid]]))
     (exec! c "CREATE TEMP TABLE legacy_parent (v text)")
     (doseq [[sql state] [["SELECT 2::legacy_child" "23514"]
-                         ["DROP DOMAIN legacy_parent" "2BP01"]]]
+                         ["DROP DOMAIN public.legacy_parent" "2BP01"]]]
       (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
         (is (= state (some-> error .getSQLState)) sql)))))
+
+(deftest domain-base-coercion-follows-catalog-identity
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [sql ["CREATE TYPE int4 AS ENUM ('ok')"
+                 "CREATE DOMAIN builtin_number AS pg_catalog.int4"
+                 "CREATE TYPE old_rating AS ENUM ('ok')"
+                 "CREATE DOMAIN rating AS old_rating"
+                 "ALTER TYPE old_rating RENAME TO new_rating"
+                 "CREATE DOMAIN narrow_floats AS float(24)[]"
+                 "CREATE DOMAIN internal_int_array AS pg_catalog._int4"
+                 "CREATE TABLE domain_bases (measurements narrow_floats, readings internal_int_array)"
+                 "INSERT INTO domain_bases VALUES ('{16777217}', '{1,2,3}')"]]
+      (exec! c sql))
+    (is (= [["5" "ok"]] (query-rows c "SELECT 5::builtin_number::text, 'ok'::rating::text")))
+    (let [error (try (exec! c "SELECT 'bad'::rating") nil (catch java.sql.SQLException e e))]
+      (is (= "22P02" (some-> error .getSQLState))))
+    (let [[[value elem-type n]] (query-rows c (str "SELECT measurements[1], "
+                                                   "pg_typeof(measurements[1])::text, readings[3] FROM domain_bases"))]
+      (is (= 16777216 (some-> ^Number value .longValue)))
+      (is (= "real" elem-type))
+      (is (= 3 n)))
+    (let [dump (dump/dump-to-string *conn*)]
+      (is (str/includes? dump "CREATE DOMAIN \"rating\" AS \"new_rating\";"))
+      (is (str/includes? dump "CREATE DOMAIN \"internal_int_array\" AS pg_catalog._int4;")))))
+
+(deftest drop-type-uses-visible-catalog-names
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN UPPER_DOMAIN AS integer")
+    (exec! c "CREATE TYPE UPPER_ENUM AS ENUM ('ok')")
+    (exec! c "SET search_path TO pg_catalog")
+    (doseq [sql ["DROP DOMAIN UPPER_DOMAIN CASCADE" "DROP TYPE UPPER_ENUM CASCADE"]]
+      (let [error (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= "42704" (some-> error .getSQLState)) sql)))
+    (is (= [[true true]] (query-rows c (str "SELECT to_regtype('public.upper_domain') IS NOT NULL, "
+                                            "to_regtype('public.upper_enum') IS NOT NULL"))))
+    (exec! c "RESET search_path")
+    (exec! c "DROP DOMAIN UPPER_DOMAIN")
+    (exec! c "DROP TYPE UPPER_ENUM")
+    (is (= [[true true]] (query-rows c (str "SELECT to_regtype('public.upper_domain') IS NULL, "
+                                            "to_regtype('public.upper_enum') IS NULL"))))))
 
 (deftest create-domain-bare-alias
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]

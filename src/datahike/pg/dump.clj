@@ -70,6 +70,7 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sequence :as sequence]
             [datahike.pg.sql.catalog :as pcat]
@@ -360,10 +361,16 @@
                      db)]
     (->> results
          (map (fn [[eid n]]
-                (let [ent (into {} (d/entity db eid))]
+                (let [ent (into {} (d/entity db eid))
+                      base-type (:datahike.pg.domain/base-type ent)
+                      base-object (params/domain-base-object db (params/domain-base-type-oid db ent))
+                      current-name (:datahike.pg.object/name base-object)]
                   {:name n
                    :depth (:depth (params/domain-spec-by-name db n))
-                   :base-type (:datahike.pg.domain/base-type ent)
+                   :base-type (if (and current-name
+                                       (not= current-name (peek (regoid/parse-qualified-name base-type))))
+                                (quote-ident current-name)
+                                base-type)
                    :base-args (some-> (:datahike.pg.domain/base-args ent) sort vec)
                    :base-typmods (:datahike.pg.domain/base-typmods ent)
                    :check-name (:datahike.pg.domain/check-name ent)

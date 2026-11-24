@@ -57,7 +57,10 @@
     (when-not (= :ident (first t1))
       (throw (ex-info "expected identifier"
                       {:error :syntax-error :got t1})))
-    (let [first-text (second t1)
+    (let [sql-name (fn [token]
+                     (cond-> (second token)
+                       (not (:quoted? (meta token))) str/lower-case))
+          first-text (sql-name t1)
           rest1 (rest toks)]
       (cond
         ;; `schema.name` glued into one token by the tokenizer (both
@@ -74,13 +77,13 @@
         (and (not (:quoted? (meta t1)))
              (str/ends-with? first-text ".")
              (= :ident (first (first rest1))))
-        [(second (first rest1)) (rest rest1)]
+        [(sql-name (first rest1)) (rest rest1)]
 
         ;; `"schema"."name"` — three tokens: quoted ident, lone `.`,
         ;; quoted ident. Tokenizer drops `.` as a single-char ident.
         (and (= [:ident "."] (first rest1))
              (= :ident (first (second rest1))))
-        [(second (second rest1)) (drop 2 rest1)]
+        [(sql-name (second rest1)) (drop 2 rest1)]
 
         :else
         [first-text rest1]))))
@@ -207,15 +210,15 @@
             [parts remaining]))
         _ (when-not (every? #(contains? #{:ident :quoted} (:type %)) (take-nth 2 name-tokens))
             (throw (ex-info "expected type name" {:sqlstate "42601"})))
-        names (regoid/parse-qualified-name (apply str (map :text name-tokens)))
+        spelling (apply str (map :text name-tokens))
+        names (regoid/parse-qualified-name spelling)
         _ (when (> (count names) 2)
             (throw (ex-info "cross-database type names are not supported" {:sqlstate "0A000"})))
         suffix (cond-> (vec rest-tokens) (= ";" (:text (last rest-tokens))) pop)
         modifier (some-> (first suffix) :text str/lower-case)]
     (when-not (and (<= (count suffix) 1) (contains? #{nil "cascade" "restrict"} modifier))
       (throw (ex-info "expected CASCADE or RESTRICT at the end of DROP" {:sqlstate "42601"})))
-    {:type-name (peek names) :type-schema (when (= 2 (count names)) (first names))
-     :if-exists? if-exists? :cascade? (= "cascade" modifier)}))
+    {:type-name (peek names) :type-spelling spelling :if-exists? if-exists? :cascade? (= "cascade" modifier)}))
 
 (defn parse-drop-type
   "Parse a single-name DROP TYPE statement."
@@ -249,9 +252,6 @@
     (subs s 1 (dec (count s)))
     s))
 
-(defn- unqualify [s]
-  (if-let [d (str/last-index-of s ".")] (subs s (inc d)) s))
-
 (defn parse-create-type-composite
   "Parse `CREATE TYPE [schema.]name AS (field type, …)` from the raw SQL
    (the tokenizer doesn't model `[]`, so we work on the text). Returns:
@@ -265,7 +265,7 @@
   (let [m (re-find #"(?is)\bcreate\s+type\s+(.+?)\s+as\s*\((.*)\)\s*;?\s*$" sql)]
     (when-not m
       (throw (ex-info "malformed CREATE TYPE … AS (...)" {:error :syntax-error})))
-    (let [type-name (-> (nth m 1) str/trim strip-quotes unqualify strip-quotes)
+    (let [type-name (peek (regoid/parse-qualified-name (str/trim (nth m 1))))
           fields (->> (split-top-level-commas (nth m 2))
                       (map str/trim)
                       (remove str/blank?)

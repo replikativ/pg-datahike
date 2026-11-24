@@ -1120,7 +1120,7 @@
                                raw-type (cond
                                           enum-match "text"
                                           (:array-type domain-match)
-                                          (params/domain-array-element-sql (:base-type domain-match))
+                                          (get-in domain-match [:array-type :element-sql])
                                           domain-match (params/domain-storage-type domain-match)
                                           :else raw-type-orig)
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
