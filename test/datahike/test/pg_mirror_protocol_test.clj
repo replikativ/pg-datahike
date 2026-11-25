@@ -198,3 +198,54 @@
           (is (not (.isAlive ^Thread (:worker subscriber))))
           (is (= :failed (:state (mirror/status subscriber))))
           (is (false? (:serving? (mirror/status subscriber)))))))))
+
+(deftest publisher-commits-are-recorded-at-their-commit-time
+  (let [last-millis (volatile! nil)
+        stamp #(.getTime ^java.util.Date (#'mirror/source-instant! last-millis %))]
+    (is (= 946684800001 (stamp 1500)) "microseconds since 2000-01-01 become Unix milliseconds")
+    (is (= 946684800002 (stamp 2000)))
+    (is (= 946684800002 (stamp 1000))
+        "a commit timestamp that goes backwards takes the instant before it")
+    (is (= 946684800002 (stamp 2999)) "commits within one millisecond share an instant")
+    (is (nil? (#'mirror/source-instant! last-millis nil))))
+  (let [config {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :keep-history? true}
+        instant #inst "2020-03-04T05:06:07.000-00:00"]
+    (d/create-database config)
+    (let [conn (d/connect config)]
+      (try
+        (with-open [destination (pg/make-query-handler conn)]
+          (#'mirror/sink-execute! destination "CREATE TABLE dated (id bigint PRIMARY KEY)")
+          (#'mirror/transaction! destination instant
+                                 #(#'mirror/sink-execute! destination "INSERT INTO dated VALUES (1)"))
+          (is (= (.getTime instant) (#'mirror/latest-instant-millis (d/db conn))))
+          (is (= [[1]] (vec (d/q '[:find ?id :where [?e :dated/id ?id]]
+                                 (d/as-of (d/db conn) instant)))))
+          (is (empty? (d/q '[:find ?id :where [?e :dated/id ?id]]
+                           (d/as-of (d/db conn) #inst "2020-03-04T05:06:06.999-00:00")))
+              "the row is absent one millisecond before the publisher committed it"))
+        (finally (d/release conn) (d/delete-database config))))))
+
+(deftest an-unfinished-snapshot-is-discarded-and-a-finished-store-is-kept
+  (let [root (.toFile (Files/createTempDirectory "pgdh-unfinished-snapshot-" (make-array FileAttribute 0)))
+        config {:directory (str (io/file root "store")) :max-in-flight-commits 1}
+        origin {:system "1" :timeline 1 :database "source"}
+        conn (#'mirror/open-store (:directory config) 1)]
+    (with-open [destination (pg/make-query-handler conn)]
+      (#'mirror/init-checkpoint! destination origin "pgdh_mirror_slot" "analytics")
+      (#'mirror/sink-execute! destination "CREATE TABLE partial (id bigint PRIMARY KEY)")
+      (#'mirror/sink-execute! destination "INSERT INTO partial VALUES (1)"))
+    (let [fresh (#'mirror/discard-incomplete-snapshot! conn config)]
+      (try
+        (is (not (identical? conn fresh)))
+        (is (empty? (d/q '[:find ?e :where [?e :partial/id _]] (d/db fresh)))
+            "rows of the unfinished copy are gone")
+        (is (= {:origin origin :slot "pgdh_mirror_slot" :publication "analytics"}
+               (select-keys (#'mirror/checkpoint (d/db fresh)) [:origin :slot :publication]))
+            "the slot name survives, so the next attempt can drop that slot")
+        (with-open [destination (pg/make-query-handler fresh)]
+          (#'mirror/transaction! destination
+                                 #(#'mirror/update-checkpoint! destination {:end-lsn nil} {:end-lsn "0/10"})))
+        (is (identical? fresh (#'mirror/discard-incomplete-snapshot! fresh config))
+            "a store with a finished snapshot is left alone")
+        (finally (d/release fresh))))))

@@ -631,16 +631,44 @@
 (defn- affected-count [^PgWireServer$QueryResult result]
   (parse-long (last (str/split (.-commandTag result) #" "))))
 
-(defn- transaction! [destination f]
-  (sink-execute! destination "BEGIN")
-  (try
-    (let [result (f)]
-      (sink-execute! destination "COMMIT")
-      result)
-    (catch Throwable error
-      (try (sink-execute! destination "ROLLBACK")
-           (catch Throwable rollback-error (.addSuppressed error rollback-error)))
-      (throw error))))
+(defn- transaction!
+  "Run `f` in one local transaction. With `instant`, a java.util.Date, the
+   transaction is recorded at that time instead of the mirror's clock."
+  ([destination f] (transaction! destination nil f))
+  ([destination instant f]
+   (sink-execute! destination "BEGIN")
+   (try
+     (let [result (f)]
+       (binding [pg/*commit-instant* instant]
+         (sink-execute! destination "COMMIT"))
+       result)
+     (catch Throwable error
+       (try (sink-execute! destination "ROLLBACK")
+            (catch Throwable rollback-error (.addSuppressed error rollback-error)))
+       (throw error)))))
+
+(def ^:private postgres-epoch-millis 946684800000)
+
+(defn- commit-millis
+  "A pgoutput commit timestamp, microseconds since 2000-01-01 UTC, as Unix
+   milliseconds."
+  [commit-micros]
+  (+ (long postgres-epoch-millis) (Math/floorDiv (long commit-micros) 1000)))
+
+(defn- latest-instant-millis
+  "The instant of the store's most recent transaction, or nil."
+  [db]
+  (some-> (d/entity db (:max-tx db)) :db/txInstant inst-ms))
+
+(defn- source-instant!
+  "The instant to record a publisher commit at: its commit time, never earlier
+   than the transaction recorded before it. PostgreSQL does not promise that
+   commit timestamps rise in commit order, and `as_of` selects every
+   transaction at or before a time, so a stamp that went backwards would show
+   a later commit without an earlier one. Commits may share an instant."
+  [last-millis commit-micros]
+  (when commit-micros
+    (java.util.Date. (long (vswap! last-millis #(max (long (or % 0)) (commit-millis commit-micros)))))))
 
 (defn- copy-columns [table]
   (comma-list (map (comp ident :name) (:columns table))))
@@ -666,17 +694,54 @@
       (.copyAbort destination "Mirror COPY failed")
       (throw error))))
 
+(def ^:private snapshot-batch-bytes (* 16 1024 1024))
+
+(def ^:private ^:dynamic *snapshot-batches*
+  "Bound to `{:instant date}` while the initial snapshot is copied. `copy-table!`
+   then commits the table in batches of its own instead of adding it to the
+   caller's transaction."
+  nil)
+
+(defn- copy-table-in-batches!
+  "Copy `table` in local transactions of about `snapshot-batch-bytes` each, so
+   the copy never has to fit in memory. PostgreSQL sends one row per COPY
+   message, so a batch ends on a row."
+  [^org.postgresql.copy.CopyOut out destination table on-bytes instant]
+  (let [limit (long snapshot-batch-bytes)]
+    (loop [total 0
+           pending (.readFromCopy out)]
+      (if pending
+        (let [carry (volatile! nil)
+              written (transaction!
+                       destination instant
+                       #(load-copy! destination (storage-table table)
+                                    (fn [write!]
+                                      (loop [^bytes chunk pending
+                                             size 0]
+                                        (on-bytes (alength chunk))
+                                        (write! chunk)
+                                        (let [size (+ size (alength chunk))
+                                              following (.readFromCopy out)]
+                                          (cond
+                                            (nil? following) nil
+                                            (>= size limit) (vreset! carry following)
+                                            :else (recur following size)))))))]
+          (recur (+ total (long written)) @carry))
+        total))))
+
 (defn- copy-table! [^Connection source destination table on-bytes]
   (let [source-api (.getCopyAPI (.unwrap source PGConnection))
         out (.copyOut source-api (copy-out-sql table))]
     (try
-      (let [written (load-copy! destination (storage-table table)
-                                (fn [write!]
-                                  (loop []
-                                    (when-let [^bytes chunk (.readFromCopy out)]
-                                      (on-bytes (alength chunk))
-                                      (write! chunk)
-                                      (recur)))))]
+      (let [written (if-let [{:keys [instant]} *snapshot-batches*]
+                      (copy-table-in-batches! out destination table on-bytes instant)
+                      (load-copy! destination (storage-table table)
+                                  (fn [write!]
+                                    (loop []
+                                      (when-let [^bytes chunk (.readFromCopy out)]
+                                        (on-bytes (alength chunk))
+                                        (write! chunk)
+                                        (recur))))))]
         (require! (= written (.getHandledRowCount out)) "COPY row counts differ"
                   {:table (relation-name table) :source (.getHandledRowCount out) :destination written})
         written)
@@ -1070,42 +1135,70 @@
                  (catalog-objects/rename-table-tx db (pgs/storage-table-oid db storage-name)
                                                   logical-name))))
 
+(defn- drop-slot-quietly! [source slot]
+  (try (query source "SELECT pg_drop_replication_slot(?)" [slot] (constantly nil))
+       (catch Exception _ nil)))
+
+(defn- publisher-instant [source]
+  (java.util.Date.
+   (long (first (query source "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint" []
+                       #(.getLong ^ResultSet % 1))))))
+
 (defn- bootstrap! [replication source destination {:keys [slot origin manifest]} check-running!
-                   {:keys [failover? max-snapshot-bytes] :as config}]
+                   {:keys [failover? initial-snapshot-bytes] :as config}]
   ;; The unique slot name was persisted locally before its first creation.
   (clear-incomplete-slot! source slot failover?)
-  (let [on-bytes (snapshot-budget check-running! max-snapshot-bytes)
+  (let [on-bytes (snapshot-budget check-running! initial-snapshot-bytes)
         retired (:retired-storage manifest)
+        ;; Read before the slot exists: every commit the stream delivers later
+        ;; was made after this moment, so the snapshot sorts before them.
+        instant (publisher-instant source)
         place (fn [table]
                 (let [storage (fresh-storage-name retired table)]
                   (cond-> table
                     (not= storage (:name table)) (assoc :storage-name storage))))]
-    (with-slot-snapshot!
-      replication source slot false failover?
-      (fn [end-lsn]
-        (let [manifest (cond-> (-> (publication-manifest source config)
-                                   (update :tables #(mapv place %))
-                                   (update :partition-parents #(mapv place %)))
-                         (seq retired) (assoc :retired-storage retired))
-              tables (:tables manifest)
-              parents (:partition-parents manifest)]
-          (transaction!
-           destination
-           (fn []
-             (install-schemas! destination (concat tables parents))
-             (install-types! destination (:types manifest))
-             (doseq [table tables]
-               (check-running!)
-               (create-table! destination (storage-table table))
-               (copy-table! source destination table on-bytes))
-             (doseq [parent parents]
-               (create-table! destination (storage-table parent)))
-             (doseq [{:keys [name storage-name]} (concat tables parents) :when storage-name]
-               (set-table-name! destination storage-name name))
-             (when (seq parents)
-               (install-partition-topology! destination manifest))
-             (update-checkpoint! destination {:slot slot :end-lsn nil}
-                                 {:manifest manifest :end-lsn end-lsn :origin origin}))))))))
+    (try
+      (with-slot-snapshot!
+        replication source slot false failover?
+        (fn [end-lsn]
+          (let [manifest (cond-> (-> (publication-manifest source config)
+                                     (update :tables #(mapv place %))
+                                     (update :partition-parents #(mapv place %)))
+                           (seq retired) (assoc :retired-storage retired))
+                tables (:tables manifest)
+                parents (:partition-parents manifest)]
+            ;; The copy is committed in batches. The checkpoint's end LSN is
+            ;; written only by the last transaction, and a store without it is
+            ;; discarded before the next attempt (`discard-incomplete-snapshot!`).
+            ;; Every batch carries the same instant, so no time selects a part
+            ;; of the snapshot.
+            (transaction!
+             destination instant
+             (fn []
+               (install-schemas! destination (concat tables parents))
+               (install-types! destination (:types manifest))
+               (doseq [table tables]
+                 (create-table! destination (storage-table table)))))
+            (binding [*snapshot-batches* {:instant instant}]
+              (doseq [table tables]
+                (check-running!)
+                (copy-table! source destination table on-bytes)))
+            (transaction!
+             destination instant
+             (fn []
+               (doseq [parent parents]
+                 (create-table! destination (storage-table parent)))
+               (doseq [{:keys [name storage-name]} (concat tables parents) :when storage-name]
+                 (set-table-name! destination storage-name name))
+               (when (seq parents)
+                 (install-partition-topology! destination manifest))
+               (update-checkpoint! destination {:slot slot :end-lsn nil}
+                                   {:manifest manifest :end-lsn end-lsn :origin origin}))))))
+      (catch Exception error
+        ;; A slot without a finished snapshot only pins WAL on the publisher.
+        ;; The next attempt creates it again.
+        (drop-slot-quietly! source slot)
+        (throw error)))))
 
 (defn- lsn [value] (LogSequenceNumber/valueOf (str value)))
 
@@ -1338,9 +1431,9 @@
       (require! (= 1 count) "A mirrored change did not affect exactly one row"
                 {:relation-id relation-id :operation op :affected count}))))
 
-(defn- apply-commit! [destination relations previous {:keys [end-lsn xid commit-micros changes install! manifest origin slot]}]
+(defn- apply-commit! [destination relations previous {:keys [end-lsn xid commit-micros changes install! manifest origin slot instant]}]
   (transaction!
-   destination
+   destination instant
    (fn []
      (run! #(apply-change! destination relations %) changes)
      (when install! (install! destination))
@@ -2689,6 +2782,9 @@
         _ (set-copy-format! destination)
         initial (emit-barrier! source)
         catch-up-progress (volatile! (System/nanoTime))
+        last-instant (volatile! (latest-instant-millis (d/db conn)))
+        dated (fn [transaction]
+                (assoc transaction :instant (source-instant! last-instant (:commit-micros transaction))))
         next-watermark (volatile! (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 30)))
         next-check (volatile! 0)
         refresh! (fn []
@@ -2789,7 +2885,8 @@
                                                   (map (fn [id] [id (storage-table (get @live id))]))
                                                   (:relation-ids transaction))]
                         (pg-resolve/with-symbol-resolver
-                          (d/transact! conn (prepare-tx-data #(prepare-replay-tx % local-relations previous transaction))))))))]
+                          (d/transact! conn (assoc (prepare-tx-data #(prepare-replay-tx % local-relations previous transaction))
+                                                   :tx-meta {:db/txInstant (:instant (dated transaction))})))))))]
     (swap! state assoc :last-schema-refresh (:last-schema-refresh manifest))
     (try
       (stream!
@@ -2827,13 +2924,15 @@
                         ;; that retains the same pgoutput relation descriptor.
                         (if (and schema-refresh? (= "23502" (:sqlstate (ex-data error))))
                           (do (reset! pipeline-suppressed? true)
+                              (swap! state assoc :queued-replay :suppressed)
                               (SQLException. "Retrying queued replay after a publisher constraint change" "08006" error))
                           error))
         :commit! (fn [relations previous {:keys [end-lsn barriers relation-ids] :as transaction}]
                    ;; A reconnect can decode old relation layouts below the
                    ;; durable checkpoint. Validate only changes we will apply.
                    (validate-transaction! relations relation-ids)
-                   (let [active @stage
+                   (let [transaction (dated transaction)
+                         active @stage
                          cutover? (contains? barriers (:barrier active))
                          initial? (contains? barriers initial)]
                      (when (or cutover? initial?) (refresh!))
@@ -2943,21 +3042,51 @@
            {:reason :replication-stalled})
          (ex-data error)))
 
+(defn- store-config [directory max-in-flight-commits]
+  (let [path (.getCanonicalPath (io/file directory))]
+    (cond-> {:store {:backend :file :path path
+                     :id (UUID/nameUUIDFromBytes (.getBytes path StandardCharsets/UTF_8))
+                     :config {:sync-blob? true :sync-store? true}}
+             :schema-flexibility :write :keep-history? true :max-string-length 0}
+      (> max-in-flight-commits 1)
+      (assoc :writer {:backend :self :writer-ownership :exclusive}))))
+
 (defn- open-store
   ([directory] (open-store directory 1))
   ([directory max-in-flight-commits]
-   (let [path (.getCanonicalPath (io/file directory))
-         config (cond-> {:store {:backend :file :path path
-                                 :id (UUID/nameUUIDFromBytes (.getBytes path StandardCharsets/UTF_8))
-                                 :config {:sync-blob? true :sync-store? true}}
-                         :schema-flexibility :write :keep-history? true :max-string-length 0}
-                  (> max-in-flight-commits 1)
-                  (assoc :writer {:backend :self :writer-ownership :exclusive}))]
+   (let [config (store-config directory max-in-flight-commits)]
      (when-not (d/database-exists? config)
        (d/create-database config))
      (d/connect config))))
 
-(defn- serve! [config conn state stopping?]
+(defn- discard-incomplete-snapshot!
+  "Replace a store whose initial snapshot never finished with an empty one.
+
+   The snapshot is committed in batches, and the checkpoint receives its end
+   LSN in the last of them. A checkpoint without one therefore marks a store
+   holding part of a copy that no reader was ever shown. The slot name is
+   carried over: the next attempt drops that slot before creating it again.
+   Returns the connection to use."
+  [conn {:keys [directory max-in-flight-commits]}]
+  (let [saved (checkpoint (d/db conn))]
+    (if (or (nil? saved) (:end-lsn saved))
+      conn
+      (do
+        (d/release conn)
+        (d/delete-database (store-config directory max-in-flight-commits))
+        (let [fresh (open-store directory max-in-flight-commits)]
+          (try
+            (with-open [destination (pg/make-query-handler fresh)]
+              (init-checkpoint! destination (:origin saved) (:slot saved) (:publication saved)))
+            fresh
+            (catch Throwable error
+              (d/release fresh)
+              (throw error))))))))
+
+(defn- serve!
+  "`store` is an atom holding the open connection. An attempt that finds an
+   unfinished initial snapshot replaces the store and the connection."
+  [config store state stopping?]
   (let [listener (atom nil)
         check-running! (fn []
                          (when @stopping?
@@ -2965,16 +3094,23 @@
         ready! (fn []
                  (check-running!)
                  (when-not @listener
-                   (reset! listener (pg/start-server conn (assoc (:server config) :database-read-only? true))))
+                   (reset! listener (pg/start-server @store (assoc (:server config) :database-read-only? true))))
                  (let [^PgWireServer server (:server @listener)]
-                   (swap! state assoc :state :following :port (.getPort server) :last-error nil)))]
+                   (swap! state assoc :state :following :port (.getPort server) :last-error nil)))
+        attempt! (fn []
+                   (with-open [destination (pg/make-query-handler @store)]
+                     (upgrade-checkpoint! @store destination))
+                   ;; No listener exists before the first snapshot finishes, so
+                   ;; nothing else holds the connection that is replaced here.
+                   (reset! store (discard-incomplete-snapshot! @store config))
+                   (with-open [destination (pg/make-query-handler @store)]
+                     (replicate! config @store destination state check-running! ready!)))]
     (try
-      (with-open [destination (pg/make-query-handler conn)]
-        (upgrade-checkpoint! conn destination)
+      (do
         (loop [retry-ms 250]
           (when-not @stopping?
             (let [error (try
-                          (replicate! config conn destination state check-running! ready!)
+                          (attempt!)
                           (catch Exception e e))]
               (when-not @stopping?
                 (let [retry? (or (retryable? error)
@@ -3057,9 +3193,14 @@
         config (assoc config :slot-prefix slot-prefix :max-snapshot-bytes max-snapshot-bytes
                       :max-transaction-bytes max-transaction-bytes :spool-store spool-store
                       :transport transport :max-in-flight-commits max-in-flight-commits
-                      :prepare-tx-data prepare-tx-data :pipeline-suppressed? (atom false))
+                      :prepare-tx-data prepare-tx-data :pipeline-suppressed? (atom false)
+                      :directory directory
+                      ;; The initial snapshot is committed in batches and needs
+                      ;; no memory bound. Only an explicit limit applies to it.
+                      :initial-snapshot-bytes (get config :max-snapshot-bytes Long/MAX_VALUE))
         state (atom (cond-> {:state :starting :publication publication}
-                      leaf-publication (assoc :leaf-publication leaf-publication)))
+                      leaf-publication (assoc :leaf-publication leaf-publication)
+                      prepare-tx-data (assoc :queued-replay :enabled)))
         stopping? (atom false)]
     (io/make-parents (str directory ".mirror-lock"))
     (let [lock (acquire-store-lock directory)
@@ -3068,9 +3209,9 @@
                     (try
                       (with-open [_ lock]
                         (spool/prepare! spool-store)
-                        (let [conn (open-store directory max-in-flight-commits)]
-                          (try (serve! config conn state stopping?)
-                               (finally (d/release conn)))))
+                        (let [store (atom (open-store directory max-in-flight-commits))]
+                          (try (serve! config store state stopping?)
+                               (finally (d/release @store)))))
                       (when @stopping? (swap! state assoc :state :stopped :port nil))
                       ;; An Error such as OutOfMemoryError ends the worker too.
                       ;; Report it: a status that still says :following would

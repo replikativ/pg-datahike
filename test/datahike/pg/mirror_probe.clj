@@ -3116,7 +3116,7 @@
           (doseq [file (reverse (file-seq directory))]
             (io/delete-file file)))))))
 
-(defn -main [& [argument mode]]
+(defn- dispatch-probe! [argument mode]
   (cond
     (= "--failover" argument)
     (prn (run-failover-probe! {:pg-bin (System/getenv "PG_MIRROR_PG_BIN")
@@ -3169,3 +3169,14 @@
               "--refresh" run-refresh-probe!
               run-probe!)
             source reference conninfo)))))
+
+(defn -main
+  "Run one probe. With PG_MIRROR_PROBE_QUEUE_DEPTH set to 2-32, every mirror
+   the probe starts, including its crash workers, uses queued replay at that
+   depth."
+  [& [argument mode]]
+  (if-let [depth (some-> (System/getenv "PG_MIRROR_PROBE_QUEUE_DEPTH") parse-long)]
+    (let [start! mirror/start!]
+      (with-redefs [mirror/start! #(start! (assoc % :max-in-flight-commits depth))]
+        (dispatch-probe! argument mode)))
+    (dispatch-probe! argument mode)))
