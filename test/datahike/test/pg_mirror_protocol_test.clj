@@ -173,3 +173,28 @@
       (finally
         (doseq [file (reverse (file-seq root))]
           (io/delete-file file true))))))
+
+(deftest a-catch-up-that-advances-has-no-deadline-and-a-stalled-one-reconnects
+  (with-redefs-fn {#'mirror/stall-timeout-nanos 1000000000}
+    (fn []
+      (is (nil? (#'mirror/require-progress! (System/nanoTime) "stalled"))
+          "progress inside the window is not a failure, however long the catch-up has run")
+      (let [error (try (#'mirror/require-progress! (- (System/nanoTime) 2000000000) "stalled")
+                       (catch SQLException e e))]
+        (is (instance? SQLException error))
+        (is (#'mirror/retryable? error)
+            "a stall reconnects from the durable checkpoint instead of pausing for good")
+        (is (= {:reason :replication-stalled :sqlstate "08006"}
+               (select-keys (#'mirror/mirror-error error) [:reason :sqlstate])))))))
+
+(deftest a-worker-ended-by-an-error-reports-failure
+  (let [root (.toFile (Files/createTempDirectory "pgdh-worker-error-" (make-array FileAttribute 0)))]
+    (with-redefs-fn {#'mirror/open-store (fn [& _] (throw (OutOfMemoryError. "simulated")))}
+      (fn []
+        (let [subscriber (mirror/start! {:source-url "jdbc:postgresql://127.0.0.1:1/none?user=mirror"
+                                         :publication "analytics"
+                                         :store-path (str (io/file root "store"))})]
+          (.join ^Thread (:worker subscriber) 10000)
+          (is (not (.isAlive ^Thread (:worker subscriber))))
+          (is (= :failed (:state (mirror/status subscriber))))
+          (is (false? (:serving? (mirror/status subscriber)))))))))

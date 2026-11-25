@@ -318,6 +318,12 @@ state. When a connection drops, the worker reconnects with backoff and catches
 up from its durable checkpoint. A missing slot, an invalidated slot, or a
 confirmation ahead of the checkpoint pauses the mirror by default.
 
+The initial catch-up and a table refresh may take as long as they need while
+they keep applying commits. If nothing is applied for ten minutes, the worker
+reports `:reason :replication-stalled`, reconnects, and continues from its
+durable checkpoint. A JVM error in the worker, such as an exhausted heap,
+ends it with state `:failed`, and the CLI exits with status 1.
+
 Snapshot and transaction sizes are bounded by `:max-snapshot-bytes` and
 `:max-transaction-bytes`. The defaults are 128 MiB and 64 MiB respectively.
 The worker checks ordinary row frames before decoding their fields. pgJDBC

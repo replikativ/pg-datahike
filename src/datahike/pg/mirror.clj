@@ -2165,7 +2165,7 @@
          (copy-table! source destination table on-bytes))))))
 
 (defn- stage-tables! [{:keys [source-url publication leaf-publication max-snapshot-bytes] :as config}
-                      origin manifest {:keys [conn changes tables barrier phase]} check-running!]
+                      origin manifest {:keys [conn changes tables barrier phase progress]} check-running!]
   (with-publisher
     source-url
     (:transport config)
@@ -2189,6 +2189,7 @@
                                      changes)
               included? (set (keys expected))]
           (reset! phase :catching-up)
+          (reset! progress (System/nanoTime))
           (stream! (replication-copy replication slot (or leaf-publication publication) end-lsn)
                    end-lsn end-lsn config
                    {:tick! (fn [_ _] (check-running!))
@@ -2196,6 +2197,7 @@
                     :barrier? #(= barrier %)
                     :select-change! #(select-change included? %)
                     :commit! (fn [relations _ {:keys [changes relation-ids bytes barriers]}]
+                               (reset! progress (System/nanoTime))
                                (doseq [id relation-ids]
                                  (require! (matches-relation? (get expected id) (get relations id))
                                            "Staged relation changed" {:relation id}))
@@ -2225,6 +2227,7 @@
         done (promise)
         stage (assoc local-store :tables tables :changes changes :manifest manifest
                      :phase (atom :copying) :barrier (str (UUID/randomUUID))
+                     :progress (atom (System/nanoTime))
                      :stopped? stopped? :done done)
         running! #(do (check-running!)
                       (require! (not @stopped?) "Table refresh stopped" {}))
@@ -2244,14 +2247,24 @@
   (.join ^Thread worker)
   (close-stage-store! stage))
 
+(def ^:private stall-timeout-nanos (.toNanos TimeUnit/MINUTES 10))
+
+(defn- require-progress!
+  "Fail when nothing has been applied since `last-progress-nanos` for the
+   stall timeout. A catch-up may take any amount of time while it advances.
+   A stalled one reconnects: the durable checkpoint keeps what was applied,
+   and the next connection emits a fresh barrier."
+  [last-progress-nanos message]
+  (when (>= (- (System/nanoTime) (long last-progress-nanos)) (long stall-timeout-nanos))
+    (throw (SQLException. ^String message "08006" (ex-info message {:reason :replication-stalled})))))
+
 (defn- refresh-result! [stage check-running!]
-  (let [deadline (+ (System/nanoTime) (.toNanos TimeUnit/MINUTES 10))]
-    (loop []
-      (check-running!)
-      (require! (< (System/nanoTime) deadline) "Timed out waiting for table refresh cutover" {})
-      (if-let [{:keys [position error]} (deref (:done stage) 50 nil)]
-        (if error (throw error) position)
-        (recur)))))
+  (loop []
+    (check-running!)
+    (if-let [{:keys [position error]} (deref (:done stage) 50 nil)]
+      (if error (throw error) position)
+      (do (require-progress! @(:progress stage) "Table refresh made no progress before its cutover")
+          (recur)))))
 
 (defn- retire-table! [destination table]
   ;; Keep the old attributes and entities for AS OF. The catalog advances
@@ -2675,7 +2688,7 @@
         _ (command! source "SET synchronous_commit = local")
         _ (set-copy-format! destination)
         initial (emit-barrier! source)
-        initial-deadline (+ (System/nanoTime) (.toNanos TimeUnit/MINUTES 10))
+        catch-up-progress (volatile! (System/nanoTime))
         next-watermark (volatile! (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 30)))
         next-check (volatile! 0)
         refresh! (fn []
@@ -2765,6 +2778,7 @@
                           (vreset! origin-update nil))
                         (when candidate (vreset! applied candidate))))
         committed! (fn [{:keys [end-lsn xid commit-micros]}]
+                     (vreset! catch-up-progress (System/nanoTime))
                      (vreset! durable end-lsn)
                      (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros))
         submit! (when (and prepare-tx-data (not @pipeline-suppressed?))
@@ -2784,7 +2798,7 @@
                  (check-running!)
                  (let [now (System/nanoTime)]
                    (when-not @following?
-                     (require! (< now initial-deadline) "Timed out waiting for the initial catch-up barrier" {}))
+                     (require-progress! @catch-up-progress "Initial catch-up made no progress"))
                    (when (>= now @next-check)
                      (drain!)
                      (checked-running-slot! source slot state failover?)
@@ -2925,6 +2939,8 @@
            {:sqlstate (.getSQLState ^SQLException error)})
          (when (instance? BindException error)
            {:reason :listener-bind-failed})
+         (when (= :replication-stalled (:reason (some-> ^Throwable error .getCause ex-data)))
+           {:reason :replication-stalled})
          (ex-data error)))
 
 (defn- open-store
@@ -3056,7 +3072,10 @@
                           (try (serve! config conn state stopping?)
                                (finally (d/release conn)))))
                       (when @stopping? (swap! state assoc :state :stopped :port nil))
-                      (catch Exception e
+                      ;; An Error such as OutOfMemoryError ends the worker too.
+                      ;; Report it: a status that still says :following would
+                      ;; keep the CLI and its supervisor waiting on a dead thread.
+                      (catch Throwable e
                         (swap! state assoc :state :failed :port nil :last-error (mirror-error e)))))
                   "pg-datahike-logical-subscriber")]
       (.start worker)
