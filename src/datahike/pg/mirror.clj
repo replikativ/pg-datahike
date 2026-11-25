@@ -10,11 +10,13 @@
             [datahike.pg.constraints.unique :as unique]
             [datahike.pg.jsonb :as jsonb]
             [datahike.pg.mirror.spool :as spool]
+            [datahike.pg.resolve :as pg-resolve]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.rewrite :as rewrite]
-            [datahike.pg.types :as types])
+            [datahike.pg.types :as types]
+            [datahike.writer])
   (:import [datahike.pg PgWireServer PgWireServer$QueryHandler PgWireServer$QueryResult]
            [java.io ByteArrayOutputStream IOException]
            [java.net BindException]
@@ -1970,31 +1972,73 @@
                           frames)]
     (assoc plan :changes changes :bytes (spool/byte-size journal xid))))
 
+(def ^:private pipeline-byte-limit (* 8 1024 1024))
+
 (defn- stream!
-  "Read pgoutput v2 transactions. A commit is acknowledged after its
-   callback succeeds. Returning true from commit! ends this stream."
-  [copy end-lsn confirmed-lsn {:keys [max-transaction-bytes spool-store]}
-   {:keys [tick! check-running! select-change! barrier? commit!]}]
+  "Read pgoutput v2 transactions. Advance feedback through the durable prefix."
+  [copy end-lsn confirmed-lsn {:keys [max-transaction-bytes spool-store max-in-flight-commits]}
+   {:keys [tick! check-running! select-change! barrier? commit! submit! committed! replay-error]}]
   (let [journal (spool/session spool-store max-transaction-bytes)
         last-packet (volatile! (System/nanoTime))
         next-feedback (volatile! 0)
         feedback-position (volatile! confirmed-lsn)
+        applied-position (volatile! end-lsn)
+        in-flight (volatile! clojure.lang.PersistentQueue/EMPTY)
+        in-flight-bytes (volatile! 0)
         reply! (fn [request-reply?]
                  (feedback! copy @feedback-position request-reply?)
                  (vreset! next-feedback (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS 1))))
         heartbeat! (fn []
                      (when (>= (System/nanoTime) @next-feedback) (reply! true)))
+        acknowledge! (fn [position]
+                       (when (pos? (compare-lsn position @feedback-position))
+                         (vreset! feedback-position position))
+                       (reply! false))
         consume-frame! (fn [] (check-running!) (heartbeat!))
-        finish! (fn [relations durable {:keys [end-lsn] :as transaction}]
-                  (let [new? (pos? (compare-lsn end-lsn durable))
-                        stop? (when new? (commit! relations durable transaction))]
-                    (when (pos? (compare-lsn end-lsn @feedback-position))
-                      (vreset! feedback-position end-lsn))
-                    (reply! false)
-                    [stop? (if new? end-lsn durable)]))]
+        poll-commits! (fn []
+                        (loop [advanced? false]
+                          (let [{:keys [completion transaction]} (peek @in-flight)]
+                            (if (and completion (realized? completion))
+                              (do
+                                (try @completion
+                                     (catch Exception error (throw (replay-error error))))
+                                (vswap! in-flight pop)
+                                (vswap! in-flight-bytes - (:bytes transaction))
+                                (committed! transaction)
+                                (vreset! applied-position (:end-lsn transaction))
+                                (acknowledge! @applied-position)
+                                (recur true))
+                              advanced?))))
+        await-room! (fn [count-limit byte-limit]
+                      (while (or (> (count @in-flight) count-limit)
+                                 (> @in-flight-bytes byte-limit))
+                        (consume-frame!)
+                        (when-not (poll-commits!)
+                          (Thread/sleep 1))))
+        drain! (fn [] (await-room! 0 0))
+        finish! (fn [relations submitted {:keys [end-lsn bytes] :as transaction}]
+                  (if (pos? (compare-lsn end-lsn submitted))
+                    (let [eligible? (and submit! (number? bytes) (<= bytes pipeline-byte-limit))
+                          _ (when eligible?
+                              (await-room! (dec max-in-flight-commits) (- pipeline-byte-limit bytes)))
+                          completion (when eligible? (submit! relations submitted transaction))]
+                      (if completion
+                        (do (vswap! in-flight conj {:completion completion :transaction transaction})
+                            (vswap! in-flight-bytes + bytes)
+                            [false end-lsn])
+                        (do (drain!)
+                            (let [stop? (commit! relations submitted transaction)]
+                              (vreset! applied-position end-lsn)
+                              (acknowledge! end-lsn)
+                              [stop? end-lsn]))))
+                    (do
+                      (when-not (pos? (compare-lsn end-lsn @applied-position))
+                        (acknowledge! end-lsn))
+                      [false submitted])))]
     (try
-      (loop [relations {} pending nil segment nil durable end-lsn]
-        (tick! (and (nil? pending) (nil? segment)))
+      (loop [relations {} pending nil segment nil submitted end-lsn]
+        (poll-commits!)
+        (tick! (and (nil? pending) (nil? segment)) drain!)
         (heartbeat!)
         (let [{:keys [^ByteBuffer data reply?] :as packet} (read-packet copy)]
           (when packet (vreset! last-packet (System/nanoTime)))
@@ -2006,7 +2050,7 @@
                 (let [subxid (Integer/toUnsignedLong (.getInt data (inc (.position data))))]
                   (require! (pos? subxid) "Invalid streamed change transaction ID" {:xid segment})
                   (spool/append! journal segment subxid data)
-                  (recur relations pending segment durable))
+                  (recur relations pending segment submitted))
                 (let [bytes (+ (or (:bytes pending) 0) size)
                       _ (when (or (streamed-row-ops tag) (= \T tag))
                           ;; JDBC supplies one wire frame. Enforce the limit before
@@ -2021,47 +2065,47 @@
                     :stream-start
                     (do (require! (nil? pending) "Stream started inside an ordinary transaction" {:xid xid})
                         (spool/begin-segment! journal xid first?)
-                        (recur relations nil xid durable))
+                        (recur relations nil xid submitted))
 
                     :stream-stop
                     (do (require! segment "Stream stopped outside a streamed segment" {})
                         (spool/end-segment! journal)
-                        (recur relations pending nil durable))
+                        (recur relations pending nil submitted))
 
                     :stream-abort
                     (do (require! (nil? pending) "Stream aborted inside an ordinary transaction" {:xid xid})
                         (spool/abort! journal xid subxid)
-                        (recur relations nil nil durable))
+                        (recur relations nil nil submitted))
 
                     :stream-commit
                     (do
                       (require! (nil? pending) "Stream committed inside an ordinary transaction" {:xid xid})
                       (let [{committed-relations :relations :as plan}
                             (streamed-transaction journal xid relations select-change! barrier? consume-frame!)
-                            [stop? position] (finish! committed-relations durable (merge message (dissoc plan :relations)))]
+                            [stop? position] (finish! committed-relations submitted (assoc (merge message (dissoc plan :relations)) :streamed? true))]
                         (spool/discard! journal xid)
                         (if stop? position (recur committed-relations nil nil position))))
 
-                    :relation (recur (assoc relations relation-id message) pending segment durable)
+                    :relation (recur (assoc relations relation-id message) pending segment submitted)
 
                     :begin
                     (do (require! (nil? pending) "Received BEGIN before the previous COMMIT" {})
-                        (recur relations (assoc message :changes [] :relation-ids #{} :bytes 0) nil durable))
+                        (recur relations (assoc message :changes [] :relation-ids #{} :bytes 0) nil submitted))
 
-                    (:origin :type) (recur relations pending segment durable)
+                    (:origin :type) (recur relations pending segment submitted)
 
                     :message
                     (recur relations (if (and transactional? payload (barrier? payload))
                                        (do (require! pending "Received a transactional message outside a transaction" {})
                                            (update pending :barriers (fnil conj #{}) payload))
                                        pending)
-                           nil durable)
+                           nil submitted)
 
                     :commit
                     (do (require! (and pending (= (:commit-lsn pending) (:commit-lsn message))
                                        (= (:commit-micros pending) (:commit-micros message)))
                                   "pgoutput COMMIT did not match BEGIN" {:commit message})
-                        (let [[stop? position] (finish! relations durable (assoc pending :end-lsn end-lsn))]
+                        (let [[stop? position] (finish! relations submitted (assoc pending :end-lsn end-lsn))]
                           (if stop? position (recur relations nil nil position))))
 
                     (do
@@ -2071,18 +2115,37 @@
                                (cond-> (assoc pending :bytes bytes)
                                  change (update :changes conj change)
                                  change (update :relation-ids into (change-relation-ids change))))
-                             nil durable))))))
+                             nil submitted))))))
             (do
               (when-not packet
                 (when (> (- (System/nanoTime) @last-packet) (.toNanos TimeUnit/SECONDS 30))
                   (throw (SQLException. "Timed out waiting for publisher replication traffic" "08006")))
                 (Thread/sleep 20))
-              (recur relations pending segment durable)))))
-      (finally (spool/close! journal)))))
+              (recur relations pending segment submitted)))))
+      (finally
+        (try
+          ;; The connection and its store lock stay owned until all writes
+          ;; complete. A reconnect reads the checkpoint from that durable head.
+          (doseq [{:keys [completion]} @in-flight]
+            (try @completion (catch Throwable _)))
+          (finally (spool/close! journal)))))))
 
 (defn- set-copy-format! [destination]
   (sink-execute! destination "SET DateStyle = 'ISO, YMD'")
   (sink-execute! destination "SET TIME ZONE 'UTC'"))
+
+(defn- prepare-replay-tx [db relations previous {:keys [changes end-lsn xid commit-micros]}]
+  (require! (= previous (some-> (checkpoint-entity db) (checkpoint-value :end-lsn)))
+            "Mirror checkpoint changed before queued replay"
+            {:expected-end-lsn previous :end-lsn end-lsn})
+  (pg/stage-embedded-replay
+   db
+   (fn [destination]
+     (set-copy-format! destination)
+     (sink-execute! destination "BEGIN")
+     (run! #(apply-change! destination relations %) changes)
+     (update-checkpoint! destination {:end-lsn previous}
+                         {:end-lsn end-lsn :source-xid xid :source-commit-micros commit-micros}))))
 
 (defn- with-stage-storage [{:keys [table stage-storage-name]}]
   (assoc table :storage-name stage-storage-name))
@@ -2128,7 +2191,7 @@
           (reset! phase :catching-up)
           (stream! (replication-copy replication slot (or leaf-publication publication) end-lsn)
                    end-lsn end-lsn config
-                   {:tick! (fn [_] (check-running!))
+                   {:tick! (fn [_ _] (check-running!))
                     :check-running! check-running!
                     :barrier? #(= barrier %)
                     :select-change! #(select-change included? %)
@@ -2584,9 +2647,21 @@
     (swap! state assoc :last-recovery (peek (get-in saved [:manifest :recovery-gaps])))
     {:saved (retire-replaced-slots! source destination saved state failover?) :info info}))
 
+(defn- pipeline-dml? [relations tables {:keys [changes barriers streamed? relation-ids]}]
+  (and (not streamed?) (empty? barriers)
+       (seq changes) (every? #(#{:insert :update :delete} (:op %)) changes)
+       (every? (fn [id]
+                 (let [wire (get relations id)
+                       table (get tables id)]
+                   (and table wire
+                        (= \d (:identity wire))
+                        (not-any? #(or (:generated-expr %) (:user-type %)) (:columns table))
+                        (matches-relation? table wire))))
+               relation-ids)))
+
 (defn- consume! [copy source conn destination saved origin state confirmed-lsn check-running! ready! config]
   (let [{:keys [manifest end-lsn slot]} saved
-        {:keys [max-snapshot-bytes schema-refresh? failover?]} config
+        {:keys [max-snapshot-bytes schema-refresh? failover? prepare-tx-data pipeline-suppressed?]} config
         origin-update (volatile! (when (not= (:origin saved) origin) origin))
         applied (volatile! manifest)
         durable (volatile! end-lsn)
@@ -2688,17 +2763,30 @@
                         (when @origin-update
                           (swap! state assoc :source-timeline (:timeline origin))
                           (vreset! origin-update nil))
-                        (when candidate (vreset! applied candidate))))]
+                        (when candidate (vreset! applied candidate))))
+        committed! (fn [{:keys [end-lsn xid commit-micros]}]
+                     (vreset! durable end-lsn)
+                     (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros))
+        submit! (when (and prepare-tx-data (not @pipeline-suppressed?))
+                  (fn [relations previous transaction]
+                    (when (and (nil? @stage) (nil? @origin-update) (empty? @pending-schema)
+                               (pipeline-dml? relations @live transaction))
+                      (let [local-relations (into {}
+                                                  (map (fn [id] [id (storage-table (get @live id))]))
+                                                  (:relation-ids transaction))]
+                        (pg-resolve/with-symbol-resolver
+                          (d/transact! conn (prepare-tx-data #(prepare-replay-tx % local-relations previous transaction))))))))]
     (swap! state assoc :last-schema-refresh (:last-schema-refresh manifest))
     (try
       (stream!
        copy end-lsn confirmed-lsn config
-       {:tick! (fn [between-transactions?]
+       {:tick! (fn [between-transactions? drain!]
                  (check-running!)
                  (let [now (System/nanoTime)]
                    (when-not @following?
                      (require! (< now initial-deadline) "Timed out waiting for the initial catch-up barrier" {}))
                    (when (>= now @next-check)
+                     (drain!)
                      (checked-running-slot! source slot state failover?)
                      (refresh!)
                      (vreset! next-check (+ now (.toNanos TimeUnit/SECONDS 5)))
@@ -2718,7 +2806,16 @@
         :barrier? (fn [payload] (or (= initial payload) (= (:barrier @stage) payload)))
         :check-running! check-running!
         :select-change! identity
-        :commit! (fn [relations previous {:keys [end-lsn xid commit-micros barriers relation-ids] :as transaction}]
+        :submit! submit!
+        :committed! committed!
+        :replay-error (fn [error]
+                        ;; Let the serial path refresh after a constraint change
+                        ;; that retains the same pgoutput relation descriptor.
+                        (if (and schema-refresh? (= "23502" (:sqlstate (ex-data error))))
+                          (do (reset! pipeline-suppressed? true)
+                              (SQLException. "Retrying queued replay after a publisher constraint change" "08006" error))
+                          error))
+        :commit! (fn [relations previous {:keys [end-lsn barriers relation-ids] :as transaction}]
                    ;; A reconnect can decode old relation layouts below the
                    ;; durable checkpoint. Validate only changes we will apply.
                    (validate-transaction! relations relation-ids)
@@ -2741,8 +2838,7 @@
                            (refresh!)
                            (when (= prior @pending-schema) (throw error))
                            (apply-live! previous transaction false nil))))
-                     (vreset! durable end-lsn)
-                     (swap! state assoc :applied-lsn end-lsn :source-xid xid :source-commit-micros commit-micros)
+                     (committed! transaction)
                      (when cutover?
                        (vreset! live (tables-by-id @applied))
                        (vreset! catalog-checked-relations {})
@@ -2831,15 +2927,19 @@
            {:reason :listener-bind-failed})
          (ex-data error)))
 
-(defn- open-store [directory]
-  (let [path (.getCanonicalPath (io/file directory))
-        config {:store {:backend :file :path path
-                        :id (UUID/nameUUIDFromBytes (.getBytes path StandardCharsets/UTF_8))
-                        :config {:sync-blob? true :sync-store? true}}
-                :schema-flexibility :write :keep-history? true :max-string-length 0}]
-    (when-not (d/database-exists? config)
-      (d/create-database config))
-    (d/connect config)))
+(defn- open-store
+  ([directory] (open-store directory 1))
+  ([directory max-in-flight-commits]
+   (let [path (.getCanonicalPath (io/file directory))
+         config (cond-> {:store {:backend :file :path path
+                                 :id (UUID/nameUUIDFromBytes (.getBytes path StandardCharsets/UTF_8))
+                                 :config {:sync-blob? true :sync-store? true}}
+                         :schema-flexibility :write :keep-history? true :max-string-length 0}
+                  (> max-in-flight-commits 1)
+                  (assoc :writer {:backend :self :writer-ownership :exclusive}))]
+     (when-not (d/database-exists? config)
+       (d/create-database config))
+     (d/connect config))))
 
 (defn- serve! [config conn state stopping?]
   (let [listener (atom nil)
@@ -2905,19 +3005,24 @@
 (defn start!
   "Start a PostgreSQL 18 subscriber. Bootstrap and catch-up run asynchronously.
    The :server options are passed to the read-only pgwire listener after catch-up.
-   Monitor with status and release resources with stop!. Use a dedicated :store-path."
+   Monitor with status and release resources with stop!. Use a dedicated :store-path.
+   :max-in-flight-commits 2–32 opts into experimental ordered DML replay and
+   requires exclusive ownership of the Datahike store."
   [{:keys [publication leaf-publication store-path slot-prefix server max-snapshot-bytes max-transaction-bytes
-           max-stream-spool-bytes schema-refresh? failover? resnapshot-on-slot-loss?]
+           max-stream-spool-bytes max-in-flight-commits schema-refresh? failover? resnapshot-on-slot-loss?]
     :or {slot-prefix "pgdh_mirror"
          max-snapshot-bytes (* 128 1024 1024)
          max-transaction-bytes (* 64 1024 1024)
-         max-stream-spool-bytes (* 1024 1024 1024)}
+         max-stream-spool-bytes (* 1024 1024 1024)
+         max-in-flight-commits 1}
     :as config}]
   (validate-source-options! config)
   (require! (and (string? slot-prefix) (re-matches #"[a-z0-9_]{1,30}" slot-prefix)
                  (string? store-path) (seq store-path)
                  (pos-int? max-snapshot-bytes) (pos-int? max-transaction-bytes) (pos-int? max-stream-spool-bytes))
             "Expected a store path, slot prefix and positive byte limits" {})
+  (require! (and (integer? max-in-flight-commits) (<= 1 max-in-flight-commits 32))
+            "Expected max-in-flight-commits between 1 and 32" {})
   (require! (or (nil? schema-refresh?) (boolean? schema-refresh?))
             "Expected a boolean schema-refresh? option" {})
   (require! (or (nil? failover?) (boolean? failover?)) "Expected a boolean failover? option" {})
@@ -2926,12 +3031,17 @@
   (require! (and (or (nil? server) (map? server))
                  (not-any? #(get server %) [:database-template :on-create-database :on-delete-database]))
             "Mirror listeners do not support database provisioning" {})
-  (let [directory (.getCanonicalPath (io/file store-path))
+  (let [prepare-tx-data (when (> max-in-flight-commits 1)
+                          (or (ns-resolve 'datahike.writer 'prepare-tx-data)
+                              (throw (ex-info "Queued replay requires a Datahike release with ordered transaction preparation"
+                                              {:reason :pipeline-unsupported-datahike}))))
+        directory (.getCanonicalPath (io/file store-path))
         spool-store (spool/store directory max-stream-spool-bytes)
         transport (publisher-transport)
         config (assoc config :slot-prefix slot-prefix :max-snapshot-bytes max-snapshot-bytes
                       :max-transaction-bytes max-transaction-bytes :spool-store spool-store
-                      :transport transport)
+                      :transport transport :max-in-flight-commits max-in-flight-commits
+                      :prepare-tx-data prepare-tx-data :pipeline-suppressed? (atom false))
         state (atom (cond-> {:state :starting :publication publication}
                       leaf-publication (assoc :leaf-publication leaf-publication)))
         stopping? (atom false)]
@@ -2942,7 +3052,7 @@
                     (try
                       (with-open [_ lock]
                         (spool/prepare! spool-store)
-                        (let [conn (open-store directory)]
+                        (let [conn (open-store directory max-in-flight-commits)]
                           (try (serve! config conn state stopping?)
                                (finally (d/release conn)))))
                       (when @stopping? (swap! state assoc :state :stopped :port nil))
