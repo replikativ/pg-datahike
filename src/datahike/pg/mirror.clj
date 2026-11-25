@@ -3279,7 +3279,7 @@
   (let [check? (= "--check" (first args))
         paths (if check? (rest args) args)]
     (require! (= 1 (count paths))
-              "Usage: clojure -M -m datahike.pg.mirror [--check] path-to-mirror.edn" {})
+              "Usage: mirror [--check] path-to-mirror.edn" {})
     (let [source-url (System/getenv "PG_MIRROR_SOURCE_URL")
           config (cond-> (edn/read-string (slurp (first paths)))
                    source-url (assoc :source-url source-url))

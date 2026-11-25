@@ -5,6 +5,17 @@ It takes a consistent initial snapshot and then follows committed transactions
 over PostgreSQL's native logical replication protocol. The mirror keeps
 Datahike history from the snapshot onward. PostgreSQL remains the write endpoint.
 
+History is dated by the publisher. Each mirrored transaction is recorded at
+its PostgreSQL commit timestamp, in milliseconds, and the initial snapshot at
+the publisher's clock when the snapshot began. `SET datahike.as_of` and
+`FOR SYSTEM_TIME AS OF` therefore select by the time the application
+committed, whatever the replication lag was. PostgreSQL does not guarantee
+that commit timestamps rise in commit order. A transaction whose timestamp
+is earlier than its predecessor's is recorded at the predecessor's instant,
+so a point in time always selects a prefix of the publisher's commits.
+Transactions recorded by a release before this change keep the mirror's
+clock.
+
 ## Start a mirror
 
 On the PostgreSQL primary, set `wal_level = logical` and restart PostgreSQL
@@ -66,6 +77,9 @@ psql -X --host=127.0.0.1 --port=15432 --username=datahike \
 On a build with Datahike ordered transaction preparation, add
 `:max-in-flight-commits 8` to the mirror configuration to try queued replay.
 The default is one, and the experimental queue accepts depths up to 32.
+Status reports `:queued-replay :enabled`. A publisher constraint change that
+the queue cannot follow switches it off until the worker restarts, and status
+then reports `:queued-replay :suppressed`.
 It holds at most 8 MiB of queued source changes. The mirror opens the
 store with an exclusive Datahike writer. Keep independent Datahike writers
 off this store while the mirror owns it.
@@ -324,8 +338,18 @@ reports `:reason :replication-stalled`, reconnects, and continues from its
 durable checkpoint. A JVM error in the worker, such as an exhausted heap,
 ends it with state `:failed`, and the CLI exits with status 1.
 
-Snapshot and transaction sizes are bounded by `:max-snapshot-bytes` and
-`:max-transaction-bytes`. The defaults are 128 MiB and 64 MiB respectively.
+The initial snapshot is committed in batches of about 16 MiB of COPY data,
+so its size is not limited by memory, and it has no size limit unless
+`:max-snapshot-bytes` is configured. The checkpoint receives its position
+with the last batch. If the snapshot stops before that, the worker drops its
+slot on the publisher when it still can, and the next attempt discards the
+partial store and copies again. Every batch is recorded at the same instant,
+so no point in time selects part of a snapshot.
+
+The snapshot of a table or schema refresh, and a resnapshot after slot loss,
+are staged in memory and bounded by `:max-snapshot-bytes`, 128 MiB by
+default. Transaction size is bounded by `:max-transaction-bytes`, 64 MiB by
+default.
 The worker checks ordinary row frames before decoding their fields. pgJDBC
 holds one complete wire frame in memory. The worker pauses when it hits a
 limit. Stop the worker and adjust the limit to retry. Cutover and occasional idle WAL confirmation use transactional logical
@@ -453,35 +477,9 @@ The next stages cover more publication types and relations. See the
 [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 
-## Known performance trap in Option 2, today
-
-`DECLARE`/`FETCH`/`CLOSE` work, but each `FETCH` re-runs the stored
-query with `LIMIT n OFFSET pos` (`rewrite-cursor-page`). At the default
-`fetch_size` of 100 a 1M-row scan is 10k queries, each re-evaluating up
-to its offset: **O(n²)**. This is not FDW-specific -- pgjdbc with a
-fetch size, psycopg named cursors and plpgsql cursors all pay it.
-
-It looked like it might also be a **correctness** bug, because paging by
-`LIMIT/OFFSET` across re-executions is only sound under a *total* order
-and the order injected for a cursor without `ORDER BY` is
-`[1 :asc]` -- non-total as soon as the first column has duplicates.
-**Measured, and it does not reproduce:** 24 rows with 6 per
-first-column value, paged at 1, 3, 5 and 7, return every row exactly
-once. Each `FETCH` re-executes against the same frozen
-`:speculative-db` captured at `BEGIN`, and the executor is
-deterministic over an immutable snapshot, so successive executions
-agree on the tie order. `cursor-paging-does-not-repeat-or-skip-rows`
-in `pg_cursor_protocol_test.clj` pins that property, so a future
-paging or planner change cannot quietly take it away.
-
-So this is a performance item, not an S1 -- which also means the fix is
-free to change the strategy (hold an iterator, or materialize once per
-cursor) without a correctness argument to preserve.
-
 ## Open questions
 
 The next subscriber stages need measurements of staging large tables and
 retracting large relation sets on TRUNCATE. Mapping upstream `valid_from`
 and `valid_to` values to Datahike's transaction-level valid time also needs
-a separate design. FDW time travel depends on support for startup
-`options` in the session settings.
+a separate design.
