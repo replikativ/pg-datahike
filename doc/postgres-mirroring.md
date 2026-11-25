@@ -7,7 +7,7 @@ Datahike history from the snapshot onward. PostgreSQL remains the write endpoint
 
 History is dated by the publisher. Each mirrored transaction is recorded at
 its PostgreSQL commit timestamp, in milliseconds, and the initial snapshot at
-the publisher's clock when the snapshot began. `SET datahike.as_of` and
+the publisher's clock just after the snapshot was taken. `SET datahike.as_of` and
 `FOR SYSTEM_TIME AS OF` therefore select by the time the application
 committed, whatever the replication lag was. PostgreSQL does not guarantee
 that commit timestamps rise in commit order. A transaction whose timestamp
@@ -15,6 +15,19 @@ is earlier than its predecessor's is recorded at the predecessor's instant,
 so a point in time always selects a prefix of the publisher's commits.
 Transactions recorded by a release before this change keep the mirror's
 clock.
+
+Three kinds of transaction are not publisher commits. The mirror's own
+bookkeeping, such as the transaction a restart commits when it opens the
+store, is dated by the mirror's clock and changes no mirrored row. A schema
+or table refresh becomes visible at the publisher commit that completes its
+cutover, which is later than the original DDL. A resnapshot after slot loss
+is dated by the mirror's clock, and the commits that follow it share that
+instant until the publisher's commit times pass it.
+
+A time selects whole transactions. `SET datahike.as_of` also accepts a
+Datahike transaction number, and the batches of the initial snapshot are
+separate transactions: a number inside the snapshot selects the tables as
+far as they had been copied. Use a time to read the snapshot.
 
 ## Start a mirror
 
@@ -335,7 +348,9 @@ confirmation ahead of the checkpoint pauses the mirror by default.
 The initial catch-up and a table refresh may take as long as they need while
 they keep applying commits. If nothing is applied for ten minutes, the worker
 reports `:reason :replication-stalled`, reconnects, and continues from its
-durable checkpoint. A JVM error in the worker, such as an exhausted heap,
+durable checkpoint. A transaction that is still arriving counts as progress.
+A stall that persists keeps the worker reconnecting with that reason in its
+status. It does not pause. A JVM error in the worker, such as an exhausted heap,
 ends it with state `:failed`, and the CLI exits with status 1.
 
 The initial snapshot is committed in batches of about 16 MiB of COPY data,
@@ -343,7 +358,8 @@ so its size is not limited by memory, and it has no size limit unless
 `:max-snapshot-bytes` is configured. The checkpoint receives its position
 with the last batch. If the snapshot stops before that, the worker drops its
 slot on the publisher when it still can, and the next attempt discards the
-partial store and copies again. Every batch is recorded at the same instant,
+partial store and copies again. While a store is being replaced, the file
+`<store-path>.mirror-reset` holds the slot name; keep it with the store. Every batch is recorded at the same instant,
 so no point in time selects part of a snapshot.
 
 The snapshot of a table or schema refresh, and a resnapshot after slot loss,

@@ -218,7 +218,7 @@
           (#'mirror/sink-execute! destination "CREATE TABLE dated (id bigint PRIMARY KEY)")
           (#'mirror/transaction! destination instant
                                  #(#'mirror/sink-execute! destination "INSERT INTO dated VALUES (1)"))
-          (is (= (.getTime instant) (#'mirror/latest-instant-millis (d/db conn))))
+          (is (= instant (:db/txInstant (d/entity (d/db conn) (:max-tx (d/db conn))))))
           (is (= [[1]] (vec (d/q '[:find ?id :where [?e :dated/id ?id]]
                                  (d/as-of (d/db conn) instant)))))
           (is (empty? (d/q '[:find ?id :where [?e :dated/id ?id]]
@@ -249,3 +249,42 @@
         (is (identical? fresh (#'mirror/discard-incomplete-snapshot! fresh config))
             "a store with a finished snapshot is left alone")
         (finally (d/release fresh))))))
+
+(deftest the-instant-floor-is-the-last-publisher-dated-transaction
+  (let [root (.toFile (Files/createTempDirectory "pgdh-instant-floor-" (make-array FileAttribute 0)))
+        conn (#'mirror/open-store (str (io/file root "store")) 1)
+        instant #inst "2020-03-04T05:06:07.000-00:00"]
+    (try
+      (with-open [destination (pg/make-query-handler conn)]
+        (#'mirror/init-checkpoint! destination {:system "1" :timeline 1 :database "source"}
+                                   "pgdh_mirror_slot" "analytics")
+        (is (nil? (#'mirror/source-floor-millis (d/db conn)))
+            "a checkpoint without an end LSN has no publisher-dated transaction")
+        (#'mirror/transaction! destination instant
+                               #(#'mirror/update-checkpoint! destination {:end-lsn nil} {:end-lsn "0/10"}))
+        ;; A later local transaction at the mirror's clock, like the one a new
+        ;; query handler commits after a restart.
+        (#'mirror/sink-execute! destination "CREATE TABLE local_only (id bigint PRIMARY KEY)")
+        (is (< (.getTime instant)
+               (.getTime ^java.util.Date (:db/txInstant (d/entity (d/db conn) (:max-tx (d/db conn)))))))
+        (is (= (.getTime instant) (#'mirror/source-floor-millis (d/db conn)))
+            "a backlog replayed after the restart is not raised to the local transaction's time"))
+      (finally (d/release conn)))))
+
+(deftest an-interrupted-store-replacement-finishes-on-the-next-start
+  (let [root (.toFile (Files/createTempDirectory "pgdh-store-reset-" (make-array FileAttribute 0)))
+        directory (str (io/file root "store"))
+        origin {:system "1" :timeline 1 :database "source"}]
+    ;; The state after a kill between deleting the old store and recording the
+    ;; slot in the new one: no store, only the reset file.
+    (spit (str directory ".mirror-reset")
+          (pr-str {:origin origin :slot "pgdh_mirror_slot" :publication "analytics"}))
+    (#'mirror/finish-store-reset! directory 1)
+    (is (not (.exists (io/file (str directory ".mirror-reset")))))
+    (let [conn (#'mirror/open-store directory 1)]
+      (try
+        (is (= {:origin origin :slot "pgdh_mirror_slot" :publication "analytics"}
+               (select-keys (#'mirror/checkpoint (d/db conn)) [:origin :slot :publication]))
+            "the slot name is still known, so the next attempt drops that slot")
+        (finally (d/release conn))))
+    (is (nil? (#'mirror/finish-store-reset! directory 1)) "nothing to do without a reset file")))

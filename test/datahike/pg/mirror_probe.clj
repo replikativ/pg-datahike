@@ -3173,9 +3173,13 @@
 (defn -main
   "Run one probe. With PG_MIRROR_PROBE_QUEUE_DEPTH set to 2-32, every mirror
    the probe starts, including its crash workers, uses queued replay at that
-   depth."
+   depth. The crash workers interrupt `apply-commit!`, which only the serial
+   path calls: a commit the queue accepts is applied without that hook, so
+   the crash cases still exercise serial apply."
   [& [argument mode]]
-  (if-let [depth (some-> (System/getenv "PG_MIRROR_PROBE_QUEUE_DEPTH") parse-long)]
+  (if-let [depth (when-let [setting (System/getenv "PG_MIRROR_PROBE_QUEUE_DEPTH")]
+                   (or (parse-long setting)
+                       (throw (ex-info "PG_MIRROR_PROBE_QUEUE_DEPTH is not a number" {:value setting}))))]
     (let [start! mirror/start!]
       (with-redefs [mirror/start! #(start! (assoc % :max-in-flight-commits depth))]
         (dispatch-probe! argument mode)))
