@@ -15212,7 +15212,9 @@
 
 (defprotocol EmbeddedTransaction
   (stage-tx! [handler tx-data]
-    "Add trusted embedded transaction data to the handler's active SQL transaction."))
+    "Add trusted embedded transaction data to the handler's active SQL transaction.")
+  (embedded-replay-data [handler]
+    "Return the operations staged by a replay-only handler."))
 
 (defn- make-query-handler*
   "The handler `make-query-handler` scopes; see there."
@@ -15227,14 +15229,15 @@
                                               secondary-index-build-timeout-ms
                                               tx-wrap]
                                        :as opts}]]
-  (admit-unique-index-enforcement!
-   conn (or (:unique-admissions opts) fallback-unique-admissions))
-  ;; Install the flag before a legacy database takes a statement or
-  ;; transaction snapshot. A reservation must then change only positions.
-  (let [db (d/db conn)]
-    (when (contains? (dbi/-schema db) :__seq__/name)
-      (when-let [schema-tx (seq (sequence/install-called-attribute db))]
-        (transact-recorded! conn schema-tx))))
+  (when-not (::embedded-staging? opts)
+    (admit-unique-index-enforcement!
+     conn (or (:unique-admissions opts) fallback-unique-admissions))
+    ;; Install the flag before a legacy database takes a statement or
+    ;; transaction snapshot. A reservation must then change only positions.
+    (let [db (d/db conn)]
+      (when (contains? (dbi/-schema db) :__seq__/name)
+        (when-let [schema-tx (seq (sequence/install-called-attribute db))]
+          (transact-recorded! conn schema-tx)))))
   (let [prepared-analyses (java.util.WeakHashMap.)
         silently-accept (resolve-silently-accept opts)
         max-result-rows (normalize-max-result-rows
@@ -15355,6 +15358,14 @@
           (when-not (and in-tx? (not aborted?) (not read-only?))
             (throw (IllegalStateException. "Expected an active writable SQL transaction")))
           (execute-ddl-in-tx tx-state tx-data "EMBEDDED TRANSACTION")))
+
+      (embedded-replay-data [_]
+        (let [{:keys [in-tx? aborted? read-only? tx-buffer tx-options ddl-version]} @tx-state]
+          (when-not (and (::embedded-staging? opts) in-tx? (not aborted?) (not read-only?)
+                         (zero? (or ddl-version 0)) (empty? tx-options))
+            (throw (IllegalStateException. "Expected a staged mirror DML transaction")))
+          (guard-catalog-tx
+           (with-retraction-overlap-guard (durable-replay-buffer tx-buffer) (d/db conn) nil))))
 
       (close [_]
         ;; pgwire client disconnected — equivalent to a PG backend
@@ -16421,6 +16432,7 @@
     (reify PgWireServer$QueryHandler
       EmbeddedTransaction
       (stage-tx! [_ tx-data] (run #(stage-tx! h tx-data)))
+      (embedded-replay-data [_] (run #(embedded-replay-data h)))
       (execute [_ sql] (statement #(.execute h sql)))
       (executeInGroup [_ sql] (statement #(.executeInGroup h sql)))
       (executeInGroup [_ sql multi-statement?]
@@ -16493,6 +16505,13 @@
    (pg-resolve/with-symbol-resolver
      (make-query-handler* conn opts))
    (:database-read-only? opts)))
+
+(defn ^:no-doc stage-embedded-replay
+  "Stage mirror DML against an immutable writer basis and return transaction data."
+  [db stage!]
+  (with-open [handler (make-query-handler (delay db) {::embedded-staging? true})]
+    (stage! handler)
+    (embedded-replay-data handler)))
 
 (defn- reject-unknown-db-handler
   "QueryHandler that rejects every query with SQLSTATE 3D000. Returned

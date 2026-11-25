@@ -61,6 +61,21 @@ psql -X --host=127.0.0.1 --port=15432 --username=datahike \
   --dbname=analytics --command='SELECT count(*) FROM billing.accounts;'
 ```
 
+## Group commit for ordinary row changes
+
+On a build with Datahike ordered transaction preparation, add
+`:max-in-flight-commits 8` to the mirror configuration to try queued replay.
+The default is one, and the experimental queue accepts depths up to 32.
+It holds at most 8 MiB of queued source changes. The mirror opens the
+store with an exclusive Datahike writer. Keep independent Datahike writers
+off this store while the mirror owns it.
+
+Each publisher commit keeps a distinct Datahike transaction and historical
+version. Several of those transactions can share one physical storage commit.
+Feedback advances through the durable prefix in source order. The mirror
+drains queued writes before schema cutovers, streamed transactions, and
+other changes handled by the serial replay path.
+
 ## Check a publication
 
 Use the same source URL and publication as the mirror configuration to inspect
