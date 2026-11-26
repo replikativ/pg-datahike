@@ -262,6 +262,15 @@
   (bit-or 0x50000000
           (Math/abs (.hashCode ^String (str kind ":" name ":" table)))))
 
+(defn- fk-action-catalog-code [action]
+  (case action
+    :no-action "a"
+    :restrict "r"
+    :cascade "c"
+    :set-null "n"
+    :set-default "d"
+    " "))
+
 (defn- not-null-constraint-rows [rows user-schema db]
   (let [hints (pgs/schema-hints db)
         tables (pgs/derive-virtual-tables user-schema hints)
@@ -383,7 +392,9 @@
                         :pg_constraint/coninhcount 0
                         :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
                         :pg_constraint/conparentid 0
-                        :pg_constraint/conperiod false)
+                        :pg_constraint/conperiod false
+                        :pg_constraint/confdeltype (get % :pg_constraint/confdeltype " ")
+                        :pg_constraint/confupdtype (get % :pg_constraint/confupdtype " "))
                 rows))
         rows))))
 
@@ -1363,6 +1374,8 @@
      {:db/ident :pg_constraint/contypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/connamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/confrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/confdeltype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_constraint/confupdtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      {:db/ident :pg_constraint/condeferrable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condeferred :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/conenforced :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
@@ -3541,6 +3554,8 @@
            :pg_constraint/conrelid      (long tbl-oid)
            :pg_constraint/connamespace  (storage-schema-oid cte-db child)
            :pg_constraint/confrelid     (long parent-oid)
+           :pg_constraint/confdeltype   (fk-action-catalog-code on-delete)
+           :pg_constraint/confupdtype   (fk-action-catalog-code on-update)
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
            :pg_constraint/convalidated  true

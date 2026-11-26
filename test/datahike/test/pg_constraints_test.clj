@@ -302,6 +302,24 @@
     (testing "DELETE unreferenced parent unaffected"
       (is (ok? (run "DELETE FROM pcas WHERE id = 3"))))))
 
+(deftest foreign-key-action-catalog
+  (is (ok? (run "CREATE TABLE action_parent (id INT PRIMARY KEY)")))
+  (is (nil? (err (run "CREATE TABLE action_child (
+                       id INT PRIMARY KEY,
+                       inactive INT REFERENCES action_parent(id),
+                       removed INT,
+                       kept INT REFERENCES action_parent(id) ON DELETE RESTRICT,
+                       FOREIGN KEY (removed) REFERENCES action_parent(id) ON DELETE CASCADE ON UPDATE RESTRICT)"))))
+  (is (= [["action_child_id_not_null" " " " "]
+          ["action_child_inactive_fkey" "a" "a"]
+          ["action_child_kept_fkey" "r" "a"]
+          ["action_child_pkey" " " " "]
+          ["action_child_removed_fkey" "c" "r"]]
+         (rows (run "SELECT conname, confdeltype, confupdtype
+                     FROM pg_constraint
+                     WHERE conrelid = 'action_child'::regclass
+                     ORDER BY conname")))))
+
 (deftest fk-set-null-rejected-at-ddl
   (testing "ON DELETE SET NULL — not yet implemented; DDL rejected"
     (is (err-contains?
