@@ -1151,13 +1151,13 @@
    (long (first (query source "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint" []
                        #(.getLong ^ResultSet % 1))))))
 
-(defn- bootstrap! [replication source conn destination {:keys [slot origin manifest]} check-running!
+(defn- bootstrap! [replication source destination {:keys [slot origin manifest]} check-running!
                    {:keys [failover? initial-snapshot-bytes] :as config}]
   ;; The unique slot name was persisted locally before its first creation.
   (clear-incomplete-slot! source slot failover?)
   (let [on-bytes (snapshot-budget check-running! initial-snapshot-bytes)
         retired (:retired-storage manifest)
-        created? (volatile! false)
+        finishing? (volatile! false)
         place (fn [table]
                 (let [storage (fresh-storage-name retired table)]
                   (cond-> table
@@ -1166,7 +1166,6 @@
       (with-slot-snapshot!
         replication source slot false failover?
         (fn [end-lsn]
-          (vreset! created? true)
           (let [;; Read once the snapshot exists. The copy holds nothing newer
                 ;; than this moment, so no time before it shows a copied row.
                 ;; A commit made between the snapshot and this reading arrives
@@ -1195,6 +1194,7 @@
               (doseq [table tables]
                 (check-running!)
                 (copy-table! source destination table on-bytes)))
+            (vreset! finishing? true)
             (transaction!
              destination instant
              (fn []
@@ -1209,13 +1209,12 @@
       (catch Throwable error
         ;; A slot without a finished snapshot only pins WAL on the publisher,
         ;; and the next attempt creates it again. Once the checkpoint holds
-        ;; its end LSN the slot is the one replication resumes from. The
-        ;; durable checkpoint decides, not whether the last call returned: a
-        ;; COMMIT can fail after its transaction was stored, and so can the
-        ;; ROLLBACK on the publisher that follows it.
-        (when (and @created?
-                   (try (nil? (:end-lsn (checkpoint (d/db conn))))
-                        (catch Throwable _ false)))
+        ;; its end LSN the slot is the one replication resumes from, and a
+        ;; COMMIT can fail after its transaction was stored. So the slot is
+        ;; dropped only when the transaction that writes the end LSN was
+        ;; never started. After that it stays, and a store that turns out to
+        ;; be unfinished is replaced on the next start, slot included.
+        (when-not @finishing?
           (drop-slot-quietly! source slot))
         (throw error)))))
 
@@ -2095,6 +2094,7 @@
         next-feedback (volatile! 0)
         feedback-position (volatile! confirmed-lsn)
         applied-position (volatile! end-lsn)
+        received? (volatile! false)
         in-flight (volatile! clojure.lang.PersistentQueue/EMPTY)
         in-flight-bytes (volatile! 0)
         reply! (fn [request-reply?]
@@ -2150,10 +2150,12 @@
     (try
       (loop [relations {} pending nil segment nil submitted end-lsn]
         (poll-commits!)
-        (tick! (and (nil? pending) (nil? segment)) drain!)
+        (tick! (and (nil? pending) (nil? segment)) drain! @received?)
+        (vreset! received? false)
         (heartbeat!)
         (let [{:keys [^ByteBuffer data reply?] :as packet} (read-packet copy)]
           (when packet (vreset! last-packet (System/nanoTime)))
+          (when data (vreset! received? true))
           (when reply? (reply! false))
           (if data
             (let [size (.remaining data)
@@ -2304,9 +2306,9 @@
           (reset! progress (System/nanoTime))
           (stream! (replication-copy replication slot (or leaf-publication publication) end-lsn)
                    end-lsn end-lsn config
-                   {:tick! (fn [between-transactions? _]
+                   {:tick! (fn [_ _ received?]
                              (check-running!)
-                             (when-not between-transactions?
+                             (when received?
                                (reset! progress (System/nanoTime))))
                     :check-running! check-running!
                     :barrier? #(= barrier %)
@@ -2918,12 +2920,14 @@
     (try
       (stream!
        copy end-lsn confirmed-lsn config
-       {:tick! (fn [between-transactions? drain!]
+       {:tick! (fn [between-transactions? drain! received?]
                  (check-running!)
                  (let [now (System/nanoTime)]
-                   ;; A transaction that is still arriving is progress too: a
-                   ;; large one can take longer to receive than the timeout.
-                   (when-not between-transactions?
+                   ;; Data that arrives is progress too: a large transaction
+                   ;; can take longer to receive than the timeout. Keepalives
+                   ;; are not, so an open transaction that stops arriving
+                   ;; still counts as a stall.
+                   (when received?
                      (vreset! catch-up-progress now))
                    (when-not @following?
                      (require-progress! @catch-up-progress "Initial catch-up made no progress"))
@@ -3030,7 +3034,7 @@
                       saved
                       (do
                         (swap! state assoc :state :snapshot)
-                        (bootstrap! replication source conn destination (assoc saved :origin origin)
+                        (bootstrap! replication source destination (assoc saved :origin origin)
                                     check-running! config)
                         (checkpoint (d/db conn))))
               {{:keys [slot end-lsn] :as saved} :saved {:keys [confirmed-lsn] :as info} :info}
@@ -3212,7 +3216,9 @@
         (when-let [^PgWireServer server (:server @listener)]
           (.stopAndDrain server))))))
 
-(defn- acquire-store-lock [directory]
+(defonce ^:private stores-in-use (atom #{}))
+
+(defn- lock-file-channel [directory]
   (let [file (io/file (str directory ".mirror-lock"))
         channel (FileChannel/open (.toPath file)
                                   (into-array StandardOpenOption
@@ -3249,6 +3255,24 @@
         channel)
       (catch Throwable e
         (.close channel)
+        (throw e)))))
+
+(defn- acquire-store-lock
+  "Lock the store for this worker. A POSIX record lock belongs to the process
+   and is released when it closes any descriptor of the lock file, so a second
+   start in this JVM must be refused before it opens that file."
+  ^java.io.Closeable [directory]
+  (let [path (.getCanonicalPath (io/file directory))
+        [before] (swap-vals! stores-in-use conj path)]
+    (require! (not (before path)) "Another mirror is using this store" {:store-path directory})
+    (try
+      (let [^FileChannel channel (lock-file-channel directory)]
+        (reify java.io.Closeable
+          (close [_]
+            (try (.close channel)
+                 (finally (swap! stores-in-use disj path))))))
+      (catch Throwable e
+        (swap! stores-in-use disj path)
         (throw e)))))
 
 (defn start!

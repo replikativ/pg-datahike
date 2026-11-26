@@ -316,8 +316,12 @@
   (let [root (.toFile (Files/createTempDirectory "pgdh-store-lock-" (make-array FileAttribute 0)))
         directory (str (io/file root "store"))]
     ;; The first acquisition writes the marker; the second reads it back.
-    (.close ^java.nio.channels.FileChannel (#'mirror/acquire-store-lock directory))
-    (with-open [_ ^java.nio.channels.FileChannel (#'mirror/acquire-store-lock directory)]
+    (.close ^java.io.Closeable (#'mirror/acquire-store-lock directory))
+    (with-open [_ ^java.io.Closeable (#'mirror/acquire-store-lock directory)]
+      ;; A second start in this JVM is refused before it opens the lock file:
+      ;; closing its descriptor would release the lock held here.
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Another mirror is using this store"
+                            (#'mirror/acquire-store-lock directory)))
       (let [java (str (System/getProperty "java.home") "/bin/java")
             probe (str "(let [c (java.nio.channels.FileChannel/open (.toPath (java.io.File. \"" directory ".mirror-lock\"))"
                        " (into-array java.nio.file.StandardOpenOption [java.nio.file.StandardOpenOption/WRITE]))]"
@@ -352,3 +356,20 @@
         (is (= (.getTime applied) (#'mirror/source-floor-millis (d/db conn)))
             "a commit made after `applied` is not raised to the time of the upgrade"))
       (finally (d/release conn)))))
+
+(deftest only-arriving-data-counts-as-catch-up-progress
+  (let [packets (atom [{:data (begin-frame 7)} {:reply? false} {:reply? false} {:reply? false}])
+        seen (atom [])]
+    ;; A BEGIN arrives, then only keepalives. The open transaction must not
+    ;; keep the stall timer fresh on its own.
+    (with-redefs-fn {#'mirror/read-packet (fn [_] (ffirst (swap-vals! packets subvec 1)))
+                     #'mirror/feedback! (fn [& _])}
+      (fn []
+        (try
+          (#'mirror/stream! nil "0/1" "0/1" {}
+                            {:tick! (fn [between-transactions? _ received?]
+                                      (swap! seen conj [between-transactions? received?]))
+                             :check-running! (constantly nil)
+                             :select-change! identity})
+          (catch IndexOutOfBoundsException _))
+        (is (= [[true false] [false true] [false false] [false false]] (take 4 @seen)))))))

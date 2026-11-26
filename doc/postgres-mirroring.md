@@ -352,7 +352,9 @@ confirmation ahead of the checkpoint pauses the mirror by default.
 The initial catch-up and a table refresh may take as long as they need while
 they keep applying commits. If nothing is applied for ten minutes, the worker
 reports `:reason :replication-stalled`, reconnects, and continues from its
-durable checkpoint. A transaction that is still arriving counts as progress.
+durable checkpoint. Data that is still arriving counts as progress;
+keepalives do not. The rule watches the stream: a local write that never
+completes is not detected by it.
 A stall that persists keeps the worker reconnecting with that reason in its
 status. It does not pause. A JVM error that ends the worker, such as an exhausted heap,
 is reported as state `:failed`, and the CLI exits with status 1. An error
@@ -360,8 +362,10 @@ raised inside a local SQL statement, including an exhausted heap during a
 COPY, surfaces as a failed statement and pauses the worker instead.
 
 The initial snapshot is committed in batches of about 16 MiB of COPY data,
-so its size is not limited by memory, and it has no size limit unless
-`:max-snapshot-bytes` is configured. The checkpoint receives its position
+so the copy does not have to fit in memory, and it has no size limit unless
+`:max-snapshot-bytes` is configured. Opening the listener afterwards still
+checks each table's primary key in memory, which for a very large table
+with a composite key can need more heap than the copy did. The checkpoint receives its position
 with the last batch. If the snapshot stops before that, the worker drops its
 slot on the publisher when it still can (a lost connection or a killed
 process leaves the slot until the next start), and the next attempt discards the
