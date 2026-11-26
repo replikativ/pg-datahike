@@ -10251,7 +10251,8 @@
    merge of old and new the way PG's init_params does."
   [db seq-name]
   (when-let [entity (sequence/entity-by-name db seq-name)]
-    (let [incr (get entity :__seq__/increment 1)]
+    (let [incr (get entity :__seq__/increment 1)
+          position (sequence/position entity)]
       {:type (get entity :__seq__/type "bigint")
        :increment incr
        :minvalue (get entity :__seq__/minvalue (if (pos? incr) 1 Long/MIN_VALUE))
@@ -10259,8 +10260,8 @@
        :start (get entity :__seq__/start 1)
        :cache (get entity :__seq__/cache 1)
        :cycle? (get entity :__seq__/cycle false)
-       :legacy-position (when (nil? (:__seq__/is-called entity))
-                          (sequence/position entity))
+       :position (first position)
+       :legacy-position (when (nil? (:__seq__/is-called entity)) position)
        :stored-value (:__seq__/value entity)})))
 
 (declare matview-entity)
@@ -10321,6 +10322,11 @@
              db {:class-oid catalog-objects/pg-class-oid :oid oid :kind :sequence
                  :name new-name :namespace-oid namespace-oid :storage-name storage})))))
 
+(defn- validate-sequence-position-tx [db storage minvalue maxvalue]
+  (when-let [entity (sequence/entity-by-name db storage)]
+    (ddl/validate-sequence-position! (first (sequence/position entity)) minvalue maxvalue))
+  [])
+
 (defn- exec-ddl-alter-sequence
   "ALTER SEQUENCE [IF EXISTS] name options…
 
@@ -10330,7 +10336,8 @@
    effect after this same statement."
   [ctx parsed]
   (let [{:keys [conn tx-state session-id]} ctx
-        {logical-name :seq-name :keys [seq-schema if-exists? seq-opts rename-to]} parsed
+        {logical-name :seq-name :keys [seq-schema if-exists? seq-opts rename-to rename-via-table?]} parsed
+        tag (if rename-via-table? "ALTER TABLE" "ALTER SEQUENCE")
         _ (when rename-to (acquire-catalog-allocation-lock! conn tx-state session-id))
         current-db (if (:in-tx? @tx-state)
                      (:speculative-db @tx-state)
@@ -10345,14 +10352,17 @@
                    (sequence-current-params current-db seq-name))]
     (cond
       (and object (not= :sequence (:datahike.pg.object/kind object)))
-      (classified-error ""
-                        (ex-info (str "\"" logical-name "\" is not a sequence")
-                                 {:sqlstate "42809"}))
+      (if rename-via-table?
+        (classified-error "" (errors/pg-error :feature-not-supported
+                                              {:message "ALTER TABLE RENAME is not supported"}))
+        (classified-error ""
+                          (ex-info (str "\"" logical-name "\" is not a sequence")
+                                   {:sqlstate "42809"})))
 
       (and (nil? existing) if-exists?)
       (do (params/notice! "NOTICE" (str "relation " (dump/quote-ident logical-name)
                                         " does not exist, skipping") "00000" nil)
-          (empty-result "ALTER SEQUENCE"))
+          (empty-result tag))
 
       (nil? existing)
       (classified-error ""
@@ -10365,9 +10375,9 @@
                        (sequence-rename-tx current-db object seq-name namespace-oid rename-to)
                        (catalog-basis/capture current-db))]
           (if (:in-tx? @tx-state)
-            (execute-ddl-in-tx tx-state tx-data "ALTER SEQUENCE")
+            (execute-ddl-in-tx tx-state tx-data tag)
             (do (transact-recorded! conn tx-data)
-                (empty-result "ALTER SEQUENCE"))))
+                (empty-result tag))))
         (catch Exception e
           (classified-error "" e)))
 
@@ -10376,6 +10386,8 @@
         (let [params (ddl/sequence-params seq-opts {:existing existing})
               sequence-ref [:__seq__/name seq-name]
               rewrite? (some #(not= :owned-by (first %)) seq-opts)
+              bounds-changed? (some #(#{:as :minvalue :maxvalue} (first %)) seq-opts)
+              check-position? (and bounds-changed? (nil? (:restart params)))
               position-tx (if-let [restart (:restart params)]
                             (sequence/position-tx current-db sequence-ref [restart false])
                             (when-let [[value called?] (:legacy-position existing)]
@@ -10393,6 +10405,10 @@
                         (into position-tx)
                         rewrite?
                         (into (relation-definition-revision-tx current-db [seq-name])))
+              tx-data (if check-position?
+                        (into [[:db.fn/call validate-sequence-position-tx seq-name
+                                (:minvalue params) (:maxvalue params)]] tx-data)
+                        tx-data)
               tx-data (if-let [owner (:owned-by params)]
                         (guard-catalog-tx
                          (into tx-data (sequence-ownership-tx current-db seq-name namespace-oid owner))

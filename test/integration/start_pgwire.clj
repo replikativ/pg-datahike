@@ -52,6 +52,7 @@
         ;; SQL CREATE/DROP DATABASE → fresh in-memory Datahike db.
         :database-template {:store {:backend :memory}
                             :schema-flexibility :write
+                            :allow-index-backfill? true
                             :keep-history? false}
         ;; dev/on-query records per-connection in-flight SQL (always on, cheap)
         ;; so a REPL session can see what each connection is running and which

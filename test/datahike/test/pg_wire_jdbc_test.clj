@@ -183,6 +183,32 @@
         (is (.next rs))
         (is (= 1 (.getLong rs 1)))))))
 
+(deftest jdbc-column-metadata-reads-domain-typmods
+  (with-conn [c {:prepareThreshold 1}]
+    (with-open [st (.createStatement c)]
+      (doseq [sql ["CREATE DOMAIN receipt_label AS varchar(12)"
+                   "CREATE DOMAIN receipt_amount AS numeric(8,2)"
+                   "CREATE DOMAIN receipt_amounts AS numeric(9,3)[]"
+                   "CREATE DOMAIN nested_label AS receipt_label"
+                   "CREATE TABLE receipts (label receipt_label, total receipt_amount)"]]
+        (.execute st sql))
+      (with-open [rs (.executeQuery st
+                                    (str "SELECT typname, typtypmod FROM pg_type "
+                                         "WHERE typname IN ('int4','nested_label','receipt_amounts','receipt_label') ORDER BY typname"))]
+        (is (= java.sql.Types/INTEGER (.getColumnType (.getMetaData rs) 2)))
+        (is (= [["int4" -1] ["nested_label" -1] ["receipt_amounts" 589831] ["receipt_label" 16]]
+               (loop [rows []]
+                 (if (.next rs)
+                   (recur (conj rows [(.getString rs 1) (.getInt rs 2)]))
+                   rows))))))
+    (with-open [rs (.getColumns (.getMetaData c) nil "public" "receipts" "total")]
+      (is (.next rs))
+      (is (= "receipt_amount" (.getString rs "TYPE_NAME")))
+      (is (= java.sql.Types/DISTINCT (.getInt rs "DATA_TYPE")))
+      (is (= 8 (.getInt rs "COLUMN_SIZE")))
+      (is (= 2 (.getInt rs "DECIMAL_DIGITS")))
+      (is (false? (.next rs))))))
+
 (deftest test-command-tag-insert-update-delete
   (testing "INSERT/UPDATE/DELETE tags report affected rowcount"
     (with-conn [c {:preferQueryMode "simple"}]

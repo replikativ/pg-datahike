@@ -72,6 +72,8 @@ FILES=(
 
   # --- type coercion -----------------------------------------------------
   "test/integration/client/json-type-parsing-tests.js"
+  "test/integration/client/type-coercion-tests.js"
+  "test/integration/client/parse-int-8-tests.js"
 )
 
 # Known-gap files (xfail): each fails on a specific, documented missing
@@ -83,14 +85,10 @@ XFAIL_FILES=(
   "test/integration/client/error-handling-tests.js"
   # backslash / exotic quoted-identifier escaping (JSqlParser identifier rules).
   "test/integration/client/field-name-escape-tests.js"
-  # query cancellation: pg_cancel_backend / pg_terminate_backend over
-  # pg_stat_activity not implemented.
+  # Preserve the first observed failure separately for each file.
+  # Later cancellation cases can be masked by an earlier catalog error.
   "test/integration/client/query-error-handling-tests.js"
   "test/integration/client/query-error-handling-prepared-statement-tests.js"
-  # Extreme PostgreSQL/ECMAScript date range; the NULL-comparison case passes.
-  "test/integration/client/type-coercion-tests.js"
-  # COUNT(*) over an empty table + '{1,2,3}'::bigint[] array-literal cast.
-  "test/integration/client/parse-int-8-tests.js"
 )
 
 cd "${PG_DIR}"

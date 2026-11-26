@@ -43,7 +43,7 @@ node-postgres/
 `run.sh` exits 0 when every non-skipped file passes. Summary line:
 
 ```
-SUMMARY: 16 passed, 0 failed, 6 skipped
+SUMMARY: 18 passed, 0 failed, 4 skipped
 ```
 
 `last-run.log` has the full output.

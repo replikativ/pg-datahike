@@ -2603,8 +2603,8 @@
       (or (= fname "substr") (= fname "substring"))
       (let [[s start len] args]
         (swap! (:where-clauses ctx) conj
-               [(if len
-                  (list 'datahike.pg.query-fns/sql-substring s start len)
+               [(if (< 2 (count args))
+                  (list 'datahike.pg.query-fns/sql-substring s start (or len :__null__))
                   (list 'datahike.pg.query-fns/sql-substring s start))
                 result-var])
         result-var)

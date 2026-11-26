@@ -74,20 +74,21 @@ probe() {
   local name="$1" mbql="$2"
   local body="$(jq -n --argjson dbid "$DB_ID" --argjson q "$mbql" \
     '{database:$dbid,type:"query",query:$q}')"
-  local resp="$(mb -X POST --data "$body" "$MB/api/dataset")"
-  local status="$(echo "$resp" | jq -r '.status // "ok"')"
-  if [[ "$status" == "completed" || "$status" == "ok" ]]; then
-    local rowcnt="$(echo "$resp" | jq '.data.rows|length')"
+  local resp rowcnt err
+  if resp="$(mb -X POST --data "$body" "$MB/api/dataset")" &&
+     rowcnt="$(jq -er 'select(.status == "completed" or .status == "ok") | .data.rows | arrays | length' <<< "$resp" 2>/dev/null)" &&
+     [[ -n "$rowcnt" ]]; then
     echo "  OK  $name (rows=$rowcnt)"
     PASS=$((PASS+1))
   else
-    echo "  FAIL $name [$status]"
-    local err="$(echo "$resp" | jq -r '.error // .message // "no-msg"' | head -c 200)"
+    err="$(jq -r '.error // .message // .status // empty' <<< "$resp" 2>/dev/null | head -c 200)" || err=
+    err="${err:-HTTP error or missing successful dataset rows}"
+    echo "  FAIL $name"
     echo "       $err"
     FAILS+=("$name :: $err")
     FAIL=$((FAIL+1))
     echo "=== $name ===" >> "$PROBE_LOG"
-    echo "$resp" | jq '.' >> "$PROBE_LOG"
+    printf '%s\n' "$resp" >> "$PROBE_LOG"
   fi
 }
 
@@ -206,4 +207,5 @@ if [[ $FAIL -gt 0 ]]; then
   for f in "${FAILS[@]}"; do echo "  - $f"; done
   echo
   echo "Full responses logged to $PROBE_LOG"
+  exit 1
 fi

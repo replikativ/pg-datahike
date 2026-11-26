@@ -414,7 +414,15 @@
      :requires ["test_setup"]
      :blockers #{:sequence-ownership-system-index :cached-sequence-position :sequence-privileges}
      :strict-slices
-     [{:id :sequence-owner-syntax
+     [{:id :sequence-type-bound-change
+       :source-lines [38 48]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "postgres-alter-sequence-rescales-type-bounds"}
+      {:id :rename-sequence-through-alter-table
+       :source-lines [144 145]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "postgres-renames-sequences-with-alter-table"}
+      {:id :sequence-owner-syntax
        :source-lines [14 14]
        :gate "test/datahike/test/pg_sequence_catalog_test.clj"
        :test-var "postgres-rejects-invalid-sequence-owners-atomically"}

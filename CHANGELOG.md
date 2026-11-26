@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Migration SQL and JDBC metadata
+
+ALTER TABLE RENAME accepts a sequence target and preserves its counter
+and dependencies. ALTER SEQUENCE AS adjusts bounds that match the old
+type's limits and validates the current counter. The substring form used
+by Odoo’s tax-tag update is supported, and pg_type exposes domain typmods for
+clients such as pgJDBC and Metabase.
+
 ### Identity restores and updates
 
 INSERT accepts OVERRIDING SYSTEM VALUE, including the statements emitted
