@@ -4,6 +4,17 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Identity restores and updates
+
+INSERT accepts OVERRIDING SYSTEM VALUE, including the statements emitted
+by pg_dump --inserts. UPDATE SET identity_column = DEFAULT uses the owned
+sequence. GENERATED ALWAYS still rejects explicit values on an UPDATE.
+
+### Session-local time conversion
+
+AT LOCAL uses the session time zone for timestamp and time conversions.
+Views and prepared statements use the zone in effect when they execute.
+
 ### Identity sequence options and renames
 
 CREATE TABLE accepts sequence options on identity columns and exposes their

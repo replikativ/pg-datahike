@@ -164,6 +164,25 @@
         (with-open [rs (.getResultSet st)]
           (loop [n 0] (if (.next rs) (recur (inc n)) (is (= 3 n)))))))))
 
+(deftest prepared-identity-restore
+  (with-conn [c {:prepareThreshold 1}]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE prepared_restore (id bigint GENERATED ALWAYS AS IDENTITY, payload text)"))
+    (with-open [ps (.prepareStatement c (str "INSERT INTO prepared_restore OVERRIDING SYSTEM VALUE "
+                                             "VALUES (?, ?) RETURNING id"))]
+      (is (= java.sql.Types/BIGINT (.getParameterType (.getParameterMetaData ps) 1)))
+      (doseq [id [42 43]]
+        (.setLong ps 1 id)
+        (.setString ps 2 (str id))
+        (with-open [rs (.executeQuery ps)]
+          (is (.next rs))
+          (is (= id (.getLong rs 1))))))
+    (with-open [ps (.prepareStatement c "UPDATE prepared_restore SET id = DEFAULT WHERE payload = ? RETURNING id")]
+      (.setString ps 1 "42")
+      (with-open [rs (.executeQuery ps)]
+        (is (.next rs))
+        (is (= 1 (.getLong rs 1)))))))
+
 (deftest test-command-tag-insert-update-delete
   (testing "INSERT/UPDATE/DELETE tags report affected rowcount"
     (with-conn [c {:preferQueryMode "simple"}]

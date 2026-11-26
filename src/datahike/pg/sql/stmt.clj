@@ -9459,6 +9459,17 @@
 
         :else nil))))
 
+(defn identity-update-reference
+  "Resolve DEFAULT on an identity column and reject an explicit ALWAYS assignment."
+  [db {:keys [seq-name generation]} column default?]
+  (when (and (= "ALWAYS" generation) (not default?))
+    (throw (errors/pg-error
+            :generated-always
+            {:message (str "column \"" column "\" can only be updated to DEFAULT")
+             :detail (str "Column \"" column "\" is an identity column defined as GENERATED ALWAYS.")})))
+  (when (and default? seq-name)
+    (sequence/stored-counter-reference db seq-name)))
+
 (defn- conflict-update-assignments
   "Validate and flatten ON CONFLICT DO UPDATE's SET list.
 
@@ -9467,7 +9478,8 @@
    expression; reject that explicitly instead of applying only its first pair."
   [^net.sf.jsqlparser.statement.insert.InsertConflictAction conflict-action
    table-name ns schema db]
-  (let [assignments
+  (let [identities (sequence/identity-columns db (get params/*temp-table-map* table-name table-name))
+        assignments
         (mapv
          identity
          (mapcat
@@ -9512,7 +9524,17 @@
                                     (nil? (array-column-spec attr schema db)))
                            (throw (errors/pg-error :feature-not-supported
                                                    {:feature "assignment to this subscripted type"})))
-                         target)))
+                         (let [physical-table (get params/*temp-table-map* table-name)
+                               physical-attr (if (and physical-table (= table-name (namespace attr)))
+                                               (keyword physical-table (name attr))
+                                               attr)
+                               reference (identity-update-reference
+                                          db (get identities physical-attr) col-name
+                                          (assignment-target/default-expression? value-expr))]
+                           (cond-> target
+                             reference (assoc :value-expr
+                                              (CCJSqlParserUtil/parseExpression
+                                               (str "nextval('" (str/replace reference "'" "''") "')"))))))))
                    cols values)))
           (.getUpdateSets conflict-action)))]
     (assignment-target/validate-duplicates! assignments "42601")
@@ -10178,7 +10200,7 @@
    the current statement snapshot. Stateful projection calls remain inert
    markers here and are resolved candidate-by-candidate by the server."
   [{:keys [source col-names source-attrs table-name ns ancestor-tables
-           sequence-defaults conflict-plan returning assignment-targets assignment-plans]}
+           sequence-defaults conflict-plan returning alias assignment-targets assignment-plans]}
    db resolve-value]
   (params/check-cancel!)
   (let [source-db db
@@ -10258,10 +10280,10 @@
                             :count (count entities)
                             :table table-name :ns ns}
                      returning (assoc :returning returning))))]
-    (if assignment-targets
-      (assoc result :insert-source-targets assignment-targets
-             :insert-shared-assignment-plans assignment-plans)
-      (assoc result :insert-source-order source-attrs))))
+    (cond-> (assoc result :alias alias)
+      assignment-targets (assoc :insert-source-targets assignment-targets
+                                :insert-shared-assignment-plans assignment-plans)
+      (nil? assignment-targets) (assoc :insert-source-order source-attrs))))
 
 (defn- timezone-value-expression? [expression]
   (let [expression (unwrap-parens expression)]
@@ -10571,6 +10593,7 @@
              :source-attrs (mapv resolve-target-attr col-names)
              :table-name table-name
              :ns ns
+             :alias target-alias
              :ancestor-tables ancestor-tables
              :sequence-defaults sequence-defaults
              :conflict-plan (when conflict-action
@@ -10591,6 +10614,7 @@
                  :count 0
                  :table table-name
                  :ns ns
+                 :alias target-alias
                  :insert-source source-plan
          ;; Describe runs before deferred source materialization, but must
          ;; advertise the same RETURNING row shape Execute will produce.

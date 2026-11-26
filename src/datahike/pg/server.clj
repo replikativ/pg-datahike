@@ -41,6 +41,7 @@
             [datahike.pg.resolve :as pg-resolve]
             [datahike.pg.secondary :as pg-secondary]
             [datahike.pg.sql :as sql]
+            [datahike.pg.sql.assignment-target :as assignment-target]
             [datahike.pg.sql.row-eval :as row-eval]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
@@ -2599,7 +2600,7 @@
    evaluator a CHECK constraint gets, so a generated expression may name
    the table's other columns and sees exactly what a CHECK would."
   [attrs constraint-plan schema db]
-  (let [gens (filter :generated (:columns constraint-plan))]
+  (let [gens (:generated-columns constraint-plan)]
     (if (empty? gens)
       attrs
       (let [table (:table constraint-plan)]
@@ -2650,27 +2651,18 @@
   ([candidate constraint-plan db resolve-value validate? assignment-context]
    (let [schema (dbi/-schema db)
          eval-expr #(row-eval/default-value % schema db)
+         ;; Reject explicit generated values before reserving sequence defaults.
+         _ (doseq [{:keys [attr] column :name} (:generated-columns constraint-plan)
+                   :when (contains? candidate attr)]
+             (throw (ex-info (str "cannot insert a non-DEFAULT value into column \"" column "\"")
+                             {:sqlstate "428C9"
+                              :error :generated-always
+                              :detail (str "Column \"" column "\" is a generated column.")})))
          attrs
          (reduce
-          (fn [attrs {:keys [attr default default-ast generated] col-name :name}]
-            ;; A generated column is filled below, from the finished row.
-            ;; Skipping it here is what stops a DEFAULT or a supplied
-            ;; value standing in for the expression.
+          (fn [attrs {:keys [attr default default-ast generated]}]
             (if generated
-              ;; A value was written for it. PostgreSQL refuses that --
-              ;; 428C9, and the DETAIL names the reason -- rather than
-              ;; silently overwriting, because a caller who wrote a
-              ;; value believes it will be stored. DEFAULT is the one
-              ;; accepted spelling, and DEFAULT arrives here as an
-              ;; OMITTED column, so its absence is what permits it.
-              (if (contains? attrs attr)
-                (throw (ex-info (str "cannot insert a non-DEFAULT value into column \""
-                                     col-name "\"")
-                                {:sqlstate "428C9"
-                                 :error :generated-always
-                                 :detail (str "Column \"" col-name
-                                              "\" is a generated column.")}))
-                attrs)
+              attrs
               (let [present? (contains? attrs attr)
                     resolved (if-let [plan (get-in assignment-context [:plans attr])]
                                (evaluate-insert-assignment
@@ -3754,28 +3746,31 @@
                              (Column. (Table. ^String (or visible table)) ^String column))
                            schema db {:table table})
               assignments (:assignments projections)
+              identities (sequence/identity-columns db table)
               quoted #(str \" (str/replace % "\"" "\"\"") \")
               assignments
               (mapv (fn [{:keys [column attr value-expr] :as a}]
-                      (if (and (instance? Column value-expr)
-                               (nil? (.getTable ^Column value-expr))
-                               (= "default" (str/lower-case (.getColumnName ^Column value-expr))))
-                        (let [[kind value arg] (row-constraints/column-default
-                                                db (d/entity db (or attr (keyword table column))))]
-                          (cond
-                            (= :nextval kind)
-                            (assoc a :sql (str "nextval('" (str/replace (or arg value) "'" "''") "')"))
+                      (let [attr (or attr (keyword table column))
+                            default? (assignment-target/default-expression? value-expr)
+                            reference (stmt/identity-update-reference db (get identities attr) column default?)]
+                        (if default?
+                          (let [[kind value arg] (if reference
+                                                   [:nextval nil reference]
+                                                   (row-constraints/column-default db (d/entity db attr)))]
+                            (cond
+                              (= :nextval kind)
+                              (assoc a :sql (str "nextval('" (str/replace (or arg value) "'" "''") "')"))
                             ;; An expression default is already SQL, and
                             ;; this path is building SQL: hand it over as
                             ;; the assignment's own expression, the same
                             ;; way `nextval` is. It is then translated and
                             ;; evaluated per row like any other SET
                             ;; expression.
-                            (= :expr kind)
-                            (assoc a :sql value)
-                            :else
-                            (assoc a :sql "NULL" :default-fill [kind value])))
-                        (assoc a :sql (str value-expr))))
+                              (= :expr kind)
+                              (assoc a :sql value)
+                              :else
+                              (assoc a :sql "NULL" :default-fill [kind value])))
+                          (assoc a :sql (str value-expr)))))
                     assignments)
               ;; A temp table is stored under a per-session name; the
               ;; statement's own text still says the name it was given.
@@ -3907,7 +3902,7 @@
         ;; UPDATE path is the only place with both the row as it was and
         ;; the values replacing it.
         gen-plan (row-constraint-plan db (:table parsed))
-        gen-cols (filterv :generated (:columns gen-plan))
+        gen-cols (:generated-columns gen-plan)
         gen-names (into #{} (map :name) gen-cols)
         ;; Assigning to one is refused -- 428C9, the same code INSERT
         ;; uses -- EXCEPT `SET c = DEFAULT`, which PostgreSQL accepts and
@@ -4109,6 +4104,16 @@
     (let [{:keys [table]} parsed
           db (d/db conn)
           {:keys [eids tx-data] :as built} (with-cte-namespaces parsed (build-update-tx ctx db schema parsed))
+          ;; DEFAULT and SET expressions can reserve a sequence value before
+          ;; RETURNING commits the row. The row snapshot is valid across
+          ;; sequence-only commits by this or another session.
+          current (when (:returning parsed) (d/db conn))
+          db (if (and current
+                      (> (long (:max-tx current)) (long (:max-tx db)))
+                      (= ::sequence-only
+                         (ring-write-eas-graced (db-ring-key current) (:max-tx db) (:max-tx current))))
+               current
+               db)
           _ (check-update-identity-collisions! db schema tx-data)
           _ (check-not-null-on-update! db tx-data)
           _ (check-updates-against-row-constraints!
@@ -9744,7 +9749,8 @@
 
 (defn- exec-insert
   [ctx parsed]
-  (let [{:keys [conn tx-state session-state]} ctx]
+  (let [{:keys [conn tx-state session-state]} ctx
+        override-system? (:override-system? parsed)]
     (cond
       (:in-tx? @tx-state)
       (try
@@ -9762,7 +9768,7 @@
                         (with-executed-source ctx source-db (:insert-source parsed))
                         source-db resolver)
                        parsed)
-              _ (when source?
+              _ (when (and source? (not override-system?))
                   (reject-explicit-always-identities!
                    (:tx-data parsed) (:table parsed) spec-db))
               table-name (:table parsed)
@@ -9896,7 +9902,7 @@
                       (with-executed-source ctx source-db (:insert-source parsed))
                       source-db resolver)
                      parsed)
-            _ (when source?
+            _ (when (and source? (not override-system?))
                 (reject-explicit-always-identities!
                  (:tx-data parsed) (:table parsed) db))]
         (execute-insert
@@ -16251,7 +16257,7 @@
                             ;; distinguishable nextval markers. Once markers are
                             ;; resolved they are ordinary longs and provenance is
                             ;; intentionally gone.
-                            _ (when (= :insert (:type parsed))
+                            _ (when (and (= :insert (:type parsed)) (not (:override-system? parsed)))
                                 (reject-explicit-always-identities!
                                  (:tx-data parsed) (:table parsed) db))
                             ;; Sibling pass to ParamRef substitution: any
