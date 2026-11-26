@@ -288,3 +288,42 @@
             "the slot name is still known, so the next attempt drops that slot")
         (finally (d/release conn))))
     (is (nil? (#'mirror/finish-store-reset! directory 1)) "nothing to do without a reset file")))
+
+(deftest a-reset-file-that-reappears-does-not-delete-a-finished-store
+  (let [root (.toFile (Files/createTempDirectory "pgdh-stale-reset-" (make-array FileAttribute 0)))
+        directory (str (io/file root "store"))
+        conn (#'mirror/open-store directory 1)]
+    (try
+      (with-open [destination (pg/make-query-handler conn)]
+        (#'mirror/init-checkpoint! destination {:system "1" :timeline 1 :database "source"}
+                                   "pgdh_mirror_slot" "analytics")
+        (#'mirror/transaction! destination
+                               #(#'mirror/update-checkpoint! destination {:end-lsn nil} {:end-lsn "0/10"})))
+      (finally (d/release conn)))
+    ;; A power loss can bring back a reset file whose removal was not durable.
+    (spit (str directory ".mirror-reset")
+          (pr-str {:origin {:system "1" :timeline 1 :database "source"}
+                   :slot "pgdh_mirror_slot" :publication "analytics"}))
+    (#'mirror/finish-store-reset! directory 1)
+    (is (not (.exists (io/file (str directory ".mirror-reset")))))
+    (let [conn (#'mirror/open-store directory 1)]
+      (try
+        (is (= "0/10" (:end-lsn (#'mirror/checkpoint (d/db conn))))
+            "the finished snapshot and its position are still there")
+        (finally (d/release conn))))))
+
+(deftest the-store-lock-survives-reading-its-marker
+  (let [root (.toFile (Files/createTempDirectory "pgdh-store-lock-" (make-array FileAttribute 0)))
+        directory (str (io/file root "store"))]
+    ;; The first acquisition writes the marker; the second reads it back.
+    (.close ^java.nio.channels.FileChannel (#'mirror/acquire-store-lock directory))
+    (with-open [_ ^java.nio.channels.FileChannel (#'mirror/acquire-store-lock directory)]
+      (let [java (str (System/getProperty "java.home") "/bin/java")
+            probe (str "(let [c (java.nio.channels.FileChannel/open (.toPath (java.io.File. \"" directory ".mirror-lock\"))"
+                       " (into-array java.nio.file.StandardOpenOption [java.nio.file.StandardOpenOption/WRITE]))]"
+                       " (System/exit (if (.tryLock c) 3 0)))")
+            process (.start (doto (ProcessBuilder. ^java.util.List [java "-cp" (System/getProperty "java.class.path")
+                                                                    "clojure.main" "-e" probe])
+                              (.redirectErrorStream true)))]
+        (is (= 0 (.waitFor process))
+            "another process cannot take the lock while this one holds it")))))

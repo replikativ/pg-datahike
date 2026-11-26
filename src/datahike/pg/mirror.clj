@@ -1151,14 +1151,13 @@
    (long (first (query source "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint" []
                        #(.getLong ^ResultSet % 1))))))
 
-(defn- bootstrap! [replication source destination {:keys [slot origin manifest]} check-running!
+(defn- bootstrap! [replication source conn destination {:keys [slot origin manifest]} check-running!
                    {:keys [failover? initial-snapshot-bytes] :as config}]
   ;; The unique slot name was persisted locally before its first creation.
   (clear-incomplete-slot! source slot failover?)
   (let [on-bytes (snapshot-budget check-running! initial-snapshot-bytes)
         retired (:retired-storage manifest)
         created? (volatile! false)
-        finished? (volatile! false)
         place (fn [table]
                 (let [storage (fresh-storage-name retired table)]
                   (cond-> table
@@ -1206,15 +1205,17 @@
                (when (seq parents)
                  (install-partition-topology! destination manifest))
                (update-checkpoint! destination {:slot slot :end-lsn nil}
-                                   {:manifest manifest :end-lsn end-lsn :origin origin})))
-            (vreset! finished? true))))
-      (catch Exception error
+                                   {:manifest manifest :end-lsn end-lsn :origin origin}))))))
+      (catch Throwable error
         ;; A slot without a finished snapshot only pins WAL on the publisher,
         ;; and the next attempt creates it again. Once the checkpoint holds
-        ;; its end LSN the slot is the one replication resumes from: an error
-        ;; raised after that, such as a failed ROLLBACK on the publisher,
-        ;; must leave it in place.
-        (when (and @created? (not @finished?))
+        ;; its end LSN the slot is the one replication resumes from. The
+        ;; durable checkpoint decides, not whether the last call returned: a
+        ;; COMMIT can fail after its transaction was stored, and so can the
+        ;; ROLLBACK on the publisher that follows it.
+        (when (and @created?
+                   (try (nil? (:end-lsn (checkpoint (d/db conn))))
+                        (catch Throwable _ false)))
           (drop-slot-quietly! source slot))
         (throw error)))))
 
@@ -2303,7 +2304,10 @@
           (reset! progress (System/nanoTime))
           (stream! (replication-copy replication slot (or leaf-publication publication) end-lsn)
                    end-lsn end-lsn config
-                   {:tick! (fn [_ _] (check-running!))
+                   {:tick! (fn [between-transactions? _]
+                             (check-running!)
+                             (when-not between-transactions?
+                               (reset! progress (System/nanoTime))))
                     :check-running! check-running!
                     :barrier? #(= barrier %)
                     :select-change! #(select-change included? %)
@@ -2432,6 +2436,11 @@
                   "Invalid legacy mirror checkpoint" {})
         (transaction!
          destination
+         ;; The new checkpoint carries a position that was reached earlier.
+         ;; Record it at that transaction's instant, so the floor for the
+         ;; next publisher commit is not raised to the time of the upgrade.
+         (some-> (first (d/datoms db :eavt entity-id :checkpoint/end_lsn))
+                 :tx (->> (d/entity db)) :db/txInstant)
          (fn []
            (stage-data! destination
                         #(create-checkpoint-tx %
@@ -3021,7 +3030,7 @@
                       saved
                       (do
                         (swap! state assoc :state :snapshot)
-                        (bootstrap! replication source destination (assoc saved :origin origin)
+                        (bootstrap! replication source conn destination (assoc saved :origin origin)
                                     check-running! config)
                         (checkpoint (d/db conn))))
               {{:keys [slot end-lsn] :as saved} :saved {:keys [confirmed-lsn] :as info} :info}
@@ -3084,6 +3093,23 @@
 (defn- reset-file ^java.io.File [directory]
   (io/file (str directory ".mirror-reset")))
 
+(defn- sync-directory!
+  "Make a rename or removal inside `directory` durable."
+  [^java.io.File directory]
+  (with-open [channel (FileChannel/open (.toPath directory)
+                                        (into-array StandardOpenOption [StandardOpenOption/READ]))]
+    (.force channel true)))
+
+(defn- snapshot-finished?
+  "True when the store at `directory` opens and its checkpoint holds an end LSN."
+  [directory max-in-flight-commits]
+  (try
+    (and (d/database-exists? (store-config directory max-in-flight-commits))
+         (let [conn (open-store directory max-in-flight-commits)]
+           (try (some? (:end-lsn (checkpoint (d/db conn))))
+                (finally (d/release conn)))))
+    (catch Exception _ false)))
+
 (defn- delete-tree! [^java.io.File root]
   (when (.exists root)
     (doseq [^java.io.File file (reverse (file-seq root))]
@@ -3098,16 +3124,21 @@
   [directory max-in-flight-commits]
   (let [file (reset-file directory)]
     (when (.exists file)
-      (let [{:keys [origin slot publication]} (edn/read-string (slurp file))]
-        (try (d/delete-database (store-config directory max-in-flight-commits))
-             (catch Exception _ nil))
-        (delete-tree! (io/file directory))
-        (let [conn (open-store directory max-in-flight-commits)]
-          (try
-            (with-open [destination (pg/make-query-handler conn)]
-              (init-checkpoint! destination origin slot publication))
-            (finally (d/release conn))))
-        (io/delete-file file)))))
+      ;; The removal of the reset file may not have reached the disk before a
+      ;; power loss. A store that has since finished its snapshot is never
+      ;; deleted on the word of a file that came back.
+      (when-not (snapshot-finished? directory max-in-flight-commits)
+        (let [{:keys [origin slot publication]} (edn/read-string (slurp file))]
+          (try (d/delete-database (store-config directory max-in-flight-commits))
+               (catch Exception _ nil))
+          (delete-tree! (io/file directory))
+          (let [conn (open-store directory max-in-flight-commits)]
+            (try
+              (with-open [destination (pg/make-query-handler conn)]
+                (init-checkpoint! destination origin slot publication))
+              (finally (d/release conn))))))
+      (io/delete-file file)
+      (sync-directory! (.getParentFile (.getAbsoluteFile file))))))
 
 (defn- discard-incomplete-snapshot!
   "Replace a store whose initial snapshot never finished with an empty one.
@@ -3131,6 +3162,9 @@
                     (into-array java.nio.file.CopyOption
                                 [java.nio.file.StandardCopyOption/ATOMIC_MOVE
                                  java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+        ;; The old store is deleted next. The name of its slot must already
+        ;; be on disk under the new file name.
+        (sync-directory! (.getParentFile (.getAbsoluteFile file)))
         (d/release conn)
         (finish-store-reset! directory max-in-flight-commits)
         (open-store directory max-in-flight-commits)))))
@@ -3182,7 +3216,8 @@
   (let [file (io/file (str directory ".mirror-lock"))
         channel (FileChannel/open (.toPath file)
                                   (into-array StandardOpenOption
-                                              [StandardOpenOption/CREATE StandardOpenOption/WRITE]))]
+                                              [StandardOpenOption/CREATE StandardOpenOption/READ
+                                               StandardOpenOption/WRITE]))]
     (try
       (let [lock (try (.tryLock channel) (catch OverlappingFileLockException _ nil))
             marker "pg-datahike logical mirror v1\n"
@@ -3197,9 +3232,20 @@
             (let [buffer (ByteBuffer/wrap bytes)]
               (while (.hasRemaining buffer) (.write channel buffer)))
             (.force channel true))
-          (require! (and (= (alength bytes) (.size channel))
-                         (= marker (Files/readString (.toPath file))))
-                    "The mirror store marker is invalid" {:store-path directory}))
+          ;; Read through the locked channel. A POSIX record lock belongs to
+          ;; the process and is released when it closes any descriptor of the
+          ;; file, so reading the marker through a second one would give the
+          ;; lock up while the store is in use.
+          (let [buffer (ByteBuffer/allocate (alength bytes))]
+            (require! (= (alength bytes) (.size channel))
+                      "The mirror store marker is invalid" {:store-path directory})
+            (loop [position 0]
+              (when (.hasRemaining buffer)
+                (let [n (.read channel buffer (long position))]
+                  (require! (pos? n) "The mirror store marker is invalid" {:store-path directory})
+                  (recur (+ position n)))))
+            (require! (java.util.Arrays/equals (.array buffer) bytes)
+                      "The mirror store marker is invalid" {:store-path directory})))
         channel)
       (catch Throwable e
         (.close channel)
