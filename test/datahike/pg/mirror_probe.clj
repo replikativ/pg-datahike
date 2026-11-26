@@ -3154,16 +3154,21 @@
                      (check! (= commits recorded)
                              "Publisher commits and local transactions differ after recovery"
                              {:mode mode :commits commits :transactions recorded})
-                     ;; Every applied commit moves the checkpoint in its own
-                     ;; transaction, whether or not it changed a row.
+                     ;; Every applied publisher transaction moves the checkpoint
+                     ;; in its own local transaction, whether or not it changed
+                     ;; a row. Besides the commits above, each mirror start emits
+                     ;; one barrier message. No transaction id may appear twice.
                      (let [moves (inspect-db store
-                                             #(count (d/q '[:find [?tx ...]
-                                                            :in $ ?after
-                                                            :where [_ :pgdh-mirror-end-lsn _ ?tx true] [(> ?tx ?after)]]
-                                                          (d/history %) base-tx)))]
-                       (check! (= commits moves)
-                               "The checkpoint moved a different number of times than the publisher committed"
-                               {:mode mode :commits commits :moves moves}))
+                                             #(d/q '[:find ?tx ?xid
+                                                     :in $ ?after
+                                                     :where [_ :pgdh-mirror-source-xid ?xid ?tx true] [(> ?tx ?after)]]
+                                                   (d/history %) base-tx))]
+                       (check! (= (count moves) (count (set (map second moves))))
+                               "A publisher transaction was applied more than once"
+                               {:mode mode :moves (count moves)})
+                       (check! (<= commits (count moves) (+ commits 2))
+                               "The checkpoint moved more often than the publisher committed"
+                               {:mode mode :commits commits :moves (count moves)}))
                      {:mode mode :applied-at-crash applied :confirmed-at-crash confirmed
                       :durable-at-crash durable :transactions recorded})))))]
         {:ok true :rounds results}))))
