@@ -1606,6 +1606,12 @@
                 (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2))))))))
         {:kind :generic-sql})))
 
+(defn- relation-rename-target [tokens]
+  (let [[rename to new-name & remaining] tokens]
+    (when (and (kw=? rename "rename") (kw=? to "to") (ident-tok? new-name)
+               (every? #(= ";" (:text %)) remaining))
+      (:text new-name))))
+
 (defn- classify-alter-sequence
   "ALTER SEQUENCE [IF EXISTS] name options… — at least one option is
    MANDATORY here (PG's SeqOptList, not OptSeqOptList), which is the one
@@ -1617,11 +1623,9 @@
         ts (if ie? (drop 2 toks) toks)]
     (or (when-let [[parts ts1] (read-relation-parts ts)]
           (let [base (cond-> {:kind :alter-sequence :seq-name (:text (peek parts)) :if-exists? ie?}
-                       (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2)))))
-                [rename to new-name & remaining] ts1]
-            (if (and (kw=? rename "rename") (kw=? to "to") (ident-tok? new-name)
-                     (every? #(= ";" (:text %)) remaining))
-              (assoc base :rename-to (:text new-name))
+                       (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2)))))]
+            (if-let [new-name (relation-rename-target ts1)]
+              (assoc base :rename-to new-name)
               (let [[opts tail] (read-sequence-options ts1)]
                 (when (and (seq opts) (every? #(= ";" (:text %)) tail))
                   (assoc base :seq-opts opts))))))
@@ -1840,8 +1844,14 @@
             ts (if if-exists? (drop 2 ts) ts)
             [parts ts] (read-relation-parts ts)
             identity (when parts (alter-column-add-identity ts))
+            rename-to (when parts (relation-rename-target ts))
             [set-token schema-token target & tail] ts]
         (cond
+          (and rename-to (<= (count parts) 2))
+          (cond-> {:kind :alter-sequence :seq-name (:text (peek parts)) :if-exists? if-exists?
+                   :rename-to rename-to :rename-via-table? true}
+            (= 2 (count parts)) (assoc :seq-schema (:text (first parts))))
+
           (and parts (kw=? set-token "set") (kw=? schema-token "schema")
                (ident-tok? target) (every? #(= ";" (:text %)) tail))
           {:kind :move-table-schema :relation-parts [(mapv :text parts)]

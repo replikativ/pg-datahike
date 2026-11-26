@@ -1,8 +1,8 @@
-# Odoo TestORM — current state
+# Odoo TestORM baseline
 
 The harness (this directory's `run.sh`) boots pgwire and drives Odoo
-19's `--init=base --test-tags=:TestORM`. As of the current commit
-**all 11 TestORM cases pass**:
+19's `--init=base --test-tags=:TestORM`. The archived baseline
+recorded **all 11 TestORM cases passing**:
 
 ```
 odoo.tests.stats:  base: 13 tests 7.08s 454 queries
@@ -11,8 +11,8 @@ odoo.tests.result: 0 failed, 0 error(s) of 11 tests when loading
 ```
 
 The harness exits 0 when it sees this line. `PASS_FLOOR` (default 9)
-is the floor below which the run reports failure; today's clean run
-sits comfortably above it.
+is the floor below which the runner reports a failure. Record the actual
+exit status and test summary when refreshing this evidence.
 
 ## Resolved blockers (history)
 
@@ -29,12 +29,13 @@ branch by these translator fixes:
 | `IN (subquery)` inside predicate-expr context (e.g. wrapped in IS NOT TRUE) raised 0A000 | `sql/expr.clj:translate-predicate-expr` — added `ParenthesedSelect` case that runs the subquery once and lifts to a value list |
 | `LEFT JOIN … ON (a AND b)` fell through to the generic predicate path, breaking outer-join semantics | `sql/stmt.clj:translate-join` — `flatten-and` now also descends through size-1 `ParenthesedExpressionList` so each AND-conjunct routes through the per-EqualsTo branch |
 
-## Excluded permanently (feature gaps we don't implement)
+## Outside the base gate
 
-Anything outside `--test-tags=:TestORM`. The full Odoo test suite
-(`account.tests.*`, etc.) touches Postgres-only features (LISTEN /
-NOTIFY, replication, COPY, large objects, server-side procedures)
-that pg-datahike is explicitly out of scope for.
+Account initialization and application workflows such as invoice posting,
+module installation, and migrations have separate integration needs.
+The base smoke does not qualify those paths. See the
+[compatibility residuals](../../../doc/compatibility-residuals.md) for the
+accounting findings.
 
 ## How to re-baseline
 

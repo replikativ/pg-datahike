@@ -1500,6 +1500,13 @@
 (defn- seq-syntax [detail]
   (throw (errors/pg-error :syntax-error {:detail detail})))
 
+(defn validate-sequence-position! [position minvalue maxvalue]
+  (when (some? position)
+    (when (< position minvalue)
+      (seq-invalid (str "RESTART value (" position ") cannot be less than MINVALUE (" minvalue ")")))
+    (when (> position maxvalue)
+      (seq-invalid (str "RESTART value (" position ") cannot be greater than MAXVALUE (" maxvalue ")")))))
+
 (defn sequence-params
   "Resolve a classifier option list into concrete sequence parameters,
    applying PG's defaults and raising PG's errors.
@@ -1546,6 +1553,10 @@
           [type-min type-max]
           (or (seq-type-bounds type-name)
               (seq-invalid "sequence type must be smallint, integer, or bigint"))
+          [old-min old-max] (when (and existing (:as o))
+                              (seq-type-bounds (:type existing)))
+          reset-max? (and (some? old-max) (= old-max (:maxvalue existing)))
+          reset-min? (and (some? old-min) (= old-min (:minvalue existing)))
 
           ;; --- INCREMENT
           increment (cond
@@ -1566,7 +1577,7 @@
           maxvalue (let [v (:maxvalue o)]
                      (cond
                        (and (some? v) (not= v :none)) v
-                       (or (= v :none) init?) (if ascending? type-max -1)
+                       (or (= v :none) init? reset-max?) (if (or ascending? reset-max?) type-max -1)
                        :else (:maxvalue existing)))
           _ (when (or (< maxvalue type-min) (> maxvalue type-max))
               (seq-invalid (str "MAXVALUE (" maxvalue ") is out of range for "
@@ -1576,7 +1587,7 @@
           minvalue (let [v (:minvalue o)]
                      (cond
                        (and (some? v) (not= v :none)) v
-                       (or (= v :none) init?) (if ascending? 1 type-min)
+                       (or (= v :none) init? reset-min?) (if (and ascending? (not reset-min?)) 1 type-min)
                        :else (:minvalue existing)))
           _ (when (or (< minvalue type-min) (> minvalue type-max))
               (seq-invalid (str "MINVALUE (" minvalue ") is out of range for "
@@ -1606,13 +1617,7 @@
           restart (when (contains? o :restart)
                     (let [v (:restart o)]
                       (if (= v :default) start v)))
-          _ (when restart
-              (when (< restart minvalue)
-                (seq-invalid (str "RESTART value (" restart ") cannot be less than "
-                                  "MINVALUE (" minvalue ")")))
-              (when (> restart maxvalue)
-                (seq-invalid (str "RESTART value (" restart ") cannot be greater than "
-                                  "MAXVALUE (" maxvalue ")"))))
+          _ (validate-sequence-position! (or restart (:position existing)) minvalue maxvalue)
 
           ;; --- CACHE
           cache (cond

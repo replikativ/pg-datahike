@@ -22,14 +22,14 @@ bb beta-exit
 | SQLLogic | full local corpus, per commit | The admitted application-facing SQL examples return their checked results. |
 | Released secondary stack | focused Datahike/Scriptum/Proximum/Stratum vertical on JDK 25, per commit | Secondary creation, mutation, fallback, pagination, history and lifecycle contracts remain valid together. |
 | pgjdbc | eight application-facing classes, 276 cases, per commit | 275 JDBC connection, statement, result, batch and metadata cases pass; one is skipped upstream. It is not complete JDBC conformance. |
-| Hibernate | 14 application tests, per commit | Hibernate 6 DDL, CRUD, relationships, HQL and transaction flows work. |
-| SQLAlchemy | 16 application tests, per commit | SQLAlchemy 2 with psycopg2 can perform the documented application flow. |
-| asyncpg | 11 upstream modules, per commit | New per-test failures and module hangs fail CI; 62 known failures remain explicit. |
-| node-postgres | 16 must-pass and 6 expected-failure files, per commit | The admitted JS client files stay green and known-gap files continue to run. |
-| `pg_dump` | default COPY-format Pagila round-trip, per commit | Every compared table restores with the same row count and no COPY data failure. |
-| Differential fuzz | fixed-seed SELECT, prepared and DML samples against PostgreSQL 17.7, per commit | Every generated sample agrees on rows, or on SQLSTATE when both fail, except divergences listed with a reason. |
-| PostgreSQL regression corpus | complete pinned 17.7 inventory plus admitted strict slices | Every scheduled upstream file is classified, and every strict slice points to a real focused regression test. |
-| Odoo and Metabase | manual release gates | Their documented end-to-end application probes pass before a release candidate is promoted. |
+| Hibernate | 13 application tests, per commit | Hibernate 6 with the stock PostgreSQL dialect and JDBC simple-query mode covers schema, CRUD, relationships, HQL and transactions. |
+| SQLAlchemy | 16 application tests, per commit | The custom Datahike dialect covers its documented SQLAlchemy and psycopg2 application flow. |
+| asyncpg | 11 pinned upstream modules, per commit | The v0.30.0 manifest checks exactly 53 expected-failing owning IDs and rejects new failures, unexpected passes and missing cases. |
+| node-postgres | 18 must-pass and four expected-failure files, per commit | The admitted JS client files pass and the known-gap files still run. |
+| `pg_dump` | COPY-format Pagila row-count round-trip, per commit | Compared table counts agree and the COPY steps complete. The schema replay has its own residuals. |
+| Differential fuzz | fixed-seed samples, per commit | Samples agree on rows or SQLSTATE except for the listed divergences. |
+| PostgreSQL regression corpus | pinned 18.6 inventory and admitted strict slices | Scheduled files are classified, and each strict slice points to a real test. |
+| Odoo and Metabase | manual application probes | Independent application runs have their own recorded fixtures, results and age. |
 | Datahike Server | version-pinned JAR and non-root container, per release | TLS/password authentication, abrupt client drops, graceful restart, durable catalog/data and post-restart writes work through the packaged server. |
 
 This is behavioral coverage. We do not use source-line coverage as a release
@@ -73,29 +73,11 @@ criteria.
 
 ## Where coverage is still weak
 
-- pgjdbc breadth has been rerun and classified. Eight stable classes gate each
-  commit; fixture-bound stored-function, identity-column, custom-type and
-  database-wide-setting suites remain explicitly deferred.
-- asyncpg's exact-set baseline is intentionally conservative: 62 known gaps
-  still pass through the harness on every commit and must be retired as their
-  underlying features become supported.
-- node-postgres allowances are file-grained. One expected failure can hide a
-  regression elsewhere in the same file. Convert the high-value files to
-  per-test admission as their blockers are fixed.
-- The PostgreSQL campaign has 57 application-facing files, but most remain in
-  discovery mode. Its 100 strict slices provide real regression evidence; the
-  raw upstream diff is not itself a pass/fail score.
-- The differential fuzzer covers query semantics, prepared statements and
-  simple DML over one fixed schema. DDL sequences, catalog views, transactions,
-  `ON CONFLICT`/`RETURNING` and COPY have no generated coverage yet, and the
-  SQLLogic corpus is not diffed against PostgreSQL in CI (`bb cross-engine`
-  exists but is manual).
-- Odoo and Metabase are not yet per-commit jobs. They remain release gates
-  until their runtime and setup costs are made reliable enough for CI.
-- The Datahike Server JAR/container lifecycle gate is intentionally manual
-  because it builds two large release artifacts and needs a container engine.
-  Run both version-pinned scripts for every server release that updates the
-  bundled adapter.
+The current [compatibility residuals](compatibility-residuals.md) track the
+upstream PostgreSQL and client findings, the manual application evidence,
+and the gaps in the test setup. The dated campaign snapshot above is
+historical. Run the version-pinned Datahike Server artifact tests for a
+server release that updates the bundled adapter.
 
 ## Campaign waves
 

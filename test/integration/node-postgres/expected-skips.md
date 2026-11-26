@@ -34,6 +34,8 @@ upstream runs as a separate `node file.js` invocation. A file passes iff
 | `test/integration/client/api-tests.js` | Callback API behavior, including startup rejection for an unknown database. |
 | `test/integration/client/transaction-tests.js` | `BEGIN` / `COMMIT` / `ROLLBACK`. |
 | `test/integration/client/json-type-parsing-tests.js` | `json` / `jsonb` parsing. |
+| `test/integration/client/type-coercion-tests.js` | Date range, timestamp and NULL coercion. |
+| `test/integration/client/parse-int-8-tests.js` | Empty aggregate rows and bigint array decoding. |
 
 ## Excluded (deliberately not in the focus list)
 
@@ -75,11 +77,9 @@ happens, move the file up into `FILES`.
 |---|---|---|
 | `error-handling-tests.js` | `non-query error with callback` | The harness connects with an unknown user but this unauthenticated local server accepts it, so the callback receives no `Error`. Temp-table isolation cases in this file now pass. |
 | `field-name-escape-tests.js` | quoted-identifier escaping | Backslash / exotic quoted-identifier rules differ from PG (JSqlParser identifier handling). Adversarial; low realistic-use value. |
-| `query-error-handling-tests.js` | "client can do nothing on cancellation" | Query cancellation via `pg_cancel_backend()` over `pg_stat_activity` not implemented. |
+| `query-error-handling-tests.js` | ErrorResponse `table` field | A temporary-table error reports the physical storage name. The first failing assertion prevents later cancellation tests from running. |
 | `query-error-handling-prepared-statement-tests.js` | backend-terminate path | `pg_terminate_backend()` over `pg_stat_activity` not implemented. |
-| `type-coercion-tests.js` | "date range extremes" | PostgreSQL and ECMAScript accept timestamps up to year 275760 and BCE dates far outside `java.time`'s practical conversion path. The 13 core coercion cases, timestamptz round-trip, and "selecting nulls" (`7 <> $1`, `$1=NULL`) pass. |
-| `parse-int-8-tests.js` | `SELECT COUNT(*), '{1,2,3}'::bigint[] FROM asdf` | `COUNT(*)` over an empty table must return one row (count 0); plus the `'{1,2,3}'::bigint[]` array-literal cast. |
 
-Priority for closing these: the array-literal cast, then narrower authentication
-and query-error cases. The latter require SQL helpers around
-`pg_stat_activity`; `field-name-escape` is adversarial and lowest priority.
+Priorities are the temporary-table error name, packaged authentication, and the
+backend termination workflow. The remaining quoted-identifier case has a smaller
+application surface.

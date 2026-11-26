@@ -113,6 +113,31 @@
     (is (= "" (one c "SELECT substring('abc', 10, 2)")))
     (is (nil? (one c "SELECT substring(NULL::text from 1 for 2)")))))
 
+(deftest substring-length-only-in-odoo-tax-tag-update
+  (with-open [c (jdbc)]
+    (is (= "ab" (one c "SELECT substring('abcdef' FOR '2')")))
+    (is (nil? (one c "SELECT substring('abcdef' FOR NULL)")))
+    (is (= "O" (one c "SELECT substring('FOR' FROM 2 FOR 1)")))
+    (is (= "22011" (try (one c "SELECT substring('abc' FOR -1)")
+                        (catch SQLException e (.getSQLState e)))))
+    (exec! c "CREATE TABLE account_account_tag (id int, name jsonb, applicability text, country_id int)")
+    (exec! c "CREATE TABLE account_report (id int, country_id int)")
+    (exec! c "CREATE TABLE account_report_line (id int, report_id int, name jsonb)")
+    (exec! c (str "INSERT INTO account_account_tag VALUES "
+                  "(1,'{\"en_US\":\"+foo\",\"de_DE\":\"+obsolete\"}','taxes',10), "
+                  "(2,'{\"en_US\":\"+foo\",\"de_DE\":\"+stay\"}','other',10)"))
+    (exec! c "INSERT INTO account_report VALUES (3,10)")
+    (exec! c "INSERT INTO account_report_line VALUES (4,3,'{\"en_US\":\"foo\",\"de_DE\":\"localized\"}')")
+    (exec! c (str
+              "UPDATE account_account_tag tag "
+              "SET name = tag.name || jsonb_build_object('de_DE', substring(tag.name->>'en_US' FOR 1) || (report_line.name->>'de_DE')) "
+              "FROM account_report_line report_line JOIN account_report report ON report.id = report_line.report_id "
+              "WHERE tag.applicability = 'taxes' AND tag.country_id = report.country_id "
+              "AND tag.name->>'en_US' = substring(tag.name->>'en_US' FOR 1) || (report_line.name->>'en_US') "
+              "AND tag.name->>'de_DE' != substring(tag.name->>'en_US' FOR 1) || (report_line.name->>'de_DE')"))
+    (is (= ["+localized" "+stay"]
+           (col c 1 "SELECT name->>'de_DE' FROM account_account_tag ORDER BY id")))))
+
 (deftest position-and-strpos-take-opposite-argument-orders
   (with-open [c (jdbc)]
     ;; `position(sub IN str)` reads sub-first, but gram.y swaps the operands

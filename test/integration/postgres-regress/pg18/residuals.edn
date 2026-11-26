@@ -107,6 +107,12 @@
   {:id :scalar-domain-defaults
    :file "domain" :lines [386 421] :state :covered :impact :wrong-result
    :detail "Omitted fields use scalar domain defaults. Column DEFAULT NULL overrides them. The gate checks typed literals, a sequence expression, NOT NULL and COPY."}
+  {:id :sequence-type-bound-change
+   :file "sequence" :lines [38 48] :state :covered :impact :wrong-result
+   :detail "ALTER SEQUENCE AS rescales the old type's bounds, retains compatible custom bounds and checks the live counter unless RESTART supplies a replacement."}
+  {:id :rename-sequence-through-alter-table
+   :file "sequence" :lines [144 145] :state :covered :impact :unsupported
+   :detail "ALTER TABLE RENAME on a sequence preserves catalog identity and serial DEFAULT dependencies. The gate checks rollback, collision and IF EXISTS."}
   {:id :sequence-data-discovery
    :file "sequence" :lines [416 417] :state :open :impact :wrong-result
    :detail "pg_get_sequence_data now gives stock pg_dump both position fields. With CACHE 10 and three calls, native 18.6 reports the reserved upper value 10 and pg-datahike reports the handed-out value 3."}

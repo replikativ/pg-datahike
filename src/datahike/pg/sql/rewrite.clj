@@ -1426,6 +1426,38 @@
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
 
+(defn- substring-length-only [code open close]
+  (loop [idx (inc open) length-token nil]
+    (if (>= idx close)
+      length-token
+      (let [token (get code idx)
+            word (kw-text token)]
+        (cond
+          (punct? token "(") (recur (match-paren-group code idx) length-token)
+          (punct? token ",") nil
+          (and (= "from" word) (not= "distinct" (kw-text (get code (dec idx))))) nil
+          (= "for" word) (when-not length-token (recur (inc idx) token))
+          :else (recur (inc idx) length-token))))))
+
+(defn- substring-length-only-rule [toks]
+  (when (some #(and (ident-tok? %) (.equalsIgnoreCase "substring" ^String (:text %))) toks)
+    (let [code (into [] (remove #(= :comment (:type %))) toks)]
+      (mapcat (fn [idx]
+                (let [open (inc idx)
+                      token (get code idx)]
+                  (when (and (= "substring" (kw-text token))
+                             (punct? (get code open) "(")
+                             (not (punct? (get code (dec idx)) ".")))
+                    (let [close (dec (match-paren-group code open))]
+                      (when (punct? (get code close) ")")
+                        (when-let [length-token (substring-length-only code open close)]
+                          (let [end (:pos (get code close))]
+                            ;; PostgreSQL inserts a start of 1 and coerces
+                            ;; the length to int4 before resolving the call.
+                            [[(:pos length-token) (:end length-token) "FROM 1 FOR ("]
+                             [end end ")::int4"]])))))))
+              (range (count code))))))
+
 (defn- distinct-on-close? [toks close]
   (loop [i (dec close) depth 1]
     (let [token (get toks i)]
@@ -1486,6 +1518,7 @@
    select-into-table-rule
    adjacent-string-literal-rule
    at-local-rule
+   substring-length-only-rule
    collate-rule
    operator-paren-rule
    primary-key-only-body-rule

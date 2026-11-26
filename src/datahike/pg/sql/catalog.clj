@@ -484,6 +484,7 @@
      {:db/ident :pg_type/typnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typbasetype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_type/typtypmod :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
      {:db/ident :pg_type/typnotnull :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typdefault :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typdefaultbin :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "pg_node_tree"}
@@ -1952,6 +1953,23 @@
           :pg_type/typmodin "-" :pg_type/typmodout "-" :pg_type/typanalyze "-"
           :pg_type/typsubscript "-"}))
 
+(defn- domain-base-typmod [domain]
+  (let [base (:datahike.pg.domain/base-type domain)
+        args (or (:datahike.pg.domain/base-typmods domain)
+                 (when-let [legacy (seq (:datahike.pg.domain/base-args domain))]
+                   (str/join ", " legacy)))
+        scalar (str/trim (str/replace base #"(?i)(?:\s+array)?(?:\s*\[\s*\d*\s*\])*\s*$" ""))
+        type-name (if args (str scalar "(" args ")") scalar)
+        [precision scale] (types/parse-numeric-args type-name)]
+    (or (some-> (types/parse-char-length type-name) (+ types/var-hdr-sz))
+        (when precision (types/encode-numeric-typmod precision scale))
+        (types/parse-timestamp-precision type-name)
+        (types/parse-time-precision type-name)
+        (types/parse-bit-length type-name)
+        (when (#{"char" "character"} scalar) (+ 1 types/var-hdr-sz))
+        (when (= "bit" scalar) 1)
+        -1)))
+
 (defn- complete-type-rows [rows]
   (let [by-oid (into {} (map (juxt :pg_type/oid identity)) rows)
         ;; Domain chains can refer to enums, composite types or other domains.
@@ -1966,7 +1984,8 @@
                                     (let [r (merge domain (domain-type-io base))]
                                       (swap! resolved assoc (:pg_type/oid r) r)
                                       r)) base (rseq chain))]
-               (resolve-type-handlers result))
+               (resolve-type-handlers
+                (update result :pg_type/typtypmod #(or % -1))))
              (let [parent (get by-oid (:pg_type/typbasetype current))]
                (when (or (nil? parent) (contains? seen oid))
                  (throw (ex-info "Invalid domain base type chain" {:oid oid})))
@@ -2288,6 +2307,7 @@
                           :pg_type/typelem 0 :pg_type/typarray 0 :pg_type/typrelid 0
                           :pg_type/typbasetype (long (or (params/domain-base-type-oid cte-db domain)
                                                          (pgs/resolve-type-oid cte-db base-type)))
+                          :pg_type/typtypmod (long (domain-base-typmod domain))
                           :pg_type/typnotnull (boolean not-null)
                           :pg_type/typdelim "," :pg_type/typnamespace 2200
                           (pgs/row-marker-attr "pg_type") true}

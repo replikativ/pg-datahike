@@ -35,6 +35,11 @@ CONF="${HERE}/odoo.conf"
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing tool: $1" >&2; exit 2; }; }
 need clojure
 
+if (exec 3<>/dev/tcp/127.0.0.1/"${PGWIRE_PORT}") 2>/dev/null; then
+  echo "ERROR: pgwire port ${PGWIRE_PORT} is already in use." >&2
+  exit 2
+fi
+
 if [[ ! -d "${ODOO_VENV}" ]]; then
   echo "ERROR: Odoo venv at ${ODOO_VENV} not found. Run ./setup.sh first." >&2
   exit 2
@@ -52,7 +57,7 @@ cat > "${CONF}" <<EOF
 [options]
 addons_path = ${ODOO_ROOT}/addons,${ODOO_ROOT}/odoo/addons
 data_dir = ${DATA_DIR}
-db_host = localhost
+db_host = 127.0.0.1
 db_port = ${PGWIRE_PORT}
 db_user = datahike
 db_password = datahike
@@ -69,7 +74,7 @@ EOF
 # we don't pre-seed.
 echo "[run] starting pgwire on :${PGWIRE_PORT}"
 pushd "${REPO_ROOT}" >/dev/null
-clojure -M:server >>"${LOG}" 2>&1 &
+DATAHIKE_PG_PORT="${PGWIRE_PORT}" clojure -M:server >>"${LOG}" 2>&1 &
 PGWIRE_PID=$!
 popd >/dev/null
 
@@ -86,7 +91,7 @@ trap cleanup EXIT
 # Wait for pgwire (cold start: ~30 s on a slow disk).
 echo "[run] waiting for pgwire on :${PGWIRE_PORT} (up to 90s)"
 for _ in $(seq 1 90); do
-  if (exec 3<>/dev/tcp/localhost/"${PGWIRE_PORT}") 2>/dev/null; then
+  if (exec 3<>/dev/tcp/127.0.0.1/"${PGWIRE_PORT}") 2>/dev/null; then
     exec 3<&-; exec 3>&-
     echo "[run] pgwire up"
     break
@@ -98,6 +103,30 @@ for _ in $(seq 1 90); do
     exit 1
   fi
 done
+
+# Odoo opens the conventional postgres database before connecting to its
+# application database. Provision it on the private pgwire process.
+if ! "${ODOO_VENV}/bin/python" - "${PGWIRE_PORT}" >>"${LOG}" 2>&1 <<'PYTHON'
+import sys
+import psycopg2
+
+conn = psycopg2.connect(host="127.0.0.1", port=sys.argv[1],
+                        dbname="datahike", user="datahike", password="datahike",
+                        connect_timeout=5)
+try:
+    conn.autocommit = True
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT 1 FROM pg_database WHERE datname = 'postgres'")
+        if cursor.fetchone() is None:
+            cursor.execute("CREATE DATABASE postgres")
+finally:
+    conn.close()
+PYTHON
+then
+  echo "ERROR: could not prepare Odoo's postgres administrative database." >&2
+  tail -40 "${LOG}" >&2
+  exit 1
+fi
 
 # ---- run Odoo init [+ tests] ----------------------------------------------
 # `--stop-after-init` is the test-runner mode: run --init=<modules>,

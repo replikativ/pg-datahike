@@ -4750,19 +4750,21 @@
 
    NULL in, NULL out -- the `:__null__` sentinel would otherwise reach
    `subs` and raise a raw ClassCastException on the Keyword."
-  ([s start] (sql-substring s start nil))
-  ([s start len]
-   (if (or (sql-null? s) (sql-null? start) (and (some? len) (sql-null? len)))
-     :__null__
+  ([s start] (sql-substring s start ::to-end))
+  ([s start length]
+   (let [to-end? (= length ::to-end)
+         len (when-not to-end? length)]
+     (if (or (sql-null? s) (sql-null? start) (and (not to-end?) (sql-null? len)))
+       :__null__
      ;; `substring(string FROM pattern)` is the SQL-standard REGEX form
      ;; and shares its spelling with the numeric one -- the second
      ;; argument decides which. It reached `(long start)` on the pattern
      ;; and raised a raw ClassCastException at the client, which is both
      ;; a missing function and an internal error escaping as one.
-     (if (and (string? start) (nil? len))
-       (let [^java.util.regex.Matcher m (.matcher (re-compile start nil) (str s))]
-         (if-not (.find m)
-           :__null__
+       (if (and (string? start) (nil? len))
+         (let [^java.util.regex.Matcher m (.matcher (re-compile start nil) (str s))]
+           (if-not (.find m)
+             :__null__
            ;; PostgreSQL returns the first parenthesised subexpression
            ;; when the pattern has one, and the whole match otherwise.
            ;; A pattern that HAS a group whose text did not participate
@@ -4771,25 +4773,24 @@
            ;; parentheses decides what is returned, and whether they
            ;; matched decides whether there is anything to return.
            ;; PostgreSQL's own `strings` test covers exactly this.
-           (if (pos? (.groupCount m))
-             (or (.group m 1) :__null__)
-             (.group m))))
-       (if (pg-bits/pg-bit? s)
-         (if (some? len)
-           (pg-bits/substring-bits s start len)
-           (pg-bits/substring-bits s start))
-         (let [^String st (pg-str s)
-               n (.length st)
-               start (long start)
-               _ (when (and len (neg? (long len)))
-                   (throw (ex-info "negative substring length not allowed"
-                                   {:error :invalid-parameter-value
-                                    :message "negative substring length not allowed"})))
+             (if (pos? (.groupCount m))
+               (or (.group m 1) :__null__)
+               (.group m))))
+         (if (pg-bits/pg-bit? s)
+           (if (some? len)
+             (pg-bits/substring-bits s start len)
+             (pg-bits/substring-bits s start))
+           (let [^String st (pg-str s)
+                 n (.length st)
+                 start (long start)
+                 _ (when (and len (neg? (long len)))
+                     (throw (ex-info "negative substring length not allowed"
+                                     {:sqlstate "22011"})))
              ;; Half-open window [start, start+len) in 1-based positions.
-               to (if len (+ start (long len)) (inc n))
-               lo (max 1 start)
-               hi (min (inc n) to)]
-           (if (<= hi lo) "" (subs st (dec lo) (dec hi)))))))))
+                 to (if len (+ start (long len)) (inc n))
+                 lo (max 1 start)
+                 hi (min (inc n) to)]
+             (if (<= hi lo) "" (subs st (dec lo) (dec hi))))))))))
 
 (defn null-safe-order-cmp
   "Row comparator for the server-side ORDER BY fallback. `sql-order-by`

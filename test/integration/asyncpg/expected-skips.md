@@ -40,7 +40,7 @@ behavior. They should enter through separately classified tranches.
 | `tests/test_timeout.py` | Mostly asyncpg client-deadline races around `pg_sleep`. Server `statement_timeout` has dedicated tests, but this matrix is not yet classified. |
 | `tests/test_cancellation.py` | CancelRequest has dedicated pg-datahike wire tests. This module adds `pg_sleep` and precise scheduling races and needs separate classification. |
 | `tests/test_adversity.py` | Fuzzing proxy + chaos testing; out of scope for a smoke test. |
-| `tests/test_subinterpreters.py` | CPython subinterpreter machinery; unrelated to server. |
+| `tests/test_utils.py` | Internal formatting and mogrify utility coverage. |
 | `tests/test__environment.py`, `tests/test__sourcecode.py` | Upstream CI-only checks (version matching, lint). |
 | `tests/test_test.py` | Meta-tests of asyncpg's own testbase. |
 
@@ -57,8 +57,8 @@ Python URL parsing without contacting the server.
 failure wins a scheduling race. `test_executemany_timeout` has both passed and
 failed on adjacent CI runs because it races a 0.5-second client deadline
 against batched `pg_sleep` calls. `test_executemany_timeout_flow_control`
-additionally relies on a concurrent `UPDATE` holding a PostgreSQL row lock;
-without row locking, its observed partial-write count depends on machine speed.
+also couples a concurrent row lock to a deadline and an observed partial-write
+count, which depends on scheduling and machine speed.
 These timing tests need a deterministic harness before they can gate server
 compatibility.
 
@@ -67,7 +67,7 @@ compatibility.
 - asyncpg's testbase calls `cluster.get_pg_version()` on startup. When `PGHOST`
   is set, it uses `RunningCluster` which derives the version from the first
   connection's `server_version` `ParameterStatus`. Our server needs to emit a
-  sensible value there (the startup code path already does: we report `17.0`).
+  matching value there. The PostgreSQL 18.6 startup identity is `18.6`.
 - Many tests `CREATE TABLE test_xyz` / `DROP TABLE` at module scope. Our
   in-memory DB resets when the pgwire JVM is restarted, but within a single
   run we rely on correct `DROP TABLE IF EXISTS` semantics.
