@@ -45,21 +45,22 @@ specialized index operator classes, and OLD/NEW aliases in RETURNING.
 | SQLAlchemy and psycopg2 | 16 workflows with the custom Datahike dialect. | The custom dialect overrides version, capability and reflection paths. The CI Python dependencies are unpinned. Stock dialect startup and reflection need a separate check. |
 | Pagila and Chinook | Pagila checks COPY and row counts across 21 tables. Chinook has a separate strict per-row bidirectional gate. | Pagila tolerates schema errors. A local #421 profile disabled index backfill on its new database, causing 21 key and 36 downstream foreign-key errors. The precreated hosted database and standalone launcher enable backfill. The revised test template uses the same backfill setting. Qualified trigger references, nested joins in views, and partition attachment produced independent errors. |
 | Odoo 19 | The archived manual base smoke passed 11 TestORM cases. The archived accounting boot reached module init and failed on the tax-tag UPDATE. | The current base runner accepts a floor of nine and reports the Odoo test-process exit code. The accounting query uses FOR-only substring. Posted invoice numbering relies on a partial UNIQUE index and needs its own concurrency test. |
-| Metabase 0.60.2.4 | The archived manual app run completed initial sync and a native query. A #421 focused replay executed all 17 captured SQL statements against the seed, with 16 returning without error. | The current per-commit assertion checks statement routing. The seventeenth execution failed on missing pg_type.typtypmod in pgJDBC getColumns. FK discovery returned no rows in the replay. The optional MBQL shell probes now fail on HTTP errors and missing result sets. Exact result-value assertions still need to be added. |
+| Metabase 0.60.2.4 | The archived manual app run completed initial sync and a native query. A #421 focused replay executed all 17 captured SQL statements against the seed, with 16 returning without error. | The current per-commit assertion checks statement routing. The seventeenth execution failed on missing pg_type.typtypmod in pgJDBC getColumns. The captured seed uses a Datahike-native reference and declares no SQL FK. A separate fixture with three declared SQL FKs returned the same three rows as stock PostgreSQL. The optional MBQL shell probes now fail on HTTP errors and missing result sets. Exact result-value assertions still need to be added. |
 
 The archived full-application evidence is older than the client and SQL
 receipts. The published build for any new live run, and its exact seed,
 driver and launch profile, should accompany each result.
 [Release gates](beta-exit.md)
 
-### Candidate application checks
+### Application checks for PR #422
 
 The sequence migration probes matched stock PostgreSQL 18.6, and the
 extracted Odoo tax-tag UPDATE returned the intended rows. The
 candidate also replayed all 17 captured Metabase statements. The JDBC
 column query returned five rows and the added focused JDBC test verified
 domain precision and scale. The Metabase replay used the captured seed
-and SQL.
+and SQL. The captured FK query also has an assertion for a declared SQL
+foreign key.
 
 A fresh Pagila restore using the production backfill setting matched row
 counts across all 21 tables. Its 42 statement errors, compared with 99

@@ -8,12 +8,13 @@
      23503  foreign key
      23514  CHECK
      0A000  feature_not_supported (GRANT/REVOKE/policies)"
-  (:require [clojure.test :refer [deftest testing is use-fixtures]]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest testing is use-fixtures]]
             [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.server :as pg])
-  (:import [datahike.pg PgWireServer$QueryResult]))
+  (:import [datahike.pg PgWireServer$QueryHandler PgWireServer$QueryResult]))
 
 (def ^:dynamic *conn* nil)
 (def ^:dynamic *h* nil)
@@ -319,6 +320,20 @@
                      FROM pg_constraint
                      WHERE conrelid = 'action_child'::regclass
                      ORDER BY conname")))))
+
+(deftest metabase-discovers-declared-foreign-keys
+  (is (ok? (run "CREATE TABLE mb_customer (id INT PRIMARY KEY)")))
+  (is (ok? (run "CREATE TABLE mb_order (
+                   id INT PRIMARY KEY,
+                   customer_id INT REFERENCES mb_customer(id))")))
+  (let [{:keys [probes]} (edn/read-string (slurp "test/fixtures/probe-fixtures/metabase.edn"))
+        sql (some (fn [{:keys [id sql]}] (when (= :foreign-key-discovery id) sql)) probes)
+        ^PgWireServer$QueryHandler handler *h*
+        parsed (.parse handler sql (int-array [1043]))
+        result (.executePrepared handler parsed (object-array [nil "public"]))]
+    (is (= [["public" "mb_order" "customer_id" "public" "mb_customer" "id"]]
+           (rows result))
+        (err result))))
 
 (deftest fk-set-null-rejected-at-ddl
   (testing "ON DELETE SET NULL — not yet implemented; DDL rejected"
