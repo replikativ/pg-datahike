@@ -485,6 +485,12 @@ forked before the checkpoint and verifies that the mirror pauses.
 Run `sh test/integration/postgres-regress/mirror-slot-recovery.sh` to check
 recovery from dropped and invalidated slots, recovery while serving reads,
 and the snapshot cutover before and after a crash.
+Run `sh test/integration/postgres-regress/mirror-publisher.sh --queued-crash`
+to kill a mirror with queued commits in flight, and again after commits are
+durable and before their feedback. It checks that the publisher's confirmed
+position never passes the durable checkpoint and that a restart applies every
+publisher commit exactly once. Set `PG_MIRROR_PROBE_QUEUE_DEPTH` to run any
+other probe with queued replay.
 Run `sh test/integration/postgres-regress/mirror-publisher.sh --streaming`
 to verify interleaving, savepoint rollback, streamed schema catch-up,
 and replay after a spool limit or a crash.

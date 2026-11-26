@@ -143,6 +143,40 @@
     (check! (= 86 (.exitValue process)) "Mirror worker did not crash before feedback"
             {:exit (.exitValue process) :log log})))
 
+(defn- run-queued-crash-worker!
+  "Start a mirror with queued replay and halt the JVM inside it.
+
+   :queued-in-flight halts as the writer prepares the 25th queued commit, with
+   earlier ones durable, acknowledged, or still on their way to storage.
+   :queued-durable halts in place of the sixth feedback that would report a new
+   position: those commits are durable and PostgreSQL has not been told.
+
+   Exit 86 means the halt happened on the queued path, 87 that it was reached
+   without any queued commit."
+  [config]
+  (let [prepare #'mirror/prepare-replay-tx
+        prepare-original @prepare
+        feedback #'mirror/feedback!
+        feedback-original @feedback
+        prepared (atom 0)
+        positions (atom #{})
+        mode (:probe-crash-mode config)
+        halt! #(.halt (Runtime/getRuntime) (if (pos? @prepared) 86 87))]
+    (with-redefs-fn {prepare (fn [& args]
+                               (when (and (= 25 (swap! prepared inc)) (= :queued-in-flight mode))
+                                 (halt!))
+                               (apply prepare-original args))
+                     feedback (fn [copy position request-reply?]
+                                (when (and (= :queued-durable mode)
+                                           (= 6 (count (swap! positions conj (str position)))))
+                                  (halt!))
+                                (feedback-original copy position request-reply?))}
+      (fn []
+        (let [subscriber (mirror/start! (dissoc config :probe-crash-mode))]
+          (try
+            (Thread/sleep 100000)
+            (finally (mirror/stop! subscriber))))))))
+
 (defn- run-crash-worker! [config]
   (let [apply-commit #'mirror/apply-commit!
         original @apply-commit
@@ -3116,6 +3150,77 @@
           (doseq [file (reverse (file-seq directory))]
             (io/delete-file file)))))))
 
+(defn- run-queued-crash-probe!
+  "Kill a mirror while queued commits are in flight, and again after commits
+   became durable and before their feedback. After each kill the publisher's
+   confirmed position must not be ahead of the durable checkpoint, and a
+   restart must converge with every publisher commit applied exactly once."
+  [admin-url directory]
+  (with-open [source (DriverManager/getConnection admin-url)]
+    (let [store (str directory "/queued-crash-store")
+          config {:source-url admin-url :publication "queued_crash_pub" :store-path store
+                  :max-in-flight-commits 8 :server {:port 0}}
+          commits 120
+          digest "SELECT count(*), md5(string_agg(id || ':' || payload, ',' ORDER BY id)) FROM queued_crash"
+          with-mirror (fn [f]
+                        (let [subscriber (mirror/start! config)]
+                          (try (f subscriber) (finally (mirror/stop! subscriber)))))]
+      (sql! source
+            "CREATE TABLE queued_crash (id bigint PRIMARY KEY, payload text NOT NULL)"
+            "INSERT INTO queued_crash SELECT n, 'base' FROM generate_series(1, 50) n"
+            "CREATE PUBLICATION queued_crash_pub FOR TABLE queued_crash")
+      (let [slot (with-mirror #(:slot (await-state! % :following)))
+            results
+            (vec
+             (for [[round mode] (map-indexed vector [:queued-in-flight :queued-durable])]
+               (let [before (durable-position store)
+                     base-tx (inspect-db store :max-tx)
+                     first-id (+ 1000 (* 1000 round))]
+                 ;; One row change per publisher commit, each with a new value.
+                 (dotimes [i commits]
+                   (sql! source (if (even? i)
+                                  (str "INSERT INTO queued_crash VALUES (" (+ first-id i) ", 'new-" round "-" i "')")
+                                  (str "UPDATE queued_crash SET payload = 'set-" round "-" i "' WHERE id = "
+                                       (inc (mod i 50))))))
+                 (child-crash! (assoc config :probe-crash-mode mode)
+                               (str directory "/" (name mode) "-crash.log"))
+                 (let [durable (durable-position store)
+                       [confirmed] (slot-query source slot "confirmed_flush_lsn")
+                       applied (inspect-db store
+                                           #(count (d/q '[:find [?tx ...]
+                                                          :in $ ?after
+                                                          :where [_ :queued_crash/payload _ ?tx] [(> ?tx ?after)]]
+                                                        (d/history %) base-tx)))]
+                   (check! (not (pos? (#'mirror/compare-lsn confirmed durable)))
+                           "The publisher's confirmed position is ahead of the durable checkpoint"
+                           {:mode mode :confirmed confirmed :durable durable})
+                   (check! (< applied commits) "The crash came after the whole backlog was applied"
+                           {:mode mode :applied applied})
+                   (when (= :queued-durable mode)
+                     (check! (pos? (#'mirror/compare-lsn durable before))
+                             "No queued commit was durable at the crash" {:before before :durable durable})
+                     (check! (pos? (#'mirror/compare-lsn durable confirmed))
+                             "Expected durable commits the publisher had not been told about"
+                             {:confirmed confirmed :durable durable}))
+                   (with-mirror (fn [subscriber]
+                                  (with-open [sink (DriverManager/getConnection (sink-url subscriber))]
+                                    (await! "The restarted mirror did not converge"
+                                            #(let [status (mirror/status subscriber)]
+                                               (check! (not (#{:failed :paused} (:state status)))
+                                                       "The restarted mirror stopped" status)
+                                               (= (rows source digest) (rows sink digest)))))))
+                   (let [recorded (inspect-db store
+                                              #(count (d/q '[:find [?tx ...]
+                                                             :in $ ?after
+                                                             :where [_ :queued_crash/payload _ ?tx] [(> ?tx ?after)]]
+                                                           (d/history %) base-tx)))]
+                     (check! (= commits recorded)
+                             "Publisher commits and local transactions differ after recovery"
+                             {:mode mode :commits commits :transactions recorded})
+                     {:mode mode :applied-at-crash applied :confirmed-at-crash confirmed
+                      :durable-at-crash durable :transactions recorded})))))]
+        {:ok true :rounds results}))))
+
 (defn- dispatch-probe! [argument mode]
   (cond
     (= "--failover" argument)
@@ -3146,8 +3251,14 @@
           probe (if (= "--namespaces" argument) run-namespace-probe! run-frozen-index-probe!)]
       (check! (seq source) "Set PG_MIRROR_SOURCE_URL to a disposable publisher database" {})
       (prn (probe source)))
+    (= "--queued-crash" argument)
+    (prn (run-queued-crash-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
+                                  (System/getenv "PG_MIRROR_RECOVERY_DIR")))
     (= "--crash-worker" argument)
-    (run-crash-worker! (edn/read (PushbackReader. *in*)))
+    (let [config (edn/read (PushbackReader. *in*))]
+      (if (#{:queued-in-flight :queued-durable} (:probe-crash-mode config))
+        (run-queued-crash-worker! config)
+        (run-crash-worker! config)))
     :else
     (let [source (System/getenv "PG_MIRROR_SOURCE_URL")
           reference (System/getenv "PG_MIRROR_REFERENCE_URL")
@@ -3173,9 +3284,9 @@
 (defn -main
   "Run one probe. With PG_MIRROR_PROBE_QUEUE_DEPTH set to 2-32, every mirror
    the probe starts, including its crash workers, uses queued replay at that
-   depth. The crash workers interrupt `apply-commit!`, which only the serial
-   path calls: a commit the queue accepts is applied without that hook, so
-   the crash cases still exercise serial apply."
+   depth. Their crash workers interrupt `apply-commit!`, which only the serial
+   path calls, so those crash cases still exercise serial apply. `--queued-crash`
+   is the probe that kills a mirror on the queued path."
   [& [argument mode]]
   (if-let [depth (when-let [setting (System/getenv "PG_MIRROR_PROBE_QUEUE_DEPTH")]
                    (or (parse-long setting)
