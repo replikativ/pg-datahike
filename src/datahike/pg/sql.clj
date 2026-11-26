@@ -1368,7 +1368,8 @@
               :alter-sequence
               (cond-> (assoc base :type :ddl-alter-sequence
                              :seq-name (unquote-ident (:seq-name cls-info)))
-                (:seq-schema cls-info) (update :seq-schema unquote-ident))
+                (:seq-schema cls-info) (update :seq-schema unquote-ident)
+                (:rename-to cls-info) (update :rename-to unquote-ident))
 
               :create-domain
               (try
@@ -1401,8 +1402,9 @@
         ;; Fall through to JSqlParser.
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
-          (let [target-rewrite (assignment-rewrite/normalize
-                                (preprocess-sql (or (:parser-sql explain) sql)))
+          (let [identity-options (cls/create-table-identity-options sql)
+                target-rewrite (assignment-rewrite/normalize
+                                (preprocess-sql (or (:sql identity-options) (:parser-sql explain) sql)))
                 ^String parser-sql (:sql target-rewrite)
                 ;; Translation mutates some JSqlParser relation nodes while
                 ;; materialising derived schemas. Validate this rare invalid
@@ -2490,10 +2492,14 @@
                       (translate-create-table-as ^CreateTable stmt schema db)
                       ;; preprocess-sql lifted any PARTITION BY clause out
                       ;; for the parser; the executor decides what it means.
-                      (let [plan (ddl/translate-create-table ^CreateTable stmt db)]
-                        (if-let [clause (rw/partition-by-clause (cls/tokenize-all sql))]
-                          (assoc plan :partition-by (:strategy clause))
-                          plan)))
+                      (let [plan (ddl/translate-create-table ^CreateTable stmt db)
+                            options (:options identity-options)
+                            partition-by (rw/partition-by-clause (cls/tokenize-all sql))]
+                        (cond-> plan
+                          (seq options)
+                          (assoc :identity-options (update-keys options unquote-ident))
+                          partition-by
+                          (assoc :partition-by (:strategy partition-by)))))
 
           ;; DROP TABLE / DROP SEQUENCE
                     (instance? Drop stmt)

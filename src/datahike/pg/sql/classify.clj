@@ -1577,20 +1577,20 @@
    MANDATORY here (PG's SeqOptList, not OptSeqOptList), which is the one
    grammatical difference from CREATE.
 
-   RENAME TO / SET SCHEMA / OWNER TO are different statement shapes; they
-   fall through to :generic-sql."
+   RENAME TO carries the new name through the same target resolution."
   [toks]
   (let [ie? (and (kw=? (first toks) "if") (kw=? (second toks) "exists"))
         ts (if ie? (drop 2 toks) toks)]
     (or (when-let [[parts ts1] (read-relation-parts ts)]
-          (let [[opts ts2] (read-sequence-options ts1)
-                ts3 (drop-while #(= ";" (:text %)) ts2)]
-            (when (and (seq opts) (empty? ts3))
-              (cond-> {:kind :alter-sequence
-                       :seq-name (:text (peek parts))
-                       :if-exists? ie?
-                       :seq-opts opts}
-                (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2))))))))
+          (let [base (cond-> {:kind :alter-sequence :seq-name (:text (peek parts)) :if-exists? ie?}
+                       (> (count parts) 1) (assoc :seq-schema (:text (nth parts (- (count parts) 2)))))
+                [rename to new-name & remaining] ts1]
+            (if (and (kw=? rename "rename") (kw=? to "to") (ident-tok? new-name)
+                     (every? #(= ";" (:text %)) remaining))
+              (assoc base :rename-to (:text new-name))
+              (let [[opts tail] (read-sequence-options ts1)]
+                (when (and (seq opts) (every? #(= ";" (:text %)) tail))
+                  (assoc base :seq-opts opts))))))
         {:kind :generic-sql})))
 
 (defn- classify-truncate
@@ -1706,25 +1706,71 @@
       true
       :else (recur (next ts)))))
 
+(defn- identity-clause [tokens]
+  (when (kw=? (first tokens) "generated")
+    (let [tail (rest tokens)
+          [mode tail]
+          (cond
+            (kw=? (first tail) "always") ["ALWAYS" (rest tail)]
+            (and (kw=? (first tail) "by") (kw=? (second tail) "default"))
+            ["BY DEFAULT" (drop 2 tail)])
+          [as identity & tail] tail]
+      (when (and mode (kw=? as "as") (kw=? identity "identity"))
+        (let [[body remaining] (if (= "(" (:text (first tail)))
+                                 (read-balanced tail)
+                                 [[] (or tail [])])
+              [options unparsed] (read-sequence-options body)]
+          (when (and (some? remaining) (empty? unparsed))
+            {:generation mode :seq-opts options
+             :option-start (:pos (first tail)) :remaining remaining
+             :has-options? (= "(" (:text (first tail)))}))))))
+
+(defn- column-identity-options [tokens]
+  (loop [remaining (rest tokens) depth 0]
+    (when-let [token (first remaining)]
+      (if-let [{:keys [has-options? seq-opts option-start] after :remaining}
+               (when (zero? depth) (identity-clause remaining))]
+        (when has-options?
+          (let [end (dec (- (count remaining) (count after)))]
+            {:column (:text (first tokens)) :options seq-opts
+             :start option-start :end (:end (nth remaining end))}))
+        (recur (rest remaining)
+               (case (:text token)
+                 ("(" "[") (inc depth)
+                 (")" "]") (dec depth)
+                 depth))))))
+
+(defn create-table-identity-options
+  "Extract identity sequence options before handing the column definitions to
+   JSqlParser. Each option list is validated by the same token reader as ALTER."
+  [sql]
+  (when (re-find #"(?i)\bidentity\b" sql)
+    (let [[create & tail] (tokenize sql)
+          tail (if (some #(kw=? (first tail) %) ["temp" "temporary" "unlogged"])
+                 (rest tail)
+                 tail)
+          [table & tail] tail
+          tail (if (and (kw=? (first tail) "if") (kw=? (second tail) "not")
+                        (kw=? (nth tail 2 nil) "exists"))
+                 (drop 3 tail)
+                 tail)]
+      (when (and (kw=? create "create") (kw=? table "table"))
+        (when-let [[_ tail] (read-relation-parts tail)]
+          (when-let [[columns _] (read-balanced tail)]
+            (when-let [spans (seq (keep column-identity-options (split-top-level-commas columns)))]
+              {:sql (reduce (fn [text {:keys [start end]}]
+                              (str (subs text 0 start) (subs text end)))
+                            sql (reverse spans))
+               :options (into {} (map (juxt :column :options)) spans)})))))))
+
 (defn- alter-column-add-identity [tokens]
   (when (kw=? (first tokens) "alter")
     (let [tail (rest tokens)
           [column add generated & tail] (if (kw=? (first tail) "column") (rest tail) tail)]
       (when (and (ident-tok? column) (kw=? add "add") (kw=? generated "generated"))
-        (let [[mode tail]
-              (cond
-                (kw=? (first tail) "always") ["ALWAYS" (rest tail)]
-                (and (kw=? (first tail) "by") (kw=? (second tail) "default"))
-                ["BY DEFAULT" (drop 2 tail)])
-              [as identity & tail] tail]
-          (when (and mode (kw=? as "as") (kw=? identity "identity"))
-            (let [[options tokens] (if (= "(" (:text (first tail)))
-                                     (read-balanced tail)
-                                     [[] (or tail [])])
-                  [options unparsed] (read-sequence-options options)]
-              (when (and (some? tokens) (empty? unparsed)
-                         (every? #(= ";" (:text %)) tokens))
-                {:column (:text column) :generation mode :seq-opts options}))))))))
+        (when-let [{:keys [generation seq-opts remaining]} (identity-clause (cons generated tail))]
+          (when (every? #(= ";" (:text %)) remaining)
+            {:column (:text column) :generation generation :seq-opts seq-opts}))))))
 
 (defn- classify-alter [toks]
   (let [[t1 & rest-toks] toks]

@@ -123,8 +123,8 @@
    :file "sequence" :lines [63 63] :state :covered :impact :unsupported
    :detail "pg_get_serial_sequence reads SERIAL and IDENTITY ownership and reflects explicit attach and detach operations."}
   {:id :identity-sequence-options
-   :file "identity" :lines [7 8] :state :open :impact :unsupported
-   :detail "CREATE TABLE rejects identity START and INCREMENT options, so later probes on itest3 are cascades. ALTER COLUMN ADD GENERATED has a separate parser gap."}
+   :file "identity" :lines [7 8] :state :covered :impact :unsupported
+   :detail "CREATE TABLE applies typed identity sequence options. The gate checks the positions, catalog metadata, duplicate options, and rejection of a second ADD GENERATED."}
   {:id :alter-comment-missing-relation
    :file "alter_table" :lines [18 18] :state :open :impact :wrong-result
    :detail "COMMENT ON a missing relation succeeds on the target. Native 18.6 rejects it before the ordinary-table migration statements."}

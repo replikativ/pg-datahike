@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Identity sequence options and renames
+
+CREATE TABLE accepts sequence options on identity columns and exposes their
+values through information_schema.columns. ALTER SEQUENCE RENAME TO keeps
+the sequence's counter, catalog identity, and bound defaults.
+
 ### Scalar domain defaults apply to omitted values
 
 Omitted columns use their declared default or the default inherited from

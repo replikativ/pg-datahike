@@ -405,6 +405,47 @@
    {:db/ident :pg_largeobject_metadata/lomacl :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_aclitem"}
    {:db/ident (pgs/row-marker-attr "pg_largeobject_metadata") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}])
 
+;; information_schema.columns — mirror PG's information_schema.sql
+;; columns view. Domain-to-Datahike-type mapping:
+;;   cardinal_number  → :db.type/long  (ordinal_position, *_precision, *_scale)
+;;   sql_identifier   → :db.type/string (table/schema/column names, udt_*)
+;;   character_data   → :db.type/string (data_type, defaults, identity_generation)
+;;   yes_or_no        → :db.type/string ("YES" / "NO" — 3-char varchar in PG)
+(def ^:private information-schema-columns-schema
+  [{:db/ident :information_schema_columns/table_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/table_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/table_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/column_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/ordinal_position :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/column_default :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/is_nullable :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/data_type :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/character_maximum_length :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/character_octet_length :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/numeric_precision :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/numeric_precision_radix :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/numeric_scale :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/datetime_precision :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/domain_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/domain_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/domain_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/udt_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/udt_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/udt_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/dtd_identifier :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/is_self_referencing :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/is_identity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/identity_generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/identity_start :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/identity_increment :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/identity_maximum :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/identity_minimum :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/identity_cycle :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/is_generated :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/generation_expression :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :information_schema_columns/is_updatable :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident (pgs/row-marker-attr "information_schema_columns") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}])
+
 (defn catalog-schema-for*
   "Built-in catalog schema — every table-name is a key in a case
    expression. Library consumers register additional tables via
@@ -1389,41 +1430,7 @@
      {:db/ident :pg_matviews/definition  :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_matviews/ispopulated :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_matviews") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
-    ;; information_schema.columns — mirror PG's information_schema.sql
-    ;; columns view. Domain-to-Datahike-type mapping:
-    ;;   cardinal_number  → :db.type/long  (ordinal_position, *_precision, *_scale)
-    ;;   sql_identifier   → :db.type/string (table/schema/column names, udt_*)
-    ;;   character_data   → :db.type/string (data_type, defaults, identity_generation)
-    ;;   yes_or_no        → :db.type/string ("YES" / "NO" — 3-char varchar in PG)
-    "information_schema_columns"
-    [{:db/ident :information_schema_columns/table_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/table_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/table_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/column_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/ordinal_position :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/column_default :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/is_nullable :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/data_type :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/character_maximum_length :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/character_octet_length :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/numeric_precision :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/numeric_precision_radix :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/numeric_scale :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/datetime_precision :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/domain_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/domain_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/domain_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/udt_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/udt_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/udt_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/dtd_identifier :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/is_self_referencing :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/is_identity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/identity_generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/is_generated :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/generation_expression :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/is_updatable :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident (pgs/row-marker-attr "information_schema_columns") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "information_schema_columns" information-schema-columns-schema
     "information_schema_tables"
     [{:db/ident :information_schema_tables/table_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_tables/table_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -2972,6 +2979,12 @@
                :information_schema_columns/is_self_referencing    "NO"
                :information_schema_columns/is_identity            (if identity? "YES" "NO")
                :information_schema_columns/identity_generation    identity-generation
+               :information_schema_columns/identity_start (some-> (:__seq__/start identity-seq) str)
+               :information_schema_columns/identity_increment (some-> (:__seq__/increment identity-seq) str)
+               :information_schema_columns/identity_maximum (some-> (:__seq__/maxvalue identity-seq) str)
+               :information_schema_columns/identity_minimum (some-> (:__seq__/minvalue identity-seq) str)
+               :information_schema_columns/identity_cycle (when identity-seq
+                                                            (if (:__seq__/cycle identity-seq) "YES" "NO"))
                ;; Hardcoded "NEVER", so information_schema reported a
                ;; generated column as an ordinary one -- the view every
                ;; portable tool reads instead of pg_attribute.
