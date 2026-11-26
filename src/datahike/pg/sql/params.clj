@@ -490,6 +490,8 @@
        :base-oid (domain-base-type-oid db domain)
        :base-args (:datahike.pg.domain/base-args domain)
        :base-typmods (:datahike.pg.domain/base-typmods domain)
+       :default-raw (:datahike.pg.domain/default-raw domain)
+       :default-resolved? (:datahike.pg.domain/default-resolved? domain)
        :not-null? (boolean not-null?)
        :check (when (not= :__null__ expression)
                 {:constraint (if (= :__null__ check-name) (str name "_check") check-name)
@@ -532,6 +534,9 @@
              :base-typmods (:base-typmods current)
              :array-type (domain-array-type (:base-type current) (:base-oid current))
              :base-oid (:base-oid current)
+             :default-raw (:default-raw
+                           (some #(when (or (:default-resolved? %) (:default-raw %)) %)
+                                 (reverse chain)))
              :depth (count chain)
              :not-null? (boolean (some :not-null? chain))
              :checks (into [] (keep :check) chain)}))))))

@@ -1846,6 +1846,19 @@
           tables (catalog-table-columns db (pgs/derive-virtual-tables schema (pgs/schema-hints db)))]
       (sequence-column-defaults db tables (set names)))))
 
+(defn domain-defaults-depending-on-sequences [db names]
+  (when (and (seq names) (get (dbi/-schema db) :datahike.pg.domain/default-raw))
+    (let [names (set names)]
+      (for [[domain expression]
+            (d/q '[:find ?name ?expression
+                   :where [?domain :datahike.pg.domain/name ?name]
+                   [?domain :datahike.pg.domain/default-raw ?expression]]
+                 db)
+            reference (ddl/default-sequence-references :expr expression nil)
+            :let [storage (sequence-name db names reference)]
+            :when storage]
+        {:domain domain :sequence storage}))))
+
 (defn- sequence-dependencies [db schema]
   (when-let [seqs (seq (sequence-entities db))]
     (let [sequences (into {} (map (juxt :__seq__/name identity)) seqs)
@@ -1874,7 +1887,13 @@
          (dependency class-id (sequence-oid db name) relation-oid
                      (or (:attnum column) (inc idx)) (if identity-generation "i" "a")))
        (for [{:keys [column sequence]} (sequence-column-defaults db tables sequences)]
-         (dependency attribute-default-id (default-oid db column) (sequence-oid db sequence) 0 "n"))))))
+         (dependency attribute-default-id (default-oid db column) (sequence-oid db sequence) 0 "n"))
+       (for [{:keys [domain sequence]} (domain-defaults-depending-on-sequences db (keys sequences))
+             :let [object (catalog-objects/object-by-identity
+                           db catalog-objects/pg-type-oid catalog-objects/public-namespace-oid domain)]
+             :when object]
+         (dependency catalog-objects/pg-type-oid (:datahike.pg.object/oid object)
+                     (sequence-oid db sequence) 0 "n"))))))
 
 (def ^:private type-io-keys
   [:typinput :typoutput :typreceive :typsend :typmodin :typmodout

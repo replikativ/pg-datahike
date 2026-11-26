@@ -104,6 +104,9 @@
   {:id :to-tsquery-function
    :file "tsearch" :lines [675 675] :state :open :impact :unsupported
    :detail "to_tsquery(unknown, text) returns 42883. The adjacent ALTER now succeeds, and ::tsquery handles the cast case."}
+  {:id :scalar-domain-defaults
+   :file "domain" :lines [386 421] :state :covered :impact :wrong-result
+   :detail "Omitted fields use scalar domain defaults. Column DEFAULT NULL overrides them. The gate checks typed literals, a sequence expression, NOT NULL and COPY."}
   {:id :sequence-data-discovery
    :file "sequence" :lines [416 417] :state :open :impact :wrong-result
    :detail "pg_get_sequence_data now gives stock pg_dump both position fields. With CACHE 10 and three calls, native 18.6 reports the reserved upper value 10 and pg-datahike reports the handed-out value 3."}
