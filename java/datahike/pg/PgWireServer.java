@@ -2394,8 +2394,11 @@ public final class PgWireServer {
             if (!java.util.Objects.equals(before, after)) continue;
 
             if (!sameResultDescription(stmt.resultDescription, newDescription)) {
+                // asyncpg uses the PostgreSQL routine field to recognize this error
+                // and discard its cached statement instead of raising a generic 0A000.
                 throw new PgProtocolException("0A000",
-                    "cached plan must not change result type");
+                    "cached plan must not change result type",
+                    java.util.Map.of("R", "RevalidateCachedQuery"));
             }
             stmt.parsed = reparsed;
             stmt.resultDescription = newDescription;

@@ -96,4 +96,3 @@ tests/test_prepare.py::TestPrepare::test_prepare_14_explain
 tests/test_prepare.py::TestPrepare::test_prepare_19_concurrent_calls
 tests/test_prepare.py::TestPrepare::test_prepare_20_concurrent_calls
 tests/test_prepare.py::TestPrepare::test_prepare_explicitly_named
-tests/test_prepare.py::TestPrepare::test_prepare_statement_invalid
