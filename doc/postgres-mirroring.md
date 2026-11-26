@@ -25,8 +25,9 @@ refresh are held back until that cutover while other tables keep applying,
 so a time inside the refresh window can show a later commit to another table
 without an earlier commit to the refreshed one, and one publisher transaction
 that touched both appears at two instants. A resnapshot after slot loss
-is dated by the mirror's clock, and the commits that follow it share that
-instant until the publisher's commit times pass it.
+is dated by the mirror's clock, or one millisecond after the last applied
+commit when that is later, and the commits that follow it share that instant
+until the publisher's commit times pass it.
 
 A time selects whole transactions. `SET datahike.as_of` also accepts a
 Datahike transaction number, and the batches of the initial snapshot are
@@ -370,7 +371,8 @@ still checked for uniqueness in memory, during the copy, in the last
 snapshot transaction, and when the listener opens, so a very large one can
 need more heap than its batches. The checkpoint receives its position
 with the last batch, after the worker has checked that the slot is still
-usable. If the snapshot stops before that last transaction begins, the worker
+usable. A slot the publisher invalidates in the moment between that check
+and the first replication connection is handled like any later slot loss. If the snapshot stops before that last transaction begins, the worker
 drops its slot on the publisher when it still can (a lost connection, a
 killed process, or a failure inside the last transaction leaves the slot
 until the next start), and the next attempt discards the

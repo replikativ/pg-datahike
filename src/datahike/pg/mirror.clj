@@ -3067,11 +3067,24 @@
   (io/file (str directory ".mirror-reset")))
 
 (defn- sync-directory!
-  "Make a rename or removal inside `directory` durable."
+  "Make a new entry, a rename or a removal inside `directory` durable.
+   Windows cannot open a directory this way and needs no such call."
   [^java.io.File directory]
-  (with-open [channel (FileChannel/open (.toPath directory)
-                                        (into-array StandardOpenOption [StandardOpenOption/READ]))]
-    (.force channel true)))
+  (when-not (str/starts-with? (System/getProperty "os.name" "") "Windows")
+    (with-open [channel (FileChannel/open (.toPath directory)
+                                          (into-array StandardOpenOption [StandardOpenOption/READ]))]
+      (.force channel true))))
+
+(defn- make-durable-parents!
+  "Create the directories above `file` and sync every one that received a
+   new entry, starting at the deepest that already existed."
+  [^java.io.File file]
+  (let [parent (.getParentFile (.getAbsoluteFile file))
+        missing (take-while #(not (.exists ^java.io.File %))
+                            (iterate #(.getParentFile ^java.io.File %) parent))]
+    (io/make-parents file)
+    (doseq [^java.io.File created missing]
+      (sync-directory! (.getParentFile created)))))
 
 (defn- snapshot-finished?
   "True when the store at `directory` opens and its checkpoint holds an end LSN."
@@ -3231,7 +3244,16 @@
    and is released when it closes any descriptor of the lock file, so a second
    start in this JVM must be refused before it opens that file."
   ^java.io.Closeable [directory]
-  (let [path (.getCanonicalPath (io/file directory))
+  (let [file (.toPath (io/file (str directory ".mirror-lock")))
+        ;; Two spellings can name one lock file, on a case-insensitive
+        ;; directory for example. Identify it by the file itself where the
+        ;; platform can, which needs it to exist. Creating it closes a
+        ;; descriptor only when nobody could hold a lock on it yet.
+        _ (try (Files/createFile file (make-array java.nio.file.attribute.FileAttribute 0))
+               (catch java.nio.file.FileAlreadyExistsException _ nil))
+        path (or (.fileKey (Files/readAttributes file java.nio.file.attribute.BasicFileAttributes
+                                                 ^"[Ljava.nio.file.LinkOption;" (make-array java.nio.file.LinkOption 0)))
+                 (.getCanonicalPath (io/file directory)))
         [before] (swap-vals! stores-in-use conj path)]
     (require! (not (before path)) "Another mirror is using this store" {:store-path directory})
     (try
@@ -3292,7 +3314,7 @@
                       leaf-publication (assoc :leaf-publication leaf-publication)
                       prepare-tx-data (assoc :queued-replay :enabled)))
         stopping? (atom false)]
-    (io/make-parents (str directory ".mirror-lock"))
+    (make-durable-parents! (io/file (str directory ".mirror-lock")))
     (let [lock (acquire-store-lock directory)
           worker (Thread.
                   (fn []
