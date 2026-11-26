@@ -400,7 +400,7 @@ to move a SQL snapshot into a writable store.
 
 ### Live PostgreSQL → pg-datahike
 
-Mirror a fixed PostgreSQL 18 publication into a read-only pg-datahike database
+Mirror a PostgreSQL 18 publication into a read-only pg-datahike database
 with Datahike history. See the [logical replication guide](doc/postgres-mirroring.md)
 for setup and supported tables.
 

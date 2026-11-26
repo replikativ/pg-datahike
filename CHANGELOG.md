@@ -4,6 +4,20 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The mirror dates history by the publisher, and its first snapshot no longer has to fit in memory
+
+Four changes to the PostgreSQL logical-replication mirror ([guide](doc/postgres-mirroring.md)).
+
+**History uses the publisher's commit time.** A mirrored transaction was recorded at the moment the mirror applied it, so `SET datahike.as_of` selected by the mirror's clock and every answer was off by the replication lag. Each transaction is now recorded at its PostgreSQL commit timestamp, and the initial snapshot at the publisher's clock just after the snapshot was taken. The mirror's own bookkeeping transactions and a resnapshot after slot loss are still dated by the mirror's clock. A commit whose timestamp is earlier than its predecessor's takes the predecessor's instant, so a point in time selects a prefix of the publisher's commits. A table under schema or table refresh is the exception: its changes are held back until the cutover. Transactions a store already holds keep the instant they were recorded at.
+
+**The initial snapshot is committed in batches.** It was one transaction built in memory, limited to 128 MiB by default, and a larger database needed both a higher `:max-snapshot-bytes` and a larger heap. The copy is now committed about 16 MiB at a time and has no limit unless `:max-snapshot-bytes` is set. A snapshot that stops part-way is discarded and redone on the next attempt, and its slot is dropped on the publisher when the worker can still reach it and had not begun the snapshot's last transaction. Before that transaction the worker checks that the slot is still usable, so a slot invalidated during a long copy no longer leaves a store that cannot resume. Tables with a composite primary key are still checked for uniqueness in memory. The mirror's store lock is also read through the locked descriptor now: reading the marker through a second one released the lock on Linux, and a second worker could have opened a store in use. A second start for the same store in one JVM is refused before it touches the lock file, for the same reason. Refresh and resnapshot staging are unchanged: in memory, bounded by `:max-snapshot-bytes`.
+
+**A slow catch-up no longer pauses the mirror for good.** The initial catch-up, and the cutover of a table or schema refresh, had to finish within ten minutes; otherwise the worker paused until restarted. The limit now measures a stall. While commits are applied there is none, and after ten minutes without one, and without data arriving, the worker reconnects and continues from its checkpoint, reporting `:reason :replication-stalled`.
+
+**A worker ended by a JVM error reports it.** After an `Error` such as an exhausted heap the status kept its last value, for example `:following` with a port, and the CLI never exited. The status is now `:failed` and the CLI exits with status 1.
+
+Status also reports `:queued-replay` as `:enabled` or `:suppressed` when `:max-in-flight-commits` is above one, and `PG_MIRROR_PROBE_QUEUE_DEPTH` runs the PostgreSQL 18 probes with queued replay.
+
 ### The server can send a notice
 
 PostgreSQL tells a client about things that are not errors, and the wire layer had no way to say any of them — 1352 `NOTICE` / `WARNING` / `INFO` lines across 73 of PostgreSQL's own regression files went silently missing, and `advisory_lock` sat at 268 of 276 output lines with *every* remaining difference a `WARNING` we could not send.

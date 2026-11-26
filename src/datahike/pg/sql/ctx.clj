@@ -449,9 +449,7 @@
                                name))))
                      (when (or virtual-catalog? (contains? nonpublic-names name)) path))
                (when (some #{"public"} path) public-storage)))]
-     (if (and storage
-              (or *physical-table-names?*
-                  (not (contains? (some-> params/*session-state* deref :private-storage) storage))))
+     (if storage
        storage
        (when required?
          (throw (errors/pg-error :undefined-table

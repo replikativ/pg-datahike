@@ -143,6 +143,40 @@
     (check! (= 86 (.exitValue process)) "Mirror worker did not crash before feedback"
             {:exit (.exitValue process) :log log})))
 
+(defn- run-queued-crash-worker!
+  "Start a mirror with queued replay and halt the JVM inside it.
+
+   :queued-in-flight halts as the writer prepares the 25th queued commit, with
+   earlier ones durable, acknowledged, or still on their way to storage.
+   :queued-durable halts in place of the sixth feedback that would report a new
+   position: those commits are durable and PostgreSQL has not been told.
+
+   Exit 86 means the halt happened on the queued path, 87 that it was reached
+   without any queued commit."
+  [config]
+  (let [prepare #'mirror/prepare-replay-tx
+        prepare-original @prepare
+        feedback #'mirror/feedback!
+        feedback-original @feedback
+        prepared (atom 0)
+        positions (atom #{})
+        mode (:probe-crash-mode config)
+        halt! #(.halt (Runtime/getRuntime) (if (pos? @prepared) 86 87))]
+    (with-redefs-fn {prepare (fn [& args]
+                               (when (and (= 25 (swap! prepared inc)) (= :queued-in-flight mode))
+                                 (halt!))
+                               (apply prepare-original args))
+                     feedback (fn [copy position request-reply?]
+                                (when (and (= :queued-durable mode)
+                                           (= 6 (count (swap! positions conj (str position)))))
+                                  (halt!))
+                                (feedback-original copy position request-reply?))}
+      (fn []
+        (let [subscriber (mirror/start! (dissoc config :probe-crash-mode))]
+          (try
+            (Thread/sleep 100000)
+            (finally (mirror/stop! subscriber))))))))
+
 (defn- run-crash-worker! [config]
   (let [apply-commit #'mirror/apply-commit!
         original @apply-commit
@@ -2660,69 +2694,6 @@
             (when (= ["false"] (slot-query source native-slot "active::text"))
               (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")")))))))))
 
-(defn- run-checkpoint-upgrade-probe! [url directory]
-  (let [path (str directory "/checkpoint-store")
-        config {:source-url url :publication "checkpoint_pub" :store-path path :server {:port 0}}
-        store #(let [conn (#'mirror/open-store path)]
-                 (try (with-open [handler (pg/make-query-handler conn)] (% conn handler))
-                      (finally (d/release conn))))]
-    (with-open [source (DriverManager/getConnection url)]
-      (sql! source "CREATE TABLE anchor (id integer PRIMARY KEY, note text)"
-            "INSERT INTO anchor VALUES (1, 'original')"
-            "CREATE TABLE public.checkpoint (id integer PRIMARY KEY, note text)"
-            "INSERT INTO public.checkpoint VALUES (1, 'published')"
-            "CREATE PUBLICATION checkpoint_pub FOR TABLE anchor")
-      (let [subscriber (mirror/start! config)]
-        (try (await-state! subscriber :following)
-             (finally (mirror/stop! subscriber))))
-      (let [{:keys [origin slot publication manifest end-lsn] :as saved} (durable-checkpoint path)]
-        ;; Install the schema and row emitted by the earlier SQL checkpoint.
-        (store (fn [_ handler]
-                 (#'mirror/transaction!
-                  handler
-                  (fn []
-                    (#'mirror/sink-execute!
-                     handler
-                     (str "CREATE TABLE pgdh_mirror.checkpoint (id integer PRIMARY KEY, "
-                          "origin text NOT NULL, slot_name text NOT NULL, publication text NOT NULL, "
-                          "manifest text, end_lsn text, source_xid text, source_commit_micros text)"))
-                    (#'mirror/sink-prepared!
-                     handler
-                     (str "INSERT INTO pgdh_mirror.checkpoint "
-                          "(id, origin, slot_name, publication, manifest, end_lsn) VALUES (1, ?, ?, ?, ?, ?)")
-                     [(pr-str origin) slot publication (pr-str manifest) end-lsn])
-                    (#'mirror/stage-data! handler
-                                          (constantly [[:db/retractEntity [:pgdh-mirror-key :checkpoint]]]))))))
-        (let [legacy-at (inspect-db path #(str (.toInstant ^java.util.Date
-                                                (:db/txInstant (d/entity % (:max-tx %))))))]
-          (with-open [_ (#'mirror/acquire-store-lock path)]
-            (store #'mirror/upgrade-checkpoint!))
-          (let [after (durable-checkpoint path)]
-            (check! (= (select-keys saved [:slot :origin :end-lsn])
-                       (select-keys after [:slot :origin :end-lsn]))
-                    "Upgrading the legacy record changed the stored position" {}))
-          (let [subscriber (mirror/start! config)]
-            (try
-              (check! (= slot (:slot (await-state! subscriber :following))) "Upgrade replaced the source slot" {})
-              (with-open [sink (DriverManager/getConnection (sink-url subscriber))]
-                (check! (= [["original"]] (rows sink "SELECT note FROM anchor")) "Upgrade changed table contents" {})
-                (sql! sink (str "SET datahike.as_of = " (literal legacy-at)))
-                (doseq [query ["SELECT slot_name FROM public.checkpoint"
-                               "SELECT slot_name FROM pgdh_mirror.checkpoint"
-                               "COPY public.checkpoint (slot_name) TO STDOUT"]]
-                  (let [state (try (sql! sink query) nil (catch SQLException error (.getSQLState error)))]
-                    (check! (= "42P01" state) "The legacy checkpoint is visible through SQL history" {:query query})))
-                (sql! sink "RESET datahike.as_of")
-                (sql! source "ALTER PUBLICATION checkpoint_pub ADD TABLE public.checkpoint")
-                (await! "Published checkpoint table did not replace the legacy SQL name"
-                        #(try (= [["published"]] (rows sink "SELECT note FROM public.checkpoint"))
-                              (catch SQLException _ false)))
-                (sql! source "UPDATE public.checkpoint SET note = 'after update'")
-                (await! "WAL for the published checkpoint table did not converge"
-                        #(= [["after update"]] (rows sink "SELECT note FROM public.checkpoint"))))
-              {:status :passed :store path}
-              (finally (mirror/stop! subscriber)))))))))
-
 (defn run-namespace-probe! [source-url]
   (let [directory (.toFile (Files/createTempDirectory "pgdh-mirror-scoped-store-" (make-array FileAttribute 0)))
         path (str (io/file directory "store"))
@@ -3116,7 +3087,93 @@
           (doseq [file (reverse (file-seq directory))]
             (io/delete-file file)))))))
 
-(defn -main [& [argument mode]]
+(defn- run-queued-crash-probe!
+  "Kill a mirror while queued commits are in flight, and again after commits
+   became durable and before their feedback. After each kill the publisher's
+   confirmed position must not be ahead of the durable checkpoint, and a
+   restart must converge with every publisher commit applied exactly once."
+  [admin-url directory]
+  (with-open [source (DriverManager/getConnection admin-url)]
+    (let [store (str directory "/queued-crash-store")
+          config {:source-url admin-url :publication "queued_crash_pub" :store-path store
+                  :max-in-flight-commits 8 :server {:port 0}}
+          commits 120
+          digest "SELECT count(*), md5(string_agg(id || ':' || payload, ',' ORDER BY id)) FROM queued_crash"
+          with-mirror (fn [f]
+                        (let [subscriber (mirror/start! config)]
+                          (try (f subscriber) (finally (mirror/stop! subscriber)))))]
+      (sql! source
+            "CREATE TABLE queued_crash (id bigint PRIMARY KEY, payload text NOT NULL)"
+            "INSERT INTO queued_crash SELECT n, 'base' FROM generate_series(1, 50) n"
+            "CREATE PUBLICATION queued_crash_pub FOR TABLE queued_crash")
+      (let [slot (with-mirror #(:slot (await-state! % :following)))
+            results
+            (vec
+             (for [[round mode] (map-indexed vector [:queued-in-flight :queued-durable])]
+               (let [before (durable-position store)
+                     base-tx (inspect-db store :max-tx)
+                     first-id (+ 1000 (* 1000 round))]
+                 ;; One row change per publisher commit, each with a new value.
+                 (dotimes [i commits]
+                   (sql! source (if (even? i)
+                                  (str "INSERT INTO queued_crash VALUES (" (+ first-id i) ", 'new-" round "-" i "')")
+                                  (str "UPDATE queued_crash SET payload = 'set-" round "-" i "' WHERE id = "
+                                       (inc (mod i 50))))))
+                 (child-crash! (assoc config :probe-crash-mode mode)
+                               (str directory "/" (name mode) "-crash.log"))
+                 (let [durable (durable-position store)
+                       [confirmed] (slot-query source slot "confirmed_flush_lsn")
+                       applied (inspect-db store
+                                           #(count (d/q '[:find [?tx ...]
+                                                          :in $ ?after
+                                                          :where [_ :queued_crash/payload _ ?tx] [(> ?tx ?after)]]
+                                                        (d/history %) base-tx)))]
+                   (check! (not (pos? (#'mirror/compare-lsn confirmed durable)))
+                           "The publisher's confirmed position is ahead of the durable checkpoint"
+                           {:mode mode :confirmed confirmed :durable durable})
+                   (check! (< applied commits) "The crash came after the whole backlog was applied"
+                           {:mode mode :applied applied})
+                   (when (= :queued-durable mode)
+                     (check! (pos? (#'mirror/compare-lsn durable before))
+                             "No queued commit was durable at the crash" {:before before :durable durable})
+                     (check! (pos? (#'mirror/compare-lsn durable confirmed))
+                             "Expected durable commits the publisher had not been told about"
+                             {:confirmed confirmed :durable durable}))
+                   (with-mirror (fn [subscriber]
+                                  (with-open [sink (DriverManager/getConnection (sink-url subscriber))]
+                                    (await! "The restarted mirror did not converge"
+                                            #(let [status (mirror/status subscriber)]
+                                               (check! (not (#{:failed :paused} (:state status)))
+                                                       "The restarted mirror stopped" status)
+                                               (= (rows source digest) (rows sink digest)))))))
+                   (let [recorded (inspect-db store
+                                              #(count (d/q '[:find [?tx ...]
+                                                             :in $ ?after
+                                                             :where [_ :queued_crash/payload _ ?tx] [(> ?tx ?after)]]
+                                                           (d/history %) base-tx)))]
+                     (check! (= commits recorded)
+                             "Publisher commits and local transactions differ after recovery"
+                             {:mode mode :commits commits :transactions recorded})
+                     ;; Every applied publisher transaction moves the checkpoint
+                     ;; in its own local transaction, whether or not it changed
+                     ;; a row. Besides the commits above, each mirror start emits
+                     ;; one barrier message. No transaction id may appear twice.
+                     (let [moves (inspect-db store
+                                             #(d/q '[:find ?tx ?xid
+                                                     :in $ ?after
+                                                     :where [_ :pgdh-mirror-source-xid ?xid ?tx true] [(> ?tx ?after)]]
+                                                   (d/history %) base-tx))]
+                       (check! (= (count moves) (count (set (map second moves))))
+                               "A publisher transaction was applied more than once"
+                               {:mode mode :moves (count moves)})
+                       (check! (<= commits (count moves) (+ commits 2))
+                               "The checkpoint moved more often than the publisher committed"
+                               {:mode mode :commits commits :moves (count moves)}))
+                     {:mode mode :applied-at-crash applied :confirmed-at-crash confirmed
+                      :durable-at-crash durable :transactions recorded})))))]
+        {:ok true :rounds results}))))
+
+(defn- dispatch-probe! [argument mode]
   (cond
     (= "--failover" argument)
     (prn (run-failover-probe! {:pg-bin (System/getenv "PG_MIRROR_PG_BIN")
@@ -3126,9 +3183,6 @@
                                :primary-url (System/getenv "PG_MIRROR_PRIMARY_URL")
                                :standby-url (System/getenv "PG_MIRROR_STANDBY_URL")
                                :source-url (System/getenv "PG_MIRROR_SOURCE_URL") :mode mode}))
-    (= "--checkpoint-upgrade" argument)
-    (prn (run-checkpoint-upgrade-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
-                                        (System/getenv "PG_MIRROR_RECOVERY_DIR")))
     (= "--slot-recovery" argument)
     (prn (run-slot-recovery-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
                                    (System/getenv "PG_MIRROR_SOURCE_URL")
@@ -3146,8 +3200,14 @@
           probe (if (= "--namespaces" argument) run-namespace-probe! run-frozen-index-probe!)]
       (check! (seq source) "Set PG_MIRROR_SOURCE_URL to a disposable publisher database" {})
       (prn (probe source)))
+    (= "--queued-crash" argument)
+    (prn (run-queued-crash-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
+                                  (System/getenv "PG_MIRROR_RECOVERY_DIR")))
     (= "--crash-worker" argument)
-    (run-crash-worker! (edn/read (PushbackReader. *in*)))
+    (let [config (edn/read (PushbackReader. *in*))]
+      (if (#{:queued-in-flight :queued-durable} (:probe-crash-mode config))
+        (run-queued-crash-worker! config)
+        (run-crash-worker! config)))
     :else
     (let [source (System/getenv "PG_MIRROR_SOURCE_URL")
           reference (System/getenv "PG_MIRROR_REFERENCE_URL")
@@ -3169,3 +3229,18 @@
               "--refresh" run-refresh-probe!
               run-probe!)
             source reference conninfo)))))
+
+(defn -main
+  "Run one probe. With PG_MIRROR_PROBE_QUEUE_DEPTH set to 2-32, every mirror
+   the probe starts, including its crash workers, uses queued replay at that
+   depth. Their crash workers interrupt `apply-commit!`, which only the serial
+   path calls, so those crash cases still exercise serial apply. `--queued-crash`
+   is the probe that kills a mirror on the queued path."
+  [& [argument mode]]
+  (if-let [depth (when-let [setting (System/getenv "PG_MIRROR_PROBE_QUEUE_DEPTH")]
+                   (or (parse-long setting)
+                       (throw (ex-info "PG_MIRROR_PROBE_QUEUE_DEPTH is not a number" {:value setting}))))]
+    (let [start! mirror/start!]
+      (with-redefs [mirror/start! #(start! (assoc % :max-in-flight-commits depth))]
+        (dispatch-probe! argument mode)))
+    (dispatch-probe! argument mode)))

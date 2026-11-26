@@ -5,6 +5,35 @@ It takes a consistent initial snapshot and then follows committed transactions
 over PostgreSQL's native logical replication protocol. The mirror keeps
 Datahike history from the snapshot onward. PostgreSQL remains the write endpoint.
 
+History is dated by the publisher. Each mirrored transaction is recorded at
+its PostgreSQL commit timestamp, in milliseconds, and the initial snapshot at
+the publisher's clock just after the snapshot was taken. `SET datahike.as_of` and
+`FOR SYSTEM_TIME AS OF` therefore select by the time the application
+committed, whatever the replication lag was. PostgreSQL does not guarantee
+that commit timestamps rise in commit order. A transaction whose timestamp
+is earlier than its predecessor's is recorded at the predecessor's instant,
+so outside a table or schema refresh a point in time selects a prefix of
+the publisher's commits. Transactions recorded by a release before this change keep the mirror's
+clock.
+
+Three kinds of transaction are not publisher commits. The mirror's own
+bookkeeping, such as the transaction a restart commits when it opens the
+store, is dated by the mirror's clock and changes no mirrored row. A schema
+or table refresh becomes visible at the publisher commit that completes its
+cutover, which is later than the original DDL. Changes to a table under
+refresh are held back until that cutover while other tables keep applying,
+so a time inside the refresh window can show a later commit to another table
+without an earlier commit to the refreshed one, and one publisher transaction
+that touched both appears at two instants. A resnapshot after slot loss
+is dated by the mirror's clock, or one millisecond after the last applied
+commit when that is later, and the commits that follow it share that instant
+until the publisher's commit times pass it.
+
+A time selects whole transactions. `SET datahike.as_of` also accepts a
+Datahike transaction number, and the batches of the initial snapshot are
+separate transactions: a number inside the snapshot selects the tables as
+far as they had been copied. Use a time to read the snapshot.
+
 ## Start a mirror
 
 On the PostgreSQL primary, set `wal_level = logical` and restart PostgreSQL
@@ -66,6 +95,9 @@ psql -X --host=127.0.0.1 --port=15432 --username=datahike \
 On a build with Datahike ordered transaction preparation, add
 `:max-in-flight-commits 8` to the mirror configuration to try queued replay.
 The default is one, and the experimental queue accepts depths up to 32.
+Status reports `:queued-replay :enabled`. A publisher constraint change that
+the queue cannot follow switches it off until the worker restarts, and status
+then reports `:queued-replay :suppressed`.
 It holds at most 8 MiB of queued source changes. The mirror opens the
 store with an exclusive Datahike writer. Keep independent Datahike writers
 off this store while the mirror owns it.
@@ -307,19 +339,51 @@ checkpoint reach durable storage together. Feedback reports committed positions
 only. After a disconnect, commits already in the checkpoint are acknowledged
 and skipped.
 
-The mirror upgrades an older SQL checkpoint in the same writer transaction
-that retires its storage and hides it from current and historical SQL.
-The publisher slot and applied position survive the upgrade.
-A publisher table named `public.checkpoint` uses its own storage.
-
 Status includes the applied and confirmed LSNs, retained WAL, and the most recent
 error. A paused worker that has already cut over serves the last committed
 state. When a connection drops, the worker reconnects with backoff and catches
 up from its durable checkpoint. A missing slot, an invalidated slot, or a
 confirmation ahead of the checkpoint pauses the mirror by default.
 
-Snapshot and transaction sizes are bounded by `:max-snapshot-bytes` and
-`:max-transaction-bytes`. The defaults are 128 MiB and 64 MiB respectively.
+The initial catch-up and a table refresh may take as long as they need while
+they keep applying commits. If nothing is applied for ten minutes, the worker
+reports `:reason :replication-stalled`, reconnects, and continues from its
+durable checkpoint. Data that is still arriving counts as progress;
+keepalives do not. The rule watches the stream: a local write that never
+completes is not detected by it, and neither is a refresh whose cutover
+barrier the publisher holds back, for example while it waits for a
+synchronized standby.
+
+Do not `TRUNCATE` a published table while the initial snapshot is being
+copied. PostgreSQL's `TRUNCATE` is not MVCC-safe: a table truncated before
+the copy reaches it reads as empty, and the mirror's history then shows it
+empty from the snapshot instant on. Current rows still converge.
+A stall that persists keeps the worker reconnecting with that reason in its
+status. It does not pause. A JVM error that ends the worker, such as an exhausted heap,
+is reported as state `:failed`, and the CLI exits with status 1. An error
+raised inside a local SQL statement, including an exhausted heap during a
+COPY, surfaces as a failed statement and pauses the worker instead.
+
+The initial snapshot is committed in batches of about 16 MiB of COPY data,
+so the copy does not have to fit in memory, and it has no size limit unless
+`:max-snapshot-bytes` is configured. A table with a composite primary key is
+still checked for uniqueness in memory, during the copy, in the last
+snapshot transaction, and when the listener opens, so a very large one can
+need more heap than its batches. The checkpoint receives its position
+with the last batch, after the worker has checked that the slot is still
+usable. A slot the publisher invalidates in the moment between that check
+and the first replication connection is handled like any later slot loss. If the snapshot stops before that last transaction begins, the worker
+drops its slot on the publisher when it still can (a lost connection, a
+killed process, or a failure inside the last transaction leaves the slot
+until the next start), and the next attempt discards the
+partial store and copies again. While a store is being replaced, the file
+`<store-path>.mirror-reset` holds the slot name; keep it with the store. Every batch is recorded at the same instant,
+so no point in time selects part of a snapshot.
+
+The snapshot of a table or schema refresh, and a resnapshot after slot loss,
+are staged in memory and bounded by `:max-snapshot-bytes`, 128 MiB by
+default. Transaction size is bounded by `:max-transaction-bytes`, 64 MiB by
+default.
 The worker checks ordinary row frames before decoding their fields. pgJDBC
 holds one complete wire frame in memory. The worker pauses when it hits a
 limit. Stop the worker and adjust the limit to retry. Cutover and occasional idle WAL confirmation use transactional logical
@@ -439,6 +503,12 @@ forked before the checkpoint and verifies that the mirror pauses.
 Run `sh test/integration/postgres-regress/mirror-slot-recovery.sh` to check
 recovery from dropped and invalidated slots, recovery while serving reads,
 and the snapshot cutover before and after a crash.
+Run `sh test/integration/postgres-regress/mirror-publisher.sh --queued-crash`
+to kill a mirror with queued commits in flight, and again after commits are
+durable and before their feedback. It checks that the publisher's confirmed
+position never passes the durable checkpoint and that a restart applies every
+publisher commit exactly once. Set `PG_MIRROR_PROBE_QUEUE_DEPTH` to run any
+other probe with queued replay.
 Run `sh test/integration/postgres-regress/mirror-publisher.sh --streaming`
 to verify interleaving, savepoint rollback, streamed schema catch-up,
 and replay after a spool limit or a crash.
@@ -447,35 +517,9 @@ The next stages cover more publication types and relations. See the
 [consolidation plan](consolidation-plan.md) and
 [PostgreSQL logical replication restrictions](https://www.postgresql.org/docs/18/logical-replication-restrictions.html).
 
-## Known performance trap in Option 2, today
-
-`DECLARE`/`FETCH`/`CLOSE` work, but each `FETCH` re-runs the stored
-query with `LIMIT n OFFSET pos` (`rewrite-cursor-page`). At the default
-`fetch_size` of 100 a 1M-row scan is 10k queries, each re-evaluating up
-to its offset: **O(n²)**. This is not FDW-specific -- pgjdbc with a
-fetch size, psycopg named cursors and plpgsql cursors all pay it.
-
-It looked like it might also be a **correctness** bug, because paging by
-`LIMIT/OFFSET` across re-executions is only sound under a *total* order
-and the order injected for a cursor without `ORDER BY` is
-`[1 :asc]` -- non-total as soon as the first column has duplicates.
-**Measured, and it does not reproduce:** 24 rows with 6 per
-first-column value, paged at 1, 3, 5 and 7, return every row exactly
-once. Each `FETCH` re-executes against the same frozen
-`:speculative-db` captured at `BEGIN`, and the executor is
-deterministic over an immutable snapshot, so successive executions
-agree on the tie order. `cursor-paging-does-not-repeat-or-skip-rows`
-in `pg_cursor_protocol_test.clj` pins that property, so a future
-paging or planner change cannot quietly take it away.
-
-So this is a performance item, not an S1 -- which also means the fix is
-free to change the strategy (hold an iterator, or materialize once per
-cursor) without a correctness argument to preserve.
-
 ## Open questions
 
 The next subscriber stages need measurements of staging large tables and
 retracting large relation sets on TRUNCATE. Mapping upstream `valid_from`
 and `valid_to` values to Datahike's transaction-level valid time also needs
-a separate design. FDW time travel depends on support for startup
-`options` in the session settings.
+a separate design.

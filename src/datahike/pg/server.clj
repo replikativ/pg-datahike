@@ -1462,6 +1462,12 @@
               tx-data))
       direct)))
 
+(def ^:dynamic *commit-instant*
+  "When bound to a java.util.Date, a transaction committed on this thread is
+   recorded at that instant instead of the local clock. The mirror binds it to
+   the publisher's commit time, so `datahike.as_of` selects by source time."
+  nil)
+
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
    recent-commit ring. EVERY server-side transact must go through this
@@ -1474,7 +1480,9 @@
    (assert-database-writable! "write")
    (let [report (d/transact conn (cond-> {:tx-data (guard-catalog-tx tx-data)}
                                    (seq tx-options)
-                                   (assoc :tx-options tx-options)))
+                                   (assoc :tx-options tx-options)
+                                   *commit-instant*
+                                   (assoc :tx-meta {:db/txInstant *commit-instant*})))
          db-after (:db-after report)
          eas (if (and (seq tx-data)
                       (every? direct-sequence-value-write? tx-data))
@@ -15252,9 +15260,7 @@
                                           :fast-path-count
                                           :full-parse-count)]
                              (swap! dispatch-stats update bucket (fnil inc 0)))))
-        private-storage (when (:database-read-only? opts) (pgs/mirror-private-storage (d/db conn)))
         session-state (atom (cond-> {:db-name (or db-name "datahike")}
-                              (seq private-storage) (assoc :private-storage private-storage)
                               ;; When the factory saw `database=X:feature`
                               ;; in the StartupMessage, pin the branch so
                               ;; every query on this session reads/writes-
