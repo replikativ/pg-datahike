@@ -687,6 +687,93 @@
     (is (= [[true true]] (query-rows c (str "SELECT to_regtype('public.upper_domain') IS NULL, "
                                             "to_regtype('public.upper_enum') IS NULL"))))))
 
+(deftest domain-defaults-fill-omitted-columns-and-respect-explicit-null
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [sql ["CREATE DOMAIN quota AS integer DEFAULT 7"
+                 "CREATE DOMAIN child_quota AS quota"
+                 "CREATE DOMAIN null_quota AS quota DEFAULT NULL"
+                 "CREATE TABLE domain_defaults (id int, inherited child_quota, explicit quota DEFAULT NULL, null_value null_quota)"
+                 "INSERT INTO domain_defaults (id) VALUES (1)"]]
+      (exec! c sql))
+    (is (= [[1 7 nil nil]] (query-rows c "SELECT * FROM domain_defaults")))
+    (exec! c "ALTER TABLE domain_defaults ALTER COLUMN explicit DROP DEFAULT")
+    (is (= [[7 7 nil]] (query-rows c (str "UPDATE domain_defaults SET inherited = DEFAULT, "
+                                          "explicit = DEFAULT, null_value = DEFAULT RETURNING inherited, explicit, null_value"))))
+    (exec! c "ALTER TABLE domain_defaults ADD COLUMN backfilled child_quota")
+    (exec! c "ALTER TABLE domain_defaults ADD COLUMN explicitly_empty child_quota DEFAULT NULL")
+    (let [copy-manager (.getCopyAPI (.unwrap c org.postgresql.PGConnection))]
+      (is (= 1 (.copyIn copy-manager "COPY domain_defaults (id) FROM STDIN"
+                        (java.io.StringReader. "2\n"))))
+      (is (= 1 (.copyIn copy-manager "COPY domain_defaults (id, inherited) FROM STDIN"
+                        (java.io.StringReader. "3\t\\N\n")))))
+    (is (= [[1 7 7 nil 7 nil] [2 7 7 nil 7 nil] [3 nil 7 nil 7 nil]]
+           (query-rows c "SELECT * FROM domain_defaults ORDER BY id")))))
+
+(deftest scalar-domain-defaults-match-postgres-regression
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [sql ["CREATE DOMAIN ddef1 AS int4 DEFAULT 3"
+                 "CREATE DOMAIN ddef2 AS oid DEFAULT '12'"
+                 "CREATE DOMAIN ddef3 AS text DEFAULT 5"
+                 "CREATE SEQUENCE ddef4_seq"
+                 "CREATE DOMAIN ddef4 AS int4 DEFAULT nextval('ddef4_seq')"
+                 "CREATE DOMAIN ddef5 AS numeric(8,2) NOT NULL DEFAULT '12.12'"
+                 (str "CREATE TABLE defaulttest (col1 ddef1, col2 ddef2, col3 ddef3, col4 ddef4 PRIMARY KEY, "
+                      "col5 ddef1 NOT NULL DEFAULT NULL, col6 ddef2 DEFAULT '88', col7 ddef4 DEFAULT 8000, col8 ddef5)")]]
+      (exec! c sql))
+    (doseq [preceding [nil "ALTER TABLE defaulttest ALTER COLUMN col5 SET DEFAULT NULL"]]
+      (when preceding (exec! c preceding))
+      (let [error (try (exec! c "INSERT INTO defaulttest (col4) VALUES (0)")
+                       nil
+                       (catch java.sql.SQLException error error))]
+        (is (= "23502" (some-> error .getSQLState))))
+      (exec! c "ALTER TABLE defaulttest ALTER COLUMN col5 DROP DEFAULT")
+      (exec! c "INSERT INTO defaulttest DEFAULT VALUES"))
+    (exec! c "INSERT INTO defaulttest DEFAULT VALUES")
+    (let [copy-manager (.getCopyAPI (.unwrap c org.postgresql.PGConnection))]
+      (is (= 1 (.copyIn copy-manager "COPY defaulttest (col5) FROM STDIN"
+                        (java.io.StringReader. "42\n")))))
+    (is (= [[3 12 "5" 1 3 88 8000 12.12M]
+            [3 12 "5" 2 3 88 8000 12.12M]
+            [3 12 "5" 3 3 88 8000 12.12M]
+            [3 12 "5" 4 42 88 8000 12.12M]]
+           (query-rows c "SELECT * FROM defaulttest ORDER BY col4")))))
+
+(deftest domain-defaults-validate-without-running-volatile-expressions
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [[query state] [["CREATE DOMAIN bad_literal AS integer DEFAULT 'bad'" "22P02"]
+                           ["CREATE DOMAIN bad_type AS integer DEFAULT CURRENT_DATE" "42804"]
+                           ["CREATE DOMAIN bad_column AS integer DEFAULT no_such_column" "0A000"]
+                           ["CREATE DOMAIN bad_subquery AS integer DEFAULT (SELECT 2)" "0A000"]]]
+      (let [error (try (exec! c query) nil (catch java.sql.SQLException error error))]
+        (is (= state (some-> error .getSQLState)) query)))
+    (exec! c "CREATE DOMAIN below_zero AS integer DEFAULT 1 CHECK (VALUE < 0)")
+    (exec! c "CREATE TABLE checked (x below_zero)")
+    (let [error (try (exec! c "INSERT INTO checked DEFAULT VALUES")
+                     nil
+                     (catch java.sql.SQLException error error))]
+      (is (= "23514" (some-> error .getSQLState))))))
+
+(deftest domain-sequence-defaults-keep-their-binding-and-dump-portably
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [sql ["CREATE SEQUENCE domain_counter"
+                 "CREATE DOMAIN allocated_id AS integer DEFAULT nextval('domain_counter')"
+                 "CREATE TABLE allocated_rows (id allocated_id)"
+                 "CREATE SCHEMA shadow"
+                 "CREATE SEQUENCE shadow.domain_counter START 100"
+                 "SET search_path TO shadow, public"]]
+      (exec! c sql))
+    (is (= [[1]] (query-rows c "INSERT INTO public.allocated_rows DEFAULT VALUES RETURNING id")))
+    (is (= [[2]] (query-rows c "INSERT INTO public.allocated_rows VALUES (DEFAULT) RETURNING id")))
+    (doseq [[query state] [["DROP SEQUENCE public.domain_counter" "2BP01"]
+                           ["DROP SEQUENCE public.domain_counter CASCADE" "0A000"]]]
+      (let [error (try (exec! c query) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> error .getSQLState)) query)))
+    (let [sql (dump/dump-to-string *conn*)
+          seq-pos (str/index-of sql "CREATE SEQUENCE \"domain_counter\"")
+          domain-pos (str/index-of sql "CREATE DOMAIN \"allocated_id\"")]
+      (is (and seq-pos domain-pos (< seq-pos domain-pos)))
+      (is (str/includes? sql "nextval('domain_counter')")))))
+
 (deftest create-domain-bare-alias
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN big AS bigint")

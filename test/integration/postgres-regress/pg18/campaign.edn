@@ -81,7 +81,12 @@
        :test-var "concrete-enum-overload-wins-over-polymorphic-argument"}]}
     {:name "domain", :boundaries #{:constraints :user-type :casts}, :mode :discovery
      :blockers #{:domain-definition-validation :domain-dependencies :domain-arrays
-                 :domain-composites :domain-value-coercion}}
+                 :domain-composites :domain-value-coercion}
+     :strict-slices
+     [{:id :scalar-domain-defaults
+       :source-lines [386 421]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "scalar-domain-defaults-match-postgres-regression"}]}
     {:name "create_type", :boundaries #{:type-ddl :type-lookup}, :mode :unmeasured}
     {:name "type_sanity", :boundaries #{:type-registry :catalogs}, :mode :unmeasured}
     {:name "opr_sanity", :boundaries #{:catalogs :operator-registry}, :mode :unmeasured}

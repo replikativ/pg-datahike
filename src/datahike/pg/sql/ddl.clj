@@ -513,7 +513,7 @@
         (every? #(= "a" (:kind %)) procs) (reject-default-expression! "aggregate")
         (every? :retset procs) (reject-default-expression! "set")))))
 
-(defn- validate-default-expression! [^Expression expr]
+(defn validate-default-expression! [^Expression expr]
   (.accept expr
            (DefaultExpressionVisitor.
             (reify Consumer (accept [_ kind] (reject-default-expression! kind)))

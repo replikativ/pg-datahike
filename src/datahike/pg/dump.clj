@@ -376,7 +376,9 @@
                    :check-name (:datahike.pg.domain/check-name ent)
                    :check-expr (:datahike.pg.domain/check-expr ent)
                    :not-null (:datahike.pg.domain/not-null ent)
-                   :default-raw (:datahike.pg.domain/default-raw ent)})))
+                   :default-raw (some-> (:datahike.pg.domain/default-raw ent)
+                                        (ddl/rewrite-default-sequence-references
+                                         (partial portable-counter-reference db)))})))
          (sort-by (juxt :depth :name))
          vec)))
 
@@ -601,22 +603,19 @@
        "SET client_encoding = 'UTF8';"
        "SET standard_conforming_strings = on;"]
 
-      ;; ENUMs and DOMAINs first — CREATE TABLE may reference them.
-      (when schema?
-        (let [enums (collect-enums db)
-              domains (collect-domains db)]
-          (concat
-           (when (seq enums)
-             (concat [""] (map emit-create-enum enums)))
-           (when (seq domains)
-             (concat [""] (map emit-create-domain domains))))))
-
-      ;; Defaults can bind to sequences while CREATE TABLE is running.
+      ;; Domains and tables can bind defaults to sequences at creation.
       (when schema?
         (concat
          (map #(str "CREATE SCHEMA IF NOT EXISTS " (quote-ident %) ";") (sort sequence-schemas))
          (when (seq seqs)
            (concat [""] (map emit-create-sequence seqs)))
+         (let [enums (collect-enums db)
+               domains (collect-domains db)]
+           (concat
+            (when (seq enums)
+              (concat [""] (map emit-create-enum enums)))
+            (when (seq domains)
+              (concat [""] (map emit-create-domain domains)))))
          (mapcat (fn [t]
                    ["" (str "-- Table: " (quote-ident (:table t)))
                     (emit-create-table db t)])

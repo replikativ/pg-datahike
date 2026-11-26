@@ -81,7 +81,7 @@
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.statement.select Select Limit Offset]
-           [net.sf.jsqlparser.expression LongValue]))
+           [net.sf.jsqlparser.expression LongValue NullValue StringValue]))
 
 (set! *warn-on-reflection* true)
 
@@ -3755,13 +3755,13 @@
                            schema db {:table table})
               assignments (:assignments projections)
               quoted #(str \" (str/replace % "\"" "\"\"") \")
-              column-constraints (read-column-constraints db table)
               assignments
-              (mapv (fn [{:keys [column value-expr] :as a}]
+              (mapv (fn [{:keys [column attr value-expr] :as a}]
                       (if (and (instance? Column value-expr)
                                (nil? (.getTable ^Column value-expr))
                                (= "default" (str/lower-case (.getColumnName ^Column value-expr))))
-                        (let [[kind value arg] (:default (get column-constraints column))]
+                        (let [[kind value arg] (row-constraints/column-default
+                                                db (d/entity db (or attr (keyword table column))))]
                           (cond
                             (= :nextval kind)
                             (assoc a :sql (str "nextval('" (str/replace (or arg value) "'" "''") "')"))
@@ -5695,6 +5695,15 @@
 (defn- drop-owned-sequences-tx [db names excluded-default? cascade?]
   (let [dependencies (remove excluded-default?
                              (catalog/defaults-depending-on-sequences db names))]
+    (when-let [{:keys [domain sequence]} (first (catalog/domain-defaults-depending-on-sequences db names))]
+      (if cascade?
+        (throw (errors/pg-error :feature-not-supported
+                                {:feature "dropping sequences with dependent domains"}))
+        (throw (ex-info (str "cannot drop sequence " (fns/quote-identifier sequence)
+                             " because other objects depend on it")
+                        {:sqlstate "2BP01"
+                         :detail (str "type " domain " depends on sequence " sequence)
+                         :hint "Use DROP ... CASCADE to drop the dependent objects too."}))))
     (when (and (seq dependencies) (not cascade?))
       (let [{:keys [table column sequence]} (first dependencies)]
         (throw (ex-info (str "cannot drop sequence " (fns/quote-identifier sequence)
@@ -11919,9 +11928,12 @@
     :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
    {:db/ident :datahike.pg.domain/default-raw
     :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/default-resolved?
+    :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
    (cond-> {:datahike.pg.domain/name domain-name
             :datahike.pg.domain/base-type base-type
             :datahike.pg.domain/base-oid (long base-oid)
+            :datahike.pg.domain/default-resolved? true
             :datahike.pg.domain/not-null (boolean not-null)}
      (seq base-args)         (assoc :datahike.pg.domain/base-args (set base-args)
                                     :datahike.pg.domain/base-typmods (str/join ", " base-args))
@@ -11954,6 +11966,36 @@
         (assoc domain :base-type typname :base-args args))
       :else domain)))
 
+(defn- resolve-domain-default [db {:keys [base-oid default-raw] :as domain}]
+  (let [base (params/domain-base-object db base-oid)
+        parent (when (= :domain (:datahike.pg.object/kind base))
+                 (params/domain-spec-by-name db (:datahike.pg.object/name base)))]
+    (if default-raw
+      (let [expression (some-> (ddl/parse-default-expression default-raw)
+                               params/unwrap-scalar-parens)]
+        (when-not expression
+          (throw (ex-info "invalid domain DEFAULT expression" {:sqlstate "42601"})))
+        (ddl/validate-default-expression! expression)
+        (let [source (first (row-eval/row-oids [expression] nil (dbi/-schema db) db))
+              storage-type (or parent domain)
+              target (:base-oid storage-type)]
+          (when (and (not (oid/untyped-literal? expression))
+                     (not (pgs/assignment-cast-exists? db source target)))
+            (throw (ex-info "domain DEFAULT expression has incompatible type"
+                            {:sqlstate "42804" :error :datatype-mismatch})))
+          ;; An unknown string literal is read as the base type at CREATE
+          ;; time. General expressions and domain checks run on each write.
+          (when (and (instance? StringValue expression) (types/catalog-type target))
+            (sql-cast/cast-scalar (.getNotExcapedValue ^StringValue expression)
+                                  (params/domain-storage-type storage-type)
+                                  {:explicit? false})))
+        (assoc domain :default-raw
+               (if (instance? NullValue expression)
+                 "NULL"
+                 (:pg/default-value
+                  (bind-sequence-default db {:pg/default-kind :expr :pg/default-value default-raw})))))
+      (cond-> domain parent (assoc :default-raw (:default-raw parent))))))
+
 (defn- exec-ddl-create-domain
   [ctx parsed]
   (let [{:keys [conn tx-state session-id]} ctx
@@ -11969,7 +12011,7 @@
           (classified-error ""
                             (ex-info (str "type " (pr-str domain-name) " already exists")
                                      {:error :duplicate-object :sqlstate "42710"}))
-          (let [domain (resolve-domain-base db domain)
+          (let [domain (resolve-domain-default db (resolve-domain-base db domain))
                 {:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
                 create-data
                 (into (vec tx-data)
@@ -12883,19 +12925,21 @@
           (when (:pg/not-null entity)
             [[:db/retract eid :pg/not-null true]]))))))
 
-(defn- alter-default-metadata [default type-name column]
+(defn- alter-default-metadata [default type-name column domain?]
   (let [{:keys [kind value raw]} default]
     (when (= :unsupported kind)
       (throw (errors/pg-error
               :feature-not-supported
               {:message (str "DEFAULT expression " (pr-str raw)
                              " on column \"" column "\" is not supported")})))
-    (when (some? value)
+    ;; An explicit NULL default masks a domain default. Base columns
+    ;; can keep the implicit NULL instead, as PostgreSQL does.
+    (when (or (some? value) (and default domain?))
       (cond-> {:pg/default-kind (if (and (= kind :literal) (string? value)
                                          (#{"bit" "varbit"} type-name))
                                   :bit-coerced
-                                  kind)
-               :pg/default-value (str value)}
+                                  kind)}
+        (some? value) (assoc :pg/default-value (str value))
         (= kind :nextval) (assoc :pg/default-arg value)))))
 
 (defn- alter-column-default-tx [db table relation-oid {:keys [name default search-path]}]
@@ -12906,7 +12950,8 @@
         eid (:db/id entity)
         metadata (binding [regoid/*search-path* search-path]
                    (bind-sequence-default
-                    db (alter-default-metadata default (types/oid->pg-name (:datahike.pg.column/type-oid column)) name)))]
+                    db (alter-default-metadata default (types/oid->pg-name (:datahike.pg.column/type-oid column))
+                                               name (:datahike.pg/domain-of entity))))]
     (when (or (:pg/generated entity) (identity-storage-column? db table attr))
       (throw (ex-info (str "column \"" name "\" of relation \"" table "\" "
                            (if (:pg/generated entity) "is a generated column" "is an identity column"))
@@ -12925,10 +12970,9 @@
   (let [column (alterable-column schema-db table relation-oid name "ADD COLUMN with a default or NOT NULL")
         attr (:datahike.pg.column/storage-ident column)
         entity (d/entity schema-db attr)
-        kind (:pg/default-kind entity)
-        default (when kind [kind (:pg/default-value entity) (:pg/default-arg entity)])
-        ast (when (= :expr kind)
-              (ddl/parse-default-expression (:pg/default-value entity)))
+        default (row-constraints/column-default schema-db entity)
+        [kind default-sql] default
+        ast (when (= :expr kind) (ddl/parse-default-expression default-sql))
         schema (dbi/-schema schema-db)
         input-schema (dbi/-schema db)
         _ (when ast (row-eval/row-oids [ast] nil input-schema db))
@@ -13456,7 +13500,8 @@
                                                                      type-object normalized-type array-spec]}
                                                              (get add-spec-by-name name)
                                                              metadata (bind-sequence-default
-                                                                       db (alter-default-metadata default base-type name))
+                                                                       db (alter-default-metadata default base-type name
+                                                                                                  (= :domain (:datahike.pg.object/kind type-object))))
                                                              raw-type type
                                                              unsupported-base (str/replace raw-type #"\s*\([^)]*\)" "")
                                                              _ (when (types/unsupported-input-type? unsupported-base)
@@ -14277,6 +14322,7 @@
                  ;; no longer bound and `trigger-handler!` refuses with
                  ;; "a trigger on \"t\" cannot run in this context".
                  :statement-handler params/*statement-handler*
+                 :row-execute     params/*row-execute*
                  :catalog-basis   (catalog-basis/capture db-now)
                ;; A transaction may have its own speculative DDL, so retain a
                ;; second basis for the durable branch.  Checking both before
@@ -14538,6 +14584,7 @@
             regoid/*database-name* (or (:regoid-database-name copy-session) "datahike")
             regoid/*temp-tables* (:regoid-temp-tables copy-session)
             params/*statement-time* (:statement-time copy-session)
+            params/*row-execute* (:row-execute copy-session)
             datetime-in/*transaction-time* (:transaction-time copy-session)
             params/*scalar-subquery-cache* (:scalar-subquery-cache copy-session)
             params/*cancel* (:cancel copy-session)]

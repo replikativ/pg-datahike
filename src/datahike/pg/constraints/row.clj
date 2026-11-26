@@ -17,6 +17,17 @@
             [datahike.pg.sql.params :as params])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]))
 
+(defn column-default
+  "A column's declared default, falling back to its domain's default."
+  [db entity]
+  (or (ddl/stored-column-default db (:pg/default-kind entity) (:pg/default-value entity)
+                                 (:pg/default-arg entity))
+      (when-not (or (:pg/generated entity) (:pg/publisher-generated? entity))
+        (when-let [value (:default-raw (params/domain-spec-by-name db (:datahike.pg/domain-of entity)))]
+          (if (.equalsIgnoreCase "null" (str/trim value))
+            [:literal nil nil]
+            (ddl/stored-column-default db :expr value nil))))))
+
 (defn column-specs [db table-name]
   (let [schema (:schema db)
         ancestors (loop [child table-name, seen #{table-name}, out []]
@@ -51,9 +62,7 @@
                                              ancestors)
                                        attr))
                             entity (d/entity db attr)
-                            publisher-generated? (:pg/publisher-generated? entity)
-                            kind (:pg/default-kind entity)
-                            argument (:pg/default-arg entity)]
+                            publisher-generated? (:pg/publisher-generated? entity)]
                         {:name name :attr attr
                          :not-null? (true? (:pg/not-null entity))
                          ;; GENERATED ALWAYS AS (expr) STORED. Carried
@@ -64,7 +73,7 @@
                          :publisher-generated? publisher-generated?
                          :generated (when-not publisher-generated? (:pg/generated entity))
                          :generated-expr (when-not publisher-generated? (:pg/generated-expr entity))
-                         :default (ddl/stored-column-default db kind (:pg/default-value entity) argument)}))))
+                         :default (column-default db entity)}))))
             ordered-columns))))
 
 (defn constraint-metadata

@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Scalar domain defaults apply to omitted values
+
+Omitted columns use their declared default or the default inherited from
+their domain. INSERT, UPDATE DEFAULT, COPY, and column backfill share
+that lookup. An explicit NULL value stays NULL, and a column declared
+DEFAULT NULL can mask a domain default. Sequence expressions keep their
+catalog binding, and dumps create the referenced sequences before domains.
+
 ### The mirror dates history by the publisher, and its first snapshot no longer has to fit in memory
 
 Four changes to the PostgreSQL logical-replication mirror ([guide](doc/postgres-mirroring.md)).
