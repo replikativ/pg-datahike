@@ -2694,69 +2694,6 @@
             (when (= ["false"] (slot-query source native-slot "active::text"))
               (sql! source (str "SELECT pg_drop_replication_slot(" (literal native-slot) ")")))))))))
 
-(defn- run-checkpoint-upgrade-probe! [url directory]
-  (let [path (str directory "/checkpoint-store")
-        config {:source-url url :publication "checkpoint_pub" :store-path path :server {:port 0}}
-        store #(let [conn (#'mirror/open-store path)]
-                 (try (with-open [handler (pg/make-query-handler conn)] (% conn handler))
-                      (finally (d/release conn))))]
-    (with-open [source (DriverManager/getConnection url)]
-      (sql! source "CREATE TABLE anchor (id integer PRIMARY KEY, note text)"
-            "INSERT INTO anchor VALUES (1, 'original')"
-            "CREATE TABLE public.checkpoint (id integer PRIMARY KEY, note text)"
-            "INSERT INTO public.checkpoint VALUES (1, 'published')"
-            "CREATE PUBLICATION checkpoint_pub FOR TABLE anchor")
-      (let [subscriber (mirror/start! config)]
-        (try (await-state! subscriber :following)
-             (finally (mirror/stop! subscriber))))
-      (let [{:keys [origin slot publication manifest end-lsn] :as saved} (durable-checkpoint path)]
-        ;; Install the schema and row emitted by the earlier SQL checkpoint.
-        (store (fn [_ handler]
-                 (#'mirror/transaction!
-                  handler
-                  (fn []
-                    (#'mirror/sink-execute!
-                     handler
-                     (str "CREATE TABLE pgdh_mirror.checkpoint (id integer PRIMARY KEY, "
-                          "origin text NOT NULL, slot_name text NOT NULL, publication text NOT NULL, "
-                          "manifest text, end_lsn text, source_xid text, source_commit_micros text)"))
-                    (#'mirror/sink-prepared!
-                     handler
-                     (str "INSERT INTO pgdh_mirror.checkpoint "
-                          "(id, origin, slot_name, publication, manifest, end_lsn) VALUES (1, ?, ?, ?, ?, ?)")
-                     [(pr-str origin) slot publication (pr-str manifest) end-lsn])
-                    (#'mirror/stage-data! handler
-                                          (constantly [[:db/retractEntity [:pgdh-mirror-key :checkpoint]]]))))))
-        (let [legacy-at (inspect-db path #(str (.toInstant ^java.util.Date
-                                                (:db/txInstant (d/entity % (:max-tx %))))))]
-          (with-open [_ (#'mirror/acquire-store-lock path)]
-            (store #'mirror/upgrade-checkpoint!))
-          (let [after (durable-checkpoint path)]
-            (check! (= (select-keys saved [:slot :origin :end-lsn])
-                       (select-keys after [:slot :origin :end-lsn]))
-                    "Upgrading the legacy record changed the stored position" {}))
-          (let [subscriber (mirror/start! config)]
-            (try
-              (check! (= slot (:slot (await-state! subscriber :following))) "Upgrade replaced the source slot" {})
-              (with-open [sink (DriverManager/getConnection (sink-url subscriber))]
-                (check! (= [["original"]] (rows sink "SELECT note FROM anchor")) "Upgrade changed table contents" {})
-                (sql! sink (str "SET datahike.as_of = " (literal legacy-at)))
-                (doseq [query ["SELECT slot_name FROM public.checkpoint"
-                               "SELECT slot_name FROM pgdh_mirror.checkpoint"
-                               "COPY public.checkpoint (slot_name) TO STDOUT"]]
-                  (let [state (try (sql! sink query) nil (catch SQLException error (.getSQLState error)))]
-                    (check! (= "42P01" state) "The legacy checkpoint is visible through SQL history" {:query query})))
-                (sql! sink "RESET datahike.as_of")
-                (sql! source "ALTER PUBLICATION checkpoint_pub ADD TABLE public.checkpoint")
-                (await! "Published checkpoint table did not replace the legacy SQL name"
-                        #(try (= [["published"]] (rows sink "SELECT note FROM public.checkpoint"))
-                              (catch SQLException _ false)))
-                (sql! source "UPDATE public.checkpoint SET note = 'after update'")
-                (await! "WAL for the published checkpoint table did not converge"
-                        #(= [["after update"]] (rows sink "SELECT note FROM public.checkpoint"))))
-              {:status :passed :store path}
-              (finally (mirror/stop! subscriber)))))))))
-
 (defn run-namespace-probe! [source-url]
   (let [directory (.toFile (Files/createTempDirectory "pgdh-mirror-scoped-store-" (make-array FileAttribute 0)))
         path (str (io/file directory "store"))
@@ -3217,6 +3154,16 @@
                      (check! (= commits recorded)
                              "Publisher commits and local transactions differ after recovery"
                              {:mode mode :commits commits :transactions recorded})
+                     ;; Every applied commit moves the checkpoint in its own
+                     ;; transaction, whether or not it changed a row.
+                     (let [moves (inspect-db store
+                                             #(count (d/q '[:find [?tx ...]
+                                                            :in $ ?after
+                                                            :where [_ :pgdh-mirror-end-lsn _ ?tx true] [(> ?tx ?after)]]
+                                                          (d/history %) base-tx)))]
+                       (check! (= commits moves)
+                               "The checkpoint moved a different number of times than the publisher committed"
+                               {:mode mode :commits commits :moves moves}))
                      {:mode mode :applied-at-crash applied :confirmed-at-crash confirmed
                       :durable-at-crash durable :transactions recorded})))))]
         {:ok true :rounds results}))))
@@ -3231,9 +3178,6 @@
                                :primary-url (System/getenv "PG_MIRROR_PRIMARY_URL")
                                :standby-url (System/getenv "PG_MIRROR_STANDBY_URL")
                                :source-url (System/getenv "PG_MIRROR_SOURCE_URL") :mode mode}))
-    (= "--checkpoint-upgrade" argument)
-    (prn (run-checkpoint-upgrade-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
-                                        (System/getenv "PG_MIRROR_RECOVERY_DIR")))
     (= "--slot-recovery" argument)
     (prn (run-slot-recovery-probe! (System/getenv "PG_MIRROR_RECOVERY_ADMIN_URL")
                                    (System/getenv "PG_MIRROR_SOURCE_URL")

@@ -338,11 +338,6 @@ checkpoint reach durable storage together. Feedback reports committed positions
 only. After a disconnect, commits already in the checkpoint are acknowledged
 and skipped.
 
-The mirror upgrades an older SQL checkpoint in the same writer transaction
-that retires its storage and hides it from current and historical SQL.
-The publisher slot and applied position survive the upgrade.
-A publisher table named `public.checkpoint` uses its own storage.
-
 Status includes the applied and confirmed LSNs, retained WAL, and the most recent
 error. A paused worker that has already cut over serves the last committed
 state. When a connection drops, the worker reconnects with backoff and catches
@@ -354,7 +349,14 @@ they keep applying commits. If nothing is applied for ten minutes, the worker
 reports `:reason :replication-stalled`, reconnects, and continues from its
 durable checkpoint. Data that is still arriving counts as progress;
 keepalives do not. The rule watches the stream: a local write that never
-completes is not detected by it.
+completes is not detected by it, and neither is a refresh whose cutover
+barrier the publisher holds back, for example while it waits for a
+synchronized standby.
+
+Do not `TRUNCATE` a published table while the initial snapshot is being
+copied. PostgreSQL's `TRUNCATE` is not MVCC-safe: a table truncated before
+the copy reaches it reads as empty, and the mirror's history then shows it
+empty from the snapshot instant on. Current rows still converge.
 A stall that persists keeps the worker reconnecting with that reason in its
 status. It does not pause. A JVM error that ends the worker, such as an exhausted heap,
 is reported as state `:failed`, and the CLI exits with status 1. An error
@@ -363,12 +365,15 @@ COPY, surfaces as a failed statement and pauses the worker instead.
 
 The initial snapshot is committed in batches of about 16 MiB of COPY data,
 so the copy does not have to fit in memory, and it has no size limit unless
-`:max-snapshot-bytes` is configured. Opening the listener afterwards still
-checks each table's primary key in memory, which for a very large table
-with a composite key can need more heap than the copy did. The checkpoint receives its position
-with the last batch. If the snapshot stops before that, the worker drops its
-slot on the publisher when it still can (a lost connection or a killed
-process leaves the slot until the next start), and the next attempt discards the
+`:max-snapshot-bytes` is configured. A table with a composite primary key is
+still checked for uniqueness in memory, during the copy, in the last
+snapshot transaction, and when the listener opens, so a very large one can
+need more heap than its batches. The checkpoint receives its position
+with the last batch, after the worker has checked that the slot is still
+usable. If the snapshot stops before that last transaction begins, the worker
+drops its slot on the publisher when it still can (a lost connection, a
+killed process, or a failure inside the last transaction leaves the slot
+until the next start), and the next attempt discards the
 partial store and copies again. While a store is being replaced, the file
 `<store-path>.mirror-reset` holds the slot name; keep it with the store. Every batch is recorded at the same instant,
 so no point in time selects part of a snapshot.

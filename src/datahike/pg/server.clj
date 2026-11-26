@@ -15260,9 +15260,7 @@
                                           :fast-path-count
                                           :full-parse-count)]
                              (swap! dispatch-stats update bucket (fnil inc 0)))))
-        private-storage (when (:database-read-only? opts) (pgs/mirror-private-storage (d/db conn)))
         session-state (atom (cond-> {:db-name (or db-name "datahike")}
-                              (seq private-storage) (assoc :private-storage private-storage)
                               ;; When the factory saw `database=X:feature`
                               ;; in the StartupMessage, pin the branch so
                               ;; every query on this session reads/writes-

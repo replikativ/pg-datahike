@@ -761,7 +761,6 @@
    :publication :db.type/string
    :manifest :db.type/string
    :end-lsn :db.type/string
-   :legacy-checkpoint :db.type/boolean
    :source-xid :db.type/long
    :source-commit-micros :db.type/long})
 
@@ -1151,6 +1150,8 @@
    (long (first (query source "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint" []
                        #(.getLong ^ResultSet % 1))))))
 
+(declare usable-slot!)
+
 (defn- bootstrap! [replication source destination {:keys [slot origin manifest]} check-running!
                    {:keys [failover? initial-snapshot-bytes] :as config}]
   ;; The unique slot name was persisted locally before its first creation.
@@ -1194,6 +1195,10 @@
               (doseq [table tables]
                 (check-running!)
                 (copy-table! source destination table on-bytes)))
+            ;; A long copy can outlast the WAL the publisher keeps for the slot.
+            ;; Writing the end LSN for a slot that is already unusable would
+            ;; leave a store that every restart keeps and none can resume.
+            (usable-slot! source slot failover?)
             (vreset! finishing? true)
             (transaction!
              destination instant
@@ -2416,42 +2421,6 @@
                               :datahike.pg.partition/key :datahike.pg.partition/key-definition
                               :datahike.pg.partition/bound]))))))))
 
-(def ^:private legacy-checkpoint-columns
-  ["id" "origin" "slot_name" "publication" "manifest" "end_lsn" "source_xid" "source_commit_micros"])
-
-(defn- upgrade-checkpoint! [conn destination]
-  (let [db (d/db conn)
-        columns (pgs/registered-columns db "checkpoint")]
-    (when (and (nil? (checkpoint-entity db)) (seq columns))
-      (require! (= legacy-checkpoint-columns (mapv :datahike.pg.column/name columns))
-                "Unexpected checkpoint relation in the mirror store" {})
-      (let [entity-id (d/q '[:find ?entity .
-                             :where [?entity :checkpoint/id 1]] db)
-            {:checkpoint/keys [origin slot_name publication manifest end_lsn source_xid source_commit_micros]}
-            (when entity-id (d/entity db entity-id))
-            saved {:origin (some-> origin edn/read-string) :slot slot_name :publication publication
-                   :manifest (some-> manifest edn/read-string) :end-lsn end_lsn
-                   :source-xid (some-> source_xid parse-long)
-                   :source-commit-micros (some-> source_commit_micros parse-long)}]
-        (require! (and entity-id (map? (:origin saved)) (seq slot_name) (seq publication)
-                       (or (nil? end_lsn) (map? (:manifest saved))))
-                  "Invalid legacy mirror checkpoint" {})
-        (transaction!
-         destination
-         ;; The new checkpoint carries a position that was reached earlier.
-         ;; Record it at that transaction's instant, so the floor for the
-         ;; next publisher commit is not raised to the time of the upgrade.
-         (some-> (first (d/datoms db :eavt entity-id :checkpoint/end_lsn))
-                 :tx (->> (d/entity db)) :db/txInstant)
-         (fn []
-           (stage-data! destination
-                        #(create-checkpoint-tx %
-                                               (-> saved
-                                                   (assoc :legacy-checkpoint true)
-                                                   (update-in [:manifest :retired-storage] (fnil conj #{}) "checkpoint"))))
-           (retire-table! destination {:schema "public" :name "checkpoint"})
-           (stage-data! destination (constantly [[:db/retractEntity entity-id]]))))))))
-
 (defn- update-type-names-tx [db removals edits]
   (let [rename-ops (into []
                          (mapcat (fn [[old current]]
@@ -3141,6 +3110,8 @@
               (with-open [destination (pg/make-query-handler conn)]
                 (init-checkpoint! destination origin slot publication))
               (finally (d/release conn))))))
+      ;; The new store's entry goes to disk before the reset file leaves.
+      (sync-directory! (.getParentFile (.getAbsoluteFile file)))
       (io/delete-file file)
       (sync-directory! (.getParentFile (.getAbsoluteFile file))))))
 
@@ -3188,8 +3159,6 @@
                  (let [^PgWireServer server (:server @listener)]
                    (swap! state assoc :state :following :port (.getPort server) :last-error nil)))
         attempt! (fn []
-                   (with-open [destination (pg/make-query-handler @store)]
-                     (upgrade-checkpoint! @store destination))
                    ;; No listener exists before the first snapshot finishes, so
                    ;; nothing else holds the connection that is replaced here.
                    (reset! store (discard-incomplete-snapshot! @store config))
@@ -3332,6 +3301,10 @@
                         (spool/prepare! spool-store)
                         (finish-store-reset! directory max-in-flight-commits)
                         (let [store (atom (open-store directory max-in-flight-commits))]
+                          ;; The store and its lock file must be on disk
+                          ;; under their names before a slot is created for
+                          ;; them, or a power loss leaves a slot nobody knows.
+                          (sync-directory! (.getParentFile (.getAbsoluteFile (io/file directory))))
                           (try (serve! config store state stopping?)
                                (finally (d/release @store)))))
                       (when @stopping? (swap! state assoc :state :stopped :port nil))
@@ -3341,7 +3314,10 @@
                       (catch Throwable e
                         (swap! state assoc :state :failed :port nil :last-error (mirror-error e)))))
                   "pg-datahike-logical-subscriber")]
-      (.start worker)
+      (try (.start worker)
+           (catch Throwable e
+             (.close lock)
+             (throw e)))
       {:state state :stopping? stopping? :worker worker :spool-bytes (:bytes spool-store)
        :transport transport})))
 

@@ -586,13 +586,6 @@
 
 (def mirror-checkpoint-id [:pgdh-mirror-key :checkpoint])
 
-(defn mirror-private-storage [db]
-  ;; Use the listener's live database so a historical SQL snapshot also
-  ;; hides the checkpoint table retained in older store histories.
-  (when (contains? (dbi/-schema db) (first mirror-checkpoint-id))
-    (when (:pgdh-mirror-legacy-checkpoint (d/entity db mirror-checkpoint-id))
-      #{"checkpoint"})))
-
 (defn- as-of-view? [db]
   (and db (= :as-of (get-in (dbi/-secondary-view db) [:system :mode]))))
 

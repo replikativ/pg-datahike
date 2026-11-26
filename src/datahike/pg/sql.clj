@@ -407,7 +407,7 @@
                   ;; in the session zone and FOLDED while translating,
                   ;; so without it in the key the first execution's
                   ;; value is served to a session in another zone.
-                  [:search-path :db-name :date-style :time-zone :private-storage]))])
+                  [:search-path :db-name :date-style :time-zone]))])
 
 (defn- translation-cache-key [sql schema db]
   ;; Keep exact values, not their hashes: native catalog transactions do not
