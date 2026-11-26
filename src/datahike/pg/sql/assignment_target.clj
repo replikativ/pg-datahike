@@ -127,13 +127,15 @@
      :expression (doto (Function.) (.setName name))
      :program program}))
 
+(defn default-expression? [expression]
+  (and (instance? Column expression)
+       (.equalsIgnoreCase "default" (.getColumnName ^Column expression))
+       (nil? (some-> ^Column expression .getTable .getName))))
+
 (defn reject-partial-default!
   "DEFAULT has no PostgreSQL meaning as a subscript replacement value."
   [target expression]
-  (when (and (partial-target? target)
-             (instance? Column expression)
-             (.equalsIgnoreCase "default" (.getColumnName ^Column expression))
-             (nil? (some-> ^Column expression .getTable .getName)))
+  (when (and (partial-target? target) (default-expression? expression))
     (throw (ex-info "cannot set an array element to DEFAULT"
                     {:error :feature-not-supported :sqlstate "0A000"})))
   target)

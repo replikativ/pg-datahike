@@ -125,6 +125,15 @@
   {:id :identity-sequence-options
    :file "identity" :lines [7 8] :state :covered :impact :unsupported
    :detail "CREATE TABLE applies typed identity sequence options. The gate checks the positions, catalog metadata, duplicate options, and rejection of a second ADD GENERATED."}
+  {:id :identity-system-override
+   :file "identity" :lines [68 72] :state :covered :impact :unsupported
+   :detail "Explicit identity values restore with OVERRIDING SYSTEM VALUE. Mixed VALUES rows still allocate DEFAULT through the owned sequence."}
+  {:id :identity-user-override
+   :file "identity" :lines [74 78] :state :open :impact :unsupported
+   :detail "OVERRIDING USER VALUE still needs PostgreSQL's separate treatment of ignored identity input expressions."}
+  {:id :identity-update-default
+   :file "identity" :lines [119 126] :state :covered :impact :wrong-result
+   :detail "UPDATE DEFAULT uses the owned sequence for both identity modes. An explicit UPDATE of GENERATED ALWAYS still raises 428C9."}
   {:id :alter-comment-missing-relation
    :file "alter_table" :lines [18 18] :state :open :impact :wrong-result
    :detail "COMMENT ON a missing relation succeeds on the target. Native 18.6 rejects it before the ordinary-table migration statements."}
@@ -183,11 +192,11 @@
    :file "timestamptz" :lines [638 650] :state :covered :impact :unsupported
    :detail "Instant-to-wall-clock conversion uses the MSK offset on the correct side of each Moscow transition."}
   {:id :timestamptz-at-local
-   :file "timestamptz" :lines [655 668] :state :open :impact :unsupported
-   :detail "AT LOCAL fails to parse, aborting the remaining session-zone comparisons."}
+   :file "timestamptz" :lines [655 661] :state :covered :impact :unsupported
+   :detail "Timestamp conversions use the session zone for both direction changes, including after a prepared statement is reused."}
   {:id :timetz-local-view
-   :file "timetz" :lines [91 102] :state :open :impact :unsupported
-   :detail "AT LOCAL fails to parse in the view definition, aborting the remaining conversion comparisons."}
+   :file "timetz" :lines [91 100] :state :covered :impact :unsupported
+   :detail "AT LOCAL in a timetz view produces the same row values as timezone(value), the UTC name and the UTC interval."}
   {:id :timetz-addition-diagnostic
    :file "timetz" :lines [64 64] :state :covered :impact :internal-error
    :detail "Adding two timetz values raises SQLSTATE 42883 during analysis, including on an empty table."}

@@ -135,9 +135,13 @@
        :gate "test/datahike/test/pg_temporal_text_test.clj"
        :test-var "postgres-time-input-needs-a-date-for-variable-zone-offsets"}]}
     {:name "timetz", :boundaries #{:typmods :casts :time-zones :temporal}, :mode :discovery
-     :blockers #{:at-local :temporal-operator-diagnostics}
+     :blockers #{:temporal-operator-diagnostics :view-deparsing}
      :strict-slices
-     [{:id :timetz-addition-diagnostic
+     [{:id :timetz-local-view
+       :source-lines [91 100]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "postgres-session-local-timetz-view"}
+      {:id :timetz-addition-diagnostic
        :source-lines [64 64]
        :gate "test/datahike/test/pg_type_output_test.clj"
        :test-var "time-expression-metadata"}
@@ -158,9 +162,13 @@
        :test-var "postgres-date-trunc-slices"}]}
     {:name "timestamptz",
      :boundaries #{:time-zones :functions :casts :operators :temporal}, :mode :discovery
-     :blockers #{:at-local :timezone-abbreviations :temporal-overflow :temporal-diagnostics}
+     :blockers #{:timezone-abbreviations :temporal-overflow :temporal-diagnostics :view-deparsing}
      :strict-slices
-     [{:id :timestamptz-relative-input
+     [{:id :timestamptz-at-local
+       :source-lines [655 661]
+       :gate "test/datahike/test/pg_type_output_test.clj"
+       :test-var "postgres-session-local-timestamp"}
+      {:id :timestamptz-relative-input
        :source-lines [13 46]
        :gate "test/datahike/test/pg_temporal_text_test.clj"
        :test-var "relative-datetime-input-uses-transaction-time"}
@@ -388,9 +396,17 @@
        :test-var "fast-default-keeps-old-row-values"}]}
     {:name "generated_stored", :boundaries #{:copy :ddl :generated-columns :dml}, :mode :unmeasured}
     {:name "identity", :boundaries #{:identity-columns :sequences :ddl :dml}, :mode :discovery
-     :blockers #{:alter-identity}
+     :blockers #{:alter-identity :identity-user-override :partitioning}
      :strict-slices
-     [{:id :identity-sequence-options
+     [{:id :identity-system-override
+       :source-lines [68 72]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "postgres-identity-system-override"}
+      {:id :identity-update-default
+       :source-lines [119 126]
+       :gate "test/datahike/test/pg_sequence_catalog_test.clj"
+       :test-var "postgres-update-identity-defaults"}
+      {:id :identity-sequence-options
        :source-lines [7 8]
        :gate "test/datahike/test/pg_sequence_catalog_test.clj"
        :test-var "create-table-identity-options-match-postgres-regression"}]}

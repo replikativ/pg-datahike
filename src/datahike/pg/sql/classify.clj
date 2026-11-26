@@ -980,6 +980,40 @@
                               (recur (rest ts) (dec depth) (conj acc t)))
           :else (recur (rest ts) depth (conj acc t)))))))
 
+(defn insert-system-override
+  "Remove the PostgreSQL system override from an INSERT header before parsing."
+  [sql]
+  (when (re-find #"(?i)\boverriding\b" sql)
+    (let [tokens (tokenize sql)
+          tokens (if (kw=? (first tokens) "with")
+                   (loop [remaining (rest tokens)]
+                     (cond
+                       (empty? remaining) nil
+                       (and (kw=? (first remaining) "insert")
+                            (kw=? (second remaining) "into")) remaining
+                       (= "(" (:text (first remaining)))
+                       (when-let [[_ tail] (read-balanced remaining)]
+                         (recur tail))
+                       :else (recur (rest remaining))))
+                   tokens)
+          [insert into & target] tokens]
+      (when (and (kw=? insert "insert") (kw=? into "into"))
+        (when-let [[_ tail] (read-relation-parts target)]
+          (let [tail (if (and (kw=? (first tail) "as") (ident-tok? (second tail)))
+                       (drop 2 tail)
+                       tail)
+                tail (if (= "(" (:text (first tail)))
+                       (second (read-balanced tail))
+                       tail)
+                [override system value source] tail]
+            (when (and (kw=? override "overriding")
+                       (kw=? system "system")
+                       (kw=? value "value")
+                       (or (= "(" (:text source))
+                           (some #(kw=? source %) ["select" "values" "with" "table"])))
+              (str (subs sql 0 (:pos override)) " "
+                   (subs sql (+ (:pos value) (count (:text value))))))))))))
+
 (defn split-top-level-commas
   "Split a token seq on commas that are not inside parens or brackets."
   [toks]

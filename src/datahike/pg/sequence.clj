@@ -170,6 +170,15 @@
                    :where [?sequence :__seq__/owned-by-table ?table]]
                  db table)))))
 
+(defn identity-columns
+  "Map storage attributes to their owned identity sequences."
+  [db table]
+  (when db
+    (into {}
+          (keep (fn [{:keys [ns col generation] :as owner}]
+                  (when (seq generation) [(keyword ns col) owner])))
+          (owned-columns db table))))
+
 (defn position
   "Return [last_value is_called]. Older stores distinguish the initial
    position from an advanced one with the start-minus-increment sentinel."

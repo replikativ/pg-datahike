@@ -183,6 +183,51 @@
                   rs (.executeQuery stmt "SELECT timestamp '2010-07-01' AT TIME ZONE 'MSK'")]
         (is (= "timezone" (.getColumnLabel (.getMetaData rs) 1)))))))
 
+(deftest postgres-session-local-timestamp
+  (with-open [c (jdbc)]
+    (exec! c "BEGIN")
+    (exec! c "SET LOCAL TIME ZONE 'Europe/Paris'")
+    (let [zoned "VALUES (CAST('1978-07-07 19:38 America/New_York' AS TIMESTAMP WITH TIME ZONE) AT LOCAL)"
+          plain "VALUES (TIMESTAMP '1978-07-07 19:38' AT LOCAL)"]
+      (is (= [["1978-07-08 01:38:00"]] (rows c zoned)))
+      (is (= [["1978-07-07 19:38:00+02"]] (rows c plain)))
+      (exec! c "SET LOCAL TIME ZONE 'Australia/Sydney'")
+      (is (= [["1978-07-08 09:38:00"]] (rows c zoned)))
+      (is (= [["1978-07-07 19:38:00+10"]] (rows c plain))))
+    (exec! c "COMMIT")
+    (exec! c "SET TIME ZONE 'America/New_York'")
+    (is (= [["2024-03-10 03:30:00-04" "2024-11-03 01:30:00-05"]]
+           (rows c (str "SELECT TIMESTAMP '2024-03-10 02:30' AT LOCAL, "
+                        "TIMESTAMP '2024-11-03 01:30' AT LOCAL"))))
+    (exec! c "CREATE TABLE local_names (at timestamp)")
+    (exec! c "INSERT INTO local_names VALUES ('2024-07-01 12:30')")
+    (is (= [["2024-07-01 12:30:00" "2024-07-01 12:30:00-04"]]
+           (rows c "SELECT DISTINCT ON (at) at local, at AT /* session */ LOCAL FROM local_names")))
+    (exec! c "PREPARE local_zone (timestamptz) AS SELECT $1 AT LOCAL")
+    (is (= [["2024-07-01 08:30:00"]] (rows c "EXECUTE local_zone('2024-07-01 12:30+00')")))
+    (exec! c "SET TIME ZONE UTC")
+    (is (= [["2024-07-01 12:30:00"]] (rows c "EXECUTE local_zone('2024-07-01 12:30+00')")))
+    (is (= "42883" (state c "SELECT 1 AT LOCAL")))))
+
+(deftest postgres-session-local-timetz-view
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE local_times (f1 timetz)")
+    (exec! c "INSERT INTO local_times VALUES ('13:24:56-07'), ('08:00+02')")
+    (exec! c "BEGIN")
+    (exec! c "SET LOCAL TimeZone TO 'UTC'")
+    (exec! c (str "CREATE VIEW timetz_local_view AS "
+                  "SELECT f1 AS dat, timezone(f1) AS dat_func, f1 AT LOCAL AS dat_at_local, "
+                  "f1 AT TIME ZONE current_setting('TimeZone') AS dat_at_tz, "
+                  "f1 AT TIME ZONE INTERVAL '00:00' AS dat_at_int "
+                  "FROM local_times ORDER BY f1"))
+    (is (= [["08:00:00+02" "06:00:00+00" "06:00:00+00" "06:00:00+00" "06:00:00+00"]
+            ["13:24:56-07" "20:24:56+00" "20:24:56+00" "20:24:56+00" "20:24:56+00"]]
+           (rows c "TABLE timetz_local_view")))
+    (exec! c "SET LOCAL TimeZone TO '+05:30'")
+    (is (= [["00:30:00-05:30"] ["14:54:56-05:30"]]
+           (rows c "SELECT f1 AT LOCAL FROM local_times ORDER BY f1")))
+    (exec! c "ROLLBACK")))
+
 (deftest at-time-zone-with-interval
   (with-open [c (jdbc)]
     (is (= [["11:45:03.123456+00" "01:45:03.123456-10"

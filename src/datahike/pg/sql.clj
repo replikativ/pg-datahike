@@ -640,7 +640,7 @@
 (defn prepared-parser-source
   "Internal normalized source for detached prepared-statement analysis."
   [sql]
-  (preprocess-sql sql))
+  (preprocess-sql (or (cls/insert-system-override sql) sql)))
 
 (defn- explain-prefix
   "Extract PostgreSQL EXPLAIN options that JSqlParser 5.2 cannot parse.
@@ -1403,8 +1403,9 @@
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
           (let [identity-options (cls/create-table-identity-options sql)
+                system-override (cls/insert-system-override sql)
                 target-rewrite (assignment-rewrite/normalize
-                                (preprocess-sql (or (:sql identity-options) (:parser-sql explain) sql)))
+                                (preprocess-sql (or (:sql identity-options) system-override (:parser-sql explain) sql)))
                 ^String parser-sql (:sql target-rewrite)
                 ;; Translation mutates some JSqlParser relation nodes while
                 ;; materialising derived schemas. Validate this rare invalid
@@ -2449,6 +2450,7 @@
                     (let [result (binding [assignment-target/*omitted-bounds* target-annotations]
                                    (translate-insert ^Insert stmt schema db))]
                       (cond-> result
+                        system-override (assoc :override-system? true)
                         (not (identical? db orig-db)) (assoc :enriched-db db)
                         (or cte-materialized?
                             (:execution-materialization? result)

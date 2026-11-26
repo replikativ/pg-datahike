@@ -167,39 +167,32 @@
   "Compile a previously read metadata snapshot. Does not reread its database
    or evaluate defaults/predicates. Check ordering follows the input snapshot."
   [{:keys [checks fks domain-enum columns] :as metadata}]
-  (assoc metadata
-         ;; An expression DEFAULT is parsed HERE, with the checks, and not
-         ;; per row: the plan is compiled once per statement, so a
-         ;; thousand-row INSERT parses `now() + interval '1 day'` once.
-         :columns
-         (mapv (fn [{:keys [default generated-expr] :as column}]
-                 (cond-> column
-                   ;; A generated column's expression is parsed here too,
-                   ;; and for the same reason: once per statement rather
-                   ;; than once per row.
-                   generated-expr
-                   (assoc :generated-ast
-                          (parse-constraint-expression generated-expr))
-                   (= :expr (first default))
-                   (assoc :default-ast
-                          (parse-constraint-expression (second default)))))
-               columns)
-         :checks (when checks
-                   (mapv (fn [{:keys [constraint expression]}]
-                           {:constraint constraint :ast (parse-constraint-expression expression)})
-                         checks))
-         :fks (when fks (mapv #(dissoc % :child-definition :parent-definition) fks))
-         :domain-enum
-         (into {}
-               (map (fn [[name spec]]
-                      [name (if (= :domain (:kind spec))
-                              (update spec :checks
-                                      (fn [checks]
-                                        (mapv (fn [{:keys [constraint expression]}]
-                                                {:constraint constraint :ast (parse-constraint-expression expression)})
-                                              checks)))
-                              spec)]))
-               domain-enum)))
+  (let [columns (mapv (fn [{:keys [default generated-expr] :as column}]
+                        (cond-> column
+                          generated-expr
+                          (assoc :generated-ast (parse-constraint-expression generated-expr))
+                          (= :expr (first default))
+                          (assoc :default-ast (parse-constraint-expression (second default)))))
+                      columns)]
+    (assoc metadata
+           :columns columns
+           :generated-columns (filterv :generated columns)
+           :checks (when checks
+                     (mapv (fn [{:keys [constraint expression]}]
+                             {:constraint constraint :ast (parse-constraint-expression expression)})
+                           checks))
+           :fks (when fks (mapv #(dissoc % :child-definition :parent-definition) fks))
+           :domain-enum
+           (into {}
+                 (map (fn [[name spec]]
+                        [name (if (= :domain (:kind spec))
+                                (update spec :checks
+                                        (fn [checks]
+                                          (mapv (fn [{:keys [constraint expression]}]
+                                                  {:constraint constraint :ast (parse-constraint-expression expression)})
+                                                checks)))
+                                spec)]))
+                 domain-enum))))
 
 (defn constraint-plan
   "Compile per-table metadata once for a statement/tx function."

@@ -1426,6 +1426,45 @@
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
 
+(defn- distinct-on-close? [toks close]
+  (loop [i (dec close) depth 1]
+    (let [token (get toks i)]
+      (cond
+        (nil? token) false
+        (punct? token ")") (recur (dec i) (inc depth))
+        (punct? token "(") (if (= 1 depth)
+                             (and (= "on" (kw-text (get toks (dec i))))
+                                  (= "distinct" (kw-text (get toks (- i 2)))))
+                             (recur (dec i) (dec depth)))
+        :else (recur (dec i) depth)))))
+
+(defn- at-local-rule [toks]
+  (when (some #(and (ident-tok? %) (.equalsIgnoreCase "local" ^String (:text %))) toks)
+    (let [toks (into [] (remove #(= :comment (:type %))) toks)]
+      (keep-indexed
+       (fn [i token]
+         (when (and (= "local" (kw-text token))
+                    (= "at" (kw-text (get toks (dec i)))))
+           (let [lhs-index (- i 2)
+                 lhs (get toks lhs-index)
+                 word (kw-text lhs)
+                 before (kw-text (get toks (dec lhs-index)))]
+             ;; AT can also name the column in SELECT at local, where LOCAL
+             ;; is its output alias. A postfix expression must have a left
+             ;; operand, including after a DISTINCT ON projection prefix.
+             (when (and (or (#{:ident :quoted :string :number :param} (:type lhs))
+                            (punct? lhs "]")
+                            (and (punct? lhs ")")
+                                 (not (distinct-on-close? toks lhs-index))))
+                        (not (#{"select" "all" "distinct" "returning" "when" "then" "else"
+                                "not" "and" "or" "from" "where" "having" "as"} word))
+                        (not (and (= "by" word) (#{"order" "group" "partition"} before)))
+                        (not (and (= "zone" word) (= "time" before)
+                                  (= "at" (kw-text (get toks (- lhs-index 2)))))))
+               [(:pos (nth toks (dec i))) (:end token)
+                "AT TIME ZONE (pg_catalog.current_setting('TimeZone'))"]))))
+       toks))))
+
 (def default-rules
   "Token-driven rewrites applied in `datahike.pg.sql/preprocess-sql`
    before JSqlParser sees the SQL. Each rule operates on tokens, not
@@ -1446,6 +1485,7 @@
    order-by-using-rule
    select-into-table-rule
    adjacent-string-literal-rule
+   at-local-rule
    collate-rule
    operator-paren-rule
    primary-key-only-body-rule
