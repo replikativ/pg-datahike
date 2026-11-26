@@ -327,3 +327,28 @@
                               (.redirectErrorStream true)))]
         (is (= 0 (.waitFor process))
             "another process cannot take the lock while this one holds it")))))
+
+(deftest upgrading-a-legacy-checkpoint-keeps-the-instant-of-its-position
+  (let [root (.toFile (Files/createTempDirectory "pgdh-legacy-instant-" (make-array FileAttribute 0)))
+        conn (#'mirror/open-store (str (io/file root "store")) 1)
+        applied #inst "2020-03-04T10:00:00.000-00:00"
+        origin {:system "1" :timeline 1 :database "source"}]
+    (try
+      (with-open [destination (pg/make-query-handler conn)]
+        ;; The record an earlier release kept as a SQL table, last written
+        ;; when the mirror applied a commit at `applied`.
+        (#'mirror/sink-execute! destination
+                                (str "CREATE TABLE checkpoint (id integer PRIMARY KEY, origin text NOT NULL, "
+                                     "slot_name text NOT NULL, publication text NOT NULL, manifest text, "
+                                     "end_lsn text, source_xid text, source_commit_micros text)"))
+        (#'mirror/transaction!
+         destination applied
+         #(#'mirror/sink-prepared! destination
+                                   (str "INSERT INTO checkpoint (id, origin, slot_name, publication, manifest, end_lsn) "
+                                        "VALUES (1, ?, ?, ?, ?, ?)")
+                                   [(pr-str origin) "pgdh_mirror_slot" "analytics" (pr-str {:tables []}) "0/10"]))
+        (#'mirror/upgrade-checkpoint! conn destination)
+        (is (= "0/10" (:end-lsn (#'mirror/checkpoint (d/db conn)))))
+        (is (= (.getTime applied) (#'mirror/source-floor-millis (d/db conn)))
+            "a commit made after `applied` is not raised to the time of the upgrade"))
+      (finally (d/release conn)))))
