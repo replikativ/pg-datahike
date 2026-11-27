@@ -6248,6 +6248,10 @@
                        :strict? true :return-oid types/oid-tsquery}
    "phraseto_tsquery" {:impl tsearch/phraseto-tsquery :arities #{2}
                        :strict? true :return-oid types/oid-tsquery}
+   "jsonb_path_query_first" {:impl jb/jsonb-path-query-first :arities #{2 3 4}
+                             :arg-oids [types/oid-jsonb types/oid-jsonpath types/oid-jsonb types/oid-bool]
+                             :unknown-args :declared
+                             :return-oid types/oid-jsonb}
    "jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "jsonb_contained"  {:impl jb/jsonb-contained?  :arities #{2}

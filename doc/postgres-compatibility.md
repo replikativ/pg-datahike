@@ -22,6 +22,21 @@ features, and planner controls are generally outside this compatibility target.
 Their syntax may still be recognized where that is useful, but applications
 must not assume that arbitrary PostgreSQL SQL or extensions will run unchanged.
 
+## JSONB path queries
+
+`jsonb_path_query_first` accepts a path string literal rooted at `$` with
+member access (`$.name`, `$."a.b"`), object wildcards (`$.*`) and array
+wildcards (`$[*]`). The default `lax` mode and explicit `strict` mode follow
+PostgreSQL's structural-error behaviour. An empty result yields SQL NULL.
+Object wildcards visit members in PostgreSQL's JSONB key order.
+
+Bare member names may contain non-ASCII characters. Quote names beginning
+with a digit or containing punctuation such as `.` or `-`.
+Quoted members support standard JSON escapes. Path comments, escapes in
+bare names, PostgreSQL-specific escapes (such as `\x61`), filters, variables
+in path expressions, indexed subscripts, methods and standalone `jsonpath`
+casts remain outside this subset.
+
 ## Sequence defaults and inherited columns
 
 INSERT and COPY reserve sequence defaults independently of the row transaction.

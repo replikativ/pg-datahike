@@ -106,3 +106,105 @@
                           (one c "SELECT jsonb_set('[1,2,3]'::jsonb,'{x}','9'::jsonb)"))
         "an array can only be addressed by an integer, and the message
          carries the 1-based position of the offending element")))
+
+(defn- error-state [c sql]
+  (try
+    (one c sql)
+    nil
+    (catch SQLException e (.getSQLState e))))
+
+(deftest postgres-jsonpath-first-accessor-results
+  (with-open [c (jdbc)]
+    ;; PostgreSQL 18.6 jsonb_jsonpath.sql lines 1106–1108.
+    (is (= "2203A" (error-state c "SELECT jsonb_path_query_first('[{\"a\": 1}, {\"a\": 2}, {}]', 'strict $[*].a')")))
+    (is (= "1" (one c "SELECT jsonb_path_query_first('[{\"a\": 1}, {\"a\": 2}, {}]', 'strict $[*].a', silent => true)")))
+    (is (= "1" (one c "SELECT jsonb_path_query_first('[{\"a\": 1}, {\"a\": 2}]', '$[*].a')")))
+    (testing "strict silent stops where the first error occurs"
+      (is (nil? (one c "SELECT jsonb_path_query_first('[{}, {\"a\":2}]', 'strict $[*].a', '{}', true)"))))
+    (testing "member order follows the JSONB binary representation"
+      (is (= "false" (one c "SELECT jsonb_path_query_first('{\"aa\":true,\"z\":false}', '$.*')")))
+      (is (= "false" (one c "SELECT jsonb_path_query_first('{\"a.b\":false}', '$.\"a.b\"')"))))
+    (testing "bare Unicode members and the lexical limits of the accessor subset"
+      (is (= "42" (one c "SELECT jsonb_path_query_first('{\"漢字\":42}', 'strict$.漢字')")))
+      (is (= "3" (one c "SELECT jsonb_path_query_first('{\"café\":3}', '$.\"caf\\u00e9\"')")))
+      (is (= "0A000" (error-state c "SELECT jsonb_path_query_first('{\"a\":1}', '$./*c*/a')")))
+      (is (= "0A000" (error-state c "SELECT jsonb_path_query_first('{\"a\":1}', '$.\"\\x61\"')")))
+      (is (= "0A000" (error-state c "SELECT jsonb_path_query_first('{\"é\":1}', '$.\\u00e9')"))))
+    (testing "Unicode input and long quoted names"
+      (is (= "22P05" (error-state c "SELECT jsonb_path_query_first('{}', '$.\"\\u0000\"')")))
+      (is (= "22P02" (error-state c "SELECT jsonb_path_query_first('{}', '$.\"\\uD800\"')")))
+      (let [key (apply str (repeat 10000 "a"))]
+        (is (nil? (one c (str "SELECT jsonb_path_query_first('{}', '$.\"" key "\"')"))))))
+    (testing "lax member access unwraps one array level"
+      (is (= "\"shallow\"" (one c "SELECT jsonb_path_query_first('[[{\"x\":\"deep\"}],{\"x\":\"shallow\"}]', '$.x')")))
+      (is (= "\"deep\"" (one c "SELECT jsonb_path_query_first('[[{\"x\":\"deep\"}],{\"x\":\"shallow\"}]', '$[*].x')"))))
+    (testing "JSON null, a string containing null, missing results and SQL NULL"
+      (is (= "null" (one c "SELECT jsonb_path_query_first('{\"a\":null}', '$.*')")))
+      (is (= "\"null\"" (one c "SELECT jsonb_path_query_first('{\"a\":\"null\"}', '$.*')")))
+      (is (nil? (one c "SELECT jsonb_path_query_first('{}', '$.*')")))
+      (is (nil? (one c "SELECT jsonb_path_query_first(NULL::jsonb, '$.*')"))))
+    (testing "input errors precede strict NULL propagation"
+      (is (= "22P02" (error-state c "SELECT jsonb_path_query_first('bad', '$', '{}', NULL)")))
+      (is (= "42601" (error-state c "SELECT jsonb_path_query_first('{}', 'garbage', '{}', NULL)")))
+      (is (= "42601" (error-state c "SELECT jsonb_path_query_first('{}', '$[', '{}', true)")))
+      (is (= "22P02" (error-state c "SELECT jsonb_path_query_first(NULL, '$', 'bad', true)")))
+      (is (= "22P02" (error-state c "SELECT jsonb_path_query_first(NULL, '$', '{}', 'bad')")))
+      (is (nil? (one c "SELECT jsonb_path_query_first(NULL, '$[*] ? (@ > 1)')"))))
+    (testing "type resolution, SQLSTATEs and unsupported SQL/JSON expressions"
+      (is (= "2203C" (error-state c "SELECT jsonb_path_query_first('0', 'strict $.*', '{}', 'false')")))
+      (is (= "42883" (error-state c "SELECT jsonb_path_query_first('0', '$', path => '$.*')")))
+      (is (= "42601" (error-state c "SELECT jsonb_path_query_first('0', path => '$', path => '$.*')")))
+      (is (= "22039" (error-state c "SELECT jsonb_path_query_first('0', 'strict $[*]')")))
+      (is (= "2203C" (error-state c "SELECT jsonb_path_query_first('0', 'strict $.*')")))
+      (is (= "22023" (error-state c "SELECT jsonb_path_query_first('0', '$', 'false'::jsonb)")))
+      (is (= "42883" (error-state c "SELECT jsonb_path_query_first('0'::text, '$')")))
+      (is (= "0A000" (error-state c "SELECT jsonb_path_query_first('[1,2]', '$[*] ? (@ > 1)')"))))))
+
+(deftest jsonpath-composes-with-jsonb-constructors-and-operators
+  (with-open [c (jdbc)]
+    (is (= "null" (one c "SELECT jsonb_path_query_first(jsonb_build_array(NULL::jsonb), '$[*]')")))
+    (is (= "1" (one c "SELECT jsonb_path_query_first(jsonb_build_array(ARRAY[1,2]), 'strict $[*][*]')")))
+    (is (= "7" (one c "SELECT jsonb_path_query_first(jsonb_build_object('row',row(7,8)), '$.row.f1')")))
+    (is (= "{\"b\": 2, \"x\": 1}"
+           (one c "SELECT jsonb_path_query_first('{\"a\":{\"x\":1}}', '$.a') || '{\"b\":2}'")))
+    (is (= "\"null\"suffix" (one c "SELECT to_jsonb('null'::text) || 'suffix'::text")))
+    (is (= "22P02" (error-state c "SELECT jsonb_path_query_first('0', '$') || 'bad'")))
+    (is (= "22P02" (error-state c "SELECT jsonb_path_query_first('0', '$') = 'bad'")))
+    (is (= "{}" (one c "SELECT jsonb_path_query_first('{\"a\":{\"x\":1}}', '$.a') - 'x'")))
+    (is (= "t" (one c "SELECT jsonb_path_query_first('[1]', '$[*]') = '1.00'")))
+    (is (= "\"null\"" (one c "SELECT to_jsonb(jsonb_path_query_first('[\"null\"]', '$[*]'))")))))
+
+(deftest jsonb-constructors-embed-json-values-by-type
+  (with-open [c (jdbc) stmt (.createStatement c)]
+    (.execute stmt "CREATE TABLE json_inputs (j json, jb jsonb)")
+    (.execute stmt "INSERT INTO json_inputs VALUES ('\"string\"','null')")
+    (testing "object keys are SQL scalars and SQL NULL has its own diagnostic"
+      (doseq [key ["'null'::jsonb" "'1'::json" "jb" "j" "ARRAY[1]"]]
+        (is (thrown-with-msg? SQLException #"key value must be scalar"
+                              (one c (str "SELECT jsonb_build_object(" key ", 1) FROM json_inputs"))))
+        (is (= "22023" (error-state c (str "SELECT jsonb_build_object(" key ", 1) FROM json_inputs")))))
+      (is (thrown-with-msg? SQLException #"argument 3: key must not be null"
+                            (one c "SELECT jsonb_build_object('ok', 1, NULL::jsonb, 2)")))
+      (is (= "22023" (error-state c "SELECT jsonb_build_object(NULL, 2)")))
+      (is (= "22023" (error-state c "SELECT jsonb_build_object('orphan')")))
+      (is (= "{\"1\": 2, \"true\": 3}" (one c "SELECT jsonb_build_object(1, 2, true, 3)"))))
+    (is (= "{\"v\": null}" (one c "SELECT jsonb_build_object('v', 'null'::jsonb)")))
+    (is (= "{\"v\": null}" (one c "SELECT jsonb_build_object('v', NULL::jsonb)")))
+    (is (= "[\"string\", null, {\"a\": 2}, \"null\"]"
+           (one c "SELECT jsonb_build_array(j, jb, '{\"a\":2}'::json, 'null'::text) FROM json_inputs")))))
+
+(deftest odoo-updates-translations-from-values
+  (with-open [c (jdbc) stmt (.createStatement c)]
+    (.execute stmt "CREATE TABLE currency_labels (id int PRIMARY KEY, label jsonb)")
+    (.execute stmt "INSERT INTO currency_labels VALUES (1, NULL), (2, '{\"en_US\":\"old\"}'), (3, '{}')")
+    (is (= 3 (.executeUpdate stmt
+                             "UPDATE currency_labels SET label =
+                               CASE WHEN tmp.label::jsonb IS NULL THEN NULL ELSE
+                                 COALESCE(currency_labels.label, jsonb_build_object(
+                                   'en_US', jsonb_path_query_first(tmp.label::jsonb, '$.*')
+                                 )) || tmp.label::jsonb END
+                               FROM (VALUES (1,'{\"fr\":\"Dollars\"}'), (2,'{\"fr\":\"Euros\"}'), (3,NULL)) AS tmp(id,label)
+                               WHERE currency_labels.id=tmp.id")))
+    (is (= "{\"fr\": \"Dollars\", \"en_US\": \"Dollars\"}" (one c "SELECT label FROM currency_labels WHERE id=1")))
+    (is (= "{\"fr\": \"Euros\", \"en_US\": \"old\"}" (one c "SELECT label FROM currency_labels WHERE id=2")))
+    (is (nil? (one c "SELECT label FROM currency_labels WHERE id=3")))))

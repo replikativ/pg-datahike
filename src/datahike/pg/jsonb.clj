@@ -10,6 +10,7 @@
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
+            [datahike.pg.input :as input]
             [datahike.pg.records :as records]
             [datahike.pg.types :as types]))
 
@@ -262,6 +263,15 @@
                      (catch clojure.lang.ExceptionInfo e (throw e))
                      (catch Exception _ v))
     :else v))
+
+(defn- jsonb-constructor-value
+  "Decode JSON-typed input when constructing a binary JSON array or object.
+   A JSON string carries quotes on the wire. A text argument is already the
+   string value to embed."
+  [oid v]
+  (if (#{types/oid-json types/oid-jsonb} oid)
+    (if (nil? v) :__null__ (parse-jsonb v))
+    (json-scalar oid v)))
 
 ;; ---------------------------------------------------------------------------
 ;; The canonical writer — PostgreSQL's jsonb output, not Jackson's
@@ -969,6 +979,37 @@
   [& args]
   (vec args))
 
+(defn- jsonb-constructor-key [oid value position]
+  (cond
+    (or (nil? value) (= :__null__ value))
+    (throw (errors/pg-error :invalid-parameter-value
+                            {:message (str "argument " position ": key must not be null")}))
+
+    (or (#{types/oid-json types/oid-jsonb} oid) (types/array-oid->element-oid oid)
+        (pg-arr/array? value) (records/record? value))
+    (throw (errors/pg-error :invalid-parameter-value
+                            {:message "key value must be scalar, not array, composite, or json"}))
+
+    :else (json-scalar oid value)))
+
+(defn jsonb-constructor
+  "Build an object or array using the declared types of the SQL arguments.
+   PostgreSQL handles keys and values differently, even for a JSON scalar."
+  [object? oids]
+  (if object?
+    (fn [& args]
+      (when (odd? (count args))
+        (throw (errors/pg-error :invalid-parameter-value
+                                {:message "argument list must have even number of elements"
+                                 :hint "The arguments of jsonb_build_object() must consist of alternating keys and values."})))
+      (apply jsonb-build-object
+             (map-indexed (fn [i v]
+                            (if (even? i)
+                              (jsonb-constructor-key (oids i) v (inc i))
+                              (jsonb-constructor-value (oids i) v)))
+                          args)))
+    (fn [& args] (mapv jsonb-constructor-value oids args))))
+
 ;; ============================================================================
 ;; Functions: transformation
 ;; ============================================================================
@@ -1072,6 +1113,126 @@
       :else
       (throw (errors/pg-error :invalid-parameter-value
                               {:message "cannot get array length of a scalar"})))))
+
+(defn- jsonpath-quoted-member [token]
+  (let [^String key (validate-json! token)]
+    (when-not (neg? (.indexOf key (int 0)))
+      (throw (ex-info "unsupported Unicode escape sequence" {:sqlstate "22P05"})))
+    (when-not (.canEncode (.newEncoder java.nio.charset.StandardCharsets/UTF_8) key)
+      (throw (ex-info "invalid input syntax for type jsonpath" {:sqlstate "22P02"})))
+    key))
+
+(defn- jsonpath-syntax-error! []
+  (throw (ex-info "syntax error at end of jsonpath input" {:sqlstate "42601"})))
+
+(def ^:private jsonpath-selector-pattern
+  ;; jsonpath_scan.l treats non-special, non-blank characters as bare
+  ;; member text. A leading ASCII digit can start a numeric token. The
+  ;; possessive repetition in a quoted member avoids one regex stack
+  ;; frame per character of long keys.
+  (let [blank #"[ \t\n\r\f]*"
+        bare #"(?![0-9])[^?%$.\[\]{}()|&!=<>@#,*:+/\\\" \t\n\r\f-]+"
+        quoted #"\"(?:[^\"\\\x00-\x1f]|\\(?:[\"\\/bfnrt]|u[0-9a-fA-F]{4}))*+\""]
+    (re-pattern (str "\\G" blank "(?:\\." blank "(\\*|" bare "|" quoted ")|\\[" blank "\\*" blank "\\])"))))
+
+(defn- jsonpath-accessors
+  "Return the supported accessor sequence, or nil for other path constructs.
+   Known input errors are raised before strict-function NULL propagation."
+  [path]
+  (if-let [[_ mode body] (re-matches #"(?is)[ \t\n\r\f]*(?:(lax|strict)[ \t\n\r\f]*)?\$(.*)" path)]
+    (let [matcher (re-matcher jsonpath-selector-pattern body)]
+      (loop [selectors [], end 0]
+        (if (.find matcher)
+          (let [key (.group matcher 1)]
+            (recur (conj selectors (cond
+                                     (nil? key) :elements
+                                     (= "*" key) :values
+                                     (str/starts-with? key "\"") (jsonpath-quoted-member key)
+                                     :else key))
+                   (.end matcher)))
+          (let [tail (subs body end)]
+            (cond
+              (re-matches #"[ \t\n\r\f]*" tail)
+              [(= "strict" (some-> mode str/lower-case)) selectors]
+
+              (or (re-matches #"[ \t\n\r\f]*(?:\.|\[[ \t\n\r\f]*\*?)[ \t\n\r\f]*" tail)
+                  (re-find #"^[ \t\n\r\f]*\.[0-9]" tail))
+              (jsonpath-syntax-error!))))))
+    (let [s (str/trim path)]
+      (cond
+        (empty? s) (throw (ex-info "invalid input syntax for type jsonpath" {:sqlstate "22P02"}))
+        (and (re-matches #"[A-Za-z_][A-Za-z_0-9]*" s) (not (#{"null" "true" "false"} s)))
+        (jsonpath-syntax-error!)))))
+
+(defn jsonpath-literal [path]
+  (jsonpath-accessors path)
+  path)
+
+(defn- jsonpath-items [selector item strict?]
+  (cond
+    (= selector :elements)
+    (cond
+      (vector? item) item
+      strict? (throw (ex-info "jsonpath wildcard array accessor can only be applied to an array"
+                              {:sqlstate "22039"}))
+      :else [item])
+
+    ;; Lax member access unwraps one array level only.
+    (and (vector? item) (not strict?))
+    (mapcat #(jsonpath-items selector % false) (filter map? item))
+
+    (map? item)
+    (cond
+      (= selector :values) (map item (sort pg-key-cmp (keys item)))
+      (contains? item selector) [(get item selector)]
+      strict? (throw (ex-info (str "JSON object does not contain key \"" selector "\"")
+                              {:sqlstate "2203A"})))
+
+    strict?
+    (if (= selector :values)
+      (throw (ex-info "jsonpath wildcard member accessor can only be applied to an object"
+                      {:sqlstate "2203C"}))
+      (throw (ex-info "jsonpath member accessor can only be applied to an object"
+                      {:sqlstate "2203A"})))))
+
+(defn jsonb-path-query-first
+  "First match of a root-relative SQL/JSON accessor path. Strict mode visits
+   every branch, even after a match. With silent enabled PostgreSQL keeps
+   matches collected before the first structural error."
+  ([target path] (jsonb-path-query-first target path {} false))
+  ([target path vars] (jsonb-path-query-first target path vars false))
+  ([target path vars silent?]
+   (let [[strict? selectors] (or (jsonpath-accessors path)
+                                 (throw (errors/pg-error :feature-not-supported
+                                                         {:message "JSON path expression outside the supported accessor subset"})))
+         ;; Constructors can carry SQL arrays, records, or SQL NULLs inside
+         ;; a Clojure map/vector. Their JSONB representation is the same as
+         ;; when stored or returned through the wire.
+         document (if (string? target)
+                    (normalize-tree (validate-json! target))
+                    (parse-jsonb (serialize-jsonb target)))
+         variables (if (string? vars) (validate-json! vars) vars)
+         silent? (if (string? silent?) (input/parse-bool silent?) silent?)]
+     (when-not (map? variables)
+       (throw (ex-info "\"vars\" argument is not an object" {:sqlstate "22023"})))
+     (loop [frames (list [[document] (seq selectors)]), result :__null__]
+       (if-let [[items steps] (first frames)]
+         (if-let [items (seq items)]
+           (let [item (first items)
+                 siblings (cons [(rest items) steps] (rest frames))]
+             (if-let [step (first steps)]
+               (let [children (try (jsonpath-items step item strict?)
+                                   (catch clojure.lang.ExceptionInfo e
+                                     (if silent? ::stop (throw e))))]
+                 (if (= ::stop children)
+                   result
+                   (recur (cons [children (next steps)] siblings) result)))
+               (let [value (if (= result :__null__)
+                             (let [sb (StringBuilder.)] (emit! sb item) (.toString sb))
+                             result)]
+                 (if strict? (recur siblings value) value))))
+           (recur (rest frames) result))
+         result)))))
 
 (defn jsonb-object-keys
   "PostgreSQL jsonb_object_keys(jsonb): return keys of object.

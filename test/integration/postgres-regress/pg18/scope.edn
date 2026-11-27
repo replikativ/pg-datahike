@@ -28,7 +28,6 @@
     "sqljson_jsontable"
     "jsonpath_encoding"
     "sqljson_queryfuncs"
-    "jsonb_jsonpath"
     "xmlmap"
     "json_encoding"},
   :encoding-and-copy #{"encoding" "copyencoding" "euc_kr"},

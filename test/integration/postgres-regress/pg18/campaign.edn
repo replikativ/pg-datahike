@@ -311,6 +311,12 @@
    :tests
    [{:name "json", :boundaries #{:json}, :mode :unmeasured}
     {:name "jsonb", :boundaries #{:jsonb}, :mode :unmeasured}
+    {:name "jsonb_jsonpath", :boundaries #{:jsonb :jsonpath}, :mode :unmeasured
+     :strict-slices
+     [{:id :jsonpath-first-accessor-results
+       :source-lines [1106 1108]
+       :gate "test/datahike/test/pg_jsonb_path_ops_test.clj"
+       :test-var "postgres-jsonpath-first-accessor-results"}]}
     {:name "jsonpath", :boundaries #{:jsonpath}, :mode :unmeasured}
     {:name "sqljson", :boundaries #{:sql-json}, :mode :unmeasured}
     {:name "tsearch", :boundaries #{:wire-result-type :full-text :normalization}, :mode :unmeasured
