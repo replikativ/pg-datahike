@@ -193,5 +193,5 @@
           (is (nil? (.-error result)))
           (is (= [["{1}" "1"]] (mapv vec (.-rows result)))))
         (is (nil? (.-error ^PgWireServer$QueryResult
-                           (.execute h "CREATE TABLE pg (p int REFERENCES p)"))))
+                   (.execute h "CREATE TABLE pg (p int REFERENCES p)"))))
         (is (nil? (catalog-read/query-db @conn #{"pg"})))))))
