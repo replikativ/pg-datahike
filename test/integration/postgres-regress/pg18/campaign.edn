@@ -281,7 +281,12 @@
      :boundaries #{:aggregates},
      :requires ["test_setup" "create_aggregate"],
      :mode :discovery
-     :blockers #{:custom-aggregate-ddl :missing-aggregates :aggregate-resolution}}
+     :blockers #{:custom-aggregate-ddl :missing-aggregates :aggregate-resolution}
+     :strict-slices
+     [{:id :partial-index-not-null-predicate
+       :source-lines [421 435]
+       :gate "test/datahike/test/pg_catalog_test.clj"
+       :test-var "postgres-partial-index-keeps-a-not-null-predicate"}]}
     {:name "groupingsets", :boundaries #{:aggregates :grouping}, :mode :discovery
      :blockers #{:grouping-sets :rollup :cube :grouping-function}}
     {:name "window",
@@ -392,7 +397,12 @@
    [{:name "create_index",
      :boundaries #{:constraints :catalogs :ddl :indexes},
      :requires ["test_setup"],
-     :mode :unmeasured}
+     :mode :unmeasured
+     :strict-slices
+     [{:id :partial-index-equality-predicates
+       :source-lines [1440 1441]
+       :gate "test/datahike/test/pg_catalog_test.clj"
+       :test-var "postgres-partial-indexes-preserve-distinct-equality-predicates"}]}
     {:name "matview", :boundaries #{:catalogs :ddl :materialized-views}, :mode :discovery
      :accepted-differences #{:explain-plan-text}
      :strict-slices
