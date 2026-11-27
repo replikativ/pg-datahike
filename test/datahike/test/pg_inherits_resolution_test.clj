@@ -325,3 +325,29 @@
     (exec! sql))
   (doseq [target ["pp1" "cc1" "cc2" "cc3"]]
     (is (= "23502" (.-sqlstate (execute (str "INSERT INTO " target " (f1) VALUES (NULL)")))))))
+
+(deftest inherited-columns-added-after-child-creation
+  ;; Odoo creates its ir_actions descendants before reflecting model fields.
+  (exec! "CREATE TABLE actions (id int)")
+  (exec! "CREATE TABLE windows () INHERITS (actions)")
+  (exec! "CREATE TABLE dialogs () INHERITS (windows)")
+  (exec! "ALTER TABLE actions ADD COLUMN label varchar(30)")
+  (exec! "INSERT INTO dialogs (id, label) VALUES (1, 'named')")
+  (is (= [["1" "named"]] (rows "SELECT id,label FROM actions")))
+  (exec! "ALTER TABLE windows ALTER COLUMN label SET NOT NULL")
+  (exec! "INSERT INTO actions (id) VALUES (2)")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO dialogs (id) VALUES (3)"))))
+  (is (= "23502" (.-sqlstate (execute "ALTER TABLE actions ALTER COLUMN label SET NOT NULL"))))
+  (exec! "UPDATE actions SET label='filled' WHERE id=2")
+  (exec! "ALTER TABLE actions ALTER COLUMN label SET NOT NULL")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO actions (id) VALUES (4)")))))
+
+(deftest add-column-merges-with-child-local-storage
+  (exec! "CREATE TABLE p_merge (id int)")
+  (exec! "CREATE TABLE c_merge (note text) INHERITS (p_merge)")
+  (exec! "CREATE TABLE g_merge () INHERITS (c_merge)")
+  (exec! "INSERT INTO g_merge VALUES (1,'existing')")
+  (exec! "ALTER TABLE p_merge ADD COLUMN note text")
+  (is (= [["existing"]] (rows "SELECT note FROM p_merge")))
+  (exec! "ALTER TABLE p_merge ALTER COLUMN note SET NOT NULL")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO g_merge (id) VALUES (2)")))))

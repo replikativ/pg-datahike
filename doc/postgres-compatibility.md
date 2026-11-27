@@ -103,10 +103,15 @@ can miss the new child rows in parent scans.
 This covers ordinary DDL, INSERT, COPY, scans, and physical-row writes in
 the admitted PostgreSQL regression cases. `ALTER COLUMN ... SET NOT NULL`
 validates existing rows in the target and its physical descendants before
-enforcing the constraint across the tree. A null in any descendant rejects
+enforcing the constraint across the tree. Columns added to an ordinary parent
+after its children exist also receive independent storage in physical children.
+A null in any descendant rejects
 the statement with SQLSTATE `23502`. Recursive changes on legacy shared
-columns, parent-only `SET NOT NULL`, and recursive `DROP NOT NULL` remain
-unsupported.
+columns, creation of a parent-only `NO INHERIT` constraint on a table with
+children, and recursive `DROP NOT NULL` remain unsupported. A column
+inherited from several parents enforces `NOT NULL` contributed by any of
+them. The generated `pg_constraint` rows can still report incomplete
+inheritance counts and locality for these constraints.
 
 ## Concurrent catalog changes
 

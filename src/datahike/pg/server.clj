@@ -13714,11 +13714,13 @@
 (defn- inherited-add-column-tx-data
   "Propagate newly added parent columns through the inheritance tree.
 
-   Each descendant receives its own durable attnum/address while sharing the
-   inherited physical attribute. A same-named local column is merged when its
-   PostgreSQL type and typmod agree, matching PostgreSQL's inheritance rule."
-  [db table added-columns]
-  (let [columns-by-relation
+   Each descendant receives its own durable attnum/address. Physical children
+   also install a column attribute, while legacy children share the parent
+   attribute. A same-named local column is merged when its PostgreSQL type
+   and typmod agree."
+  [db table added-columns declarations occupied-storage]
+  (let [schema-by-ident (into {} (keep #(when (:db/valueType %) [(:db/ident %) %])) declarations)
+        columns-by-relation
         (atom {})
         touched-relations (atom #{})
         tx-data (atom [])
@@ -13738,7 +13740,7 @@
               (let [columns (catalog-objects/columns-by-relation db relation-oid)]
                 (swap! columns-by-relation assoc relation-oid columns)
                 columns)))]
-    (letfn [(propagate! [parent-name parent-column]
+    (letfn [(propagate! [parent-name parent-column declaration]
               (doseq [child-name (child-names parent-name)]
                 (let [child (catalog-objects/object-by-identity
                              db catalog-objects/pg-class-oid
@@ -13775,32 +13777,46 @@
                                     [:db/add column-ref
                                      :datahike.pg.column/inherited-from-address
                                      (:address parent-column)]])
-                            (assoc live-column
-                                   :name (:datahike.pg.column/name live-column)
-                                   :type-oid (:datahike.pg.column/type-oid live-column)
-                                   :typmod (:datahike.pg.column/typmod live-column)
-                                   :storage-ident
-                                   (:datahike.pg.column/storage-ident live-column)
-                                   :address
-                                   (:datahike.pg.column/address-key live-column))))
+                            (swap! columns-by-relation update child-oid
+                                   (fn [cols]
+                                     (mapv #(if (= live-column %)
+                                              (assoc % :datahike.pg.column/inherit-count next-count)
+                                              %)
+                                           cols)))
+                            ;; Its descendants already inherited this column.
+                            nil))
                         (let [attnum (inc (reduce max 0
                                                   (map :datahike.pg.column/attnum
                                                        columns)))
+                              physical? (inheritance/physical? db child-name)
+                              name (:name parent-column)
+                              ident (if physical?
+                                      (available-column-storage-ident
+                                       (into @occupied-storage (map :datahike.pg.column/storage-ident columns))
+                                       child-name name attnum)
+                                      (:storage-ident parent-column))
                               spec {:attnum attnum
                                     :name (:name parent-column)
                                     :type-oid (:type-oid parent-column)
                                     :typmod (:typmod parent-column)
-                                    :storage-ident (:storage-ident parent-column)
+                                    :storage-ident ident
                                     :local? false
                                     :inherit-count 1
                                     :inherited-from-address
                                     (:address parent-column)}]
+                          (when physical?
+                            (swap! occupied-storage conj ident)
+                            (swap! tx-data conj (assoc declaration :db/ident ident))
+                            (when (not= ident (keyword child-name name))
+                              (swap! tx-data conj {:datahike.pg/for-ident ident
+                                                   :datahike.pg/column name})))
                           (swap! tx-data into
                                  (catalog-objects/create-columns-tx child-oid [spec]))
                           (swap! columns-by-relation update child-oid conj
                                  (assoc spec
                                         :datahike.pg.column/attnum attnum
                                         :datahike.pg.column/name (:name spec)
+                                        :datahike.pg.column/inherit-count 1
                                         :datahike.pg.column/type-oid (:type-oid spec)
                                         :datahike.pg.column/typmod (:typmod spec)
                                         :datahike.pg.column/storage-ident
@@ -13811,12 +13827,13 @@
                           (assoc spec :address
                                  (catalog-objects/column-address-key child-oid attnum))))]
                   (swap! touched-relations conj child-oid)
-                  (propagate! child-name child-column))))]
+                  (when child-column (propagate! child-name child-column declaration)))))]
       (doseq [column added-columns]
         (propagate! table
                     (assoc column :address
                            (catalog-objects/column-address-key
-                            (:relation-oid column) (:attnum column)))))
+                            (:relation-oid column) (:attnum column)))
+                    (get schema-by-ident (:storage-ident column))))
       (into @tx-data
             (mapcat #(catalog-objects/bump-revision-tx
                       db catalog-objects/pg-class-oid %)
@@ -14106,7 +14123,9 @@
             (inherited-add-column-tx-data
              db table
              (map #(assoc % :relation-oid relation-oid)
-                  added-column-specs))
+                  added-column-specs)
+             schema-and-constraint-data
+             occupied-storage)
             hint-data
             (keep (fn [{:keys [name storage-ident]}]
                     (when (not= storage-ident (keyword table name))
