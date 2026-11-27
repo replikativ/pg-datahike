@@ -10,10 +10,10 @@ runs.
 
 The pinned source is REL_18_6. The inventory classifies 231 scheduled
 files. The campaign has 90 files, including 12 whole-file strict gates
-and 54 strict slices at 0.1.431. The frozen 164-file discovery result
-predates the current server and uses a different adapter build and
-launcher. Fresh raw results need the tested revision, fixture receipt,
-and timeout profile for each file.
+and 58 strict slices after the varchar widening batch. The frozen
+164-file discovery result uses an older adapter build and launcher.
+Fresh raw results need the tested revision, fixture receipt, and timeout
+profile for each file.
 
 The 0.1.431 discovery refresh attempted all 164 files and collected 158
 complete outputs. Of the 157 with a comparable frozen result,
@@ -97,8 +97,6 @@ synthesizes the names of some explicit PRIMARY KEY and UNIQUE constraints.
 With both changes, the live boot advanced to converting
 `res_users.login` from `varchar(64)` to unconstrained `varchar`. The ALTER
 failed on the column's dependencies (SQLSTATE 0A000), before TestORM.
-The next check is whether widening a typmod can use the existing storage
-and retain the unique constraint and its index.
 
 The PostgreSQL fixture verifies SET NULL on self-references and
 cross-table references, child-row preservation, rollback and a NOT NULL
@@ -110,6 +108,26 @@ internal failures. Partitioning, deferred constraints and several
 referential action variants still affect the full file. ALTER restores
 continue to admit existing ON UPDATE CASCADE declarations with
 restrictive parent-key updates.
+
+### Odoo login widening and device views
+
+The adapter now widens a bounded varchar column by updating its typmod.
+The Odoo login ALTER keeps the original column and unique key, accepts
+longer values, and preserves the prior width in historical reads. The
+strict PostgreSQL suite gained the `alter_table.sql` slice that widens a
+varchar primary key in the transaction that creates it. A prepared JDBC
+statement verifies that it sees the new descriptor.
+
+Odoo's parenthesized `res_device` SELECT now creates a view. The captured
+query produces the same rows as PostgreSQL 18.6 on a fixture covering
+revocation, null-safe grouping, and tied activity times.
+
+A fresh Odoo 19 base boot at commit `007e86391e14` passed both statements
+and reached model-field reflection before TestORM. Odoo declares
+`UNIQUE (model, name)` through ALTER TABLE on `ir_model_fields`. A later
+`INSERT ... ON CONFLICT (model, name) DO UPDATE` failed with SQLSTATE
+42P10. Odoo also caught two nonfatal errors creating device-log partial
+indexes with `WHERE revoked IS NOT TRUE`.
 
 ### asyncpg expected failures by owning ID
 
@@ -131,9 +149,10 @@ need separately provisioned evidence.
 
 ## Next verification work
 
-1. Preserve dependencies when widening the typmod of a column such as
-   `res_users.login`. Repeat Odoo base and accounting boot. Check invoice
-   numbering separately with its partial uniqueness and concurrency workload.
+1. Verify composite UNIQUE constraints added through ALTER TABLE. Cover
+   duplicate rejection, existing-row validation, and ON CONFLICT inference.
+   Repeat Odoo base and accounting boot. Check the device-log partial
+   indexes and invoice numbering's partial uniqueness separately.
 2. Assert admitted constraints, view results and trigger effects alongside
    Pagila COPY counts. Repeat Metabase initial sync on a named release and
    validate JDBC metadata and representative MBQL values.

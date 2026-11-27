@@ -429,6 +429,21 @@
           (is (= "Alice" (.getString rs "name")))
           (is (nil? (.getString rs "note"))))))))
 
+(deftest prepared-varchar-descriptor-refreshes-after-widening
+  (with-conn [c {:preferQueryMode "extended" :prepareThreshold "1"}]
+    (with-open [stmt (.createStatement c)]
+      (.executeUpdate stmt "CREATE TABLE width_probe (code varchar(4) PRIMARY KEY)")
+      (.executeUpdate stmt "INSERT INTO width_probe VALUES ('abc')")
+      (with-open [ps (.prepareStatement c "SELECT code FROM width_probe WHERE code = ?")]
+        (.setString ps 1 "abc")
+        (with-open [rs (.executeQuery ps)]
+          (is (= 4 (.getPrecision (.getMetaData rs) 1))))
+        (.executeUpdate stmt "ALTER TABLE width_probe ALTER COLUMN code TYPE varchar(8)")
+        (with-open [rs (.executeQuery ps)]
+          (is (= 8 (.getPrecision (.getMetaData rs) 1)))
+          (is (.next rs))
+          (is (= "abc" (.getString rs 1))))))))
+
 (deftest test-prepared-statement-revalidation-follows-ddl-commit
   (testing "a pre-commit invalidation cannot hide the later published schema"
     (with-conn [reader {:preferQueryMode "extended"
