@@ -45,6 +45,7 @@
     :datahike.pg.index/keys
     :datahike.pg.index/unique?
     :datahike.pg.index/primary?
+    :datahike.pg.index/constraint?
     :datahike.pg.index/legacy-incomplete?
     :datahike.pg.object/address-key
     :datahike.pg.object/identity-key
@@ -70,6 +71,7 @@
    :datahike.pg.index/keys
    :datahike.pg.index/unique?
    :datahike.pg.index/primary?
+   :datahike.pg.index/constraint?
    :datahike.pg.index/legacy-incomplete?])
 
 (defn- invalid-descriptor! [name message]
@@ -124,6 +126,7 @@
                     keys-edn (:datahike.pg.index/keys object)
                     unique? (:datahike.pg.index/unique? object)
                     primary? (:datahike.pg.index/primary? object)
+                    constraint? (:datahike.pg.index/constraint? object)
                     legacy-incomplete? (:datahike.pg.index/legacy-incomplete? object)
                     method (:datahike.pg.index/method object)
                     namespace-ref (:datahike.pg.object/namespace object)
@@ -176,8 +179,8 @@
                         (invalid-descriptor! name "incomplete or incoherent index metadata"))
                     _ (when (and unique? (not= "btree" method))
                         (invalid-descriptor! name "unique enforcement requires btree"))
-                    _ (when (and primary? (not unique?))
-                        (invalid-descriptor! name "a primary index must enforce uniqueness"))
+                    _ (when (and (or primary? constraint?) (not unique?))
+                        (invalid-descriptor! name "a constraint index must enforce uniqueness"))
                     keys (try
                            (edn/read-string keys-edn)
                            (catch Exception _
@@ -208,6 +211,7 @@
                 {:entity entity
                  :oid (long oid)
                  :name name
+                 :constraint? (true? constraint?)
                  :table table
                  :keys keys
                  :attrs attrs

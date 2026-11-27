@@ -231,7 +231,12 @@
        :test-var "compound-arithmetic-defaults"}]}
     {:name "insert", :boundaries #{:constraints :defaults :insert-select :dml}, :mode :unmeasured}
     {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :discovery
-     :blockers #{:conflict-operator-class-index :explain-insert}}
+     :blockers #{:conflict-operator-class-index :explain-insert}
+     :strict-slices
+     [{:id :composite-index-conflict-inference
+       :source-lines [133 141]
+       :gate "test/datahike/test/pg_unique_index_test.clj"
+       :test-var "postgres-composite-index-inference-accepts-both-column-orders"}]}
     {:name "update", :boundaries #{:update-from :dml :row-assignment}, :mode :unmeasured}
     {:name "delete", :boundaries #{:name-resolution :dml}, :mode :strict}
     {:name "returning",
@@ -347,7 +352,11 @@
       {:id :alter-varchar-widening-keeps-primary-key
        :source-lines [1436 1439]
        :gate "test/datahike/test/pg_system_at_test.clj"
-       :test-var "postgres-varchar-widening-retains-a-primary-key-created-in-the-same-transaction"}]}]}
+       :test-var "postgres-varchar-widening-retains-a-primary-key-created-in-the-same-transaction"}
+      {:id :alter-composite-unique
+       :source-lines [706 718]
+       :gate "test/datahike/test/pg_unique_index_test.clj"
+       :test-var "postgres-alter-table-adds-a-composite-unique-constraint"}]}]}
   {:id 5,
    :name "bulk I/O, temporary relations, and client tooling",
    :tests

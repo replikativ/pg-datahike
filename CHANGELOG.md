@@ -4,6 +4,13 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Composite unique constraints added by ALTER TABLE
+
+ALTER TABLE ADD UNIQUE enforces a composite key on existing and future
+rows. Named constraints and their backing indexes appear in PostgreSQL
+catalogs and are available as ON CONFLICT arbiters. Constraint creation
+and removal roll back with the surrounding transaction.
+
 ### Migration SQL for Odoo
 
 ALTER TABLE widens a bounded varchar column in place, including a

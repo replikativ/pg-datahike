@@ -2599,12 +2599,8 @@
                                           {:op :add-column
                                            :columns (mapv alter-added-column (.getColDataTypeList exp))}
                                 ;; ADD [CONSTRAINT name] PRIMARY KEY / UNIQUE —
-                                ;; carry the columns so the executor can upgrade
-                                ;; the attributes to :db/unique (single column)
-                                ;; or :db/index (composite members) via
-                                ;; datahike's index-backfill migration. Bare
-                                ;; forms surface via getPkColumns/getUkColumns;
-                                ;; named-constraint forms via getIndex.
+                                ;; Bare keys use getPkColumns/getUkColumns.
+                                ;; Named UNIQUE constraints also carry the index name.
                                           (= op "ADD")
                                           (let [idx (.getIndex exp)
                                                 idx-type (some-> idx .getType str/upper-case)
@@ -2617,6 +2613,10 @@
                                                               (or pk-cols (.getColumnsNames idx)))}
                                               (or uk-cols (= idx-type "UNIQUE"))
                                               {:op :add-unique
+                                               :name (unquote-ident (or (.getUkName exp) (some-> idx .getName)))
+                                               :options (into (mapv str (.getConstraints exp))
+                                                              (concat (.getParameters exp)
+                                                                      (some-> idx .getIndexSpec)))
                                                :columns (mapv unquote-ident
                                                               (or uk-cols (.getColumnsNames idx)))}
                                               ;; CHECK and FOREIGN KEY ride

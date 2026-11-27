@@ -1738,6 +1738,7 @@
          {:oid (long oid) :name name :table table :method method
           :relation-oid (long relation-oid) :keys keys
           :unique? (boolean unique?) :primary? primary?
+          :constraint? (true? (:datahike.pg.index/constraint? index))
           :ready? (not= :building status)
           :valid? (and (not legacy-incomplete?) (not= :building status))
           :indexdef indexdef}))
@@ -1756,6 +1757,16 @@
 (defn- explicit-primary-keys [db]
   (into {} (comp (filter :primary?) (map (juxt :table identity)))
         (explicit-index-descriptors db)))
+
+(defn- reflected-unique-keys [db tables logical-names]
+  (concat
+   (for [[table {:keys [columns]}] (sort-by key tables)
+         column columns
+         :when (:unique column)]
+     {:table table
+      :name (str (get logical-names table table) "_" (:name column) "_key")
+      :keys [column]})
+   (filter :constraint? (explicit-index-descriptors db))))
 
 (defn- native-index-descriptors
   "The indexes PostgreSQL would have created implicitly -- one per UNIQUE
@@ -3537,11 +3548,13 @@
            :pg_constraint/condef        (str (if primary? "PRIMARY KEY (" "UNIQUE (")
                                              (str/join ", " cols) ")")
            (pgs/row-marker-attr "pg_constraint") true})
-        (for [{:keys [table name oid relation-oid keys valid?]}
-              (vals (explicit-primary-keys cte-db))]
-          {:pg_constraint/oid           (long (constraint-oid "p" name table))
+        (for [{:keys [table name oid relation-oid keys valid? primary? constraint?]}
+              (explicit-index-descriptors cte-db)
+              :when (or primary? constraint?)
+              :let [contype (if primary? "p" "u")]]
+          {:pg_constraint/oid           (long (constraint-oid contype name table))
            :pg_constraint/conname       name
-           :pg_constraint/contype       "p"
+           :pg_constraint/contype       contype
            :pg_constraint/conindid      oid
            :pg_constraint/conrelid      relation-oid
            :pg_constraint/connamespace  (storage-schema-oid cte-db table)
@@ -3551,7 +3564,7 @@
            :pg_constraint/convalidated  valid?
            :pg_constraint/conkey        (->conkey (map :attnum keys))
            :pg_constraint/confkey       "{}"
-           :pg_constraint/condef        (str "PRIMARY KEY ("
+           :pg_constraint/condef        (str (if primary? "PRIMARY KEY (" "UNIQUE (")
                                              (str/join ", " (map (comp fns/quote-identifier :name) keys))
                                              ")")
            (pgs/row-marker-attr "pg_constraint") true})
@@ -3651,13 +3664,12 @@
            :information_schema_table_constraints/initially_deferred "NO"
            :information_schema_table_constraints/enforced "YES"
            (pgs/row-marker-attr "information_schema_table_constraints") true})
-        (for [[tname {:keys [columns]}] (sort-by key tables)
-              col columns
-              :when (:unique col)
+        (for [{tname :table cname :name}
+              (reflected-unique-keys cte-db tables logical-names)
               :let [table-name (get logical-names tname tname)]]
           {:information_schema_table_constraints/constraint_catalog "datahike"
            :information_schema_table_constraints/constraint_schema (storage-schema-name cte-db tname)
-           :information_schema_table_constraints/constraint_name (str table-name "_" (:name col) "_key")
+           :information_schema_table_constraints/constraint_name cname
            :information_schema_table_constraints/table_catalog "datahike"
            :information_schema_table_constraints/table_schema (storage-schema-name cte-db tname)
            :information_schema_table_constraints/table_name table-name
@@ -3685,20 +3697,20 @@
            :information_schema_key_column_usage/column_name (:name col)
            :information_schema_key_column_usage/ordinal_position (long (inc position))
            (pgs/row-marker-attr "information_schema_key_column_usage") true})
-        (for [[tname {:keys [columns]}] (sort-by key tables)
-              col columns
-              :when (:unique col)
+        (for [{tname :table cname :name :keys [keys]}
+              (reflected-unique-keys cte-db tables logical-names)
+              [position col] (map-indexed vector keys)
               :let [table-name (get logical-names tname tname)]]
-          {:information_schema_key_column_usage/constraint_catalog "datahike"
-           :information_schema_key_column_usage/constraint_schema (storage-schema-name cte-db tname)
-           :information_schema_key_column_usage/constraint_name (str table-name "_" (:name col) "_key")
-           :information_schema_key_column_usage/table_catalog "datahike"
-           :information_schema_key_column_usage/table_schema (storage-schema-name cte-db tname)
-           :information_schema_key_column_usage/table_name table-name
-           :information_schema_key_column_usage/column_name (:name col)
-           :information_schema_key_column_usage/ordinal_position 1
-           :information_schema_key_column_usage/position_in_unique_constraint 1
-           (pgs/row-marker-attr "information_schema_key_column_usage") true}))))
+          (cond-> {:information_schema_key_column_usage/constraint_catalog "datahike"
+                   :information_schema_key_column_usage/constraint_schema (storage-schema-name cte-db tname)
+                   :information_schema_key_column_usage/constraint_name cname
+                   :information_schema_key_column_usage/table_catalog "datahike"
+                   :information_schema_key_column_usage/table_schema (storage-schema-name cte-db tname)
+                   :information_schema_key_column_usage/table_name table-name
+                   :information_schema_key_column_usage/column_name (:name col)
+                   :information_schema_key_column_usage/ordinal_position (long (inc position))
+                   (pgs/row-marker-attr "information_schema_key_column_usage") true}
+            (:unique col) (assoc :information_schema_key_column_usage/position_in_unique_constraint 1))))))
     nil))
 
 (declare collect-in-stmt! collect-in-expr!)

@@ -75,5 +75,8 @@
   ["jsonb_agg(jt) from jt" "[{\"b\": true, \"d\": \"2026-01-01\", \"m\": \"$1.50\", \"id\": 1, \"ts\": \"2026-01-01T10:00:00\", \"tz\": \"2026-01-01T05:00:00-05:00\"}]"]
   ["jsonb_agg(x order by x desc) from (values (date '2026-01-01'), (date '2026-02-01')) v(x)" "[\"2026-02-01\", \"2026-01-01\"]"]
   ["jsonb_object_agg(k, v) from (values ('a', 1.5::money)) t(k, v)" "{\"a\": \"$1.50\"}"]
-  ["json_object_agg(k, v) from (values ('a\"b', 1), ('c', 2)) t(k, v)" "{ \"a\\\"b\" : 1, \"c\" : 2 }"]
+  ;; No aggregate ORDER BY. Check both legal byte-for-byte renderings.
+  ["json_object_agg(k, v) from (values ('a\"b', 1), ('c', 2)) t(k, v)"
+   #{"{ \"a\\\"b\" : 1, \"c\" : 2 }"
+     "{ \"c\" : 2, \"a\\\"b\" : 1 }"}]
  ]}

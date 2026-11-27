@@ -9366,9 +9366,12 @@
    constraint name would silently turn an upsert into a plain insert
    that then overwrites the existing row."
   [constraint-name table-name ns schema db]
-  (let [cname (str/lower-case (unquote-ident constraint-name))
+  (let [exact-name (unquote-ident constraint-name)
+        cname (str/lower-case exact-name)
         descriptor (some #(when (and (= table-name (:table %))
-                                     (= cname (str/lower-case (:name %))))
+                                     (if (:constraint? %)
+                                       (= exact-name (:name %))
+                                       (= cname (str/lower-case (:name %)))))
                             %)
                          (unique-constraints/index-descriptors db))
         cols (pgs/column-info schema table-name db)
