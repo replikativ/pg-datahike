@@ -124,7 +124,7 @@
 (defn resolve-foreign-key!
   "Validate and resolve a foreign key against the catalog snapshot used by DDL.
    The optional local table describes columns and schema still being created."
-  [db child {:keys [name cols parent-table parent-cols added-columns]} local]
+  [db child {:keys [name cols parent-table parent-cols added-columns on-delete]} local]
   (let [child-columns (if local (:columns local) (into (fk-column-attrs db child) added-columns))
         local-parent? (and local (= child parent-table))
         parent-columns (if local-parent? (:columns local) (fk-column-attrs db parent-table))
@@ -132,6 +132,13 @@
                         (get (:schema db) (pgs/row-marker-attr parent-table)))
             (throw (errors/pg-error :undefined-table {:table parent-table})))
         _ (validate-fk-columns! child-columns cols)
+        _ (when (and (= :set-null on-delete)
+                     (some (fn [attr]
+                             (or (get-in local [:schema attr :pg/generated])
+                                 (some->> attr (d/entity db) :pg/generated)))
+                           (map child-columns cols)))
+            (throw (ex-info "invalid ON DELETE action for foreign key constraint containing generated column"
+                            {:sqlstate "42601" :constraint name})))
         explicit? (seq parent-cols)
         parent-cols (if explicit? parent-cols
                         (if local-parent? (:primary-key local) (primary-key-cols db parent-table)))]
@@ -672,6 +679,25 @@
    :parent-cols (referenced-columns (.getReferencedColumnNames fk))
    :on-delete (some-> (.getOnDeleteReferenceOption fk) str/lower-case)
    :on-update (some-> (.getOnUpdateReferenceOption fk) str/lower-case)})
+
+(defn foreign-key-action [action]
+  (when action
+    (case (str/lower-case action)
+      "cascade" :cascade
+      "set null" :set-null
+      "set default" :set-default
+      "restrict" :restrict
+      :no-action)))
+
+(defn validate-foreign-key-actions! [constraint on-delete on-update]
+  (doseq [[event action] [["DELETE" on-delete] ["UPDATE" on-update]]
+          :when (or (= :set-default action)
+                    (and (= "UPDATE" event) (contains? #{:cascade :set-null} action)))]
+    (throw (ex-info "foreign-key action is not supported"
+                    {:error :feature-not-supported
+                     :feature (str "FOREIGN KEY ON " event " "
+                                   (-> action name (str/replace "-" " ") str/upper-case))
+                     :constraint constraint}))))
 
 (defn alter-added-constraint
   "The constraint an `ALTER TABLE ... ADD ...` expression adds, as
@@ -1369,17 +1395,9 @@
         fk-entities
         (vec (for [{:keys [name cols parent-table parent-schema parent-cols on-delete on-update]} (:fks constraints)
                    :let [cname (choose! name (str/join "_" cols) "fkey")
-                         ->action (fn [s]
-                                    (when s
-                                      (case (str/lower-case s)
-                                        "cascade"     :cascade
-                                        "set null"    :set-null
-                                        "set default" :set-default
-                                        "restrict"    :restrict
-                                        "no action"   :no-action
-                                        :no-action)))
-                         od (->action on-delete)
-                         ou (->action on-update)]
+                         od (foreign-key-action on-delete)
+                         ou (foreign-key-action on-update)
+                         _ (validate-foreign-key-actions! cname od ou)]
                    :when parent-table]
                (cond-> {:pg/constraint-key  (constraint-key table-name cname)
                         :pg/fk-conname      cname
@@ -1391,34 +1409,6 @@
                  od (assoc :pg/fk-on-delete od)
                  ou (assoc :pg/fk-on-update ou))))
         schema-tx (into schema-tx (into check-entities fk-entities))
-        ;; Loud error at DDL for FK actions we don't yet implement.
-        ;; ON DELETE CASCADE *is* implemented (server.clj
-        ;; collect-fk-cascade-retractions!) so we accept it here.
-        ;; ON DELETE SET NULL / SET DEFAULT and ON UPDATE * still raise.
-        _ (doseq [fk fk-entities]
-            (when (contains? #{:set-null :set-default}
-                             (:pg/fk-on-delete fk))
-              (throw (ex-info "ON DELETE action not supported"
-                              {:error :feature-not-supported
-                               :feature (str "FOREIGN KEY ON DELETE "
-                                             (name (:pg/fk-on-delete fk)))
-                               :detail (str "FOREIGN KEY ON DELETE "
-                                            (name (:pg/fk-on-delete fk))
-                                            " is not yet supported for "
-                                            (:pg/fk-conname fk)
-                                            " — only NO ACTION / RESTRICT / CASCADE are enforced")
-                               :constraint (:pg/fk-conname fk)})))
-            (when (contains? #{:cascade :set-null :set-default}
-                             (:pg/fk-on-update fk))
-              (throw (ex-info "ON UPDATE action not supported"
-                              {:error :feature-not-supported
-                               :feature (str "FOREIGN KEY ON UPDATE "
-                                             (name (:pg/fk-on-update fk)))
-                               :detail (str "FOREIGN KEY ON UPDATE "
-                                            (name (:pg/fk-on-update fk))
-                                            " is not yet supported for "
-                                            (:pg/fk-conname fk))
-                               :constraint (:pg/fk-conname fk)}))))
         ;; Sequence schema + initial entity for each IDENTITY column
         seq-tx (vec (mapcat (fn [col-name]
                               (let [seq-name (str table-name "_" col-name "_seq")

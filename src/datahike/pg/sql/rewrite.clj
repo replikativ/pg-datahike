@@ -150,26 +150,38 @@
         (contains? #{"cascade" "restrict"} k3)
         {:end-idx (+ idx 3) :verb k2 :action k3}))))
 
+(defn- foreign-key-actions
+  "Read the consecutive ON DELETE/UPDATE clauses and their final token position."
+  [toks start]
+  (loop [idx start, actions {}]
+    (if-let [{:keys [end-idx verb action]} (match-on-action toks idx)]
+      (do
+        (when (contains? actions verb)
+          (throw (ex-info "duplicate foreign-key action" {:sqlstate "42601"})))
+        (when (and (= "delete" verb)
+                   (contains? #{"set null" "set default"} action)
+                   (punct? (nth toks (skip-non-comment toks end-idx (constantly false)) nil) "("))
+          (throw (ex-info "foreign-key action column list is not supported"
+                          {:error :feature-not-supported
+                           :feature "ON DELETE SET NULL/DEFAULT with a column list"})))
+        (recur end-idx (assoc actions verb action)))
+      [actions idx])))
+
 (defn- find-inline-col-name
-  "Walk back from `idx` (pointing at inline `references`) to find the
-   column name — the first ident after the most recent `,` or opening
-   `(` of the column list. Returns the source text of that ident, or
-   nil if not found."
+  "Find the column's leading identifier, skipping parenthesized type
+   modifiers and column expressions while walking back to its boundary."
   [toks ^long idx]
-  (let [start-idx (loop [i (dec idx)]
-                    (cond
-                      (neg? i) 0
-                      (or (punct? (nth toks i) ",")
-                          (punct? (nth toks i) "("))
-                      (inc i)
-                      :else (recur (dec i))))]
-    (loop [i start-idx]
-      (let [t (nth toks i nil)]
-        (cond
-          (nil? t) nil
-          (= :comment (:type t)) (recur (inc i))
-          (ident-tok? t) (:text t)
-          :else (recur (inc i)))))))
+  (let [start-idx (loop [i (dec idx), depth 0]
+                    (let [t (nth toks i nil)]
+                      (cond
+                        (nil? t) 0
+                        (punct? t ")") (recur (dec i) (inc depth))
+                        (and (pos? depth) (punct? t "(")) (recur (dec i) (dec depth))
+                        (and (zero? depth) (or (punct? t ",") (punct? t "("))) (inc i)
+                        :else (recur (dec i) depth))))
+        t (nth toks (skip-non-comment toks start-idx (constantly false)) nil)]
+    (when (contains? #{:ident :quoted} (:type t))
+      (:text t))))
 
 (defn- find-enclosing-close-paren
   "From `idx` walk forward at the current paren depth until the matching
@@ -216,7 +228,7 @@
    NO ACTION form; stripping that form used to silently disable both orphan
    INSERT checks and parent-side DELETE checks.
 
-   **SET NULL / SET DEFAULT / ON UPDATE non-trivial** raise
+   **SET DEFAULT / ON UPDATE non-trivial** raise
       0A000; not yet implemented at the runtime side.
 
    Leaves table-level FOREIGN KEY clauses to the table-level rule."
@@ -241,28 +253,18 @@
                       ;; definition became `a int   MATCH FULL,` and the
                       ;; whole CREATE TABLE failed to parse.
                       after-match-idx (skip-match-type toks after-cols-idx)
-                      on-match (match-on-action toks after-match-idx)
-                      end-idx (or (:end-idx on-match) after-match-idx)
-                      end-pos (:end (nth toks (dec end-idx)))
-                      act (:action on-match)
-                      verb (:verb on-match)]
-                  (cond
-                    ;; SET NULL / SET DEFAULT / non-DELETE CASCADE — not yet
-                    ;; implemented at the runtime FK enforcement side.
-                    (or (contains? #{"set null" "set default"} act)
-                        (and (= "update" verb)
-                             (contains? #{"cascade" "set null" "set default"} act)))
+                      [actions end-idx] (foreign-key-actions toks after-match-idx)
+                      end-pos (:end (nth toks (dec end-idx)))]
+                  (doseq [[verb action] actions
+                          :when (or (= "set default" action)
+                                    (and (= "update" verb)
+                                         (contains? #{"cascade" "set null"} action)))]
                     (throw (ex-info "unsupported foreign-key action"
                                     {:error :feature-not-supported
                                      :feature (str "foreign-key action ON "
-                                                   (str/upper-case (or verb "DELETE")) " "
-                                                   (str/upper-case act))}))
-
-                    ;; Every supported inline form is lifted to a
-                    ;; table-level FK so runtime metadata and enforcement
-                    ;; cannot diverge by syntax spelling.
-                    :else
-                    (let [col-name (find-inline-col-name toks i)
+                                                   (str/upper-case verb) " "
+                                                   (str/upper-case action))})))
+                  (let [col-name (find-inline-col-name toks i)
                           ;; `REFERENCES name [(col)]` — reconstruct from
                           ;; the tokens between `references` (inc i) and
                           ;; the action clause start (after-cols-idx).
@@ -270,28 +272,28 @@
                           ;; (at `(` of the col list), so we need (inc i).
                           ;; The MATCH clause is deliberately NOT carried
                           ;; into the lifted FK: see `skip-match-type`.
-                          ref-target (str (token-range-text toks (inc i) after-cols-idx)
+                        ref-target (str (token-range-text toks (inc i) after-cols-idx)
                                           ;; JSqlParser requires an explicit
                                           ;; referenced-column list although
                                           ;; PostgreSQL does not.  Carry an
                                           ;; internal sentinel through the AST;
                                           ;; DDL lowering replaces it with the
                                           ;; parent's primary-key columns.
-                                          (when (= after-name-idx after-cols-idx)
-                                            " (__pg_default_pk__)"))
-                          close-paren-pos (find-enclosing-close-paren toks (inc i))
-                          inject (when col-name
-                                   (str ", FOREIGN KEY (" col-name ") "
-                                        "REFERENCES " ref-target
-                                        (when (and verb act)
-                                          (str " ON " (str/upper-case verb) " "
-                                               (str/upper-case act)))
-                                        " "))
-                          acc' (conj acc [start end-pos " "])
-                          acc'' (if (and inject close-paren-pos)
-                                  (conj acc' [close-paren-pos close-paren-pos inject])
-                                  acc')]
-                      (recur end-idx acc''))))))))))))
+                                        (when (= after-name-idx after-cols-idx)
+                                          " (__pg_default_pk__)"))
+                        close-paren-pos (find-enclosing-close-paren toks (inc i))
+                        inject (when col-name
+                                 (str ", FOREIGN KEY (" col-name ") "
+                                      "REFERENCES " ref-target
+                                      (apply str (for [[verb action] actions]
+                                                   (str " ON " (str/upper-case verb) " "
+                                                        (str/upper-case action))))
+                                      " "))
+                        acc' (conj acc [start end-pos " "])
+                        acc'' (if (and inject close-paren-pos)
+                                (conj acc' [close-paren-pos close-paren-pos inject])
+                                acc')]
+                    (recur end-idx acc'')))))))))))
 
 (def unnamed-check-sentinel
   "Injected by `alter-add-check-rule`; recognised as \"no name given\"."
@@ -379,6 +381,8 @@
                 (recur (inc i) acc)
                 (let [after-name-idx (referenced-relation-end toks (inc i))
                       after-cols-idx (match-paren-group toks after-name-idx)
+                      after-match-idx (skip-match-type toks after-cols-idx)
+                      _ (foreign-key-actions toks after-match-idx)
                       mt (kw-text (nth toks (inc after-cols-idx) nil))
                       name-end (:end (non-comment-before toks after-name-idx))
                       acc (cond-> acc

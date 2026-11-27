@@ -327,7 +327,11 @@
      [{:id :foreign-key-definition-validation
        :source-lines [538 543]
        :gate "test/datahike/test/pg_constraints_test.clj"
-       :test-var "postgres-rejects-invalid-foreign-key-definitions"}]}
+       :test-var "postgres-rejects-invalid-foreign-key-definitions"}
+      {:id :foreign-key-delete-set-null
+       :source-lines [1510 1513]
+       :gate "test/datahike/test/pg_constraints_test.clj"
+       :test-var "fk-cascade-to-composite-set-null"}]}
     {:name "create_view", :boundaries #{:ddl :relational :views}, :mode :unmeasured}
     {:name "alter_table", :boundaries #{:constraints :schema-evolution :ddl}, :mode :discovery
      :blockers #{:alter-comment-missing-relation}

@@ -46,9 +46,14 @@
       ;; carries it.
       (is (not (re-find #"INT\s+REFERENCES" out))))))
 
+(deftest inline-references-preserve-both-actions
+  (let [out (strip-refs (str "CREATE TABLE c (pid INT REFERENCES p"
+                             " ON UPDATE RESTRICT ON DELETE SET NULL)"))]
+    (is (re-find #"FOREIGN KEY \(pid\) REFERENCES p \(__pg_default_pk__\)" out))
+    (is (re-find #"ON UPDATE RESTRICT ON DELETE SET NULL" out))))
+
 (deftest inline-references-with-unsupported-action-raises-0a000
-  (doseq [[action verb] [["SET NULL" "DELETE"]
-                         ["SET DEFAULT" "DELETE"]
+  (doseq [[action verb] [["SET DEFAULT" "DELETE"]
                          ["CASCADE" "UPDATE"]
                          ["SET NULL" "UPDATE"]
                          ["SET DEFAULT" "UPDATE"]]]

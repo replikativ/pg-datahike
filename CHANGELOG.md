@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Foreign-key actions and client metadata
+
+ON DELETE SET NULL clears child keys in the same transaction as the
+parent DELETE, including composite keys and actions reached through
+CASCADE. Child UPDATE triggers, generated columns, and constraints apply.
+PostgreSQL catalogs expose foreign-key action codes, and cached-plan
+invalidation errors include the routine field used by asyncpg.
+
 ### Migration SQL and JDBC metadata
 
 ALTER TABLE RENAME accepts a sequence target and preserves its counter
