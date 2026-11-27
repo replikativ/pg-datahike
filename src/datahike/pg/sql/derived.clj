@@ -24,15 +24,15 @@
        (not (and (instance? java.util.Collection value) (.isEmpty ^java.util.Collection value)))
        (not (and (string? value) (empty? value)))))
 
-(defn- select-boundary? [^Select select]
+(defn- select-shape? [^Select select outer-with-limit?]
   ;; Both a PlainSelect and its ParenthesedSelect wrapper can carry barriers.
   ;; Direct calls also work in native images; a JVM test audits new getters.
-  (and (empty? (.getWithItemsList select))
+  (and (or outer-with-limit? (empty? (.getWithItemsList select)))
        (not (.isOracleSiblings select))
        (not (.isNoWait select))
        (nil? (.getForClause select))
        (empty? (.getOrderByElements select))
-       (nil? (.getLimit select))
+       (or outer-with-limit? (nil? (.getLimit select)))
        (nil? (.getLimitBy select))
        (nil? (.getOffset select))
        (nil? (.getFetch select))
@@ -44,10 +44,11 @@
        (nil? (.getPivot select))
        (nil? (.getUnPivot select))))
 
-(defn plain-shape?
-  "A plain SELECT without sorting, grouping, limits, locking or other modifiers."
-  [^PlainSelect select]
-  (and (select-boundary? select)
+(defn select-boundary? [select]
+  (select-shape? select false))
+
+(defn- plain-select-shape? [^PlainSelect select outer-with-limit?]
+  (and (select-shape? select outer-with-limit?)
        (empty? (.getIntoTables select))
        (empty? (.getLateralViews select))
        (not (.isUsingFinal select))
@@ -75,6 +76,12 @@
        (not (.getMySqlSqlCalcFoundRows select))
        (nil? (.getMySqlSqlCacheFlag select))
        (nil? (.getAlias select))))
+
+(defn plain-shape?
+  "A plain SELECT without sorting, grouping, locking or other modifiers. The
+   recursive consumer validates its own WITH and LIMIT in the second arity."
+  ([select] (plain-select-shape? select false))
+  ([select outer-with-limit?] (plain-select-shape? select outer-with-limit?)))
 
 (defn- unwrap [expression]
   (if (instance? ParenthesedExpressionList expression)

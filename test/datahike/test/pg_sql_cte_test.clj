@@ -487,15 +487,93 @@
                          (rows c "SELECT (VALUES(1, 2))")))]
       (is (= "42601" (.getSQLState ^SQLException e))))))
 
-(deftest demand-limited-unbounded-recursion-fails-before-materialization
+(deftest postgres-demand-limited-recursion
+  ;; PostgreSQL 18 with.sql:64–76. Both counters are infinite if the
+  ;; consumer asks for the complete result.
   (with-open [c (jdbc)]
+    (let [ten (mapv #(vector (str %)) (range 1 11))]
+      (is (= ten (rows c "WITH RECURSIVE t(n) AS (
+                            VALUES (1) UNION ALL SELECT n+1 FROM t
+                          ) SELECT * FROM t LIMIT 10")))
+      (is (= ten (rows c "WITH RECURSIVE t(n) AS (
+                            SELECT 1 UNION SELECT n+1 FROM t
+                          ) SELECT * FROM t LIMIT 10"))))
+    (is (= [["1"] ["1"] ["1"] ["1"]]
+           (rows c "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM t)
+                    SELECT n FROM t LIMIT 4")))
+    (is (= [["1"]]
+           (rows c "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n FROM t)
+                    SELECT n FROM t LIMIT 4")))))
+
+(deftest recursive-demand-stops-before-the-next-generation
+  (with-open [c (jdbc)]
+    (let [counter "WITH RECURSIVE t(n) AS (SELECT 2147483647 UNION ALL SELECT n+1 FROM t)
+                   SELECT n FROM t LIMIT "]
+      (is (= [["2147483647"]] (rows c (str counter 1))))
+      (let [e (is (thrown? SQLException (rows c (str counter 2))))]
+        (is (= "22003" (.getSQLState ^SQLException e)))))
     (let [e (is (thrown? SQLException
                          (rows c "WITH RECURSIVE t(n) AS (
-                                    SELECT 1 UNION SELECT n+1 FROM t
-                                  ) SELECT n FROM t LIMIT 10")))]
-      (is (= "0A000" (.getSQLState ^SQLException e)))
-      (is (re-find #"demand-driven recursive CTE"
-                   (.getMessage ^SQLException e))))))
+                                    SELECT 1 UNION SELECT a.n FROM t a JOIN t b ON a.n=b.n
+                                  ) SELECT n FROM t LIMIT 1")))]
+      (is (= "42P19" (.getSQLState ^SQLException e))))))
+
+(deftest correlated-lateral-recursive-demand-reports-unsupported
+  (with-open [c (jdbc)]
+    (let [e (is (thrown? SQLException
+                         (rows c "SELECT v.x,q.n FROM (VALUES (1),(2)) v(x)
+                                  LEFT JOIN LATERAL (
+                                    WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n FROM t)
+                                    SELECT n FROM t WHERE n=v.x LIMIT 1
+                                  ) q ON true ORDER BY v.x")))]
+      (is (= "0A000" (.getSQLState ^SQLException e))))))
+
+(deftest recursive-demand-observes-server-row-cap
+  (let [handler (pg/make-query-handler *conn* {:max-result-rows 2})
+        counter "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t)
+                 SELECT n FROM t LIMIT "]
+    (is (= "54000" (.sqlstate (.execute handler (str counter 1000)))))
+    (is (= 2 (count (result-rows (.execute handler (str counter 2))))))
+    (is (empty? (result-rows (.execute handler (str counter 0)))))))
+
+(deftest recursive-demand-polls-cancellation-while-filtering
+  (with-open [c (jdbc)
+              st (.createStatement c)]
+    (.execute st "SET statement_timeout = 250")
+    (let [e (is (thrown? SQLException
+                         (rows c "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM t)
+                                  SELECT n FROM t WHERE n=2 LIMIT 1")))]
+      (is (= "57014" (.getSQLState ^SQLException e))))
+    (.execute st "RESET statement_timeout")
+    (is (= [["1"]] (rows c "SELECT 1")))))
+
+(deftest recursive-demand-preserves-relation-scope
+  (with-open [c (jdbc)]
+    (update-count c "CREATE TABLE counter (n INTEGER)")
+    (update-count c "INSERT INTO counter VALUES (99)")
+    (is (= [["1"] ["2"]]
+           (rows c "WITH RECURSIVE counter(n) AS (
+                      SELECT 1 UNION ALL SELECT n+1 FROM counter
+                    ) SELECT n FROM counter LIMIT 2")))
+    (is (= [["99"]] (rows c "SELECT n FROM counter")))))
+
+(deftest odoo-menu-recursive-cycle-check
+  (with-open [c (named-jdbc)]
+    (update-count c "CREATE TABLE menu (id INTEGER PRIMARY KEY, parent_id INTEGER)")
+    (update-count c "INSERT INTO menu VALUES (1,NULL),(2,1),(3,2),(4,5),(5,6),(6,4)")
+    (let [cycle-check (fn [start]
+                        (str "WITH RECURSIVE __reachability AS (
+                                SELECT id AS source, parent_id AS destination FROM menu
+                                WHERE id IN (" start ") AND parent_id IS NOT NULL
+                                UNION
+                                SELECT r.source, t.parent_id FROM __reachability r
+                                JOIN menu t ON r.destination=t.id AND t.parent_id IS NOT NULL
+                              ) SELECT 1 FROM __reachability WHERE source=destination LIMIT 1"))]
+      (is (= [] (rows c (cycle-check 3))))
+      (with-open [check (named-statement c (cycle-check 4))]
+        (is (= [["1"]] (prepared-rows check)))
+        (update-count c "UPDATE menu SET parent_id=NULL WHERE id=6")
+        (is (= [] (prepared-rows check)))))))
 
 (deftest postgres-recursive-set-operation-shape-slice
   ;; PostgreSQL with.sql lines 916-924. A recursive reference is legal only

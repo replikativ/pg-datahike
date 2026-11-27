@@ -22,6 +22,20 @@ features, and planner controls are generally outside this compatibility target.
 Their syntax may still be recognized where that is useful, but applications
 must not assume that arbitrary PostgreSQL SQL or extensions will run unchanged.
 
+## Recursive queries with a limit
+
+A direct scan of a recursive CTE can stop when enough rows pass the
+outer filter to satisfy a literal `LIMIT`. This covers integer counters
+and Odoo's menu-cycle check, which follows parent IDs until a menu reaches
+itself or there are no parents left. `UNION` ignores a row already seen in
+any generation. A single-row counter using `UNION ALL` can emit the same
+value repeatedly.
+
+This execution path supports integer columns, simple projections and
+filters, and a single recursive CTE. Queries with sorting, aggregation or
+`OFFSET` may still return SQLSTATE `0A000`. A correlated `LATERAL` subquery
+with a limited recursive CTE also returns `0A000`.
+
 ## Nested correlated EXISTS
 
 For ordinary tables, a nested `EXISTS` can match an outer integer key
