@@ -61,7 +61,7 @@
    :release-gate? true
    :evidence ["test/integration/node-postgres/run.sh"
               "test/integration/node-postgres/expected-skips.md"]
-   :claim "sixteen must-pass and six expected-failure upstream files"}
+   :claim "18 required upstream files and four known-gap files"}
   {:id :pg-dump
    :cadence :commit
    :status :gating
@@ -83,8 +83,10 @@
    :ci-job "campaign-inventory"
    :release-gate? true
    :evidence ["test/integration/postgres-regress/campaign.edn"
-              "test/integration/postgres-regress/scope.edn"]
-   :claim "complete classification of the pinned PostgreSQL 17.7 schedule and valid strict slices"}
+              "test/integration/postgres-regress/scope.edn"
+              "test/integration/postgres-regress/pg18/campaign.edn"
+              "test/integration/postgres-regress/pg18/scope.edn"]
+   :claim "inventory validation for the pinned PostgreSQL 17.7 and 18.6 schedules and execution of the strict PostgreSQL 18.6 wave"}
   {:id :odoo
    :cadence :release
    :status :manual

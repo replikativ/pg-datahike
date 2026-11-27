@@ -8,12 +8,13 @@
      23503  foreign key
      23514  CHECK
      0A000  feature_not_supported (GRANT/REVOKE/policies)"
-  (:require [clojure.test :refer [deftest testing is use-fixtures]]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest testing is use-fixtures]]
             [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.server :as pg])
-  (:import [datahike.pg PgWireServer$QueryResult]))
+  (:import [datahike.pg PgWireServer$QueryHandler PgWireServer$QueryResult]))
 
 (def ^:dynamic *conn* nil)
 (def ^:dynamic *h* nil)
@@ -302,11 +303,172 @@
     (testing "DELETE unreferenced parent unaffected"
       (is (ok? (run "DELETE FROM pcas WHERE id = 3"))))))
 
-(deftest fk-set-null-rejected-at-ddl
-  (testing "ON DELETE SET NULL — not yet implemented; DDL rejected"
-    (is (err-contains?
-         (run "CREATE TABLE csn (id INT PRIMARY KEY, pid INT REFERENCES p2(id) ON DELETE SET NULL)")
-         "not supported"))))
+(deftest foreign-key-action-catalog
+  (is (ok? (run "CREATE TABLE action_parent (id INT PRIMARY KEY)")))
+  (is (nil? (err (run "CREATE TABLE action_child (
+                       id INT PRIMARY KEY,
+                       inactive INT REFERENCES action_parent(id),
+                       removed INT,
+                       kept INT REFERENCES action_parent(id) ON DELETE RESTRICT,
+                       FOREIGN KEY (removed) REFERENCES action_parent(id) ON DELETE CASCADE ON UPDATE RESTRICT)"))))
+  (is (= [["action_child_id_not_null" " " " "]
+          ["action_child_inactive_fkey" "a" "a"]
+          ["action_child_kept_fkey" "r" "a"]
+          ["action_child_pkey" " " " "]
+          ["action_child_removed_fkey" "c" "r"]]
+         (rows (run "SELECT conname, confdeltype, confupdtype
+                     FROM pg_constraint
+                     WHERE conrelid = 'action_child'::regclass
+                     ORDER BY conname")))))
+
+(deftest alter-foreign-key-preserves-restore-admission
+  (is (ok? (run "CREATE TABLE action_parent (id int PRIMARY KEY)")))
+  (is (ok? (run "CREATE TABLE action_child (pid int)")))
+  (let [r (run "ALTER TABLE action_child ADD CONSTRAINT action_fk
+                FOREIGN KEY (pid) REFERENCES action_parent ON UPDATE CASCADE")]
+    (is (ok? r) (err r)))
+  (is (= [["c"]] (rows (run "SELECT confupdtype FROM pg_constraint
+                             WHERE conname = 'action_fk'"))))
+  (let [r (run "INSERT INTO action_child VALUES (1)")]
+    (is (= "23503" (.sqlstate ^PgWireServer$QueryResult r)) (err r))))
+
+(deftest metabase-discovers-declared-foreign-keys
+  (is (ok? (run "CREATE TABLE mb_customer (id INT PRIMARY KEY)")))
+  (is (ok? (run "CREATE TABLE mb_order (
+                   id INT PRIMARY KEY,
+                   customer_id INT REFERENCES mb_customer(id))")))
+  (let [{:keys [probes]} (edn/read-string (slurp "test/fixtures/probe-fixtures/metabase.edn"))
+        sql (some (fn [{:keys [id sql]}] (when (= :foreign-key-discovery id) sql)) probes)
+        ^PgWireServer$QueryHandler handler *h*
+        parsed (.parse handler sql (int-array [1043]))
+        result (.executePrepared handler parsed (object-array [nil "public"]))]
+    (is (= [["public" "mb_order" "customer_id" "public" "mb_customer" "id"]]
+           (rows result))
+        (err result))))
+
+(deftest fk-delete-set-null
+  (doseq [sql ["CREATE TABLE parent (id int PRIMARY KEY, ancestor int REFERENCES parent ON DELETE SET NULL)"
+               "CREATE TABLE child (id int PRIMARY KEY,
+                                     pid int DEFAULT 2 REFERENCES parent ON UPDATE RESTRICT ON DELETE SET NULL,
+                                     derived int GENERATED ALWAYS AS (coalesce(pid, -1)) STORED)"
+               "INSERT INTO parent VALUES (1, NULL), (2, 1)"
+               "INSERT INTO child (id, pid) VALUES (10, 1), (20, 2)"]]
+    (let [r (run sql)] (is (ok? r) (err r))))
+  (is (= [["n" "r"]] (rows (run "SELECT confdeltype, confupdtype FROM pg_constraint
+                                 WHERE conname = 'child_pid_fkey'"))))
+  (is (ok? (run "BEGIN")))
+  (is (= [["1"]] (rows (run "DELETE FROM parent WHERE id = 1 RETURNING id"))))
+  (is (= [["2" nil]] (rows (run "SELECT id, ancestor FROM parent"))))
+  (is (= [["10" nil "-1"] ["20" "2" "2"]]
+         (rows (run "SELECT id, pid, derived FROM child ORDER BY id"))))
+  (is (ok? (run "ROLLBACK")))
+  (is (= [["1" nil] ["2" "1"]] (rows (run "SELECT id, ancestor FROM parent ORDER BY id"))))
+  (is (= [["10" "1" "1"] ["20" "2" "2"]]
+         (rows (run "SELECT id, pid, derived FROM child ORDER BY id"))))
+  (is (ok? (run "DELETE FROM parent WHERE id = 1")))
+  (is (= [["10" nil "-1"] ["20" "2" "2"]]
+         (rows (run "SELECT id, pid, derived FROM child ORDER BY id"))))
+  (testing "Rows inserted earlier in an explicit transaction retain their allocated IDs on replay"
+    (is (ok? (run "BEGIN")))
+    (is (ok? (run "INSERT INTO parent VALUES (3, NULL)")))
+    (is (ok? (run "INSERT INTO child (id, pid) VALUES (30, 3)")))
+    (is (ok? (run "DELETE FROM parent WHERE id = 3")))
+    (is (ok? (run "COMMIT")))
+    (is (= [["30" nil "-1"]]
+           (rows (run "SELECT id, pid, derived FROM child WHERE id = 30"))))))
+
+(deftest fk-cascade-to-composite-set-null
+  (doseq [sql ["CREATE TABLE root (id int PRIMARY KEY)"
+               "CREATE TABLE middle (rid int REFERENCES root ON DELETE CASCADE,
+                                     n int, PRIMARY KEY (rid, n))"
+               "CREATE TABLE leaf (rid int, n int)"
+               "ALTER TABLE leaf ADD CONSTRAINT keep_leaf FOREIGN KEY (rid, n)
+                REFERENCES middle ON DELETE SET NULL"
+               "INSERT INTO root VALUES (1), (2)"
+               "INSERT INTO middle VALUES (1, 5), (2, 5)"
+               "INSERT INTO leaf VALUES (1, 5), (2, 5)"
+               "DELETE FROM root WHERE id = 1"]]
+    (let [r (run sql)] (is (ok? r) (err r))))
+  (is (= [["2" "5"] [nil nil]]
+         (rows (run "SELECT rid, n FROM leaf ORDER BY rid NULLS LAST"))))
+  (is (= [["2" "5"]] (rows (run "SELECT rid, n FROM middle"))))
+  (let [r (run "ALTER TABLE leaf ADD FOREIGN KEY (rid, n)
+                REFERENCES middle ON DELETE SET NULL (n)")]
+    (is (= "0A000" (.sqlstate ^PgWireServer$QueryResult r)) (err r))))
+
+(deftest fk-set-null-cannot-assign-a-generated-column
+  (is (ok? (run "CREATE TABLE root (id int PRIMARY KEY)")))
+  (let [r (run "CREATE TABLE child (
+                 source int, pid int GENERATED ALWAYS AS (source + 1) STORED
+                 REFERENCES root ON DELETE SET NULL)")]
+    (is (= "42601" (.sqlstate ^PgWireServer$QueryResult r)) (err r)))
+  (is (ok? (run "CREATE TABLE child (source int, pid int GENERATED ALWAYS AS (source + 1) STORED)")))
+  (let [r (run "ALTER TABLE child ADD FOREIGN KEY (pid) REFERENCES root ON DELETE SET NULL")]
+    (is (= "42601" (.sqlstate ^PgWireServer$QueryResult r)) (err r))))
+
+(deftest fk-set-null-constraint-errors-are-atomic
+  (doseq [sql ["CREATE TABLE root (id int PRIMARY KEY)"
+               "CREATE TABLE required_child (id int PRIMARY KEY, pid int NOT NULL
+                                              REFERENCES root ON DELETE SET NULL)"
+               "CREATE TABLE checked_child (id int PRIMARY KEY, pid int
+                                             REFERENCES root ON DELETE SET NULL,
+                                             CHECK (pid IS NOT NULL))"
+               "INSERT INTO root VALUES (1), (2)"
+               "INSERT INTO required_child VALUES (10, 1)"
+               "INSERT INTO checked_child VALUES (20, 2)"]]
+    (let [r (run sql)] (is (ok? r) (err r))))
+  (doseq [[id state] [[1 "23502"] [2 "23514"]]]
+    (let [r (run (str "DELETE FROM root WHERE id = " id))]
+      (is (= state (.sqlstate ^PgWireServer$QueryResult r)) (err r))))
+  (is (= [["1"] ["2"]] (rows (run "SELECT id FROM root ORDER BY id"))))
+  (is (= [["10" "1"]] (rows (run "SELECT id, pid FROM required_child"))))
+  (is (= [["20" "2"]] (rows (run "SELECT id, pid FROM checked_child")))))
+
+(deftest fk-set-null-runs-child-update-triggers-atomically
+  (doseq [sql ["CREATE TABLE root (id int PRIMARY KEY)"
+               "CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES root ON DELETE SET NULL,
+                                     changes int, reject boolean)"
+               "CREATE TABLE audit (entry serial PRIMARY KEY, child_id int, change_count int)"
+               "CREATE FUNCTION before_null() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN NEW.changes := OLD.changes + 1; RETURN NEW; END $$"
+               "CREATE FUNCTION after_null() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                  INSERT INTO audit (child_id, change_count) VALUES (NEW.id, NEW.changes);
+                  IF NEW.reject THEN RAISE EXCEPTION 'reject child update'; END IF;
+                  RETURN NEW;
+                END $$"
+               "CREATE TRIGGER bn BEFORE UPDATE OF pid ON child FOR EACH ROW EXECUTE FUNCTION before_null()"
+               "CREATE TRIGGER an AFTER UPDATE OF pid ON child FOR EACH ROW EXECUTE FUNCTION after_null()"
+               "INSERT INTO root VALUES (1), (2)"
+               "INSERT INTO child VALUES (10, 1, 0, false), (20, 2, 0, true)"]]
+    (let [r (run sql)] (is (ok? r) (err r))))
+  (let [r (run "DELETE FROM root")]
+    (is (= "P0001" (.sqlstate ^PgWireServer$QueryResult r)) (err r)))
+  (is (= [["1"] ["2"]] (rows (run "SELECT id FROM root ORDER BY id"))))
+  (is (= [["10" "1" "0"] ["20" "2" "0"]]
+         (rows (run "SELECT id, pid, changes FROM child ORDER BY id"))))
+  (is (= [] (rows (run "SELECT child_id FROM audit"))))
+  (is (ok? (run "UPDATE child SET reject = false")))
+  (let [r (run "DELETE FROM root")]
+    (is (ok? r) (err r)))
+  (is (= [["10" nil "1"] ["20" nil "1"]]
+         (rows (run "SELECT id, pid, changes FROM child ORDER BY id"))))
+  (is (= [["10" "1"] ["20" "1"]]
+         (rows (run "SELECT child_id, change_count FROM audit ORDER BY child_id")))))
+
+(deftest fk-set-null-commit-rejects-new-references
+  (doseq [sql ["CREATE TABLE root (id int PRIMARY KEY)"
+               "CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES root ON DELETE SET NULL)"
+               "INSERT INTO root VALUES (1)"
+               "BEGIN"
+               "DELETE FROM root WHERE id = 1"]]
+    (let [r (run sql)] (is (ok? r) (err r))))
+  (binding [*h* (pg/make-query-handler *conn*)]
+    (is (ok? (run "INSERT INTO child VALUES (10, 1)"))))
+  (let [r (run "COMMIT")]
+    (is (= "40001" (.sqlstate ^PgWireServer$QueryResult r)) (err r)))
+  (is (= [["1"]] (rows (run "SELECT id FROM root"))))
+  (is (= [["10" "1"]] (rows (run "SELECT id, pid FROM child")))))
 
 ;; ============================================================================
 ;; CT6 — GRANT / REVOKE / RLS rejected with 0A000

@@ -11,6 +11,7 @@
    :note "missed catalog probe — could be fast-pathed"}
   {:sql
    "SELECT \"fk_ns\".\"nspname\" AS \"fk-table-schema\", \"fk_table\".\"relname\" AS \"fk-table-name\", \"fk_column\".\"attname\" AS \"fk-column-name\", \"pk_ns\".\"nspname\" AS \"pk-table-schema\", \"pk_table\".\"relname\" AS \"pk-table-name\", \"pk_column\".\"attname\" AS \"pk-column-name\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_class\" AS \"fk_table\" ON \"c\".\"conrelid\" = \"fk_table\".\"oid\" INNER JOIN \"pg_namespace\" AS \"fk_ns\" ON \"c\".\"connamespace\" = \"fk_ns\".\"oid\" INNER JOIN \"pg_attribute\" AS \"fk_column\" ON \"c\".\"conrelid\" = \"fk_column\".\"attrelid\" INNER JOIN \"pg_class\" AS \"pk_table\" ON \"c\".\"confrelid\" = \"pk_table\".\"oid\" INNER JOIN \"pg_namespace\" AS \"pk_ns\" ON \"pk_table\".\"relnamespace\" = \"pk_ns\".\"oid\" INNER JOIN \"pg_attribute\" AS \"pk_column\" ON \"c\".\"confrelid\" = \"pk_column\".\"attrelid\" WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_' AND (\"c\".\"contype\" = 'f'::char) AND (\"fk_column\".\"attnum\" = ANY(c.conkey)) AND (\"pk_column\".\"attnum\" = ANY(c.confkey)) AND (\"fk_ns\".\"nspname\" IN ($1)) ORDER BY \"fk-table-schema\" ASC, \"fk-table-name\" ASC",
+   :id :foreign-key-discovery,
    :expected-system-kind nil,
    :note "missed catalog probe — could be fast-pathed"}
   {:sql

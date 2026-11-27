@@ -319,3 +319,32 @@
                          ON r.id = l.id AND r.tableoid = 'tableoid_right'::regclass
                        LEFT JOIN pg_class c ON c.oid = r.tableoid
                        ORDER BY l.id"))))))
+
+(deftest constraint-column-usage-lists-the-columns-a-constraint-depends-on
+  (with-handler
+    (fn [h]
+      (doseq [sql ["CREATE SCHEMA app"
+                   "CREATE TABLE app.parent (a int, b int, PRIMARY KEY (a, b))"
+                   "CREATE TABLE child (
+                      a int, b int NOT NULL, code int,
+                      CONSTRAINT child_fk FOREIGN KEY (a, b) REFERENCES app.parent,
+                      UNIQUE (code),
+                      CONSTRAINT child_check CHECK (a <> b))"]]
+        (is (= "" (run h sql)) sql))
+      (let [query "SELECT constraint_schema, constraint_name, table_schema, table_name, column_name
+                     FROM information_schema.constraint_column_usage
+                    WHERE constraint_name IN ('child_fk', 'parent_pkey', 'child_code_key', 'child_check')
+                    ORDER BY constraint_name, column_name"]
+        (is (= (str/join "\n" ["public|child_check|public|child|a"
+                               "public|child_check|public|child|b"
+                               "public|child_code_key|public|child|code"
+                               "public|child_fk|app|parent|a"
+                               "public|child_fk|app|parent|b"
+                               "app|parent_pkey|app|parent|a"
+                               "app|parent_pkey|app|parent|b"])
+               (run h query))))
+      (is (= "b" (run h "SELECT column_name FROM information_schema.constraint_column_usage
+                         WHERE constraint_name = 'child_b_not_null'")))
+      (is (= "" (run h "SELECT 1 FROM information_schema.constraint_column_usage
+                        WHERE table_name = 'child' AND constraint_name = 'child_fk'
+                          AND table_schema = current_schema"))))))

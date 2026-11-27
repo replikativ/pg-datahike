@@ -15,6 +15,13 @@ predates the current server and uses a different adapter build and
 launcher. Fresh raw results need the tested revision, fixture receipt,
 and timeout profile for each file.
 
+The 0.1.431 discovery refresh attempted all 164 files and collected 158
+complete outputs. Of the 157 with a comparable frozen result,
+normalized matches rose from 11 to 13. The new matches were `enum.sql`
+and `time.sql`. Normalization removes diagnostic source positions.
+`alter_table`, `database`, `generated_stored`, `inherit`, `join`, and
+`sqljson` remained incomplete.
+
 The targeted rerun on #421 recorded the following raw diagnostic counts
 against the preceding schema batch. A count can fall when a fix removes
 follow-on errors after an aborted transaction. Equal counts can still
@@ -45,21 +52,22 @@ specialized index operator classes, and OLD/NEW aliases in RETURNING.
 | SQLAlchemy and psycopg2 | 16 workflows with the custom Datahike dialect. | The custom dialect overrides version, capability and reflection paths. The CI Python dependencies are unpinned. Stock dialect startup and reflection need a separate check. |
 | Pagila and Chinook | Pagila checks COPY and row counts across 21 tables. Chinook has a separate strict per-row bidirectional gate. | Pagila tolerates schema errors. A local #421 profile disabled index backfill on its new database, causing 21 key and 36 downstream foreign-key errors. The precreated hosted database and standalone launcher enable backfill. The revised test template uses the same backfill setting. Qualified trigger references, nested joins in views, and partition attachment produced independent errors. |
 | Odoo 19 | The archived manual base smoke passed 11 TestORM cases. The archived accounting boot reached module init and failed on the tax-tag UPDATE. | The current base runner accepts a floor of nine and reports the Odoo test-process exit code. The accounting query uses FOR-only substring. Posted invoice numbering relies on a partial UNIQUE index and needs its own concurrency test. |
-| Metabase 0.60.2.4 | The archived manual app run completed initial sync and a native query. A #421 focused replay executed all 17 captured SQL statements against the seed, with 16 returning without error. | The current per-commit assertion checks statement routing. The seventeenth execution failed on missing pg_type.typtypmod in pgJDBC getColumns. FK discovery returned no rows in the replay. The optional MBQL shell probes now fail on HTTP errors and missing result sets. Exact result-value assertions still need to be added. |
+| Metabase 0.60.2.4 | The archived manual app run completed initial sync and a native query. A #421 focused replay executed all 17 captured SQL statements against the seed, with 16 returning without error. | The current per-commit assertion checks statement routing. The seventeenth execution failed on missing pg_type.typtypmod in pgJDBC getColumns. The captured seed uses a Datahike-native reference and declares no SQL FK. A separate fixture with three declared SQL FKs returned the same three rows as stock PostgreSQL. The optional MBQL shell probes now fail on HTTP errors and missing result sets. Exact result-value assertions still need to be added. |
 
 The archived full-application evidence is older than the client and SQL
 receipts. The published build for any new live run, and its exact seed,
 driver and launch profile, should accompany each result.
 [Release gates](beta-exit.md)
 
-### Candidate application checks
+### Application checks for PR #422
 
 The sequence migration probes matched stock PostgreSQL 18.6, and the
 extracted Odoo tax-tag UPDATE returned the intended rows. The
 candidate also replayed all 17 captured Metabase statements. The JDBC
 column query returned five rows and the added focused JDBC test verified
 domain precision and scale. The Metabase replay used the captured seed
-and SQL.
+and SQL. The captured FK query also has an assertion for a declared SQL
+foreign key.
 
 A fresh Pagila restore using the production backfill setting matched row
 counts across all 21 tables. Its 42 statement errors, compared with 99
@@ -77,7 +85,31 @@ administrative database on the private test endpoint. With that fixture
 in place, Odoo stopped during base SQL initialization on ON DELETE SET
 NULL (SQLSTATE 0A000). Its TestORM cases were not reached. The prior
 11-case report is historical. The manual harness now provisions that
-database, and referential SET NULL behavior remains a server gap.
+database.
+
+The SET NULL follow-on passed database initialization. The next boot
+failure was the `information_schema.constraint_column_usage` lookup in
+`ir_logging.init` (SQLSTATE 42P01). The added view reports the referenced
+table and columns of a foreign key, with the constraint's own schema.
+Its key names follow the existing `pg_constraint` metadata, which still
+synthesizes the names of some explicit PRIMARY KEY and UNIQUE constraints.
+
+With both changes, the live boot advanced to converting
+`res_users.login` from `varchar(64)` to unconstrained `varchar`. The ALTER
+failed on the column's dependencies (SQLSTATE 0A000), before TestORM.
+The next check is whether widening a typmod can use the existing storage
+and retain the unique constraint and its index.
+
+The PostgreSQL fixture verifies SET NULL on self-references and
+cross-table references, child-row preservation, rollback and a NOT NULL
+failure. The DELETE guard can return 40001 if a concurrent write
+changes the database while the referential action is being prepared.
+The targeted `foreign_key.sql` discovery run went from 857 adapter
+diagnostics on 0.1.431 to 832, with 198 expected from stock and zero
+internal failures. Partitioning, deferred constraints and several
+referential action variants still affect the full file. ALTER restores
+continue to admit existing ON UPDATE CASCADE declarations with
+restrictive parent-key updates.
 
 ### asyncpg expected failures by owning ID
 
@@ -99,10 +131,9 @@ need separately provisioned evidence.
 
 ## Next verification work
 
-1. Implement the referential SET NULL path, including the constraint
-   metadata Odoo inspects. Then rerun Odoo base and accounting boot.
-   Check invoice numbering separately with its partial uniqueness and
-   concurrency workload.
+1. Preserve dependencies when widening the typmod of a column such as
+   `res_users.login`. Repeat Odoo base and accounting boot. Check invoice
+   numbering separately with its partial uniqueness and concurrency workload.
 2. Assert admitted constraints, view results and trigger effects alongside
    Pagila COPY counts. Repeat Metabase initial sync on a named release and
    validate JDBC metadata and representative MBQL values.

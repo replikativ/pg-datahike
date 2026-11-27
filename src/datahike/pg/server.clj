@@ -2107,12 +2107,14 @@
     (let [parent-table (referenced-table-storage db parent-table parent-schema)
           cname (or name (ddl/generated-constraint-name
                           taken table (str/join "_" cols) "fkey"))
+          od (ddl/foreign-key-action on-delete)
+          ou (ddl/foreign-key-action on-update)
           parent-cols (ddl/resolve-foreign-key!
                        db table {:name cname :cols cols :parent-table parent-table
-                                 :parent-cols parent-cols :added-columns added-columns} nil)
-          ->action {"cascade" :cascade "set null" :set-null
-                    "set default" :set-default "restrict" :restrict
-                    "no action" :no-action}]
+                                 :parent-cols parent-cols :added-columns added-columns
+                                 :on-delete od} nil)]
+      ;; ALTER restores preserve declared action metadata. Parent-key
+      ;; updates still use the existing restrictive enforcement.
       (validate-added-fk! db table cname cols parent-table parent-cols)
       [(cond-> {:pg/constraint-key (ddl/constraint-key table cname)
                 :pg/fk-conname cname
@@ -2120,8 +2122,8 @@
                 :pg/fk-child-cols (jb/serialize-jsonb cols)
                 :pg/fk-parent-table parent-table
                 :pg/fk-parent-cols (jb/serialize-jsonb parent-cols)}
-         on-delete (assoc :pg/fk-on-delete (->action on-delete :no-action))
-         on-update (assoc :pg/fk-on-update (->action on-update :no-action)))])
+         od (assoc :pg/fk-on-delete od)
+         ou (assoc :pg/fk-on-update ou))])
 
     nil))
 
@@ -2160,114 +2162,85 @@
                                             ") is not present in table \""
                                             parent-table "\".")})))))))))
 
-(defn- find-fk-children
-  "Find child eids that reference any of the parent eids via the given FK.
-   Returns the eids as a set, or empty set if none."
-  [db table-name fk eids]
-  (let [q-fn d/q
-        {:keys [child-table child-cols parent-cols]} fk
-        parent-attrs (mapv #(keyword table-name %) parent-cols)
-        child-attrs (mapv #(keyword child-table %) child-cols)]
-    (into #{}
-          (mapcat (fn [eid]
-                    (let [parent-vals (mapv (fn [a]
-                                              (ffirst (q-fn {:find '[?v]
-                                                             :in '[$ ?e]
-                                                             :where [['?e a '?v]]}
-                                                            db eid)))
-                                            parent-attrs)]
-                      (when (every? some? parent-vals)
-                        (let [patterns (mapv (fn [attr v] ['?c attr v])
-                                             child-attrs parent-vals)
-                              q {:find '[?c] :where patterns}]
-                          (mapv first (q-fn q db)))))))
-          eids)))
+(defn- fk-parent-key [db table-name {:keys [parent-cols]} eid]
+  (mapv (fn [column]
+          (some-> (first (d/datoms db :eavt eid (keyword table-name column))) :v))
+        parent-cols))
 
-(defn- collect-fk-cascade-retractions!
-  "Walk all FKs with this table as parent. For RESTRICT/NO ACTION, raise
-   23503 if any child references the deleted eids. For CASCADE, recurse:
-   collect the child eids and ALSO walk THEIR children. Returns a set of
-   cascade-eids (across all child tables) to retract in the same tx.
-   PG-equivalent (commands/trigger.c::RI_FKey_cascade_del). Walks
-   iteratively against `db` (pre-transact); since retractEntity is
-   atomic, the same tx removes parent + transitively-cascading children."
-  [db table-name eids]
-  (when (seq eids)
-    (loop [pending [[table-name eids]]
-           visited #{}                  ;; [table-name eid] pairs already cascaded
-           cascade-eids #{}]
-      (if (empty? pending)
-        cascade-eids
-        (let [[t es] (first pending)
-              fks (read-fks-referring-to db t)
-              ;; Bucket FKs by action.
-              by-action (group-by :on-delete fks)
-              ;; RESTRICT / NO ACTION: any child = abort.
-              restrict-fks (concat (get by-action :no-action)
-                                   (get by-action :restrict))]
-          ;; Raise on first restrict violation.
-          (doseq [{:keys [name parent-cols] :as fk} restrict-fks
-                  :let [hits (find-fk-children db t fk es)]
-                  :when (seq hits)
-                  :let [parent-attrs (mapv #(keyword t %) parent-cols)
-                        eid (first es)
-                        parent-vals (mapv (fn [a]
-                                            (ffirst (d/q
-                                                     {:find '[?v]
-                                                      :in '[$ ?e]
-                                                      :where [['?e a '?v]]}
-                                                     db eid)))
-                                          parent-attrs)]]
-            (throw (ex-info "foreign key still referenced"
-                            {:error :foreign-key-violation
-                             :table (:child-table fk)
-                             :parent-table t
-                             :operation :delete
-                             :constraint name
-                             :detail (str "Key ("
-                                          (str/join ", " parent-cols)
-                                          ")=("
-                                          (str/join ", " (map str parent-vals))
-                                          ") is still referenced from table \""
-                                          (:child-table fk) "\".")})))
-          ;; CASCADE: collect new child eids, recurse on those.
-          (let [cascades (get by-action :cascade)
-                new-by-table
-                (reduce (fn [acc fk]
-                          (let [hits (find-fk-children db t fk es)
-                                fresh (remove (fn [c]
-                                                (contains? visited [(:child-table fk) c]))
-                                              hits)]
-                            (if (seq fresh)
-                              (update acc (:child-table fk) (fnil into #{}) fresh)
-                              acc)))
-                        {} cascades)
-                next-pending (concat (rest pending)
-                                     (for [[t' es'] new-by-table] [t' es']))
-                next-visited (into visited
-                                   (mapcat (fn [[t' es']]
-                                             (map vector (repeat t') es')))
-                                   new-by-table)
-                next-cascade (into cascade-eids
-                                   (mapcat val) new-by-table)]
-            ;; SET NULL / SET DEFAULT not yet supported — surface clearly.
-            (when-let [unsupported (seq (concat (get by-action :set-null)
-                                                (get by-action :set-default)))]
-              (throw (ex-info "ON DELETE action not implemented"
-                              {:error :feature-not-supported
-                               :feature (str "ON DELETE "
-                                             (name (:on-delete (first unsupported))))
-                               :constraint (:name (first unsupported))})))
-            (recur next-pending next-visited next-cascade)))))))
+(defn- find-fk-child-rows [db {:keys [child-table child-cols]} values]
+  (when (every? some? values)
+    (mapv first
+          (d/q {:find '[?c]
+                :where (mapv (fn [column value] ['?c (keyword child-table column) value])
+                             child-cols values)}
+               db))))
 
-(defn- enforce-fk-restrict-on-delete!
-  "Compatibility shim — older sites call this. Walks the FK graph and
-   either raises 23503 (RESTRICT/NO ACTION) or returns nil (we don't
-   add cascade retractions through this path; new callers should use
-   collect-fk-cascade-retractions! and append to tx-data)."
+(defn- find-fk-children [db table-name fk eids]
+  (into #{} (mapcat #(find-fk-child-rows db fk (fk-parent-key db table-name fk %))) eids))
+
+(defn- fk-set-null-reachable?
+  "Check whether a delete may reach SET NULL directly or through CASCADE."
+  [db table]
+  (loop [pending (list table), visited #{}]
+    (when-let [table (first pending)]
+      (if (contains? visited table)
+        (recur (rest pending) visited)
+        (let [fks (group-by :on-delete (read-fks-referring-to db table))]
+          (or (seq (:set-null fks))
+              (recur (into (rest pending) (map :child-table) (:cascade fks))
+                     (conj visited table))))))))
+
+(defn- collect-fk-delete-effects!
+  "Plan entity deletions and the SET NULL updates caused by each parent row.
+   Keep the old key for each update so matching can run after the parent
+   has been deleted from the speculative database."
   [db table-name eids]
-  (collect-fk-cascade-retractions! db table-name eids)
-  nil)
+  (loop [pending (when (seq eids) (list [table-name eids]))
+         visited (set (map #(vector table-name %) eids))
+         deleted-eids (set eids)
+         set-null-actions []]
+    (if-let [[t es] (first pending)]
+      (let [by-action (group-by :on-delete (read-fks-referring-to db t))
+            restrict-fks (concat (:no-action by-action) (:restrict by-action))]
+        (doseq [{:keys [name parent-cols] :as fk} restrict-fks
+                :let [parent-key (some (fn [eid]
+                                         (let [key (fk-parent-key db t fk eid)]
+                                           (when (seq (find-fk-child-rows db fk key)) key)))
+                                       es)]
+                :when parent-key]
+          (throw (ex-info "foreign key still referenced"
+                          {:error :foreign-key-violation
+                           :table (:child-table fk)
+                           :parent-table t
+                           :operation :delete
+                           :constraint name
+                           :detail (str "Key (" (str/join ", " parent-cols)
+                                        ")=(" (str/join ", " (map str parent-key))
+                                        ") is still referenced from table \""
+                                        (:child-table fk) "\".")})))
+        (when-let [unsupported (first (:set-default by-action))]
+          (throw (ex-info "ON DELETE SET DEFAULT is not supported"
+                          {:error :feature-not-supported
+                           :feature "ON DELETE SET DEFAULT"
+                           :constraint (:name unsupported)})))
+        (let [new-by-table (reduce (fn [acc fk]
+                                     (let [child (:child-table fk)
+                                           new-eids (remove #(contains? visited [child %])
+                                                            (find-fk-children db t fk es))]
+                                       (if (seq new-eids)
+                                         (update acc child (fnil into #{}) new-eids)
+                                         acc)))
+                                   {} (:cascade by-action))]
+          (recur (concat (rest pending) new-by-table)
+                 (into visited (mapcat (fn [[child ids]] (map #(vector child %) ids))) new-by-table)
+                 (into deleted-eids (mapcat val) new-by-table)
+                 (into set-null-actions
+                       (for [eid es
+                             fk (:set-null by-action)
+                             :let [key (fk-parent-key db t fk eid)]
+                             :when (every? some? key)]
+                         [fk key])))))
+      {:deleted-eids deleted-eids :set-null-actions set-null-actions})))
 
 (defn- enforce-fk-restrict-on-update!
   "Mirror of enforce-fk-restrict-on-delete!, but for UPDATE: when an
@@ -2290,7 +2263,7 @@
             ;; parent-referenced column on a committed row.
             touched (for [op tx-data
                           :when (and (vector? op)
-                                     (= :db/add (first op))
+                                     (contains? #{:db/add :db/retract} (first op))
                                      (contains? parent-col-attrs (nth op 2)))
                           :let [[_ eid attr _new] op
                                 old-val (ffirst (q-fn {:find '[?v]
@@ -3616,21 +3589,20 @@
 
 (defn- prepare-delete-effects
   "Run BEFORE triggers and resolve foreign-key effects for rows that will be deleted."
-  [db table eids]
+  [db table eids current-db]
   (fire-statement-triggers! db table :delete :before)
   (let [old-rows (into {} (map (fn [eid] [eid (entity-columns db table eid)])) eids)
-        kept (vec (keep-row-deletes db table eids old-rows))
-        cascaded (collect-fk-cascade-retractions! db table kept)]
-    {:eids kept
-     :deleted-eids (into kept (remove (set kept)) cascaded)
-     :after-rows (mapv (fn [eid] {:old (get old-rows eid)}) kept)}))
+        kept (vec (keep-row-deletes db table eids old-rows))]
+    (assoc (collect-fk-delete-effects! (current-db) table kept)
+           :eids kept
+           :after-rows (mapv (fn [eid] {:old (get old-rows eid)}) kept))))
 
 (defn- execute-delete [ctx conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
           matched (with-cte-namespaces parsed (match-delete-rows ctx db schema parsed))
-          {:keys [eids deleted-eids after-rows]} (prepare-delete-effects db table (:eids matched))
+          {:keys [eids deleted-eids after-rows]} (prepare-delete-effects db table (:eids matched) (constantly db))
           returning-result (when-let [returning (:returning parsed)]
                              (build-returning-result returning db db eids table
                                                      (:alias parsed) schema :delete matched))
@@ -5540,7 +5512,8 @@
                                       {:name (:pg/fk-conname datum)
                                        :cols (jb/parse-jsonb (:pg/fk-child-cols datum))
                                        :parent-table (:pg/fk-parent-table datum)
-                                       :parent-cols (jb/parse-jsonb (:pg/fk-parent-cols datum))}
+                                       :parent-cols (jb/parse-jsonb (:pg/fk-parent-cols datum))
+                                       :on-delete (:pg/fk-on-delete datum)}
                                       local)]
                         (assoc datum :pg/fk-parent-cols (jb/serialize-jsonb resolved)))
                       datum))
@@ -7329,54 +7302,56 @@
    explicit COMMIT. Throws on conflict or transact failure; the caller
    resets tx-state. Shared by explicit COMMIT and the implicit-group
    commit so both behave identically."
-  [conn tx-state]
+  ([conn tx-state]
+   (transact-tx-buffer! conn tx-state identity))
+  ([conn tx-state tx-wrap]
   ;; The conflict check and the commit form one atomic step under a
   ;; global monitor: without it two committers can both read the same
   ;; current-max-tx, both pass, then serialize through d/transact and
   ;; lose an update. Commits are already serialized by datahike's
   ;; single writer, so the monitor adds no real concurrency cost.
-  (locking commit-check-lock
-    (let [;; Unsafe enum-label facts exist only in the speculative DB.  Once
+   (locking commit-check-lock
+     (let [;; Unsafe enum-label facts exist only in the speculative DB.  Once
           ;; the surrounding transaction commits, every added label becomes
           ;; safe, so never persist those marker operations.
-          buf (durable-replay-buffer (:tx-buffer @tx-state))
-          begin-max-tx (:begin-max-tx @tx-state)
-          real-db (d/db conn)
-          current-max-tx (when begin-max-tx (:max-tx real-db))
-          advanced? (and begin-max-tx current-max-tx
-                         (> current-max-tx begin-max-tx))
-          guarded
-          (if (and (seq buf) advanced?)
-            (let [our-eas (tx-buffer-eas buf real-db)
-                  their-eas (ring-write-eas-graced (db-ring-key real-db)
-                                                   begin-max-tx current-max-tx)
-                  conflict?
-                  (cond
-                    (= ::gap their-eas) true
+           buf (durable-replay-buffer (:tx-buffer @tx-state))
+           begin-max-tx (:begin-max-tx @tx-state)
+           real-db (d/db conn)
+           current-max-tx (when begin-max-tx (:max-tx real-db))
+           advanced? (and begin-max-tx current-max-tx
+                          (> current-max-tx begin-max-tx))
+           guarded
+           (if (and (seq buf) advanced?)
+             (let [our-eas (tx-buffer-eas buf real-db)
+                   their-eas (ring-write-eas-graced (db-ring-key real-db)
+                                                    begin-max-tx current-max-tx)
+                   conflict?
+                   (cond
+                     (= ::gap their-eas) true
 
                     ;; nextval reservations commit outside the surrounding
                     ;; SQL transaction and only conflict with direct writes
                     ;; to the sequence's own storage.
-                    (= ::sequence-only their-eas)
-                    (some direct-sequence-value-write? buf)
+                     (= ::sequence-only their-eas)
+                     (some direct-sequence-value-write? buf)
 
-                    (= ::opaque our-eas) true
+                     (= ::opaque our-eas) true
 
-                    :else (eas-overlap? our-eas their-eas))]
-              (when conflict?
-                (throw (ex-info "could not serialize access due to concurrent update"
-                                {:error :serialization-failure
-                                 :detail (str "base=" begin-max-tx ", current=" current-max-tx)})))
-              (with-retraction-overlap-guard buf real-db their-eas))
-            (with-retraction-overlap-guard buf real-db nil))]
-      (when (seq guarded)
-        (transact-recorded! conn guarded (:tx-options @tx-state)))
+                     :else (eas-overlap? our-eas their-eas))]
+               (when conflict?
+                 (throw (ex-info "could not serialize access due to concurrent update"
+                                 {:error :serialization-failure
+                                  :detail (str "base=" begin-max-tx ", current=" current-max-tx)})))
+               (with-retraction-overlap-guard buf real-db their-eas))
+             (with-retraction-overlap-guard buf real-db nil))]
+       (when (seq guarded)
+         (transact-recorded! conn (tx-wrap guarded) (:tx-options @tx-state)))
       ;; A successful DDL commit publishes schema/catalog changes after the
       ;; statement-level cache bust. Advance once more now so a concurrent
       ;; session that revalidated against the pre-commit DB cannot retain a
       ;; stale prepared plan under the statement's earlier generation.
-      (when (pos? (long (or (:ddl-version @tx-state) 0)))
-        (invalidate-schema-cache!)))))
+       (when (pos? (long (or (:ddl-version @tx-state) 0)))
+         (invalidate-schema-cache!))))))
 
 (defn- end-tx!
   "Release this session's locks and reset tx-state to not-in-tx. Used at
@@ -9992,55 +9967,152 @@
           (classified-error "UPDATE error: " e)))
       (execute-update ctx conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
+(defn- fk-delete-snapshot-guard [basis]
+  ;; The read set includes missing child rows. A concurrent INSERT can
+  ;; introduce a reference even if none of this DELETE's write keys
+  ;; overlap it. Compare at the writer, including on buffer replay.
+  [:db.fn/call
+   (fresh-insert-fn
+    (fn [db]
+      (when (and (not= basis (:max-tx db))
+                 (not= ::sequence-only
+                       (ring-write-eas-graced (db-ring-key db) basis (:max-tx db))))
+        (throw (ex-info "could not serialize foreign-key delete action"
+                        {:error :serialization-failure
+                         :detail "database advanced while ON DELETE SET NULL was evaluated"})))
+      []))])
+
+(defn- refresh-fk-generated-values [db table tx-data eids]
+  (let [plan (row-constraint-plan db table)
+        generated (:generated-columns plan)]
+    (if (seq generated)
+      (into tx-data
+            (mapcat (fn [[eid {:keys [new base]}]]
+                      (let [attrs (into {} (map (fn [[column value]]
+                                                  [(keyword table column) value])) new)
+                            values (generated-column-values attrs plan (:schema db) db)]
+                        (keep (fn [{:keys [attr]}]
+                                (let [value (get values attr)]
+                                  (when (not= (get base attr) value)
+                                    (assignment-op eid base attr value (:schema db) db))))
+                              generated))))
+            (update-rows-from-ops db table tx-data eids))
+      tx-data)))
+
+(defn- exec-fk-set-null! [tx-state {:keys [child-table child-cols] :as fk} parent-key]
+  ;; As in PostgreSQL's RI trigger, run one child UPDATE per parent key
+  ;; and constraint. Trigger statements see the same speculative database.
+  (let [db (:speculative-db @tx-state)
+        eids (vec (find-fk-child-rows db fk parent-key))
+        columns (set child-cols)
+        changes (into []
+                      (mapcat (fn [eid]
+                                (map (fn [column value]
+                                       [:db/retract eid (keyword child-table column) value])
+                                     child-cols parent-key)))
+                      eids)
+        _ (fire-statement-triggers! db child-table :update :before nil columns)
+        [changes _ updated-eids] (apply-before-row-updates db child-table changes columns eids)
+        db (:speculative-db @tx-state)
+        changes (refresh-fk-generated-values db child-table changes updated-eids)
+        _ (check-update-identity-collisions! db (:schema db) changes)
+        _ (check-not-null-on-update! db changes)
+        _ (check-updates-against-row-constraints! db child-table child-table changes)
+        _ (enforce-fk-restrict-on-update! db child-table changes)
+        after-rows (mapv #(select-keys % [:old :new])
+                         (vals (update-rows-from-ops db child-table changes updated-eids)))]
+    (when (seq changes)
+      (let [report (dc/with db changes)
+            _ (unique-constraints/validate-report! report)
+            commit-data (remap-row-operations db changes (:eid->tempid @tx-state))]
+        (swap! tx-state
+               (fn [state]
+                 (-> state
+                     (update :tx-buffer into commit-data)
+                     (assoc :speculative-db (:db-after report)))))))
+    (let [after (:speculative-db @tx-state)]
+      (fire-after-row-triggers! after child-table :update after-rows columns)
+      (fire-statement-triggers! after child-table :update :after after-rows columns))))
+
+(defn- exec-buffered-delete
+  [{:keys [conn schema tx-state] :as ctx} parsed]
+  (try
+    (let [session-id (:session-id @tx-state)
+          ;; Same blocking row-lock + rebase discipline as exec-update.
+          _ (when (empty? (:tx-buffer @tx-state))
+              (rebase-tx-state! conn tx-state))
+          matched
+          (loop []
+            (let [spec-db (:speculative-db @tx-state)
+                  {:keys [eids] :as built} (with-cte-namespaces parsed (match-delete-rows ctx spec-db schema parsed))
+                  lockable (filterv integer? eids)]
+              (if (and session-id (seq lockable)
+                       (nil? (:origin-db spec-db)))
+                (let [watermark (:begin-max-tx @tx-state)
+                      _ (lock-rows-blocking! session-id tx-state
+                                             (:table parsed) lockable
+                                             row-lock-timeout-ms)
+                      _ (rebase-tx-state! conn tx-state)]
+                  (if (not= watermark (:begin-max-tx @tx-state))
+                    (recur)
+                    built))
+                built)))
+          spec-db (:speculative-db @tx-state)
+          eid->tempid (:eid->tempid @tx-state)
+          {:keys [eids deleted-eids set-null-actions after-rows]}
+          (prepare-delete-effects spec-db (:table parsed) (:eids matched)
+                                  #(:speculative-db @tx-state))
+          write-db (:speculative-db @tx-state)
+          returning-result (when-let [returning (:returning parsed)]
+                             (build-returning-result returning spec-db spec-db eids
+                                                     (:table parsed) (:alias parsed)
+                                                     (:schema spec-db) :delete matched))
+          spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) deleted-eids)
+          spec-report (dc/with write-db spec-tx-data)
+          commit-tx-data (guard-catalog-tx (remap-row-operations write-db spec-tx-data eid->tempid))
+          guarded (if (seq set-null-actions)
+                    (into [(fk-delete-snapshot-guard (:begin-max-tx @tx-state))] commit-tx-data)
+                    commit-tx-data)]
+      (swap! tx-state (fn [ts]
+                        (-> ts
+                            (update :tx-buffer into guarded)
+                            (assoc :speculative-db (:db-after spec-report)))))
+      (doseq [[fk parent-key] set-null-actions]
+        (exec-fk-set-null! tx-state fk parent-key))
+      (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
+                                :delete after-rows)
+      (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
+                                :delete :after after-rows)
+      (or returning-result (empty-result (str "DELETE " (count eids)))))
+    (catch Exception e
+      (swap! tx-state assoc :aborted? true)
+      (classified-error "DELETE error: " e))))
+
 (defn- exec-delete
-  [ctx parsed]
-  (let [{:keys [conn schema tx-state]} ctx]
-    (if (:in-tx? @tx-state)
+  [{:keys [conn schema tx-state handler session-id cursors] :as ctx} parsed]
+  (cond
+    (:in-tx? @tx-state)
+    (exec-buffered-delete ctx parsed)
+
+    ;; The standalone handler API can call execute without a wire group.
+    ;; Give triggered child updates the same rollback boundary there.
+    (fk-set-null-reachable? (d/db conn) (:table parsed))
+    (do
+      (open-implicit-tx! ctx)
       (try
-        (let [session-id (:session-id @tx-state)
-              ;; Same blocking row-lock + rebase discipline as exec-update.
-              _ (when (empty? (:tx-buffer @tx-state))
-                  (rebase-tx-state! conn tx-state))
-              matched
-              (loop []
-                (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (with-cte-namespaces parsed (match-delete-rows ctx spec-db schema parsed))
-                      lockable (filterv integer? eids)]
-                  (if (and session-id (seq lockable)
-                           (nil? (:origin-db spec-db)))
-                    (let [watermark (:begin-max-tx @tx-state)
-                          _ (lock-rows-blocking! session-id tx-state
-                                                 (:table parsed) lockable
-                                                 row-lock-timeout-ms)
-                          _ (rebase-tx-state! conn tx-state)]
-                      (if (not= watermark (:begin-max-tx @tx-state))
-                        (recur)
-                        built))
-                    built)))
-              spec-db (:speculative-db @tx-state)
-              eid->tempid (:eid->tempid @tx-state)
-              {:keys [eids deleted-eids after-rows]}
-              (prepare-delete-effects spec-db (:table parsed) (:eids matched))
-              returning-result (when-let [returning (:returning parsed)]
-                                 (build-returning-result returning spec-db spec-db eids
-                                                         (:table parsed) (:alias parsed)
-                                                         (:schema spec-db) :delete matched))
-              spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) deleted-eids)
-              spec-report (dc/with spec-db spec-tx-data)
-              commit-tx-data (remap-row-operations spec-db spec-tx-data eid->tempid)]
-          (swap! tx-state (fn [ts]
-                            (-> ts
-                                (update :tx-buffer into (guard-catalog-tx commit-tx-data))
-                                (assoc :speculative-db (:db-after spec-report)))))
-          (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
-                                    :delete after-rows)
-          (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
-                                    :delete :after after-rows)
-          (or returning-result (empty-result (str "DELETE " (count eids)))))
+        (let [result (exec-buffered-delete ctx parsed)]
+          (if (.error ^PgWireServer$QueryResult result)
+            (.rollbackImplicit ^PgWireServer$QueryHandler handler)
+            (do
+              (transact-tx-buffer! conn tx-state (:tx-wrap ctx))
+              (end-tx! session-id tx-state cursors)))
+          result)
         (catch Exception e
-          (swap! tx-state assoc :aborted? true)
-          (classified-error "DELETE error: " e)))
-      (execute-delete ctx conn parsed schema :tx-wrap (:tx-wrap ctx)))))
+          (.rollbackImplicit ^PgWireServer$QueryHandler handler)
+          (classified-error "DELETE error: " e))))
+
+    :else
+    (execute-delete ctx conn parsed schema :tx-wrap (:tx-wrap ctx))))
 
 (defn- table-row-eids
   "All row entity-ids of `table` in `db` — union across EVERY attr in

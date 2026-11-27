@@ -156,7 +156,8 @@
     "information_schema_columns" "information_schema_tables"
     "information_schema_sequences"
     "information_schema_table_constraints"
-    "information_schema_key_column_usage"})
+    "information_schema_key_column_usage"
+    "information_schema_constraint_column_usage"})
 
 (declare extra-catalog-tables)
 
@@ -261,6 +262,15 @@
   ;; Tag the high bit to avoid collisions with table OIDs.
   (bit-or 0x50000000
           (Math/abs (.hashCode ^String (str kind ":" name ":" table)))))
+
+(defn- fk-action-catalog-code [action]
+  (case action
+    :no-action "a"
+    :restrict "r"
+    :cascade "c"
+    :set-null "n"
+    :set-default "d"
+    " "))
 
 (defn- not-null-constraint-rows [rows user-schema db]
   (let [hints (pgs/schema-hints db)
@@ -383,7 +393,9 @@
                         :pg_constraint/coninhcount 0
                         :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
                         :pg_constraint/conparentid 0
-                        :pg_constraint/conperiod false)
+                        :pg_constraint/conperiod false
+                        :pg_constraint/confdeltype (get % :pg_constraint/confdeltype " ")
+                        :pg_constraint/confupdtype (get % :pg_constraint/confupdtype " "))
                 rows))
         rows))))
 
@@ -1363,6 +1375,8 @@
      {:db/ident :pg_constraint/contypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_constraint/connamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/confrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/confdeltype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_constraint/confupdtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      {:db/ident :pg_constraint/condeferrable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condeferred :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/conenforced :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
@@ -1466,6 +1480,16 @@
      {:db/ident :information_schema_table_constraints/initially_deferred :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_table_constraints/enforced :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "information_schema_table_constraints") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "information_schema_constraint_column_usage"
+    (conj (mapv (fn [column]
+                  {:db/ident (keyword "information_schema_constraint_column_usage" column)
+                   :db/valueType :db.type/string
+                   :db/cardinality :db.cardinality/one})
+                ["table_catalog" "table_schema" "table_name" "column_name"
+                 "constraint_catalog" "constraint_schema" "constraint_name"])
+          {:db/ident (pgs/row-marker-attr "information_schema_constraint_column_usage")
+           :db/valueType :db.type/boolean
+           :db/cardinality :db.cardinality/one})
     "information_schema_key_column_usage"
     [{:db/ident :information_schema_key_column_usage/constraint_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_key_column_usage/constraint_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -2224,6 +2248,45 @@
                             [(keyword table (name column)) value])))
                   row))
           rows)))
+
+(defn- constraint-column-usage-rows
+  "The table and columns used by each constraint. For a foreign key these
+   are the referenced columns, while the constraint belongs to the child."
+  [user-schema db]
+  (let [relations (into {}
+                        (comp (filter #(contains? #{"r" "p"} (:pg_class/relkind %)))
+                              (map (juxt :pg_class/oid identity)))
+                        (relation-rows user-schema db))
+        namespaces (into {}
+                         (map (juxt :pg_namespace/oid :pg_namespace/nspname))
+                         (catalog-data-for* "pg_namespace" user-schema db))
+        attributes (group-by :pg_attribute/attrelid
+                             (remove :pg_attribute/attisdropped
+                                     (catalog-data-for* "pg_attribute" user-schema db)))]
+    (vec
+     (for [{:pg_constraint/keys [contype connamespace conname conrelid confrelid conkey confkey condef]}
+           (catalog-data-for "pg_constraint" user-schema db)
+           :let [foreign? (= "f" contype)
+                 relation-id (if foreign? confrelid conrelid)
+                 relation (get relations relation-id)]
+           :when relation
+           :let [columns (get attributes relation-id)
+                 used (if (= "c" contype)
+                        (let [[_ expr] (re-matches #"(?s)CHECK \((.*)\)" condef)]
+                          (filter (set (when expr (ddl/check-columns expr)))
+                                  (map :pg_attribute/attname columns)))
+                        (let [key-text (if foreign? confkey conkey)
+                              by-attnum (into {} (map (juxt :pg_attribute/attnum :pg_attribute/attname)) columns)]
+                          (keep by-attnum (map parse-long (re-seq #"-?[0-9]+" (or key-text ""))))))]
+           column used]
+       {:information_schema_constraint_column_usage/table_catalog regoid/*database-name*
+        :information_schema_constraint_column_usage/table_schema (get namespaces (:pg_class/relnamespace relation))
+        :information_schema_constraint_column_usage/table_name (:pg_class/relname relation)
+        :information_schema_constraint_column_usage/column_name column
+        :information_schema_constraint_column_usage/constraint_catalog regoid/*database-name*
+        :information_schema_constraint_column_usage/constraint_schema (get namespaces connamespace)
+        :information_schema_constraint_column_usage/constraint_name conname
+        (pgs/row-marker-attr "information_schema_constraint_column_usage") true}))))
 
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
@@ -3541,6 +3604,8 @@
            :pg_constraint/conrelid      (long tbl-oid)
            :pg_constraint/connamespace  (storage-schema-oid cte-db child)
            :pg_constraint/confrelid     (long parent-oid)
+           :pg_constraint/confdeltype   (fk-action-catalog-code on-delete)
+           :pg_constraint/confupdtype   (fk-action-catalog-code on-update)
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
            :pg_constraint/convalidated  true
@@ -3564,6 +3629,8 @@
                   (action-text " ON UPDATE " on-update)
                   (action-text " ON DELETE " on-delete)))
            (pgs/row-marker-attr "pg_constraint") true}))))
+    "information_schema_constraint_column_usage"
+    (constraint-column-usage-rows user-schema cte-db)
     "information_schema_table_constraints"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           primary-keys (explicit-primary-keys cte-db)
