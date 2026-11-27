@@ -9,8 +9,8 @@ runs.
 ## PostgreSQL 18.6
 
 The pinned source is REL_18_6. The inventory classifies 231 scheduled
-files. The campaign has 90 files, including 12 whole-file strict gates
-and 62 strict slices after the ordinary partial index batch. The
+files. The campaign has 91 files, including 12 whole-file strict gates
+and 64 strict slices after the expression-index batch. The
 frozen 164-file discovery result uses an older adapter build and launcher.
 Fresh raw results need the tested revision, fixture receipt, and timeout
 profile for each file.
@@ -175,6 +175,26 @@ was a B-tree index on the expression `("barcode" IS NOT NULL)` for
 `res_partner`, with `WHERE "barcode" IS NOT NULL` (42601). That precedes
 TestORM. The 21 caught inherited-column `SET NOT NULL` errors recur.
 
+### Ordinary expression index keys
+
+The barcode case and the partial arithmetic case from `indexing.sql`
+both preserve an expression key with zero in `indkey`, the expression
+in `indexprs`, and the key's type in `pg_attribute`. The barcode query
+distinguishes SQL NULL from JSON `null`. The `create_table.sql` slice
+pairs expression-key dependencies with durable column positions after
+earlier columns are dropped. The audited inventory admits the DDL
+slice from `indexing.sql`. Its whole-file measurement remains open.
+
+These gates cover declarative non-unique B-tree keys on ordinary
+tables. SQL queries evaluate expressions through Datahike's general
+access paths. Expression uniqueness, storage-backed expression
+access paths, partition-index attachment, and wider expression syntax
+remain separate coverage gaps.
+
+The live Odoo 19 boot at `007e86391e14` created the barcode expression
+index and proceeded to add foreign keys. The 21 caught inherited-column
+`SET NOT NULL` errors still recur.
+
 ### asyncpg expected failures by owning ID
 
 | Area | IDs | Observed causes |
@@ -195,12 +215,10 @@ need separately provisioned evidence.
 
 ## Next verification work
 
-1. Cover expression index keys for Odoo's company-dependent field.
-   Pair its partial expression index with the expression-key DDL in
-   `indexing.sql` (211–217) and the dependent-column cases in
-   `create_table.sql` (746–748). Cover inherited nullability with
-   `inherit.sql`, then repeat base and accounting boot. Verify posted
-   invoice numbering with its partial-uniqueness and concurrency workload.
+1. Continue Odoo base and accounting checks past index setup. Pair
+   inherited nullability with `inherit.sql` and verify child-local
+   constraints and parent-to-child propagation. Verify posted invoice
+   numbering with its partial-uniqueness and concurrency workload.
 2. Assert admitted constraints, view results and trigger effects alongside
    Pagila COPY counts. Repeat Metabase initial sync on a named release and
    validate JDBC metadata and representative MBQL values.

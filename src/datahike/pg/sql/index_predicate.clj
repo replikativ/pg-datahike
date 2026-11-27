@@ -1,17 +1,20 @@
 (ns datahike.pg.sql.index-predicate
-  "Bind ordinary B-tree index predicates to the indexed table's columns."
+  "Bind ordinary B-tree key expressions and predicates to the indexed table."
   (:require [clojure.string :as str]
             [datahike.pg.catalog.objects :as objects]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.errors :as errors]
+            [datahike.pg.schema :as pgs]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.oid-infer :as oid-infer]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [datahike.pg ColumnSubstitutingDeParser]
            [java.util.function Function]
            [net.sf.jsqlparser.expression BinaryExpression BooleanValue DoubleValue
             LongValue NotExpression NullValue SignedExpression StringValue]
+           [net.sf.jsqlparser.expression.operators.arithmetic Addition Concat Multiplication Subtraction]
            [net.sf.jsqlparser.expression.operators.conditional AndExpression OrExpression]
            [net.sf.jsqlparser.expression.operators.relational
             ComparisonOperator IsBooleanExpression IsNullExpression ParenthesedExpressionList]
@@ -23,35 +26,67 @@
 (defn- keyword-token? [token word]
   (and (= :ident (:type token)) (= word (str/lower-case (:text token)))))
 
-(defn split-predicate
-  "Parse the index declaration and its WHERE expression independently.
-   JSqlParser's CREATE INDEX grammar cannot parse PostgreSQL predicates."
+(defn- index-options [tokens]
+  (let [[_ second-token & tail] (drop-while #(= ";" (:text %)) tokens)]
+    (if (keyword-token? second-token "unique") (next tail) tail)))
+
+(defn- split-predicate [^String sql tokens]
+  (loop [remaining tokens depth 0]
+    (when-let [{:keys [text pos end] :as token} (first remaining)]
+      (if (and (zero? depth) (keyword-token? token "where"))
+        (let [last-token (last (remove #(= ";" (:text %)) (next remaining)))]
+          {:head (subs sql 0 pos)
+           :predicate (if last-token (str/trim (subs sql end (:end last-token))) "")})
+        (recur (next remaining) (case text "(" (inc depth) ")" (dec depth) depth))))))
+
+(defn- expression-key [sql position tokens]
+  (when-let [[_ tail] (cls/read-balanced tokens)]
+    (when (seq tail)
+      (throw (errors/pg-error :feature-not-supported
+                              {:message "expression-key index options are not supported"})))
+    {:position position
+     :start (:pos (first tokens))
+     :end (:end (peek tokens))
+     :sql (subs sql (:end (first tokens)) (:pos (peek tokens)))}))
+
+(defn split-declaration
+  "Let JSqlParser parse the index header with placeholder column keys.
+   Retain each parenthesized expression by its position in the key list."
   [^String sql]
-  (let [[_ second-token & tail] (drop-while #(= ";" (:text %)) (cls/tokenize sql))
-        tokens (if (keyword-token? second-token "unique") (next tail) tail)]
-    (loop [remaining tokens depth 0]
-      (when-let [{:keys [text pos end] :as token} (first remaining)]
-        (if (and (zero? depth) (keyword-token? token "where"))
-          (let [last-token (last (remove #(= ";" (:text %)) (next remaining)))]
-            {:head (subs sql 0 pos)
-             :concurrently? (keyword-token? (first tokens) "concurrently")
-             :predicate (if last-token (str/trim (subs sql end (:end last-token))) "")})
-          (recur (next remaining) (case text "(" (inc depth) ")" (dec depth) depth)))))))
+  (let [tokens (index-options (cls/tokenize sql))
+        predicate (split-predicate sql tokens)
+        head (or (:head predicate) sql)
+        key-list (->> tokens
+                      (take-while #(< (:pos %) (count head)))
+                      (drop-while #(not= "(" (:text %))))
+        [inside] (cls/read-balanced key-list)
+        expressions (into [] (keep-indexed (partial expression-key head))
+                          (cls/split-top-level-commas inside))]
+    (cond
+      (seq expressions)
+      (assoc predicate
+             :head (reduce (fn [head {:keys [position start end]}]
+                             (str (subs head 0 start)
+                                  "__pg_index_expr_" position " " (subs head end)))
+                           head (rseq expressions))
+             :expression-keys (into {} (map (juxt :position :sql)) expressions)
+             :concurrently? (keyword-token? (first tokens) "concurrently"))
+      predicate (assoc predicate :concurrently? (keyword-token? (first tokens) "concurrently")))))
 
 (defn- syntax [message]
   (ex-info message {:sqlstate "42601"}))
 
 (defn- unsupported []
   (errors/pg-error :feature-not-supported
-                   {:message "partial index predicates support simple column tests and comparisons"}))
+                   {:message "index expressions support simple scalar tests, comparisons and arithmetic"}))
 
-(defn- parse-predicate [sql]
+(defn- parse-index-expression [sql]
   (when (str/blank? sql)
-    (throw (syntax "missing index predicate after WHERE")))
+    (throw (syntax "missing index expression")))
   (try
     (CCJSqlParserUtil/parseCondExpression sql false)
     (catch net.sf.jsqlparser.JSQLParserException _
-      (throw (syntax "invalid index predicate")))))
+      (throw (syntax "invalid index expression")))))
 
 (def ^:private numeric-types #{:integer :float :numeric})
 (def ^:private comparison-types #{:text :boolean :integer :float :numeric})
@@ -63,17 +98,37 @@
 
 (declare expression-type)
 
+(defn- arithmetic? [expression]
+  (or (instance? Addition expression)
+      (instance? Subtraction expression)
+      (instance? Multiplication expression)))
+
 (defn- binary-type [lookup ^BinaryExpression expression]
   (let [left (expression-type lookup (.getLeftExpression expression))
         right (expression-type lookup (.getRightExpression expression))]
-    (if (or (instance? AndExpression expression) (instance? OrExpression expression))
-      (do (require-boolean! left) (require-boolean! right))
-      (when-not (or (and (= left right) (comparison-types left))
-                    (and (numeric-types left) (numeric-types right))
-                    (and (#{:null} left) (or (comparison-types right) (= :null right)))
-                    (and (= :null right) (comparison-types left)))
-        (throw (unsupported))))
-    :boolean))
+    (cond
+      (or (instance? AndExpression expression) (instance? OrExpression expression))
+      (do (require-boolean! left) (require-boolean! right) :boolean)
+
+      (arithmetic? expression)
+      (do
+        (when-not (and (numeric-types left) (numeric-types right))
+          (throw (unsupported)))
+        (cond
+          (or (= left :float) (= right :float)) :float
+          (or (= left :numeric) (= right :numeric)) :numeric
+          :else :integer))
+
+      (instance? Concat expression)
+      (if (= left right :text) :text (throw (unsupported)))
+
+      :else
+      (if (or (and (= left right) (comparison-types left))
+              (and (numeric-types left) (numeric-types right))
+              (and (= :null left) (or (comparison-types right) (= :null right)))
+              (and (= :null right) (comparison-types left)))
+        :boolean
+        (throw (unsupported))))))
 
 (defn- expression-type [lookup expression]
   (cond
@@ -100,6 +155,8 @@
 
     (or (instance? AndExpression expression)
         (instance? OrExpression expression)
+        (arithmetic? expression)
+        (instance? Concat expression)
         (and (instance? ComparisonOperator expression)
              (comparison-operators (.getStringExpression ^ComparisonOperator expression))))
     (binary-type lookup expression)
@@ -117,10 +174,16 @@
     (instance? NullValue expression) :null
     :else (throw (unsupported))))
 
-(defn bind-predicate [db relation-oid sql]
-  (let [ast (parse-predicate sql)
+(defn- unwrap-key [ast]
+  (if (and (instance? ParenthesedExpressionList ast) (= 1 (count ast)))
+    (recur (first ast))
+    ast))
+
+(defn- bind-expression [db relation-oid sql predicate?]
+  (let [ast (cond-> (parse-index-expression sql) (not predicate?) unwrap-key)
         relation (objects/object-by-address db objects/pg-class-oid relation-oid)
         table (:datahike.pg.object/name relation)
+        storage-table (or (:datahike.pg.object/storage-name relation) table)
         namespace (objects/namespace-by-oid db (objects/object-namespace-oid db relation))
         schema (:datahike.pg.object/name namespace)
         dependencies (volatile! #{})
@@ -136,21 +199,40 @@
                    (when-not found
                      (throw (errors/pg-error :undefined-column {:table table :column (str column)})))
                    (vswap! dependencies conj (:datahike.pg.column/attnum found))
-                   found))]
-    (require-boolean! (expression-type lookup ast))
-    (let [rendered (ColumnSubstitutingDeParser/deparse
-                    ast (reify Function
-                          (apply [_ column]
-                            (fns/quote-identifier (:datahike.pg.column/name (lookup column))))))]
-      {:sql (if (or (instance? Column ast) (instance? BooleanValue ast)
-                    (instance? ParenthesedExpressionList ast))
-              rendered
-              (str "(" rendered ")"))
-       :columns @dependencies})))
+                   found))
+        type (expression-type lookup ast)
+        _ (when predicate? (require-boolean! type))
+        rendered (ColumnSubstitutingDeParser/deparse
+                  ast (reify Function
+                        (apply [_ column]
+                          (fns/quote-identifier (:datahike.pg.column/name (lookup column))))))]
+    (if (and (not predicate?) (instance? Column ast))
+      {:column (:datahike.pg.column/name (lookup ast))}
+      (cond-> {:sql (if (or (instance? Column ast) (instance? BooleanValue ast)
+                            (instance? ParenthesedExpressionList ast)
+                            (instance? LongValue ast) (instance? DoubleValue ast)
+                            (instance? SignedExpression ast) (instance? StringValue ast))
+                      rendered
+                      (str "(" rendered ")"))
+               :columns @dependencies}
+        (not predicate?)
+        (assoc :type-oid
+               (or (and (not= :null type)
+                        (oid-infer/expr-oid
+                         ast {:db db :schema (:schema db)
+                              :hints (pgs/schema-hints db)
+                              :default-table storage-table :table-aliases {table storage-table}}))
+                   (throw (unsupported))))))))
+
+(defn bind-predicate [db relation-oid sql]
+  (bind-expression db relation-oid sql true))
+
+(defn bind-key [db relation-oid sql]
+  (bind-expression db relation-oid sql false))
 
 (defn rename-column [{:keys [sql] :as predicate} old-name new-name]
   (assoc predicate :sql (ColumnSubstitutingDeParser/deparse
-                         (parse-predicate sql)
+                         (parse-index-expression sql)
                          (reify Function
                            (apply [_ column]
                              (let [name (params/unquote-ident (.getColumnName ^Column column))]

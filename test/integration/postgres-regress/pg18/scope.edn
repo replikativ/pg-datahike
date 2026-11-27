@@ -88,7 +88,6 @@
     "create_index_spgist"
     "index_including_gist"
     "hash_func"
-    "indexing"
     "index_including"
     "brin"},
   :platform-collation-matrix

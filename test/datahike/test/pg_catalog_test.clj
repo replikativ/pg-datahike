@@ -420,6 +420,80 @@
     (is (= next-oid (:datahike.pg.catalog/next-oid (catalog-objects/catalog-entity (d/db *conn*)))))
     (is (empty? (rows "SELECT indexname FROM pg_indexes WHERE tablename='partial_invalid'")))))
 
+(deftest postgres-partial-expression-index-has-typed-arithmetic-key
+  (doseq [sql ["CREATE TABLE idxpart1 (id int, a int, b int, d bool)"
+               "INSERT INTO idxpart1 VALUES (1,2,3,true),(2,3,2,false),(3,3,2,NULL),(4,1,2,true)"
+               "CREATE INDEX idxpart1_expr ON idxpart1 ((a+b)) WHERE d = true"]]
+    (let [result (ex sql)]
+      (is (nil? (:err result)) (str sql " " (:err result)))))
+  (is (= [["0" "(a + b)" "(d = true)"]]
+         (rows "SELECT indkey,pg_get_expr(indexprs,indrelid),pg_get_expr(indpred,indrelid)
+                FROM pg_index WHERE indexrelid='idxpart1_expr'::regclass")))
+  (is (= [["expr" "23"]]
+         (rows "SELECT attname,atttypid FROM pg_attribute
+                WHERE attrelid='idxpart1_expr'::regclass AND attnum>0")))
+  (is (= [["1" "5"]] (rows "SELECT id,a+b FROM idxpart1 WHERE d=true AND a+b=5 ORDER BY id"))))
+
+(deftest odoo-jsonb-barcode-expression-key-follows-column-rename
+  (doseq [sql ["CREATE TABLE res_partner (id int PRIMARY KEY, barcode jsonb)"
+               "INSERT INTO res_partner VALUES (1,NULL),(2,'{}'::jsonb),(3,'null'::jsonb)"
+               "CREATE INDEX \"res_partner__barcode_index\" ON \"res_partner\" USING btree
+                ((\"barcode\" IS NOT NULL)) WHERE \"barcode\" IS NOT NULL"]]
+    (let [result (ex sql)]
+      (is (nil? (:err result)) (str sql " " (:err result)))))
+  (is (= [["1" "f"] ["2" "t"] ["3" "t"]]
+         (rows "SELECT id,barcode IS NOT NULL FROM res_partner ORDER BY id")))
+  (is (= [["expr" "16"]]
+         (rows "SELECT attname,atttypid FROM pg_attribute
+                WHERE attrelid='res_partner__barcode_index'::regclass AND attnum>0")))
+  (is (nil? (:err (ex "ALTER TABLE res_partner RENAME COLUMN barcode TO company_barcode"))))
+  (is (= [["CREATE INDEX res_partner__barcode_index ON public.res_partner USING btree (((company_barcode IS NOT NULL))) WHERE (company_barcode IS NOT NULL)"]]
+         (rows "SELECT indexdef FROM pg_indexes WHERE indexname='res_partner__barcode_index'")))
+  (is (= [["(company_barcode IS NOT NULL)" "(company_barcode IS NOT NULL)"]]
+         (rows "SELECT pg_get_expr(indexprs,indrelid),pg_get_expr(indpred,indrelid)
+                FROM pg_index WHERE indexrelid='res_partner__barcode_index'::regclass"))))
+
+(deftest postgres-expression-indexes-retain-column-addresses-after-drop
+  (doseq [sql ["CREATE TABLE part_column_drop (id int, useless_1 int, d int, useless_2 int, b int, useless_3 int)"
+               "ALTER TABLE part_column_drop DROP COLUMN useless_1"
+               "ALTER TABLE part_column_drop DROP COLUMN useless_2"
+               "ALTER TABLE part_column_drop DROP COLUMN useless_3"
+               "CREATE INDEX part_column_drop_b_pred ON part_column_drop(b) WHERE b = 1"
+               "CREATE INDEX part_column_drop_b_expr ON part_column_drop((b = 1))"
+               "CREATE INDEX part_column_drop_d_pred ON part_column_drop(d) WHERE d = 2"
+               "CREATE INDEX part_column_drop_d_expr ON part_column_drop((d = 2))"
+               "BEGIN"
+               "ALTER TABLE part_column_drop DROP COLUMN b"]]
+    (is (nil? (:err (ex sql))) sql))
+  (is (= [["part_column_drop_d_expr"] ["part_column_drop_d_pred"]]
+         (rows "SELECT indexname FROM pg_indexes WHERE tablename='part_column_drop' ORDER BY indexname")))
+  (is (nil? (:err (ex "ROLLBACK"))))
+  (is (= [["part_column_drop_b_expr" "0"] ["part_column_drop_b_pred" "5"]
+          ["part_column_drop_d_expr" "0"] ["part_column_drop_d_pred" "3"]]
+         (rows "SELECT c.relname,i.indkey FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                WHERE i.indrelid='part_column_drop'::regclass ORDER BY c.relname"))))
+
+(deftest expression-index-keeps-mixed-key-order-and-rejects-unavailable-semantics
+  (doseq [sql ["CREATE TABLE expression_keys (expr int, a int, b bigint)"
+               "CREATE INDEX mixed_keys ON expression_keys (expr, (a+b), (a>0))"]]
+    (is (nil? (:err (ex sql))) sql))
+  (is (= [["1 0 0" "(a + b), (a > 0)"]]
+         (rows "SELECT indkey,pg_get_expr(indexprs,indrelid) FROM pg_index
+                WHERE indexrelid='mixed_keys'::regclass")))
+  (is (= [["expr" "23"] ["expr1" "20"] ["expr2" "16"]]
+         (rows "SELECT attname,atttypid FROM pg_attribute
+                WHERE attrelid='mixed_keys'::regclass AND attnum>0 ORDER BY attnum")))
+  (let [oid-before (:datahike.pg.catalog/next-oid (catalog-objects/catalog-entity (d/db *conn*)))]
+    (doseq [[sql state] [["CREATE UNIQUE INDEX invalid_key ON expression_keys ((a+b))" "0A000"]
+                         ["CREATE INDEX invalid_key ON expression_keys ((random()))" "0A000"]
+                         ["CREATE INDEX invalid_key ON expression_keys ((a+unknown_col))" "42703"]
+                         ["CREATE INDEX invalid_key ON expression_keys ((a+b) DESC)" "0A000"]
+                         ["ALTER TABLE expression_keys ALTER COLUMN b TYPE integer" "0A000"]]]
+      (is (= state (:sqlstate (ex sql))) sql))
+    (is (= oid-before (:datahike.pg.catalog/next-oid (catalog-objects/catalog-entity (d/db *conn*))))))
+  (is (nil? (:err (ex "ALTER TABLE expression_keys DROP COLUMN a, DROP COLUMN b"))))
+  (is (empty? (rows "SELECT indexname FROM pg_indexes WHERE indexname='mixed_keys'"))))
+
 (deftest explicit-unique-indexes-are-enforced-and-transactional
   (is (nil? (:err (ex "CREATE TABLE explicit_unique (id integer, code text)"))))
   (is (nil? (:err (ex "CREATE UNIQUE INDEX explicit_unique_code ON explicit_unique (code)"))))

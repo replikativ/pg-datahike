@@ -964,7 +964,7 @@
       (recur (conj opts opt) ts')
       [opts ts])))
 
-(defn- read-balanced
+(defn read-balanced
   "Consume `(` through its matching `)`. Returns [inner-toks rest-toks],
    or nil when the head is not `(` or the parens do not close."
   [toks]

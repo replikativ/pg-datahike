@@ -193,23 +193,28 @@
                 (when-not (and (vector? keys)
                                (if (true? legacy-incomplete?)
                                  (and (false? unique?) (empty? keys))
-                                 (and (seq keys)
-                                      (every? map? keys)
-                                      (every? keyword? attrs))))
-                  (invalid-descriptor! name "missing key storage identity"))
-                (doseq [[key attr] (map vector keys attrs)
-                        :let [schema-entry (get (dbi/-schema db) attr)
-                              registered (objects/column-by-attnum
-                                          db relation-oid (:attnum key))]]
-                  (when-not schema-entry
-                    (invalid-descriptor! name (str "unknown key attribute " attr)))
-                  (when-not (and registered
-                                 (not (:datahike.pg.column/dropped? registered))
-                                 (= (:name key) (:datahike.pg.column/name registered))
-                                 (= attr (:datahike.pg.column/storage-ident registered)))
-                    (invalid-descriptor! name "key does not name a live table column"))
-                  (when (= :db.cardinality/many (:db/cardinality schema-entry))
-                    (invalid-descriptor! name "cardinality-many keys are unsupported")))
+                                 (and (seq keys) (every? map? keys))))
+                  (invalid-descriptor! name "missing key metadata"))
+                (doseq [[key attr] (map vector keys attrs)]
+                  (if-let [{:keys [sql columns type-oid]} (:expression key)]
+                    (when-not (and (not unique?) (= "btree" method) (= 0 (:attnum key))
+                                   (nil? attr) (string? sql) (pos-int? type-oid) (set? columns)
+                                   (every? (fn [attnum]
+                                             (when-let [column (objects/column-by-attnum db relation-oid attnum)]
+                                               (not (:datahike.pg.column/dropped? column))))
+                                           columns))
+                      (invalid-descriptor! name "invalid expression key metadata"))
+                    (let [schema-entry (get (dbi/-schema db) attr)
+                          registered (objects/column-by-attnum db relation-oid (:attnum key))]
+                      (when-not (and (keyword? attr) schema-entry)
+                        (invalid-descriptor! name (str "unknown key attribute " attr)))
+                      (when-not (and registered
+                                     (not (:datahike.pg.column/dropped? registered))
+                                     (= (:name key) (:datahike.pg.column/name registered))
+                                     (= attr (:datahike.pg.column/storage-ident registered)))
+                        (invalid-descriptor! name "key does not name a live table column"))
+                      (when (= :db.cardinality/many (:db/cardinality schema-entry))
+                        (invalid-descriptor! name "cardinality-many keys are unsupported")))))
                 (when-not (get (dbi/-schema db) (keyword table "db-row-exists"))
                   (invalid-descriptor! name "table row marker is missing"))
                 {:entity entity
