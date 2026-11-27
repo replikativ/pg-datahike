@@ -1725,6 +1725,7 @@
              ident (:db/ident index)
              legacy-incomplete? (:datahike.pg.index/legacy-incomplete? index)
              primary? (true? (:datahike.pg.index/primary? index))
+             predicate (some-> (:datahike.pg.index/predicate index) edn/read-string :sql)
              status (get-in db [:schema ident :db.secondary/status])
              logical-table (catalog-objects/public-relation-name db table)
              indexdef (str "CREATE " (when unique? "UNIQUE ")
@@ -1734,11 +1735,13 @@
                            " USING " method " ("
                            (if legacy-incomplete?
                              "/* legacy key metadata unavailable; DROP and recreate */"
-                             (str/join ", " (map (comp fns/quote-identifier :name) keys))) ")")]
+                             (str/join ", " (map (comp fns/quote-identifier :name) keys))) ")"
+                           (when predicate (str " WHERE " predicate)))]
          {:oid (long oid) :name name :table table :method method
           :relation-oid (long relation-oid) :keys keys
           :unique? (boolean unique?) :primary? primary?
           :constraint? (true? (:datahike.pg.index/constraint? index))
+          :predicate predicate
           :ready? (not= :building status)
           :valid? (and (not legacy-incomplete?) (not= :building status))
           :indexdef indexdef}))
@@ -3179,22 +3182,23 @@
              :pg_index/indexdef indexdef
              (pgs/row-marker-attr "pg_index") true})
           explicit
-          (for [{:keys [oid relation-oid keys primary? unique? valid? ready? indexdef]}
+          (for [{:keys [oid relation-oid keys primary? unique? valid? ready? indexdef predicate]}
                 (explicit-index-descriptors cte-db)]
-            {:pg_index/indrelid relation-oid
-             :pg_index/indexrelid oid
-             :pg_index/indkey (str/join " " (map :attnum keys))
-             :pg_index/indnatts (long (count keys))
-             :pg_index/indnkeyatts (long (count keys))
-             :pg_index/indisprimary primary?
-             :pg_index/indisunique unique?
-             :pg_index/indisvalid valid?
-             :pg_index/indisready ready?
-             :pg_index/indisclustered false
-             :pg_index/indisreplident false
-             :pg_index/indnullsnotdistinct false
-             :pg_index/indexdef indexdef
-             (pgs/row-marker-attr "pg_index") true})]
+            (cond-> {:pg_index/indrelid relation-oid
+                     :pg_index/indexrelid oid
+                     :pg_index/indkey (str/join " " (map :attnum keys))
+                     :pg_index/indnatts (long (count keys))
+                     :pg_index/indnkeyatts (long (count keys))
+                     :pg_index/indisprimary primary?
+                     :pg_index/indisunique unique?
+                     :pg_index/indisvalid valid?
+                     :pg_index/indisready ready?
+                     :pg_index/indisclustered false
+                     :pg_index/indisreplident false
+                     :pg_index/indnullsnotdistinct false
+                     :pg_index/indexdef indexdef
+                     (pgs/row-marker-attr "pg_index") true}
+              predicate (assoc :pg_index/indpred predicate)))]
       (vec (concat native explicit)))
 
     "pg_attrdef"

@@ -98,6 +98,12 @@
   {:id :composite-index-conflict-inference
    :file "insert_conflict" :lines [133 141] :state :covered :impact :wrong-result
    :detail "A two-column unique index is an ON CONFLICT arbiter in either column order. An incomplete key is rejected."}
+  {:id :partial-index-not-null-predicate
+   :file "aggregates" :lines [421 435] :state :covered :impact :unsupported
+   :detail "An ordinary partial B-tree declaration preserves its IS NOT NULL predicate on the inherited table. MIN and MAX still return the expected values across the child and parent."}
+  {:id :partial-index-equality-predicates
+   :file "create_index" :lines [1440 1441] :state :covered :impact :unsupported
+   :detail "Two ordinary partial index declarations on one column retain their distinct equality predicates. The corresponding WHERE filters return the expected rows."}
   {:id :alter-composite-unique
    :file "alter_table" :lines [706 718] :state :covered :impact :wrong-result
    :detail "ALTER TABLE ADD UNIQUE creates an enforced composite constraint. The upstream sequence rejects a duplicate pair and admits distinct pairs that share a column."}

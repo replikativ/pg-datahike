@@ -46,6 +46,7 @@
     :datahike.pg.index/unique?
     :datahike.pg.index/primary?
     :datahike.pg.index/constraint?
+    :datahike.pg.index/predicate
     :datahike.pg.index/legacy-incomplete?
     :datahike.pg.object/address-key
     :datahike.pg.object/identity-key
@@ -177,6 +178,9 @@
                                      (string? keys-edn)
                                      (boolean? unique?))
                         (invalid-descriptor! name "incomplete or incoherent index metadata"))
+                    _ (when (and (:datahike.pg.index/predicate object)
+                                 (or unique? (not= "btree" method)))
+                        (invalid-descriptor! name "partial declarations require a non-unique btree index"))
                     _ (when (and unique? (not= "btree" method))
                         (invalid-descriptor! name "unique enforcement requires btree"))
                     _ (when (and (or primary? constraint?) (not unique?))

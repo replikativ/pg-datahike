@@ -339,6 +339,87 @@
                       "JOIN pg_class c ON c.oid = a.attrelid "
                       "WHERE c.relname = 'catalog_typed' ORDER BY a.attnum"))))))
 
+(deftest postgres-partial-index-keeps-a-not-null-predicate
+  (doseq [sql ["CREATE TABLE minmaxtest (f1 int)"
+               "CREATE TABLE minmaxtest3 () INHERITS (minmaxtest)"
+               "CREATE INDEX minmaxtest3i ON minmaxtest3(f1) WHERE f1 IS NOT NULL"
+               "INSERT INTO minmaxtest VALUES (11), (12)"
+               "INSERT INTO minmaxtest3 VALUES (17), (18), (NULL)"]]
+    (is (nil? (:err (ex sql))) sql))
+  (is (= [["CREATE INDEX minmaxtest3i ON public.minmaxtest3 USING btree (f1) WHERE (f1 IS NOT NULL)"]]
+         (rows "SELECT indexdef FROM pg_indexes WHERE indexname='minmaxtest3i'")))
+  (is (= [["11" "18"]] (rows "SELECT min(f1), max(f1) FROM minmaxtest"))))
+
+(deftest postgres-partial-indexes-preserve-distinct-equality-predicates
+  (doseq [sql ["CREATE TABLE bitmap_split_or (a int, b int)"
+               "INSERT INTO bitmap_split_or VALUES (1,7),(2,7),(3,8),(NULL,9)"
+               "CREATE INDEX t_b_partial_1_idx ON bitmap_split_or (b) WHERE a = 1"
+               "CREATE INDEX t_b_partial_2_idx ON bitmap_split_or (b) WHERE a = 2"]]
+    (is (nil? (:err (ex sql))) sql))
+  (is (= [["t_b_partial_1_idx" "(a = 1)"] ["t_b_partial_2_idx" "(a = 2)"]]
+         (rows "SELECT c.relname, pg_get_expr(i.indpred,i.indrelid)
+                FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                WHERE i.indrelid='bitmap_split_or'::regclass ORDER BY c.relname")))
+  (is (= [["1" "7"] ["2" "7"]]
+         (rows "SELECT a,b FROM bitmap_split_or WHERE (a=1 OR a=2) AND b=7 ORDER BY a")))
+  (is (nil? (:err (ex "INSERT INTO bitmap_split_or VALUES (2,7)"))))
+  (is (= [["5"]] (rows "SELECT count(*) FROM bitmap_split_or")))
+  (is (not (get-in (d/db *conn*) [:schema :bitmap_split_or/b :db/index]))))
+
+(deftest odoo-partial-indexes-preserve-null-and-boolean-tests
+  (doseq [sql ["CREATE TABLE ir_ui_view (\"key\" varchar, active boolean)"
+               "INSERT INTO ir_ui_view VALUES (NULL,true), ('base.foo',false), ('base.bar',NULL)"
+               "CREATE INDEX \"ir_ui_view__key_index\" ON \"ir_ui_view\" USING btree (\"key\") WHERE \"key\" IS NOT NULL"
+               "CREATE TABLE res_device_log (user_id int, session_identifier text, platform text,
+                                             browser text, last_activity timestamp, id int, revoked boolean)"
+               "CREATE INDEX res_device_log_composite_idx ON res_device_log
+                (user_id,session_identifier,platform,browser,last_activity,id) WHERE revoked IS NOT TRUE"
+               "CREATE INDEX res_device_log_revoked_idx ON res_device_log (revoked) WHERE revoked IS NOT TRUE"]]
+    (let [result (ex sql)]
+      (is (nil? (:err result)) (str sql " " (:err result)))))
+  (is (= [["ir_ui_view__key_index" "(key IS NOT NULL)" "f"]
+          ["res_device_log_composite_idx" "(revoked IS NOT TRUE)" "f"]
+          ["res_device_log_revoked_idx" "(revoked IS NOT TRUE)" "f"]]
+         (rows "SELECT c.relname, pg_get_expr(i.indpred,i.indrelid),i.indisunique
+                FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                WHERE i.indrelid IN ('ir_ui_view'::regclass,'res_device_log'::regclass)
+                ORDER BY c.relname")))
+  (is (= [["base.bar"] ["base.foo"]]
+         (rows "SELECT \"key\" FROM ir_ui_view WHERE \"key\" IS NOT NULL AND active IS NOT TRUE ORDER BY \"key\""))))
+
+(deftest partial-index-predicate-follows-column-lifecycle
+  (let [definition "SELECT indexdef FROM pg_indexes WHERE indexname='scoped_partial'"]
+    (doseq [sql ["CREATE SCHEMA catalog_partials"
+                 "CREATE TABLE catalog_partials.scope_test (key_col int, \"where\" boolean)"
+                 "/* WHERE in a comment */ CREATE INDEX scoped_partial ON catalog_partials.scope_test (key_col)
+                  WHERE \"where\" IS NOT TRUE"
+                 "CREATE INDEX IF NOT EXISTS scoped_partial ON catalog_partials.scope_test (key_col)
+                  WHERE \"where\" IS TRUE"
+                 "ALTER TABLE catalog_partials.scope_test RENAME COLUMN \"where\" TO \"Keep Me\""]]
+      (is (nil? (:err (ex sql))) sql))
+    (is (= [["CREATE INDEX scoped_partial ON catalog_partials.scope_test USING btree (key_col) WHERE (\"Keep Me\" IS NOT TRUE)"]]
+           (rows definition)))
+    (doseq [sql ["BEGIN" "ALTER TABLE catalog_partials.scope_test DROP COLUMN \"Keep Me\""]]
+      (is (nil? (:err (ex sql))) sql))
+    (is (empty? (rows definition)))
+    (is (nil? (:err (ex "ROLLBACK"))))
+    (is (= 1 (count (rows definition))))
+    (is (nil? (:err (ex "ALTER TABLE catalog_partials.scope_test DROP COLUMN key_col, DROP COLUMN \"Keep Me\""))))
+    (is (empty? (rows definition)))))
+
+(deftest partial-index-validates-the-predicate-before-allocation
+  (is (nil? (:err (ex "CREATE TABLE partial_invalid (amount int, flag bool)"))))
+  (let [next-oid (:datahike.pg.catalog/next-oid (catalog-objects/catalog-entity (d/db *conn*)))]
+    (doseq [[sql state] [["CREATE INDEX bad_partial ON partial_invalid (amount) WHERE" "42601"]
+                         ["CREATE INDEX bad_partial ON partial_invalid (amount) WHERE missing IS NULL" "42703"]
+                         ["CREATE INDEX bad_partial ON partial_invalid (amount) WHERE amount" "42804"]
+                         ["CREATE INDEX bad_partial ON partial_invalid (amount) WHERE amount IS TRUE" "42804"]
+                         ["CREATE INDEX bad_partial ON partial_invalid (amount) WHERE random() > 0" "0A000"]
+                         ["CREATE UNIQUE INDEX bad_partial ON partial_invalid (amount) WHERE flag" "0A000"]]]
+      (is (= state (:sqlstate (ex sql))) sql))
+    (is (= next-oid (:datahike.pg.catalog/next-oid (catalog-objects/catalog-entity (d/db *conn*)))))
+    (is (empty? (rows "SELECT indexname FROM pg_indexes WHERE tablename='partial_invalid'")))))
+
 (deftest explicit-unique-indexes-are-enforced-and-transactional
   (is (nil? (:err (ex "CREATE TABLE explicit_unique (id integer, code text)"))))
   (is (nil? (:err (ex "CREATE UNIQUE INDEX explicit_unique_code ON explicit_unique (code)"))))

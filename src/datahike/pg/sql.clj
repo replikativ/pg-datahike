@@ -42,6 +42,7 @@
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.index-predicate :as index-predicate]
             [datahike.pg.sql.grouping-validation :as grouping-validation]
             [datahike.pg.jsonb]
             [datahike.pg.sql.oid-infer :as oid]
@@ -1413,10 +1414,13 @@
         ;; Fall through to JSqlParser.
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
-          (let [identity-options (cls/create-table-identity-options sql)
+          (let [partial-index (when (:index-declaration? cls-info)
+                                (index-predicate/split-predicate sql))
+                identity-options (cls/create-table-identity-options sql)
                 system-override (cls/insert-system-override sql)
                 target-rewrite (assignment-rewrite/normalize
-                                (preprocess-sql (or (:sql identity-options) system-override (:parser-sql explain) sql)))
+                                (preprocess-sql (or (:sql identity-options) system-override (:parser-sql explain)
+                                                    (:head partial-index) sql)))
                 ^String parser-sql (:sql target-rewrite)
                 ;; Translation mutates some JSqlParser relation nodes while
                 ;; materialising derived schemas. Validate this rare invalid
@@ -2580,7 +2584,8 @@
                                :column-specs column-specs
                                :tail-parameters (mapv str (or (.getTailParameters ci) []))
                                :options (create-index-options ci)}
-                        table-schema (assoc :table-schema table-schema)))
+                        table-schema (assoc :table-schema table-schema)
+                        partial-index (merge (select-keys partial-index [:predicate :concurrently?]))))
 
           ;; ALTER TABLE — extract operations for ADD COLUMN support
                     (instance? Alter stmt)

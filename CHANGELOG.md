@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Ordinary partial B-tree index declarations
+
+CREATE INDEX accepts predicates on ordinary non-unique B-tree column
+keys, including null and boolean tests, simple comparisons, and boolean
+combinations. PostgreSQL catalogs and pg_dump preserve the predicate.
+Predicates follow column renames and index removal rolls back with a
+column drop. Query execution uses Datahike's general access paths.
+
 ### Composite unique constraints added by ALTER TABLE
 
 ALTER TABLE ADD UNIQUE enforces a composite key on existing and future

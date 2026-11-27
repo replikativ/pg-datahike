@@ -10,7 +10,7 @@ runs.
 
 The pinned source is REL_18_6. The inventory classifies 231 scheduled
 files. The campaign has 90 files, including 12 whole-file strict gates
-and 60 strict slices after the composite unique constraint batch. The
+and 62 strict slices after the ordinary partial index batch. The
 frozen 164-file discovery result uses an older adapter build and launcher.
 Fresh raw results need the tested revision, fixture receipt, and timeout
 profile for each file.
@@ -152,6 +152,29 @@ INDEX. The same predicates in SELECT return the expected rows. Compare
 the app's index to `aggregates.sql` at line 427, and the inherited
 nullability changes to `inherit.sql` starting at line 827.
 
+### Ordinary partial indexes
+
+The Odoo `ir_ui_view` non-null predicate and the two device-log boolean
+predicates now round-trip through index reflection. The source-linked
+gates cover the inherited-table index in `aggregates.sql` (421–435) and
+the distinct equality predicates in `create_index.sql` (1440–1441).
+They verify result rows as well as predicate text. Stock PostgreSQL and
+pg-datahike both restored the tested predicates from the adapter's
+`pg_dump` output.
+
+This batch supports ordinary non-unique B-tree declarations on column
+keys. The adapter stores the validated predicate as catalog metadata,
+which follows column renames and transactional drops. SQL filtering
+uses Datahike's general access paths. Predicate uniqueness, partial
+index inference for ON CONFLICT, and expression index keys remain
+separate coverage gaps.
+
+The live Odoo 19 bootstrap at `007e86391e14` created the device-log,
+view-key, and company-registry partial indexes. Its next fatal statement
+was a B-tree index on the expression `("barcode" IS NOT NULL)` for
+`res_partner`, with `WHERE "barcode" IS NOT NULL` (42601). That precedes
+TestORM. The 21 caught inherited-column `SET NOT NULL` errors recur.
+
 ### asyncpg expected failures by owning ID
 
 | Area | IDs | Observed causes |
@@ -172,12 +195,12 @@ need separately provisioned evidence.
 
 ## Next verification work
 
-1. Support ordinary partial indexes for Odoo's base bootstrap. Verify
-   predicate reflection and pair the app fixture with the upstream
-   partial-index and boolean-predicate cases. Cover inherited nullability
-   separately with `inherit.sql`, then repeat base and accounting boot.
-   Verify posted-invoice numbering with its partial-uniqueness and
-   concurrency workload.
+1. Cover expression index keys for Odoo's company-dependent field.
+   Pair its partial expression index with the expression-key DDL in
+   `indexing.sql` (211–217) and the dependent-column cases in
+   `create_table.sql` (746–748). Cover inherited nullability with
+   `inherit.sql`, then repeat base and accounting boot. Verify posted
+   invoice numbering with its partial-uniqueness and concurrency workload.
 2. Assert admitted constraints, view results and trigger effects alongside
    Pagila COPY counts. Repeat Metabase initial sync on a named release and
    validate JDBC metadata and representative MBQL values.
