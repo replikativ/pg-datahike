@@ -1374,7 +1374,7 @@
     ;; pg_attribute to pg_constraint via `attnum = ANY(c.conkey)`,
     ;; so populating these isn't optional.
     [{:db/ident :pg_constraint/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_constraint/conname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_constraint/contype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      ;; The index a PRIMARY KEY / UNIQUE constraint is enforced by; 0 for
      ;; a CHECK. psql's \d joins pg_index to pg_constraint on it.

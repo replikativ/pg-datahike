@@ -647,6 +647,7 @@
                  "SELECT rolname FROM pg_roles"
                  "SELECT datname FROM pg_database"
                  "SELECT proname FROM pg_proc"
+                 "SELECT conname FROM pg_constraint"
                  "SELECT relname FROM pg_class"]]
       (is (= [19] (:oids (ex sql))) sql))))
 
