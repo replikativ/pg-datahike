@@ -141,9 +141,16 @@ Catalog and dump probes cover the constraint name, column order,
 index ownership, and rollback. A PostgreSQL 18.6 restore of the adapter's
 `pg_dump` output retained upsert inference and duplicate rejection.
 
-The live Odoo 19 bootstrap at `007e86391e14` completed the field upsert
-and moved on to reflecting selection values. The two device-log partial
-indexes with `WHERE revoked IS NOT TRUE` still report syntax errors.
+The live Odoo 19 bootstrap at `007e86391e14` completed field and selection
+reflection. It stopped before TestORM on a partial index for
+`ir_ui_view.key` with `WHERE "key" IS NOT NULL` (42601). Odoo also caught
+two device-log partial-index syntax errors and 21 inherited-column
+`SET NOT NULL` errors.
+
+The partial-index repro also rejects an equality predicate in CREATE
+INDEX. The same predicates in SELECT return the expected rows. Compare
+the app's index to `aggregates.sql` at line 427, and the inherited
+nullability changes to `inherit.sql` starting at line 827.
 
 ### asyncpg expected failures by owning ID
 
@@ -165,10 +172,12 @@ need separately provisioned evidence.
 
 ## Next verification work
 
-1. Continue the Odoo base and accounting boot checks past field reflection.
-   Pair device-log partial indexes with the upstream partial-index and
-   boolean-predicate cases. Verify posted-invoice numbering with a separate
-   partial-uniqueness and concurrency workload.
+1. Support ordinary partial indexes for Odoo's base bootstrap. Verify
+   predicate reflection and pair the app fixture with the upstream
+   partial-index and boolean-predicate cases. Cover inherited nullability
+   separately with `inherit.sql`, then repeat base and accounting boot.
+   Verify posted-invoice numbering with its partial-uniqueness and
+   concurrency workload.
 2. Assert admitted constraints, view results and trigger effects alongside
    Pagila COPY counts. Repeat Metabase initial sync on a named release and
    validate JDBC metadata and representative MBQL values.

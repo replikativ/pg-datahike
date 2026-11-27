@@ -56,7 +56,9 @@
                 (swap! bad conj [expr (str "error: " err)
                                  (if (map? got) (str (:error got)) (str got))]))
               (map? got) (swap! bad conj [expr expected (str "ERROR " (:error got))])
-              :else (when-not (= expected got) (swap! bad conj [expr expected got])))))
+              :else (let [allowed (if (set? expected) expected #{expected})]
+                      (when-not (contains? allowed got)
+                        (swap! bad conj [expr expected got]))))))
         (doseq [[expr want got] @bad]
           (println " " expr "\n    want:" want "\n    got :" got))
         (is (empty? @bad)
