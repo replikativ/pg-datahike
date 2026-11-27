@@ -25,7 +25,8 @@
             PgWireServer$QueryHandlerFactory]
            [java.sql Connection DriverManager PreparedStatement ResultSet
             SQLException Statement Types]
-           [java.util.concurrent CountDownLatch TimeUnit]))
+           [java.util.concurrent CountDownLatch TimeUnit]
+           [org.postgresql.util PSQLException]))
 
 (def jdbc-schema
   [{:db/ident :t/id   :db/valueType :db.type/long   :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
@@ -412,8 +413,8 @@
           (is (.next rs))
           (is (= "Alice" (.getString rs 1))))))))
 
-(deftest test-prepared-statement-rejects-result-type-change-after-ddl
-  (testing "DDL cannot silently change a prepared statement's row descriptor"
+(deftest test-prepared-statement-retries-invalidated-plan-in-autocommit
+  (testing "pgJDBC reparses a cached plan after PostgreSQL's invalidation error"
     (with-conn [c {:preferQueryMode "extended"
                    :prepareThreshold "1"
                    :autosave "never"}]
@@ -422,13 +423,11 @@
           (is (= 3 (.getColumnCount (.getMetaData rs)))))
         (with-open [st (.createStatement c)]
           (.executeUpdate st "ALTER TABLE t ADD COLUMN note TEXT"))
-        (try
-          (.executeQuery ps)
-          (is false "expected cached-plan result-type error")
-          (catch SQLException e
-            (is (= "0A000" (.getSQLState e)))
-            (is (str/includes? (.getMessage e)
-                               "cached plan must not change result type"))))))))
+        (with-open [rs (.executeQuery ps)]
+          (is (= 4 (.getColumnCount (.getMetaData rs))))
+          (is (.next rs))
+          (is (= "Alice" (.getString rs "name")))
+          (is (nil? (.getString rs "note"))))))))
 
 (deftest test-prepared-statement-revalidation-follows-ddl-commit
   (testing "a pre-commit invalidation cannot hide the later published schema"
@@ -447,11 +446,8 @@
         (with-open [rs (.executeQuery ps)]
           (is (= 3 (.getColumnCount (.getMetaData rs)))))
         (.commit writer)
-        (try
-          (.executeQuery ps)
-          (is false "expected result-type error after DDL commit")
-          (catch SQLException e
-            (is (= "0A000" (.getSQLState e)))))))))
+        (with-open [rs (.executeQuery ps)]
+          (is (= 4 (.getColumnCount (.getMetaData rs)))))))))
 
 (deftest test-prepared-plan-wire-error-aborts-explicit-transaction
   (testing "a wire-level cached-plan error cannot let speculative DDL commit"
@@ -467,8 +463,10 @@
         (try
           (.executeQuery ps)
           (is false "expected cached-plan result-type error")
-          (catch SQLException e
-            (is (= "0A000" (.getSQLState e)))))
+          (catch PSQLException e
+            (is (= "0A000" (.getSQLState e)))
+            (is (= "RevalidateCachedQuery" (.getRoutine (.getServerErrorMessage e))))
+            (is (str/includes? (.getMessage e) "cached plan must not change result type"))))
         ;; PostgreSQL accepts COMMIT in a failed transaction as ROLLBACK.
         (.commit c)
         (with-open [st (.createStatement c)]
