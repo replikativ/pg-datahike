@@ -114,8 +114,8 @@
    :file "inherit" :lines [637 642] :state :covered :impact :wrong-result
    :detail "New children with local primary keys keep the parent's serial default and use one shared sequence."}
   {:id :inheritance-recursive-not-null
-   :file "inherit" :lines [829 833] :state :open :impact :unsupported
-   :detail "Setting NOT NULL on a parent must validate and update each physical descendant. Odoo base attempts this on ir_actions and catches the current feature error at a savepoint."}
+   :file "inherit" :lines [829 833] :state :covered :impact :unsupported
+   :detail "Setting NOT NULL validates the parent and each physical descendant atomically, including descendants reached through multiple parents. Legacy shared columns and recursive DROP NOT NULL remain open."}
   {:id :partial-arithmetic-expression-index
    :file "indexing" :lines [211 211] :state :covered :impact :unsupported
    :detail "The partial arithmetic index declaration retains a typed expression key and its predicate. The slice covers the ordinary table definition and result rows."}

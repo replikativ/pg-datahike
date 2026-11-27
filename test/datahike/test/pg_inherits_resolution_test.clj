@@ -268,3 +268,32 @@
           ["4" "Test 4"] ["5" "Test 5"] ["6" "Test 6"]]
          (rows "SELECT * FROM matest0 ORDER BY id")))
   (is (empty? (rows "SELECT * FROM ONLY matest0"))))
+
+(deftest recursive-column-not-null
+  ;; PostgreSQL 18.6 alter_table.sql, ordinary parent/child nullability.
+  (exec! "CREATE TABLE nn_parent (a int)")
+  (exec! "CREATE TABLE nn_child (b text) INHERITS (nn_parent)")
+  (exec! "CREATE TABLE nn_leaf () INHERITS (nn_child)")
+  (is (= "0A000" (.-sqlstate (execute "ALTER TABLE ONLY nn_parent ALTER COLUMN a SET NOT NULL"))))
+  (exec! "INSERT INTO nn_leaf DEFAULT VALUES")
+  (let [result (execute "ALTER TABLE nn_parent ALTER COLUMN a SET NOT NULL")]
+    (is (= "23502" (.-sqlstate result)))
+    (is (re-find #"nn_leaf" (or (.-error result) ""))))
+  (exec! "INSERT INTO nn_parent DEFAULT VALUES")
+  (exec! "DELETE FROM nn_parent")
+  (exec! "ALTER TABLE nn_parent ALTER COLUMN a SET NOT NULL")
+  (doseq [target ["nn_parent" "nn_child" "nn_leaf"]]
+    (is (= "23502" (.-sqlstate (execute (str "INSERT INTO " target " DEFAULT VALUES"))))))
+  (exec! "CREATE TABLE nn_new () INHERITS (nn_parent)")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO nn_new DEFAULT VALUES")))))
+
+(deftest postgres-inheritance-recursive-not-null
+  ;; PostgreSQL 18.6 inherit.sql lines 829-833, including converging paths.
+  (doseq [sql ["create table pp1 (f1 int)"
+               "create table cc1 (f2 text, f3 int) inherits (pp1)"
+               "create table cc2 (f4 float) inherits (pp1,cc1)"
+               "create table cc3 () inherits (pp1,cc1,cc2)"
+               "alter table pp1 alter f1 set not null"]]
+    (exec! sql))
+  (doseq [target ["pp1" "cc1" "cc2" "cc3"]]
+    (is (= "23502" (.-sqlstate (execute (str "INSERT INTO " target " (f1) VALUES (NULL)")))))))

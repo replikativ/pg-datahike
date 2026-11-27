@@ -440,7 +440,11 @@
       {:id :inheritance-child-serial-defaults
        :source-lines [637 642]
        :gate "test/datahike/test/pg_inherits_resolution_test.clj"
-       :test-var "postgres-inheritance-child-serial-defaults"}]}
+       :test-var "postgres-inheritance-child-serial-defaults"}
+      {:id :inheritance-recursive-not-null
+       :source-lines [829 833]
+       :gate "test/datahike/test/pg_inherits_resolution_test.clj"
+       :test-var "postgres-inheritance-recursive-not-null"}]}
     {:name "matview", :boundaries #{:catalogs :ddl :materialized-views}, :mode :discovery
      :accepted-differences #{:explain-plan-text}
      :strict-slices

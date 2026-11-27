@@ -13135,11 +13135,10 @@
                       {:sqlstate "42809"})))
     (when-not (:datahike.pg.column/storage-ident column)
       (throw (errors/pg-error :undefined-column {:table table :column name})))
-    (when (or (seq (inherited-column-dependents db (:datahike.pg.column/address-key column)))
-              (and (or (not (:datahike.pg.column/local? column))
-                       (pos? (or (:datahike.pg.column/inherit-count column) 0)))
-                   (not (and (= action "SET NOT NULL")
-                             (inheritance/physical? db table)))))
+    (when (and (not= action "SET NOT NULL")
+               (or (seq (inherited-column-dependents db (:datahike.pg.column/address-key column)))
+                   (not (:datahike.pg.column/local? column))
+                   (pos? (or (:datahike.pg.column/inherit-count column) 0))))
       (throw (errors/pg-error
               :feature-not-supported
               {:message (str action " on inherited columns is not supported")})))
@@ -13214,22 +13213,50 @@
     (catch Exception e
       (classified-error "" e))))
 
+(defn- set-column-not-null-tx [db table column only?]
+  (let [name (:datahike.pg.column/name column)
+        children (sort (inheritance/descendants db table))]
+    (when only?
+      (throw (errors/pg-error :feature-not-supported
+                              {:message "SET NOT NULL with NO INHERIT is not supported"})))
+    (into []
+          (mapcat
+           (fn [target]
+             (let [root? (= target table)
+                   oid (when-not root?
+                         (:datahike.pg.object/oid (inheritance/table-object db target)))
+                   col (if root? column (catalog-objects/column-by-name db oid name))
+                   attr (:datahike.pg.column/storage-ident col)]
+               ;; Older children share the parent's attribute. Changing its metadata
+               ;; would also tighten the constraint on ancestors and siblings.
+               (when (or (nil? attr)
+                         (and (or (not root?) (pos? (:datahike.pg.column/inherit-count col 0)))
+                              (not (and (= target (namespace attr))
+                                        (inheritance/physical? db target)))))
+                 (throw (errors/pg-error :feature-not-supported
+                                         {:message "SET NOT NULL on shared inherited columns is not supported"})))
+               (let [entity (d/entity db attr)]
+                 (when-not (:pg/not-null entity)
+                   (when (some #(nil? (get (d/entity db %) attr)) (table-row-eids db target))
+                     (throw (ex-info (str "column \"" name "\" of relation \"" target
+                                          "\" contains null values")
+                                     {:sqlstate "23502" :table target :column name})))
+                   (into [[:db/add (:db/id entity) :pg/not-null true]]
+                         (when-not root?
+                           (catalog-objects/bump-revision-tx db catalog-objects/pg-class-oid oid))))))))
+          (cons table children))))
+
 (defn- alter-column-nullability-tx
-  [db table relation-oid {:keys [op name]}]
+  [db table relation-oid {:keys [op name only?]}]
   (let [action (if (= :set-not-null op) "SET NOT NULL" "DROP NOT NULL")
-        attr (:datahike.pg.column/storage-ident
-              (alterable-column db table relation-oid name action))
+        column (alterable-column db table relation-oid name action)
+        attr (:datahike.pg.column/storage-ident column)
         schema (dbi/-schema db)]
     (let [entity (d/entity db attr)
           eid (:db/id entity)]
       (case op
         :set-not-null
-        (when-not (:pg/not-null entity)
-          (when (some #(nil? (get (d/entity db %) attr)) (table-row-eids db table))
-            (throw (ex-info (str "column \"" name "\" of relation \"" table
-                                 "\" contains null values")
-                            {:sqlstate "23502" :table table :column name})))
-          [[:db/add eid :pg/not-null true]])
+        (set-column-not-null-tx db table column only?)
 
         :drop-not-null
         (do

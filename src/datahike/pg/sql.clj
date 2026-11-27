@@ -2692,7 +2692,8 @@
                                                            #"(?i)\s*VALIDATE\s+CONSTRAINT\s+(\S+)\s*"
                                                            (str exp))))}
                                           (= op "ALTER")
-                                          (or (alter-column-nullability exp)
+                                          (or (when-let [change (alter-column-nullability exp)]
+                                                (cond-> change (.isUseOnly alter-stmt) (assoc :only? true)))
                                               (alter-column-default exp)
                                               (alter-column-type exp using-expressions)
                                               {:op :other :raw (str exp)})

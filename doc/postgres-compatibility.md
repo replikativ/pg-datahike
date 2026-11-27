@@ -101,8 +101,12 @@ that understands that layout for subsequent SQL reads. An older adapter
 can miss the new child rows in parent scans.
 
 This covers ordinary DDL, INSERT, COPY, scans, and physical-row writes in
-the admitted PostgreSQL regression cases. Recursively setting `NOT NULL`
-on a parent with children remains open.
+the admitted PostgreSQL regression cases. `ALTER COLUMN ... SET NOT NULL`
+validates existing rows in the target and its physical descendants before
+enforcing the constraint across the tree. A null in any descendant rejects
+the statement with SQLSTATE `23502`. Recursive changes on legacy shared
+columns, parent-only `SET NOT NULL`, and recursive `DROP NOT NULL` remain
+unsupported.
 
 ## Concurrent catalog changes
 
