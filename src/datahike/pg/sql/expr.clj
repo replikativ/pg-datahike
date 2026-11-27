@@ -193,11 +193,25 @@
    PostgreSQL uses a known argument type to resolve unknown literals in
    homogeneous calls (for example div(numeric, unknown))."
   [ctx fname arg-exprs]
-  (let [rule (get-in fns/sql-function-specs [fname :unknown-args])
+  (let [{rule :unknown-args arg-oids :arg-oids} (get fns/sql-function-specs fname)
         homogeneous-count (cond
                             (= :homogeneous rule) (count arg-exprs)
                             (map? rule) (:homogeneous-prefix rule))]
-    (if homogeneous-count
+    (cond
+      ;; PostgreSQL's unknown literal inputs are coerced during analysis,
+      ;; even when a separate argument will make a strict call return NULL.
+      (= :declared rule)
+      (do (fns/check-arity! fname (count arg-exprs))
+          (mapv (fn [arg oid]
+                  (if (instance? StringValue arg)
+                    (let [text (string-value-text arg)]
+                      (if (= oid types/oid-jsonpath)
+                        (jb/jsonpath-literal text)
+                        (sql-cast/cast-scalar text (types/oid->pg-name oid) {})))
+                    arg))
+                arg-exprs arg-oids))
+
+      homogeneous-count
       (let [homogeneous-args (take homogeneous-count arg-exprs)
             targets (keep #(numeric-target-for-oid
                             (try (source-oid ctx %)
@@ -216,7 +230,7 @@
                     arg))
                 (range) arg-exprs)
           arg-exprs))
-      arg-exprs)))
+      :else arg-exprs)))
 
 (defn- no-such-function
   "42883 for a call with no matching overload, worded as PostgreSQL's
@@ -1289,19 +1303,16 @@
 (declare zone-crossing jsonb-column?)
 
 (defn- json-typed-args
-  "Prepare constructor arguments according to their SQL types. JSONB
-   constructors decode JSON input before embedding it in the result."
-  ([ctx params args] (json-typed-args ctx params args false))
-  ([ctx params args binary?]
-   (mapv (fn [p a]
-           (if (and (not binary?) (jsonb-column? ctx p))
-             a
-             (ctx/materialize-arg! ctx
-                                   (list (if binary?
-                                           'datahike.pg.query-fns/jsonb-constructor-value
-                                           'datahike.pg.query-fns/json-scalar)
-                                         (source-oid ctx p) a))))
-         params args)))
+  "Arguments of the json constructors as `datum_to_json` makes them, by
+   each argument's SQL type -- see `jsonb/json-scalar`. A json/jsonb
+   argument is left alone: it is already json."
+  [ctx params args]
+  (mapv (fn [p a]
+          (if (jsonb-column? ctx p)
+            a
+            (ctx/materialize-arg! ctx (list 'datahike.pg.query-fns/json-scalar
+                                            (source-oid ctx p) a))))
+        params args))
 
 (def ^:private named-parameters
   "Functions that take PostgreSQL's `name => value` arguments, by their
@@ -2830,20 +2841,12 @@
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
-      (= fname "jsonb_build_object")
-      (let [fn-param (symbol (str "?jsonb-build-obj" (swap! (:var-counter ctx) inc)))
-            args (json-typed-args ctx params args true)]
+      (contains? #{"jsonb_build_object" "jsonb_build_array"} fname)
+      (let [fn-param (ctx/fresh-var! ctx)
+            constructor (jb/jsonb-constructor (= fname "jsonb_build_object")
+                                              (mapv #(source-oid ctx %) params))]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj jb/jsonb-build-object)
-        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
-        result-var)
-
-      ;; jsonb_build_array(v1, v2, ...) → in-param fn
-      (= fname "jsonb_build_array")
-      (let [fn-param (symbol (str "?jsonb-build-arr" (swap! (:var-counter ctx) inc)))
-            args (json-typed-args ctx params args true)]
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj jb/jsonb-build-array)
+        (swap! (:in-args ctx) conj constructor)
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
@@ -7971,16 +7974,18 @@
     ;; at runtime since the operand types aren't known at parse time.
     (instance? Concat expr)
     (let [^Concat e expr
-          l (translate-expr ctx (.getLeftExpression e))
-          r (translate-expr ctx (.getRightExpression e))
+          ;; Use the RowDescription overload here, including its implicit
+          ;; jsonb input coercion for an unknown string literal.
+          jsonb-concat? (= types/oid-jsonb (source-oid ctx e))
+          operand (fn [x]
+                    (if (and jsonb-concat? (instance? StringValue x))
+                      (sql-cast/cast-scalar (string-value-text x) "jsonb" {})
+                      (translate-expr ctx x)))
+          l (operand (.getLeftExpression e))
+          r (operand (.getRightExpression e))
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (if (seq? r) (ctx/materialize-arg! ctx r) r)
           fn-param (symbol (str "?pg-concat" (swap! (:var-counter ctx) inc)))
-          ;; `||` on jsonb is jsonb_concat, not string concatenation.
-          ;; Decided here rather than in the runtime cond because the
-          ;; stored value is a string either way — see jsonb-column?.
-          jsonb-concat? (or (jsonb-column? ctx (.getLeftExpression e))
-                            (jsonb-column? ctx (.getRightExpression e)))
           ;; A temporal operand has to render the PostgreSQL way, and the
           ;; date/timestamp distinction is only visible here — see
           ;; types/temporal->pg-text.
@@ -8623,7 +8628,7 @@
           (params/pg-type-of-attr (:db ctx) attr)))))
 
 (defn jsonb-column?
-  "Whether `expr` is a column reference of `jsonb` type.
+  "Whether the column, cast or function result is a JSONB operand.
 
    A stored jsonb value IS a string, so runtime dispatch cannot tell it
    from `text` — `p || '{\"z\":9}'` looks like two strings and fell to
@@ -8633,6 +8638,7 @@
   [ctx expr]
   (boolean
    (or
+    (and (instance? Function expr) (= types/oid-jsonb (source-oid ctx expr)))
     ;; An explicit `::jsonb` cast is a jsonb operand even though it is
     ;; not a column — `'[1,2,3]'::jsonb - 1`.
     (when (instance? CastExpression expr)
@@ -8759,7 +8765,8 @@
              (column-vtype ctx typed)
              (some-> oid types/dh-type-for-oid))]
     (cond
-      (= oid types/oid-money) [(sql-cast/cast-scalar s "money" {})]
+      (contains? #{types/oid-money types/oid-jsonb} oid)
+      [(sql-cast/cast-scalar s (types/oid->pg-name oid) {})]
       (= oid types/oid-vector) [(pg-vector/coerce s)]
       ;; A time/timetz EXPRESSION carries LocalTime/OffsetTime; a column of
       ;; those types still stores its canonical text (below: no coercion).

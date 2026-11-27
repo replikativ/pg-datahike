@@ -30,8 +30,12 @@ wildcards (`$[*]`). The default `lax` mode and explicit `strict` mode follow
 PostgreSQL's structural-error behaviour. An empty result yields SQL NULL.
 Object wildcards visit members in PostgreSQL's JSONB key order.
 
-Filters, variables in path expressions, indexed subscripts, methods and
-standalone `jsonpath` casts remain outside this subset.
+Bare member names may contain non-ASCII characters. Quote names beginning
+with a digit or containing punctuation such as `.` or `-`.
+Quoted members support standard JSON escapes. Path comments, escapes in
+bare names, PostgreSQL-specific escapes (such as `\x61`), filters, variables
+in path expressions, indexed subscripts, methods and standalone `jsonpath`
+casts remain outside this subset.
 
 ## Sequence defaults and inherited columns
 
