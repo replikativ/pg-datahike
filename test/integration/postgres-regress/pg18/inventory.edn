@@ -778,8 +778,8 @@
    :sql-sha256 "5fd85442bff659818e1be49e419970b18fb9407f907351030765e071b24df7fc",
    :expected-sha256 "31693d86c049c2ac8e3f3d50c63318d70e80ac2e7b64065a8daa99db769767fc",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :json-and-xml}
+   :status :campaign,
+   :wave 3}
   {:name "jsonpath",
    :scheduled? true,
    :sql-sha256 "f8f76358e4edc74b24f17257a94a8e6d9f79ff7fbf8f3540782a7f80e42b2347",

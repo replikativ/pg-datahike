@@ -1289,22 +1289,26 @@
 (declare zone-crossing jsonb-column?)
 
 (defn- json-typed-args
-  "Arguments of the json constructors as `datum_to_json` makes them, by
-   each argument's SQL type -- see `jsonb/json-scalar`. A json/jsonb
-   argument is left alone: it is already json."
-  [ctx params args]
-  (mapv (fn [p a]
-          (if (jsonb-column? ctx p)
-            a
-            (ctx/materialize-arg! ctx (list 'datahike.pg.query-fns/json-scalar
-                                            (source-oid ctx p) a))))
-        params args))
+  "Prepare constructor arguments according to their SQL types. JSONB
+   constructors decode JSON input before embedding it in the result."
+  ([ctx params args] (json-typed-args ctx params args false))
+  ([ctx params args binary?]
+   (mapv (fn [p a]
+           (if (and (not binary?) (jsonb-column? ctx p))
+             a
+             (ctx/materialize-arg! ctx
+                                   (list (if binary?
+                                           'datahike.pg.query-fns/jsonb-constructor-value
+                                           'datahike.pg.query-fns/json-scalar)
+                                         (source-oid ctx p) a))))
+         params args)))
 
 (def ^:private named-parameters
   "Functions that take PostgreSQL's `name => value` arguments, by their
    parameter names in order, with the default each takes when left out."
   {"make_interval" [["years" 0] ["months" 0] ["weeks" 0] ["days" 0]
-                    ["hours" 0] ["mins" 0] ["secs" 0]]})
+                    ["hours" 0] ["mins" 0] ["secs" 0]]
+   "jsonb_path_query_first" [["target"] ["path"] ["vars" "{}"] ["silent" false]]})
 
 (defn- named-args->positional
   "`make_interval(days => 10)` as `make_interval(0, 0, 0, 10)`: named
@@ -1320,18 +1324,31 @@
                                              {:message (str "function " fname
                                                             " does not accept named arguments")})))
             positional (vec (take-while (complement named?) arg-exprs))
-            by-name (into {}
-                          (map (fn [^net.sf.jsqlparser.expression.OracleNamedFunctionParameter p]
-                                 [(str/lower-case (.getName p)) (.getExpression p)]))
-                          (filter named? arg-exprs))
-            names (set (map first spec))]
-        (doseq [n (keys by-name)]
-          (when-not (contains? names n)
-            (throw (errors/pg-error :undefined-function
-                                    {:message (str "function " fname "(" n " => unknown) does not exist")}))))
+            remaining (drop (count positional) spec)
+            allowed (set (map first remaining))
+            by-name (reduce (fn [named arg]
+                              (when-not (named? arg)
+                                (throw (ex-info "positional argument cannot follow named argument"
+                                                {:sqlstate "42601"})))
+                              (let [^net.sf.jsqlparser.expression.OracleNamedFunctionParameter p arg
+                                    n (str/lower-case (.getName p))]
+                                (when (contains? named n)
+                                  (throw (ex-info (str "argument name \"" n "\" used more than once")
+                                                  {:sqlstate "42601"})))
+                                (when-not (contains? allowed n)
+                                  (throw (errors/pg-error :undefined-function
+                                                          {:message (str "function " fname "(" n " => unknown) does not exist")})))
+                                (assoc named n (.getExpression p))))
+                            {} (drop (count positional) arg-exprs))]
         (vec (concat positional
-                     (for [[n default] (drop (count positional) spec)]
-                       (get by-name n (net.sf.jsqlparser.expression.LongValue. (long default))))))))))
+                     (for [[n default] remaining]
+                       (or (get by-name n)
+                           (cond
+                             (integer? default) (LongValue. (long default))
+                             (boolean? default) (BooleanValue. (boolean default))
+                             (string? default) (StringValue. ^String default)
+                             :else (throw (errors/pg-error :undefined-function
+                                                           {:message (str "missing argument " n " for " fname)})))))))))))
 
 (defn- session-temporal-context! [ctx]
   (let [state params/*session-state*
@@ -2815,7 +2832,7 @@
 
       (= fname "jsonb_build_object")
       (let [fn-param (symbol (str "?jsonb-build-obj" (swap! (:var-counter ctx) inc)))
-            args (json-typed-args ctx params args)]
+            args (json-typed-args ctx params args true)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/jsonb-build-object)
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
@@ -2824,7 +2841,7 @@
       ;; jsonb_build_array(v1, v2, ...) → in-param fn
       (= fname "jsonb_build_array")
       (let [fn-param (symbol (str "?jsonb-build-arr" (swap! (:var-counter ctx) inc)))
-            args (json-typed-args ctx params args)]
+            args (json-typed-args ctx params args true)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/jsonb-build-array)
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])

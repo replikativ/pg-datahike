@@ -59,6 +59,9 @@
  [{:id :simple-query-copy-continuation
    :file "copyselect" :lines [90 96] :state :covered :impact :wrong-result
    :detail "COPY-IN used to drop subsequent commands and retain only the first batch."}
+  {:id :jsonpath-first-accessor-results
+   :file "jsonb_jsonpath" :lines [1106 1108] :state :covered :impact :unsupported
+   :detail "Accessor paths support lax and strict mode, including a late strict error after the first match. Filters, variables, subscripts and methods remain outside this slice."}
   {:id :materialized-view-with-no-data
    :file "matview" :lines [17 21] :state :covered :impact :wrong-result
    :detail "The catalog used to report relispopulated true for an unpopulated view. The gate checks the flag, the scan SQLSTATE and refresh."}

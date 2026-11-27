@@ -88,6 +88,7 @@
 (def sql-timestamptz+interval            fns/sql-timestamptz+interval)
 (def sql-overlaps                        fns/sql-overlaps)
 (def json-scalar                         jsonb/json-scalar)
+(def jsonb-constructor-value              jsonb/jsonb-constructor-value)
 (def json-key                            jsonb/json-key)
 (def sql-to-char-datetime                fns/sql-to-char-datetime)
 (def sql-to-timestamp-fmt                fns/sql-to-timestamp-fmt)

@@ -85,6 +85,7 @@
 (def oid-bit      1560)
 (def oid-varbit   1562)
 (def oid-jsonb    3802)
+(def oid-jsonpath 4072)
 (def oid-tsvector 3614)
 (def oid-tsquery  3615)
 (def oid-pg-lsn   3220)
