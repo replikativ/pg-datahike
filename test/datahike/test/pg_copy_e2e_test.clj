@@ -90,6 +90,17 @@
     (is (= 1 (copy-in-text c "COPY copy_ids(id,v) FROM STDIN" "99\t8\n")))
     (is (= [[2 7] [99 8]] (query-rows c "SELECT id,v FROM copy_ids ORDER BY id")))))
 
+(deftest copy-into-inheritance-keeps-the-row-in-its-physical-table
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))
+              st (.createStatement c)]
+    (.execute st "CREATE TABLE copy_child (PRIMARY KEY(id)) INHERITS (users)")
+    (.execute st "INSERT INTO users(id,name) VALUES(7,'parent')")
+    (is (= 1 (copy-in-text c "COPY copy_child(id,name) FROM STDIN" "7\tchild\n")))
+    (is (= [[7 "child"] [7 "parent"]]
+           (query-rows c "SELECT id,name FROM users WHERE id=7 ORDER BY name")))
+    (is (= [[7 "parent"]] (query-rows c "SELECT id,name FROM ONLY users")))
+    (is (= [[7 "child"]] (query-rows c "SELECT id,name FROM ONLY copy_child")))))
+
 (deftest copy-default-marker
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (with-open [st (.createStatement c)]

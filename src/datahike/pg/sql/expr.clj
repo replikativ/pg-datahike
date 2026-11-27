@@ -7256,6 +7256,7 @@
       (throw (errors/pg-error :undefined-column {:column "tableoid"})))
     (cond
       partition-scan? (ctx/col-var! ctx [:aliased alias pgs/partition-scan-tableoid])
+      (seq (ctx/inheritance-branches ctx alias)) (ctx/inherited-tableoid! ctx alias)
       (and (contains? @(:left-join-evars ctx) evar)
            (not= alias (:join-condition-right-alias ctx)))
       ;; A null-extended row has no tableoid. The current ON condition
@@ -9495,6 +9496,7 @@
     (let [^Column column expr
           alias (some-> (.getTable column) .getName unquote-ident)]
       (when (and (contains? aliases alias)
+                 (not (seq (ctx/inheritance-branches ctx alias)))
                  (nil? (.getArrayConstructor column))
                  (#{types/oid-int2 types/oid-int4 types/oid-int8} (source-oid ctx column)))
         (let [resolved (ctx/resolve-column column (:table-aliases ctx) (:default-table ctx)

@@ -81,9 +81,13 @@
 ;; ============================================================================
 
 (deftest primary-key-paren-still-rewrites
-  (testing "(PRIMARY KEY(col)) body is replaced with (id serial) for INHERITS"
-    (is (= "CREATE TABLE child (id serial) INHERITS (parent)"
+  (testing "An inherited primary key survives normalization"
+    (is (= "CREATE TABLE child (db_id bigint, PRIMARY KEY(child_id)) INHERITS (parent)"
            (preprocess "CREATE TABLE child (PRIMARY KEY(child_id)) INHERITS (parent)")))))
+
+(deftest public-inheritance-parent-survives-dump-normalization
+  (is (= "CREATE TABLE public.child (detail text) INHERITS (parent, second_parent)"
+         (preprocess "CREATE TABLE public.child (detail text) INHERITS (public.parent, public.second_parent)"))))
 
 (deftest primary-key-paren-in-string-literal
   (testing "(PRIMARY KEY (...)) inside a string literal must be preserved"

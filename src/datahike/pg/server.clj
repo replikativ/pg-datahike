@@ -57,6 +57,7 @@
             [datahike.pg.sql.index-predicate :as index-predicate]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
+            [datahike.pg.sql.inheritance :as inheritance]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.guc :as guc]
             [datahike.pg.sql.params :as params]
@@ -1797,14 +1798,17 @@
                                                        table-alias schema source-scopes))
         col-names (mapv :name items)
         visible (or table-alias table-name)
+        branches (inheritance/scan-branches row-db table-name)
         results (binding [params/*bound-params* bound]
                   (mapv (fn [eid]
-                          (row-eval/row-values
-                           asts (into {::row-eval/source-values (get source-values eid)}
-                                      (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
-                                      (d/datoms row-db :eavt eid))
-                           table-name schema row-db
-                           {:alias visible :exec-db subquery-db :source-scopes source-scopes}))
+                          (let [row (into {::row-eval/source-values (get source-values eid)}
+                                          (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
+                                          (d/datoms row-db :eavt eid))
+                                branch (when (seq branches) (inheritance/row-branch branches row))]
+                            (row-eval/row-values
+                             asts (if branch (inheritance/project-row branch row) row)
+                             table-name schema row-db
+                             {:alias visible :exec-db subquery-db :source-scopes source-scopes})))
                         eids))
         row-arrays (into-array (Class/forName "[Ljava.lang.String;")
                                (for [{:keys [values]} results]
@@ -3542,7 +3546,11 @@
                   ctx (#'sql-ctx/make-ctx query-schema table-aliases default-key
                                           {:db query-db
                                            :parse-sql sql/parse-sql
-                                           :hints (pgs/schema-hints query-db)})
+                                           :hints (pgs/schema-hints query-db)
+                                           :only-aliases
+                                           (when (contains? (or (:only-tables parsed) params/*only-tables*)
+                                                            (str/lower-case (str table)))
+                                             #{default-key})})
                   _ (when where-expr
                       ;; Top-level DELETE WHERE = conjunctive context: enables the
                       ;; data-pattern fast paths. Params stay as ?pN vars (values
@@ -3587,29 +3595,56 @@
     (joined-write-rows ctx db schema parsed)
     (match-plain-delete-rows db schema parsed)))
 
+(defn- physical-row-groups [db table eids]
+  (if-let [branches (inheritance/scan-branches db table)]
+    (->> eids
+         (group-by (fn [eid]
+                     (or (:table (inheritance/row-branch branches (d/entity db eid)))
+                         (throw (ex-info "Missing physical row owner" {:table table :eid eid})))))
+         (sort-by key))
+    [[table eids]]))
+
+(defn- lock-physical-rows! [db table session-id tx-state eids]
+  (doseq [[owner rows] (physical-row-groups db table eids)]
+    (lock-rows-blocking! session-id tx-state owner rows row-lock-timeout-ms)))
+
+(defn- fire-physical-after-triggers! [db op groups columns]
+  (doseq [[owner rows] groups]
+    (fire-after-row-triggers! db owner op rows columns)))
+
 (defn- prepare-delete-effects
-  "Run BEFORE triggers and resolve foreign-key effects for rows that will be deleted."
+  "Run BEFORE triggers and resolve foreign-key effects in each physical table."
   [db table eids current-db]
   (fire-statement-triggers! db table :delete :before)
-  (let [old-rows (into {} (map (fn [eid] [eid (entity-columns db table eid)])) eids)
-        kept (vec (keep-row-deletes db table eids old-rows))]
-    (assoc (collect-fk-delete-effects! (current-db) table kept)
-           :eids kept
-           :after-rows (mapv (fn [eid] {:old (get old-rows eid)}) kept))))
+  (let [kept (mapv (fn [[owner ids]]
+                     (let [old-rows (into {} (map (fn [eid] [eid (entity-columns db owner eid)])) ids)
+                           ids (vec (keep-row-deletes db owner ids old-rows))]
+                       {:table owner :eids ids
+                        :after-rows (mapv (fn [eid] {:old (get old-rows eid)}) ids)}))
+                   (physical-row-groups db table eids))
+        effects (mapv (fn [{:keys [table eids]}]
+                        (collect-fk-delete-effects! (current-db) table eids))
+                      kept)
+        keep-set (into #{} (mapcat :eids) kept)]
+    {:eids (filterv keep-set eids)
+     :deleted-eids (into #{} (mapcat :deleted-eids) effects)
+     :set-null-actions (into [] (comp (mapcat :set-null-actions) (distinct)) effects)
+     :after-groups (mapv (juxt :table :after-rows) kept)
+     :after-rows (into [] (mapcat :after-rows) kept)}))
 
 (defn- execute-delete [ctx conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
           matched (with-cte-namespaces parsed (match-delete-rows ctx db schema parsed))
-          {:keys [eids deleted-eids after-rows]} (prepare-delete-effects db table (:eids matched) (constantly db))
+          {:keys [eids deleted-eids after-groups after-rows]} (prepare-delete-effects db table (:eids matched) (constantly db))
           returning-result (when-let [returning (:returning parsed)]
                              (build-returning-result returning db db eids table
                                                      (:alias parsed) schema :delete matched))
           tx-data (tx-wrap (mapv (fn [eid] [:db/retractEntity eid]) deleted-eids))]
       (when (seq tx-data)
         (transact-recorded! conn tx-data))
-      (fire-after-row-triggers! db table :delete after-rows)
+      (fire-physical-after-triggers! db :delete after-groups nil)
       (fire-statement-triggers! db table :delete :after after-rows)
       (or returning-result (empty-result (str "DELETE " (count eids)))))
     (catch Exception e
@@ -3870,6 +3905,7 @@
 (defn- build-update-tx-from-plan [ctx db schema parsed]
   (let [{:keys [ns]} parsed
         {:keys [rows assignments] :as matched} (joined-write-rows ctx db schema parsed)
+        branches (inheritance/scan-branches db (:table parsed))
         ;; GENERATED ALWAYS AS (expr) STORED. Two obligations, and the
         ;; UPDATE path is the only place with both the row as it was and
         ;; the values replacing it.
@@ -3890,16 +3926,23 @@
         tx-data (into []
                       (mapcat
                        (fn [[eid & values]]
-                         (let [entity-map (into {} (map (fn [^datahike.datom.Datom d]
+                         (let [branch (when (seq branches)
+                                        (inheritance/row-branch branches (d/entity db eid)))
+                               owner (or (:table branch) (:table parsed))
+                               gen-cols (if (= owner (:table parsed))
+                                          gen-cols
+                                          (:generated-columns (row-constraint-plan db owner)))
+                               entity-map (into {} (map (fn [^datahike.datom.Datom d]
                                                           [(.-a d) (.-v d)]))
                                                 (d/datoms db :eavt eid))
                                assigned
                                (keep (fn [[{:keys [column default-fill]} v]]
-                                       (assignment-op eid entity-map (keyword ns column)
-                                                      (if default-fill
-                                                        (apply row-constraints/eval-default default-fill)
-                                                        (when-not (= :__null__ v) v))
-                                                      schema db))
+                                       (let [attr (keyword ns column)]
+                                         (assignment-op eid entity-map (get (:attrs branch) attr attr)
+                                                        (if default-fill
+                                                          (apply row-constraints/eval-default default-fill)
+                                                          (when-not (= :__null__ v) v))
+                                                        schema db)))
                                      (map vector assignments values))]
                            (if (empty? gen-cols)
                              assigned
@@ -3935,7 +3978,7 @@
                                                (let [v (first (:values
                                                                (row-eval/row-values
                                                                 [generated-ast] row-after
-                                                                (:table parsed) schema db)))]
+                                                                owner schema db)))]
                                                  (assignment-op eid entity-map attr
                                                                 (when (some? v)
                                                                   (#'stmt/coerce-insert-value
@@ -4071,6 +4114,37 @@
           (when fks?
             (enforce-fk-on-insert! db table-name ns [post])))))))
 
+(defn- prepare-update-effects [db schema {:keys [table ns]} tx-data eids]
+  (check-update-identity-collisions! db schema tx-data)
+  (check-not-null-on-update! db tx-data)
+  (let [changed-columns (into #{}
+                              (keep (fn [op]
+                                      (when (and (vector? op)
+                                                 (= :db/add (first op))
+                                                 (keyword? (nth op 2 nil)))
+                                        (name (nth op 2)))))
+                              tx-data)
+        groups (physical-row-groups db table eids)
+        scoped (if (= [[table eids]] groups)
+                 [[table eids tx-data]]
+                 (let [ops (group-by second tx-data)]
+                   (mapv (fn [[owner rows]] [owner rows (into [] (mapcat ops) rows)]) groups)))]
+    (doseq [[owner _ ops] scoped]
+      (check-updates-against-row-constraints! db owner (if (= owner table) (or ns owner) owner) ops)
+      (enforce-fk-restrict-on-update! db owner ops))
+    (fire-statement-triggers! db table :update :before nil changed-columns)
+    (let [effects (mapv (fn [[owner ids ops]]
+                          (let [[tx-data after-rows eids]
+                                (apply-before-row-updates db owner ops changed-columns ids)]
+                            {:owner owner :tx-data tx-data :after-rows after-rows :eids eids}))
+                        scoped)
+          kept (into #{} (mapcat :eids) effects)]
+      {:tx-data (into [] (mapcat :tx-data) effects)
+       :after-rows (into [] (mapcat :after-rows) effects)
+       :after-groups (mapv (juxt :owner :after-rows) effects)
+       :updated-eids (filterv kept eids)
+       :changed-columns changed-columns})))
+
 (defn- execute-update [ctx conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
@@ -4086,19 +4160,8 @@
                          (ring-write-eas-graced (db-ring-key current) (:max-tx db) (:max-tx current))))
                current
                db)
-          _ (check-update-identity-collisions! db schema tx-data)
-          _ (check-not-null-on-update! db tx-data)
-          _ (check-updates-against-row-constraints!
-             db table (or (:ns parsed) table) tx-data)
-          _ (enforce-fk-restrict-on-update! db table tx-data)
-          changed-columns (set (keep (fn [op]
-                                       (when (and (vector? op) (= :db/add (first op))
-                                                  (keyword? (nth op 2 nil)))
-                                         (name (nth op 2))))
-                                     tx-data))
-          _ (fire-statement-triggers! db table :update :before nil changed-columns)
-          [tx-data after-rows updated-eids] (apply-before-row-updates
-                                             db table tx-data changed-columns eids)
+          {:keys [tx-data after-rows after-groups updated-eids changed-columns]}
+          (prepare-update-effects db schema parsed tx-data eids)
           tx-data (tx-wrap tx-data)
           returning (:returning parsed)
           tx-report (when (seq tx-data)
@@ -4113,10 +4176,10 @@
               result (build-returning-result returning db-after db updated-eids table (:alias parsed)
                                              (:schema db-after) :update built)]
           (when (seq tx-data) (transact-speculative-report! conn db tx-report))
-          (fire-after-row-triggers! db table :update after-rows changed-columns)
+          (fire-physical-after-triggers! db :update after-groups changed-columns)
           (fire-statement-triggers! db table :update :after after-rows changed-columns)
           result)
-        (do (fire-after-row-triggers! db table :update after-rows changed-columns)
+        (do (fire-physical-after-triggers! db :update after-groups changed-columns)
             (fire-statement-triggers! db table :update :after after-rows changed-columns)
             ;; A row a BEFORE trigger cancelled was not updated, so it
             ;; is not counted. Every other MATCHED row is, including one
@@ -5218,7 +5281,7 @@
                              (map #(str "__dh_pg_table_" oid "_" %) (range 1 Long/MAX_VALUE))))))
       table)))
 
-(defn- table-storage-tx-data [db tx-data table storage namespace-oid]
+(defn- table-storage-tx-data [db tx-data table storage namespace-oid qualified-parents]
   (let [attr-for (fn [attr]
                    (if (and (keyword? attr) (= table (namespace attr)))
                      (keyword storage (name attr))
@@ -5226,7 +5289,7 @@
         storage-for (fn [name]
                       (if (= table name)
                         storage
-                        (referenced-table-storage db name)))
+                        (referenced-table-storage db name (when (contains? qualified-parents name) "public"))))
         fk-storage (fn [name schema]
                      (let [self? (and (= name table)
                                       (or sql-ctx/*physical-table-names?*
@@ -5339,6 +5402,23 @@
     (:persistence parameters) (assoc :__seq__/persistence (:persistence parameters))
     (:restart parameters) (assoc :__seq__/value (:restart parameters))))
 
+(defn- inherit-column-schema [db storage parsed column]
+  (let [name (:datahike.pg.column/name column)
+        source-attr (:datahike.pg.column/storage-ident column)
+        source (d/entity db source-attr)
+        primary-cols (:pk-cols parsed)]
+    (cond-> (assoc (select-keys source
+                                [:db/valueType :db/cardinality :db/isComponent
+                                 :pg/type :pg/typmod :pg/not-null :pg/array-elem :pg/array-ndim
+                                 :pg/default-kind :pg/default-value :pg/default-arg
+                                 :pg/generated :pg/generated-expr
+                                 :datahike.pg/enum-of :datahike.pg/domain-of])
+                   :db/ident (keyword storage name))
+      (some #{name} primary-cols) (assoc :pg/not-null true)
+      (= [name] primary-cols) (assoc :db/unique :db.unique/identity)
+      (some #{name} (:unique-cols parsed)) (assoc :db/unique :db.unique/value)
+      (:temp? parsed) (assoc :db/noHistory true))))
+
 (defn- table-create-tx-data [db parsed]
   (doseq [column (:column-order parsed)]
     (ddl/validate-table-column-name! column))
@@ -5346,6 +5426,9 @@
         namespace-oid (get parsed :namespace-oid catalog-objects/public-namespace-oid)
         public? (= namespace-oid catalog-objects/public-namespace-oid)
         raw-ddl-data (ddl-tx-data parsed)
+        physical-inheritance? (and (seq (:inherits parsed))
+                                   (every? #(contains? (dbi/-schema db) (pgs/row-marker-attr %))
+                                           (:inherits parsed)))
         _ (when (and (not public?) (seq (:inherits parsed)))
             (throw (errors/pg-error :feature-not-supported
                                     {:feature "inheritance in non-public schemas"})))
@@ -5380,7 +5463,8 @@
                              :namespace-oid namespace-oid})))
               (vals sequence-addresses))
         storage (new-table-storage-name db table-name oid namespace-oid)
-        storage-ddl-data (table-storage-tx-data db raw-ddl-data table-name storage namespace-oid)
+        storage-ddl-data (table-storage-tx-data db raw-ddl-data table-name storage
+                                                namespace-oid (:qualified-inheritance-parents parsed))
         marker (pgs/row-marker-attr storage)
         column-counters (into {} (map (juxt #(keyword storage (:column %)) identity)) (vals sequence-addresses))
         explicit-sequence-defaults?
@@ -5436,7 +5520,7 @@
                                  parent-name)]
                           (when (= :table (:datahike.pg.object/kind o)) o)))
                       (:inherits parsed))
-        parent-columns
+        {parent-columns :cols additional-not-null :additional-not-null}
         (->> parents
              (mapcat (fn [parent]
                        (catalog-objects/columns-by-relation
@@ -5448,30 +5532,39 @@
                                 "NOTICE"
                                 (str "merging multiple inherited definitions"
                                      " of column \"" nm "\""))
-                               acc)
+                               (cond-> acc
+                                 (and physical-inheritance?
+                                      (:pg/not-null
+                                       (d/entity db (:datahike.pg.column/storage-ident column))))
+                                 (update :additional-not-null conj nm)))
                            (-> acc
                                (update :seen conj nm)
                                (update :cols conj column)))))
-                     {:seen #{} :cols []})
-             :cols)
+                     {:seen #{} :cols [] :additional-not-null #{}}))
         inherited-specs
         (mapv (fn [column]
-                (let [name (:datahike.pg.column/name column)]
+                (let [name (:datahike.pg.column/name column)
+                      local? (contains? local-name-set name)
+                      local-oid (when local?
+                                  (or (get-in parsed [:column-type-oids name])
+                                      (some->> (get-in parsed [:column-types name])
+                                               (pgs/resolve-type-oid db))))]
+                  (when local?
+                    (when (and local-oid (:datahike.pg.column/type-oid column)
+                               (not= local-oid (:datahike.pg.column/type-oid column)))
+                      (throw (ex-info (str "column \"" name "\" has a type conflict")
+                                      {:sqlstate "42804" :table table-name :column name})))
+                    (params/notice! "NOTICE" (str "merging column \"" name "\" with inherited definition")))
                   {:name name
                    :storage-ident
-                   (if (contains? local-name-set name)
+                   (if (or physical-inheritance? (contains? local-name-set name))
                      (keyword storage name)
                      (:datahike.pg.column/storage-ident column))
-                   :local? (contains? local-name-set name)
+                   :local? local?
                    :inherit-count 1
-                   :type-oid
-                   (if (contains? local-name-set name)
-                     (or (get-in parsed [:column-type-oids name])
-                         (some->> (get-in parsed [:column-types name])
-                                  (pgs/resolve-type-oid db)))
-                     (:datahike.pg.column/type-oid column))
+                   :type-oid (or local-oid (:datahike.pg.column/type-oid column))
                    :typmod
-                   (if (contains? local-name-set name)
+                   (if local?
                      (:pg/typmod (get ddl-by-ident (keyword storage name)))
                      (:datahike.pg.column/typmod column))
                    :inherited-from-address
@@ -5488,9 +5581,47 @@
                                                (pgs/resolve-type-oid db)))
                         :typmod (:pg/typmod (get ddl-by-ident ident))})))
               (remove inherited-names local-names))
+        inherited-by-ident
+        (when physical-inheritance?
+          (into {} (map (fn [column]
+                          (let [data (cond-> (inherit-column-schema db storage parsed column)
+                                       (contains? additional-not-null (:datahike.pg.column/name column))
+                                       (assoc :pg/not-null true))]
+                            [(:db/ident data) data])))
+                parent-columns))
+        inherited-ddl (into []
+                            (remove #(contains? ddl-by-ident (:db/ident %)))
+                            (vals inherited-by-ident))
+        ddl-data
+        (if (seq inherited-by-ident)
+          (mapv (fn [datum]
+                  (if-let [inherited (get inherited-by-ident (:db/ident datum))]
+                    (cond-> datum
+                      (not (:pg/default-kind datum))
+                      (merge (select-keys inherited [:pg/default-kind :pg/default-value :pg/default-arg]))
+                      (:pg/not-null inherited) (assoc :pg/not-null true))
+                    datum))
+                ddl-data)
+          ddl-data)
+        ddl-by-ident (into (or inherited-by-ident {})
+                           (keep #(when (:db/ident %) [(:db/ident %) %]))
+                           ddl-data)
+        _ (when physical-inheritance?
+            (let [names (into #{} (map :name) effective-columns)]
+              (doseq [name (:pk-cols parsed)]
+                (when-not (contains? names name)
+                  (throw (errors/pg-error :undefined-column {:table table-name :column name}))))))
         column-data
         (catalog-objects/create-columns-tx
          oid (map-indexed #(assoc %2 :attnum (inc %1)) effective-columns))
+        layout-data
+        (when physical-inheritance?
+          (let [relation-address (catalog-objects/address-key catalog-objects/pg-class-oid oid)
+                layout-datom [:db/add [:datahike.pg.object/address-key relation-address]
+                              :datahike.pg.object/relation-layout 2]]
+            (if (contains? (dbi/-schema db) :datahike.pg.object/relation-layout)
+              [layout-datom]
+              [inheritance/layout-attr layout-datom])))
         sequence-ownership
         (when (seq column-counters)
           (into (cond-> []
@@ -5526,10 +5657,10 @@
         tx-data (into (vec tx-data)
                       (concat (when (some :__seq__/persistence ddl-data)
                                 [sequence/persistence-attribute])
-                              ddl-data object-data row-type-data sequence-object-data
-                              column-data sequence-ownership))]
+                              inherited-ddl ddl-data object-data row-type-data sequence-object-data
+                              column-data sequence-ownership layout-data))]
     (cond-> tx-data
-      (or has-foreign-keys? explicit-sequence-defaults?)
+      (or physical-inheritance? has-foreign-keys? explicit-sequence-defaults?)
       (guard-catalog-tx (catalog-basis/capture db)))))
 
 (defn- execute-ddl-create [conn parsed tx-state session-id]
@@ -9921,9 +10052,7 @@
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db)))
                     (let [watermark (:begin-max-tx @tx-state)
-                          _ (lock-rows-blocking! session-id tx-state
-                                                 (:table parsed) lockable
-                                                 row-lock-timeout-ms)
+                          _ (lock-physical-rows! spec-db (:table parsed) session-id tx-state lockable)
                           ;; A conflicting holder may commit and release just
                           ;; before our first registry probe, so "did we wait?"
                           ;; is not a sufficient freshness signal. Recheck the
@@ -9937,21 +10066,8 @@
                     built)))
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
-              _ (check-update-identity-collisions! spec-db schema tx-data)
-              _ (check-not-null-on-update! spec-db tx-data)
-              _ (check-updates-against-row-constraints!
-                 spec-db (:table parsed) (or (:ns parsed) (:table parsed)) tx-data)
-              _ (enforce-fk-restrict-on-update! spec-db (:table parsed) tx-data)
-              changed-columns (set (keep (fn [op]
-                                           (when (and (vector? op) (= :db/add (first op))
-                                                      (keyword? (nth op 2 nil)))
-                                             (name (nth op 2))))
-                                         tx-data))
-              _ (fire-statement-triggers! spec-db (:table parsed) :update :before
-                                          nil changed-columns)
-              [tx-data after-rows updated-eids] (apply-before-row-updates
-                                                 spec-db (:table parsed) tx-data
-                                                 changed-columns eids)
+              {:keys [tx-data after-rows after-groups updated-eids changed-columns]}
+              (prepare-update-effects spec-db schema parsed tx-data eids)
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-report (dc/with spec-db tx-data)
               _ (unique-constraints/validate-report! spec-report)
@@ -9967,8 +10083,8 @@
                             (-> ts
                                 (update :tx-buffer into (guard-catalog-tx commit-tx-data))
                                 (assoc :speculative-db db-after))))
-          (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
-                                    :update after-rows changed-columns)
+          (fire-physical-after-triggers! (:speculative-db @tx-state)
+                                         :update after-groups changed-columns)
           (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
                                     :update :after after-rows changed-columns)
           (or returning-result
@@ -10060,9 +10176,7 @@
               (if (and session-id (seq lockable)
                        (nil? (:origin-db spec-db)))
                 (let [watermark (:begin-max-tx @tx-state)
-                      _ (lock-rows-blocking! session-id tx-state
-                                             (:table parsed) lockable
-                                             row-lock-timeout-ms)
+                      _ (lock-physical-rows! spec-db (:table parsed) session-id tx-state lockable)
                       _ (rebase-tx-state! conn tx-state)]
                   (if (not= watermark (:begin-max-tx @tx-state))
                     (recur)
@@ -10070,7 +10184,7 @@
                 built)))
           spec-db (:speculative-db @tx-state)
           eid->tempid (:eid->tempid @tx-state)
-          {:keys [eids deleted-eids set-null-actions after-rows]}
+          {:keys [eids deleted-eids set-null-actions after-groups after-rows]}
           (prepare-delete-effects spec-db (:table parsed) (:eids matched)
                                   #(:speculative-db @tx-state))
           write-db (:speculative-db @tx-state)
@@ -10090,8 +10204,7 @@
                             (assoc :speculative-db (:db-after spec-report)))))
       (doseq [[fk parent-key] set-null-actions]
         (exec-fk-set-null! tx-state fk parent-key))
-      (fire-after-row-triggers! (:speculative-db @tx-state) (:table parsed)
-                                :delete after-rows)
+      (fire-physical-after-triggers! (:speculative-db @tx-state) :delete after-groups nil)
       (fire-statement-triggers! (:speculative-db @tx-state) (:table parsed)
                                 :delete :after after-rows)
       (or returning-result (empty-result (str "DELETE " (count eids)))))
@@ -10107,7 +10220,11 @@
 
     ;; The standalone handler API can call execute without a wire group.
     ;; Give triggered child updates the same rollback boundary there.
-    (fk-set-null-reachable? (d/db conn) (:table parsed))
+    (let [db (d/db conn)
+          table (:table parsed)]
+      (or (fk-set-null-reachable? db table)
+          (some #(fk-set-null-reachable? db (:table %))
+                (inheritance/scan-branches db table))))
     (do
       (open-implicit-tx! ctx)
       (try
@@ -13023,10 +13140,10 @@
                       {:sqlstate "42809"})))
     (when-not (:datahike.pg.column/storage-ident column)
       (throw (errors/pg-error :undefined-column {:table table :column name})))
-    (when (or (not (:datahike.pg.column/local? column))
-              (pos? (or (:datahike.pg.column/inherit-count column) 0))
-              (seq (inherited-column-dependents
-                    db (:datahike.pg.column/address-key column))))
+    (when (and (not= action "SET NOT NULL")
+               (or (seq (inherited-column-dependents db (:datahike.pg.column/address-key column)))
+                   (not (:datahike.pg.column/local? column))
+                   (pos? (or (:datahike.pg.column/inherit-count column) 0))))
       (throw (errors/pg-error
               :feature-not-supported
               {:message (str action " on inherited columns is not supported")})))
@@ -13101,22 +13218,51 @@
     (catch Exception e
       (classified-error "" e))))
 
+(defn- set-column-not-null-tx [db table column only?]
+  (let [name (:datahike.pg.column/name column)
+        children (sort (inheritance/descendants db table))]
+    (when (and only? (seq children)
+               (not (:pg/not-null (d/entity db (:datahike.pg.column/storage-ident column)))))
+      (throw (errors/pg-error :feature-not-supported
+                              {:message "SET NOT NULL with NO INHERIT is not supported"})))
+    (into []
+          (mapcat
+           (fn [target]
+             (let [root? (= target table)
+                   oid (when-not root?
+                         (:datahike.pg.object/oid (inheritance/table-object db target)))
+                   col (if root? column (catalog-objects/column-by-name db oid name))
+                   attr (:datahike.pg.column/storage-ident col)]
+               ;; Older children share the parent's attribute. Changing its metadata
+               ;; would also tighten the constraint on ancestors and siblings.
+               (when (or (nil? attr)
+                         (and (or (not root?) (pos? (:datahike.pg.column/inherit-count col 0)))
+                              (not (and (= target (namespace attr))
+                                        (inheritance/physical? db target)))))
+                 (throw (errors/pg-error :feature-not-supported
+                                         {:message "SET NOT NULL on shared inherited columns is not supported"})))
+               (let [entity (d/entity db attr)]
+                 (when-not (:pg/not-null entity)
+                   (when (some #(nil? (get (d/entity db %) attr)) (table-row-eids db target))
+                     (throw (ex-info (str "column \"" name "\" of relation \"" target
+                                          "\" contains null values")
+                                     {:sqlstate "23502" :table target :column name})))
+                   (into [[:db/add (:db/id entity) :pg/not-null true]]
+                         (when-not root?
+                           (catalog-objects/bump-revision-tx db catalog-objects/pg-class-oid oid))))))))
+          (if only? [table] (cons table children)))))
+
 (defn- alter-column-nullability-tx
-  [db table relation-oid {:keys [op name]}]
+  [db table relation-oid {:keys [op name only?]}]
   (let [action (if (= :set-not-null op) "SET NOT NULL" "DROP NOT NULL")
-        attr (:datahike.pg.column/storage-ident
-              (alterable-column db table relation-oid name action))
+        column (alterable-column db table relation-oid name action)
+        attr (:datahike.pg.column/storage-ident column)
         schema (dbi/-schema db)]
     (let [entity (d/entity db attr)
           eid (:db/id entity)]
       (case op
         :set-not-null
-        (when-not (:pg/not-null entity)
-          (when (some #(nil? (get (d/entity db %) attr)) (table-row-eids db table))
-            (throw (ex-info (str "column \"" name "\" of relation \"" table
-                                 "\" contains null values")
-                            {:sqlstate "23502" :table table :column name})))
-          [[:db/add eid :pg/not-null true]])
+        (set-column-not-null-tx db table column only?)
 
         :drop-not-null
         (do
@@ -13568,11 +13714,13 @@
 (defn- inherited-add-column-tx-data
   "Propagate newly added parent columns through the inheritance tree.
 
-   Each descendant receives its own durable attnum/address while sharing the
-   inherited physical attribute. A same-named local column is merged when its
-   PostgreSQL type and typmod agree, matching PostgreSQL's inheritance rule."
-  [db table added-columns]
-  (let [columns-by-relation
+   Each descendant receives its own durable attnum/address. Physical children
+   also install a column attribute, while legacy children share the parent
+   attribute. A same-named local column is merged when its PostgreSQL type
+   and typmod agree."
+  [db table added-columns declarations occupied-storage]
+  (let [schema-by-ident (into {} (keep #(when (:db/valueType %) [(:db/ident %) %])) declarations)
+        columns-by-relation
         (atom {})
         touched-relations (atom #{})
         tx-data (atom [])
@@ -13592,7 +13740,7 @@
               (let [columns (catalog-objects/columns-by-relation db relation-oid)]
                 (swap! columns-by-relation assoc relation-oid columns)
                 columns)))]
-    (letfn [(propagate! [parent-name parent-column]
+    (letfn [(propagate! [parent-name parent-column declaration]
               (doseq [child-name (child-names parent-name)]
                 (let [child (catalog-objects/object-by-identity
                              db catalog-objects/pg-class-oid
@@ -13629,32 +13777,46 @@
                                     [:db/add column-ref
                                      :datahike.pg.column/inherited-from-address
                                      (:address parent-column)]])
-                            (assoc live-column
-                                   :name (:datahike.pg.column/name live-column)
-                                   :type-oid (:datahike.pg.column/type-oid live-column)
-                                   :typmod (:datahike.pg.column/typmod live-column)
-                                   :storage-ident
-                                   (:datahike.pg.column/storage-ident live-column)
-                                   :address
-                                   (:datahike.pg.column/address-key live-column))))
+                            (swap! columns-by-relation update child-oid
+                                   (fn [cols]
+                                     (mapv #(if (= live-column %)
+                                              (assoc % :datahike.pg.column/inherit-count next-count)
+                                              %)
+                                           cols)))
+                            ;; Its descendants already inherited this column.
+                            nil))
                         (let [attnum (inc (reduce max 0
                                                   (map :datahike.pg.column/attnum
                                                        columns)))
+                              physical? (inheritance/physical? db child-name)
+                              name (:name parent-column)
+                              ident (if physical?
+                                      (available-column-storage-ident
+                                       (into @occupied-storage (map :datahike.pg.column/storage-ident columns))
+                                       child-name name attnum)
+                                      (:storage-ident parent-column))
                               spec {:attnum attnum
                                     :name (:name parent-column)
                                     :type-oid (:type-oid parent-column)
                                     :typmod (:typmod parent-column)
-                                    :storage-ident (:storage-ident parent-column)
+                                    :storage-ident ident
                                     :local? false
                                     :inherit-count 1
                                     :inherited-from-address
                                     (:address parent-column)}]
+                          (when physical?
+                            (swap! occupied-storage conj ident)
+                            (swap! tx-data conj (assoc declaration :db/ident ident))
+                            (when (not= ident (keyword child-name name))
+                              (swap! tx-data conj {:datahike.pg/for-ident ident
+                                                   :datahike.pg/column name})))
                           (swap! tx-data into
                                  (catalog-objects/create-columns-tx child-oid [spec]))
                           (swap! columns-by-relation update child-oid conj
                                  (assoc spec
                                         :datahike.pg.column/attnum attnum
                                         :datahike.pg.column/name (:name spec)
+                                        :datahike.pg.column/inherit-count 1
                                         :datahike.pg.column/type-oid (:type-oid spec)
                                         :datahike.pg.column/typmod (:typmod spec)
                                         :datahike.pg.column/storage-ident
@@ -13665,12 +13827,13 @@
                           (assoc spec :address
                                  (catalog-objects/column-address-key child-oid attnum))))]
                   (swap! touched-relations conj child-oid)
-                  (propagate! child-name child-column))))]
+                  (when child-column (propagate! child-name child-column declaration)))))]
       (doseq [column added-columns]
         (propagate! table
                     (assoc column :address
                            (catalog-objects/column-address-key
-                            (:relation-oid column) (:attnum column)))))
+                            (:relation-oid column) (:attnum column)))
+                    (get schema-by-ident (:storage-ident column))))
       (into @tx-data
             (mapcat #(catalog-objects/bump-revision-tx
                       db catalog-objects/pg-class-oid %)
@@ -13960,7 +14123,9 @@
             (inherited-add-column-tx-data
              db table
              (map #(assoc % :relation-oid relation-oid)
-                  added-column-specs))
+                  added-column-specs)
+             schema-and-constraint-data
+             occupied-storage)
             hint-data
             (keep (fn [{:keys [name storage-ident]}]
                     (when (not= storage-ident (keyword table name))
@@ -14601,8 +14766,8 @@
         ;; A row belongs to every ancestor as well as to the table it was
         ;; copied into -- that is how the parent sees it. INSERT has
         ;; always set those markers; COPY set only its own.
-        ancestor-markers (mapv pgs/row-marker-attr
-                               (sql-ctx/inheritance-ancestors db-now ns))
+        ancestor-markers (when-not (inheritance/physical? db-now ns)
+                           (mapv pgs/row-marker-attr (sql-ctx/inheritance-ancestors db-now ns)))
         col-names (or columns available-columns)
         unknown-columns (seq (remove (set available-columns) col-names))]
     (when-not table-exists?

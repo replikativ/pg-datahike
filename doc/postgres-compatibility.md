@@ -86,6 +86,33 @@ with `ALTER TABLE parent ALTER COLUMN id SET DEFAULT nextval('parent_id_seq')`.
 Fresh SERIAL declarations store an ordinary nextval default and report no
 identity generation in the PostgreSQL catalogs.
 
+## Ordinary table inheritance
+
+New SQL tables created with `INHERITS` in `public` store their rows and
+keys in the child relation. A parent scan includes child rows, `ONLY`
+scans the named relation, and `tableoid` identifies the physical relation
+for newly created children. A child's declared primary key and foreign
+keys apply to that relation, so a parent and its child can store the
+same key value.
+
+The adapter reads both the original shared-row layout and the independent
+child layout. Once a store contains an independent child, use an adapter
+that understands that layout for subsequent SQL reads. An older adapter
+can miss the new child rows in parent scans.
+
+This covers ordinary DDL, INSERT, COPY, scans, and physical-row writes in
+the admitted PostgreSQL regression cases. `ALTER COLUMN ... SET NOT NULL`
+validates existing rows in the target and its physical descendants before
+enforcing the constraint across the tree. Columns added to an ordinary parent
+after its children exist also receive independent storage in physical children.
+A null in any descendant rejects
+the statement with SQLSTATE `23502`. Recursive changes on legacy shared
+columns, creation of a parent-only `NO INHERIT` constraint on a table with
+children, and recursive `DROP NOT NULL` remain unsupported. A column
+inherited from several parents enforces `NOT NULL` contributed by any of
+them. The generated `pg_constraint` rows can still report incomplete
+inheritance counts and locality for these constraints.
+
 ## Concurrent catalog changes
 
 Writes validate the catalog metadata used to prepare them against the writer's

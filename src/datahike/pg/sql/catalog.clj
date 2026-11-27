@@ -35,6 +35,7 @@
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.inheritance :as inheritance]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [datahike.pg PgWireServer]
@@ -277,7 +278,22 @@
   (let [hints (pgs/schema-hints db)
         tables (pgs/derive-virtual-tables user-schema hints)
         logical-names (catalog-objects/table-name-overrides db)
-        by-table (group-by :pg_constraint/conrelid rows)]
+        by-table (group-by :pg_constraint/conrelid rows)
+        inherited-counts
+        (when (get user-schema :__inherit__/child)
+          (into {}
+                (map (fn [[oid attnum inherit-count]] [[oid attnum] inherit-count]))
+                (d/q '[:find ?oid ?attnum ?inherit-count
+                       :where [?column :datahike.pg.column/relation ?relation]
+                       [?relation :datahike.pg.object/oid ?oid]
+                       [?column :datahike.pg.column/attnum ?attnum]
+                       [?column :datahike.pg.column/inherit-count ?inherit-count]
+                       [?column :datahike.pg.column/inherited-from-address ?address]
+                       [?parent :datahike.pg.column/address-key ?address]
+                       [?parent :datahike.pg.column/storage-ident ?attr]
+                       [?definition :db/ident ?attr]
+                       [?definition :pg/not-null true]]
+                     db)))]
     (mapcat
      (fn [[table {:keys [columns]}]]
        (let [relid (long (or (pgs/storage-table-oid db table) (Math/abs (.hashCode ^String table))))
@@ -288,7 +304,8 @@
              (let [col (:name column)
                    attnum (pgs/column-attnum user-schema table col hints)]
                (if (and attnum (or (:not-null? column) (= :db.unique/identity (:unique column))))
-                 (let [name (ddl/generated-constraint-name names (get logical-names table table) col "not_null")]
+                 (let [name (ddl/generated-constraint-name names (get logical-names table table) col "not_null")
+                       inherit-count (get inherited-counts [relid attnum] 0)]
                    {:names (conj names name)
                     :rows (conj rows {:pg_constraint/oid (long (constraint-oid "n" name table))
                                       :pg_constraint/conname name
@@ -300,6 +317,8 @@
                                       :pg_constraint/condeferrable false
                                       :pg_constraint/condeferred false
                                       :pg_constraint/convalidated true
+                                      :pg_constraint/conislocal (zero? inherit-count)
+                                      :pg_constraint/coninhcount inherit-count
                                       :pg_constraint/conkey (str "{" attnum "}")
                                       :pg_constraint/condef (str "NOT NULL " (fns/quote-identifier col))
                                       (pgs/row-marker-attr "pg_constraint") true})})
@@ -390,8 +409,8 @@
                      rows)]
           (mapv #(assoc % :pg_constraint/contypid (get % :pg_constraint/contypid 0)
                         :pg_constraint/conenforced true
-                        :pg_constraint/conislocal true
-                        :pg_constraint/coninhcount 0
+                        :pg_constraint/conislocal (get % :pg_constraint/conislocal true)
+                        :pg_constraint/coninhcount (get % :pg_constraint/coninhcount 0)
                         :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
                         :pg_constraint/conparentid 0
                         :pg_constraint/conperiod false
@@ -2151,7 +2170,8 @@
                                       :where [?e :datahike.pg.partition/bound ?bound]
                                       [?e :datahike.pg.object/oid ?oid]]
                                     cte-db))
-               has-partitions (set (vals partitions))
+               has-children (into (set (vals partitions)) (map second)
+                                  (inheritance/catalog-edges cte-db))
                matviews (into {}
                               (d/q '{:find [?n ?populated]
                                      :where [[?e :datahike.pg.matview/name ?n]
@@ -2172,7 +2192,7 @@
                                 :pg_class/relname logical-name
                                 :pg_class/relnamespace (or (:namespace-oid identity) 2200)
                                 :pg_class/relispartition (contains? partitions tbl-oid)
-                                :pg_class/relhassubclass (contains? has-partitions tbl-oid)
+                                :pg_class/relhassubclass (contains? has-children tbl-oid)
                                 :pg_class/relkind (cond
                                                     (contains? parents tbl-oid) "p"
                                                     (contains? matviews t) "m"
@@ -3355,18 +3375,31 @@
                 (into [[catalog-objects/pg-type-oid types/oid-vector]]
                       (map (fn [routine] [catalog-objects/pg-proc-oid (:oid routine)]))
                       regoid/vector-extension-routines))
-          (sequence-dependencies cte-db user-schema))
+          (concat (sequence-dependencies cte-db user-schema)
+                  (map (fn [[child parent]]
+                         {:pg_depend/classid catalog-objects/pg-class-oid
+                          :pg_depend/objid child
+                          :pg_depend/objsubid 0
+                          :pg_depend/refclassid catalog-objects/pg-class-oid
+                          :pg_depend/refobjid parent
+                          :pg_depend/refobjsubid 0
+                          :pg_depend/deptype "n"
+                          (pgs/row-marker-attr "pg_depend") true})
+                       (inheritance/catalog-edges cte-db))))
     "pg_inherits"
-    (mapv (fn [[oid parent]]
-            {:pg_inherits/inhrelid oid
-             :pg_inherits/inhparent parent
-             :pg_inherits/inhseqno 1
-             :pg_inherits/inhdetachpending false
-             (pgs/row-marker-attr "pg_inherits") true})
-          (d/q '{:find [?oid ?parent]
-                 :where [[?e :datahike.pg.partition/parent-oid ?parent]
-                         [?e :datahike.pg.object/oid ?oid]]}
-               cte-db))
+    (into []
+          (map (fn [[oid parent ordinal]]
+                 {:pg_inherits/inhrelid oid
+                  :pg_inherits/inhparent parent
+                  :pg_inherits/inhseqno ordinal
+                  :pg_inherits/inhdetachpending false
+                  (pgs/row-marker-attr "pg_inherits") true}))
+          (concat (map (fn [[oid parent]] [oid parent 1])
+                       (d/q '[:find ?oid ?parent
+                              :where [?e :datahike.pg.partition/parent-oid ?parent]
+                              [?e :datahike.pg.object/oid ?oid]]
+                            cte-db))
+                  (inheritance/catalog-edges cte-db)))
     "pg_enum"
     (vec
      (for [{:keys [name oid values]} (pgs/enum-types cte-db)
