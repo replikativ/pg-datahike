@@ -107,7 +107,9 @@ changes the database while the referential action is being prepared.
 The targeted `foreign_key.sql` discovery run went from 857 adapter
 diagnostics on 0.1.431 to 832, with 198 expected from stock and zero
 internal failures. Partitioning, deferred constraints and several
-referential action variants still affect the full file.
+referential action variants still affect the full file. ALTER restores
+continue to admit existing ON UPDATE CASCADE declarations with
+restrictive parent-key updates.
 
 ### asyncpg expected failures by owning ID
 

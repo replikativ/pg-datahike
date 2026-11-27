@@ -689,7 +689,7 @@
       "restrict" :restrict
       :no-action)))
 
-(defn validate-foreign-key-actions! [constraint on-delete on-update]
+(defn- validate-foreign-key-actions! [constraint on-delete on-update]
   (doseq [[event action] [["DELETE" on-delete] ["UPDATE" on-update]]
           :when (or (= :set-default action)
                     (and (= "UPDATE" event) (contains? #{:cascade :set-null} action)))]

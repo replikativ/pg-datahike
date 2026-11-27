@@ -321,6 +321,17 @@
                      WHERE conrelid = 'action_child'::regclass
                      ORDER BY conname")))))
 
+(deftest alter-foreign-key-preserves-restore-admission
+  (is (ok? (run "CREATE TABLE action_parent (id int PRIMARY KEY)")))
+  (is (ok? (run "CREATE TABLE action_child (pid int)")))
+  (let [r (run "ALTER TABLE action_child ADD CONSTRAINT action_fk
+                FOREIGN KEY (pid) REFERENCES action_parent ON UPDATE CASCADE")]
+    (is (ok? r) (err r)))
+  (is (= [["c"]] (rows (run "SELECT confupdtype FROM pg_constraint
+                             WHERE conname = 'action_fk'"))))
+  (let [r (run "INSERT INTO action_child VALUES (1)")]
+    (is (= "23503" (.sqlstate ^PgWireServer$QueryResult r)) (err r))))
+
 (deftest metabase-discovers-declared-foreign-keys
   (is (ok? (run "CREATE TABLE mb_customer (id INT PRIMARY KEY)")))
   (is (ok? (run "CREATE TABLE mb_order (

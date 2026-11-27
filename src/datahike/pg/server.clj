@@ -2113,7 +2113,8 @@
                        db table {:name cname :cols cols :parent-table parent-table
                                  :parent-cols parent-cols :added-columns added-columns
                                  :on-delete od} nil)]
-      (ddl/validate-foreign-key-actions! cname od ou)
+      ;; ALTER restores preserve declared action metadata. Parent-key
+      ;; updates still use the existing restrictive enforcement.
       (validate-added-fk! db table cname cols parent-table parent-cols)
       [(cond-> {:pg/constraint-key (ddl/constraint-key table cname)
                 :pg/fk-conname cname
