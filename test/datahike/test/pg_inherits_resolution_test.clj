@@ -282,10 +282,38 @@
   (exec! "INSERT INTO nn_parent DEFAULT VALUES")
   (exec! "DELETE FROM nn_parent")
   (exec! "ALTER TABLE nn_parent ALTER COLUMN a SET NOT NULL")
+  (exec! "ALTER TABLE ONLY nn_parent ALTER COLUMN a SET NOT NULL")
   (doseq [target ["nn_parent" "nn_child" "nn_leaf"]]
     (is (= "23502" (.-sqlstate (execute (str "INSERT INTO " target " DEFAULT VALUES"))))))
   (exec! "CREATE TABLE nn_new () INHERITS (nn_parent)")
   (is (= "23502" (.-sqlstate (execute "INSERT INTO nn_new DEFAULT VALUES")))))
+
+(deftest only-set-not-null-without-descendants
+  ;; PostgreSQL 18.6 constraints.sql, ALTER TABLE ONLY on an inherited leaf.
+  (exec! "CREATE TABLE nn_parent (a int)")
+  (exec! "CREATE TABLE nn_leaf () INHERITS (nn_parent)")
+  (exec! "INSERT INTO nn_leaf DEFAULT VALUES")
+  (is (= "23502" (.-sqlstate (execute "ALTER TABLE ONLY nn_leaf ALTER COLUMN a SET NOT NULL"))))
+  (exec! "DELETE FROM nn_leaf")
+  (exec! "ALTER TABLE ONLY nn_leaf ALTER COLUMN a SET NOT NULL")
+  (exec! "INSERT INTO nn_parent DEFAULT VALUES")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO nn_leaf DEFAULT VALUES"))))
+  (exec! "CREATE TABLE nn_grandchild () INHERITS (nn_leaf)")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO nn_grandchild DEFAULT VALUES"))))
+  (exec! "CREATE TABLE nn_standalone (a int)")
+  (exec! "ALTER TABLE ONLY nn_standalone ALTER COLUMN a SET NOT NULL")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO nn_standalone DEFAULT VALUES")))))
+
+(deftest new-child-inherits-not-null-from-each-parent
+  (exec! "CREATE TABLE nn_optional (a int)")
+  (exec! "CREATE TABLE nn_required (a int)")
+  (exec! "ALTER TABLE nn_required ALTER COLUMN a SET NOT NULL")
+  (exec! "CREATE TABLE nn_child () INHERITS (nn_optional, nn_required)")
+  (exec! "CREATE TABLE nn_local (a int) INHERITS (nn_optional, nn_required)")
+  (exec! "INSERT INTO nn_optional DEFAULT VALUES")
+  (doseq [target ["nn_child" "nn_local"]]
+    (is (= "23502" (.-sqlstate (execute (str "INSERT INTO " target " DEFAULT VALUES")))))
+    (exec! (str "INSERT INTO " target " (a) VALUES (1)"))))
 
 (deftest postgres-inheritance-recursive-not-null
   ;; PostgreSQL 18.6 inherit.sql lines 829-833, including converging paths.

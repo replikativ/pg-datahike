@@ -5520,7 +5520,7 @@
                                  parent-name)]
                           (when (= :table (:datahike.pg.object/kind o)) o)))
                       (:inherits parsed))
-        parent-columns
+        {parent-columns :cols additional-not-null :additional-not-null}
         (->> parents
              (mapcat (fn [parent]
                        (catalog-objects/columns-by-relation
@@ -5532,12 +5532,15 @@
                                 "NOTICE"
                                 (str "merging multiple inherited definitions"
                                      " of column \"" nm "\""))
-                               acc)
+                               (cond-> acc
+                                 (and physical-inheritance?
+                                      (:pg/not-null
+                                       (d/entity db (:datahike.pg.column/storage-ident column))))
+                                 (update :additional-not-null conj nm)))
                            (-> acc
                                (update :seen conj nm)
                                (update :cols conj column)))))
-                     {:seen #{} :cols []})
-             :cols)
+                     {:seen #{} :cols [] :additional-not-null #{}}))
         inherited-specs
         (mapv (fn [column]
                 (let [name (:datahike.pg.column/name column)
@@ -5581,7 +5584,9 @@
         inherited-by-ident
         (when physical-inheritance?
           (into {} (map (fn [column]
-                          (let [data (inherit-column-schema db storage parsed column)]
+                          (let [data (cond-> (inherit-column-schema db storage parsed column)
+                                       (contains? additional-not-null (:datahike.pg.column/name column))
+                                       (assoc :pg/not-null true))]
                             [(:db/ident data) data])))
                 parent-columns))
         inherited-ddl (into []
@@ -13216,7 +13221,8 @@
 (defn- set-column-not-null-tx [db table column only?]
   (let [name (:datahike.pg.column/name column)
         children (sort (inheritance/descendants db table))]
-    (when only?
+    (when (and only? (seq children)
+               (not (:pg/not-null (d/entity db (:datahike.pg.column/storage-ident column)))))
       (throw (errors/pg-error :feature-not-supported
                               {:message "SET NOT NULL with NO INHERIT is not supported"})))
     (into []
@@ -13244,7 +13250,7 @@
                    (into [[:db/add (:db/id entity) :pg/not-null true]]
                          (when-not root?
                            (catalog-objects/bump-revision-tx db catalog-objects/pg-class-oid oid))))))))
-          (cons table children))))
+          (if only? [table] (cons table children)))))
 
 (defn- alter-column-nullability-tx
   [db table relation-oid {:keys [op name only?]}]
