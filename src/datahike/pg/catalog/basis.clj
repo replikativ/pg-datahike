@@ -324,10 +324,15 @@
            (tracking/valid? (::token (meta basis)) db ::catalog tracking-selector))
       (= basis (capture db (:limits (meta basis))))))
 
+(def relation-name-attributes
+  "Catalog attributes whose values name the relations they describe or depend on."
+  #{:datahike.pg/table :datahike.pg/view-name :datahike.pg.matview/name
+    :datahike.pg.trigger/table :datahike.pg.index/table
+    :__inherit__/parent :__inherit__/child :__seq__/name
+    :pg/table :pg/check-table :pg/fk-child-table :pg/fk-parent-table})
+
 (defn- basis-relations
-  "The relation names a capture knows about: an attribute entity is named
-   by its `:db/ident`'s namespace, a catalog object by its
-   `:datahike.pg.object/name`."
+  "Logical and storage names in a capture, including native attribute namespaces."
   [basis]
   (persistent!
    (reduce (fn [out [attr _eid value _added]]
@@ -335,7 +340,8 @@
                (and (= :db/ident attr) (keyword? value) (namespace value))
                (conj! out (namespace value))
 
-               (and (= :datahike.pg.object/name attr) (string? value))
+               (and (#{:datahike.pg.object/name :datahike.pg.object/storage-name} attr)
+                    (string? value))
                (conj! out value)
 
                :else out))
@@ -375,10 +381,13 @@
    difference is examined instead, and admitted only in the one shape
    that cannot affect an already-lowered statement:
 
-     - nothing the expected capture held may be MISSING or CHANGED, in
-       the frozen schema or in the catalog rows; and
-     - every added row must belong to an entity the expected capture did
-       not have, naming relations it did not know.
+     - Every captured schema entry and catalog row must still exist unchanged.
+     - Added rows must belong to new entities. The names they introduce
+       must be absent from the expected capture.
+     - New relation-name metadata must refer only to those new relations.
+
+   An incoming FK on an old parent can change a buffered DELETE even when
+   all of the FK's metadata entities are new.
 
    `ALTER TABLE … ADD COLUMN` therefore does NOT qualify -- it adds an
    attribute in an EXISTING relation's namespace, which a lowered
@@ -406,6 +415,10 @@
                (every? (fn [[_ eid _ _]] (not (contains? e-eids eid))) added)
                ;; naming only relations the capture did not know
                (not-any? e-rels added-rels)
+               (not-any? (fn [[attr _ value]]
+                           (and (relation-name-attributes attr)
+                                (not (contains? added-rels value))))
+                         added)
                ;; and every new schema entry belongs to one of them
                (every? (fn [[k v]]
                          (or (contains? e-schema k)
@@ -413,9 +426,7 @@
                        c-schema))))))))
 
 (defn compatible?
-  "`matches?`, widened by `only-new-relations?`: a catalog that merely
-   GAINED relations cannot have changed what an already-lowered statement
-   reads, so it is not a reason to abort that statement's write."
+  "Accept exact matches and unrelated additions proven by `only-new-relations?`."
   [basis db]
   (when-not (::basis (meta basis))
     (throw (ex-info "Expected a captured catalog basis" {:error :catalog-basis-value})))
