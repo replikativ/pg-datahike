@@ -1457,17 +1457,8 @@
             ;; `(not= cte-db orig-db)` check further down tags the
             ;; result with :enriched-db for the server's executor.
             ;;
-            ;; Caching: the LRU is keyed by [schema-hash sorted-cat-names]
-            ;; so two connections with the same user schema and the same
-            ;; query-shape catalog set share the enriched-db. The
-            ;; expensive `catalog-schema-for` + `catalog-data-for` walks
-            ;; (each one re-derives virtual tables, traverses the schema,
-            ;; and runs Datalog queries against the user db) MUST live
-            ;; inside the cache-miss branch — earlier this block computed
-            ;; combined-schema / combined-data eagerly even on cache
-            ;; hits, so a 600-table Odoo startup paid for 5k catalog
-            ;; rebuilds per probe regardless of memoisation.
                 orig-db db
+                catalog-source (when (and db (identical? schema (dbi/-schema db))) db)
                 ;; catalog-names-used: recorded on the parsed result so the
                 ;; server can RE-RESOLVE the catalog enriched-db at execute
                 ;; (prepared statements would otherwise reuse a stale
@@ -2154,7 +2145,10 @@
                           result (if (and (seq catalog-names-used)
                                           (not cte-materialized?)
                                           (not derived-table-edb?))
-                                   (assoc result :catalog-tables (vec catalog-names-used))
+                                   (cond-> (assoc result :catalog-tables (vec catalog-names-used))
+                                     (and catalog-source
+                                          (catalog/statement-stable-catalogs? catalog-names-used))
+                                     (vary-meta assoc ::catalog-source catalog-source))
                                    result)
                         ;; Parameterised recursive CTEs: schema enriched at
                         ;; parse (above), but DATA must be materialised at

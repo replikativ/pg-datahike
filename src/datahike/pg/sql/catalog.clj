@@ -239,6 +239,15 @@
   (swap! extra-catalog-tables assoc table-name entry)
   nil)
 
+(defn statement-stable-catalogs?
+  "Whether these relations depend on the statement's database and schema.
+   A runtime catalog registration can define arbitrary data providers."
+  [names]
+  (let [extensions @extra-catalog-tables]
+    (every? #(and (contains? #{"pg_class" "pg_attribute" "pg_constraint"} %)
+                  (not (contains? extensions %)))
+            names)))
+
 (defn unregister-catalog-table!
   "Remove a previously-registered catalog table. No-op if unregistered."
   [table-name]

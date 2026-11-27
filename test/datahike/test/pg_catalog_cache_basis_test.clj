@@ -2,9 +2,11 @@
   (:require [clojure.test :refer [deftest is]]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
+            [datahike.pg.server :as pg]
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.catalog :as catalog]
-            [datahike.pg.sql.stmt :as stmt]))
+            [datahike.pg.sql.stmt :as stmt])
+  (:import [datahike.pg PgWireServer$QueryHandler PgWireServer$QueryResult]))
 
 (defn- with-db [f]
   (let [config {:store {:backend :memory :id (random-uuid)}
@@ -92,3 +94,26 @@
                        (set (d/q '[:find [?v ...] :where [_ :pg_cache_basis_extension/value ?v]]
                                  enriched)))))))))
       (finally (catalog/unregister-catalog-table! name)))))
+
+(deftest built-in-catalog-reuse-is-local-to-the-simple-statement
+  (with-db
+    (fn [conn]
+      (let [^PgWireServer$QueryHandler handler (pg/make-query-handler conn)
+            query (str "SELECT c.relname FROM pg_class c JOIN pg_attribute a "
+                       "ON a.attrelid = c.oid WHERE a.attname = 'new_column' "
+                       "AND c.relname = 'new_relation'")
+            enrich sql/enrich-db-with-catalogs
+            calls (atom 0)]
+        (with-redefs [sql/enrich-db-with-catalogs (fn [db schema catalogs]
+                                                    (swap! calls inc)
+                                                    (enrich db schema catalogs))]
+          (let [^PgWireServer$QueryResult before (.execute handler query)]
+            (is (nil? (.-error before)))
+            (is (empty? (.-rows before)))
+            (is (= 1 @calls)))
+          (let [prepared (.parse handler query (int-array 0))
+                ^PgWireServer$QueryResult created (.execute handler "CREATE TABLE new_relation(new_column int)")
+                ^PgWireServer$QueryResult after (.executePrepared handler prepared (object-array [nil]))]
+            (is (nil? (.-error created)))
+            (is (nil? (.-error after)))
+            (is (= [["new_relation"]] (mapv vec (.-rows after))))))))))
