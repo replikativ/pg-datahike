@@ -228,6 +228,17 @@
         (vec (repeat (count output-aliases) -1)))
       item-typmods)))
 
+(defn- unwrap-view-select [select]
+  (loop [body select]
+    (if (instance? ParenthesedSelect body)
+      (let [inner (.getSelect ^ParenthesedSelect body)]
+        ;; Keep query modifiers such as a LIMIT outside the parentheses
+        ;; attached to their own query level.
+        (if (= (str body) (str "(" inner ")"))
+          (recur inner)
+          body))
+      body)))
+
 (defn- translate-create-view [^CreateView cv schema db]
   (let [^Table view (.getView cv)
         view-name (unquote-ident (if (= "public" (unquote-ident (.getSchemaName view)))
@@ -244,7 +255,7 @@
                                 (keys schema)))
         replace? (.isOrReplace cv)
         if-not-exists? (.isIfNotExists cv)
-        select (.getSelect cv)]
+        select (unwrap-view-select (.getSelect cv))]
     (when (seq (.getColumnNames cv))
       (throw (errors/pg-error :feature-not-supported
                               {:feature "CREATE VIEW column name lists"})))

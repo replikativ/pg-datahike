@@ -343,7 +343,11 @@
       {:id :alter-column-nullability
        :source-lines [876 908]
        :gate "test/datahike/test/pg_constraints_test.clj"
-       :test-var "alter-column-nullability"}]}]}
+       :test-var "alter-column-nullability"}
+      {:id :alter-varchar-widening-keeps-primary-key
+       :source-lines [1436 1439]
+       :gate "test/datahike/test/pg_system_at_test.clj"
+       :test-var "postgres-varchar-widening-retains-a-primary-key-created-in-the-same-transaction"}]}]}
   {:id 5,
    :name "bulk I/O, temporary relations, and client tooling",
    :tests

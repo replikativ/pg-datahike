@@ -4,6 +4,13 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Migration SQL for Odoo
+
+ALTER TABLE widens a bounded varchar column in place, including a
+value-preserving USING cast. Keys, indexes, existing rows, and historical
+column widths are retained. CREATE VIEW accepts a parenthesized SELECT,
+including the correlated query Odoo uses for active devices.
+
 ### Foreign-key actions and client metadata
 
 ON DELETE SET NULL clears child keys in the same transaction as the

@@ -205,6 +205,35 @@
                     "JOIN pg_class c ON c.oid = a.attrelid "
                     "WHERE c.relname = 'star_dependent' ORDER BY a.attnum")))))
 
+(deftest parenthesized-odoo-device-view-uses-the-latest-active-row
+  (doseq [sql ["CREATE TABLE res_device_log (
+                  id int PRIMARY KEY, user_id int, session_identifier text,
+                  platform text, browser text, last_activity timestamp, revoked boolean)"
+               "INSERT INTO res_device_log VALUES
+                  (1, 10, 's', NULL, NULL, '2026-01-01', false),
+                  (2, 10, 's', NULL, NULL, '2026-01-02', false),
+                  (3, 10, 's', NULL, NULL, '2026-01-03', true),
+                  (4, 10, 's', 'Linux', NULL, '2026-01-01', false),
+                  (5, 10, 's', NULL, NULL, '2026-01-02', NULL),
+                  (6, 11, 's', NULL, NULL, '2026-01-01', false),
+                  (7, 10, 'different-session', NULL, NULL, '2026-01-01', false)"
+               "CREATE OR REPLACE VIEW res_device AS (SELECT D.* FROM res_device_log D
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM res_device_log D2
+                    WHERE D2.user_id = D.user_id
+                      AND D2.session_identifier = D.session_identifier
+                      AND D2.platform IS NOT DISTINCT FROM D.platform
+                      AND D2.browser IS NOT DISTINCT FROM D.browser
+                      AND (D2.last_activity > D.last_activity
+                           OR (D2.last_activity = D.last_activity AND D2.id > D.id))
+                      AND D2.revoked IS NOT TRUE
+                  ) AND D.revoked IS NOT TRUE)"
+               "CREATE VIEW newest_device AS ((SELECT id FROM res_device ORDER BY id DESC LIMIT 1))"]]
+    (let [result (ex sql)]
+      (is (nil? (:err result)) (str sql " " (:err result)))))
+  (is (= [["4"] ["5"] ["6"] ["7"]] (:rows (ex "SELECT id FROM res_device ORDER BY id"))))
+  (is (= [["7"]] (:rows (ex "SELECT id FROM newest_device")))))
+
 (deftest addressable-ddl-objects-have-postgresql-shaped-catalog-identities
   (doseq [ddl ["CREATE TABLE address_table (id integer, payload text)"
                "CREATE TYPE address_pair AS (left_value integer, right_value text)"

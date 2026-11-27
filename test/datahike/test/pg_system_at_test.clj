@@ -216,6 +216,94 @@
       (is (nil? (err (run sql))) sql))
     (is (= [["3"] ["4"]] (mapv vec (.rows (run "SELECT detail FROM tasks ORDER BY key")))))))
 
+(deftest postgres-varchar-widening-retains-a-primary-key-created-in-the-same-transaction
+  (let [run #(.execute *handler* %)]
+    (doseq [sql ["BEGIN"
+                 "CREATE TABLE skip_wal_skip_rewrite_index (c varchar(10) PRIMARY KEY)"
+                 "ALTER TABLE skip_wal_skip_rewrite_index ALTER c TYPE varchar(20)"
+                 "COMMIT"
+                 "INSERT INTO skip_wal_skip_rewrite_index VALUES ('longer-than-ten')"]]
+      (let [r (run sql)]
+        (is (nil? (err r)) (str sql " " (err r)))))
+    (is (= "23505"
+           (.sqlstate (run "INSERT INTO skip_wal_skip_rewrite_index VALUES ('longer-than-ten')"))))))
+
+(deftest varchar-widening-keeps-the-unique-key-and-historical-typmod
+  (let [run #(.execute *handler* %)
+        rows (fn [sql]
+               (let [result (run sql)]
+                 (is (nil? (err result)) sql)
+                 (mapv vec (.rows result))))
+        width-sql "SELECT character_maximum_length FROM information_schema.columns
+                   WHERE table_name = 'res_users' AND column_name = 'login'"
+        att-sql "SELECT attnum, atttypmod FROM pg_attribute
+                 WHERE attrelid = 'res_users'::regclass AND attname = 'login'"]
+    (doseq [sql ["CREATE TABLE res_users (login varchar(64) NOT NULL UNIQUE DEFAULT 'guest')"
+                 "INSERT INTO res_users VALUES ('alice')"]]
+      (is (nil? (err (run sql))) sql))
+    (let [before (d/db *conn*)
+          relation-oid (pgs/table-oid before "res_users")
+          attribute (:datahike.pg.column/storage-ident (objects/column-by-name before relation-oid "login"))
+          snapshot (.toInstant ^java.util.Date (:db/txInstant (d/entity before (:max-tx before))))]
+      (is (= [["64"]] (rows width-sql)))
+      (is (= [["1" "68"]] (rows att-sql)))
+      (doseq [sql ["BEGIN"
+                   (str "ALTER TABLE res_users ALTER COLUMN login DROP DEFAULT, "
+                        "ALTER COLUMN login TYPE varchar(80) USING login::varchar(80)")]]
+        (is (nil? (err (run sql))) sql))
+      (is (= [["80"]] (rows width-sql)))
+      (is (nil? (err (run "ROLLBACK"))))
+      (is (= [["64"]] (rows width-sql)))
+      (is (= [["guest"]] (rows "INSERT INTO res_users DEFAULT VALUES RETURNING login")))
+      (is (= "22001" (.sqlstate (run "INSERT INTO res_users VALUES (repeat('a', 80))"))))
+      (is (nil? (err (run (str "ALTER TABLE res_users ALTER COLUMN login DROP DEFAULT, "
+                               "ALTER COLUMN login TYPE VARCHAR USING login::VARCHAR")))))
+      (is (= [[nil]] (rows width-sql)))
+      (is (= [["1" "-1"]] (rows att-sql)))
+      (is (= attribute (:datahike.pg.column/storage-ident
+                        (objects/column-by-name (d/db *conn*) relation-oid "login"))))
+      (is (= [["80"]] (rows "INSERT INTO res_users VALUES (repeat('a', 80)) RETURNING length(login)")))
+      (is (= "23505" (.sqlstate (run "INSERT INTO res_users VALUES ('alice')"))))
+      (is (= "23502" (.sqlstate (run "INSERT INTO res_users DEFAULT VALUES"))))
+      (is (nil? (err (run (str "SET datahike.as_of = '" snapshot "'")))))
+      (is (= [["64"]] (rows width-sql)))
+      (is (= [["1" "68"]] (rows att-sql)))
+      (is (= [["alice"]] (rows "SELECT login FROM res_users"))))))
+
+(deftest varchar-widening-retains-checks-foreign-keys-and-view-dependencies
+  (let [run #(.execute *handler* %)
+        ok! (fn [sql] (let [r (run sql)] (is (nil? (err r)) (str sql " " (err r)))))
+        state (fn [sql] (.sqlstate (run sql)))]
+    (doseq [sql ["CREATE TABLE parent (id int PRIMARY KEY, v varchar(4) UNIQUE CHECK (length(v) < 7))"
+                 "CREATE TABLE child (v varchar(4) REFERENCES parent(v))"
+                 "CREATE VIEW unrelated_projection AS SELECT id FROM parent"
+                 "ALTER TABLE parent ALTER COLUMN v TYPE varchar(8)"
+                 "ALTER TABLE child ALTER COLUMN v TYPE varchar(8)"
+                 "INSERT INTO parent VALUES (1, '123456')"
+                 "INSERT INTO child VALUES ('123456')"]]
+      (ok! sql))
+    (is (= "23514" (state "INSERT INTO parent VALUES (2, '1234567')")))
+    (is (= "23503" (state "INSERT INTO child VALUES ('absent')")))
+    (is (= "0A000" (state "ALTER TABLE parent ALTER COLUMN v TYPE varchar(16) USING lower(v)")))
+    (is (= "0A000" (state "ALTER TABLE parent ALTER COLUMN v TYPE varchar(16) USING v::varchar(2)")))
+    (ok! "CREATE VIEW dependent_projection AS SELECT p.v FROM parent AS p")
+    (is (= "0A000" (state "ALTER TABLE parent ALTER COLUMN v TYPE varchar(16)")))
+    (ok! "CREATE TABLE generated_dep (v varchar(4), n int GENERATED ALWAYS AS (length(v)) STORED)")
+    (is (= "0A000" (state "ALTER TABLE generated_dep ALTER COLUMN v TYPE varchar(8)")))
+    (doseq [sql ["CREATE FUNCTION pass_row() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$"
+                 "CREATE TABLE triggert (v varchar(4), other varchar(4))"
+                 "CREATE TRIGGER by_key BEFORE UPDATE OF v ON triggert FOR EACH ROW EXECUTE FUNCTION pass_row()"]]
+      (ok! sql))
+    (is (= "0A000" (state "ALTER TABLE triggert ALTER COLUMN v TYPE varchar(8)")))
+    (ok! "ALTER TABLE triggert ALTER COLUMN other TYPE varchar(8) USING other::varchar")
+    (ok! "DROP TRIGGER by_key ON triggert")
+    (ok! (str "CREATE TRIGGER by_when BEFORE UPDATE ON triggert FOR EACH ROW "
+              "WHEN (OLD.v <> NEW.v) EXECUTE FUNCTION pass_row()"))
+    (is (= "0A000" (state "ALTER TABLE triggert ALTER COLUMN v TYPE varchar(8)")))
+    (ok! "DROP TRIGGER by_when ON triggert")
+    (ok! "CREATE TRIGGER all_rows BEFORE UPDATE ON triggert FOR EACH ROW EXECUTE FUNCTION pass_row()")
+    (ok! "ALTER TABLE triggert ALTER COLUMN v TYPE character varying(8) USING v::character varying(8)")))
+
 (deftest writes-resolve-the-logical-table-name
   (let [run #(.execute *handler* %)
         data #(mapv vec (.rows (run %)))]

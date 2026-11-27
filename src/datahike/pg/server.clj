@@ -82,7 +82,8 @@
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.statement.select Select Limit Offset]
-           [net.sf.jsqlparser.expression LongValue NullValue StringValue]))
+           [net.sf.jsqlparser.expression CastExpression LongValue NullValue StringValue]
+           [net.sf.jsqlparser.util TablesNamesFinder]))
 
 (set! *warn-on-reflection* true)
 
@@ -13317,20 +13318,107 @@
                     (when (some? value) [:db/retract eid old-attr value]))))
           (table-row-eids db table))))
 
+(defn- identity-varchar-using? [db using name source-typmod]
+  (let [expression (stmt/unwrap-parens (alter-type-using-ast using name))
+        input (if (instance? CastExpression expression)
+                (let [^CastExpression cast expression
+                      cast-type (str (.getColDataType cast))
+                      normalized (types/normalize-sql-type-name cast-type)
+                      cast-typmod (some-> (types/parse-char-length normalized) (+ types/var-hdr-sz))]
+                  (when (and (contains? #{"varchar" "character varying"} (types/base-type-name-of normalized))
+                             (nil? (pgs/user-type-object db cast-type))
+                             (or (nil? cast-typmod) (>= cast-typmod source-typmod)))
+                    (stmt/unwrap-parens (.getLeftExpression cast))))
+                expression)]
+    (and (instance? Column input)
+         (nil? (some-> (.getTable ^Column input) .getName))
+         (= name (params/unquote-ident (.getColumnName ^Column input))))))
+
+(defn- mentions-identifier? [tokens name]
+  (some (fn [{:keys [type text]}]
+          (and (#{:ident :quoted} type) (= name (params/unquote-ident text))))
+        tokens))
+
+(defn- view-may-depend-on-column?
+  "View definitions are stored as SQL. Match referenced relations and keep
+   a conservative column check when a definition uses a wildcard or a
+   column name cannot be disambiguated between sources."
+  [db table relation-oid column]
+  (let [relation (catalog-objects/object-by-address db catalog-objects/pg-class-oid relation-oid)
+        logical-name (or (:datahike.pg.object/name relation) table)
+        namespace-name (or (some->> (catalog-objects/object-namespace-oid db relation)
+                                    (catalog-objects/namespace-by-oid db)
+                                    :datahike.pg.object/name)
+                           "public")]
+    (some
+     (fn [attr]
+       (when (get (dbi/-schema db) attr)
+         (some (fn [[definition]]
+                 (let [tokens (cls/tokenize-all definition)]
+                   (and (mentions-identifier? tokens logical-name)
+                        (or (mentions-identifier? tokens column)
+                            (some #(= "*" (:text %)) tokens))
+                        (try
+                          (some (fn [source]
+                                  (let [parts (regoid/parse-qualified-name source)]
+                                    (and (= logical-name (peek parts))
+                                         (or (= 1 (count parts))
+                                             (= namespace-name (peek (pop parts)))))))
+                                (TablesNamesFinder/findTables definition))
+                          (catch Exception _ true)))))
+               (d/q '{:find [?definition]
+                      :in [$ ?attr]
+                      :where [[?view ?attr ?definition]]}
+                    db attr))))
+     [:datahike.pg/view-definition :datahike.pg.matview/query])))
+
+(defn- varchar-widening-tx [db table relation-oid column using typmod]
+  (let [name (:datahike.pg.column/name column)
+        attr (:datahike.pg.column/storage-ident column)
+        column-typmod (:datahike.pg.column/typmod column)
+        storage-column (d/entity db attr)
+        storage-typmod (:pg/typmod storage-column)
+        previous (or storage-typmod column-typmod)]
+    (when (and (some? previous)
+               (> previous types/var-hdr-sz)
+               (or (nil? typmod) (> typmod previous))
+               (identity-varchar-using? db using name previous))
+      (when (or (view-may-depend-on-column? db table relation-oid name)
+                (:pg/generated-expr storage-column)
+                (some (fn [{:keys [generated-expr]}]
+                        (and generated-expr
+                             (mentions-identifier? (cls/tokenize-all generated-expr) name)))
+                      (:columns (row-constraints/constraint-metadata db table)))
+                (some (fn [trigger]
+                        (or (some #{name} (:update-columns trigger))
+                            (when-let [condition (:when trigger)]
+                              (mentions-identifier? (cls/tokenize-all condition) name))))
+                      (table-triggers db table)))
+        (throw (errors/pg-error
+                :feature-not-supported
+                {:message (str "ALTER COLUMN TYPE with dependencies on column "
+                               (dump/quote-ident name) " is not supported")})))
+      (let [storage [:db/ident attr]
+            address [:datahike.pg.column/address-key (:datahike.pg.column/address-key column)]]
+        (if (some? typmod)
+          [[:db/add storage :pg/typmod (long typmod)]
+           [:db/add address :datahike.pg.column/typmod (long typmod)]]
+          (cond-> []
+            (some? storage-typmod) (conj [:db/retract storage :pg/typmod storage-typmod])
+            (some? column-typmod) (conj [:db/retract address :datahike.pg.column/typmod column-typmod])))))))
+
 (defn- type-rewrite-tx
   "Rewrite one column's row values and catalog address atomically. A fresh
    physical attribute keeps old values and type metadata addressable as of the
    transaction before the rewrite."
-  [db table relation-oid {:keys [name type using]}]
-  (let [column (alterable-column db table relation-oid name "TYPE")
-        indexes (column-index-dependents db table column)
+  [db table column {:keys [name type using]} {:keys [base oid typmod vtype array-spec]}]
+  (let [indexes (column-index-dependents db table column)
         _ (assert-rewritable-column! db table column indexes)
         old-attr (:datahike.pg.column/storage-ident column)
         source-oid (:datahike.pg.column/type-oid column)
         old-entity (d/entity db old-attr)
         schema (dbi/-schema db)
         attnum (:datahike.pg.column/attnum column)
-        {:keys [base oid typmod vtype array-spec]} (alter-type-column-spec db type)
         new-attr (available-column-storage-ident (conj (set (keys schema)) (keyword table name))
                                                  table name attnum)
         definition (merge (select-keys (get schema old-attr) [:db/index :db/noHistory])
@@ -13394,7 +13482,14 @@
                         (some? updated) (conj [:db/add eid new-attr updated])))))
           (table-row-eids db table))))
 
-(defn- type-rewrite-op [table relation-oid changes]
+(defn- alter-column-type-tx [db table relation-oid {:keys [name type using] :as change}]
+  (let [column (alterable-column db table relation-oid name "TYPE")
+        {:keys [oid typmod] :as target} (alter-type-column-spec db type)]
+    (or (when (= types/oid-varchar oid (:datahike.pg.column/type-oid column))
+          (varchar-widening-tx db table relation-oid column using typmod))
+        (type-rewrite-tx db table column change target))))
+
+(defn- alter-column-type-op [table relation-oid changes]
   (let [time-zone types/*time-zone*
         date-style types/*date-style*
         transaction-time datetime-in/*transaction-time*
@@ -13405,7 +13500,7 @@
                  types/*date-style* date-style
                  datetime-in/*transaction-time* transaction-time
                  params/*statement-time* statement-time]
-         (into [] (mapcat #(type-rewrite-tx db table relation-oid %)) changes)))]))
+         (into [] (mapcat #(alter-column-type-tx db table relation-oid %)) changes)))]))
 
 (defn- inherited-add-column-tx-data
   "Propagate newly added parent columns through the inheritance tree.
@@ -13812,7 +13907,7 @@
                           [(added-column-backfill-op ctx db table relation-oid schema-tx backfill-columns)])
             tx-data (into schema-tx
                           (concat backfill-tx lifecycle-data (default-tx true)
-                                  (when (seq type-ops) [(type-rewrite-op table relation-oid type-ops)])
+                                  (when (seq type-ops) [(alter-column-type-op table relation-oid type-ops)])
                                   (default-tx false)
                                   (nullability-tx :set-not-null)))
             tx-data (if (and relation-oid (seq tx-data))

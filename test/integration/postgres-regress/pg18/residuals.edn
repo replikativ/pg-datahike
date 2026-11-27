@@ -95,6 +95,9 @@
   {:id :alter-table-preserves-existing-default-values
    :file "fast_default" :lines [87 98] :state :covered :impact :wrong-result
    :detail "ADD COLUMN with a literal default fills existing rows. SET DEFAULT affects later writes, and short rows in a VALUES list remain separate rows."}
+  {:id :alter-varchar-widening-keeps-primary-key
+   :file "alter_table" :lines [1436 1439] :state :covered :impact :unsupported
+   :detail "The varchar widening updates the typmod on the existing attribute and catalog address. The strict test keeps the primary key created earlier in the transaction and verifies longer values and duplicate rejection."}
   {:id :expression-default-backfill
    :file "fast_default" :lines [67 67] :state :covered :impact :unsupported
    :detail "ADD COLUMN evaluates the typed volatile default per existing row. The gate includes the upstream random expression, transaction-stable timestamps, and UUID values that survive COMMIT."}
