@@ -62,6 +62,12 @@
   {:id :jsonpath-first-accessor-results
    :file "jsonb_jsonpath" :lines [1106 1108] :state :covered :impact :unsupported
    :detail "Accessor paths support lax and strict mode, including a late strict error after the first match. Filters, variables, subscripts and methods remain outside this slice."}
+  {:id :delete-exists-cross-join-derived-array
+   :file "subselect" :lines [451 458] :state :open :impact :unsupported
+   :detail "The DELETE uses a correlated EXISTS over a cross join and a derived relation with an ARRAY subquery. PostgreSQL deletes the matching road in a positive control; the adapter rejects the shape with 0A000."}
+  {:id :nested-exists-ancestor-correlations
+   :file "subselect" :lines [619 623] :state :covered :impact :unsupported
+   :detail "The middle EXISTS and innermost NOT EXISTS refer to different outer aliases. The gate checks the upstream empty result and a positive control with different exclusion keys."}
   {:id :materialized-view-with-no-data
    :file "matview" :lines [17 21] :state :covered :impact :wrong-result
    :detail "The catalog used to report relispopulated true for an unpopulated view. The gate checks the flag, the scan SQLSTATE and refresh."}

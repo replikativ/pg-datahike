@@ -65,6 +65,7 @@
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.input :as input]
             [datahike.pg.sql.ctx :as ctx]
+            [datahike.pg.sql.derived :as derived]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.plpgsql.parse :as pl-parse]
             [datahike.pg.plpgsql.exec :as pl-exec]
@@ -7134,6 +7135,10 @@
                       (into [1] (:lbounds first-array))))
       (pg-arr/array element-type values))))
 
+(defn- subquery-key-set [parse-fn inner schema db namespaces]
+  (into #{} (remove fns/sql-null?)
+        (strict-subquery-values parse-fn inner schema db nil namespaces)))
+
 (defn- uncorrelated-subquery-var!
   "Bind an uncorrelated subquery expression once per statement execution."
   [ctx inner evaluate-subquery]
@@ -10239,18 +10244,40 @@
                   :else nil)
           corr-refs (when inner
                       (correlated-subquery-refs inner (outer-alias-set ctx) (ctx-level ctx)))
-          _ (when (seq corr-refs)
-              (analyze-exists-subquery! ctx inner corr-refs))
-          _ (when (and (seq corr-refs) (nested-subquery-body? inner))
-              (throw (errors/pg-error
-                      :feature-not-supported
-                      {:message "correlated EXISTS containing nested subqueries is not implemented"})))]
-      (if-let [db (:db ctx)]
+          nested? (and (seq corr-refs) (nested-subquery-body? inner))
+          probes (when (and nested? (empty? params/*from-bindings*)
+                            (empty? params/*temp-table-map*))
+                   (let [aliases (or (seq (:relation-aliases (meta (:table-aliases ctx))))
+                                     (outer-alias-set ctx))
+                         probes (derived/sublink-key-probes
+                                 sub-select (set aliases) not-exists?
+                                 [(:schema ctx) (:db ctx) (set (keys ctx/*relation-namespaces*))])]
+                     (when (and (seq probes)
+                                (every? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8}
+                                                    (operand-type-oid ctx (:outer %))) probes))
+                       probes)))
+          _ (when (and (seq corr-refs) (not probes))
+              (analyze-exists-subquery! ctx inner corr-refs))]
+      (cond
+        nested?
+        (if probes
+          (mapv (fn [{:keys [keys-select outer negated?]}]
+                  (let [keys-var (uncorrelated-subquery-var! ctx keys-select subquery-key-set)
+                        outer-var (translate-expr ctx outer)
+                        found (ctx/materialize-arg! ctx (list 'contains? keys-var outer-var))]
+                    [(list '= found (not negated?))]))
+                probes)
+          (throw (errors/pg-error
+                  :feature-not-supported
+                  {:message "correlated EXISTS containing nested subqueries is not implemented"})))
+
+        (:db ctx)
         ;; Try correlated EXISTS first: translate inner query to Datalog patterns
         ;; and use not-join/or-join for correlation with the outer query.
         ;; Uncorrelated forms can fall back to standalone execution; a failed
         ;; correlated lowering is reported explicitly rather than misread.
-        (let [schema (:schema ctx)
+        (let [db (:db ctx)
+              schema (:schema ctx)
               outer-aliases (:table-aliases ctx)
               snapshot (ctx/snapshot ctx)]
           (try
@@ -10637,6 +10664,7 @@
                         :feature-not-supported
                         {:message "this correlated EXISTS shape is not implemented"}))
                 (throw _ex)))))
+        :else
         (throw (ex-info "EXISTS subquery requires database context"
                         {:error :internal-error
                          :detail "EXISTS subquery requires database context"
