@@ -1414,13 +1414,13 @@
         ;; Fall through to JSqlParser.
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
-          (let [partial-index (when (:index-declaration? cls-info)
-                                (index-predicate/split-predicate sql))
+          (let [index-declaration (when (:index-declaration? cls-info)
+                                    (index-predicate/split-declaration sql))
                 identity-options (cls/create-table-identity-options sql)
                 system-override (cls/insert-system-override sql)
                 target-rewrite (assignment-rewrite/normalize
                                 (preprocess-sql (or (:sql identity-options) system-override (:parser-sql explain)
-                                                    (:head partial-index) sql)))
+                                                    (:head index-declaration) sql)))
                 ^String parser-sql (:sql target-rewrite)
                 ;; Translation mutates some JSqlParser relation nodes while
                 ;; materialising derived schemas. Validate this rare invalid
@@ -2585,7 +2585,7 @@
                                :tail-parameters (mapv str (or (.getTailParameters ci) []))
                                :options (create-index-options ci)}
                         table-schema (assoc :table-schema table-schema)
-                        partial-index (merge (select-keys partial-index [:predicate :concurrently?]))))
+                        index-declaration (merge (select-keys index-declaration [:predicate :concurrently? :expression-keys]))))
 
           ;; ALTER TABLE — extract operations for ADD COLUMN support
                     (instance? Alter stmt)

@@ -1709,6 +1709,11 @@
          " EXECUTE FUNCTION " (:function t) "("
          (str/join ", " (map #(str "'" % "'") arguments)) ")")))
 
+(defn- index-key-definition [{:keys [name expression]}]
+  (if expression
+    (str "(" (:sql expression) ")")
+    (fns/quote-identifier name)))
+
 (defn- explicit-index-descriptors [db]
   (if-not db
     []
@@ -1735,13 +1740,14 @@
                            " USING " method " ("
                            (if legacy-incomplete?
                              "/* legacy key metadata unavailable; DROP and recreate */"
-                             (str/join ", " (map (comp fns/quote-identifier :name) keys))) ")"
+                             (str/join ", " (map index-key-definition keys))) ")"
                            (when predicate (str " WHERE " predicate)))]
          {:oid (long oid) :name name :table table :method method
           :relation-oid (long relation-oid) :keys keys
           :unique? (boolean unique?) :primary? primary?
           :constraint? (true? (:datahike.pg.index/constraint? index))
           :predicate predicate
+          :expressions (seq (keep (comp :sql :expression) keys))
           :ready? (not= :building status)
           :valid? (and (not legacy-incomplete?) (not= :building status))
           :indexdef indexdef}))
@@ -1831,6 +1837,36 @@
                      types/oid-bpchar types/oid-json types/oid-jsonb}
                    oid)) "x"
     :else "p"))
+
+(defn- expression-index-attributes [db]
+  (mapcat
+   (fn [{:keys [oid keys relation-oid expressions]}]
+     (when expressions
+       (second
+        (reduce
+         (fn [[used rows] [position {:keys [name attnum expression]}]]
+           (let [base (or name "expr")
+                 name (if (contains? used base)
+                        (first (remove used (map #(str base %) (iterate inc 1))))
+                        base)
+                 column (when-not expression (catalog-objects/column-by-attnum db relation-oid attnum))
+                 type-oid (or (:type-oid expression) (:datahike.pg.column/type-oid column))]
+             [(conj used name)
+              (conj rows {:pg_attribute/attname name
+                          :pg_attribute/atttypid (long type-oid)
+                          :pg_attribute/attnum (long (inc position))
+                          :pg_attribute/attrelid oid
+                          :pg_attribute/attnotnull false
+                          :pg_attribute/atthasdef false
+                          :pg_attribute/attidentity ""
+                          :pg_attribute/attgenerated ""
+                          :pg_attribute/attstorage (attribute-storage type-oid)
+                          :pg_attribute/attcompression ""
+                          :pg_attribute/atttypmod (long (or (:datahike.pg.column/typmod column) -1))
+                          :pg_attribute/attisdropped false
+                          (pgs/row-marker-attr "pg_attribute") true})]))
+         [#{} []] (map-indexed vector keys)))))
+   (explicit-index-descriptors db)))
 
 (defn- catalog-table-columns
   "Return `[table-name columns]` pairs with durable relation-local attnums.
@@ -2453,6 +2489,7 @@
                  :pg_attribute/attisdropped false
                  (pgs/row-marker-attr "pg_attribute") true})))
        (concat
+        (expression-index-attributes cte-db)
         (for [[tname columns] table-columns
               [idx col] (map-indexed vector columns)
               :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
@@ -3182,7 +3219,7 @@
              :pg_index/indexdef indexdef
              (pgs/row-marker-attr "pg_index") true})
           explicit
-          (for [{:keys [oid relation-oid keys primary? unique? valid? ready? indexdef predicate]}
+          (for [{:keys [oid relation-oid keys primary? unique? valid? ready? indexdef predicate expressions]}
                 (explicit-index-descriptors cte-db)]
             (cond-> {:pg_index/indrelid relation-oid
                      :pg_index/indexrelid oid
@@ -3198,7 +3235,8 @@
                      :pg_index/indnullsnotdistinct false
                      :pg_index/indexdef indexdef
                      (pgs/row-marker-attr "pg_index") true}
-              predicate (assoc :pg_index/indpred predicate)))]
+              predicate (assoc :pg_index/indpred predicate)
+              expressions (assoc :pg_index/indexprs (str/join ", " expressions))))]
       (vec (concat native explicit)))
 
     "pg_attrdef"

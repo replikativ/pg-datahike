@@ -4,6 +4,17 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Ordinary B-tree expression keys
+
+CREATE INDEX preserves parenthesized scalar expression keys on
+non-unique B-tree indexes, including partial indexes. Supported keys
+include null and boolean tests, comparisons, numeric addition,
+subtraction and multiplication, and text concatenation. Catalogs
+expose the expression, its result type, and its position in mixed
+keys. pg_dump preserves keys and predicates. Column renames and drops
+update their dependent declarations.
+Query execution uses Datahike's general access paths.
+
 ### Ordinary partial B-tree index declarations
 
 CREATE INDEX accepts predicates on ordinary non-unique B-tree column

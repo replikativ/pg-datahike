@@ -659,8 +659,8 @@
    :sql-sha256 "6092ba2cdd1ceb8c374d8b46241988ee6c15ada494d0865525b050283fae4d89",
    :expected-sha256 "3711a24a3107c4926678993716480eca91e3f202a643f58baa5969d0099aa7c1",
    :fixture-boundaries #{},
-   :status :out-of-scope,
-   :reason :physical-access-methods}
+   :status :campaign,
+   :wave 6}
   {:name "indirect_toast",
    :scheduled? true,
    :sql-sha256 "6a9555cb0e8474f0c26be9ce5c0e9d780e76c90a2113ecf81d1383cdf1b855e1",
@@ -1662,7 +1662,11 @@
    :status :backlog,
    :reason :json-and-xml}],
  :surface-decisions
- {"compression_pglz"
+ {"indexing"
+  {:scope :campaign,
+   :source-lines [211 211],
+   :basis "The partial expression declaration has client-visible metadata. The gate runs its source-linked DDL slice. Partition-index attachment and physical planner output remain unmeasured."},
+  "compression_pglz"
   {:scope :out-of-scope,
    :source-lines [5 63],
    :basis

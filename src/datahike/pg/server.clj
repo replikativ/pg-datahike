@@ -12565,8 +12565,9 @@
                      ;; transaction. An index upgrade at replay time cannot
                      ;; backfill earlier, uncommitted writes into AVET. The
                      ;; descriptor uses existing indexes or scans the rows.
-                     ;; A partial declaration does not build a filtered AVET index.
-                     (when (and (= "btree" method) (not constraint?) (not predicate))
+                     ;; Partial and expression declarations use catalog metadata.
+                     (when (and (= "btree" method) (not constraint?) (not predicate)
+                                (not-any? :expression key-columns))
                        (mapcat
                         (fn [{:keys [storage-ident]}]
                           (let [entry (get schema storage-ident)]
@@ -12584,13 +12585,14 @@
           db (or (:speculative-db @tx-state) (d/db conn))
           schema (dbi/-schema db)
           method (or (:method parsed) "btree")
-          _ (when (and (:predicate parsed)
+          declaration-only? (or (:predicate parsed) (seq (:expression-keys parsed)))
+          _ (when (and declaration-only?
                        (or (:unique? parsed) (not= "btree" method) (:concurrently? parsed)
                            (seq (:tail-parameters parsed))
                            (some (comp seq :params) (:column-specs parsed))))
               (throw (errors/pg-error
                       :feature-not-supported
-                      {:message "partial indexes support ordinary B-tree column keys"})))
+                      {:message "partial and expression indexes support ordinary non-unique B-tree declarations"})))
           _ (when (:unique? parsed)
               (when-not (= "btree" method)
                 (throw (errors/pg-error
@@ -12639,19 +12641,23 @@
                    (assoc :table (:datahike.pg.object/storage-name table-object)))
           key-columns
           (mapv
-           (fn [column]
-             (let [registered (catalog-objects/column-by-name
-                               db relation-oid column)
-                   attr (:datahike.pg.column/storage-ident registered)]
-               (when-not (and registered (get schema attr))
-                 (throw (errors/pg-error :undefined-column
-                                         {:column column :table (:table parsed)})))
-               {:name column
-                :attnum (or (:datahike.pg.column/attnum registered)
-                            (pgs/column-attnum schema (:table parsed) column
-                                               (pgs/schema-hints db)))
-                :storage-ident attr}))
-           (:columns parsed))
+           (fn [position column]
+             (let [expression (some->> (get (:expression-keys parsed) position)
+                                       (index-predicate/bind-key db relation-oid))
+                   column (or (:column expression) column)]
+               (if (:sql expression)
+                 {:attnum 0 :expression expression}
+                 (let [registered (catalog-objects/column-by-name db relation-oid column)
+                       attr (:datahike.pg.column/storage-ident registered)]
+                   (when-not (and registered (get schema attr))
+                     (throw (errors/pg-error :undefined-column
+                                             {:column column :table (:table parsed)})))
+                   {:name column
+                    :attnum (or (:datahike.pg.column/attnum registered)
+                                (pgs/column-attnum schema (:table parsed) column
+                                                   (pgs/schema-hints db)))
+                    :storage-ident attr}))))
+           (range) (:columns parsed))
           column (first (:columns parsed))
           attr (:storage-ident (first key-columns))
           attr-schema (get schema attr)
@@ -12662,8 +12668,11 @@
           parsed (assoc parsed :index-ident ident)
           catalog-tx tx-data]
       (cond
-        (:predicate parsed)
-        (record-compatibility-index! conn tx-state parsed catalog-tx)
+        declaration-only?
+        (record-compatibility-index!
+         conn tx-state parsed catalog-tx
+         (when (and (not (:predicate parsed)) (not-any? :expression key-columns))
+           {:allow-index-backfill? true}))
 
         (not= 1 (count key-columns))
         (if (contains? #{"hnsw" "ivfflat" "gin" "gist"} method)
@@ -12898,15 +12907,18 @@
                              (catch Exception _ []))
                       index (d/entity db entity)
                       predicate (some-> (:datahike.pg.index/predicate index) edn/read-string)
-                      predicate-dependent? (contains? (:columns predicate)
-                                                      (:datahike.pg.column/attnum column))]
-                  (when (or predicate-dependent?
+                      attnum (:datahike.pg.column/attnum column)
+                      predicate-dependent? (contains? (:columns predicate) attnum)
+                      expression-dependent? (some #(contains? (get-in % [:expression :columns]) attnum)
+                                                  keys)]
+                  (when (or predicate-dependent? expression-dependent?
                             (some #(or (= (:datahike.pg.column/name column) (:name %))
                                        (= (:datahike.pg.column/storage-ident column)
                                           (:storage-ident %)))
                                   keys))
                     {:entity entity :name index-name :keys keys
                      :predicate predicate :predicate-dependent? predicate-dependent?
+                     :expression-dependent? expression-dependent?
                      :method (:datahike.pg.index/method index)
                      :unique? (:datahike.pg.index/unique? index)
                      :constraint? (:datahike.pg.index/constraint? index)
@@ -12949,7 +12961,7 @@
                       constraint?
                       [[:db.fn/call drop-constraint-index-tx table oid name
                         (into #{} (map :name) keys)]]
-                      predicate
+                      (or predicate (some :expression keys))
                       [[:db.fn/call catalog-objects/drop-object-tx catalog-objects/pg-class-oid oid]]
                       :else (catalog-objects/drop-object-tx db catalog-objects/pg-class-oid oid))))
                 index-dependents)
@@ -12995,9 +13007,13 @@
               new-name new-ident)
              (mapcat (fn [{:keys [entity keys predicate predicate-dependent?]}]
                        (cond-> [[:db/add entity :datahike.pg.index/keys
-                                 (pr-str (mapv #(if (= old-name (:name %))
-                                                  (assoc % :name new-name)
-                                                  %)
+                                 (pr-str (mapv (fn [key]
+                                                 (cond
+                                                   (= old-name (:name key)) (assoc key :name new-name)
+                                                   (contains? (get-in key [:expression :columns])
+                                                              (:datahike.pg.column/attnum column))
+                                                   (update key :expression index-predicate/rename-column old-name new-name)
+                                                   :else key))
                                                keys))]]
                          predicate-dependent?
                          (conj [:db/add entity :datahike.pg.index/predicate
@@ -13281,8 +13297,8 @@
               (not= :db.cardinality/one (:db/cardinality attr-schema))
               (= :db.type/ref (:db/valueType attr-schema))
               (identity-storage-column? db table attr)
-              (some (fn [{:keys [method unique? materialized? predicate-dependent?]}]
-                      (or unique? materialized? predicate-dependent? (not (contains? #{"btree" "hash"} method))))
+              (some (fn [{:keys [method unique? materialized? predicate-dependent? expression-dependent?]}]
+                      (or unique? materialized? predicate-dependent? expression-dependent? (not (contains? #{"btree" "hash"} method))))
                     indexes)
               (some (fn [entry] (some #{attr} (:db/tupleAttrs (val entry)))) schema)
               (some (fn [entry] (:generated-expr entry)) (:columns metadata))

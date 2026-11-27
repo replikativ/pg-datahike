@@ -222,7 +222,11 @@
       {:id :reject-unknown-partition-strategy
        :source-lines [161 163]
        :gate "test/datahike/test/pg_check_constraint_test.clj"
-       :test-var "postgres-create-table-rejects-invalid-options"}]}
+       :test-var "postgres-create-table-rejects-invalid-options"}
+      {:id :expression-index-column-addresses
+       :source-lines [742 748]
+       :gate "test/datahike/test/pg_catalog_test.clj"
+       :test-var "postgres-expression-indexes-retain-column-addresses-after-drop"}]}
     {:name "constraints", :boundaries #{:constraints :defaults :ddl}, :mode :unmeasured
      :strict-slices
      [{:id :unparenthesized-arithmetic-default
@@ -403,6 +407,14 @@
        :source-lines [1440 1441]
        :gate "test/datahike/test/pg_catalog_test.clj"
        :test-var "postgres-partial-indexes-preserve-distinct-equality-predicates"}]}
+    {:name "indexing",
+     :boundaries #{:catalogs :ddl :expression-indexes :partitioning},
+     :mode :unmeasured
+     :strict-slices
+     [{:id :partial-arithmetic-expression-index
+       :source-lines [211 211]
+       :gate "test/datahike/test/pg_catalog_test.clj"
+       :test-var "postgres-partial-expression-index-has-typed-arithmetic-key"}]}
     {:name "matview", :boundaries #{:catalogs :ddl :materialized-views}, :mode :discovery
      :accepted-differences #{:explain-plan-text}
      :strict-slices
