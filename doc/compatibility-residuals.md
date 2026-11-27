@@ -87,13 +87,27 @@ NULL (SQLSTATE 0A000). Its TestORM cases were not reached. The prior
 11-case report is historical. The manual harness now provisions that
 database.
 
-The SET NULL follow-on passed that initialization and reached Odoo's base
-module model setup. The next observed blocker is
-`information_schema.constraint_column_usage` in `ir_logging.init`
-(SQLSTATE 42P01). The focused PostgreSQL fixture covers self-references,
-child rows preserved with null links, rollback, and a NOT NULL failure.
-The DELETE guard can return 40001 if a concurrent write changes the
-database while the referential action is being prepared.
+The SET NULL follow-on passed database initialization. The next boot
+failure was the `information_schema.constraint_column_usage` lookup in
+`ir_logging.init` (SQLSTATE 42P01). The added view reports the referenced
+table and columns of a foreign key, with the constraint's own schema.
+Its key names follow the existing `pg_constraint` metadata, which still
+synthesizes the names of some explicit PRIMARY KEY and UNIQUE constraints.
+
+With both changes, the live boot advanced to converting
+`res_users.login` from `varchar(64)` to unconstrained `varchar`. The ALTER
+failed on the column's dependencies (SQLSTATE 0A000), before TestORM.
+The next check is whether widening a typmod can use the existing storage
+and retain the unique constraint and its index.
+
+The PostgreSQL fixture verifies SET NULL on self-references and
+cross-table references, child-row preservation, rollback and a NOT NULL
+failure. The DELETE guard can return 40001 if a concurrent write
+changes the database while the referential action is being prepared.
+The targeted `foreign_key.sql` discovery run went from 857 adapter
+diagnostics on 0.1.431 to 832, with 198 expected from stock and zero
+internal failures. Partitioning, deferred constraints and several
+referential action variants still affect the full file.
 
 ### asyncpg expected failures by owning ID
 
@@ -115,9 +129,9 @@ need separately provisioned evidence.
 
 ## Next verification work
 
-1. Add `information_schema.constraint_column_usage` and rerun Odoo
-   base and accounting boot. Check invoice numbering separately with
-   its partial uniqueness and concurrency workload.
+1. Preserve dependencies when widening the typmod of a column such as
+   `res_users.login`. Repeat Odoo base and accounting boot. Check invoice
+   numbering separately with its partial uniqueness and concurrency workload.
 2. Assert admitted constraints, view results and trigger effects alongside
    Pagila COPY counts. Repeat Metabase initial sync on a named release and
    validate JDBC metadata and representative MBQL values.

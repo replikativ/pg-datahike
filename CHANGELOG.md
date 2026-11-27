@@ -9,8 +9,9 @@ All notable changes to pg-datahike.
 ON DELETE SET NULL clears child keys in the same transaction as the
 parent DELETE, including composite keys and actions reached through
 CASCADE. Child UPDATE triggers, generated columns, and constraints apply.
-PostgreSQL catalogs expose foreign-key action codes, and cached-plan
-invalidation errors include the routine field used by asyncpg.
+PostgreSQL catalogs expose foreign-key action codes and
+information_schema.constraint_column_usage. Cached-plan invalidation
+errors include the routine field used by asyncpg.
 
 ### Migration SQL and JDBC metadata
 
