@@ -7,6 +7,7 @@
             [datahike.versioning :as versioning]
             [datahike.pg.catalog.objects :as objects]
             [datahike.pg.constraints.unique :as unique]
+            [datahike.pg.dump :as dump]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
@@ -49,6 +50,88 @@
   (is (nil? (state "DROP INDEX uniq_pair_ab")))
   (is (nil? (state "INSERT INTO uniq_pair VALUES(1,2)")))
   (is (= [] (rows "SELECT indexname FROM pg_indexes WHERE tablename='uniq_pair'"))))
+
+(deftest postgres-alter-table-adds-a-composite-unique-constraint
+  (doseq [sql ["CREATE TABLE atacc1 (test int, test2 int)"
+               "ALTER TABLE atacc1 ADD CONSTRAINT atacc_test1 UNIQUE (test, test2)"
+               "INSERT INTO atacc1 (test,test2) VALUES (4,4)"]]
+    (is (nil? (state sql)) sql))
+  (is (= "23505" (state "INSERT INTO atacc1 (test,test2) VALUES (4,4)")))
+  (doseq [sql ["INSERT INTO atacc1 (test,test2) VALUES (4,5)"
+               "INSERT INTO atacc1 (test,test2) VALUES (5,4)"
+               "INSERT INTO atacc1 (test,test2) VALUES (5,5)"]]
+    (is (nil? (state sql)) sql))
+  (is (= [["4" "4"] ["4" "5"] ["5" "4"] ["5" "5"]]
+         (rows "SELECT test,test2 FROM atacc1 ORDER BY test,test2")))
+  (is (nil? (state "DROP TABLE atacc1")))
+  (is (= [] (rows "SELECT indexname FROM pg_indexes WHERE indexname='atacc_test1'"))))
+
+(deftest odoo-alter-added-key-arbitrates-field-upserts
+  (doseq [sql ["CREATE TABLE ir_model_fields (id int PRIMARY KEY, model varchar NOT NULL, name varchar NOT NULL, changed int)"
+               "BEGIN"
+               "INSERT INTO ir_model_fields VALUES (1, 'res.users', 'login', 0), (2, 'res.users', 'active', 0)"
+               "ALTER TABLE ir_model_fields ADD CONSTRAINT ir_model_fields_name_unique UNIQUE (model,name)"
+               "COMMENT ON CONSTRAINT ir_model_fields_name_unique ON ir_model_fields IS 'UNIQUE(model, name)'"
+               "COMMIT"]]
+    (let [result (execute sql)]
+      (is (nil? (:state result)) (str sql " " (:error result)))))
+  (is (= [["1" "1"]]
+         (rows "INSERT INTO ir_model_fields VALUES (3, 'res.users', 'login', 1)
+                ON CONFLICT (model, name) DO UPDATE SET changed=EXCLUDED.changed RETURNING id, changed")))
+  (is (= [["1" "2"]]
+         (rows "INSERT INTO ir_model_fields VALUES (4, 'res.users', 'login', 2)
+                ON CONFLICT ON CONSTRAINT ir_model_fields_name_unique
+                DO UPDATE SET changed=EXCLUDED.changed RETURNING id, changed")))
+  (is (= "23505" (state "INSERT INTO ir_model_fields VALUES (4, 'res.users', 'login', 3)")))
+  (is (= "23505" (state "UPDATE ir_model_fields SET name='login' WHERE id=2")))
+  (is (= [["1" "login" "2"] ["2" "active" "0"]]
+         (rows "SELECT id,name,changed FROM ir_model_fields ORDER BY id")))
+  (is (= [["u" "UNIQUE (model, name)" "t"]]
+         (rows "SELECT c.contype, pg_get_constraintdef(c.oid), i.indisunique
+                FROM pg_constraint c JOIN pg_index i ON i.indexrelid=c.conindid
+                WHERE c.conname='ir_model_fields_name_unique'")))
+  (is (= [["model" "1" nil] ["name" "2" nil]]
+         (rows "SELECT column_name, ordinal_position, position_in_unique_constraint
+                FROM information_schema.key_column_usage
+                WHERE constraint_name='ir_model_fields_name_unique' ORDER BY ordinal_position")))
+  (is (= [["UNIQUE"]]
+         (rows "SELECT constraint_type FROM information_schema.table_constraints
+                WHERE constraint_name='ir_model_fields_name_unique'")))
+  (is (re-find #"ADD CONSTRAINT \"ir_model_fields_name_unique\" UNIQUE"
+               (dump/dump-to-string *conn* {:sections #{:schema}})))
+  (is (= "2BP01" (state "DROP INDEX ir_model_fields_name_unique")))
+  (is (nil? (state "CREATE TABLE field_reference (model varchar,name varchar, FOREIGN KEY (model,name) REFERENCES ir_model_fields(model,name))")))
+  (is (= "2BP01" (state "ALTER TABLE ir_model_fields DROP CONSTRAINT ir_model_fields_name_unique")))
+  (is (nil? (state "DROP TABLE field_reference")))
+  (is (nil? (state "ALTER TABLE ir_model_fields DROP CONSTRAINT ir_model_fields_name_unique")))
+  (is (= [] (rows "SELECT indexname FROM pg_indexes WHERE indexname='ir_model_fields_name_unique'")))
+  (is (nil? (state "INSERT INTO ir_model_fields VALUES (4, 'res.users', 'login', 3)"))))
+
+(deftest composite-unique-add-validates-old-rows-and-rolls-back
+  (doseq [sql ["CREATE TABLE populated (a int,b int)"
+               "INSERT INTO populated VALUES (1,2),(1,2),(1,NULL),(1,NULL)"]]
+    (is (nil? (state sql)) sql))
+  (let [oid-before (:datahike.pg.catalog/next-oid (objects/catalog-entity (d/db *conn*)))]
+    (is (= "23505" (state "ALTER TABLE populated ADD UNIQUE (a,b)")))
+    (is (= oid-before (:datahike.pg.catalog/next-oid (objects/catalog-entity (d/db *conn*)))))
+    (is (= [] (rows "SELECT indexname FROM pg_indexes WHERE tablename='populated'"))))
+  (is (= "42703" (state "ALTER TABLE populated ADD UNIQUE (a,missing)")))
+  (is (= "42701" (state "ALTER TABLE populated ADD UNIQUE (a,a)")))
+  (is (= "0A000" (state "ALTER TABLE populated ADD CONSTRAINT deferred_key UNIQUE (a,b) DEFERRABLE")))
+  (doseq [sql ["DELETE FROM populated WHERE b=2"
+               "INSERT INTO populated VALUES (1,2)"
+               "BEGIN"
+               "ALTER TABLE populated ADD UNIQUE (a,b), ADD COLUMN c int, ADD UNIQUE (b,c)"]]
+    (let [result (execute sql)]
+      (is (nil? (:state result)) (str sql " " (:error result)))))
+  (is (= [["populated_a_b_key"] ["populated_b_c_key"]]
+         (rows "SELECT indexname FROM pg_indexes WHERE tablename='populated' ORDER BY indexname")))
+  (is (= "23505" (state "INSERT INTO populated (a,b) VALUES (1,2)")))
+  (is (nil? (state "ROLLBACK")))
+  (is (= [] (rows "SELECT indexname FROM pg_indexes WHERE tablename='populated'")))
+  (is (nil? (state "ALTER TABLE populated ADD UNIQUE (a,b)")))
+  (is (nil? (state "INSERT INTO populated VALUES (1,NULL),(1,NULL)")))
+  (is (= "23505" (state "INSERT INTO populated VALUES (1,2)"))))
 
 (deftest failed-create-is-atomic
   (is (nil? (state "CREATE TABLE uniq_existing(a int)")))
@@ -154,6 +237,20 @@
   (is (nil? (state (str "INSERT INTO uniq_upsert VALUES(1,2,'ignored') "
                         "ON CONFLICT DO NOTHING"))))
   (is (= [["new"]] (rows "SELECT v FROM uniq_upsert"))))
+
+(deftest postgres-composite-index-inference-accepts-both-column-orders
+  (doseq [sql ["CREATE TABLE insertconflicttest (key int, fruit text)"
+               "CREATE UNIQUE INDEX comp_key_index ON insertconflicttest (key,fruit)"
+               "INSERT INTO insertconflicttest VALUES (7, 'Raspberry')
+                ON CONFLICT (key,fruit) DO UPDATE SET fruit=EXCLUDED.fruit"
+               "INSERT INTO insertconflicttest VALUES (8, 'Lime')
+                ON CONFLICT (fruit,key) DO UPDATE SET fruit=EXCLUDED.fruit"]]
+    (is (nil? (state sql)) sql))
+  (is (= "42P10"
+         (state "INSERT INTO insertconflicttest VALUES (9, 'Banana')
+                 ON CONFLICT (key) DO UPDATE SET fruit=EXCLUDED.fruit")))
+  (is (= [["7" "Raspberry"] ["8" "Lime"]]
+         (rows "SELECT key,fruit FROM insertconflicttest ORDER BY key"))))
 
 (deftest violations-fail-at-the-statement-inside-a-transaction
   (doseq [sql ["CREATE TABLE uniq_tx(a int)"

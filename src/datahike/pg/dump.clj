@@ -69,6 +69,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
+            [datahike.pg.constraints.unique :as unique]
             [datahike.pg.schema :as pgs]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.sql.params :as params]
@@ -637,10 +638,15 @@
          tables))
 
       ;; Constraints (post-data so cyclic FKs are fine)
-      (when (and schema? (seq fks))
-        (concat
-         ["" "-- Constraints"]
-         (map emit-fk-constraint fks)))
+      (when schema?
+        (let [included (into #{} (map :table) tables)
+              unique-keys (for [{:keys [table name keys constraint?]} (unique/index-descriptors db)
+                                :when (and constraint? (contains? included table))]
+                            (str "ALTER TABLE " (quote-ident table)
+                                 " ADD CONSTRAINT " (quote-ident name)
+                                 " UNIQUE (" (str/join ", " (map (comp quote-ident :name) keys)) ");"))]
+          (when (or (seq unique-keys) (seq fks))
+            (concat ["" "-- Constraints"] unique-keys (map emit-fk-constraint fks)))))
 
       ;; Sequence values (post-data so setval reflects what we just
       ;; loaded — matches pg_dump's behaviour)

@@ -2033,16 +2033,23 @@
                                     ") is not present in table \""
                                     parent-table "\".")})))))
 
+(defn- drop-constraint-index-tx [db table index-oid name columns]
+  (when (some #(= (set (:parent-cols %)) columns)
+              (read-fks-referring-to db table))
+    (throw (ex-info (str "cannot drop constraint " name " because a foreign key requires it")
+                    {:error :dependent-objects-still-exist :sqlstate "2BP01"})))
+  (catalog-objects/drop-object-tx db catalog-objects/pg-class-oid index-oid))
+
 (defn- dropped-constraint-tx
   "`ALTER TABLE t DROP CONSTRAINT c` -- retract the CHECK or FOREIGN KEY
-   entity named `c` on `t`, or raise 42704 when there is none.
+   entity or a constraint-owned index named `c` on `t`, or raise 42704.
 
    This was a compatibility no-op, which was harmless while ALTER could
    not ADD a constraint either. Once it could, a constraint could be
    added and never removed: rows PostgreSQL accepts stayed refused, and
    an unknown name answered ALTER TABLE instead of
    `constraint \"x\" of relation \"t\" does not exist`."
-  [db table {:keys [name if-exists?]}]
+  [db table {:keys [name if-exists? validate-only?]}]
   (let [eids (into (d/q '{:find [[?e ...]]
                           :in [$ ?tbl ?n]
                           :where [[?e :pg/check-table ?tbl]
@@ -2056,8 +2063,14 @@
                                   (or-join [?e ?n]
                                            [?e :pg/fk-conname ?n]
                                            [?e :pg/fk-name ?n])]}
-                        db table name))]
+                        db table name))
+        index (some #(when (and (:constraint? %) (= table (:table %)) (= name (:name %))) %)
+                    (unique-constraints/index-descriptors db))]
     (cond
+      (and validate-only? (or index (seq eids))) []
+      index
+      [[:db.fn/call drop-constraint-index-tx table (:oid index) name
+        (into #{} (map :name) (:keys index))]]
       (seq eids) (mapv (fn [e] [:db/retractEntity e]) eids)
       if-exists? []
       :else (throw (ex-info (str "constraint \"" name "\" of relation \""
@@ -4651,6 +4664,7 @@
               [:datahike.pg.index/keys str1]
               [:datahike.pg.index/unique? bool1]
               [:datahike.pg.index/primary? bool1]
+              [:datahike.pg.index/constraint? bool1]
               [:datahike.pg.index/legacy-incomplete? bool1]]
         missing (into []
                       (keep (fn [[ident tmpl]]
@@ -12516,6 +12530,48 @@
                             (some-> secondary-index-build-timeout-ms long))
     (empty-result "CREATE INDEX")))
 
+(defn- index-declaration
+  [db relation-oid namespace-oid {:keys [table name method unique? constraint?]} key-columns]
+  (let [{:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
+        legacy-ident (secondary-index-ident name)
+        ident (if (and (= namespace-oid catalog-objects/public-namespace-oid)
+                       (nil? (d/entity db legacy-ident)))
+                legacy-ident
+                (catalog-objects/scoped-index-ident oid))
+        schema (dbi/-schema db)
+        declaration (cond-> {:db/id [:datahike.pg.object/address-key
+                                     (catalog-objects/address-key catalog-objects/pg-class-oid oid)]
+                             :db/ident ident
+                             :datahike.pg.index/table table
+                             :datahike.pg.index/relation
+                             [:datahike.pg.object/address-key
+                              (catalog-objects/address-key catalog-objects/pg-class-oid relation-oid)]
+                             :datahike.pg.index/method method
+                             :datahike.pg.index/keys (pr-str key-columns)
+                             :datahike.pg.index/unique? (boolean unique?)}
+                      constraint? (assoc :datahike.pg.index/constraint? true))]
+    {:oid oid
+     :ident ident
+     :tx-data (into tx-data
+                    (concat
+                     (catalog-objects/create-object-tx
+                      db {:class-oid catalog-objects/pg-class-oid
+                          :oid oid :kind :index :name name :namespace-oid namespace-oid})
+                     [declaration]
+                     ;; A constraint may follow INSERT/COPY in the same SQL
+                     ;; transaction. An index upgrade at replay time cannot
+                     ;; backfill earlier, uncommitted writes into AVET. The
+                     ;; descriptor uses existing indexes or scans the rows.
+                     (when (and (= "btree" method) (not constraint?))
+                       (mapcat
+                        (fn [{:keys [storage-ident]}]
+                          (let [entry (get schema storage-ident)]
+                            (cond-> [{:db/ident storage-ident :db/index true}]
+                              (not (or (:db/index entry) (:db/unique entry)))
+                              (conj {:datahike.pg/for-ident storage-ident
+                                     :datahike.pg/internal-index true}))))
+                        key-columns))))}))
+
 (defn- exec-ddl-create-index
   [ctx parsed]
   (try
@@ -12588,43 +12644,10 @@
           attr-schema (get schema attr)
           pg-hints (pgs/schema-hints db)
           pg-type (get-in pg-hints [attr :pg-type])
-          {:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
-          legacy-ident (secondary-index-ident (:name parsed))
-          index-ident (if (and (= namespace-oid catalog-objects/public-namespace-oid)
-                               (nil? (d/entity db legacy-ident)))
-                        legacy-ident
-                        (catalog-objects/scoped-index-ident oid))
-          parsed (assoc parsed :index-ident index-ident)
-          catalog-tx
-          (into (vec tx-data)
-                (concat
-                 (catalog-objects/create-object-tx
-                  db {:class-oid catalog-objects/pg-class-oid
-                      :oid oid :kind :index :name (:name parsed)
-                      :namespace-oid namespace-oid})
-                 [{:db/id [:datahike.pg.object/address-key
-                           (catalog-objects/address-key
-                            catalog-objects/pg-class-oid oid)]
-                   :db/ident index-ident
-                   :datahike.pg.index/table (:table parsed)
-                   :datahike.pg.index/relation
-                   [:datahike.pg.object/address-key
-                    (catalog-objects/address-key
-                     catalog-objects/pg-class-oid relation-oid)]
-                   :datahike.pg.index/method method
-                   :datahike.pg.index/keys (pr-str key-columns)
-                   :datahike.pg.index/unique? (boolean (:unique? parsed))}]
-                 (when (= "btree" method)
-                   (mapcat
-                    (fn [{:keys [storage-ident]}]
-                      (let [entry (get schema storage-ident)
-                            already-indexed?
-                            (or (:db/index entry) (:db/unique entry))]
-                        (cond-> [{:db/ident storage-ident :db/index true}]
-                          (not already-indexed?)
-                          (conj {:datahike.pg/for-ident storage-ident
-                                 :datahike.pg/internal-index true}))))
-                    key-columns))))]
+          {:keys [oid ident tx-data]}
+          (index-declaration db relation-oid namespace-oid (assoc parsed :method method) key-columns)
+          parsed (assoc parsed :index-ident ident)
+          catalog-tx tx-data]
       (cond
         (not= 1 (count key-columns))
         (if (contains? #{"hnsw" "ivfflat" "gin" "gist"} method)
@@ -12790,7 +12813,11 @@
                           {:error :wrong-object-type :sqlstate "42809"})))
         (cond
           entity-id
-          (let [materialized? (some? (:db.secondary/type (get schema index-ident)))
+          (let [_ (when (:datahike.pg.index/constraint? (d/entity db entity-id))
+                    (throw (ex-info (str "cannot drop index " index-name
+                                         " because a constraint requires it")
+                                    {:error :dependent-objects-still-exist :sqlstate "2BP01"})))
+                materialized? (some? (:db.secondary/type (get schema index-ident)))
                 _ (when (and materialized?
                              (:in-tx? @tx-state)
                              (not (:implicit? @tx-state)))
@@ -12861,6 +12888,7 @@
                       {:entity entity :name index-name :keys keys
                        :method (:datahike.pg.index/method index)
                        :unique? (:datahike.pg.index/unique? index)
+                       :constraint? (:datahike.pg.index/constraint? index)
                        :materialized? (some? (:db.secondary/type index))})))))
         (d/q '{:find [?index ?name ?keys]
                :in [$ ?table]
@@ -12894,14 +12922,12 @@
               (concat
                [(deferred-drop-op drop-column-owned-sequences-tx table column dropping-attributes cascade?)]
                (mapcat
-                (fn [{:keys [name]}]
-                  (when-let [index-object
-                             (catalog-objects/object-by-identity
-                              db catalog-objects/pg-class-oid
-                              catalog-objects/public-namespace-oid name)]
-                    (catalog-objects/drop-object-tx
-                     db catalog-objects/pg-class-oid
-                     (:datahike.pg.object/oid index-object))))
+                (fn [{:keys [entity name keys constraint?]}]
+                  (let [oid (:datahike.pg.object/oid (d/entity db entity))]
+                    (if constraint?
+                      [[:db.fn/call drop-constraint-index-tx table oid name
+                        (into #{} (map :name) keys)]]
+                      (catalog-objects/drop-object-tx db catalog-objects/pg-class-oid oid))))
                 index-dependents)
                [(if hint-eid
                   [:db/add hint-eid :datahike.pg/hidden true]
@@ -13613,11 +13639,55 @@
                       db catalog-objects/pg-class-oid %)
                     @touched-relations)))))
 
+(defn- composite-unique-operation? [{:keys [op columns]}]
+  (and (= op :add-unique) (< 1 (count columns))))
+
+(defn- add-composite-unique-tx [db table relation-oid {:keys [name options columns]}]
+  (when (some #(not= "NOT DEFERRABLE" (str/upper-case (str %))) options)
+    (throw (errors/pg-error :feature-not-supported
+                            {:message "ALTER TABLE ADD UNIQUE with constraint options is not supported"})))
+  (when-not (= (count columns) (count (distinct columns)))
+    (throw (ex-info "column appears twice in unique constraint" {:sqlstate "42701"})))
+  (let [relation (catalog-objects/object-by-address db catalog-objects/pg-class-oid relation-oid)
+        logical-name (:datahike.pg.object/name relation)
+        namespace-oid (catalog-objects/object-namespace-oid db relation)
+        schema (dbi/-schema db)
+        key-columns
+        (mapv (fn [column]
+                (let [registered (catalog-objects/column-by-name db relation-oid column)
+                      attr (:datahike.pg.column/storage-ident registered)]
+                  (when-not (get schema attr)
+                    (throw (errors/pg-error :undefined-column {:table logical-name :column column})))
+                  (when (= :db.type/float-array (get-in schema [attr :db/valueType]))
+                    (throw (errors/pg-error :feature-not-supported
+                                            {:message "UNIQUE constraints on vector columns are not supported"})))
+                  {:name column :attnum (:datahike.pg.column/attnum registered) :storage-ident attr}))
+              columns)
+        occupied-relations (into #{} (comp (filter #(= namespace-oid (:pg_class/relnamespace %)))
+                                           (map :pg_class/relname))
+                                 (catalog/catalog-data-for "pg_class" schema db))
+        constraints (row-constraints/constraint-metadata db table)
+        occupied-constraints (into #{} (map :constraint) (concat (:checks constraints) (:fks constraints)))
+        name (or name (ddl/generated-constraint-name
+                       (into occupied-relations occupied-constraints)
+                       logical-name (str/join "_" columns) "key"))]
+    (when (contains? occupied-relations name)
+      (throw (ex-info (str "relation \"" name "\" already exists") {:sqlstate "42P07"})))
+    (when (contains? occupied-constraints name)
+      (throw (ex-info (str "constraint \"" name "\" already exists") {:sqlstate "42710"})))
+    (:tx-data (index-declaration db relation-oid namespace-oid
+                                 {:table table :name name :method "btree" :unique? true
+                                  :constraint? true}
+                                 key-columns))))
+
 (defn- exec-ddl-alter
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx]
     (try
       (let [{logical-name :table :keys [operations table-schema]} parsed
+            composite-uniques (filterv composite-unique-operation? operations)
+            _ (when (seq composite-uniques)
+                (acquire-catalog-allocation-lock! conn tx-state (:session-id ctx)))
             db (or (:speculative-db @tx-state) (d/db conn))
             schema (dbi/-schema db)
             object (ddl-table-object db logical-name table-schema)
@@ -13733,7 +13803,7 @@
                                            "vector columns are not supported")})))
                   nil))
             schema-and-constraint-data (vec (mapcat
-                                             (fn [{:keys [op columns]}]
+                                             (fn [{:keys [op columns] :as operation}]
                                                (case op
                                                  :add-column
                                                  (for [{:keys [name]} columns
@@ -13799,7 +13869,8 @@
                                                                          (catalog-objects/column-by-name
                                                                           db relation-oid col))
                                                                         (keyword table col))]
-                                                         :when (contains? schema attr)]
+                                                         :when (and (not (composite-unique-operation? operation))
+                                                                    (contains? schema attr))]
                                                      (if single?
                                                        {:db/ident attr :db/unique unique-kw}
                                                        {:db/ident attr :db/index true})))
@@ -13838,7 +13909,7 @@
                                ;; for a constraint that does not exist.
                                (= :validate-constraint op)
                                (do (dropped-constraint-tx
-                                    db table (assoc operation :if-exists? false))
+                                    db table (assoc operation :validate-only? true))
                                    nil)))
                            operations)))
             attnum-data
@@ -13905,11 +13976,15 @@
                                     attnum-data inherited-column-data hint-data))
             backfill-tx (when (seq backfill-columns)
                           [(added-column-backfill-op ctx db table relation-oid schema-tx backfill-columns)])
+            unique-tx (mapv (fn [operation]
+                              [:db.fn/call add-composite-unique-tx table relation-oid operation])
+                            composite-uniques)
             tx-data (into schema-tx
                           (concat backfill-tx lifecycle-data (default-tx true)
                                   (when (seq type-ops) [(alter-column-type-op table relation-oid type-ops)])
                                   (default-tx false)
-                                  (nullability-tx :set-not-null)))
+                                  (nullability-tx :set-not-null)
+                                  unique-tx))
             tx-data (if (and relation-oid (seq tx-data))
                       (into tx-data
                             (catalog-objects/bump-revision-tx

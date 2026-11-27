@@ -10,8 +10,8 @@ runs.
 
 The pinned source is REL_18_6. The inventory classifies 231 scheduled
 files. The campaign has 90 files, including 12 whole-file strict gates
-and 58 strict slices after the varchar widening batch. The frozen
-164-file discovery result uses an older adapter build and launcher.
+and 60 strict slices after the composite unique constraint batch. The
+frozen 164-file discovery result uses an older adapter build and launcher.
 Fresh raw results need the tested revision, fixture receipt, and timeout
 profile for each file.
 
@@ -129,6 +129,22 @@ and reached model-field reflection before TestORM. Odoo declares
 42P10. Odoo also caught two nonfatal errors creating device-log partial
 indexes with `WHERE revoked IS NOT TRUE`.
 
+### Composite unique constraints and conflict inference
+
+The strict campaign includes the composite `ADD UNIQUE` sequence from
+`alter_table.sql` (706–718) and the key inference sequence from
+`insert_conflict.sql` (133–141). The Odoo field reflection fixture uses
+a named constraint, adds it after writes in the same transaction, then
+verifies that its upsert updates the original row. The backing index
+also rejects duplicate writes and the ALTER validates existing rows.
+Catalog and dump probes cover the constraint name, column order,
+index ownership, and rollback. A PostgreSQL 18.6 restore of the adapter's
+`pg_dump` output retained upsert inference and duplicate rejection.
+
+The live Odoo 19 bootstrap at `007e86391e14` completed the field upsert
+and moved on to reflecting selection values. The two device-log partial
+indexes with `WHERE revoked IS NOT TRUE` still report syntax errors.
+
 ### asyncpg expected failures by owning ID
 
 | Area | IDs | Observed causes |
@@ -149,10 +165,10 @@ need separately provisioned evidence.
 
 ## Next verification work
 
-1. Verify composite UNIQUE constraints added through ALTER TABLE. Cover
-   duplicate rejection, existing-row validation, and ON CONFLICT inference.
-   Repeat Odoo base and accounting boot. Check the device-log partial
-   indexes and invoice numbering's partial uniqueness separately.
+1. Continue the Odoo base and accounting boot checks past field reflection.
+   Pair device-log partial indexes with the upstream partial-index and
+   boolean-predicate cases. Verify posted-invoice numbering with a separate
+   partial-uniqueness and concurrency workload.
 2. Assert admitted constraints, view results and trigger effects alongside
    Pagila COPY counts. Repeat Metabase initial sync on a named release and
    validate JDBC metadata and representative MBQL values.
