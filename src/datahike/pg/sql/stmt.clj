@@ -72,6 +72,7 @@
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.inheritance :as inheritance]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.assignment-target :as assignment-target]
@@ -3911,6 +3912,12 @@
    projection, and loses duplicates outright."
   false)
 
+(defn- inherited-read? [eid clause]
+  (= eid (first (::ctx/inherited-read (meta clause)))))
+
+(defn- read-output [clause]
+  (or (second (::ctx/inherited-read (meta clause))) (second clause)))
+
 (defn- clause-bound-vars
   "The logic variables a clause BINDS, as opposed to reads: a data
    pattern binds its entity and value, a function clause binds its
@@ -3919,6 +3926,9 @@
    merely read by a projection is not a variable the join can key on."
   [clause]
   (cond
+    (::ctx/inherited-read (meta clause))
+    (set (::ctx/inherited-read (meta clause)))
+
     (and (vector? clause) (= 3 (count clause)) (keyword? (second clause)))
     (into #{} (filter symbol?) [(first clause) (nth clause 2)])
 
@@ -4794,6 +4804,7 @@
                            :parse-sql params/*parse-sql*
                            :hints hints
                            :derived-aliases derived-alias-set
+                           :only-aliases only-aliases
                            :partition-scan-aliases (into (cond-> #{} partition-scan? (conj default-table))
                                                          (comp (filter :partition-scan?) (map :alias))
                                                          derived-joins)
@@ -6816,7 +6827,8 @@
                       right-membership (ctx/relation-membership-clause
                                         ctx right-table right-evar)
                       right-side? (fn [c]
-                                    (or (and (vector? c) (= 3 (count c))
+                                    (or (inherited-read? right-evar c)
+                                        (and (vector? c) (= 3 (count c))
                                              (= right-evar (first c))
                                              (keyword? (second c)))
                                         (and (vector? c) (= 2 (count c))
@@ -6836,7 +6848,7 @@
                                         (remove #(and (vector? %) (= 3 (count %))
                                                       (= right-marker (second %)))
                                                 right-clauses))
-                      right-vars (vec (distinct (keep second right-reads)))
+                      right-vars (vec (distinct (keep read-output right-reads)))
                       ;; The LEFT row's anchor, mentioned so the branch
                       ;; is evaluated per left row -- which is what a
                       ;; nested loop is -- and so the negation below has
@@ -6931,9 +6943,10 @@
                                              (seq? (first clause))
                                              (= 'get-else (first (first clause)))
                                              (= right-evar (nth (vec (first clause)) 2 nil))))
-                      right-side? (fn [c] (or (right-clause? c) (right-get-else? c)))
+                      right-read? (fn [c] (or (right-get-else? c) (inherited-read? right-evar c)))
+                      right-side? (fn [c] (or (right-clause? c) (right-read? c)))
                       right-clauses (vec (filter right-clause? all-clauses))
-                      right-reads (vec (filter right-get-else? all-clauses))
+                      right-reads (vec (filter right-read? all-clauses))
                       left-clauses (vec (remove right-side? all-clauses))
                       ;; Also remove any right-side marker/get-else from left clauses
                       right-table (get (:table-aliases ctx) right-alias right-alias)
@@ -6956,7 +6969,7 @@
                       ;; and from the column reads that moved inside)
                       right-val-vars (vec (distinct
                                            (concat (keep (fn [[_ _ v]] v) right-non-key)
-                                                   (keep second right-reads))))
+                                                   (keep read-output right-reads))))
                       ;; The right-side key vars a SELECT asked for, by attr
                       key-var-by-attr (into {} (map (fn [[_ a v]] [a v])) right-key-clauses)
                       left-key? (set left-key-vars)
@@ -6967,8 +6980,12 @@
                       ;; equality of the ON clause. One data pattern per
                       ;; equality, all on the same right entity var.
                       ;; Use get-else for non-key right columns (they may be NULL)
+                      right-branches (ctx/inheritance-branches ctx right-alias)
                       matched-keys (mapv (fn [{:keys [left-key-var right-key-attr]}]
-                                           [right-evar right-key-attr left-key-var])
+                                           (if (seq right-branches)
+                                             (inheritance/key-clause right-branches right-evar
+                                                                     right-key-attr left-key-var)
+                                             [right-evar right-key-attr left-key-var]))
                                          value-keys)
                       matched-non-key (into (mapv (fn [[_e a v]]
                                                     [(list 'get-else '$ right-evar a :__null__) v])
@@ -10417,7 +10434,8 @@
         physical->logical (set/map-invert temp-table-map)
         db-table (get temp-table-map raw-table storage)
         ancestor-db-tables (ctx/inheritance-ancestors db db-table)
-        ancestor-tables (mapv #(get physical->logical % %) ancestor-db-tables)
+        ancestor-tables (when-not (inheritance/physical? db db-table)
+                          (mapv #(get physical->logical % %) ancestor-db-tables))
         raw-cols (if (seq columns)
                    (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
                    (let [db-order (pgs/column-order-from-db db db-table)

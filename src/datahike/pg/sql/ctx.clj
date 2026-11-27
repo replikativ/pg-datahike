@@ -33,6 +33,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.inheritance :as inheritance]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.expression Alias]
@@ -276,21 +277,7 @@
           [:aliased alias-key kw]
           kw)))))
 
-(defn inheritance-descendants
-  "Every table that inherits from `table-name`, directly or through
-   another, so `ONLY` can exclude all of them at once."
-  [db table-name]
-  (when db
-    (loop [frontier #{table-name}, seen #{}]
-      (let [kids (into #{}
-                       (comp (map first) (remove seen))
-                       (d/q '{:find [?child] :in [$ [?parent ...]]
-                              :where [[?e :__inherit__/parent ?parent]
-                                      [?e :__inherit__/child ?child]]}
-                            db (vec frontier)))]
-        (if (empty? kids)
-          seen
-          (recur kids (into seen kids)))))))
+(def inheritance-descendants inheritance/descendants)
 
 (defn- direct-parents
   "A table's immediate parents in the order its INHERITS clause named
@@ -351,8 +338,8 @@
 
    `resolve-column` returns two attribute-bearing shapes, `:ns/col` and
    `[:aliased alias :ns/col]`, and inheritance has to be resolved for
-   BOTH: an INHERITS child stores its parent's columns under the PARENT
-   namespace on the same entity (`:par/pname`, not `:chi/pname`), so a
+   BOTH: a legacy INHERITS child stores its parent's columns under the
+   parent namespace on the same entity (`:par/pname`, not `:chi/pname`), so a
    reference that keeps the child namespace binds nothing and reads as
    NULL.
 
@@ -481,6 +468,23 @@
      :name storage-name
      :alias (or alias-name name)}))
 
+(defn- scan-visible-inheritance [db schema table]
+  (let [storage (get (::pgs/physical-table-names (meta schema)) table table)
+        branches (inheritance/scan-branches db storage)]
+    (if (= storage table)
+      branches
+      (mapv (fn [branch]
+              (update branch :attrs
+                      (fn [attrs]
+                        (into {}
+                              (map (fn [[attr source]]
+                                     [(if (= storage (namespace attr))
+                                        (keyword table (name attr))
+                                        attr)
+                                      source]))
+                              attrs))))
+            branches))))
+
 (defn make-ctx
   "Create a fresh translation context. The options map may carry:
    - :db        — live Datahike db snapshot (for schema inherits lookup,
@@ -496,11 +500,17 @@
                   so `WHERE <renamed-col>` and `JOIN … ON …` resolve hint-
                   mapped columns to their real attribute keywords."
   [schema table-aliases default-table & [{:keys [db parse-sql hints derived-aliases ref-targets
-                                                 computed-aliases column-overrides partition-scan-aliases]}]]
+                                                 computed-aliases column-overrides partition-scan-aliases
+                                                 only-aliases]}]]
   {:schema        schema
    :table-aliases table-aliases
    :default-table default-table
    :db            db
+   :only-aliases  (or only-aliases #{})
+   :inheritance-branches
+   (when (and db (get schema (:db/ident inheritance/layout-attr)))
+     (into {} (map (fn [table] [table (delay (scan-visible-inheritance db schema table))]))
+           (distinct (vals table-aliases))))
    ;; Every parse through the context is of nested SQL (a subquery).
    :parse-sql     (some-> parse-sql params/nested-parse-fn)
    :hints         (or hints {})
@@ -625,6 +635,12 @@
   [ctx]
   (symbol (str "?v" (swap! (:var-counter ctx) inc))))
 
+(defn inheritance-branches [ctx alias]
+  (when-let [branches (:inheritance-branches ctx)]
+    (when-not (contains? (:only-aliases ctx) alias)
+      (let [table (get (:table-aliases ctx) alias alias)]
+        (force (get branches table))))))
+
 (defn relation-membership-clause
   "Return one Datalog clause binding `evar` to every physical row of
    `table-name`.
@@ -644,12 +660,18 @@
   (let [schema (:schema ctx)
         db (:db ctx)
         table-name (str table-name)
+        branches (when (:inheritance-branches ctx)
+                   (let [alias (some (fn [[alias entity]] (when (= evar entity) alias))
+                                     @(:entity-vars ctx))]
+                     (inheritance-branches ctx (or alias table-name))))
         {:keys [marker native]}
         (pgs/relation-membership-attrs schema table-name)
         read-flexible?
         (= :read (try (:schema-flexibility (dbi/-config db))
                       (catch Throwable _ nil)))]
     (cond
+      (seq branches) (inheritance/branch-clause branches evar nil nil)
+
       marker [evar marker true]
 
       read-flexible?
@@ -927,6 +949,33 @@
                        :sqlstate "42P01"
                        :table (namespace attr)})))))
 
+(defn- inherited-value! [ctx alias cache-key projection]
+  (let [branches (inheritance-branches ctx alias)
+        cvars (:col->var ctx)]
+    (or (get @cvars cache-key)
+        (let [value (fresh-var! ctx)
+              eid (entity-var! ctx alias)]
+          (add-clause! ctx (with-meta (inheritance/branch-clause branches eid value (partial projection eid))
+                             {::inherited-read [eid value]}))
+          (swap! (:nullable-vars ctx) conj value)
+          (swap! cvars assoc cache-key value)
+          value))))
+
+(defn inherited-tableoid! [ctx alias]
+  (inherited-value! ctx alias [alias ::tableoid]
+                    (fn [_ branch] (list 'ground (:oid branch)))))
+
+(defn- column-alias [attr]
+  (if (vector? attr) (second attr) (namespace attr)))
+
+(defn- inherited-col-var! [ctx attr]
+  (let [alias (column-alias attr)
+        kw (attr-of ctx attr)]
+    (validate-column! ctx kw)
+    (inherited-value! ctx alias [alias kw]
+                      (fn [eid branch]
+                        (list 'get-else '$ eid (get (:attrs branch) kw) :__null__)))))
+
 (defn col-var!
   "Get or create the logic variable for an attribute.
 
@@ -960,6 +1009,9 @@
     ;; [:db-id alias-key] → entity var (not nullable)
     (and (vector? attr) (= :db-id (first attr)))
     (entity-var! ctx (second attr))
+
+    (seq (inheritance-branches ctx (column-alias attr)))
+    (inherited-col-var! ctx attr)
 
     ;; [:aliased alias-key :ns/col] → aliased column for self-joins
     ;; Mirrors the regular keyword branch below: must unpack the
@@ -1097,7 +1149,15 @@
                (not (contains? (:derived-aliases ctx) alias-key)))
       (let [evar (entity-var! ctx alias-key)]
         (when-not (contains? @(:left-join-evars ctx) evar)
-          {:cache-key [alias-key attr] :attr attr :evar evar})))))
+          {:cache-key [alias-key attr] :attr attr :evar evar
+           :branches (inheritance-branches ctx alias-key)})))))
+
+(defn- add-key-pattern! [ctx {:keys [evar attr branches]} value]
+  (let [clause (if (seq branches)
+                 (inheritance/key-clause branches evar attr value)
+                 [evar attr value])]
+    (add-clause! ctx clause)
+    (swap! (:required-join-patterns ctx) conj clause)))
 
 (defn unify-inner-equijoin!
   "Try to translate an INNER-JOIN equality between two plain columns as
@@ -1122,10 +1182,8 @@
             ;; matches — the sentinel value never appears in storage
             ;; for base tables, so `:__null__` rows drop out (correct
             ;; for INNER joins).
-            (add-clause! ctx [(:evar l) (:attr l) jv])
-            (add-clause! ctx [(:evar r) (:attr r) jv])
-            (swap! (:required-join-patterns ctx) conj
-                   [(:evar l) (:attr l) jv] [(:evar r) (:attr r) jv])
+            (add-key-pattern! ctx l jv)
+            (add-key-pattern! ctx r jv)
             (when-not l-cached (swap! cvars assoc (:cache-key l) jv))
             (when-not r-cached (swap! cvars assoc (:cache-key r) jv))
             true))))))
@@ -1151,9 +1209,8 @@
                      :db.type/keyword (keyword? v)
                      false)]
         (when match?
-          (add-clause! ctx [(:evar c) (:attr c) v])
-          (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) v])
-          (when (get-in (:schema ctx) [(:attr c) :db/unique])
+          (add-key-pattern! ctx c v)
+          (when (and (empty? (:branches c)) (get-in (:schema ctx) [(:attr c) :db/unique]))
             (reset! (:unique-value-bound? ctx) true))
           true)))))
 
@@ -1255,9 +1312,8 @@
         ;; one `$N` is compared with columns of different storage types.
               (swap! (:in-params ctx) conj kvar)
               (swap! (:in-args ctx) conj (params/seek-param-ref param-idx vtype))
-              (add-clause! ctx [(:evar c) (:attr c) kvar])
-              (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) kvar])
-              (when (get-in (:schema ctx) [(:attr c) :db/unique])
+              (add-key-pattern! ctx c kvar)
+              (when (and (empty? (:branches c)) (get-in (:schema ctx) [(:attr c) :db/unique]))
                 (reset! (:unique-value-bound? ctx) true))
               true)))))))
 

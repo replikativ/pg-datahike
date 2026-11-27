@@ -639,7 +639,7 @@
      - reserved-keyword aliases (`AS select` → `AS \"select\"`)
      - COLLATE strip (qualified + bare)
      - OPERATOR(qual.op) → bare op
-     - (PRIMARY KEY(col)) → (id serial) for INHERITS bodies
+     - parser-only leading column for primary-key-only table bodies
      - ALTER TABLE … TYPE … USING half stripping
      - reserved column name (INDEX/KEY varchar) quoting
      - negative NUMERIC/DECIMAL scale packing for JSqlParser
@@ -2511,8 +2511,13 @@
                       ;; for the parser; the executor decides what it means.
                       (let [plan (ddl/translate-create-table ^CreateTable stmt db)
                             options (:options identity-options)
-                            partition-by (rw/partition-by-clause (cls/tokenize-all sql))]
+                            tokens (cls/tokenize-all sql)
+                            partition-by (rw/partition-by-clause tokens)
+                            qualified-parents (when (seq (:inherits plan))
+                                                (rw/qualified-inheritance-parents tokens))]
                         (cond-> plan
+                          (seq qualified-parents)
+                          (assoc :qualified-inheritance-parents qualified-parents)
                           (seq options)
                           (assoc :identity-options (update-keys options unquote-ident))
                           partition-by

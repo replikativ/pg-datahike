@@ -104,6 +104,18 @@
   {:id :expression-index-column-addresses
    :file "create_table" :lines [742 748] :state :covered :impact :unsupported
    :detail "Plain keys preserve column positions after earlier columns are dropped. Expression keys use zero in indkey, and dropping a referenced column removes its index within the DDL transaction."}
+  {:id :inheritance-child-key-nullability
+   :file "inherit" :lines [96 101] :state :covered :impact :wrong-result
+   :detail "A temporary child's local primary key rejects NULL on the inherited column. A UNIQUE constraint on those same columns accepts NULL."}
+  {:id :inheritance-table-local-cascade
+   :file "inherit" :lines [451 459] :state :covered :impact :wrong-result
+   :detail "A cascading foreign key deletes only referencing rows in the physical table that owns the constraint. Parent scans still include the surviving child rows."}
+  {:id :inheritance-child-serial-defaults
+   :file "inherit" :lines [637 642] :state :covered :impact :wrong-result
+   :detail "New children with local primary keys keep the parent's serial default and use one shared sequence."}
+  {:id :inheritance-recursive-not-null
+   :file "inherit" :lines [829 833] :state :open :impact :unsupported
+   :detail "Setting NOT NULL on a parent must validate and update each physical descendant. Odoo base attempts this on ir_actions and catches the current feature error at a savepoint."}
   {:id :partial-arithmetic-expression-index
    :file "indexing" :lines [211 211] :state :covered :impact :unsupported
    :detail "The partial arithmetic index declaration retains a typed expression key and its predicate. The slice covers the ordinary table definition and result rows."}

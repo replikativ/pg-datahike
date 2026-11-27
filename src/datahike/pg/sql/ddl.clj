@@ -839,8 +839,14 @@
                    (str/replace #"^\(" "")
                    (str/replace #"\)$" "")
                    (str/split #","))
-               (map #(params/unquote-ident (str/trim %)))
                (remove str/blank?)
+               (map (fn [entry]
+                      (let [parts (regoid/parse-qualified-name entry)]
+                        (when (or (> (count parts) 2)
+                                  (and (= 2 (count parts)) (not= "public" (first parts))))
+                          (throw (errors/pg-error :feature-not-supported
+                                                  {:feature "inheritance in non-public schemas"})))
+                        (peek parts))))
                vec
                seq))))))
 
@@ -1001,13 +1007,7 @@
             (throw (errors/pg-error
                     :feature-not-supported
                     {:message "vector arrays are not supported"}))))
-        ;; For INHERITS children, skip `id` — it's shared with parent. Adding
-        ;; a child-namespaced id attr would cause auto-increment to assign
-        ;; DIFFERENT values for child vs parent, breaking SELECT FROM parent
-        ;; WHERE id = N lookups.
-        skip-col? (fn [cn]
-                    (or (= cn "db_id")
-                        (and (seq parent-tables) (= cn "id"))))
+        skip-col? #(= % "db_id")
         col-names (vec (keep (fn [^ColumnDefinition col]
                                (let [cn (params/unquote-ident (.getColumnName col))]
                                  (when-not (skip-col? cn) cn)))

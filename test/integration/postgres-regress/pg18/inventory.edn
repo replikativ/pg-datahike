@@ -687,8 +687,8 @@
    :sql-sha256 "8127b7ba3ec29183cf62f8a184a83c72314224412191ecba3f68aa5dd85b7833",
    :expected-sha256 "dec2fe7a90441a56adcf6dc73d66b207ee29ec49ad3ac27cc8dcf9da1a1f44ae",
    :fixture-boundaries #{},
-   :status :backlog,
-   :reason :ddl-and-dml}
+   :status :campaign,
+   :wave 6}
   {:name "init_privs",
    :scheduled? true,
    :sql-sha256 "74620e61670d18c10874c641ae663ed30984f7847cccd9b612c046bbd194a4f6",

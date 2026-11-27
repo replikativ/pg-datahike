@@ -638,16 +638,14 @@
 
 ;; ============================================================================
 ;; (PRIMARY KEY (<col>)) — INHERITS table body that contains only a PK.
-;; Replace the outer parenthesised body with `(id serial)` so JSqlParser
-;; sees a viable column list. We don't enforce inherited PKs on the child;
-;; this rewrite is purely to make INHERITS bootstrap parse cleanly.
+;; JSqlParser requires a column before table constraints. DDL omits
+;; the reserved db_id column inserted here.
 ;; ============================================================================
 
 (defn primary-key-only-body-rule
   "Match `( PRIMARY KEY ( <ident> [, <ident>]* ) )` as a complete
    parenthesised body — i.e. nothing else inside the outer `(...)` —
-   and replace with `(id serial)`. Used by Odoo's bootstrap-DDL where
-   tables declared with `INHERITS (parent)` carry only a PK."
+   and insert a parser-only column before the primary key."
   [toks]
   (let [n (count toks)]
     (loop [i 0, acc []]
@@ -680,7 +678,7 @@
                                     (when (punct? x ")") x)))]
                   (if outer-end
                     (recur (+ inner-end-idx 2)
-                           (conj acc [(:pos t) (:end outer-end) "(id serial)"]))
+                           (conj acc [(:end t) (:end t) "db_id bigint, "]))
                     (recur (inc i) acc)))
                 (recur (inc i) acc)))))))))
 
@@ -982,6 +980,38 @@
                 (recur end)))
             (punct? t "(") (recur (match-paren-group code i))
             :else (recur (inc i))))))))
+
+(defn- public-inheritance-qualifiers [toks]
+  (let [code (vec (remove #(= :comment (:type %)) toks))]
+    (when-let [start (create-table-options-start code)]
+      (let [open (inc start)]
+        (when (and (= "inherits" (kw-text (nth code start nil)))
+                   (punct? (nth code open nil) "("))
+          (let [end (match-paren-group code open)]
+            (when (and end (punct? (nth code (dec end) nil) ")"))
+              (into []
+                    (keep (fn [i]
+                            (let [prev (nth code (dec i))
+                                  t (nth code i)
+                                  dot (nth code (inc i))]
+                              (when (and (or (punct? prev "(") (punct? prev ","))
+                                         (punct? dot "."))
+                                (if (or (= "public" (kw-text t))
+                                        (and (= :quoted (:type t)) (= "public" (:value t))))
+                                  (let [parent (nth code (+ i 2))]
+                                    {:parent (params/unquote-ident (:text parent))
+                                     :span [(:pos t) (:end dot) ""]})
+                                  (throw (errors/pg-error :feature-not-supported
+                                                          {:feature "inheritance in non-public schemas"})))))))
+                    (range (inc open) (dec end))))))))))
+
+(defn public-inheritance-rule
+  "Normalize public-qualified parents for JSqlParser."
+  [toks]
+  (mapv :span (public-inheritance-qualifiers toks)))
+
+(defn qualified-inheritance-parents [toks]
+  (into #{} (map :parent) (public-inheritance-qualifiers toks)))
 
 (defn partition-by-clause
   "The table-level `PARTITION BY <strategy> (...)` clause of a CREATE
@@ -1531,6 +1561,7 @@
    collate-rule
    operator-paren-rule
    primary-key-only-body-rule
+   public-inheritance-rule
    type-using-rule
    drop-column-restrict-rule
    reserved-column-name-rule

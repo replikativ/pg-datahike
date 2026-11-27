@@ -425,6 +425,22 @@
        :source-lines [211 211]
        :gate "test/datahike/test/pg_catalog_test.clj"
        :test-var "postgres-partial-expression-index-has-typed-arithmetic-key"}]}
+    {:name "inherit",
+     :boundaries #{:catalogs :constraints :ddl :dml :inheritance},
+     :mode :unmeasured
+     :strict-slices
+     [{:id :inheritance-child-key-nullability
+       :source-lines [96 101]
+       :gate "test/datahike/test/pg_inherits_resolution_test.clj"
+       :test-var "postgres-inheritance-child-key-nullability"}
+      {:id :inheritance-table-local-cascade
+       :source-lines [451 459]
+       :gate "test/datahike/test/pg_inherits_resolution_test.clj"
+       :test-var "postgres-inheritance-cascade-excludes-child-table"}
+      {:id :inheritance-child-serial-defaults
+       :source-lines [637 642]
+       :gate "test/datahike/test/pg_inherits_resolution_test.clj"
+       :test-var "postgres-inheritance-child-serial-defaults"}]}
     {:name "matview", :boundaries #{:catalogs :ddl :materialized-views}, :mode :discovery
      :accepted-differences #{:explain-plan-text}
      :strict-slices

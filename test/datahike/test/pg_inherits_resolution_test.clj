@@ -1,26 +1,6 @@
 (ns datahike.test.pg-inherits-resolution-test
-  "INHERITS column resolution through a table ALIAS.
-
-   An INHERITS child stores its parent's columns under the PARENT
-   namespace on the same entity — a `chi` row carries `:par/pname`, not
-   `:chi/pname` — so a reference has to be remapped before it can bind.
-   `resolve-inherited-attr` does that, and every consumer called it…
-   for only one of the two shapes `resolve-column` returns:
-
-       pname     -> :chi/pname               remapped  ✓
-       c.pname   -> [:aliased \"c\" :chi/pname]  NOT remapped  ✗
-
-   So every aliased reference to an inherited column bound nothing and
-   read as NULL. Aliases are what ORMs emit, so this was most of the
-   real-world surface. `ctx/attr-of` is now the single normaliser both
-   shapes go through.
-
-   The IS NULL path was worse: it did no resolution at all, so
-   `WHERE inherited_col IS NULL` was INVERTED — the child-namespace
-   attribute is absent from every row, making the test true for all of
-   them.
-
-   Expectations captured from PostgreSQL 17."
+  "Ordinary table inheritance through SQL, including child column resolution,
+   physical relation keys, and source-linked PostgreSQL 18 regression cases."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
@@ -52,6 +32,13 @@
   (mapv vec (.-rows ^PgWireServer$QueryResult (.execute *handler* sql))))
 
 (defn- v [sql] (ffirst (rows sql)))
+
+(defn- execute ^PgWireServer$QueryResult [sql]
+  (.execute *handler* sql))
+
+(defn- exec! [sql]
+  (let [result (execute sql)]
+    (is (nil? (.-error result)) sql)))
 
 ;; ---------------------------------------------------------------------------
 ;; The regression: aliased access
@@ -208,3 +195,76 @@
   (.execute *handler* "INSERT INTO par (id, pname, pnum) VALUES (9, 'z', 90)")
   (is (= "z" (v "SELECT p.pname FROM par p WHERE p.id = 9")))
   (is (= "z" (v "SELECT pname FROM par WHERE id = 9"))))
+
+(deftest physical-inheritance-keeps-keys-and-foreign-actions-table-local
+  (doseq [sql ["CREATE TABLE actions(id serial PRIMARY KEY, label text)"
+               "CREATE TABLE windows(PRIMARY KEY(id)) INHERITS(actions)"
+               "CREATE TABLE action_ref(id int PRIMARY KEY, action_id int REFERENCES actions(id) ON DELETE CASCADE)"
+               "CREATE TABLE window_ref(id int PRIMARY KEY, action_id int REFERENCES windows(id) ON DELETE CASCADE)"
+               "INSERT INTO actions(id,label) VALUES(7,'parent')"
+               "INSERT INTO windows(id,label) VALUES(7,'child')"
+               "INSERT INTO windows(label) VALUES('from default')"
+               "INSERT INTO action_ref VALUES(1,7)"
+               "INSERT INTO window_ref VALUES(1,7)"]]
+    (exec! sql))
+  (is (= [["windows" "1" "from default"] ["windows" "7" "child"] ["actions" "7" "parent"]]
+         (rows "SELECT tableoid::regclass, id, label FROM actions ORDER BY id,label")))
+  (is (= [["actions" "7" "parent"]] (rows "SELECT tableoid::regclass,id,label FROM ONLY actions")))
+  (is (= "23503" (.-sqlstate ^PgWireServer$QueryResult (execute "INSERT INTO action_ref VALUES(2,1)"))))
+  (exec! "BEGIN")
+  (is (= #{["7" "changed child"] ["7" "changed parent"]}
+         (set (rows "UPDATE actions SET label='changed '||label WHERE id=7 RETURNING id,label"))))
+  (exec! "DELETE FROM actions WHERE id=7")
+  (is (= [["0" "0"]]
+         (rows "SELECT (SELECT count(*) FROM action_ref), (SELECT count(*) FROM window_ref)")))
+  (exec! "ROLLBACK")
+  (exec! "CREATE TABLE requests(requested int)")
+  (exec! "INSERT INTO requests VALUES(7),(19)")
+  (is (= [["7" "child"] ["7" "parent"] ["19" nil]]
+         (rows "SELECT r.requested,p.label FROM requests r LEFT JOIN actions p ON r.requested=p.id ORDER BY r.requested,p.label")))
+  (exec! "DELETE FROM ONLY windows WHERE id=7")
+  (is (= [["1" "0"]]
+         (rows "SELECT (SELECT count(*) FROM action_ref), (SELECT count(*) FROM window_ref)")))
+  (is (= "23503" (.-sqlstate ^PgWireServer$QueryResult (execute "INSERT INTO window_ref VALUES(2,7)"))))
+  (is (= [["actions" "7" "parent"] ["windows" "1" "from default"]]
+         (rows "SELECT tableoid::regclass,id,label FROM actions ORDER BY label DESC")))
+  (exec! "ALTER TABLE windows ALTER COLUMN label SET NOT NULL")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO windows(id) VALUES(20)")))))
+
+(deftest postgres-inheritance-child-key-nullability
+  (exec! "CREATE TABLE a (aa text)")
+  (exec! "CREATE TEMP TABLE z (b TEXT, PRIMARY KEY(aa, b)) inherits (a)")
+  (is (= "23502" (.-sqlstate (execute "INSERT INTO z VALUES (NULL, 'text')"))))
+  (exec! "CREATE TEMP TABLE z2 (b TEXT, UNIQUE(aa, b)) inherits (a)")
+  (exec! "INSERT INTO z2 VALUES (NULL, 'text')")
+  (is (= [[nil "text"]] (rows "SELECT * FROM z2"))))
+
+(deftest postgres-inheritance-cascade-excludes-child-table
+  (doseq [sql ["create table inh_fk_1 (a int primary key)"
+               "insert into inh_fk_1 values (1), (2), (3)"
+               "create table inh_fk_2 (x int primary key, y int references inh_fk_1 on delete cascade)"
+               "insert into inh_fk_2 values (11, 1), (22, 2), (33, 3)"
+               "create table inh_fk_2_child () inherits (inh_fk_2)"
+               "insert into inh_fk_2_child values (111, 1), (222, 2)"
+               "delete from inh_fk_1 where a = 1"]]
+    (exec! sql))
+  (is (= [["2"] ["3"]] (rows "select * from inh_fk_1 order by 1")))
+  (is (= [["22" "2"] ["33" "3"] ["111" "1"] ["222" "2"]]
+         (rows "select * from inh_fk_2 order by 1, 2"))))
+
+(deftest postgres-inheritance-child-serial-defaults
+  (doseq [sql ["create table matest0 (id serial primary key, name text)"
+               "create table matest1 (id integer primary key) inherits (matest0)"
+               "create table matest2 (id integer primary key) inherits (matest0)"
+               "create table matest3 (id integer primary key) inherits (matest0)"
+               "insert into matest1 (name) values ('Test 1')"
+               "insert into matest1 (name) values ('Test 2')"
+               "insert into matest2 (name) values ('Test 3')"
+               "insert into matest2 (name) values ('Test 4')"
+               "insert into matest3 (name) values ('Test 5')"
+               "insert into matest3 (name) values ('Test 6')"]]
+    (exec! sql))
+  (is (= [["1" "Test 1"] ["2" "Test 2"] ["3" "Test 3"]
+          ["4" "Test 4"] ["5" "Test 5"] ["6" "Test 6"]]
+         (rows "SELECT * FROM matest0 ORDER BY id")))
+  (is (empty? (rows "SELECT * FROM ONLY matest0"))))
