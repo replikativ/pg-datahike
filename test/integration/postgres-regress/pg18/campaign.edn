@@ -305,7 +305,12 @@
     {:name "with",
      :boundaries #{:ctes :recursive-queries},
      :requires ["test_setup" "create_misc"],
-     :mode :unmeasured}
+     :mode :unmeasured
+     :strict-slices
+     [{:id :recursive-limit-consumer
+       :source-lines [64 76]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-demand-limited-recursion"}]}
     {:name "limit", :boundaries #{:relational}, :requires ["test_setup"], :mode :unmeasured}
     {:name "tsrf",
      :boundaries #{:set-returning-projections :expressions :relational},

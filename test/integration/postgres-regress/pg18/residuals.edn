@@ -65,6 +65,9 @@
   {:id :delete-exists-cross-join-derived-array
    :file "subselect" :lines [451 458] :state :open :impact :unsupported
    :detail "The DELETE uses a correlated EXISTS over a cross join and a derived relation with an ARRAY subquery. PostgreSQL deletes the matching road in a positive control; the adapter rejects the shape with 0A000."}
+  {:id :recursive-limit-consumer
+   :file "with" :lines [64 76] :state :covered :impact :unsupported
+   :detail "A direct outer LIMIT stops the recursive UNION ALL and UNION counters after ten rows. The companion Odoo cycle check counts rows that pass the outer WHERE."}
   {:id :nested-exists-ancestor-correlations
    :file "subselect" :lines [619 623] :state :covered :impact :unsupported
    :detail "The middle EXISTS and innermost NOT EXISTS refer to different outer aliases. The gate checks the upstream empty result and a positive control with different exclusion keys."}

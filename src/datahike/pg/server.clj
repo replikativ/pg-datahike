@@ -6324,7 +6324,7 @@
       (update :deferred-recursive-ctes
               (fn [specs]
                 (mapv (fn [spec]
-                        (if (= :iterative (:kind spec))
+                        (if (contains? #{:iterative :demand} (:kind spec))
                           ;; Iterative spec: params live in the anchor/recursive
                           ;; branches' :in-args.
                           (-> spec
@@ -9159,11 +9159,21 @@
                 sql-order-by sql-limit sql-offset fetch-with-ties?
                 post-window-order-by
                 project-set project-order-by project-limit project-offset
-                enriched-db literal-row literal-rows for-update]} parsed]
-    (if (or literal-row literal-rows)
+                enriched-db literal-row literal-rows for-update]} parsed
+        demand (first (:deferred-recursive-ctes parsed))]
+    (cond
+      (= :demand (:kind demand))
+      (let [consumer (cond-> parsed *max-result-rows*
+                             (update :limit min (inc *max-result-rows*)))]
+        {:literal? true :results (enforce-result-row-cap (stmt/recursive-demand-rows demand consumer enriched-db))
+         :find-aliases find-aliases})
+
+      (or literal-row literal-rows)
       {:literal? true
        :results (or literal-rows [literal-row])
        :find-aliases find-aliases}
+
+      :else
       (let [call-seen (java.util.IdentityHashMap.)
             resolve-result-value
             #(params/resolve-nextvals!

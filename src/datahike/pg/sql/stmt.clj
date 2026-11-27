@@ -2219,7 +2219,7 @@
       (str "column" (inc i))))
 
 (declare correlated-subquery-refs)
-(declare eval-values-literal)
+(declare eval-values-literal recursive-cte-self-reference?)
 
 (defn- lateral-rows-fn
   "Row producer for a correlated LATERAL subquery: given the outer
@@ -2485,6 +2485,14 @@
                          ;; as `FROM t, LATERAL (SELECT b)` means.
                          (correlated-subquery-refs inner outer-aliases outer-level)))]
     (when (and corr-refs (or (instance? PlainSelect inner) values?))
+      ;; The per-outer-row producer executes only the child's Datalog query.
+      ;; A limited recursive CTE also needs its deferred frontier evaluator.
+      (when (and (instance? PlainSelect inner) (.getLimit ^PlainSelect inner)
+                 (some (fn [^net.sf.jsqlparser.statement.select.WithItem wi]
+                         (and (.isRecursive wi) (recursive-cte-self-reference? wi)))
+                       (.getWithItemsList ^PlainSelect inner)))
+        (throw (errors/pg-error :feature-not-supported
+                                {:feature "limited recursive CTE in correlated LATERAL"})))
       ;; This producer's legacy best-effort shape does not analyze the inner
       ;; scope. Refuse EXPLAIN until it can validate names/types without rows.
       (params/require-execution! "correlated LATERAL relation metadata")
@@ -11327,13 +11335,28 @@
     (and body
          (select-references-relation? body (str/trim (str (.getAlias wi)))))))
 
-(defn- recursive-cte-branches
+(defn- recursive-values-anchor [^Values values]
+  ;; A singleton VALUES row has exactly the cardinality of a table-free
+  ;; SELECT. Preserve VALUES' default SQL column names.
+  (let [rows (analysis/values-expression-rows values)]
+    (when (and (derived/select-boundary? values) (= 1 (count rows))
+               (every? #(instance? LongValue %) (first rows)))
+      (doto (PlainSelect.)
+        (.setSelectItems (mapv (fn [i ^net.sf.jsqlparser.expression.Expression e]
+                                 (SelectItem. e (Alias. (str "column" (inc i)))))
+                               (range) (first rows)))))))
+
+(defn- recursive-table-reference? [item cte-name]
+  (and (instance? Table item) (nil? (.getSchemaName ^Table item))
+       (= cte-name (unquote-ident (.getName ^Table item)))))
+
+(defn- checked-recursive-branches
   "Split a WITH RECURSIVE item into [anchor recursive]. PostgreSQL requires
    recursive references to have the form `<anchor> UNION [ALL] <recursive>`;
    rejecting other set operations before lowering prevents invalid recursion
    from becoming unbounded work. Returns nil for a non-recursive PlainSelect,
    which callers may handle as an anchor-only item."
-  [^net.sf.jsqlparser.statement.select.WithItem wi]
+  [^net.sf.jsqlparser.statement.select.WithItem wi allow-values?]
   (let [select (let [s (.getSelect wi)]
                  (if (instance? ParenthesedSelect s)
                    (.getSelect ^ParenthesedSelect s) s))]
@@ -11347,7 +11370,9 @@
 
       (instance? SetOperationList select)
       (let [^SetOperationList sol select
-            selects (.getSelects sol)
+            selects (vec (.getSelects sol))
+            selects (if (and allow-values? (instance? Values (first selects)))
+                      (assoc selects 0 (recursive-values-anchor (first selects))) selects)
             ops (.getOperations sol)]
         (when-not (and (= 2 (count selects))
                        (= 1 (count ops))
@@ -11382,6 +11407,12 @@
                     (mapcat (fn [^SelectItem item]
                               (params/ast-function-names (.getExpression item))))
                     (.getSelectItems recursive))]
+          (when (< 1 (count (filter #(recursive-table-reference? % (unquote-ident (.getAliasName wi)))
+                                    (cons (.getFromItem recursive)
+                                          (map #(.getRightItem ^Join %) (.getJoins recursive))))))
+            (throw (ex-info (str "recursive reference to query \"" cte-name
+                                 "\" must not appear more than once")
+                            {:error :invalid-recursion :sqlstate "42P19" :query cte-name})))
           (when (some fns/aggregate-function? recursive-functions)
             (throw
              (ex-info
@@ -11435,6 +11466,9 @@
           [(first selects) recursive]))
 
       :else nil)))
+
+(defn- recursive-cte-branches [wi]
+  (checked-recursive-branches wi false))
 
 (defn validate-recursive-cte-shape!
   "Raise PostgreSQL's structural error for a recursive CTE whose recursive
@@ -11852,6 +11886,135 @@
               (d/q query exec-db))]
     (mapv (fn [r] (let [v (if (sequential? r) (vec r) [r])] (vec (take vis v))))
           (checked-rows raw))))
+
+(defn- demand-scalar? [e]
+  (or (instance? Column e) (instance? LongValue e) (instance? JdbcParameter e)))
+
+(defn- demand-filter? [e]
+  (cond
+    (nil? e) true
+    (instance? AndExpression e)
+    (and (not (.isUseOperator ^AndExpression e))
+         (demand-filter? (.getLeftExpression ^AndExpression e))
+         (demand-filter? (.getRightExpression ^AndExpression e)))
+    (instance? EqualsTo e)
+    (let [^EqualsTo e e]
+      (and (zero? (.getOldOracleJoinSyntax e))
+           (zero? (.getOraclePriorPosition e))
+           (demand-scalar? (.getLeftExpression e)) (demand-scalar? (.getRightExpression e))))
+    (instance? IsNullExpression e) (demand-scalar? (.getLeftExpression ^IsNullExpression e))
+    (instance? InExpression e)
+    (let [^InExpression e e
+          rhs (.getRightExpression e)]
+      (and (demand-scalar? (.getLeftExpression e))
+           (instance? ParenthesedExpressionList rhs) (every? demand-scalar? rhs)))
+    :else false))
+
+(defn- demand-branch? [^PlainSelect ps singleton?]
+  (and (derived/plain-shape? ps) (demand-filter? (.getWhere ps))
+       (or (nil? (.getFromItem ps)) (instance? Table (.getFromItem ps)))
+       (every? (fn [^Join j]
+                 (and (derived/unmodified-join? j)
+                      (instance? Table (.getRightItem j))
+                      (every? demand-filter? (.getOnExpressions j))))
+               (.getJoins ps))
+       (every? (fn [^SelectItem item]
+                 (let [e (.getExpression item)]
+                   (or (demand-scalar? e)
+                       (and singleton? (instance? Addition e)
+                            (demand-scalar? (.getLeftExpression ^Addition e))
+                            (demand-scalar? (.getRightExpression ^Addition e))))))
+               (.getSelectItems ps))))
+
+(defn- compile-demand-branch [branch schema db explicit-columns]
+  ;; INSERT ... SELECT defers its own projections until after row filtering.
+  ;; A recursive term computes its outputs inside the current generation.
+  (binding [expr/*defer-all-projection-computations?* false]
+    (let [metadata (binding [params/*analysis-only?* true]
+                     (translate-select branch schema db))
+          columns (visible-output-columns metadata explicit-columns)
+          plan (if params/*analysis-only?* metadata (translate-select branch schema db))]
+      ;; A branch over a view or partitioned relation may have its own
+      ;; materialized overlay. Each generation runs on the CTE's frontier
+      ;; overlay, so those plans require a separate overlay composition step.
+      (when (or (:enriched-db plan) (seq (:compound-exprs plan)))
+        (throw (errors/pg-error :feature-not-supported
+                                {:feature "recursive demand with a materialized relation or deferred projection"})))
+      [columns (select-keys plan [:query :hidden-count :in-args])])))
+
+(defn recursive-demand-plan
+  "Compile a single recursive stream consumed by a nonblocking SELECT with
+   literal LIMIT. SQL translation owns predicate and projection semantics;
+   the executor controls which generation is visible to each invocation."
+  [^PlainSelect outer ^net.sf.jsqlparser.statement.select.WithItem wi cte-name target db schema]
+  (let [src (.getFromItem outer)
+        limit (.getLimit outer)
+        wrapper (.getSelect wi)
+        body (.getSelect wrapper)]
+    (when (and (= 1 (count (.getWithItemsList outer)))
+               (derived/plain-shape? outer true)
+               (instance? LongValue (some-> limit .getRowCount))
+               (nil? (.getOffset ^Limit limit)) (empty? (.getByExpressions ^Limit limit))
+               (derived/select-boundary? wrapper)
+               (empty? (.getJoins outer)) (recursive-table-reference? src cte-name)
+               (demand-filter? (.getWhere outer))
+               (every? (fn [^SelectItem i]
+                         (let [e (.getExpression i)]
+                           (or (demand-scalar? e)
+                               (and (= AllColumns (class e)) (= "*" (str e))))))
+                       (.getSelectItems outer))
+               (instance? SetOperationList body)
+               (derived/select-boundary? body))
+      (let [[^PlainSelect anchor ^PlainSelect recursive] (checked-recursive-branches wi true)
+            from (.getFromItem recursive)
+            all? (.isAll ^net.sf.jsqlparser.statement.select.UnionOp
+                  (first (.getOperations ^SetOperationList body)))
+            singleton? (and (nil? (.getFromItem anchor)) (empty? (.getJoins anchor))
+                            (empty? (.getJoins recursive)))]
+        (when (and (recursive-table-reference? from cte-name)
+                   ;; A join can collapse identical projected rows in a
+                   ;; Datalog relation. DISTINCT recursion removes those
+                   ;; anyway; ALL with arithmetic is single-row per step.
+                   (or (not all?) singleton?)
+                   (demand-branch? anchor false) (demand-branch? recursive singleton?))
+          (let [[columns anchor-plan] (compile-demand-branch anchor schema db (recursive-analysis-column-names wi))]
+            (when (every? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8} (:oid %)) columns)
+              (let [relation (materialize-output-schema! db target cte-name columns)
+                    [step-columns step-plan]
+                    (binding [*cte-relations* (conj *cte-relations* cte-name)
+                              *cte-namespaces* (assoc *cte-namespaces* cte-name target)
+                              ctx/*relation-namespaces* (assoc ctx/*relation-namespaces* cte-name target)]
+                      (compile-demand-branch recursive (:schema relation) (:db relation) nil))]
+                (validate-recursive-analysis-columns! cte-name columns step-columns)
+                (assoc relation :deferred {:kind :demand :all? all?
+                                           :attrs (mapv #(keyword target (:name %)) columns)
+                                           :marker (pgs/row-marker-attr target)
+                                           :anchor anchor-plan :recursive step-plan})))))))))
+
+(defn recursive-demand-rows
+  "Run each recursive term against the previous generation. A distinct
+   UNION remembers every CTE row emitted by any generation. LIMIT consumes
+   qualifying outer rows, so a filtered generation can still produce its
+   successor. No iteration count stands in for reaching a fixed point."
+  [{:keys [anchor recursive all? attrs marker]} outer db]
+  (let [limit (:limit outer)
+        tx-row (fn [row]
+                 (reduce (fn [m [k v]] (if (fns/sql-null? v) m (assoc m k v)))
+                         {marker true} (map vector attrs row)))]
+    (if (zero? limit)
+      []
+      (loop [frontier (visible-query-rows anchor db), seen #{}, result []]
+        (params/check-cancel!)
+        (let [frontier (if all? frontier (into [] (comp (remove seen) (distinct)) (checked-rows frontier)))]
+          (if (empty? frontier)
+            result
+            (let [work-db (checked-db-with db (mapv tx-row (checked-rows frontier)))
+                  output (visible-query-rows outer work-db)
+                  result (into result (take (- limit (count result))) (checked-rows output))]
+              (if (= limit (count result))
+                result
+                (recur (visible-query-rows recursive work-db)
+                       (if all? seen (into seen frontier)) result)))))))))
 
 (defn materialize-recursive-iterative!
   "FALLBACK recursive-CTE evaluator (B1): semi-naive iteration instead of a

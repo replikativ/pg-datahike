@@ -915,8 +915,15 @@
                     (instance? PlainSelect stmt)
                     (some? (.getLimit ^PlainSelect stmt))
                     recursive-step
-                    (nil? (.getWhere ^PlainSelect recursive-step)))]
+                    (nil? (.getWhere ^PlainSelect recursive-step)))
+               demand-plan
+               (when (and recursive? (instance? PlainSelect stmt) (instance? SetOperationList inner)
+                          (.getLimit ^PlainSelect stmt))
+                 (stmt/recursive-demand-plan stmt wi cte-name cte-ns curr-db curr-schema))]
            (cond
+             demand-plan
+             [(:db demand-plan) (:schema demand-plan) [(:deferred demand-plan)] {cte-name cte-ns}]
+
              ;; `WITH RECURSIVE` marks every WithItem recursive in
              ;; JSqlParser, including INSERT/UPDATE/DELETE bodies that are
              ;; not select-shaped.  Detect those before recursive validation:
