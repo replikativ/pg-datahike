@@ -4,6 +4,13 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Foreign-key catalog lookups
+
+ORM queries that join foreign keys to named tables and their columns can
+read metadata for the matching relations from the statement snapshot.
+Prepared queries see intervening DDL and savepoint rollback. Explicitly
+named column-level foreign keys retain their names in `pg_constraint`.
+
 ### Ordinary B-tree expression keys
 
 CREATE INDEX preserves parenthesized scalar expression keys on

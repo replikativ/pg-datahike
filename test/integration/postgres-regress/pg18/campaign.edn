@@ -358,6 +358,10 @@
        :source-lines [876 908]
        :gate "test/datahike/test/pg_constraints_test.clj"
        :test-var "alter-column-nullability"}
+      {:id :named-inline-reference
+       :source-lines [2186 2187]
+       :gate "test/datahike/test/pg_constraint_identity_test.clj"
+       :test-var "postgres-preserves-an-explicit-inline-reference-name"}
       {:id :alter-varchar-widening-keeps-primary-key
        :source-lines [1436 1439]
        :gate "test/datahike/test/pg_system_at_test.clj"

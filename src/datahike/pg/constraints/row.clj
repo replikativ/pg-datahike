@@ -10,6 +10,7 @@
             [datahike.api :as d]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.catalog.foreign-keys :as foreign-keys]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -99,7 +100,8 @@
         child-by-name (into {} (map (juxt :name :attr))
                             (pgs/column-info schema table-name db))
         fks (when (get schema :pg/fk-child-table)
-              (mapv (fn [[constraint child-json parent-table parent-json]]
+              (mapv (fn [{constraint :name child-json :child-cols
+                          parent-table :parent-table parent-json :parent-cols}]
                       (let [parent-cols (vec (jb/parse-jsonb parent-json))
                             parent-by-name (into {} (map (juxt :name :attr))
                                                  (pgs/column-info schema parent-table db))]
@@ -110,16 +112,7 @@
                                             (vec (jb/parse-jsonb child-json)))
                          :parent-table parent-table
                          :parent-attrs (mapv parent-by-name parent-cols)}))
-                    (d/q '{:find [?name ?child-cols ?parent-table ?parent-cols]
-                           :in [$ ?table]
-                           :where [[?fk :pg/fk-child-table ?table]
-                                   (or-join [?fk ?name]
-                                            [?fk :pg/fk-conname ?name]
-                                            [?fk :pg/fk-name ?name])
-                                   [?fk :pg/fk-child-cols ?child-cols]
-                                   [?fk :pg/fk-parent-table ?parent-table]
-                                   [?fk :pg/fk-parent-cols ?parent-cols]]}
-                         db table-name)))
+                    (foreign-keys/definitions db :child table-name)))
         domain-enum
         (into {}
               (keep

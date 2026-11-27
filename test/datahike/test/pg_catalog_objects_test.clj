@@ -582,3 +582,19 @@
       (finally
         (d/delete-database cfg)
         (Files/deleteIfExists root)))))
+
+(deftest admitting-an-existing-store-preserves-unindexed-foreign-key-endpoints
+  (with-catalog
+    (fn [conn]
+      (let [endpoints [:pg/fk-child-table :pg/fk-parent-table]]
+        (d/transact conn (for [attr endpoints]
+                           {:db/ident attr :db/cardinality :db.cardinality/one
+                            :db/valueType :db.type/string}))
+        (d/transact conn [{:pg/fk-child-table "child" :pg/fk-parent-table "parent"}])
+        (#'server/ensure-pg-schema! conn)
+        (let [db (d/db conn)]
+          (is (every? #(not (get-in (:schema db) [% :db/index])) endpoints))
+          (is (= #{["child" "parent"]}
+                 (d/q '[:find ?c ?p :where [?e :pg/fk-child-table ?c]
+                        [?e :pg/fk-parent-table ?p]] db)))
+          (is (empty? (#'server/prepare-pg-schema-tx db))))))))

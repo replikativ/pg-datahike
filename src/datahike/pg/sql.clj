@@ -38,6 +38,7 @@
             [datahike.pg.sql.assignment-target :as assignment-target]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.catalog :as catalog]
+            [datahike.pg.sql.catalog-read :as catalog-read]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.expr :as expr]
@@ -410,7 +411,7 @@
    to miss the cache and looked correct."
   []
   [params/*declared-param-oids* params/*temp-table-map* params/*nested-parse?*
-   ctx/*physical-table-names?*
+   ctx/*physical-table-names?* catalog-read/*execution-inputs?*
    params/*analysis-only?*
    (when params/*session-state*
      (select-keys @params/*session-state*
@@ -1463,14 +1464,16 @@
                 ;; server can RE-RESOLVE the catalog enriched-db at execute
                 ;; (prepared statements would otherwise reuse a stale
                 ;; parse-time snapshot across a DDL).
-                [db schema catalog-names-used]
-                (if db
-                  (let [used-catalogs (catalog/catalog-tables-in-stmt stmt)]
-                    (if (empty? used-catalogs)
-                      [db schema nil]
-                      (let [enriched (enrich-db-with-catalogs db schema used-catalogs)]
-                        [enriched (:schema enriched) (sort used-catalogs)])))
-                  [db schema nil])
+                used-catalogs (when db (catalog/catalog-tables-in-stmt stmt))
+                catalog-analysis (when (and catalog-source (seq used-catalogs)
+                                            (not params/*analysis-only?*)
+                                            (empty? stmt/*cte-relations*))
+                                   (catalog-read/analysis-db stmt db used-catalogs))
+                catalog-names-used (seq (sort used-catalogs))
+                db (cond catalog-analysis catalog-analysis
+                         catalog-names-used (enrich-db-with-catalogs db schema used-catalogs)
+                         :else db)
+                schema (if catalog-names-used (:schema db) schema)
             ;; Top-level WITH-fold. Materialise every CTE body into a
             ;; speculative db (virtual `:<cte>/<col>` attrs) so all four
             ;; DML paths plus SELECT see the enriched db/schema before
@@ -2146,6 +2149,9 @@
                                           (not cte-materialized?)
                                           (not derived-table-edb?))
                                    (cond-> (assoc result :catalog-tables (vec catalog-names-used))
+                                     catalog-analysis
+                                     (assoc :catalog-read? true
+                                            :catalog-child-names (catalog-read/lookup-plan (:query result)))
                                      (and catalog-source
                                           (catalog/statement-stable-catalogs? catalog-names-used))
                                      (vary-meta assoc ::catalog-source catalog-source))
@@ -2954,12 +2960,14 @@
      - **AST cache** (`*ast-cache*`) — covers everything else that
        hits JSqlParser, repeated or not."
   ([^String sql schema] (parse-sql sql schema nil))
-  ([^String sql schema db]
+  ([^String sql schema db] (parse-sql sql schema db false))
+  ([^String sql schema db execution-inputs?]
    (let [clock-read? (volatile! false)
          outer-clock-read datetime-in/*on-clock-read*]
    ;; A row scope (row-eval) belongs to this statement only: a subquery
    ;; parsed from here on sees the row as an outer relation.
-     (binding [datetime-in/*on-clock-read* (fn []
+     (binding [catalog-read/*execution-inputs?* execution-inputs?
+               datetime-in/*on-clock-read* (fn []
                                              (vreset! clock-read? true)
                                              (when outer-clock-read (outer-clock-read)))
                params/*statement-row-scope-tables* params/*row-scope-tables*

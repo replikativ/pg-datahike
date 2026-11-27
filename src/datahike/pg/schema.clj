@@ -1020,6 +1020,9 @@
     (or (internal-namespace? ns)
         (= (name ident) row-marker-col))))
 
+(defn user-column-ident? [ident]
+  (and (qualified-keyword? ident) (not (internal-attr? ident))))
+
 (defn schema-unique [hints attr props]
   (if-let [visible (::visible-uniqueness hints)]
     (get visible attr)
@@ -1080,9 +1083,7 @@
                  (into {} (remove (fn [[attr _]] (and (keyword? attr)
                                                       (contains? retired (namespace attr))))) schema)
                  schema)
-        user-attrs (remove (fn [[k _]] (or (not (keyword? k))
-                                           (internal-attr? k)
-                                           (nil? (namespace k))
+        user-attrs (remove (fn [[k _]] (or (not (user-column-ident? k))
                                            (:hidden (get hints k))))
                            schema)
         tables-from-attrs (reduce

@@ -244,7 +244,11 @@
             (let [prev (non-comment-before toks i)]
               (if (and (punct? prev ")") (fk-column-count toks i))
                 (recur (inc i) acc)
-                (let [start (:pos t)
+                (let [[name-token prefix] (take 2 (remove #(= :comment (:type %))
+                                                          (rseq (subvec toks 0 i))))
+                      named? (and (= "constraint" (kw-text prefix))
+                                  (contains? #{:ident :quoted} (:type name-token)))
+                      start (:pos (if named? prefix t))
                       after-name-idx (referenced-relation-end toks (inc i))
                       after-cols-idx (match-paren-group toks after-name-idx)
                       ;; `MATCH FULL` sits here, before the ON clauses.
@@ -283,7 +287,8 @@
                                           " (__pg_default_pk__)"))
                         close-paren-pos (find-enclosing-close-paren toks (inc i))
                         inject (when col-name
-                                 (str ", FOREIGN KEY (" col-name ") "
+                                 (str ", " (when named? (str "CONSTRAINT " (:text name-token) " "))
+                                      "FOREIGN KEY (" col-name ") "
                                       "REFERENCES " ref-target
                                       (apply str (for [[verb action] actions]
                                                    (str " ON " (str/upper-case verb) " "
