@@ -273,7 +273,12 @@
     {:name "subselect",
      :boundaries #{:name-resolution :scalar-subqueries :write-expressions :relational},
      :requires ["test_setup"],
-     :mode :unmeasured}
+     :mode :unmeasured
+     :strict-slices
+     [{:id :nested-exists-ancestor-correlations
+       :source-lines [619 623]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "postgres-nested-exists-ancestor-scopes"}]}
     {:name "union", :boundaries #{:relational :common-types}, :requires ["test_setup"], :mode :unmeasured}
     {:name "join", :boundaries #{:relational}, :requires ["test_setup" "create_misc"], :mode :unmeasured
      :strict-slices

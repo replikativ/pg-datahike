@@ -1206,3 +1206,63 @@
     (is (= "{2}"
            (one c (str "SELECT ARRAY(SELECT DISTINCT v FROM array_floats "
                        "ORDER BY v DESC LIMIT 1 OFFSET 1)"))))))
+
+(deftest postgres-nested-exists-ancestor-scopes
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE tenk1 (thousand int, hundred int)")
+    (exec! c "INSERT INTO tenk1 VALUES (1,10),(2,10),(3,NULL),(NULL,10)")
+    ;; PostgreSQL 18.6 subselect.sql lines 619-623. The innermost
+    ;; relation refers past c to a, while the middle relation reads b.
+    (is (= [] (rows c "select a.thousand from tenk1 a, tenk1 b
+                        where a.thousand = b.thousand
+                          and exists ( select 1 from tenk1 c where b.hundred = c.hundred
+                                           and not exists ( select 1 from tenk1 d
+                                                            where a.thousand = d.thousand ) )")))
+    ;; Give d different contents so that a lost correlation cannot pass by
+    ;; always yielding the empty result expected by the upstream statement.
+    (exec! c "CREATE TABLE excluded (thousand int)")
+    (exec! c "INSERT INTO excluded VALUES (2),(NULL)")
+    (is (= [["1"]] (rows c "select a.thousand from tenk1 a, tenk1 b
+                            where a.thousand = b.thousand
+                              and exists (select 1 from tenk1 c where b.hundred = c.hundred
+                                and not exists (select 1 from excluded d where a.thousand = d.thousand))")))))
+
+(deftest odoo-group-privilege-nested-exists
+  (with-open [c (jdbc)]
+    (doseq [sql ["CREATE TABLE ir_module_category (id int PRIMARY KEY, sequence int, name jsonb)"
+                 "CREATE TABLE res_groups_privilege (id int PRIMARY KEY, category_id int)"
+                 "CREATE TABLE res_groups (id int PRIMARY KEY, privilege_id int)"
+                 "INSERT INTO ir_module_category VALUES (1,1,'{\"en_US\":\"included\"}'),(2,2,'{\"en_US\":\"excluded\"}'),(3,3,NULL)"
+                 "INSERT INTO res_groups_privilege VALUES (11,1),(12,2),(13,NULL)"
+                 "INSERT INTO res_groups VALUES (21,11),(22,NULL),(23,11)"]]
+      (exec! c sql))
+    (with-open [st (.prepareStatement c
+                                      "SELECT ir_module_category.id FROM ir_module_category WHERE EXISTS(
+                                         SELECT FROM (SELECT res_groups_privilege.category_id AS __inverse
+                                           FROM res_groups_privilege WHERE (res_groups_privilege.category_id IS NOT NULL AND EXISTS(
+                                             SELECT FROM (SELECT res_groups.privilege_id AS __inverse FROM res_groups
+                                               WHERE res_groups.privilege_id IS NOT NULL) AS __sub
+                                             WHERE __inverse = res_groups_privilege.id))) AS __sub
+                                         WHERE __inverse = ir_module_category.id)
+                                       ORDER BY ir_module_category.sequence, ir_module_category.name->>'en_US', ir_module_category.id")]
+      (.setPrepareThreshold ^PGStatement st 1)
+      (letfn [(ids []
+                (with-open [rs (.executeQuery st)]
+                  (loop [out []]
+                    (if (.next rs) (recur (conj out (.getInt rs 1))) out))))]
+        (is (= [1] (ids)))
+        (exec! c "INSERT INTO res_groups VALUES (24,12)")
+        (is (= [1 2] (ids)))
+        (exec! c "DELETE FROM res_groups WHERE privilege_id=11")
+        (is (= [2] (ids)))))))
+
+(deftest derived-exists-null-and-duplicate-keys
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE owners (k int)")
+    (exec! c "CREATE TABLE links (k int)")
+    (exec! c "INSERT INTO owners VALUES (NULL),(1),(2),(2)")
+    (exec! c "INSERT INTO links VALUES (NULL),(1),(1)")
+    (let [body "(SELECT 1 FROM (SELECT k AS link FROM links) derived WHERE link = owners.k)"]
+      (is (= [["1"]] (rows c (str "SELECT k FROM owners WHERE EXISTS " body))))
+      (is (= [["2"] ["2"] [nil]]
+             (rows c (str "SELECT k FROM owners WHERE NOT EXISTS " body " ORDER BY k NULLS LAST")))))))

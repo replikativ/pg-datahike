@@ -12,9 +12,9 @@
             [datahike.pg.types :as types])
   (:import [datahike.db DB]
            [net.sf.jsqlparser.schema Column Table]
-           [net.sf.jsqlparser.expression Alias BooleanValue JdbcParameter LongValue SignedExpression]
+           [net.sf.jsqlparser.expression Alias BooleanValue JdbcParameter LongValue NotExpression SignedExpression]
            [net.sf.jsqlparser.expression.operators.conditional AndExpression]
-           [net.sf.jsqlparser.expression.operators.relational EqualsTo ParenthesedExpressionList]
+           [net.sf.jsqlparser.expression.operators.relational EqualsTo ExistsExpression IsNullExpression ParenthesedExpressionList]
            [net.sf.jsqlparser.statement.select PlainSelect ParenthesedSelect LateralSubSelect Join Select SelectItem]))
 
 (set! *warn-on-reflection* true)
@@ -301,3 +301,126 @@
                                      (or (nil? qualifier) (= alias qualifier)))
                             (get by-name (params/unquote-ident (.getColumnName column))))))]
                   (rewrite-predicate (.getWhere outer) resolve-output))))))))))
+
+;; Equality-correlated EXISTS can be evaluated by building a set of the
+;; inner keys once and probing it with the outer column. Prove which WHERE
+;; conjuncts are local and which belong to an enclosing query level before
+;; moving them: in particular, an ancestor-only NOT EXISTS is independent
+;; of the rows supplying the local keys.
+(defn- conjuncts [expression]
+  (let [e (unwrap expression)]
+    (if (and (instance? AndExpression e) (not (.isUseOperator ^AndExpression e)))
+      (concat (conjuncts (.getLeftExpression ^AndExpression e))
+              (conjuncts (.getRightExpression ^AndExpression e)))
+      (when expression [(or e expression)]))))
+
+(defn- sublink [e]
+  (let [negated? (instance? NotExpression e)
+        e (if negated? (unwrap (.getExpression ^NotExpression e)) e)]
+    (when (instance? ExistsExpression e)
+      (let [^ExistsExpression e e
+            ps (.getRightExpression e)]
+        (when (and (instance? ParenthesedSelect ps) (select-boundary? ps))
+          [(.getSelect ^ParenthesedSelect ps) (not= negated? (.isNot e))])))))
+
+(defn- single-source? [ps]
+  (and (instance? PlainSelect ps)
+       (plain-shape? ps)
+       (empty? (.getJoins ^PlainSelect ps))))
+
+(defn- column-qualifier [^Column column]
+  (some-> column .getTable .getName params/unquote-ident))
+
+(defn- equality-key [e local-key? outers]
+  (when (and (instance? EqualsTo e) (zero? (.getOldOracleJoinSyntax ^EqualsTo e))
+             (zero? (.getOraclePriorPosition ^EqualsTo e)))
+    (let [lhs (.getLeftExpression ^EqualsTo e)
+          rhs (.getRightExpression ^EqualsTo e)]
+      (when (and (instance? Column lhs) (instance? Column rhs)
+                 (local-column? lhs) (local-column? rhs))
+        (some (fn [[local outer]]
+                (when (and (local-key? local) (contains? outers (column-qualifier outer)))
+                  [local outer]))
+              [[lhs rhs] [rhs lhs]])))))
+
+(defn- local-not-null? [e src]
+  (and (instance? IsNullExpression e) (.isNot ^IsNullExpression e)
+       (let [col (.getLeftExpression ^IsNullExpression e)]
+         (and (instance? Column col) (resolve-base [src] col)))))
+
+(declare ^:private exists-key-probes)
+
+(defn- derived-key-probe [^PlainSelect ps ^ParenthesedSelect item outers negated? env]
+  (let [inner (.getSelect item)
+        alias (.getAlias item)]
+    (when (and (= ParenthesedSelect (class item)) (select-boundary? item)
+               (nil? (.getSampleClause item)) alias (empty? (.getAliasColumns alias))
+               (single-source? inner))
+      (let [^PlainSelect inner inner
+            base (.getFromItem inner)
+            projection (.getSelectItems inner)]
+        (when (and (instance? Table base) (= 1 (count projection)))
+          (let [src (apply source base env)
+                ^SelectItem projected (first projection)
+                key (.getExpression projected)
+                name (when (instance? Column key)
+                       (params/unquote-ident (or (some-> projected .getAlias .getName)
+                                                 (.getColumnName ^Column key))))
+                alias (params/unquote-ident (.getName alias))
+                local-key? #(and (= name (params/unquote-ident (.getColumnName ^Column %)))
+                                 (or (nil? (column-qualifier %)) (= alias (column-qualifier %))))
+                [_ outer] (equality-key (unwrap (.getWhere ps)) local-key? (disj outers alias))]
+            (when (and src name outer (integral-column? (resolve-base [src] key))
+                       ;; Only local, deterministic restrictions may be
+                       ;; evaluated once for the whole outer relation.
+                       (every? (fn [term]
+                                 (or (local-not-null? term src)
+                                     (when-let [[nested neg?] (sublink term)]
+                                       (when-let [probes (exists-key-probes nested #{(:alias src)} neg? env)]
+                                         (every? #(integral-column? (resolve-base [src] (:outer %)))
+                                                 probes)))))
+                               (conjuncts (.getWhere inner))))
+              [{:keys-select inner :outer outer :negated? negated?}])))))))
+
+(defn- base-key-probes [^PlainSelect ps ^Table table outers negated? env]
+  (when-let [src (apply source table env)]
+    (let [outers (disj outers (:alias src))
+          terms (conjuncts (.getWhere ps))
+          local-key? #(integral-column? (resolve-base [src] %))
+          equalities (keep #(equality-key % local-key? outers) terms)
+          [key outer] (first equalities)
+          filters (filter #(local-not-null? % src) terms)
+          sublinks (keep sublink terms)]
+      (when (and (= 1 (count equalities))
+                 (= (count terms) (+ 1 (count filters) (count sublinks)))
+                 (or (empty? sublinks) (not negated?)))
+        (let [lifted (mapv (fn [[nested neg?]] (exists-key-probes nested outers neg? env)) sublinks)]
+          (when (every? some? lifted)
+            (let [keys-select (doto (PlainSelect.)
+                                (.setFromItem table)
+                                (.setSelectItems [(SelectItem. key)]))]
+              (when (seq filters)
+                (.setWhere keys-select (reduce #(AndExpression. %1 %2) filters)))
+              (into [{:keys-select keys-select :outer outer :negated? negated?}]
+                    cat lifted))))))))
+
+(defn- exists-key-probes
+  "Prove a conjunction of independent, integral membership tests for an
+   EXISTS body. An unproved SELECT or WHERE expression yields nil."
+  [ps outers negated? [_ db :as env]]
+  (when (and (instance? DB db) (= :write (:schema-flexibility (dbi/-config db)))
+             (single-source? ps)
+             (= 1 (count (.getSelectItems ^PlainSelect ps)))
+             (instance? LongValue (.getExpression ^SelectItem (first (.getSelectItems ^PlainSelect ps)))))
+    (let [item (.getFromItem ^PlainSelect ps)]
+      (cond
+        (instance? Table item) (base-key-probes ps item outers negated? env)
+        (instance? ParenthesedSelect item) (derived-key-probe ps item outers negated? env)))))
+
+(defn sublink-key-probes
+  "Inspect the enclosing SELECT wrapper as well as the body for barriers."
+  [select outers negated? env]
+  (cond
+    (instance? PlainSelect select) (exists-key-probes select outers negated? env)
+    (and (= ParenthesedSelect (class select)) (select-boundary? select))
+    (exists-key-probes (.getSelect ^ParenthesedSelect select) outers negated? env)))

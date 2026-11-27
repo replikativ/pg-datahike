@@ -22,6 +22,19 @@ features, and planner controls are generally outside this compatibility target.
 Their syntax may still be recognized where that is useful, but applications
 must not assume that arbitrary PostgreSQL SQL or extensions will run unchanged.
 
+## Nested correlated EXISTS
+
+For ordinary tables, a nested `EXISTS` can match an outer integer key
+against a single column projected by a derived table. Odoo uses this to
+find module categories with at least one group privilege. Duplicate inner
+keys yield one match per outer row. A null key never compares equal.
+
+The compiler also handles a nested `NOT EXISTS` whose equality depends
+only on a more distant outer query. It builds the eligible key sets for
+each execution, so prepared statements see intervening writes. More
+complex nested shapes can return SQLSTATE `0A000`, including a correlated
+`DELETE` whose inner cross join projects an array subquery.
+
 ## JSONB path queries
 
 `jsonb_path_query_first` accepts a path string literal rooted at `$` with
