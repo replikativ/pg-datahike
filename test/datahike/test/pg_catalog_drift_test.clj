@@ -312,3 +312,43 @@
                                :db/cardinality :db.cardinality/one}])
           (is (false? (basis/compatible? mid (d/db *conn*)))))))))
 
+(deftest new-foreign-key-cannot-leave-a-dangling-reference-after-delete
+  (doseq [mode [:inline :alter]]
+    (testing (name mode)
+      (let [parent (str "guard_parent_" (name mode))
+            child (str "guard_child_" (name mode))
+            reference (str " FOREIGN KEY (pid) REFERENCES " parent "(id)")]
+        (with-open [other (pg/make-query-handler *conn*)]
+          (is (nil? (state (execute (str "CREATE TABLE " parent " (id int PRIMARY KEY)")))))
+          (is (nil? (state (execute (str "INSERT INTO " parent " VALUES (1)")))))
+          (when (= :alter mode)
+            (is (nil? (state (.execute other (str "CREATE TABLE " child " (pid int)"))))))
+          (is (nil? (state (execute "BEGIN"))))
+          (is (nil? (state (execute (str "DELETE FROM " parent " WHERE id=1")))))
+          (is (nil? (state (.execute other
+                                     (case mode
+                                       :inline (str "CREATE TABLE " child " (pid int," reference ")")
+                                       :alter (str "ALTER TABLE " child " ADD" reference))))))
+          (is (nil? (state (.execute other (str "INSERT INTO " child " VALUES (1)")))))
+          (is (= "40001" (state (execute "COMMIT"))))
+          (is (= [["1"]] (rows (.execute other (str "SELECT id FROM " parent)))))
+          (is (= [["1"]] (rows (.execute other (str "SELECT pid FROM " child))))))))))
+
+(deftest only-new-relations-checks-the-target-of-new-metadata
+  (is (nil? (state (execute "CREATE TABLE guard_existing (id int PRIMARY KEY)"))))
+  ;; Install the metadata attributes before taking the basis so schema
+  ;; additions for the metadata itself cannot affect the result.
+  (is (nil? (state (execute "CREATE TABLE guard_seed_fk (pid int REFERENCES guard_existing(id))"))))
+  (is (nil? (state (execute "CREATE TABLE guard_seed_child () INHERITS (guard_existing)"))))
+  (let [before (basis/capture @*conn*)]
+    (is (nil? (state (execute "CREATE TABLE guard_new_parent (id int PRIMARY KEY)"))))
+    (is (nil? (state (execute "CREATE TABLE guard_new_fk (pid int REFERENCES guard_new_parent(id))"))))
+    (is (nil? (state (execute "CREATE TABLE guard_new_child () INHERITS (guard_new_parent)"))))
+    (is (basis/compatible? before @*conn*))
+    (let [before-inherits (basis/capture @*conn*)]
+      (is (nil? (state (execute "CREATE TABLE guard_related_child () INHERITS (guard_existing)"))))
+      (is (false? (basis/compatible? before-inherits @*conn*))))
+    (let [before-fk (basis/capture @*conn*)]
+      (is (nil? (state (execute "CREATE TABLE guard_related_fk (pid int REFERENCES guard_existing(id))"))))
+      (is (false? (basis/compatible? before-fk @*conn*))))))
+

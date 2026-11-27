@@ -154,12 +154,6 @@
     (when (or (= "db" (namespace attr)) (basis/catalog-attribute? attr))
       [attr (:e datom) (:v datom) (:tx datom) (:added datom)])))
 
-(def ^:private relation-name-attributes
-  #{:datahike.pg/table :datahike.pg/view-name :datahike.pg.matview/name
-    :datahike.pg.trigger/table :datahike.pg.index/table
-    :__inherit__/parent :__inherit__/child :__seq__/name
-    :pg/table :pg/check-table :pg/fk-child-table :pg/fk-parent-table})
-
 (def ^:private type-name-attributes
   #{:datahike.pg.enum/name :datahike.pg.domain/name :datahike.pg.composite/name})
 
@@ -207,7 +201,7 @@
                                   (and (= a :datahike.pg/for-ident) (contains? attrs v))
                                   (and (contains? type-name-attributes a)
                                        (contains? type-names v))
-                                  (and (contains? relation-name-attributes a)
+                                  (and (contains? basis/relation-name-attributes a)
                                        (contains? names v)))
                             (conj roots (:e datom)) roots))) roots rows)
         ;; Capture dependent metadata rows through actual ref attributes,
