@@ -9052,13 +9052,15 @@
               % (fn [sequence-name]
                   (session-nextval! (:conn ctx) tx-state session-state sequence-name))
               nil call-seen)
-            ;; Catalog-only SELECT: re-resolve the enriched-db against the
-            ;; CURRENT db so a reused prepared statement reflects catalog
-            ;; changes (CREATE TYPE etc.) since Parse — the cache makes this
-            ;; a lookup, and it's DDL-invalidated. CTE/derived enrichment
-            ;; (no :catalog-tables) keeps its query-scoped parse-time snapshot.
+            ;; Use the translation overlay for the immediate Simple Query
+            ;; dispatch if its input is the exact execution snapshot. Prepared
+            ;; plans and runtime catalog extensions refresh at execution.
             query-db (if-let [cats (:catalog-tables parsed)]
-                       (sql/enrich-db-with-catalogs db (dbi/-schema db) cats)
+                       (if (and (:reuse-statement-catalogs? ctx)
+                                (identical? db (::sql/catalog-source (meta parsed)))
+                                (catalog/statement-stable-catalogs? cats))
+                         enriched-db
+                         (sql/enrich-db-with-catalogs db (dbi/-schema db) cats))
                        (or enriched-db db))
             ;; Parameterised recursive CTEs: enriched-db carries the CTE
             ;; schema from parse, but the rows depend on `$n` (bound only
@@ -16706,7 +16708,10 @@
                                                                   (:in-tx? @tx-state))
                                                          (swap! tx-state assoc :aborted? true))
                                                        r)
-                              :select                (exec-select ctx parsed)
+                              :select                (exec-select
+                                                      (assoc ctx :reuse-statement-catalogs?
+                                                             (nil? *cached-parsed*))
+                                                      parsed)
                               :insert                (exec-insert ctx parsed)
                             ;; Templated simple-protocol UPDATE/DELETE ride
                             ;; the prepared-statement machinery: the exec
