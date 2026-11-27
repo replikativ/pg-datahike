@@ -113,6 +113,9 @@
   {:id :alter-composite-unique
    :file "alter_table" :lines [706 718] :state :covered :impact :wrong-result
    :detail "ALTER TABLE ADD UNIQUE creates an enforced composite constraint. The upstream sequence rejects a duplicate pair and admits distinct pairs that share a column."}
+  {:id :named-inline-reference
+   :file "alter_table" :lines [2186 2187] :state :covered :impact :wrong-result
+   :detail "A named column REFERENCES clause keeps its declared foreign-key name in pg_constraint and ALTER TABLE DROP CONSTRAINT."}
   {:id :alter-varchar-widening-keeps-primary-key
    :file "alter_table" :lines [1436 1439] :state :covered :impact :unsupported
    :detail "The varchar widening updates the typmod on the existing attribute and catalog address. The strict test keeps the primary key created earlier in the transaction and verifies longer values and duplicate rejection."}

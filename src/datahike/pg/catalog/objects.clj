@@ -347,6 +347,11 @@
 (defn- column-map [entity]
   (when entity (select-keys entity column-keys)))
 
+(defn catalog-column-name [column]
+  (if (:datahike.pg.column/dropped? column)
+    (str "........pg.dropped." (:datahike.pg.column/attnum column) "........")
+    (:datahike.pg.column/name column)))
+
 (defn column-by-attnum [db relation-oid attnum]
   (when (get (dbi/-schema db) :datahike.pg.column/address-key)
     (some-> (entity-by-unique db :datahike.pg.column/address-key

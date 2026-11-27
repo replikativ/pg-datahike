@@ -2,9 +2,11 @@
   (:require [clojure.test :refer [deftest is]]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
+            [datahike.pg.schema :as schema]
             [datahike.pg.server :as pg]
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.catalog :as catalog]
+            [datahike.pg.sql.catalog-read :as catalog-read]
             [datahike.pg.sql.stmt :as stmt])
   (:import [datahike.pg PgWireServer$QueryHandler PgWireServer$QueryResult]))
 
@@ -117,3 +119,79 @@
             (is (nil? (.-error created)))
             (is (nil? (.-error after)))
             (is (= [["new_relation"]] (mapv vec (.-rows after))))))))))
+
+(deftest scoped-foreign-key-catalog-reads-use-the-execution-snapshot
+  (with-db
+    (fn [conn]
+      (with-open [^PgWireServer$QueryHandler h (pg/make-query-handler conn)]
+        (let [execute (fn [sql]
+                        (let [^PgWireServer$QueryResult result (.execute h sql)]
+                          (is (nil? (.-error result)) sql)
+                          (mapv vec (.-rows result))))
+              query (str "SELECT f.conname, p.relname, a.attname FROM pg_constraint f "
+                         "JOIN pg_class c ON c.oid = f.conrelid "
+                         "JOIN pg_class p ON p.oid = f.confrelid "
+                         "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = f.conkey[1] "
+                         "WHERE f.contype = 'f' AND c.relname IN ('child','also_absent') "
+                         "AND c.relnamespace = current_schema::regnamespace")]
+          (doseq [ddl ["CREATE TABLE parent (id int PRIMARY KEY)"
+                       "CREATE TABLE child (p int CONSTRAINT public_fk REFERENCES parent)"
+                       "CREATE SCHEMA audit"
+                       "CREATE TABLE audit.child (p int CONSTRAINT audit_fk REFERENCES public.parent)"]]
+            (execute ddl))
+          (is (= #{"child" "also_absent"}
+                 (:catalog-child-names (sql/parse-sql query (:schema @conn) @conn true))))
+          (is (nil? (:catalog-read? (sql/parse-sql query (:schema @conn) @conn))))
+          (is (every? #(get-in (:schema @conn) [% :db/index]) [:pg/fk-child-table :pg/fk-parent-table]))
+          (let [two-relations (str "SELECT k.conname FROM pg_class t JOIN pg_constraint k "
+                                   "ON k.conrelid = t.oid WHERE t.relname = 'child' AND k.contype = 'f'")]
+            (is (= #{"child"} (:catalog-child-names (sql/parse-sql two-relations (:schema @conn) @conn true))))
+            (is (= #{["public_fk"] ["audit_fk"]} (set (execute two-relations)))))
+          (let [plan (.parse h query (int-array 0))
+                read-plan (fn []
+                            (let [^PgWireServer$QueryResult result
+                                  (.executePrepared h plan (object-array [nil]))]
+                              (is (nil? (.-error result)))
+                              (is (= [19 19 19] (vec (.-columnOids result))))
+                              (set (map vec (.-rows result)))))]
+            (is (= #{["public_fk" "parent" "p"]} (read-plan)))
+            (execute "SET search_path TO audit, public")
+            (is (= #{["audit_fk" "parent" "p"]} (read-plan)))
+            (execute "BEGIN")
+            (execute "SAVEPOINT before_fk")
+            (execute "ALTER TABLE audit.child ADD CONSTRAINT new_fk FOREIGN KEY (p) REFERENCES public.parent")
+            (is (= #{["audit_fk" "parent" "p"] ["new_fk" "parent" "p"]} (read-plan)))
+            (execute "ROLLBACK TO SAVEPOINT before_fk")
+            (is (= #{["audit_fk" "parent" "p"]} (read-plan)))
+            (execute "COMMIT"))
+          (let [scan "SELECT conname FROM pg_constraint WHERE contype = 'f'"]
+            (is (= #{["public_fk"] ["audit_fk"]} (set (execute scan)))))
+          (let [independent (str "SELECT a.attname FROM pg_class c "
+                                 "JOIN pg_constraint f ON c.oid = f.conrelid "
+                                 "CROSS JOIN pg_attribute a WHERE c.relname = 'child' AND f.contype = 'f'")]
+            (is (nil? (:catalog-child-names (sql/parse-sql independent (:schema @conn) @conn true))))
+            (is (some #{["id"]} (execute independent))))
+          (execute "SET search_path TO public")
+          (is (some? (catalog-read/query-db @conn #{"child"})))
+          (schema/set-hint! conn :child/p {:hidden true})
+          (is (nil? (catalog-read/query-db @conn #{"child"})))
+          (is (empty? (execute query))))))))
+
+(deftest foreign-key-attnums-use-live-names
+  (with-db
+    (fn [conn]
+      (with-open [^PgWireServer$QueryHandler h (pg/make-query-handler conn)]
+        (doseq [sql ["CREATE TABLE p (id int PRIMARY KEY)"
+                     "CREATE TABLE c (\"........pg.dropped.2........\" int REFERENCES p, spare int)"
+                     "ALTER TABLE c DROP COLUMN spare"]]
+          (is (nil? (.-error ^PgWireServer$QueryResult (.execute h sql)))))
+        (let [sql (str "SELECT f.conkey, a.attnum FROM pg_constraint f "
+                       "JOIN pg_class c ON c.oid=f.conrelid "
+                       "JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=f.conkey[1] "
+                       "WHERE f.contype='f' AND c.relname='c'")
+              ^PgWireServer$QueryResult result (.execute h sql)]
+          (is (nil? (.-error result)))
+          (is (= [["{1}" "1"]] (mapv vec (.-rows result)))))
+        (is (nil? (.-error ^PgWireServer$QueryResult
+                   (.execute h "CREATE TABLE pg (p int REFERENCES p)"))))
+        (is (nil? (catalog-read/query-db @conn #{"pg"})))))))

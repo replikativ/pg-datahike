@@ -25,6 +25,7 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.catalog.foreign-keys :as foreign-keys]
             [datahike.pg.catalog.regoid :as regoid]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.locks :as locks]
@@ -271,15 +272,6 @@
   ;; Tag the high bit to avoid collisions with table OIDs.
   (bit-or 0x50000000
           (Math/abs (.hashCode ^String (str kind ":" name ":" table)))))
-
-(defn- fk-action-catalog-code [action]
-  (case action
-    :no-action "a"
-    :restrict "r"
-    :cascade "c"
-    :set-null "n"
-    :set-default "d"
-    " "))
 
 (defn- not-null-constraint-rows [rows user-schema db]
   (let [hints (pgs/schema-hints db)
@@ -1374,7 +1366,7 @@
     ;; pg_attribute to pg_constraint via `attnum = ANY(c.conkey)`,
     ;; so populating these isn't optional.
     [{:db/ident :pg_constraint/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_constraint/conname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_constraint/contype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      ;; The index a PRIMARY KEY / UNIQUE constraint is enforced by; 0 for
      ;; a CHECK. psql's \d joins pg_index to pg_constraint on it.
@@ -2591,8 +2583,7 @@
                       cte-db (:datahike.pg.object/oid relation))
               :when (:datahike.pg.column/dropped? column)]
           {:pg_attribute/attname
-           (str "........pg.dropped."
-                (:datahike.pg.column/attnum column) "........")
+           (catalog-objects/catalog-column-name column)
            :pg_attribute/atttypid 0
            :pg_attribute/attnum (:datahike.pg.column/attnum column)
            :pg_attribute/attrelid (:datahike.pg.object/oid relation)
@@ -3487,16 +3478,7 @@
                     (catch Throwable _ []))
           ;; FK constraints persisted via :pg/fk-* attrs.
           fks (try
-                (q-fn '{:find  [?n ?ct ?cc ?pt ?pc ?on-update ?on-delete]
-                        :keys  [name child-table child-cols parent-table parent-cols on-update on-delete]
-                        :where [[?e :pg/fk-child-table ?ct]
-                                [?e :pg/fk-child-cols ?cc]
-                                [?e :pg/fk-parent-table ?pt]
-                                [?e :pg/fk-parent-cols ?pc]
-                                [(get-else $ ?e :pg/fk-on-update :no-action) ?on-update]
-                                [(get-else $ ?e :pg/fk-on-delete :no-action) ?on-delete]
-                                (or-join [?e ?n] [?e :pg/fk-conname ?n] [?e :pg/fk-name ?n])]}
-                      cte-db)
+                (foreign-keys/definitions cte-db)
                 (catch Throwable _ []))
           ;; Prefer durable PostgreSQL attnums. Positional fallback keeps
           ;; bare/native databases usable before handler migration.
@@ -3646,53 +3628,38 @@
         ;; identifiers in the condef (matches PG's pg_get_constraintdef).
         (for [{cname :name child :child-table child-cols :child-cols
                parent :parent-table parent-cols :parent-cols
-               :keys [on-update on-delete]} fks
+               :keys [on-update on-delete] :as fk} fks
               :let [tbl-oid (or (pgs/storage-table-oid cte-db child)
                                 (Math/abs (.hashCode ^String child)))
                     parent-oid (or (pgs/storage-table-oid cte-db parent)
                                    (Math/abs (.hashCode ^String parent)))
-                    parse-cols (fn [s]
-                                 (try
-                                   (let [v (jb/parse-jsonb s)]
-                                     (cond (vector? v)     v
-                                           (sequential? v) (vec v)
-                                           :else           [v]))
-                                   (catch Throwable _ [s])))
-                    cs (parse-cols child-cols)
-                    ps (parse-cols parent-cols)
+                    cs (foreign-keys/column-names child-cols)
+                    ps (foreign-keys/column-names parent-cols)
                     child-attnums  (vec (keep #(attnum-for child %) cs))
                     parent-attnums (vec (keep #(attnum-for parent %) ps))]]
-          {:pg_constraint/oid           (long (constraint-oid "f" cname child))
-           :pg_constraint/conname       cname
-           :pg_constraint/contype       "f"
-           :pg_constraint/conrelid      (long tbl-oid)
-           :pg_constraint/connamespace  (storage-schema-oid cte-db child)
-           :pg_constraint/confrelid     (long parent-oid)
-           :pg_constraint/confdeltype   (fk-action-catalog-code on-delete)
-           :pg_constraint/confupdtype   (fk-action-catalog-code on-update)
-           :pg_constraint/condeferrable false
-           :pg_constraint/condeferred   false
-           :pg_constraint/convalidated  true
-           :pg_constraint/conkey        (->conkey child-attnums)
-           :pg_constraint/confkey       (->conkey parent-attnums)
-           :pg_constraint/condef
-           (let [path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
-                 reference (binding [regoid/*db* cte-db
-                                     regoid/*relation-db* cte-db
-                                     regoid/*relation-provider* relation-identity
-                                     regoid/*search-path* path]
-                             (regoid/output types/oid-regclass parent-oid types/format-type))
-                 action-text (fn [clause action]
-                               (when (not= :no-action action)
-                                 (str clause (-> action name (str/replace "-" " ") str/upper-case))))]
-             (str "FOREIGN KEY (" (str/join ", " (map fns/quote-identifier cs))
-                  ") REFERENCES " (if (= reference (str parent-oid))
-                                    (fns/quote-identifier parent)
-                                    reference)
-                  " (" (str/join ", " (map fns/quote-identifier ps)) ")"
-                  (action-text " ON UPDATE " on-update)
-                  (action-text " ON DELETE " on-delete)))
-           (pgs/row-marker-attr "pg_constraint") true}))))
+          (assoc (foreign-keys/catalog-fields fk tbl-oid parent-oid child-attnums parent-attnums)
+                 :pg_constraint/oid (long (constraint-oid "f" cname child))
+                 :pg_constraint/connamespace (storage-schema-oid cte-db child)
+                 :pg_constraint/condeferrable false
+                 :pg_constraint/condeferred false
+                 :pg_constraint/convalidated true
+                 :pg_constraint/condef
+                 (let [path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+                       reference (binding [regoid/*db* cte-db
+                                           regoid/*relation-db* cte-db
+                                           regoid/*relation-provider* relation-identity
+                                           regoid/*search-path* path]
+                                   (regoid/output types/oid-regclass parent-oid types/format-type))
+                       action-text (fn [clause action]
+                                     (when (not= :no-action action)
+                                       (str clause (-> action name (str/replace "-" " ") str/upper-case))))]
+                   (str "FOREIGN KEY (" (str/join ", " (map fns/quote-identifier cs))
+                        ") REFERENCES " (if (= reference (str parent-oid))
+                                          (fns/quote-identifier parent)
+                                          reference)
+                        " (" (str/join ", " (map fns/quote-identifier ps)) ")"
+                        (action-text " ON UPDATE " on-update)
+                        (action-text " ON DELETE " on-delete))))))))
     "information_schema_constraint_column_usage"
     (constraint-column-usage-rows user-schema cte-db)
     "information_schema_table_constraints"

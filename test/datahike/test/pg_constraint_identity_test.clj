@@ -118,3 +118,12 @@
       (run c "CREATE TABLE gone (a int)")
       (is (= 1 (run c "INSERT INTO gone VALUES (-1)")))
       (is (= "23514" (second (run c "INSERT INTO live VALUES (-1)")))))))
+
+(deftest postgres-preserves-an-explicit-inline-reference-name
+  (with-open [c (jdbc)]
+    (is (= 0 (run c "CREATE TABLE comment_test (id text PRIMARY KEY)")))
+    (is (= 0 (run c "CREATE TABLE comment_test_child (
+                     id text CONSTRAINT comment_test_child_fk REFERENCES comment_test)")))
+    (is (= ["comment_test_child_fk"]
+           (run c "SELECT conname FROM pg_constraint WHERE contype = 'f'")))
+    (is (= 0 (run c "ALTER TABLE comment_test_child DROP CONSTRAINT comment_test_child_fk")))))

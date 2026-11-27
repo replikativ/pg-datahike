@@ -44,7 +44,9 @@
        (nil? (.getPivot select))
        (nil? (.getUnPivot select))))
 
-(defn- plain-shape? [^PlainSelect select]
+(defn plain-shape?
+  "A plain SELECT without sorting, grouping, limits, locking or other modifiers."
+  [^PlainSelect select]
   (and (select-boundary? select)
        (empty? (.getIntoTables select))
        (empty? (.getLateralViews select))
@@ -142,18 +144,20 @@
                          db name)))
       {:alias alias :columns (pgs/column-info schema canonical db)})))
 
+(defn unmodified-join? [^Join join]
+  (and (not (or (.isLeft join) (.isRight join) (.isFull join)
+                (.isOuter join) (.isNatural join) (.isApply join)
+                (.isSemi join) (.isStraight join) (.isGlobal join)
+                (.isWindowJoin join)))
+       (nil? (.getJoinWindow join)) (nil? (.getJoinHint join))
+       (empty? (.getUsingColumns join))))
+
 (defn- sources [^PlainSelect inner schema db cte-names]
   (let [joins (vec (or (.getJoins inner) []))
         items (cons (.getFromItem inner) (map #(.getRightItem ^Join %) joins))]
     (when (and (every? #(instance? Table %) items)
-               (every? (fn [^Join join]
-                         (and (or (.isSimple join) (.isCross join) (.isInner join))
-                              (not (or (.isLeft join) (.isRight join) (.isFull join)
-                                       (.isOuter join) (.isNatural join) (.isApply join)
-                                       (.isSemi join) (.isStraight join) (.isGlobal join)
-                                       (.isWindowJoin join)))
-                              (nil? (.getJoinWindow join)) (nil? (.getJoinHint join))
-                              (empty? (.getUsingColumns join)))) joins))
+               (every? (fn [^Join j] (and (unmodified-join? j)
+                                          (or (.isSimple j) (.isCross j) (.isInner j)))) joins))
       (let [sources (mapv #(source % schema db cte-names) items)]
         (when (and (every? some? sources)
                    (= (count sources) (count (set (map :alias sources))))) sources)))))

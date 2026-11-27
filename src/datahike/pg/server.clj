@@ -29,6 +29,7 @@
             [datahike.pg.catalog.admission :as catalog-admission]
             [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.catalog.foreign-keys :as foreign-keys]
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.constraints.unique :as unique-constraints]
             [datahike.pg.records :as pg-rec]
@@ -46,6 +47,7 @@
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.catalog :as catalog]
+            [datahike.pg.sql.catalog-read :as catalog-read]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.copy :as copy]
@@ -1944,15 +1946,7 @@
    Memoised per (schema, table)."
   [db table-name]
   (let [v (schema-cached db [::fk-child table-name]
-                         #(let [rows (d/q '{:find [?n ?cc ?pt ?pc]
-                                            :keys [name child-cols parent-table parent-cols]
-                                            :in [$ ?tbl]
-                                            :where [[?e :pg/fk-child-table ?tbl]
-                                                    [?e :pg/fk-child-cols ?cc]
-                                                    [?e :pg/fk-parent-table ?pt]
-                                                    [?e :pg/fk-parent-cols ?pc]
-                                                    (or-join [?e ?n] [?e :pg/fk-conname ?n] [?e :pg/fk-name ?n])]}
-                                          db table-name)]
+                         #(let [rows (foreign-keys/definitions db :child table-name)]
                             (mapv (fn [{:keys [name child-cols parent-table parent-cols]}]
                                     {:name name
                                      :child-cols (vec (jb/parse-jsonb child-cols))
@@ -1969,21 +1963,12 @@
   [db table-name]
   (let [v (schema-cached
            db [::fk-parent table-name]
-           #(mapv (fn [[n ct cc pc od]]
-                    {:name n :child-table ct
-                     :child-cols (vec (jb/parse-jsonb cc))
-                     :parent-cols (vec (jb/parse-jsonb pc))
-                     ;; PG default for missing ON DELETE is NO ACTION.
-                     :on-delete (or od :no-action)})
-                  (d/q '{:find [?n ?ct ?cc ?pc ?od]
-                         :in [$ ?pt]
-                         :where [[?e :pg/fk-parent-table ?pt]
-                                 [?e :pg/fk-child-table ?ct]
-                                 [?e :pg/fk-child-cols ?cc]
-                                 [?e :pg/fk-parent-cols ?pc]
-                                 [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]
-                                 (or-join [?e ?n] [?e :pg/fk-conname ?n] [?e :pg/fk-name ?n])]}
-                       db table-name)))]
+           #(mapv (fn [{:keys [name child-table child-cols parent-cols on-delete]}]
+                    {:name name :child-table child-table
+                     :child-cols (vec (jb/parse-jsonb child-cols))
+                     :parent-cols (vec (jb/parse-jsonb parent-cols))
+                     :on-delete on-delete})
+                  (foreign-keys/definitions db :parent table-name)))]
     (if (= ::nil v) [] v)))
 
 (defn- table-row-attrs
@@ -4645,9 +4630,11 @@
               [:pg/check-expr str1]
               ;; FOREIGN KEY constraints — one entity per FK.
               [:pg/fk-name (assoc str1 :db/unique :db.unique/identity)]
-              [:pg/fk-child-table str1]
+              ;; Index new endpoint attributes. Old stores retain their existing
+              ;; declaration and use bound Datalog queries without a backfill.
+              [:pg/fk-child-table (assoc str1 :db/index true)]
               [:pg/fk-child-cols str1]
-              [:pg/fk-parent-table str1]
+              [:pg/fk-parent-table (assoc str1 :db/index true)]
               [:pg/fk-parent-cols str1]
               [:pg/fk-on-delete kw1]
               [:pg/fk-on-update kw1]
@@ -9055,12 +9042,17 @@
             ;; Use the translation overlay for the immediate Simple Query
             ;; dispatch if its input is the exact execution snapshot. Prepared
             ;; plans and runtime catalog extensions refresh at execution.
+            catalog-input (when-let [names (:catalog-child-names parsed)]
+                            (catalog-read/query-db db names))
             query-db (if-let [cats (:catalog-tables parsed)]
-                       (if (and (:reuse-statement-catalogs? ctx)
-                                (identical? db (::sql/catalog-source (meta parsed)))
-                                (catalog/statement-stable-catalogs? cats))
+                       (cond
+                         catalog-input catalog-input
+                         (and (not (:catalog-read? parsed))
+                              (:reuse-statement-catalogs? ctx)
+                              (identical? db (::sql/catalog-source (meta parsed)))
+                              (catalog/statement-stable-catalogs? cats))
                          enriched-db
-                         (sql/enrich-db-with-catalogs db (dbi/-schema db) cats))
+                         :else (sql/enrich-db-with-catalogs db (dbi/-schema db) cats))
                        (or enriched-db db))
             ;; Parameterised recursive CTEs: enriched-db carries the CTE
             ;; schema from parse, but the rows depend on `$n` (bound only
@@ -9123,8 +9115,8 @@
                 ;; Runtime subquery closures execute inside d/q. Bind the
                 ;; statement's effective query DB, not merely the connection's
                 ;; raw snapshot: CTEs and derived relations live in `query-db`.
-                (binding [params/*runtime-db* query-db
-                          regoid/*db* query-db
+                (binding [params/*runtime-db* (if catalog-input db query-db)
+                          regoid/*db* (if catalog-input db query-db)
                           regoid/*relation-db* (or regoid/*relation-db* regoid/*db* db)]
                   (if (seq args)
                     (run-param-query q-input #(apply d/q q-input query-db args))
@@ -15475,7 +15467,7 @@
                        (visible-session-schema schema temp-tables db)
                        schema)
         parsed (binding [params/*temp-table-map* mapping]
-                 (sql/parse-sql sql parse-schema db))]
+                 (sql/parse-sql sql parse-schema db true))]
     ;; Preserve the ordinary parser's schema identity and deferred values for
     ;; sessions with no temp namespace. Rewriting is only needed once a temp
     ;; table exists or for the CREATE that introduces one.

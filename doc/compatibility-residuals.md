@@ -195,6 +195,27 @@ The live Odoo 19 boot at `007e86391e14` created the barcode expression
 index and proceeded to add foreign keys. The 21 caught inherited-column
 `SET NOT NULL` errors still recur.
 
+### Odoo foreign-key reflection and inherited primary keys
+
+The wire executor can look up foreign keys by child relation name and
+follow their relation OIDs to both sides of the key. It resolves the
+names against the execution snapshot, including for prepared queries.
+Unrestricted catalog scans and queries that also read user tables use
+the existing catalog projection.
+
+Odoo 19 at `007e86391e14` reached the FK from
+`ir_act_window_group_rel.act_id` to `ir_act_window.id` in a fresh base
+installation. It stopped with 42830 before TestORM. The target table was
+created with `CREATE TABLE ir_act_window (PRIMARY KEY (id)) INHERITS (ir_actions)`. Its child-local
+primary key must be available as a foreign-key target. The trace also
+recorded 87 reads of `information_schema.columns` by table name, taking
+about 29 seconds together in this run.
+
+The PostgreSQL 18.6 `alter_table.sql` statements at lines 2186–2187
+cover preservation of the explicit name on an inline foreign key. The
+adapter gate checks the name in `pg_constraint` and drops the constraint
+by that name.
+
 ### asyncpg expected failures by owning ID
 
 | Area | IDs | Observed causes |
