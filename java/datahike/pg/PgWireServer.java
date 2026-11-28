@@ -428,15 +428,6 @@ public final class PgWireServer {
         Object parsed;  // opaque; handler-specific; replaced after DDL revalidation
         QueryResult resultDescription;
         Object planCacheToken;
-        /**
-         * Set to true once Describe('S', name) has emitted
-         * RowDescription for this statement. All Portals bound from
-         * it then skip RowDescription in Execute — PG's contract says
-         * if the client did any Describe (S or P), Execute sends only
-         * DataRows + CommandComplete.
-         */
-        boolean described;
-
         PreparedStmt(String sql, int[] paramOids, Object parsed,
                      QueryResult resultDescription, Object planCacheToken) {
             this.sql = sql;
@@ -444,7 +435,6 @@ public final class PgWireServer {
             this.parsed = parsed;
             this.resultDescription = resultDescription;
             this.planCacheToken = planCacheToken;
-            this.described = false;
         }
     }
 
@@ -467,8 +457,6 @@ public final class PgWireServer {
          * to encode each DataRow value as text or binary per OID.
          */
         final short[] resultFormats;
-        /** True once a Describe('P', …) has emitted RowDescription; Execute then skips it. */
-        boolean described;
         /**
          * A row-returning statement is executed once and retained while
          * Execute(maxRows) drains it. This is the eager backing for PostgreSQL
@@ -486,7 +474,6 @@ public final class PgWireServer {
             this.resultDescription = stmt.resultDescription;
             this.boundParams = boundParams;
             this.resultFormats = resultFormats;
-            this.described = false;
             this.activeResult = null;
             this.nextRow = 0;
             this.complete = false;
@@ -1127,6 +1114,7 @@ public final class PgWireServer {
     private static final class SimpleQuery {
         final String[] statements;
         int next;
+        String finalTag;
 
         SimpleQuery(String[] statements) {
             this.statements = statements;
@@ -1249,14 +1237,7 @@ public final class PgWireServer {
                 // (which clears the state and sends RFQ) and Terminate.
                 if (inError[0]) {
                     if (msgType == 'S') {
-                        // Drop any held extended-query state. The client
-                        // got no CommandCompletes for the held INSERTs
-                        // and no Parse/Bind/Describe responses for any
-                        // pre-Execute messages still in the cur buffer,
-                        // so dropping them keeps the wire response and
-                        // the persisted state in sync. Also drop the
-                        // handler's running speculative-db so the next
-                        // batch re-anchors on the live committed db.
+                        // Roll back the failed group at its Sync boundary.
                         extBatch.clear();
                         try { handler.discardBatch(); } catch (Exception ignore) {}
                         // The group errored — roll back the implicit
@@ -1299,7 +1280,7 @@ public final class PgWireServer {
                                             cr.sqlstate != null ? cr.sqlstate : "XX000",
                                             cr.error, cr.errorFields);
                                 } else {
-                                    sendCommandComplete(out,
+                                    completeSimpleCommand(out, copyState.simpleQuery,
                                             cr != null && cr.commandTag != null
                                                 ? cr.commandTag : "COPY 0");
                                 }
@@ -1326,11 +1307,11 @@ public final class PgWireServer {
                         copyState.simpleQuery = null;
                         if (failed && txStatus[0] == 'T') txStatus[0] = 'E';
                         if (simpleQuery == null) {
-                            handler.endQueryGroup();
-                            sendReadyForQuery(out, txStatus[0]);
+                            // Extended COPY finishes Execute. Sync ends the group.
+                            inError[0] = failed;
                             out.flush();
                         } else if (failed) {
-                            finishSimpleQuery(out, txStatus, handler, batch, true);
+                            finishSimpleQuery(out, txStatus, handler, batch, simpleQuery, true);
                         } else {
                             runSimpleQuery(simpleQuery, out, txStatus, handler, copyState, batch);
                         }
@@ -1411,6 +1392,15 @@ public final class PgWireServer {
                                 + " sqlstate=" + sqlstate + ": " + e.getMessage());
                         if (!(e instanceof PgProtocolException)) e.printStackTrace(System.err);
                     }
+                    if (msgType == 'P' || msgType == 'B' || msgType == 'D'
+                            || msgType == 'E' || msgType == 'C') {
+                        // Earlier messages succeeded even when this command fails.
+                        // Sync discards the group's speculative writes.
+                        for (byte[] bytes : extBatch.heldBytes) out.write(bytes);
+                        extBatch.cur.writeTo(out);
+                        extBatch.clear();
+                        inError[0] = true;
+                    }
                     sendError(out, "ERROR", sqlstate,
                             e.getMessage() != null ? e.getMessage() : e.getClass().getName(),
                             fields);
@@ -1421,13 +1411,6 @@ public final class PgWireServer {
                     if (txStatus[0] == 'T') {
                         handler.markTransactionFailed();
                         txStatus[0] = 'E';
-                    }
-                    // Extended-query messages enter error-skip mode; Simple Query
-                    // recovers on its own (handleQuery catches internally and
-                    // sends its own ReadyForQuery).
-                    if (msgType == 'P' || msgType == 'B' || msgType == 'D'
-                            || msgType == 'E' || msgType == 'C') {
-                        inError[0] = true;
                     }
                 }
                 // Statement-boundary cleanup (runs after success or
@@ -1970,7 +1953,7 @@ public final class PgWireServer {
                         errored = true;
                         break;
                     }
-                    sendCopyOut(out, result);
+                    sendCopyOut(out, result, query);
                 } else if (!result.returnsRows()) {
                     // Non-batchable single command (DDL, SET, BEGIN,
                     // …). Drain the held batch first so its rows are
@@ -1985,7 +1968,7 @@ public final class PgWireServer {
                         errored = true;
                         break;
                     }
-                    sendCommandComplete(out, result.commandTag);
+                    completeSimpleCommand(out, query, result.commandTag);
                 } else {
                     QueryResult flushErr = flushBatch(out, handler, batch);
                     if (flushErr != null) {
@@ -2002,7 +1985,7 @@ public final class PgWireServer {
                     for (String[] row : result.rows) {
                         sendDataRow(out, row);
                     }
-                    sendCommandComplete(out, result.commandTag);
+                    completeSimpleCommand(out, query, result.commandTag);
                 }
             } catch (Exception e) {
                 sendError(out, "ERROR", "XX000",
@@ -2012,23 +1995,20 @@ public final class PgWireServer {
             }
         }
 
-        finishSimpleQuery(out, txStatus, handler, batch, errored);
+        finishSimpleQuery(out, txStatus, handler, batch, query, errored);
     }
 
     private void finishSimpleQuery(DataOutputStream out, char[] txStatus, QueryHandler handler,
-                                   BatchBuffer batch, boolean errored) throws IOException {
-        // End-of-Q drain. On the error path the rows were never
-        // CommandComplete'd to the client, so dropping them keeps
-        // wire response and persisted state in sync. On the success
-        // path flushBatch emits the held CCs in arrival order before
-        // RFQ.
+                                   BatchBuffer batch, SimpleQuery query, boolean errored) throws IOException {
+        // Earlier statements can already have sent completions. The last
+        // command completes only after its implicit transaction succeeds.
         if (errored) {
             batch.clear();
             // The 'Q' errored → roll back its implicit transaction so the
             // whole multi-statement Q rolls back as a unit (PG).
             try { handler.rollbackImplicit(); } catch (Exception ignore) {}
         } else {
-            QueryResult flushErr = flushBatch(out, handler, batch);
+            QueryResult flushErr = flushBatch(out, handler, batch, query);
             if (flushErr != null) {
                 sendError(out, "ERROR",
                         flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
@@ -2045,6 +2025,8 @@ public final class PgWireServer {
                             implErr.sqlstate != null ? implErr.sqlstate : "XX000",
                             implErr.error, implErr.errorFields);
                     if (txStatus[0] == 'T') txStatus[0] = 'E';
+                } else if (query.finalTag != null) {
+                    sendCommandComplete(out, query.finalTag);
                 }
             }
         }
@@ -2576,7 +2558,7 @@ public final class PgWireServer {
         // code applying to all, or zero codes for all-text). Captured on
         // the Portal so sendDataRow can encode each column as the client
         // requested — matching the format field we advertise in
-        // RowDescription at Execute time.
+        // the portal RowDescription at Describe time.
         short[] resultFormats;
         if (buf.hasRemaining()) {
             short numResultFormats = buf.getShort();
@@ -2671,23 +2653,6 @@ public final class PgWireServer {
                               meta.columnTableOids, meta.columnAttnums,
                               meta.columnTypmods, resultFormats);
             trace("send RowDescription cols=" + meta.columnNames.length);
-            // Mark BOTH the portal and the underlying statement as
-            // described. pgJDBC caches row metadata per-statement: once
-            // it has seen RowDescription for a server-side prepared
-            // statement, it expects subsequent re-Binds + Executes of
-            // the same statement to skip RowDescription (it parses the
-            // responses against the cached metadata). Sending a
-            // duplicate RowDescription on iteration 2+ leaves pgJDBC's
-            // response queue empty when it tries to consume the (not-
-            // expected) RowDescription — manifests as NoSuchElement on
-            // its internal ArrayDeque. Mirrors PG backend behavior:
-            // once the frontend has received metadata for a statement,
-            // the backend doesn't resend it on re-Execute.
-            stmt.described = true;
-            if (descType == 'P') {
-                Portal p = portals.get(name);
-                if (p != null) p.described = true;
-            }
         }
         out.flush();
     }
@@ -2786,17 +2751,6 @@ public final class PgWireServer {
             extBatch.resetCur();
             sendCommandComplete(out, "SELECT 0");
         } else if (result.error != null) {
-            // Implicit-transaction semantics: an error anywhere in an
-            // extended-query message group (every message up to the next
-            // Sync) rolls the WHOLE group back, matching PostgreSQL. So
-            // we must NOT commit the held INSERTs — discard them (and the
-            // running speculative-db) and throw. The connection loop sends
-            // ErrorResponse and enters extended-query error-skip; the
-            // group-terminating Sync clears any remaining state. This is
-            // what makes a client's executemany atomic: one bad row rolls
-            // back every row in the batch.
-            extBatch.clear();
-            try { handler.discardBatch(); } catch (Exception ignore) {}
             throw new PgProtocolException(
                 result.sqlstate != null ? result.sqlstate : "XX000",
                 result.error,
@@ -2838,7 +2792,7 @@ public final class PgWireServer {
             }
             extBatch.cur.writeTo(out);
             extBatch.resetCur();
-            sendCopyOut(out, result);
+            sendCopyOut(out, result, null);
             return;
         } else if (!result.returnsRows()) {
             // Non-batchable command (DDL, BEGIN, COMMIT, …). Commit
@@ -2873,25 +2827,7 @@ public final class PgWireServer {
             }
             extBatch.cur.writeTo(out);
             extBatch.resetCur();
-            // PG contract: if Describe has already emitted RowDescription
-            // (either on the statement or the portal), Execute sends only
-            // DataRows + CommandComplete. Sending a duplicate leaves
-            // pgJDBC's response queue confused (NoSuchElementException
-            // on its internal ArrayDeque).
-            boolean alreadyDescribed = portal.described || portal.stmt.described;
-            if (!alreadyDescribed) {
-                sendRowDescription(out, result.columnNames, result.columnOids,
-                                  result.columnTableOids, result.columnAttnums,
-                                  result.columnTypmods,
-                                  portal.resultFormats);
-                trace("send RowDescription cols=" + result.columnNames.length);
-                // A RowDescription emitted by Execute belongs to this portal.
-                // Mark it so a resumed Execute sends only the next DataRows.
-                portal.described = true;
-            } else {
-                trace("skip RowDescription (already described: portal=" + portal.described
-                      + " stmt=" + portal.stmt.described + ")");
-            }
+            // Extended Execute sends tuples. Describe supplies their metadata.
             int start = portal.nextRow;
             // PostgreSQL's exec_execute_message maps every max_rows <= 0
             // value to FETCH_ALL, not only zero.
@@ -3054,6 +2990,11 @@ public final class PgWireServer {
      */
     private QueryResult flushBatch(DataOutputStream out, QueryHandler handler,
                                     BatchBuffer batch) throws IOException {
+        return flushBatch(out, handler, batch, null);
+    }
+
+    private QueryResult flushBatch(DataOutputStream out, QueryHandler handler,
+                                   BatchBuffer batch, SimpleQuery finalQuery) throws IOException {
         if (batch.isEmpty()) return null;
         java.util.List<Object> txData = new java.util.ArrayList<>(batch.txData);
         java.util.List<String> tags = new java.util.ArrayList<>(batch.heldTags);
@@ -3069,8 +3010,8 @@ public final class PgWireServer {
         if (res != null && res.error != null) {
             return res;
         }
-        for (String tag : tags) {
-            sendCommandComplete(out, tag);
+        for (int i = 0; i < tags.size(); i++) {
+            completeSimpleCommand(out, i == tags.size() - 1 ? finalQuery : null, tags.get(i));
         }
         return null;
     }
@@ -3218,6 +3159,16 @@ public final class PgWireServer {
         sendDataRow(out, values, null, null);
     }
 
+    // PostgreSQL finishes the last simple-query transaction before EndCommand.
+    // Data rows can stream earlier. A commit error replaces the final tag.
+    private void completeSimpleCommand(DataOutputStream out, SimpleQuery query, String tag) throws IOException {
+        if (query != null && query.next == query.statements.length) {
+            query.finalTag = tag;
+        } else {
+            sendCommandComplete(out, tag);
+        }
+    }
+
     private void sendCommandComplete(DataOutputStream out, String tag) throws IOException {
         byte[] tagBytes = tag.getBytes(StandardCharsets.UTF_8);
         out.writeByte('C');
@@ -3299,7 +3250,7 @@ public final class PgWireServer {
      * the way COPY FROM STDIN does, because the server is the one
      * doing the talking.
      */
-    private void sendCopyOut(DataOutputStream out, QueryResult result) throws IOException {
+    private void sendCopyOut(DataOutputStream out, QueryResult result, SimpleQuery query) throws IOException {
         sendCopyOutResponse(out, result.copyColumnCount);
         if (result.copyOutLines != null) {
             for (String line : result.copyOutLines) {
@@ -3307,7 +3258,7 @@ public final class PgWireServer {
             }
         }
         sendCopyDone(out);
-        sendCommandComplete(out, result.commandTag);
+        completeSimpleCommand(out, query, result.commandTag);
     }
 
     /**

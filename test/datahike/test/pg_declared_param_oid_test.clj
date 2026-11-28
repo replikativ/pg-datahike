@@ -1135,3 +1135,95 @@
       (send-copy-data! out "1\n")
       (is (= [\C \G] (mapv first (read-until-tags in #{\G \Z}))))))
   (is (= [["0"]] (:rows (simple "SELECT count(*) FROM copy_group")))))
+
+(deftest simple-query-final-completion-requires-a-successful-implicit-commit
+  (simple "CREATE TABLE commit_probe (id serial PRIMARY KEY, payload int)")
+  (with-conn
+    (fn [in out]
+      (let [query (fn [sql]
+                    (send-msg! out \Q (cstr sql))
+                    (read-until-ready in))
+            fail-commit (fn [& _] (throw (ex-info "commit rejected" {:sqlstate "40001"})))]
+        (doseq [[sql tags] [["INSERT INTO commit_probe(payload) VALUES(1)" [\E \Z]]
+                            ["INSERT INTO commit_probe(payload) VALUES(2) RETURNING id" [\T \D \E \Z]]
+                            ["INSERT INTO commit_probe(payload) VALUES(3); SELECT 7" [\C \T \D \E \Z]]]]
+          (let [msgs (with-redefs-fn {#'pg/transact-tx-buffer! fail-commit} #(query sql))]
+            (is (= tags (mapv first msgs)))
+            (is (= "40001" (get-in (decode msgs) [:error \C])))
+            (is (= \I (ready-status msgs)))))
+        (is (= [["0"]] (:rows (decode (query "SELECT count(*) FROM commit_probe")))))
+        ;; Each sequence reservation succeeded before its row commit failed.
+        (is (= [["3"]] (:rows (decode (query "SELECT currval('commit_probe_id_seq')")))))))))
+
+(deftest final-copy-completion-requires-a-successful-implicit-commit
+  (simple "CREATE TABLE copy_at_commit (id int PRIMARY KEY)")
+  (doseq [from? [true false]]
+    (with-conn
+      (fn [in out]
+        (with-redefs-fn
+          {#'pg/transact-tx-buffer! (fn [& _] (throw (ex-info "commit rejected" {:sqlstate "40001"})))}
+          (fn []
+            (send-msg! out \Q (cstr (str "INSERT INTO copy_at_commit VALUES(1); COPY copy_at_commit "
+                                         (if from? "FROM STDIN" "TO STDOUT"))))
+            (when from?
+              (is (= [\C \G] (mapv first (read-until-tags in #{\G \Z}))))
+              (send-copy-data! out "2\n"))
+            (let [msgs (read-until-ready in)]
+              (is (= (if from? [\E \Z] [\C \H \d \c \E \Z]) (mapv first msgs)))
+              (is (= "40001" (get-in (decode msgs) [:error \C]))))))
+        (is (= [["0"]] (:rows (simple "SELECT count(*) FROM copy_at_commit"))))))))
+
+(deftest execute-and-explicit-transaction-completions-can-precede-commit
+  (simple "CREATE TABLE commit_boundary (id int PRIMARY KEY)")
+  (with-conn
+    (fn [in out]
+      (let [query (fn [sql]
+                    (send-msg! out \Q (cstr sql))
+                    (read-until-ready in))
+            fail-commit (fn [& _] (throw (ex-info "commit rejected" {:sqlstate "40001"})))]
+        (with-redefs-fn {#'pg/transact-tx-buffer! fail-commit}
+          (fn []
+            (send-msg! out \P (ba (cstr "ins") (cstr "INSERT INTO commit_boundary VALUES(1) RETURNING id") [:i16 0]))
+            (send-bind-execute-sync! out "ins" [])
+            (let [msgs (read-until-ready in)]
+              (is (= [\1 \2 \D \C \E \Z] (mapv first msgs)))
+              (is (= "40001" (get-in (decode msgs) [:error \C])))
+              (is (= \I (ready-status msgs))))
+            (is (= \T (ready-status (query "BEGIN"))))
+            (let [msgs (query "INSERT INTO commit_boundary VALUES(2) RETURNING id")]
+              (is (= [\T \D \C \Z] (mapv first msgs)))
+              (is (= \T (ready-status msgs))))
+            (let [msgs (query "COMMIT")]
+              (is (= [\E \Z] (mapv first msgs)))
+              (is (= "40001" (get-in (decode msgs) [:error \C])))
+              (is (= \I (ready-status msgs))))))
+        (is (= [["0"]] (:rows (decode (query "SELECT count(*) FROM commit_boundary")))))))))
+
+(deftest extended-copy-completion-and-error-resynchronize-at-sync
+  (simple "CREATE TABLE copy_sync (id int PRIMARY KEY)")
+  (with-conn
+    (fn [in out]
+      (let [execute (fn [sql]
+                      (send-msg! out \P (ba (cstr "") (cstr sql) [:i16 0]))
+                      (send-msg! out \B (bind-body "" []))
+                      (send-msg! out \E (ba (cstr "") [:i32 0])))]
+        (doseq [mode [:success :copy-fail :subsequent-error]]
+          (execute "COPY copy_sync FROM STDIN")
+          (send-msg! out \H (byte-array 0))
+          (is (= [\1 \2 \G] (mapv first (read-until-tags in #{\G \Z}))))
+          (if (= mode :copy-fail)
+            (send-msg! out \f (cstr "cancelled"))
+            (do (send-copy-data! out (if (= mode :success) "1\n" "4\n"))
+                (send-msg! out \H (byte-array 0))
+                (is (= [\C] (mapv first (read-until-tags in #{\C \Z}))))
+                (let [peer (simple "SELECT id FROM copy_sync ORDER BY id")]
+                  (is (nil? (:error peer)))
+                  (is (= (if (= mode :success) [] [["1"] ["2"]]) (vec (:rows peer)))))))
+          (execute (if (= mode :copy-fail) "INSERT INTO copy_sync VALUES(3)" "INSERT INTO copy_sync VALUES(2)"))
+          (send-msg! out \S (byte-array 0))
+          (let [msgs (read-until-ready in)]
+            (is (= (case mode :copy-fail [\E \Z] :success [\1 \2 \C \Z] :subsequent-error [\1 \2 \E \Z]) (mapv first msgs)))
+            (is (= (case mode :copy-fail "57014" :subsequent-error "23505" nil)
+                   (get-in (decode msgs) [:error \C])))
+            (is (= \I (ready-status msgs))))
+          (is (= [["1"] ["2"]] (:rows (simple "SELECT id FROM copy_sync ORDER BY id")))))))))

@@ -7629,7 +7629,7 @@
           (restore-temp-tables! tx-state temp-tables)
           (guc/rollback! session-state)
           (end-tx! session-id tx-state cursors)
-          (classified-error "COMMIT failed: " e))))
+          (tag-tx-status (classified-error "COMMIT failed: " e) tx-state))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
@@ -16846,7 +16846,7 @@
                                      (not *snapshot-db*)
                                      (not (:in-tx? @tx-state))
                                      (or (contains? write-parse-types (:type parsed))
-                                         (and (= :simple-multi *implicit-tx-group*)
+                                         (and (#{:simple-multi :extended} *implicit-tx-group*)
                                               (copy-from? parsed))))
                             (open-implicit-tx! ctx))
                           (binding [params/*runtime-db* db
