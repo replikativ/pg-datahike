@@ -14,6 +14,11 @@ The harness exits 0 when it sees this line. `PASS_FLOOR` (default 9)
 is the floor below which the runner reports a failure. Record the actual
 exit status and test summary when refreshing this evidence.
 
+A fresh run on Odoo 19 commit `007e86391e14` with the transactional
+index and nested membership fixes also passed all 11 tests and exited 0
+with `--init=base --test-tags=:TestORM --skip-auto-install`.
+The default run additionally initializes auto-installed modules, including web.
+
 ## Resolved blockers (history)
 
 The prior `feature/postgres-wire-protocol` branch in `datahike`

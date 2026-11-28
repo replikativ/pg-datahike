@@ -53,7 +53,7 @@ A passing run proves that:
    from `feature/postgres-wire-protocol`'s exploratory work, **9/11
    passing** is the floor; below that is a regression.
 
-The 2 known-failing tests are tracked in `expected-skips.md`.
+The archived and current TestORM results are recorded in `expected-skips.md`.
 
 ## Re-running after pg-datahike changes
 

@@ -352,3 +352,30 @@
       (is (nil? (state (execute "CREATE TABLE guard_related_fk (pid int REFERENCES guard_existing(id))"))))
       (is (false? (basis/compatible? before-fk @*conn*))))))
 
+(deftest serial-upsert-after-private-index-creation
+  (is (nil? (state (execute "CREATE TABLE external_ids
+                             (id serial PRIMARY KEY, module text, name text, value int)"))))
+  (is (nil? (state (execute "INSERT INTO external_ids(module,name,value)
+                             VALUES ('base','group',1)"))))
+  (is (nil? (state (execute "BEGIN"))))
+  (is (nil? (state (execute "CREATE UNIQUE INDEX external_ids_key ON external_ids(module,name)"))))
+  (let [result (execute "INSERT INTO external_ids(module,name,value)
+                         VALUES ('base','group',1), ('base','new',2)
+                         ON CONFLICT (module,name) DO UPDATE SET value=excluded.value
+                         WHERE external_ids.value != excluded.value RETURNING id")]
+    (is (nil? (state result)))
+    (is (= [["3"]] (rows result))))
+  (is (nil? (state (execute "COMMIT"))))
+  (is (= [["1" "group"] ["3" "new"]]
+         (rows (execute "SELECT id,name FROM external_ids ORDER BY id"))))
+  (is (= [["4"]] (rows (execute "SELECT nextval('external_ids_id_seq')")))))
+
+(deftest private-index-does-not-hide-concurrent-target-drift
+  (is (nil? (state (execute "CREATE TABLE drift_rows(id serial PRIMARY KEY, a int, b int)"))))
+  (is (nil? (state (execute "BEGIN"))))
+  (is (nil? (state (execute "CREATE UNIQUE INDEX drift_rows_key ON drift_rows(a,b)"))))
+  (is (nil? (state (execute "INSERT INTO drift_rows(a,b) VALUES (1,2)
+                             ON CONFLICT (a,b) DO NOTHING"))))
+  (require-b!)
+  (is (= "40001" (state (execute "COMMIT"))))
+  (is (= [] (rows (execute "SELECT id FROM drift_rows")))))

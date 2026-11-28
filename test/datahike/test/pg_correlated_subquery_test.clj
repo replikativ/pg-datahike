@@ -1266,3 +1266,52 @@
       (is (= [["1"]] (rows c (str "SELECT k FROM owners WHERE EXISTS " body))))
       (is (= [["2"] ["2"] [nil]]
              (rows c (str "SELECT k FROM owners WHERE NOT EXISTS " body " ORDER BY k NULLS LAST")))))))
+
+(deftest odoo-user-group-membership-nested-in
+  (with-open [c (jdbc)]
+    (doseq [sql ["CREATE TABLE res_users(id int PRIMARY KEY, active bool)"
+                 "CREATE TABLE res_groups(id int PRIMARY KEY)"
+                 "CREATE TABLE res_groups_users_rel(uid int REFERENCES res_users(id), gid int REFERENCES res_groups(id))"
+                 "INSERT INTO res_users VALUES (1,false),(2,true),(3,true),(4,true)"
+                 "INSERT INTO res_groups VALUES (1),(2),(4),(10),(11)"
+                 "INSERT INTO res_groups_users_rel VALUES (1,1),(1,10),(2,1),(3,1),(3,10),(4,10),(4,11)"]]
+      (exec! c sql))
+    (is (= [["3"]] (rows c "SELECT res_users.id FROM res_users WHERE (res_users.active IS TRUE
+                     AND EXISTS (SELECT 1 FROM res_groups_users_rel AS res_users__group_ids
+                               WHERE res_users__group_ids.uid = res_users.id AND res_users__group_ids.gid IN (1))
+                     AND ((EXISTS (SELECT 1 FROM res_groups_users_rel AS res_users__group_ids
+                               WHERE res_users__group_ids.uid = res_users.id AND res_users__group_ids.gid IN
+                                     (SELECT res_groups.id FROM res_groups WHERE res_groups.id IN (1, 2, 4)))
+                     AND EXISTS (SELECT 1 FROM res_groups_users_rel AS res_users__group_ids
+                               WHERE res_users__group_ids.uid = res_users.id AND res_users__group_ids.gid IN
+                                     (SELECT res_groups.id FROM res_groups WHERE res_groups.id IN (10, 11))))
+                       OR (EXISTS (SELECT 1 FROM res_groups_users_rel AS res_users__group_ids
+                               WHERE res_users__group_ids.uid = res_users.id AND res_users__group_ids.gid IN
+                                     (SELECT res_groups.id FROM res_groups WHERE res_groups.id IN (10)))
+                     AND EXISTS (SELECT 1 FROM res_groups_users_rel AS res_users__group_ids
+                               WHERE res_users__group_ids.uid = res_users.id AND res_users__group_ids.gid IN
+                                     (SELECT res_groups.id FROM res_groups WHERE res_groups.id IN (11))))))
+                   ORDER BY res_users.id   LIMIT 1")))))
+
+(deftest nested-membership-keeps-null-and-row-scope
+  (with-open [c (jdbc)]
+    (doseq [sql ["CREATE TABLE users (id int)"
+                 "CREATE TABLE links (owner int, group_id int)"
+                 "CREATE TABLE roles (id int)"
+                 "INSERT INTO users VALUES (1),(2),(3),(NULL)"
+                 "INSERT INTO links VALUES (1,11),(2,12),(3,NULL),(NULL,11)"
+                 "INSERT INTO roles VALUES (11),(NULL)"]]
+      (exec! c sql))
+    (let [query (fn [exists in]
+                  (str "SELECT u.id FROM users u WHERE " exists
+                       " (SELECT 1 FROM links l WHERE l.owner=u.id AND l.group_id "
+                       in " (SELECT id FROM roles)) ORDER BY u.id NULLS LAST"))]
+      (is (= [["1"]] (rows c (query "EXISTS" "IN"))))
+      (is (= [] (rows c (query "EXISTS" "NOT IN"))))
+      (is (= [["2"] ["3"] [nil]] (rows c (query "NOT EXISTS" "IN"))))
+      (exec! c "DELETE FROM roles")
+      ;; SQL's NULL NOT IN (empty set) is true for the NULL group in links.
+      (is (= [["1"] ["2"] ["3"]] (rows c (query "EXISTS" "NOT IN")))))
+    (is (= "0A000" (sqlstate c "SELECT u.id FROM users u WHERE EXISTS (
+                                  SELECT 1 FROM links l WHERE l.owner=u.id AND l.group_id IN (
+                                    SELECT l.owner FROM roles))")))))

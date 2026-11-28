@@ -101,6 +101,9 @@
   {:id :foreign-key-delete-set-null
    :file "foreign_key" :lines [1510 1513] :state :covered :impact :wrong-result
    :detail "The ordinary-table composite-key case clears both child columns and preserves the row. The gate uses a non-partitioned fixture; PostgreSQL's partition routing and action column lists remain open."}
+  {:id :new-table-index-includes-earlier-writes
+   :file "alter_table" :lines [2349 2351] :state :covered :impact :wrong-result
+   :detail "The CREATE, INSERT and CREATE UNIQUE INDEX sequence also runs in one SQL transaction. Indexed equality reads find the earlier rows after commit and the index rejects duplicates. The Odoo gate covers two composite indexes on its external-ID registry."}
   {:id :alter-column-nullability
    :file "alter_table" :lines [876 908] :state :covered :impact :wrong-result
    :detail "SET and DROP NOT NULL on ordinary tables update enforcement and the catalog together. The gate checks rejecting existing NULL rows, atomic failure with multiple ALTER actions, and visibility before and after rollback."}

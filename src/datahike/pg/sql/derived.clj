@@ -12,9 +12,9 @@
             [datahike.pg.types :as types])
   (:import [datahike.db DB]
            [net.sf.jsqlparser.schema Column Table]
-           [net.sf.jsqlparser.expression Alias BooleanValue JdbcParameter LongValue NotExpression SignedExpression]
+           [net.sf.jsqlparser.expression Alias BooleanValue JdbcParameter LongValue NotExpression NullValue SignedExpression]
            [net.sf.jsqlparser.expression.operators.conditional AndExpression]
-           [net.sf.jsqlparser.expression.operators.relational EqualsTo ExistsExpression IsNullExpression ParenthesedExpressionList]
+           [net.sf.jsqlparser.expression.operators.relational EqualsTo ExistsExpression InExpression IsNullExpression ParenthesedExpressionList]
            [net.sf.jsqlparser.statement.select PlainSelect ParenthesedSelect LateralSubSelect Join Select SelectItem]))
 
 (set! *warn-on-reflection* true)
@@ -389,6 +389,41 @@
                                (conjuncts (.getWhere inner))))
               [{:keys-select inner :outer outer :negated? negated?}])))))))
 
+(declare ^:private local-key-filter?)
+
+(defn- local-membership? [^InExpression predicate src env]
+  (let [col (.getLeftExpression predicate)
+        rhs (.getRightExpression predicate)
+        column (when (instance? Column col) (resolve-base [src] col))]
+    (when (and (integral-column? column)
+               (not (.isGlobal predicate)) (zero? (.getOldOracleJoinSyntax predicate))
+               (zero? (.getOraclePriorPosition predicate)))
+      (cond
+        (instance? ParenthesedExpressionList rhs)
+        (every? (fn [item]
+                  (or (instance? NullValue item)
+                      (let [value (literal item)]
+                        (and (contains? value :integer) (compatible? (:oid column) value)))))
+                rhs)
+
+        (and (= ParenthesedSelect (class rhs)) (select-boundary? rhs))
+        (let [^PlainSelect body (.getSelect ^ParenthesedSelect rhs)]
+          (when (and (single-source? body)
+                     (instance? Table (.getFromItem body))
+                     (= 1 (count (.getSelectItems body))))
+            (let [inner (apply source (.getFromItem body) env)
+                  projection (.getExpression ^SelectItem (first (.getSelectItems body)))]
+              (and inner (instance? Column projection)
+                   (integral-column? (resolve-base [inner] projection))
+                   ;; Every inner column must belong to this relation. Preserve
+                   ;; SQL's IN/NOT IN and NULL semantics in the original filter.
+                   (every? #(local-key-filter? % inner env)
+                           (conjuncts (.getWhere body)))))))))))
+
+(defn- local-key-filter? [term src env]
+  (or (local-not-null? term src)
+      (and (instance? InExpression term) (local-membership? term src env))))
+
 (defn- base-key-probes [^PlainSelect ps ^Table table outers negated? env]
   (when-let [src (apply source table env)]
     (let [outers (disj outers (:alias src))
@@ -396,7 +431,7 @@
           local-key? #(integral-column? (resolve-base [src] %))
           equalities (keep #(equality-key % local-key? outers) terms)
           [key outer] (first equalities)
-          filters (filter #(local-not-null? % src) terms)
+          filters (filter #(local-key-filter? % src env) terms)
           sublinks (keep sublink terms)]
       (when (and (= 1 (count equalities))
                  (= (count terms) (+ 1 (count filters) (count sublinks)))

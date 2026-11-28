@@ -374,6 +374,10 @@
        :source-lines [22 22]
        :gate "test/datahike/test/pg_catalog_columns_test.clj"
        :test-var "table-columns-cannot-shadow-system-columns"}
+      {:id :new-table-index-includes-earlier-writes
+       :source-lines [2349 2351]
+       :gate "test/datahike/test/pg_unique_index_test.clj"
+       :test-var "new-table-index-includes-earlier-writes-at-commit"}
       {:id :alter-column-nullability
        :source-lines [876 908]
        :gate "test/datahike/test/pg_constraints_test.clj"

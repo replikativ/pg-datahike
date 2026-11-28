@@ -174,3 +174,59 @@
     (is (= "2" (aget ^"[Ljava.lang.String;"
                 (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_ine')"))) 0))
         "counter preserved across IF NOT EXISTS retry (no reset to 100)")))
+
+(deftest migration-can-reserve-committed-ids-after-declaring-a-private-serial
+  (let [handler (pg/make-query-handler *conn*)
+        run (fn [sql]
+              (let [^PgWireServer$QueryResult r (.execute handler sql)]
+                (is (nil? (.-sqlstate r)) (str sql " " (.-error r)))
+                (mapv vec (.-rows r))))]
+    (run "CREATE TABLE company (id int PRIMARY KEY, paper int)")
+    (run "INSERT INTO company VALUES (1,0)")
+    (run "CREATE SEQUENCE existing")
+    (run "BEGIN")
+    (run "CREATE TABLE new_module (id serial PRIMARY KEY)")
+    (is (= [["1"]] (run "SELECT nextval('new_module_id_seq')")))
+    (run "SAVEPOINT before_ids")
+    ;; Force eviction after each reservation. ROLLBACK TO must keep the
+    ;; sequence-only watermark even though these reservations survive.
+    (with-redefs-fn {#'pg/recent-commit-ring-size 1}
+      #(do (run "SELECT nextval('existing')")
+           (run "SELECT nextval('existing')")
+           (run "ROLLBACK TO before_ids")
+           (run "UPDATE company SET paper = v.paper FROM (VALUES (1,9)) v(id,paper)
+                 WHERE company.id = v.id")
+           (run "COMMIT")))
+    (is (= [["9"]] (run "SELECT paper FROM company")))
+    (is (= [["2"]] (run "SELECT nextval('new_module_id_seq')")))
+    (is (= [["3"]] (run "SELECT nextval('existing')")))))
+
+(deftest buffered-write-to-committed-sequence-still-conflicts
+  (let [a (pg/make-query-handler *conn*)
+        b (pg/make-query-handler *conn*)
+        run (fn [handler sql] (.execute handler sql))]
+    (doseq [sql ["CREATE SEQUENCE shared_seq" "BEGIN"
+                 "CREATE TABLE private_module (id serial PRIMARY KEY)"
+                 "SELECT nextval('shared_seq')"
+                 "SELECT setval('shared_seq',100)"]]
+      (is (nil? (.-error ^PgWireServer$QueryResult (run a sql))) sql))
+    (is (= [["2"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run b "SELECT nextval('shared_seq')")))))
+    ;; This reservation must check the SETVAL appended after the first
+    ;; checkpoint. Publishing its watermark would let COMMIT overwrite it.
+    (is (= [["3"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run a "SELECT nextval('shared_seq')")))))
+    (is (= "40001" (.-sqlstate ^PgWireServer$QueryResult (run a "COMMIT"))))
+    (is (= [["4"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run b "SELECT nextval('shared_seq')")))))))
+
+(deftest reservation-checkpoint-retains-a-concurrent-row-write
+  (let [h (pg/make-query-handler *conn*)]
+    (doseq [sql ["CREATE SEQUENCE existing" "CREATE TABLE company (id int PRIMARY KEY, paper int)"
+                 "INSERT INTO company VALUES (1,0)" "BEGIN" "CREATE TABLE new_module (id serial)"
+                 "UPDATE company SET paper=8 WHERE id=1" "SELECT nextval('existing')"]]
+      (is (nil? (.-error ^PgWireServer$QueryResult (.execute h sql))) sql))
+    ;; A native writer can change the locked SQL row. Its unrecorded commit
+    ;; breaks the chain just after a successfully checked buffer prefix.
+    (let [eid (d/q '[:find ?e . :where [?e :company/id 1]] (d/db *conn*))]
+      (d/transact *conn* [[:db/add eid :company/paper 9]]))
+    (is (nil? (.-error ^PgWireServer$QueryResult (.execute h "SELECT nextval('existing')"))))
+    (is (= "40001" (.-sqlstate ^PgWireServer$QueryResult (.execute h "COMMIT"))))
+    (is (= [["9"]] (mapv vec (.-rows ^PgWireServer$QueryResult (.execute h "SELECT paper FROM company")))))))
