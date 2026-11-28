@@ -7,7 +7,8 @@
             [datahike.db.interface :as dbi]
             [datahike.pg.cache :as cache]
             [datahike.pg.catalog.basis :as basis]
-            [datahike.pg.catalog.objects :as objects]))
+            [datahike.pg.catalog.objects :as objects])
+  (:import [datahike.java IEntity]))
 
 (def predicate-id ::indexes)
 
@@ -256,10 +257,20 @@
 (defn own-row? [db descriptor eid]
   (physical-row? descriptor (d/entity db eid)))
 
+(defn- reference-id [db value]
+  (cond
+    (nil? value) nil
+    (instance? IEntity value) (:db/id value)
+    (number? value) value
+    :else (:db/id (d/entity db value))))
+
 (defn- row-key-values [db descriptor eid]
   (let [entity (d/entity db eid)]
     (when (physical-row? descriptor entity)
-      (let [values (mapv #(get entity %) (:attrs descriptor))]
+      (let [values (mapv (fn [attr]
+                           (let [value (get entity attr)]
+                             (if (instance? IEntity value) (reference-id db value) value)))
+                         (:attrs descriptor))]
         ;; PostgreSQL UNIQUE indexes use NULLS DISTINCT unless explicitly
         ;; declared otherwise (that syntax is rejected by the DDL parser).
         (when (every? some? values) values)))))
@@ -326,6 +337,7 @@
   ([db table] (conflict-lookup db table nil))
   ([db table descriptor]
    (let [schema (dbi/-schema db)
+         reference-attrs (or (dbi/-attrs-by db :db.type/ref) #{})
          table-descriptor (delay (or descriptor
                                      {:table table :marker (keyword table "db-row-exists")
                                       :descendant-markers
@@ -333,37 +345,44 @@
                                             (descendant-tables db table))}))
          groups (volatile! {})]
      (fn [attrs values & [except-eid]]
-       (when (and (seq attrs) (every? some? values))
-         (let [descriptor (assoc @table-descriptor :attrs attrs)
-               key (mapv canonical-key-value values)
-               probes (keep-indexed
-                       (fn [i attr]
-                         (let [entry (get schema attr)
-                               value (nth values i)]
-                           (when (and (or (:db/index entry) (:db/unique entry))
-                                      (index-probe-safe? value))
-                             [i (d/datoms db :avet attr value)])))
-                       attrs)]
-           (if-let [[_ hits] (some (fn [[_ hits :as probe]]
-                                     (when-not (next hits) probe))
-                                   probes)]
-             (when-let [hit (first hits)]
-               (let [eid (.-e ^datahike.datom.Datom hit)]
-                 (when (and (not= except-eid eid) (= key (row-key db descriptor eid))) eid)))
-             (let [[i hits] (first probes)
-                   group (if i [attrs i (nth key i)] [attrs])
-                   by-key
-                   (or (get @groups group)
-                       (let [eids (if i
-                                    (map #(.-e ^datahike.datom.Datom %) hits)
-                                    (table-eids db descriptor))
-                             m (index-row-keys db descriptor eids)]
-                         (vswap! groups assoc group m)
-                         m))
-                   found (get by-key key)]
-               (if (vector? found)
-                 (if (= except-eid (first found)) (second found) (first found))
-                 (when (not= except-eid found) found))))))))))
+       (let [values (if (some reference-attrs attrs)
+                      (mapv (fn [attr value]
+                              (if (contains? reference-attrs attr)
+                                (reference-id db value)
+                                value))
+                            attrs values)
+                      values)]
+         (when (and (seq attrs) (every? some? values))
+           (let [descriptor (assoc @table-descriptor :attrs attrs)
+                 key (mapv canonical-key-value values)
+                 probes (keep-indexed
+                         (fn [i attr]
+                           (let [entry (get schema attr)
+                                 value (nth values i)]
+                             (when (and (or (:db/index entry) (:db/unique entry))
+                                        (index-probe-safe? value))
+                               [i (d/datoms db :avet attr value)])))
+                         attrs)]
+             (if-let [[_ hits] (some (fn [[_ hits :as probe]]
+                                       (when-not (next hits) probe))
+                                     probes)]
+               (when-let [hit (first hits)]
+                 (let [eid (.-e ^datahike.datom.Datom hit)]
+                   (when (and (not= except-eid eid) (= key (row-key db descriptor eid))) eid)))
+               (let [[i hits] (first probes)
+                     group (if i [attrs i (nth key i)] [attrs])
+                     by-key
+                     (or (get @groups group)
+                         (let [eids (if i
+                                      (map #(.-e ^datahike.datom.Datom %) hits)
+                                      (table-eids db descriptor))
+                               m (index-row-keys db descriptor eids)]
+                           (vswap! groups assoc group m)
+                           m))
+                     found (get by-key key)]
+                 (if (vector? found)
+                   (if (= except-eid (first found)) (second found) (first found))
+                   (when (not= except-eid found) found)))))))))))
 
 (defn- report-datoms [report]
   (filter #(instance? datahike.datom.Datom %)
