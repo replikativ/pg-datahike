@@ -174,3 +174,41 @@
     (is (= "2" (aget ^"[Ljava.lang.String;"
                 (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_ine')"))) 0))
         "counter preserved across IF NOT EXISTS retry (no reset to 100)")))
+
+(deftest migration-can-reserve-committed-ids-after-declaring-a-private-serial
+  (let [handler (pg/make-query-handler *conn*)
+        run (fn [sql]
+              (let [^PgWireServer$QueryResult r (.execute handler sql)]
+                (is (nil? (.-sqlstate r)) (str sql " " (.-error r)))
+                (mapv vec (.-rows r))))]
+    (run "CREATE TABLE company (id int PRIMARY KEY, paper int)")
+    (run "INSERT INTO company VALUES (1,0)")
+    (run "CREATE SEQUENCE existing")
+    (run "BEGIN")
+    (run "CREATE TABLE new_module (id serial PRIMARY KEY)")
+    (is (= [["1"]] (run "SELECT nextval('new_module_id_seq')")))
+    (run "SAVEPOINT before_ids")
+    ;; Force eviction after each reservation. ROLLBACK TO must keep the
+    ;; sequence-only watermark even though these reservations survive.
+    (with-redefs-fn {#'pg/recent-commit-ring-size 1}
+      #(do (run "SELECT nextval('existing')")
+           (run "SELECT nextval('existing')")
+           (run "ROLLBACK TO before_ids")
+           (run "UPDATE company SET paper = v.paper FROM (VALUES (1,9)) v(id,paper)
+                 WHERE company.id = v.id")
+           (run "COMMIT")))
+    (is (= [["9"]] (run "SELECT paper FROM company")))
+    (is (= [["2"]] (run "SELECT nextval('new_module_id_seq')")))
+    (is (= [["3"]] (run "SELECT nextval('existing')")))))
+
+(deftest buffered-write-to-committed-sequence-still-conflicts
+  (let [a (pg/make-query-handler *conn*)
+        b (pg/make-query-handler *conn*)
+        run (fn [handler sql] (.execute handler sql))]
+    (doseq [sql ["CREATE SEQUENCE shared_seq" "BEGIN"
+                 "CREATE TABLE private_module (id serial PRIMARY KEY)"
+                 "SELECT setval('shared_seq',100)"]]
+      (is (nil? (.-error ^PgWireServer$QueryResult (run a sql))) sql))
+    (is (= [["1"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run b "SELECT nextval('shared_seq')")))))
+    (is (= "40001" (.-sqlstate ^PgWireServer$QueryResult (run a "COMMIT"))))
+    (is (= [["2"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run b "SELECT nextval('shared_seq')")))))))

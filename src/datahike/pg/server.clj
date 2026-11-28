@@ -1416,7 +1416,13 @@
              (throw e))))
        (thunk)))))
 
-(declare direct-sequence-value-write?)
+(defn- direct-sequence-value-write?
+  "True when a buffered operation itself mutates sequence storage."
+  [op]
+  (or (and (map? op) (some #(contains? op %) sequence/position-attributes))
+      (and (vector? op)
+           (contains? #{:db/add :db/retract :db/cas :db.fn/cas} (first op))
+           (contains? sequence/position-attributes (nth op 2 nil)))))
 
 (def ^:dynamic ^:private *database-read-only?* false)
 
@@ -1491,7 +1497,9 @@
                                    (assoc :tx-meta {:db/txInstant *commit-instant*})))
          db-after (:db-after report)
          eas (if (and (seq tx-data)
-                      (every? direct-sequence-value-write? tx-data))
+                      ;; A map that initializes a sequence can also publish its
+                      ;; unique name or change another catalog attribute.
+                      (every? #(and (vector? %) (direct-sequence-value-write? %)) tx-data))
                ::sequence-only
                (committed-write-eas report tx-data))]
      (record-commit-writes! (db-ring-key db-after)
@@ -7323,6 +7331,24 @@
               []))])
     buffer))
 
+(defn- writes-committed-sequence? [db buffer]
+  ;; Only committed sequences can receive non-transactional reservations.
+  ;; CREATE TABLE ... SERIAL creates a named sequence in the private overlay.
+  ;; Its initial value and local nextval updates use its unique name and
+  ;; cannot touch any sequence in a proven sequence-only commit window.
+  (let [exists? (memoize #(and (get (dbi/-schema db) :__seq__/name)
+                               (seq (d/datoms db :avet :__seq__/name %))))]
+    (some (fn [op]
+            (when (direct-sequence-value-write? op)
+              (if (map? op)
+                ;; A declaration without an explicit EID can still upsert
+                ;; an existing entity through any of its unique attributes.
+                (or (:db/id op) (not= #{} (tx-buffer-eas [op] db)))
+                (let [ref (second op)]
+                  (or (not (and (vector? ref) (= :__seq__/name (first ref))))
+                      (exists? (second ref)))))))
+          buffer)))
+
 (defn- rebase-tx-state!
   "After a row-lock wait, the values this transaction has read are stale
    by exactly the awaited holder's commit. Re-anchor the speculative
@@ -7348,7 +7374,7 @@
                       conflict? (cond
                                   (= ::gap their) true
                                   (= ::sequence-only their)
-                                  (some direct-sequence-value-write? buf)
+                                  (writes-committed-sequence? base buf)
                                   (= ::opaque our-eas) true
                                   :else (eas-overlap? our-eas their))]
                   (when conflict?
@@ -7381,14 +7407,6 @@
   (and (vector? op)
        (= :db/add (first op))
        (= :datahike.pg.enum/unsafe-values (nth op 2 nil))))
-
-(defn- direct-sequence-value-write?
-  "True when a buffered operation itself mutates sequence storage."
-  [op]
-  (or (and (map? op) (some #(contains? op %) sequence/position-attributes))
-      (and (vector? op)
-           (contains? #{:db/add :db/retract :db/cas :db.fn/cas} (first op))
-           (contains? sequence/position-attributes (nth op 2 nil)))))
 
 (defn- durable-replay-buffer [buffer]
   ;; Only preceding marker adds owned by this buffer may be absent on replay.
@@ -7446,7 +7464,7 @@
                     ;; SQL transaction and only conflict with direct writes
                     ;; to the sequence's own storage.
                      (= ::sequence-only their-eas)
-                     (some direct-sequence-value-write? buf)
+                     (writes-committed-sequence? real-db buf)
 
                      (= ::opaque our-eas) true
 
@@ -8033,15 +8051,15 @@
    Bulk INSERT/COPY can reserve more values than the bounded recent-commit
    ring retains. Without this checkpoint, the transaction later sees a ring
    gap and aborts conservatively even though only non-transactional nextval
-   writes advanced the branch. Direct sequence mutations in the transaction
-   deliberately opt out because those do conflict with durable reservations."
+   writes advanced the branch. Buffered writes to committed sequence positions
+   opt out because they may conflict with durable reservations."
   [conn tx-state]
   (let [{:keys [in-tx? begin-max-tx tx-buffer]} @tx-state
         db-now (when in-tx? (d/db conn))
         current-max-tx (:max-tx db-now)]
     (when (and begin-max-tx current-max-tx
                (> (long current-max-tx) (long begin-max-tx))
-               (not-any? direct-sequence-value-write? tx-buffer)
+               (not (writes-committed-sequence? db-now tx-buffer))
                (= ::sequence-only
                   (ring-write-eas-graced (db-ring-key db-now)
                                          begin-max-tx current-max-tx)))
