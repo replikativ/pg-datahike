@@ -777,7 +777,7 @@
         eid (d/q '[:find ?e . :where [?e :t/id 1]] @*conn*)
         wrapped (fn [_] [[:db/add eid :t/n (swap! calls inc)]])]
     (with-open [h (pg/make-query-handler *conn*
-                    {:tx-wrap #(conj (vec %) [:db.fn/call wrapped])})]
+                                         {:tx-wrap #(conj (vec %) [:db.fn/call wrapped])})]
       (let [r (.execute h "INSERT INTO t(id,n) VALUES(1,20) ON CONFLICT(id) DO UPDATE SET n=excluded.n RETURNING n")]
         (is (nil? (.error r)))
         (is (= [["1"]] (mapv vec (.rows r)))))

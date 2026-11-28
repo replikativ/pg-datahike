@@ -2643,7 +2643,7 @@
                               :detail (str "Column \"" column "\" is a generated column.")})))
          attrs
          (reduce
-          (fn [attrs {:keys [attr default default-ast generated]}]
+          (fn [attrs {:keys [attr default default-ast generated input-type]}]
             (if generated
               attrs
               (let [present? (contains? attrs attr)
@@ -2655,7 +2655,7 @@
                                  (materialize-column-default default resolve-value
                                                              default-ast eval-expr)))
                     coerced (when (some? resolved)
-                              (#'stmt/coerce-insert-value resolved attr schema db))]
+                              (stmt/coerce-insert-value resolved attr schema db input-type))]
                 (cond-> attrs
                   (or present? default) (assoc attr coerced)))))
           candidate

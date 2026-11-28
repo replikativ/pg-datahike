@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Bulk upserts
+
+Multi-row inserts and upserts reuse the target columns’ PostgreSQL type
+metadata. Large embedded upserts can commit after reserving sequence values
+when those reservations are the only intervening writes.
+
 ### PostgreSQL transaction completion
 
 A simple query sends its final command tag after its implicit commit succeeds.

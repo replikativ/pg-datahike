@@ -8766,6 +8766,8 @@
 
 (defn coerce-insert-value
   "Coerce a value to match the schema type for an attribute.
+   An optional input-type descriptor supplies the PostgreSQL type and typmod
+   captured from the same database snapshot as the target column.
 
    `:db.type/ref` columns: SQL FK semantics says `INSERT/UPDATE … SET
    col = N` writes the target's PK value (matching what the
@@ -8776,7 +8778,7 @@
    read and write FK semantics symmetric. Falls through to the raw
    value when no target is resolvable (hint-only refs without a
    threaded db, or genuinely-unmapped refs)."
-  [val attr schema & [db]]
+  [val attr schema & [db input-type]]
   ;; The query engine's NULL sentinel is SQL NULL here too: INSERT ...
   ;; SELECT passed `:__null__` through as a value, and Datahike rejected it.
   (when (and (some? val) (not= :__null__ val))
@@ -8794,7 +8796,7 @@
             ;; only ever reached the INSERT translator, which is why
             ;; `numeric(p,s)` rounded on INSERT but not on UPDATE.
             typmod    (or (get-in schema [attr :pg/typmod])
-                          (params/pg-typmod-of-attr db attr))
+                          (if input-type (:pg/typmod input-type) (params/pg-typmod-of-attr db attr)))
             num-scale (or (second (when typmod (types/decode-numeric-typmod typmod)))
                           (get-in schema [attr :pg/numeric-scale]))
             num-prec  (or (first (when typmod (types/decode-numeric-typmod typmod)))
@@ -8810,7 +8812,7 @@
           ;; — i.e. for every client that is not psql. Absent metadata has to
           ;; mean "ask", not "not jsonb".
             pg-type   (or (get-in schema [attr :pg/type])
-                          (params/pg-type-of-attr db attr))
+                          (if input-type (:pg/type input-type) (params/pg-type-of-attr db attr)))
             ;; An array column's element type, from the same ident
             ;; entity: DDL names the array type `_<elem>`. Read from the
             ;; schema map alone, it was absent unless the caller had
@@ -9791,7 +9793,7 @@
   (row-constraints/prepare-candidate
    attrs constraint-plan
    (fn [value attr]
-     (coerce-insert-value value attr schema txdb))))
+     (coerce-insert-value value attr schema txdb (get (:input-types constraint-plan) attr)))))
 
 (defn- validate-conflict-row-constraints!
   [txdb table-name attrs constraint-plan effective-rows include-fk?]
@@ -10687,6 +10689,19 @@
                                (assoc target :value-expr value-expr))
                              targets row)
                        schema db)) rows))
+            ;; Resolve the ident metadata once for each VALUES target. A
+            ;; missing typmod (unbounded text, for example) is also a result.
+            value-targets
+            (if (and (not partial?) (empty? temp-table-map) (next rows))
+              (mapv (fn [{:keys [attr] :as target}]
+                      (let [column (get schema attr)]
+                        (if (and (:pg/type column) (:pg/typmod column))
+                          target
+                          (assoc target :input-type
+                                 (when-let [basis (or params/*parse-db* db)]
+                                   (params/column-input-type (d/entity basis attr)))))))
+                    targets)
+              targets)
             row-attrs (mapv (fn [row]
                               (into {}
                                     (keep (fn [[target value]]
@@ -10695,7 +10710,7 @@
                                                         (if (insert-default-expression? value)
                                                           ::insert-default nil)
                                                         value)
-                                                  coerced (coerce-insert-value val attr schema)]
+                                                  coerced (coerce-insert-value val attr schema nil (:input-type target))]
                                           ;; DEFAULT means omitted; explicit
                                           ;; NULL remains a present nil so a
                                           ;; declared default is not applied.
@@ -10707,7 +10722,7 @@
                                                 (= ::insert-default val) nil
                                                 (some? coerced) [attr coerced]
                                                 :else [attr nil])))
-                                          (map vector targets row))))
+                                          (map vector value-targets row))))
                             rows)
         ;; Add row-existence marker for this table
             marker (pgs/row-marker-attr table-name)
