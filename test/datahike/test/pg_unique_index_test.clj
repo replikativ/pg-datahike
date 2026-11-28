@@ -732,6 +732,39 @@
                           (#'pg/rebase-tx-state! *conn* tx-state)))
     (is (identical? speculative (:speculative-db @tx-state)))))
 
+(deftest new-table-index-includes-earlier-writes-at-commit
+  ;; PostgreSQL 18 alter_table.sql:2349–2351, grouped as one migration.
+  (doseq [sql ["BEGIN"
+               "CREATE TABLE ataddindex(f1 INT)"
+               "INSERT INTO ataddindex VALUES (42), (43)"
+               "CREATE UNIQUE INDEX ataddindexi0 ON ataddindex(f1)"]]
+    (is (nil? (state sql)) sql))
+  (let [lookup "SELECT f1 FROM ataddindex WHERE f1 = 42"]
+    (is (= [["42"]] (rows lookup)))
+    (is (nil? (state "COMMIT")))
+    (binding [*handler* (pg/make-query-handler *conn*)]
+      (is (= [["42"] ["43"]] (rows "SELECT f1 FROM ataddindex ORDER BY f1")))
+      (is (= [["42"]] (rows lookup)))
+      (is (= "23505" (state "INSERT INTO ataddindex VALUES (42)"))))))
+
+(deftest odoo-external-ids-remain-searchable-after-bootstrap
+  (doseq [sql ["BEGIN"
+               "CREATE TABLE ir_model_data(module varchar, name varchar, model varchar, res_id int)"
+               "INSERT INTO ir_model_data VALUES ('base','group_user','res.groups',1), ('base','module_category_accounting','ir.module.category',1)"
+               "CREATE UNIQUE INDEX ir_model_data_module_name ON ir_model_data(module,name)"
+               "CREATE INDEX ir_model_data_model_res_id ON ir_model_data(model,res_id)"
+               "COMMIT"]]
+    (is (nil? (state sql)) sql))
+  (binding [*handler* (pg/make-query-handler *conn*)]
+    (is (= [["res.groups" "1"]]
+           (rows "SELECT model,res_id FROM ir_model_data WHERE module='base' AND name='group_user'")))
+    (is (= [["1"]]
+           (rows "SELECT res_id FROM ir_model_data WHERE name='module_category_accounting' AND module='base' AND model='ir.module.category'")))
+    (is (= [["2"]]
+           (rows "INSERT INTO ir_model_data VALUES ('base','group_user','res.groups',2)
+                  ON CONFLICT(module,name) DO UPDATE SET res_id=EXCLUDED.res_id RETURNING res_id")))
+    (is (= [["2"]] (rows "SELECT count(*) FROM ir_model_data")))))
+
 (deftest index-backfill-options-follow-savepoint-rollback-and-commit
   (doseq [sql ["CREATE TABLE uniq_savepoint(a int,b int)"
                "INSERT INTO uniq_savepoint VALUES(1,10),(2,20)"
