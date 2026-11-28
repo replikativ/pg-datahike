@@ -12,6 +12,7 @@
    commit) since it's the feed for the FK-via-ref JOIN rewrite."
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as objects]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg])
   (:import [java.sql Connection DriverManager]))
@@ -112,5 +113,48 @@
       (.execute st "ALTER TABLE managed_hint DROP COLUMN note"))
     (pgs/set-hint! *conn* :managed_hint/note {:hidden true})
     (let [raised (try (rows c "SELECT note FROM managed_hint") nil
+                      (catch java.sql.SQLException e e))]
+      (is (= "42703" (some-> raised .getSQLState))))))
+
+(deftest registered-names-follow-catalog-changes-and-caller-hints
+  (with-open [c (jdbc)
+              st (.createStatement c)]
+    (.execute st "CREATE TABLE registry_probe (id int, note text)")
+    ;; The native attribute has no registered column. A caller-supplied
+    ;; hidden hint can still make it explicitly addressable.
+    (d/transact *conn* [{:db/ident :registry_probe/native_col :db/valueType :db.type/string
+                         :db/cardinality :db.cardinality/one}])
+    (let [registered (fn [db hints]
+                       (get-in (pgs/ci-index (:schema db) hints) [:registered-columns "registry_probe"]))
+          before (d/db *conn*)
+          hints (pgs/schema-hints before)
+          read-columns objects/columns-by-relation
+          reads (atom 0)]
+      (with-redefs [objects/columns-by-relation
+                    (fn [& args] (swap! reads inc) (apply read-columns args))]
+        (let [names (registered before hints)
+              initial @reads]
+          (is (pos? initial))
+          (is (= :registry_probe/note (get names "note")))
+          (is (nil? (get names "native_col")))
+          (.execute st "INSERT INTO registry_probe(id,note) VALUES (1,'one')")
+          (let [after (d/db *conn*) n @reads]
+            (is (= names (registered after (pgs/schema-hints after))))
+            (is (= n @reads) "a data-only write reuses the detached registry"))
+          (is (= :registry_probe/native_col
+                 (get (registered before (assoc hints :registry_probe/native_col {:hidden true}))
+                      "native_col")))
+          (is (= names (registered before hints)))
+          (let [overlay (assoc (:schema before) :query_alias/value
+                               {:db/valueType :db.type/string :db/cardinality :db.cardinality/one})]
+            (is (= :query_alias/value (get-in (pgs/ci-index overlay hints)
+                                              [:columns "query_alias" "value"])))
+            (is (nil? (get-in (pgs/ci-index (:schema before) hints) [:columns "query_alias"])))))))
+    (.execute st "BEGIN")
+    (.execute st "ALTER TABLE registry_probe RENAME COLUMN note TO title")
+    (is (= [["one"]] (rows c "SELECT title FROM registry_probe")))
+    (.execute st "ROLLBACK")
+    (is (= [["one"]] (rows c "SELECT note FROM registry_probe")))
+    (let [raised (try (rows c "SELECT title FROM registry_probe") nil
                       (catch java.sql.SQLException e e))]
       (is (= "42703" (some-> raised .getSQLState))))))
