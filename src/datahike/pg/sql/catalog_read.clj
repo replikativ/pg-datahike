@@ -15,7 +15,7 @@
   (:import [datahike.db DB]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.statement.select PlainSelect SelectItem Join]
-           [net.sf.jsqlparser.expression ArrayConstructor CastExpression JdbcParameter JdbcNamedParameter LongValue StringValue]
+           [net.sf.jsqlparser.expression ArrayConstructor BooleanValue CastExpression JdbcParameter JdbcNamedParameter LongValue StringValue]
            [net.sf.jsqlparser.expression.operators.conditional AndExpression]
            [net.sf.jsqlparser.expression.operators.relational EqualsTo InExpression ExpressionList]))
 
@@ -147,13 +147,79 @@
           (when-let [name (some column-name-predicate terms)]
             {:column-relation name}))))))
 
+(def ^:private attribute-fields
+  #{:pg_attribute/attname :pg_attribute/attnotnull :pg_attribute/attnum
+    :pg_attribute/attisdropped :pg_attribute/atttypid :pg_attribute/atttypmod})
+
+(defn- attribute-filter [aliases field x]
+  (cond
+    (instance? EqualsTo x)
+    (let [left (field (.getLeftExpression ^EqualsTo x))
+          right (.getRightExpression ^EqualsTo x)]
+      (cond
+        (and (= left :pg_class/relname) (instance? StringValue right)
+             (nil? (.getPrefix ^StringValue right)))
+        [:relation (.getNotExcapedValue ^StringValue right)]
+        (= (set [left (field right)]) #{:pg_class/oid :pg_attribute/attrelid}) [:join true]
+        (and (= left :pg_attribute/attisdropped) (instance? BooleanValue right)
+             (not (.getValue ^BooleanValue right))) [:live true]
+        (and (= left :pg_class/relnamespace) (instance? CastExpression right)
+             (simple-expression? aliases right)) [:namespace true]))
+    (instance? InExpression x)
+    (let [left (.getLeftExpression ^InExpression x)
+          right (.getRightExpression ^InExpression x)]
+      (when (and (instance? ExpressionList right) (every? #(instance? StringValue %) right)
+                 (or (= :pg_attribute/attname (field left))
+                     (= [:pg_attribute/atttypid :pg_attribute/atttypmod]
+                        (mapv field (derived/plain-call-args left #{"format_type" "pg_catalog.format_type"})))))
+        [:filter true]))))
+
+(defn- attribute-plan [^PlainSelect stmt]
+  (let [[^Join join :as joins] (.getJoins stmt)
+        sources [(.getFromItem stmt) (when join (.getRightItem join))]]
+    (when (and (= 1 (count joins)) (derived/unmodified-join? join)
+               (or (.isSimple join) (.isInnerJoin join))
+               (every? #(and (instance? Table %)
+                             (= (ctx/inference-table-name %) (catalog/catalog-table-name %))) sources))
+      (let [aliases (into {} (map (fn [^Table t]
+                                    [(params/unquote-ident (or (some-> t .getAlias .getName) (.getName t)))
+                                     (catalog/catalog-table-name t)])) sources)
+            field (fn [x]
+                    (when (and (instance? Column x) (nil? (.getArrayConstructor ^Column x)))
+                      (when-let [owner (some-> ^Column x .getTable .getName params/unquote-ident aliases)]
+                        (keyword owner (params/unquote-ident (.getColumnName ^Column x))))))
+            terms (mapcat derived/conjuncts (cons (.getWhere stmt) (.getOnExpressions join)))
+            predicates (map #(attribute-filter aliases field %) terms)
+            proof (into {} (remove nil?) predicates)]
+        (when (and (= 2 (count aliases)) (every? some? predicates)
+                   (:join proof) (:live proof) (:relation proof) (:namespace proof)
+                   (every? #(attribute-fields (field (.getExpression ^SelectItem %))) (.getSelectItems stmt)))
+          {:attribute-relation (:relation proof)})))))
+
+(defn- attribute-db [db name]
+  (let [named (when (contains? (:schema db) :datahike.pg.object/name)
+                (map #(d/entity db (:e %)) (d/datoms db :avet :datahike.pg.object/name name)))
+        registered (filter #(= objects/pg-class-oid (:datahike.pg.object/class-oid %)) named)
+        classes (relation-read/rows db {:relation-names #{name}})
+        table-oids (set (map :datahike.pg.object/oid registered))]
+    ;; The canonical pg_attribute source also contains index and composite
+    ;; attributes, views and tombstones. Only durable tables with a proven
+    ;; live-column predicate can use the relation-local projection.
+    (when (and (seq registered) (every? #(and (= :table (:datahike.pg.object/kind %))
+                                              (not (:datahike.pg.object/legacy-oid? %))) registered)
+               (= table-oids (set (map :pg_class/oid classes))))
+      (let [storage (into #{} (map #(or (:datahike.pg.object/storage-name %) name)) registered)
+            rows (catalog/table-attribute-rows (:schema db) db storage)
+            fields (conj attribute-fields :pg_attribute/attrelid :pg_attribute/db-row-exists)]
+        (d/db-with @declarations (into classes (map #(select-keys % fields)) rows))))))
+
 (def ^:private builtin-fields
   (delay
     (into {}
           (map (fn [name]
                  [name (conj (mapv :db/ident (catalog/catalog-schema-for* name))
                              (schema/row-marker-attr name))]))
-          ["pg_class" "pg_constraint" "pg_description" columns-table])))
+          ["pg_class" "pg_attribute" "pg_constraint" "pg_description" columns-table])))
 
 (defn- builtin-input? [db names]
   (and (instance? DB db)
@@ -170,6 +236,7 @@
     (let [names (set names)
           plan (when (builtin-input? db names)
                  (cond
+                   (= names #{"pg_class" "pg_attribute"}) (attribute-plan stmt)
                    (= names #{columns-table}) (columns-plan stmt)
                    (= names #{"pg_class"}) (relation-read/plan stmt)
                    (= names #{"pg_constraint" "pg_class" "pg_description"})
@@ -284,6 +351,7 @@
     (query-db db children)
     (when (builtin-input? db names)
       (cond
+        (:attribute-relation plan) (attribute-db db (:attribute-relation plan))
         (:constraint-name plan) (constraint-read/query-db db plan)
         (:column-relation plan)
         (d/db-with @scoped-declarations

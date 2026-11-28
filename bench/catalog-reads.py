@@ -8,6 +8,12 @@ import psycopg2
 
 
 QUERIES = {
+    "attributes": """
+        SELECT a.attname, a.attnotnull FROM pg_class c, pg_attribute a
+        WHERE c.relname=%s AND c.relnamespace=current_schema::regnamespace
+        AND c.oid=a.attrelid AND a.attisdropped=false
+        AND pg_catalog.format_type(a.atttypid,a.atttypmod) NOT IN ('cid','tid','oid','xid')
+        AND a.attname NOT IN ('id','enabled')""",
     "columns": """
         SELECT column_name, udt_name, character_maximum_length, is_nullable
         FROM information_schema.columns

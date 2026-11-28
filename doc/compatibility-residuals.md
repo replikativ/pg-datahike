@@ -254,7 +254,14 @@ definition. Older tables whose original name was discarded retain the
 generated name. Column introspection also returns pg-datahike's synthetic
 `db_id` column.
 
-The [64-table benchmark](../bench/catalog-reads.py) exercises the same three
+For `pg_attribute` nullability checks, a join on the named table's OID can
+read its live columns directly. Odoo also filters by column name and
+formatted type. Dropped columns disappear from this lookup and reappear
+after savepoint rollback. Queries requesting dropped columns, indexes or
+views still use the full catalog. The prepared-query gate checks repeated
+`SET NOT NULL` against PostgreSQL 18.6's `constraints.sql` lines 639–641.
+
+The [64-table benchmark](../bench/catalog-reads.py) exercises all four
 queries on pg-datahike and PostgreSQL. The transaction gate also checks that
 aborting a table creation removes its `pg_class` row and restores deleted
 rows, following PostgreSQL 18.6's `transactions.sql` lines 21–36.

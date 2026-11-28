@@ -1,5 +1,6 @@
 (ns datahike.test.pg-catalog-cache-basis-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.schema :as schema]
@@ -332,3 +333,55 @@
             (let [r (run (str projection "table_name='widgets' AND table_schema=current_schema"))]
               (is (= (disj public-rows ["enabled" "bool" nil "YES"])
                      (compare-scan r "widgets"))))))))))
+
+(deftest named-attribute-reads-follow-nullability-and-dropped-columns
+  (with-db
+    (fn [conn]
+      (with-open [^PgWireServer$QueryHandler h (pg/make-query-handler conn)]
+        (let [run (fn [text]
+                    (let [^PgWireServer$QueryResult r (.execute h text)]
+                      (is (nil? (.-error r)) (str text " " (.-error r)))
+                      (mapv vec (.-rows r))))
+              query (str "SELECT a.attname, a.attnotnull FROM pg_class c, pg_attribute a "
+                         "WHERE c.relname='notnull_tbl1' AND c.relnamespace=current_schema::regnamespace "
+                         "AND c.oid=a.attrelid AND a.attisdropped=false "
+                         "AND pg_catalog.format_type(a.atttypid,a.atttypmod) NOT IN ('cid','tid','oid','xid') "
+                         "AND a.attname NOT IN ('db_id')")
+              constraints "select conname, contype, conkey from pg_constraint where conrelid = 'notnull_tbl1'::regclass"]
+          (run "CREATE TABLE notnull_tbl1 (a integer NOT NULL, b text)")
+          (let [prepared (.parse h query (int-array 0))
+                read-cols (fn []
+                            (let [^PgWireServer$QueryResult r (.executePrepared h prepared (object-array [nil]))]
+                              (is (nil? (.-error r)) (.-error r))
+                              (set (map vec (.-rows r)))))]
+            (is (= {:attribute-relation "notnull_tbl1"}
+                   (:catalog-plan (sql/parse-sql query (:schema @conn) @conn true))))
+            (with-redefs [sql/enrich-db-with-catalogs
+                          (fn [& _] (throw (AssertionError. "unexpected full catalog scan")))]
+              (is (= #{["a" "t"] ["b" "f"]} (read-cols))))
+            (let [inner (-> query
+                            (str/replace "pg_class c, pg_attribute a"
+                                         "pg_class c JOIN pg_attribute a ON c.oid=a.attrelid")
+                            (str/replace " AND c.oid=a.attrelid AND" " AND"))
+                  outer (str/replace inner " JOIN " " LEFT JOIN ")]
+              (is (= {:attribute-relation "notnull_tbl1"}
+                     (:catalog-plan (sql/parse-sql inner (:schema @conn) @conn true))))
+              (is (= (read-cols) (set (run inner))))
+              (is (nil? (:catalog-plan (sql/parse-sql outer (:schema @conn) @conn true)))))
+            (run "ALTER TABLE notnull_tbl1 ALTER a DROP NOT NULL")
+            (is (= #{["a" "f"] ["b" "f"]} (read-cols)))
+            (is (not-any? #(= "notnull_tbl1_a_not_null" (first %)) (run constraints)))
+            (run "ALTER TABLE notnull_tbl1 ALTER a SET NOT NULL")
+            (run "ALTER TABLE notnull_tbl1 ALTER a SET NOT NULL")
+            (is (= [["notnull_tbl1_a_not_null" "n" "{1}"]] (run constraints)))
+            (run "BEGIN")
+            (run "SAVEPOINT before_drop")
+            (run "ALTER TABLE notnull_tbl1 DROP COLUMN b")
+            (is (= #{["a" "t"]} (read-cols)))
+            (run "ROLLBACK TO SAVEPOINT before_drop")
+            (is (= #{["a" "t"] ["b" "f"]} (read-cols)))
+            (run "COMMIT")
+            (run "CREATE SCHEMA archive")
+            (run "CREATE TABLE archive.notnull_tbl1 (label text)")
+            (run "SET search_path TO archive, public")
+            (is (= #{["label" "f"]} (read-cols)))))))))

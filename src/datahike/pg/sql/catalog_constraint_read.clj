@@ -8,8 +8,9 @@
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.catalog-relation-read :as relations]
             [datahike.pg.sql.ctx :as ctx]
+            [datahike.pg.sql.derived :as derived]
             [datahike.pg.sql.params :as params])
-  (:import [net.sf.jsqlparser.expression CastExpression Function StringValue]
+  (:import [net.sf.jsqlparser.expression CastExpression StringValue]
            [net.sf.jsqlparser.expression.operators.conditional AndExpression]
            [net.sf.jsqlparser.expression.operators.relational EqualsTo]
            [net.sf.jsqlparser.schema Column Table]
@@ -65,15 +66,6 @@
                                [(.getLeftExpression ^EqualsTo on) (.getRightExpression ^EqualsTo on)])))
          (empty? (.getUsingColumns join)) (not (.isNatural join)))))
 
-(defn- call-args [expr name]
-  (when (and (instance? Function expr)
-             (= name (str/lower-case (.getName ^Function expr)))
-             ;; Reject DISTINCT, named arguments, filter/order modifiers and
-             ;; other expressions hidden outside the ordinary argument list.
-             (= (str expr)
-                (str (.getName ^Function expr) "(" (.getParameters ^Function expr) ")")))
-    (vec (.getParameters ^Function expr))))
-
 (defn plan [^PlainSelect stmt _db names]
   (when (= tables (set names))
     (let [[^Join inner ^Join outer :as joins] (.getJoins stmt)
@@ -88,8 +80,8 @@
               terms (conjunction (.getWhere stmt))
               preds (into {} (keep #(filter-term aliases %)) terms)
               items (.getSelectItems stmt)
-              [descr definition :as args] (call-args (.getExpression ^SelectItem (first items)) "coalesce")
-              oid (call-args definition "pg_get_constraintdef")]
+              [descr definition :as args] (derived/plain-call-args (.getExpression ^SelectItem (first items)) #{"coalesce"})
+              oid (derived/plain-call-args definition #{"pg_get_constraintdef"})]
           (when (and (= 3 (count aliases)) (= 1 (count items))
                      (= 2 (count args)) (= :pg_description/description (field aliases descr))
                      (= 1 (count oid)) (= :pg_constraint/oid (field aliases (first oid)))
