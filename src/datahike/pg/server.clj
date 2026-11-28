@@ -9193,8 +9193,8 @@
             ;; Use the translation overlay for the immediate Simple Query
             ;; dispatch if its input is the exact execution snapshot. Prepared
             ;; plans and runtime catalog extensions refresh at execution.
-            catalog-input (when-let [names (:catalog-child-names parsed)]
-                            (catalog-read/query-db db names))
+            catalog-input (when-let [plan (:catalog-plan parsed)]
+                            (catalog-read/scoped-query-db db (:catalog-tables parsed) plan))
             query-db (if-let [cats (:catalog-tables parsed)]
                        (cond
                          catalog-input catalog-input

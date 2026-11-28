@@ -243,6 +243,22 @@ private serial sequence and advancing a committed sequence. The focused
 gate verifies the update commits and genuine overlapping writes still fail.
 Stock PostgreSQL 18.6 completed initialization of all 14 modules.
 
+### Odoo catalog reflection
+
+Odoo's column, constraint and relation-existence queries can select the
+catalog rows for a named relation at execution time. SQL still applies the
+namespace predicate against the statement snapshot. Bound table-name
+parameters and broader catalog scans use the general execution path.
+A named composite unique constraint now returns its declared name and
+definition. Older tables whose original name was discarded retain the
+generated name. Column introspection also returns pg-datahike's synthetic
+`db_id` column.
+
+The [64-table benchmark](../bench/catalog-reads.py) exercises the same three
+queries on pg-datahike and PostgreSQL. The transaction gate also checks that
+aborting a table creation removes its `pg_class` row and restores deleted
+rows, following PostgreSQL 18.6's `transactions.sql` lines 21–36.
+
 ### asyncpg expected failures by owning ID
 
 | Area | IDs | Observed causes |

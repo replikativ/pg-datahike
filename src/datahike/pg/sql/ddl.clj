@@ -1357,9 +1357,10 @@
         ;; but they are engine indexes rather than user columns. Hide them
         ;; from SELECT *, pg_attribute and information_schema while keeping
         ;; the underlying attribute available to Datahike.
-        tuple-hint-tx (mapv (fn [{:keys [ident]}]
+        tuple-hint-tx (mapv (fn [{:keys [ident name]}]
                               {:datahike.pg/for-ident ident
-                               :datahike.pg/hidden true})
+                               :datahike.pg/hidden true
+                               :datahike.pg/constraint-name name})
                             tuple-attrs)
         schema-tx (into schema-tx (into tuple-schema-tx tuple-hint-tx))
         ;; CHECK-constraint entities, one per CHECK clause, identified by

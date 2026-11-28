@@ -1475,9 +1475,9 @@
                 catalog-analysis (when (and catalog-source (seq used-catalogs)
                                             (not params/*analysis-only?*)
                                             (empty? stmt/*cte-relations*))
-                                   (catalog-read/analysis-db stmt db used-catalogs))
+                                   (catalog-read/compile-input stmt db used-catalogs))
                 catalog-names-used (seq (sort used-catalogs))
-                db (cond catalog-analysis catalog-analysis
+                db (cond catalog-analysis (:db catalog-analysis)
                          catalog-names-used (enrich-db-with-catalogs db schema used-catalogs)
                          :else db)
                 schema (if catalog-names-used (:schema db) schema)
@@ -2158,7 +2158,9 @@
                                    (cond-> (assoc result :catalog-tables (vec catalog-names-used))
                                      catalog-analysis
                                      (assoc :catalog-read? true
-                                            :catalog-child-names (catalog-read/lookup-plan (:query result)))
+                                            :catalog-plan (or (:plan catalog-analysis)
+                                                              (when-let [children (catalog-read/lookup-plan (:query result))]
+                                                                {:foreign-key-children children})))
                                      (and catalog-source
                                           (catalog/statement-stable-catalogs? catalog-names-used))
                                      (vary-meta assoc ::catalog-source catalog-source))

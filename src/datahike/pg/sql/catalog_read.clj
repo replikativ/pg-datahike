@@ -7,6 +7,8 @@
             [datahike.pg.catalog.objects :as objects]
             [datahike.pg.schema :as schema]
             [datahike.pg.sql.catalog :as catalog]
+            [datahike.pg.sql.catalog-constraint-read :as constraint-read]
+            [datahike.pg.sql.catalog-relation-read :as relation-read]
             [datahike.pg.sql.derived :as derived]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.params :as params])
@@ -105,6 +107,79 @@
                                  (mapcat #(.getOnExpressions ^Join %) joins))))
         @declarations))))
 
+(def ^:private columns-table "information_schema_columns")
+
+(def ^:private scoped-declarations
+  (delay (d/db-with @declarations (vec (catalog/catalog-schema-for* columns-table)))))
+
+(defn- column-name-predicate [expr]
+  (when (instance? EqualsTo expr)
+    (let [left (.getLeftExpression ^EqualsTo expr)
+          right (.getRightExpression ^EqualsTo expr)]
+      (when (and (instance? Column left) (nil? (.getArrayConstructor ^Column left))
+                 (= "table_name" (params/unquote-ident (.getColumnName ^Column left)))
+                 (instance? StringValue right) (nil? (.getPrefix ^StringValue right)))
+        (.getNotExcapedValue ^StringValue right)))))
+
+(def ^:private column-fields
+  (delay (into #{} (map (comp name :db/ident)) (catalog/catalog-schema-for* columns-table))))
+
+(defn- columns-plan [^PlainSelect stmt]
+  (let [table (.getFromItem stmt)
+        predicate (.getWhere stmt)]
+    (when (and (instance? Table table) (empty? (.getJoins stmt))
+               (= columns-table (catalog/catalog-table-name table) (ctx/inference-table-name table))
+               (every? (fn [^SelectItem item]
+                         (let [c (.getExpression item)]
+                           (and (instance? Column c) (nil? (.getArrayConstructor ^Column c))
+                                (contains? @column-fields (params/unquote-ident (.getColumnName ^Column c))))))
+                       (.getSelectItems stmt)))
+      (let [terms (if (instance? AndExpression predicate)
+                    [(.getLeftExpression ^AndExpression predicate)
+                     (.getRightExpression ^AndExpression predicate)]
+                    [predicate])]
+        (when (every? #(or (column-name-predicate %)
+                           (and (instance? EqualsTo %)
+                                (= "table_schema" (some-> (.getLeftExpression ^EqualsTo %)
+                                                          str str/lower-case))
+                                (= "current_schema" (some-> (.getRightExpression ^EqualsTo %)
+                                                            str str/lower-case)))) terms)
+          (when-let [name (some column-name-predicate terms)]
+            {:column-relation name}))))))
+
+(def ^:private builtin-fields
+  (delay
+    (into {}
+          (map (fn [name]
+                 [name (conj (mapv :db/ident (catalog/catalog-schema-for* name))
+                             (schema/row-marker-attr name))]))
+          ["pg_class" "pg_constraint" "pg_description" columns-table])))
+
+(defn- builtin-input? [db names]
+  (and (instance? DB db)
+       (= :write (get-in db [:config :schema-flexibility]))
+       (catalog/statement-stable-catalogs? names)
+       (every? (fn [name]
+                 (when-let [fields (get @builtin-fields name)]
+                   (not-any? #(contains? (:schema db) %) fields))) names)))
+
+(defn compile-input [stmt db names]
+  (when (and *execution-inputs?* (instance? PlainSelect stmt)
+             (not params/*nested-parse?*) (empty? params/*temp-table-map*)
+             (derived/plain-shape? stmt))
+    (let [names (set names)
+          plan (when (builtin-input? db names)
+                 (cond
+                   (= names #{columns-table}) (columns-plan stmt)
+                   (= names #{"pg_class"}) (relation-read/plan stmt)
+                   (= names #{"pg_constraint" "pg_class" "pg_description"})
+                   (constraint-read/plan stmt db names)))]
+      (if plan
+        {:db (if (:constraint-name plan) (constraint-read/analysis-db) @scoped-declarations)
+         :plan plan}
+        (when-let [decls (analysis-db stmt db names)]
+          {:db decls})))))
+
 (defn- field-use [clause]
   (let [[head attr value] clause]
     (cond
@@ -147,15 +222,6 @@
                 (names-for fields where)))
             (vals aliases)))))
 
-(defn- child-storage-names [db names]
-  ;; Include the physical spelling for native or pre-registry tables. The
-  ;; SQL predicates will recheck logical name and namespace on every match.
-  (into (set names)
-        (mapcat (fn [n]
-                  (keep #(get (d/entity db (:e %)) :datahike.pg.object/storage-name)
-                        (d/datoms db :avet :datahike.pg.object/name n))))
-        names))
-
 (defn- visible-column? [db retired c]
   (let [ident (:datahike.pg.column/storage-ident c)]
     (or (:datahike.pg.column/dropped? c)
@@ -194,7 +260,7 @@
    for unsupported metadata so the caller can use the canonical full scan."
   [db names]
   (when (and (instance? DB db) (catalog/statement-stable-catalogs? tables))
-    (let [children (child-storage-names db names)
+    (let [children (relation-read/storage-candidates db names)
           fks (foreign-keys/for-children db children)
           storage (into #{} (mapcat (juxt :child-table :parent-table)) fks)
           retired (schema/retired-table-names db)
@@ -212,3 +278,17 @@
                                (foreign-keys/catalog-fields fk child parent ck pk)))) fks)]
           (when (every? some? rows)
             (d/db-with @declarations (into rows (concat (map :class (vals ends)) cols)))))))))
+
+(defn scoped-query-db [db names plan]
+  (if-let [children (:foreign-key-children plan)]
+    (query-db db children)
+    (when (builtin-input? db names)
+      (cond
+        (:constraint-name plan) (constraint-read/query-db db plan)
+        (:column-relation plan)
+        (d/db-with @scoped-declarations
+                   (vec (catalog/information-schema-column-rows
+                         (:schema db) db (relation-read/storage-candidates db #{(:column-relation plan)}))))
+        (:relation-names plan)
+        (when-let [rows (relation-read/rows db plan)]
+          (d/db-with @scoped-declarations rows))))))
