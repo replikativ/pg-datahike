@@ -8054,26 +8054,32 @@
    writes advanced the branch. Buffered writes to committed sequence positions
    opt out because they may conflict with durable reservations."
   [conn tx-state]
-  (let [{:keys [in-tx? begin-max-tx tx-buffer]} @tx-state
+  (let [{:keys [in-tx? begin-max-tx tx-buffer] :as state} @tx-state
         db-now (when in-tx? (d/db conn))
-        current-max-tx (:max-tx db-now)]
+        current-max-tx (:max-tx db-now)
+        [verified-at verified-count] (::sequence-checkpoint (meta tx-buffer))
+        ;; Statements append replay operations. An extension of the same
+        ;; vector inherits its verified prefix; savepoint rollback restores
+        ;; the saved vector (and its own proof). A different basis requires
+        ;; a fresh check because previously private names can become durable.
+        n (count tx-buffer)
+        from (if (and begin-max-tx (= verified-at begin-max-tx) (<= verified-count n))
+               verified-count 0)]
     (when (and begin-max-tx current-max-tx
                (> (long current-max-tx) (long begin-max-tx))
-               (not (writes-committed-sequence? db-now tx-buffer))
+               (or (= from n)
+                   (not (writes-committed-sequence? db-now (subvec tx-buffer from))))
                (= ::sequence-only
                   (ring-write-eas-graced (db-ring-key db-now)
                                          begin-max-tx current-max-tx)))
-      (swap! tx-state
-             (fn [state]
-               (-> state
-                   (assoc :begin-max-tx current-max-tx)
-                   ;; A rollback-to-savepoint must not resurrect a watermark
-                   ;; that predates non-transactional reservations which the
-                   ;; rollback itself cannot undo.
-                   (update :savepoints
-                           (fn [savepoints]
-                             (mapv #(assoc % :begin-max-tx current-max-tx)
-                                   savepoints)))))))))
+      (compare-and-set! tx-state state
+                        (-> state
+                            (assoc :begin-max-tx current-max-tx
+                                   :tx-buffer (vary-meta tx-buffer assoc ::sequence-checkpoint [current-max-tx n]))
+                            ;; Rollback cannot undo a durable reservation.
+                            (update :savepoints (fn [savepoints]
+                                                  (mapv #(assoc % :begin-max-tx current-max-tx)
+                                                        savepoints))))))))
 
 (defn- nextval-for-tx!
   "Reserve from a committed sequence independently, or from a sequence newly

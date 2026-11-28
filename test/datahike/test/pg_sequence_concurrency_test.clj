@@ -207,8 +207,26 @@
         run (fn [handler sql] (.execute handler sql))]
     (doseq [sql ["CREATE SEQUENCE shared_seq" "BEGIN"
                  "CREATE TABLE private_module (id serial PRIMARY KEY)"
+                 "SELECT nextval('shared_seq')"
                  "SELECT setval('shared_seq',100)"]]
       (is (nil? (.-error ^PgWireServer$QueryResult (run a sql))) sql))
-    (is (= [["1"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run b "SELECT nextval('shared_seq')")))))
+    (is (= [["2"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run b "SELECT nextval('shared_seq')")))))
+    ;; This reservation must check the SETVAL appended after the first
+    ;; checkpoint. Publishing its watermark would let COMMIT overwrite it.
+    (is (= [["3"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run a "SELECT nextval('shared_seq')")))))
     (is (= "40001" (.-sqlstate ^PgWireServer$QueryResult (run a "COMMIT"))))
-    (is (= [["2"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run b "SELECT nextval('shared_seq')")))))))
+    (is (= [["4"]] (mapv vec (.-rows ^PgWireServer$QueryResult (run b "SELECT nextval('shared_seq')")))))))
+
+(deftest reservation-checkpoint-retains-a-concurrent-row-write
+  (let [h (pg/make-query-handler *conn*)]
+    (doseq [sql ["CREATE SEQUENCE existing" "CREATE TABLE company (id int PRIMARY KEY, paper int)"
+                 "INSERT INTO company VALUES (1,0)" "BEGIN" "CREATE TABLE new_module (id serial)"
+                 "UPDATE company SET paper=8 WHERE id=1" "SELECT nextval('existing')"]]
+      (is (nil? (.-error ^PgWireServer$QueryResult (.execute h sql))) sql))
+    ;; A native writer can change the locked SQL row. Its unrecorded commit
+    ;; breaks the chain just after a successfully checked buffer prefix.
+    (let [eid (d/q '[:find ?e . :where [?e :company/id 1]] (d/db *conn*))]
+      (d/transact *conn* [[:db/add eid :company/paper 9]]))
+    (is (nil? (.-error ^PgWireServer$QueryResult (.execute h "SELECT nextval('existing')"))))
+    (is (= "40001" (.-sqlstate ^PgWireServer$QueryResult (.execute h "COMMIT"))))
+    (is (= [["9"]] (mapv vec (.-rows ^PgWireServer$QueryResult (.execute h "SELECT paper FROM company")))))))
