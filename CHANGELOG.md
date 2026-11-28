@@ -4,6 +4,21 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Transactional index creation and sequence reservations
+
+Rows inserted before an index is created on a new table remain searchable
+by that index after commit. Unique indexes enforce those earlier values,
+including during subsequent upserts. The fix applies to new transactions.
+An existing database written with an incomplete index needs separate assessment.
+
+A migration can create a private serial sequence and reserve IDs from an
+existing sequence in the same transaction. Concurrent writes to the same
+row or sequence still participate in conflict detection.
+
+Correlated EXISTS predicates now support local integer membership filters
+with an independent, single-table IN or NOT IN subquery, including the
+group-access query used by Odoo 19.
+
 ### Foreign-key catalog lookups
 
 ORM queries that join foreign keys to named tables and their columns can
