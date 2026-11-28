@@ -352,7 +352,6 @@
       (is (nil? (state (execute "CREATE TABLE guard_related_fk (pid int REFERENCES guard_existing(id))"))))
       (is (false? (basis/compatible? before-fk @*conn*))))))
 
-
 (deftest serial-upsert-after-private-index-creation
   (is (nil? (state (execute "CREATE TABLE external_ids
                              (id serial PRIMARY KEY, module text, name text, value int)"))))
