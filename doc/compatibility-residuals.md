@@ -231,13 +231,16 @@ The module-list update passed. Ten of the eleven base ORM cases passed in
 that run. The remaining case, `test_m2m_store_trigger`, reached a group
 membership query combining five correlated EXISTS predicates. Its captured
 SQL now has a focused PostgreSQL 18.6 comparison, including separate tests
-for NULL and empty membership sets. A full application run with the
-membership change is pending.
+for NULL and empty membership sets. With the membership change, a fresh base installation
+with optional module auto-installation disabled exited successfully and
+passed all 11 ORM cases.
 
 The same installation reached the auto-installed web module. Updating
 `res_company.paperformat_id` then failed with SQLSTATE 40001 during
 transaction rebase. The logged transaction numbers were 536870964 and
-536871995. Whether concurrent writes actually overlapped is unverified.
+536871995. A single-session reproduction failed after creating a table with a
+private serial sequence and advancing a committed sequence. The focused
+gate verifies the update commits and genuine overlapping writes still fail.
 Stock PostgreSQL 18.6 completed initialization of all 14 modules.
 
 ### asyncpg expected failures by owning ID
