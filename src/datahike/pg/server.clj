@@ -8069,9 +8069,17 @@
                                  (sequence-descriptor (:speculative-db state) seq-name))
         identity (when speculative-descriptor
                    [(:name speculative-descriptor) (:eid speculative-descriptor)])
-        local? (contains? (:local-sequence-identities state #{}) identity)]
-    (if (and (sequence-descriptor (d/db conn) seq-name) (not local?))
-      (let [value (nextval! conn seq-name)]
+        local? (contains? (:local-sequence-identities state #{}) identity)
+        committed-db (d/db conn)]
+    (if (and (sequence-descriptor committed-db seq-name) (not local?))
+      ;; A committed sequence advances outside the SQL transaction. After
+      ;; private DDL its writer cannot see the row statement's catalog.
+      ;; Guard the reservation against the committed catalog it resolved in.
+      ;; The surrounding DML retains its own guard for speculation and replay.
+      (let [value (if (and *statement-catalog-basis* (pos? (:ddl-version state 0)))
+                    (binding [*statement-catalog-basis* (catalog-basis/capture committed-db)]
+                      (nextval! conn seq-name))
+                    (nextval! conn seq-name))]
         (checkpoint-sequence-only-window! conn tx-state)
         value)
       (locking tx-state
