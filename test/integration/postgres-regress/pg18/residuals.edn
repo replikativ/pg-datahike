@@ -107,6 +107,9 @@
   {:id :alter-table-preserves-existing-default-values
    :file "fast_default" :lines [87 98] :state :covered :impact :wrong-result
    :detail "ADD COLUMN with a literal default fills existing rows. SET DEFAULT affects later writes, and short rows in a VALUES list remain separate rows."}
+  {:id :independent-conflict-arbiters
+   :file "insert_conflict" :lines [202 212] :state :covered :impact :wrong-result
+   :detail "With independent unique indexes, the nominated key chooses the conflicting row. Its final values must satisfy both indexes; conflicting proposed values that the UPDATE discards are harmless."}
   {:id :composite-index-conflict-inference
    :file "insert_conflict" :lines [133 141] :state :covered :impact :wrong-result
    :detail "A two-column unique index is an ON CONFLICT arbiter in either column order. An incomplete key is rejected."}

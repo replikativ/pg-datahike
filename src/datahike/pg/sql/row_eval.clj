@@ -204,6 +204,42 @@
                (seq (:window-specs plan))
                (:has-aggregates? plan))))
 
+(defn row-projector
+  "Prepare a projection for rows from one statement snapshot. Bind ordinary
+   parameters and read the tuple afresh on each call. Session-dependent
+   plans retain their per-row translation semantics."
+  [asts table schema db {:keys [exec-db] :as opts}]
+  (let [scs (scopes db schema table opts)
+        readers (into [] (mapcat :columns) scs)
+        exec-db (or exec-db db)
+        n (count asts)
+        prepared (volatile! nil)]
+    (fn [row]
+      (let [b params/*bound-params*
+            bound (if (sequential? b) (vec b) [])
+            {:keys [plan run]} (or @prepared
+                                   (let [p (compiled-plan asts scs schema db)]
+                                     (when-not (:session-dependent? p) (vreset! prepared p))
+                                     p))
+            ;; Values are read only for the placeholders the plan uses.
+            fetch (fn [idx]
+                    (let [idx (long idx)]
+                      (if (> idx row-base)
+                        ((:read (nth readers (- idx row-base 1))) row)
+                        (nth bound (dec idx) nil))))
+            bound-plan (params/substitute-select-plan plan fetch)
+            values (binding [params/*runtime-db* exec-db]
+                     (cond
+                       ;; The full SELECT executor resolves deferred calls such as nextval.
+                       (and params/*row-execute* (needs-executor? plan))
+                       (let [row (first (params/*row-execute* bound-plan exec-db))
+                             row (if (sequential? row) (vec row) [row])]
+                         (mapv #(stmt/sql-value (nth row % nil)) (range n)))
+                       run (vec (take n (or (run (:in-args bound-plan)) (repeat nil))))
+                       :else (stmt/run-const-select-row bound-plan exec-db n)))]
+        {:values values
+         :oids (vec (take n (:select-item-oids plan)))}))))
+
 (defn row-values
   "The values of the SQL expressions `asts` over one row of `table`, and
    their OIDs: {:values [...] :oids [...]}, NULL as nil. `row` holds the
@@ -224,34 +260,8 @@
 
    Parameters in the expressions (`$1`) take the values of
    params/*bound-params*."
-  [asts row table schema db & [{:keys [exec-db] :as opts}]]
-  (let [b params/*bound-params*
-        bound (if (sequential? b) (vec b) [])
-        scs (scopes db schema table opts)
-        {:keys [plan run]} (compiled-plan asts scs schema db)
-        readers (into [] (mapcat :columns) scs)
-        ;; Values are read only for the placeholders the plan uses.
-        fetch (fn [idx]
-                (let [idx (long idx)]
-                  (if (> idx row-base)
-                    ((:read (nth readers (- idx row-base 1))) row)
-                    (nth bound (dec idx) nil))))
-        bound-plan (params/substitute-select-plan plan fetch)
-        exec-db (or exec-db db)
-        n (count asts)
-        values (binding [params/*runtime-db* exec-db]
-                 (cond
-                   ;; A plan the server can run for us goes through the
-                   ;; whole SELECT pipeline: its deferred calls (nextval)
-                   ;; are resolved there and nowhere else.
-                   (and params/*row-execute* (needs-executor? plan))
-                   (let [row (first (params/*row-execute* bound-plan exec-db))
-                         row (if (sequential? row) (vec row) [row])]
-                     (mapv #(stmt/sql-value (nth row % nil)) (range n)))
-                   run (vec (take n (or (run (:in-args bound-plan)) (repeat nil))))
-                   :else (stmt/run-const-select-row bound-plan exec-db n)))]
-    {:values values
-     :oids (vec (take n (:select-item-oids plan)))}))
+  [asts row table schema db & [opts]]
+  ((row-projector asts table schema db opts) row))
 
 (defn row-oids
   "The OIDs `row-values` returns for `asts` over `table`, without a row:

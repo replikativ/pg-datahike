@@ -1799,16 +1799,15 @@
         col-names (mapv :name items)
         visible (or table-alias table-name)
         branches (inheritance/scan-branches row-db table-name)
+        project (row-eval/row-projector asts table-name schema row-db
+                                        {:alias visible :exec-db subquery-db :source-scopes source-scopes})
         results (binding [params/*bound-params* bound]
                   (mapv (fn [eid]
                           (let [row (into {::row-eval/source-values (get source-values eid)}
                                           (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
                                           (d/datoms row-db :eavt eid))
                                 branch (when (seq branches) (inheritance/row-branch branches row))]
-                            (row-eval/row-values
-                             asts (if branch (inheritance/project-row branch row) row)
-                             table-name schema row-db
-                             {:alias visible :exec-db subquery-db :source-scopes source-scopes})))
+                            (project (if branch (inheritance/project-row branch row) row))))
                         eids))
         row-arrays (into-array (Class/forName "[Ljava.lang.String;")
                                (for [{:keys [values]} results]
@@ -2564,7 +2563,6 @@
                    (row-constraints/eval-default kind value))]
          (resolve-value raw))))))
 
-(declare before-row-insert-triggers?)
 ;; Defined with the DDL executors below; the DO-block branch above
 ;; needs the same validation CREATE FUNCTION applies.
 (declare validate-plpgsql-body!)
@@ -2734,7 +2732,7 @@
    The final writer-side guard remains authoritative for concurrency. This
    ordered check exists so a duplicate at source row N stops evaluation before
    row N+1's volatile expressions, while avoiding one full `dc/with` per row."
-  [db table-name specs seen candidate]
+  [db table-name specs lookup seen candidate]
   (reduce
    (fn [seen {:keys [kind identity attr attrs columns constraint]}]
      (let [values (mapv #(get candidate %) attrs)]
@@ -2746,8 +2744,7 @@
                existing?
                (case kind
                  :native (first (d/datoms db :avet attr value))
-                 :catalog (unique-constraints/conflicting-eid
-                           db table-name attrs values))]
+                 :catalog (lookup attrs values))]
            (when (or existing? (contains? seen key))
              (throw (ex-info "unique violation"
                              {:error :unique-violation
@@ -2928,12 +2925,17 @@
                                             (trigger-transitions
                                              db table-name t transition-rows))})))))
 
-(defn- before-row-insert-triggers?
-  "Whether `table-name` has any BEFORE ROW trigger for `event`. The
-   candidate pass asks so it can leave constraint checking to the
-   post-trigger pass; see `materialize-insert-candidate`."
-  [db table-name event]
-  (boolean (seq (matching-triggers db table-name event :before :row nil))))
+(defn- fire-insert-row [db table-name event handler triggers entry]
+  (if-not (map? entry)
+    entry
+    (loop [[trigger & more] triggers, entity entry]
+      (if-not trigger
+        entity
+        (let [columns (row-entity->columns db table-name entity)
+              {:keys [row]} (run-one-trigger db handler trigger table-name event columns nil)]
+          ;; Returning NULL suppresses this candidate and stops its triggers.
+          (when row
+            (recur more (columns->row-entity db table-name entity row))))))))
 
 (defn- fire-row-triggers
   "Run the BEFORE ROW triggers of `table-name` over prepared INSERT
@@ -2953,23 +2955,7 @@
     (if (empty? triggers)
       tx-data
       (let [handler (trigger-handler! table-name)]
-        (into []
-              (keep (fn [entry]
-                      (if-not (map? entry)
-                        entry
-                        (loop [[t & more] triggers, entity entry]
-                          (if (nil? t)
-                            entity
-                            (let [cols (row-entity->columns db table-name entity)
-                                  {:keys [row]} (run-one-trigger db handler t table-name
-                                                                 event cols nil)]
-                              ;; nil means the trigger suppressed the row:
-                              ;; no later trigger runs and nothing is
-                              ;; written, as in PostgreSQL.
-                              (if (nil? row)
-                                nil
-                                (recur more (columns->row-entity db table-name entity row))))))))
-                    tx-data))))))
+        (into [] (keep #(fire-insert-row db table-name event handler triggers %)) tx-data)))))
 
 (defn- transition-relation-sql
   "A transition relation as SQL a CTE can hold: `VALUES (…), (…)` with
@@ -3258,10 +3244,13 @@
    remain writer-side checks and may be re-evaluated on the commit basis."
   [parsed base-db resolve-value]
   (let [table-name (:table parsed)
-        constraint-plan
-        (row-constraint-plan base-db table-name)
+        constraint-plan (row-constraint-plan base-db table-name)
+        before-triggers (matching-triggers base-db table-name :insert :before :row nil)
+        on-conflict? (= :on-conflict (:insert-mode parsed))
         unique-specs (when (= :plain (:insert-mode parsed))
-                       (plain-unique-specs base-db table-name constraint-plan))]
+                       (plain-unique-specs base-db table-name constraint-plan))
+        lookup (when (some #(= :catalog (:kind %)) unique-specs)
+                 (unique-constraints/conflict-lookup base-db table-name))]
     (loop [candidates (:insert-candidates parsed)
            assignment-plans (:insert-assignment-plans parsed)
            prepared []
@@ -3285,30 +3274,19 @@
                            (:insert-source-order parsed) base-db resolve-value))
               candidate (materialize-insert-candidate
                          candidate constraint-plan base-db resolve-value
-                         (not (before-row-insert-triggers?
-                               base-db (:table constraint-plan) :insert))
+                         (empty? before-triggers)
                          {:plans (or (:insert-shared-assignment-plans parsed)
                                      (first assignment-plans))
                           :source-values source-values})
-              ;; ON CONFLICT arbitration has statement-wide state: two source
-              ;; rows may not update the same target, and an earlier update can
-              ;; change the key seen by a later row. Carry that reducer state
-              ;; forward while applying only the new row-operation delta to
-              ;; the speculative database.
-              on-conflict? (= :on-conflict (:insert-mode parsed))
               ;; BEFORE INSERT ROW fires for the PROPOSED row, before
               ;; arbitration decides whether it inserts or updates
               ;; (ExecInsert runs ExecBRInsertTriggers ahead of the
               ;; speculative insertion). The non-conflict path runs them
-              ;; over the prepared tx-data below; the ON CONFLICT path
-              ;; produced raw ops rather than entity maps, so
-              ;; `fire-row-triggers`' `(if-not (map? entry) entry …)`
-              ;; guard passed every one through and NOTHING fired --
-              ;; a BEFORE trigger that rewrites NEW was simply skipped
-              ;; by `INSERT … ON CONFLICT`.
-              candidate (if (and on-conflict? (map? candidate))
-                          (first (fire-row-triggers base-db table-name
-                                                    [candidate] :insert))
+              ;; over the prepared tx-data below. Arbitration consumes the
+              ;; row after its triggers have rewritten or suppressed it.
+              candidate (if (and on-conflict? (seq before-triggers) (map? candidate))
+                          (fire-insert-row base-db table-name :insert (trigger-handler! table-name)
+                                           before-triggers candidate)
                           candidate)
               next-conflict-state
               (when (and on-conflict? (some? candidate))
@@ -3318,7 +3296,7 @@
               next-seen-unique (if on-conflict?
                                  seen-unique
                                  (validate-plain-candidate-unique!
-                                  base-db table-name unique-specs seen-unique candidate))
+                                  base-db table-name unique-specs lookup seen-unique candidate))
               replay-tx-data (when-not on-conflict?
                                (single-insert-candidate-tx-data parsed candidate))]
           (recur (next candidates)
@@ -3333,7 +3311,7 @@
                    conflict-state
                    next-conflict-state)
                  next-seen-unique))
-        (if (= :on-conflict (:insert-mode parsed))
+        (if on-conflict?
           (do
             (doseq [row (:mutated-rows conflict-state)]
               (row-constraints/validate-mutation!
@@ -14860,6 +14838,7 @@
                  :durable-catalog-basis (catalog-basis/capture (d/db conn))
                  :constraint-plan constraint-plan
                  :unique-specs    (plain-unique-specs db-now table constraint-plan)
+                 :unique-lookup   (unique-constraints/conflict-lookup db-now table)
                  :speculative-db  db-now
                  :tx-data         []
                  :tempids         {}
@@ -14940,7 +14919,9 @@
           (swap! copy-state #(-> %
                                  (assoc :pending-rows [])
                                  (assoc :pending-unique #{})
-                                 (assoc :speculative-db (:db-after spec-report))
+                                 (assoc :speculative-db (:db-after spec-report)
+                                        :unique-lookup (unique-constraints/conflict-lookup
+                                                        (:db-after spec-report) (:table s)))
                                  (assoc :local-sequence-op-offset
                                         (count (:tx-buffer @tx-state)))
                                  (update :tx-data into rows)
@@ -15072,7 +15053,7 @@
                 ;; so this stays off until the COPY batch model carries
                 ;; them. See doc/review-backlog.md.
                 seen (validate-plain-candidate-unique!
-                      db-now (:table s) (:unique-specs s)
+                      db-now (:table s) (:unique-specs s) (:unique-lookup s)
                       (:pending-unique s #{}) candidate)]
             (swap! copy-state
                    #(-> %
@@ -15126,10 +15107,11 @@
     (into [[:db.fn/call
             (fresh-insert-fn
              (fn [txdb]
-               (let [specs (plain-unique-specs txdb table unique-plan)]
+               (let [specs (plain-unique-specs txdb table unique-plan)
+                     lookup (unique-constraints/conflict-lookup txdb table)]
                  (reduce (fn [seen row]
                            (validate-plain-candidate-unique!
-                            txdb table specs seen row))
+                            txdb table specs lookup seen row))
                          #{} rows))
                []))]]
           (column-constraint-operations rows table column-plan))))

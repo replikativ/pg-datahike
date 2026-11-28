@@ -116,3 +116,19 @@ query sample use the same RNG seeds, cosine operator class, `m`,
 `ef_construction`, and `ef_search` sweep as `secondary_validation.clj`, so
 pgvector and Proximum results are directly comparable. pgvector remains an
 optional prerequisite because PostgreSQL itself does not ship the extension.
+
+## Composite-key upsert
+
+In a disposable database, run the same literal batch twice to measure an initial
+insert and an unchanged replay. The workload uses Odoo's conflict target,
+conditional tuple assignment and RETURNING projection. The first statement
+returns every inserted row and the second returns none. psql consumes both
+results and prints their elapsed times plus the final stored row count.
+
+```sh
+python3 bench/composite-upsert.py --rows 1000 | psql -X
+```
+
+Set the usual libpq connection variables for each server. Repeat on the same
+running server to distinguish startup and warm runs. The script creates and
+drops its own table, `upsert_bench`, and stops if the name is already in use.

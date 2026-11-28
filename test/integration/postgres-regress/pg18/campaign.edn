@@ -240,7 +240,11 @@
      [{:id :composite-index-conflict-inference
        :source-lines [133 141]
        :gate "test/datahike/test/pg_unique_index_test.clj"
-       :test-var "postgres-composite-index-inference-accepts-both-column-orders"}]}
+       :test-var "postgres-composite-index-inference-accepts-both-column-orders"}
+      {:id :independent-conflict-arbiters
+       :source-lines [202 212]
+       :gate "test/datahike/test/pg_on_conflict_semantics_test.clj"
+       :test-var "postgres-independent-conflict-arbiters"}]}
     {:name "update", :boundaries #{:update-from :dml :row-assignment}, :mode :unmeasured}
     {:name "delete", :boundaries #{:name-resolution :dml}, :mode :strict}
     {:name "returning",

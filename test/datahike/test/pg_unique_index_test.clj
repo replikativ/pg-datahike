@@ -252,6 +252,19 @@
   (is (= [["7" "Raspberry"] ["8" "Lime"]]
          (rows "SELECT key,fruit FROM insertconflicttest ORDER BY key"))))
 
+(deftest composite-arbitration-sees-an-earlier-key-change
+  (doseq [sql ["CREATE TABLE moving_key(module text, k int, dest int, UNIQUE(module,k))"
+               "INSERT INTO moving_key VALUES ('base',1,7)"]]
+    (is (nil? (state sql)) sql))
+  ;; The first candidate moves the existing row to key 2. Key 1 is free
+  ;; for the next candidate even though it exists on the statement basis.
+  (let [result (execute "INSERT INTO moving_key VALUES ('base',1,2),('base',1,9)
+                         ON CONFLICT (module,k) DO UPDATE SET k=excluded.dest
+                         RETURNING k,dest")]
+    (is (nil? (:state result)))
+    (is (= [["2" "7"] ["1" "9"]] (:rows result))))
+  (is (= [["1" "9"] ["2" "7"]] (rows "SELECT k,dest FROM moving_key ORDER BY k"))))
+
 (deftest violations-fail-at-the-statement-inside-a-transaction
   (doseq [sql ["CREATE TABLE uniq_tx(a int)"
                "CREATE UNIQUE INDEX uniq_tx_a ON uniq_tx(a)"
@@ -272,6 +285,17 @@
   ;; A rejected publication must not poison the writer chain.
   (d/transact *conn* [{:uniq_native/a 2 :uniq_native/db-row-exists true}])
   (is (= [["1"] ["2"]] (rows "SELECT a FROM uniq_native ORDER BY a"))))
+
+(deftest native-batch-validates-composite-keys-with-a-shared-leading-value
+  (is (nil? (state "CREATE TABLE batch_keys (a int, b int)")))
+  (is (nil? (state "CREATE UNIQUE INDEX batch_ab ON batch_keys(a,b)")))
+  (let [row (fn [b] {:batch_keys/db-row-exists true :batch_keys/a 1 :batch_keys/b b})]
+    (d/transact *conn* [(row 1) (row 2)])
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unique violation"
+                          (d/transact *conn* [(row 3) (row 2)])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unique violation"
+                          (d/transact *conn* [(row 3) (row 3)])))
+    (is (= [["1"] ["2"]] (rows "SELECT b FROM batch_keys ORDER BY b")))))
 
 (deftest writer-gate-checks-rows-that-enter-a-table-by-marker
   (is (nil? (state "CREATE TABLE uniq_marker(a int)")))
