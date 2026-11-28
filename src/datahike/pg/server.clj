@@ -2643,7 +2643,7 @@
                               :detail (str "Column \"" column "\" is a generated column.")})))
          attrs
          (reduce
-          (fn [attrs {:keys [attr default default-ast generated]}]
+          (fn [attrs {:keys [attr default default-ast generated input-type]}]
             (if generated
               attrs
               (let [present? (contains? attrs attr)
@@ -2655,7 +2655,7 @@
                                  (materialize-column-default default resolve-value
                                                              default-ast eval-expr)))
                     coerced (when (some? resolved)
-                              (#'stmt/coerce-insert-value resolved attr schema db))]
+                              (stmt/coerce-insert-value resolved attr schema db input-type))]
                 (cond-> attrs
                   (or present? default) (assoc attr coerced)))))
           candidate
@@ -3366,18 +3366,37 @@
                                       ", current=" current)})))
       durable-db)))
 
-(defn- execute-insert [conn parsed resolve-candidate
+(defn- execute-insert [conn parsed reserve-value call-seen
                        & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [table-name (:table parsed)
           candidate-db (d/db conn)
+          ;; Retain a proof across large batches. The ring can evict the
+          ;; beginning before the final arbitration check. Advance the
+          ;; watermark only over a fully witnessed sequence-only chain.
+          verified (volatile! candidate-db)
+          reserve (if (= :on-conflict (:insert-mode parsed))
+                    (let [interval (max 1 (quot recent-commit-ring-size 2))
+                          remaining (volatile! interval)]
+                      (fn [reference]
+                        (let [value (reserve-value reference)]
+                          (when (zero? (vswap! remaining dec))
+                            (vreset! remaining interval)
+                            (let [now (d/db conn)]
+                              (when (= ::sequence-only
+                                       (ring-write-eas-graced (db-ring-key now)
+                                                              (:max-tx @verified) (:max-tx now)))
+                                (vreset! verified now))))
+                          value)))
+                    reserve-value)
+          resolve-candidate #(params/resolve-nextvals! % reserve nil call-seen)
           prepared (prepare-insert-candidates parsed candidate-db resolve-candidate)
           ;; Existing sequences reserve outside the SQL transaction. Their
           ;; nextval writes can therefore advance the connection while the
           ;; candidate fold is running. Re-evaluate the already-materialized
           ;; row operations on the resulting durable basis; this never runs a
           ;; volatile/default expression again.
-          db (materialized-insert-base candidate-db (d/db conn) parsed)
+          db (materialized-insert-base @verified (d/db conn) parsed)
           ;; BEFORE ROW triggers see the prepared candidate -- defaults
           ;; materialised -- and may rewrite or suppress it, so they run
           ;; ahead of the constraint pass, as ExecBRInsertTriggers does
@@ -10043,7 +10062,7 @@
                 (reject-explicit-always-identities!
                  (:tx-data parsed) (:table parsed) db))]
         (execute-insert
-         conn parsed resolver
+         conn parsed nextval-resolver call-seen
          :tx-wrap (:tx-wrap ctx))))))
 
 (defn- exec-update

@@ -1273,6 +1273,13 @@
    inheritance is the correct semantics, not merely the convenient one."
   nil)
 
+(defn column-input-type
+  "Capture the assignment type from a column ident on the plan's catalog basis.
+   An absent typmod on a resolved column means the type is unconstrained."
+  [entity]
+  (when entity
+    {:pg/type (:pg/type entity) :pg/typmod (:pg/typmod entity)}))
+
 (defn pg-type-of-attr
   "Look up the :pg/type string attached to a schema ident entity.
    Datahike's (:schema db) only surfaces schema-governing attrs

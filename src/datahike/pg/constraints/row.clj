@@ -9,6 +9,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.catalog.foreign-keys :as foreign-keys]
             [datahike.pg.errors :as errors]
@@ -65,6 +66,9 @@
                             entity (d/entity db attr)
                             publisher-generated? (:pg/publisher-generated? entity)]
                         {:name name :attr attr
+                         ;; Session-private metadata is outside the shared catalog basis.
+                         :input-type (when-not (catalog-basis/temp-object-name? attr)
+                                       (params/column-input-type entity))
                          :not-null? (true? (:pg/not-null entity))
                          ;; GENERATED ALWAYS AS (expr) STORED. Carried
                          ;; alongside the default and not as one: a
@@ -169,6 +173,7 @@
                       columns)]
     (assoc metadata
            :columns columns
+           :input-types (into {} (map (juxt :attr :input-type)) columns)
            :generated-columns (filterv :generated columns)
            :checks (when checks
                      (mapv (fn [{:keys [constraint expression]}]

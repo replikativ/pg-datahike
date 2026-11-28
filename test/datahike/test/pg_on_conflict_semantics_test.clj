@@ -25,6 +25,7 @@
   (:import [datahike.pg PgWireServer$QueryResult]))
 
 (def ^:dynamic *handler* nil)
+(def ^:dynamic *conn* nil)
 
 (defn- fixture [f]
   (pg/reset-lock-registry!)
@@ -34,7 +35,7 @@
     (d/create-database cfg)
     (let [conn (d/connect cfg)]
       (try
-        (binding [*handler* (pg/make-query-handler conn)]
+        (binding [*conn* conn *handler* (pg/make-query-handler conn)]
           (.execute *handler*
                     "CREATE TABLE t (id int PRIMARY KEY, title text, n int)")
           (f))
@@ -736,3 +737,49 @@
            (.sqlstate (run (upsert "('base','a','state',7),('base','a','state',8)")))))
     (is (= [["a" "1"] ["b" "3"] ["c" "2"]]
            (rows "SELECT name,res_id FROM model_data ORDER BY name")))))
+
+(deftest direct-upsert-can-reserve-more-values-than-the-commit-ring-retains
+  (is (nil? (err "CREATE TABLE direct_ids (id serial PRIMARY KEY, v int UNIQUE)")))
+  (let [insert "INSERT INTO direct_ids(v) VALUES (1),(2),(3),(4),(5) ON CONFLICT(v) DO NOTHING RETURNING id"]
+    (with-redefs-fn {#'pg/recent-commit-ring-size 2
+                     #'pg/recent-commit-writes (atom clojure.lang.PersistentQueue/EMPTY)}
+      (fn []
+        (is (= [["1"] ["2"] ["3"] ["4"] ["5"]] (rows insert)))
+        (is (= "INSERT 0 0" (tag insert)))
+        (is (= "INSERT 0 0" (tag (str "INSERT INTO direct_ids(v) SELECT v FROM direct_ids "
+                                      "ON CONFLICT(v) DO NOTHING"))))
+        (is (= [["15"]] (rows "SELECT currval('direct_ids_id_seq')")))
+        (is (= [["5"]] (rows "SELECT count(*) FROM direct_ids")))))))
+
+(deftest direct-upsert-keeps-an-intervening-row-write-in-its-conflict-window
+  (run "CREATE TABLE proof_rows (id serial PRIMARY KEY, v int UNIQUE)")
+  (run "INSERT INTO proof_rows(v) VALUES (1)")
+  (with-open [peer (pg/make-query-handler *conn*)]
+    (let [reserve @#'pg/session-nextval!
+          issued (atom 0)]
+      (with-redefs-fn {#'pg/recent-commit-ring-size 2
+                       #'pg/recent-commit-writes (atom clojure.lang.PersistentQueue/EMPTY)
+                       #'pg/session-nextval!
+                       (fn [& args]
+                         (let [v (apply reserve args)]
+                           (when (= 2 (swap! issued inc))
+                             (is (nil? (.error (.execute peer "UPDATE proof_rows SET v=11 WHERE v=1")))))
+                           v))}
+        (fn []
+          (let [r (run "INSERT INTO proof_rows(v) VALUES(1),(2),(3),(4),(5) ON CONFLICT(v) DO NOTHING")]
+            (is (= "40001" (.sqlstate r)))
+            (is (= 5 @issued))
+            (is (= [["11"]] (rows "SELECT v FROM proof_rows")))))))))
+
+(deftest direct-upsert-commits-the-exact-report-used-by-returning
+  (seed!)
+  (let [calls (atom 0)
+        eid (d/q '[:find ?e . :where [?e :t/id 1]] @*conn*)
+        wrapped (fn [_] [[:db/add eid :t/n (swap! calls inc)]])]
+    (with-open [h (pg/make-query-handler *conn*
+                                         {:tx-wrap #(conj (vec %) [:db.fn/call wrapped])})]
+      (let [r (.execute h "INSERT INTO t(id,n) VALUES(1,20) ON CONFLICT(id) DO UPDATE SET n=excluded.n RETURNING n")]
+        (is (nil? (.error r)))
+        (is (= [["1"]] (mapv vec (.rows r)))))
+      (is (= 1 @calls))
+      (is (= [["1"]] (rows "SELECT n FROM t WHERE id=1"))))))

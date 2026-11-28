@@ -385,3 +385,26 @@
             (run "CREATE TABLE archive.notnull_tbl1 (label text)")
             (run "SET search_path TO archive, public")
             (is (= #{["label" "f"]} (read-cols)))))))))
+
+(deftest upsert-input-types-follow-the-visible-column-declaration
+  (with-db
+    (fn [conn]
+      (with-open [^PgWireServer$QueryHandler h (pg/make-query-handler conn)]
+        (let [run (fn [sql]
+                    (let [r (.execute h sql)]
+                      (is (nil? (.error r)) (.error r))
+                      (mapv vec (.rows r))))
+              upsert (str "INSERT INTO prices VALUES(1,1.239),(2,2.349) "
+                          "ON CONFLICT(id) DO UPDATE SET n=excluded.n RETURNING n")]
+          (run "CREATE TABLE prices(id int PRIMARY KEY, n numeric(6,2))")
+          (let [before @conn
+                column #(get-in (#'pg/row-constraint-plan % "prices") [:input-types :prices/n])
+                typmod (:pg/typmod (column before))]
+            (is (= [["1.24"] ["2.35"]] (run upsert)))
+            ;; Change only ident metadata, without triggering SQL DDL invalidation.
+            (d/transact conn [[:db/add [:db/ident :prices/n] :pg/typmod (dec typmod)]])
+            (is (= [["1.2"] ["2.3"]] (run upsert)))
+            (is (= (dec typmod) (:pg/typmod (column @conn))))
+            (is (= typmod (:pg/typmod (column before))))
+            (is (= 1.24M (stmt/coerce-insert-value 1.239M :prices/n
+                                                   (dbi/-schema before) before (column before))))))))))
