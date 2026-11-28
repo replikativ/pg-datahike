@@ -1135,3 +1135,66 @@
       (send-copy-data! out "1\n")
       (is (= [\C \G] (mapv first (read-until-tags in #{\G \Z}))))))
   (is (= [["0"]] (:rows (simple "SELECT count(*) FROM copy_group")))))
+
+(deftest simple-query-final-completion-requires-a-successful-implicit-commit
+  (simple "CREATE TABLE commit_probe (id serial PRIMARY KEY, payload int)")
+  (with-conn
+    (fn [in out]
+      (let [query (fn [sql]
+                    (send-msg! out \Q (cstr sql))
+                    (read-until-ready in))
+            fail-commit (fn [& _] (throw (ex-info "commit rejected" {:sqlstate "40001"})))]
+        (doseq [[sql tags] [["INSERT INTO commit_probe(payload) VALUES(1)" [\E \Z]]
+                            ["INSERT INTO commit_probe(payload) VALUES(2) RETURNING id" [\T \D \E \Z]]
+                            ["INSERT INTO commit_probe(payload) VALUES(3); SELECT 7" [\C \T \D \E \Z]]]]
+          (let [msgs (with-redefs-fn {#'pg/transact-tx-buffer! fail-commit} #(query sql))]
+            (is (= tags (mapv first msgs)))
+            (is (= "40001" (get-in (decode msgs) [:error \C])))
+            (is (= \I (ready-status msgs)))))
+        (is (= [["0"]] (:rows (decode (query "SELECT count(*) FROM commit_probe")))))
+        ;; Each sequence reservation succeeded before its row commit failed.
+        (is (= [["3"]] (:rows (decode (query "SELECT currval('commit_probe_id_seq')")))))))))
+
+(deftest final-copy-completion-requires-a-successful-implicit-commit
+  (simple "CREATE TABLE copy_at_commit (id int PRIMARY KEY)")
+  (doseq [from? [true false]]
+    (with-conn
+      (fn [in out]
+        (with-redefs-fn
+          {#'pg/transact-tx-buffer! (fn [& _] (throw (ex-info "commit rejected" {:sqlstate "40001"})))}
+          (fn []
+            (send-msg! out \Q (cstr (str "INSERT INTO copy_at_commit VALUES(1); COPY copy_at_commit "
+                                         (if from? "FROM STDIN" "TO STDOUT"))))
+            (when from?
+              (is (= [\C \G] (mapv first (read-until-tags in #{\G \Z}))))
+              (send-copy-data! out "2\n"))
+            (let [msgs (read-until-ready in)]
+              (is (= (if from? [\E \Z] [\C \H \d \c \E \Z]) (mapv first msgs)))
+              (is (= "40001" (get-in (decode msgs) [:error \C]))))))
+        (is (= [["0"]] (:rows (simple "SELECT count(*) FROM copy_at_commit"))))))))
+
+(deftest execute-and-explicit-transaction-completions-can-precede-commit
+  (simple "CREATE TABLE commit_boundary (id int PRIMARY KEY)")
+  (with-conn
+    (fn [in out]
+      (let [query (fn [sql]
+                    (send-msg! out \Q (cstr sql))
+                    (read-until-ready in))
+            fail-commit (fn [& _] (throw (ex-info "commit rejected" {:sqlstate "40001"})))]
+        (with-redefs-fn {#'pg/transact-tx-buffer! fail-commit}
+          (fn []
+            (send-msg! out \P (ba (cstr "ins") (cstr "INSERT INTO commit_boundary VALUES(1) RETURNING id") [:i16 0]))
+            (send-bind-execute-sync! out "ins" [])
+            (let [msgs (read-until-ready in)]
+              (is (= [\1 \2 \D \C \E \Z] (mapv first msgs)))
+              (is (= "40001" (get-in (decode msgs) [:error \C])))
+              (is (= \I (ready-status msgs))))
+            (is (= \T (ready-status (query "BEGIN"))))
+            (let [msgs (query "INSERT INTO commit_boundary VALUES(2) RETURNING id")]
+              (is (= [\T \D \C \Z] (mapv first msgs)))
+              (is (= \T (ready-status msgs))))
+            (let [msgs (query "COMMIT")]
+              (is (= [\E \Z] (mapv first msgs)))
+              (is (= "40001" (get-in (decode msgs) [:error \C])))
+              (is (= \I (ready-status msgs))))))
+        (is (= [["0"]] (:rows (decode (query "SELECT count(*) FROM commit_boundary")))))))))

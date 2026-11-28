@@ -7629,7 +7629,7 @@
           (restore-temp-tables! tx-state temp-tables)
           (guc/rollback! session-state)
           (end-tx! session-id tx-state cursors)
-          (classified-error "COMMIT failed: " e))))
+          (tag-tx-status (classified-error "COMMIT failed: " e) tx-state))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback

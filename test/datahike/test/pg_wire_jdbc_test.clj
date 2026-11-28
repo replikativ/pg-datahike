@@ -597,9 +597,7 @@
     ;; sends Describe('P') on iter 1 and then bare Bind+Execute on
     ;; iter 2+, expecting no RowDescription on those later Executes
     ;; (it cached the metadata per-statement from the first
-    ;; RowDescription). Our server marks the PreparedStmt as described
-    ;; whenever Describe emits RowDescription, so subsequent re-Binds
-    ;; of the same statement skip RowDescription in Execute.
+    ;; RowDescription).
     (with-conn [c {:preferQueryMode      "extended"
                    :prepareThreshold     "1"
                    :binaryTransferEnable "20,21,23,700,701,1114,1184,2950"

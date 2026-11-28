@@ -24,7 +24,8 @@
    Messages and SQLSTATEs are byte-for-byte from PostgreSQL 17."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.writing :as writing])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
 (def ^:dynamic *handler* nil)
@@ -275,3 +276,16 @@
            (err "SELECT lastval()")))
     (.execute *handler* "SELECT nextval('s')")
     (is (= "43" (v "SELECT lastval()")))))
+(deftest failed-sequence-flush-preserves-the-last-successful-allocation
+  (is (nil? (err "CREATE TABLE failed_flush(id serial PRIMARY KEY, payload int)")))
+  (is (= "1" (v "SELECT nextval('failed_flush_id_seq')")))
+  (is (nil? (err "BEGIN")))
+  (let [result (with-redefs [writing/commit! (fn [& _] (throw (ex-info "injected sequence flush failure" {})))]
+                 (.execute *handler* "INSERT INTO failed_flush(payload) VALUES(42) RETURNING id"))]
+    (is (some? (.error result)))
+    (is (empty? (.rows result))))
+  (is (nil? (err "ROLLBACK")))
+  (is (= "1" (v "SELECT currval('failed_flush_id_seq')")))
+  (is (= "1" (v "SELECT lastval()")))
+  (is (= "1" (v "SELECT last_value FROM failed_flush_id_seq")))
+  (is (= "0" (v "SELECT count(*) FROM failed_flush"))))
