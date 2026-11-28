@@ -7,6 +7,7 @@
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.catalog-read :as catalog-read]
+            [datahike.pg.sql.catalog-relation-read :as relation-read]
             [datahike.pg.sql.stmt :as stmt])
   (:import [datahike.pg PgWireServer$QueryHandler PgWireServer$QueryResult]))
 
@@ -30,6 +31,53 @@
 
 (defn- values [db]
   (set (d/q '[:find [?v ...] :where [_ :cache_test/value ?v]] db)))
+
+(deftest prepared-relation-probes-follow-the-visible-schema
+  (with-db
+    (fn [conn]
+      (with-open [^PgWireServer$QueryHandler h (pg/make-query-handler conn)]
+        (let [execute (fn [sql]
+                        (let [^PgWireServer$QueryResult result (.execute h sql)]
+                          (is (nil? (.-error result)) sql)
+                          (set (map vec (.-rows result)))))
+              query (str "SELECT c.relname, c.relkind FROM pg_class c "
+                         "WHERE c.relname IN ('probe', 'later', 'cache_test') "
+                         "AND c.relkind IN ('r','v','m') "
+                         "AND c.relnamespace = current_schema::regnamespace")]
+          (execute "CREATE TABLE probe (id int)")
+          (execute "CREATE VIEW probe_view AS SELECT id FROM probe")
+          (execute "CREATE MATERIALIZED VIEW probe_mat AS SELECT id FROM probe")
+          (let [kinds (str "SELECT relname, relkind FROM pg_class "
+                           "WHERE relname IN ('probe','probe_view','probe_mat','pg_class') "
+                           "AND relkind IN ('r','v','m')")]
+            (is (= #{["probe" "r"] ["probe_view" "v"] ["probe_mat" "m"] ["pg_class" "r"]}
+                   (execute kinds))))
+          ;; A CTE with the catalog name has its own rows and column types.
+          (is (= #{["local" "r"]}
+                 (execute (str "WITH pg_class AS (SELECT 'local' AS relname, 'r' AS relkind) "
+                               "SELECT c.relname, c.relkind FROM pg_class c "
+                               "WHERE c.relname IN ('local') AND c.relkind IN ('r')"))))
+          (execute "CREATE SCHEMA audit")
+          (execute "CREATE TABLE audit.later (id int)")
+          (let [prepared (.parse h query (int-array 0))
+                run (fn []
+                      (let [^PgWireServer$QueryResult r (.executePrepared h prepared (object-array [nil]))]
+                        (is (nil? (.-error r)))
+                        (set (map vec (.-rows r)))))
+                reads (atom 0)
+                original relation-read/rows]
+            (with-redefs [relation-read/rows (fn [db plan] (swap! reads inc) (original db plan))]
+              (is (= #{["probe" "r"] ["cache_test" "r"]} (run)))
+              (execute "SET search_path TO audit, public")
+              (is (= #{["later" "r"]} (run)))
+              (execute "BEGIN")
+              (execute "SAVEPOINT ddl")
+              (execute "CREATE TABLE audit.probe (id int)")
+              (is (= #{["later" "r"] ["probe" "r"]} (run)))
+              (execute "ROLLBACK TO SAVEPOINT ddl")
+              (is (= #{["later" "r"]} (run)))
+              (execute "COMMIT")
+              (is (pos? @reads)))))))))
 
 (deftest enriched-catalogs-preserve-the-current-user-snapshot
   (binding [sql/*catalog-cache* (java.util.HashMap.)]
@@ -140,12 +188,12 @@
                        "CREATE TABLE audit.child (p int CONSTRAINT audit_fk REFERENCES public.parent)"]]
             (execute ddl))
           (is (= #{"child" "also_absent"}
-                 (:catalog-child-names (sql/parse-sql query (:schema @conn) @conn true))))
+                 (get-in (sql/parse-sql query (:schema @conn) @conn true) [:catalog-plan :foreign-key-children])))
           (is (nil? (:catalog-read? (sql/parse-sql query (:schema @conn) @conn))))
           (is (every? #(get-in (:schema @conn) [% :db/index]) [:pg/fk-child-table :pg/fk-parent-table]))
           (let [two-relations (str "SELECT k.conname FROM pg_class t JOIN pg_constraint k "
                                    "ON k.conrelid = t.oid WHERE t.relname = 'child' AND k.contype = 'f'")]
-            (is (= #{"child"} (:catalog-child-names (sql/parse-sql two-relations (:schema @conn) @conn true))))
+            (is (= #{"child"} (get-in (sql/parse-sql two-relations (:schema @conn) @conn true) [:catalog-plan :foreign-key-children])))
             (is (= #{["public_fk"] ["audit_fk"]} (set (execute two-relations)))))
           (let [plan (.parse h query (int-array 0))
                 read-plan (fn []
@@ -169,7 +217,7 @@
           (let [independent (str "SELECT a.attname FROM pg_class c "
                                  "JOIN pg_constraint f ON c.oid = f.conrelid "
                                  "CROSS JOIN pg_attribute a WHERE c.relname = 'child' AND f.contype = 'f'")]
-            (is (nil? (:catalog-child-names (sql/parse-sql independent (:schema @conn) @conn true))))
+            (is (nil? (get-in (sql/parse-sql independent (:schema @conn) @conn true) [:catalog-plan :foreign-key-children])))
             (is (some #{["id"]} (execute independent))))
           (execute "SET search_path TO public")
           (is (some? (catalog-read/query-db @conn #{"child"})))
@@ -195,3 +243,92 @@
         (is (nil? (.-error ^PgWireServer$QueryResult
                    (.execute h "CREATE TABLE pg (p int REFERENCES p)"))))
         (is (nil? (catalog-read/query-db @conn #{"pg"})))))))
+
+(deftest postgres-abort-restores-table-and-relation-catalog
+  (with-db
+    (fn [conn]
+      (with-open [^PgWireServer$QueryHandler h (pg/make-query-handler conn)]
+        (let [execute (fn [text]
+                        (let [^PgWireServer$QueryResult r (.execute h text)]
+                          (is (nil? (.-error r)) text)
+                          (mapv vec (.-rows r))))
+              relation "SELECT oid FROM pg_class WHERE relname = 'disappear'"]
+          (execute "CREATE TABLE xacttest (a smallint, b real)")
+          (execute "INSERT INTO xacttest VALUES (42, 324.78)")
+          (let [original (execute "SELECT * FROM xacttest")]
+            (execute "BEGIN")
+            (execute "CREATE TABLE disappear (a int4)")
+            (is (= 1 (count (execute relation))))
+            (execute "DELETE FROM xacttest")
+            (is (empty? (execute "SELECT * FROM xacttest")))
+            (execute "ABORT")
+            (is (empty? (execute relation)))
+            (is (= original (execute "SELECT * FROM xacttest")))))))))
+
+(deftest named-information-schema-columns-follow-statement-snapshot
+  (with-db
+    (fn [conn]
+      (with-open [^PgWireServer$QueryHandler h (pg/make-query-handler conn)]
+        (let [run (fn [text]
+                    (let [^PgWireServer$QueryResult r (.execute h text)]
+                      (is (nil? (.-error r)) (str text " " (.-error r)))
+                      r))
+              metadata (fn [^PgWireServer$QueryResult r]
+                         (mapv vec [(.-columnNames r) (.-columnOids r)
+                                    (.-columnTableOids r) (.-columnAttnums r)
+                                    (.-columnTypmods r)]))
+              rows (fn [^PgWireServer$QueryResult r] (set (map vec (.-rows r))))
+              projection (str "SELECT column_name, udt_name, character_maximum_length, is_nullable "
+                              "FROM information_schema.columns WHERE ")
+              compare-scan (fn [^PgWireServer$QueryResult result pattern]
+                             (let [scan (run (str projection "table_name LIKE '" pattern
+                                                  "' AND table_schema=current_schema"))]
+                               (is (= (metadata scan) (metadata result)))
+                               (is (= (rows scan) (rows result)))
+                               (rows result)))]
+          (run "CREATE TABLE widgets (label varchar(12) NOT NULL, enabled boolean)")
+          (run "CREATE TABLE child_widget (weight int) INHERITS (widgets)")
+          (let [db @conn
+                full (catalog/catalog-data-for "information_schema_columns" (:schema db) db)
+                child (catalog/information-schema-column-rows (:schema db) db #{"child_widget"})]
+            (is (= (set (filter #(= "child_widget" (:information_schema_columns/table_name %)) full))
+                   (set child)))
+            (is (contains? (set (map :information_schema_columns/column_name child)) "label")))
+          (run "CREATE SCHEMA warehouse")
+          (run "CREATE TABLE warehouse.widgets (sku int)")
+          (let [query (str projection "table_name='widgets' AND table_schema=current_schema")
+                prepared (.parse h query (int-array 0))
+                parameterized (.parse h (str projection "table_name=$1 AND table_schema=current_schema")
+                                      (int-array [25]))
+                read-table (fn []
+                             (let [^PgWireServer$QueryResult r
+                                   (.executePrepared h prepared (object-array [nil]))]
+                               (is (nil? (.-error r)) (.-error r))
+                               (compare-scan r "widgets")))
+                public-rows #{["db_id" "int8" nil "NO"]
+                              ["label" "varchar" "12" "NO"]
+                              ["enabled" "bool" nil "YES"]}]
+            (is (= {:column-relation "widgets"}
+                   (:catalog-plan (sql/parse-sql query (:schema @conn) @conn true))))
+            (is (= public-rows (read-table)))
+            (is (empty? (compare-scan (run (str projection "table_name='absent' AND table_schema=current_schema"))
+                                      "absent")))
+            (doseq [name ["widgets" "absent"]]
+              (let [^PgWireServer$QueryResult r (.executePrepared h parameterized (object-array [nil name]))]
+                (is (nil? (.-error r)))
+                (compare-scan r name)))
+            (run "SET search_path TO warehouse, public")
+            (is (= #{["db_id" "int8" nil "NO"] ["sku" "int4" nil "YES"]}
+                   (read-table)))
+            (run "SET search_path TO public")
+            (run "BEGIN")
+            (run "SAVEPOINT before_alter")
+            (run "ALTER TABLE widgets ADD COLUMN price numeric(6, 2)")
+            (is (contains? (read-table) ["price" "numeric" nil "YES"]))
+            (run "ROLLBACK TO SAVEPOINT before_alter")
+            (is (= public-rows (read-table)))
+            (run "COMMIT")
+            (schema/set-hint! conn :widgets/enabled {:hidden true})
+            (let [r (run (str projection "table_name='widgets' AND table_schema=current_schema"))]
+              (is (= (disj public-rows ["enabled" "bool" nil "YES"])
+                     (compare-scan r "widgets"))))))))))

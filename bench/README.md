@@ -132,3 +132,12 @@ python3 bench/composite-upsert.py --rows 1000 | psql -X
 Set the usual libpq connection variables for each server. Repeat on the same
 running server to distinguish startup and warm runs. The script creates and
 drops its own table, `upsert_bench`, and stops if the name is already in use.
+
+## Odoo catalog lookups
+
+Run `python3 bench/catalog-reads.py` with psycopg2 and the libpq connection
+variables pointed at a fresh disposable database. The script commits 64 tables
+and queries three of them in rotation. It prints the first result of each lookup,
+six warm samples after three warm-up passes, and six samples after unrelated DDL
+in the same transaction. Timings include the wire round trip and fetching all
+rows. Discard the database after the run.

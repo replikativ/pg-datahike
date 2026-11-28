@@ -267,7 +267,11 @@
      :mode :discovery
      :blockers #{:transaction-characteristic-transitions}
      :strict-slices
-     [{:id :reset-transaction-isolation
+     [{:id :rollback-relation-catalog
+       :source-lines [21 36]
+       :gate "test/datahike/test/pg_catalog_cache_basis_test.clj"
+       :test-var "postgres-abort-restores-table-and-relation-catalog"}
+      {:id :reset-transaction-isolation
        :source-lines [39 42]
        :gate "test/datahike/test/pg_server_test.clj"
        :test-var "postgres-transaction-characteristics-cannot-be-reset"}]}

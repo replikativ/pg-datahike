@@ -144,6 +144,10 @@
     :db/valueType :db.type/boolean
     :db/cardinality :db.cardinality/one
     :db/doc "When true, the target attribute is excluded from virtual table derivation (pg_tables, information_schema.columns, SELECT *)."}
+   {:db/ident :datahike.pg/constraint-name
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "Declared PostgreSQL name of a key constraint backed by this tuple attribute."}
    {:db/ident :datahike.pg/internal-index
     :db/valueType :db.type/boolean
     :db/cardinality :db.cardinality/one

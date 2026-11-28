@@ -8,6 +8,8 @@
             [datahike.pg.catalog.objects :as objects]
             [datahike.pg.constraints.unique :as unique]
             [datahike.pg.dump :as dump]
+            [datahike.pg.sql :as sql]
+            [datahike.pg.sql.catalog-constraint-read :as constraint-read]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
@@ -812,3 +814,37 @@
     (is (nil? (state "CREATE UNIQUE INDEX hx_ub ON hx USING BTREE (guid_field)"))))
   (testing "an unknown access method is still refused"
     (is (= "0A000" (state "CREATE INDEX hx_brin ON hx USING BRIN (id)")))))
+
+(deftest named-composite-key-definition-follows-transactional-ddl
+  (let [probe (str "SELECT COALESCE(d.description, pg_get_constraintdef(c.oid)) "
+                   "FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid "
+                   "LEFT JOIN pg_description d ON c.oid=d.objoid "
+                   "WHERE t.relname='probe' AND conname='probe_key' "
+                   "AND t.relnamespace=current_schema::regnamespace")
+        prepared (.parse *handler* probe (int-array 0))
+        read-definition (fn []
+                          (let [^PgWireServer$QueryResult r
+                                (.executePrepared *handler* prepared (object-array [nil]))]
+                            (is (nil? (.-error r)) (.-error r))
+                            (mapv vec (.-rows r))))]
+    (is (= [] (read-definition)))
+    (is (nil? (state "CREATE TABLE probe(id int, name text, CONSTRAINT probe_key UNIQUE(id, name))")))
+    (let [db @*conn*
+          plan (:catalog-plan (sql/parse-sql probe (:schema db) db true))]
+      (is (= {:relation-name "probe" :constraint-name "probe_key"} plan))
+      (is (some? (constraint-read/query-db db plan))))
+    (is (= [["UNIQUE (id, name)"]] (read-definition)))
+    (is (= [["UNIQUE (id, name)"]]
+           (rows "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c WHERE c.conname = 'probe_key'")))
+    (is (nil? (state "CREATE SCHEMA archive")))
+    (is (nil? (state "CREATE TABLE archive.probe(x int, y int, CONSTRAINT probe_key PRIMARY KEY(x,y))")))
+    (is (nil? (state "SET search_path TO archive, public")))
+    (is (= [["PRIMARY KEY (x, y)"]] (read-definition)))
+    (is (nil? (state "SET search_path TO public")))
+    (is (nil? (state "BEGIN")))
+    (is (nil? (state "SAVEPOINT before_drop")))
+    (is (nil? (state "DROP TABLE probe")))
+    (is (= [] (read-definition)))
+    (is (nil? (state "ROLLBACK TO SAVEPOINT before_drop")))
+    (is (= [["UNIQUE (id, name)"]] (read-definition)))
+    (is (nil? (state "COMMIT")))))

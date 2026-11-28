@@ -110,12 +110,9 @@ reproduced and should be measured before it is believed.
   NOT VALID`). `VALIDATE CONSTRAINT` is implemented, so only the
   deferred-validation half is missing.
 - **`EXECUTE` with a missing argument** substitutes a literal NULL.
-- **An explicitly named COMPOSITE constraint reports the default name.**
-  `CONSTRAINT pk1 PRIMARY KEY (x,y)` appears in `pg_constraint` as
-  `t_pkey`: the lowering computes the name and does not persist it on
-  the derived tuple attribute, so the catalog re-derives PostgreSQL's
-  default.
-
+- **Historical composite constraint names.** New composite primary keys
+  and unique constraints keep their declared names. A table created by a
+  version that discarded the declaration still reports the generated name.
 - **3 of PostgreSQL's 21 `&&`/`@>`/`<@` geometric pairs are
   unimplemented** — polygon-to-polygon overlap and containment, which
   need `lseg_inside_poly` and segment intersection. They refuse with

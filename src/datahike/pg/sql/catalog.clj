@@ -246,7 +246,8 @@
    A runtime catalog registration can define arbitrary data providers."
   [names]
   (let [extensions @extra-catalog-tables]
-    (every? #(and (contains? #{"pg_class" "pg_attribute" "pg_constraint"} %)
+    (every? #(and (contains? #{"pg_class" "pg_attribute" "pg_constraint" "pg_description"
+                               "information_schema_columns"} %)
                   (not (contains? extensions %)))
             names)))
 
@@ -274,9 +275,10 @@
   (bit-or 0x50000000
           (Math/abs (.hashCode ^String (str kind ":" name ":" table)))))
 
-(defn- not-null-constraint-rows [rows user-schema db]
+(defn- not-null-constraint-rows [rows user-schema db storage-names]
   (let [hints (pgs/schema-hints db)
-        tables (pgs/derive-virtual-tables user-schema hints)
+        tables (cond-> (pgs/derive-virtual-tables user-schema hints)
+                 storage-names (select-keys storage-names))
         logical-names (catalog-objects/table-name-overrides db)
         by-table (group-by :pg_constraint/conrelid rows)
         inherited-counts
@@ -364,6 +366,22 @@
   (or (:schema (get @extra-catalog-tables table-name))
       (catalog-schema-for* table-name)))
 
+(defn- complete-constraint-rows [rows user-schema cte-db storage-names]
+  ;; All supported constraints are enforced, local and non-temporal.
+  (let [rows (if (>= (parse-long PgWireServer/SERVER_VERSION_NUM) 180000)
+               (into rows (not-null-constraint-rows rows user-schema cte-db storage-names))
+               rows)]
+    (mapv #(assoc % :pg_constraint/contypid (get % :pg_constraint/contypid 0)
+                  :pg_constraint/conenforced true
+                  :pg_constraint/conislocal (get % :pg_constraint/conislocal true)
+                  :pg_constraint/coninhcount (get % :pg_constraint/coninhcount 0)
+                  :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
+                  :pg_constraint/conparentid 0
+                  :pg_constraint/conperiod false
+                  :pg_constraint/confdeltype (get % :pg_constraint/confdeltype " ")
+                  :pg_constraint/confupdtype (get % :pg_constraint/confupdtype " "))
+          rows)))
+
 (defn catalog-data-for
   "Build one catalog table's row data. Same precedence as
    catalog-schema-for."
@@ -403,20 +421,7 @@
                       alignment (assoc :pg_attribute/attalign alignment))))
                 rows))
         "pg_constraint"
-        ;; All supported constraints are enforced, local and non-temporal.
-        (let [rows (if (>= (parse-long PgWireServer/SERVER_VERSION_NUM) 180000)
-                     (into rows (not-null-constraint-rows rows user-schema cte-db))
-                     rows)]
-          (mapv #(assoc % :pg_constraint/contypid (get % :pg_constraint/contypid 0)
-                        :pg_constraint/conenforced true
-                        :pg_constraint/conislocal (get % :pg_constraint/conislocal true)
-                        :pg_constraint/coninhcount (get % :pg_constraint/coninhcount 0)
-                        :pg_constraint/connoinherit (contains? #{"p" "u" "f"} (:pg_constraint/contype %))
-                        :pg_constraint/conparentid 0
-                        :pg_constraint/conperiod false
-                        :pg_constraint/confdeltype (get % :pg_constraint/confdeltype " ")
-                        :pg_constraint/confupdtype (get % :pg_constraint/confupdtype " "))
-                rows))
+        (complete-constraint-rows rows user-schema cte-db nil)
         rows))))
 
 (def ^:private partitioned-table-schema
@@ -1734,54 +1739,58 @@
     (str "(" (:sql expression) ")")
     (fns/quote-identifier name)))
 
-(defn- explicit-index-descriptors [db]
-  (if-not db
-    []
-    (mapv
-     (fn [[entity oid name table method keys-str unique? relation-oid]]
-       (let [keys (try (edn/read-string keys-str) (catch Exception _ []))
-             keys (mapv (fn [{:keys [attnum] :as key}]
-                          (if-let [column (catalog-objects/column-by-attnum
-                                           db relation-oid attnum)]
-                            (assoc key :name (:datahike.pg.column/name column))
-                            key))
-                        keys)
-             index (d/entity db entity)
-             ident (:db/ident index)
-             legacy-incomplete? (:datahike.pg.index/legacy-incomplete? index)
-             primary? (true? (:datahike.pg.index/primary? index))
-             predicate (some-> (:datahike.pg.index/predicate index) edn/read-string :sql)
-             status (get-in db [:schema ident :db.secondary/status])
-             logical-table (catalog-objects/public-relation-name db table)
-             indexdef (str "CREATE " (when unique? "UNIQUE ")
-                           "INDEX " (fns/quote-identifier name) " ON "
-                           (fns/quote-identifier (storage-schema-name db table)) "."
-                           (fns/quote-identifier logical-table)
-                           " USING " method " ("
-                           (if legacy-incomplete?
-                             "/* legacy key metadata unavailable; DROP and recreate */"
-                             (str/join ", " (map index-key-definition keys))) ")"
-                           (when predicate (str " WHERE " predicate)))]
-         {:oid (long oid) :name name :table table :method method
-          :relation-oid (long relation-oid) :keys keys
-          :unique? (boolean unique?) :primary? primary?
-          :constraint? (true? (:datahike.pg.index/constraint? index))
-          :predicate predicate
-          :expressions (seq (keep (comp :sql :expression) keys))
-          :ready? (not= :building status)
-          :valid? (and (not legacy-incomplete?) (not= :building status))
-          :indexdef indexdef}))
-     (d/q '{:find [?index ?oid ?name ?table ?method ?keys ?unique ?relation-oid]
-            :where [[?index :datahike.pg.object/kind :index]
-                    [?index :datahike.pg.object/oid ?oid]
-                    [?index :datahike.pg.object/name ?name]
-                    [?index :datahike.pg.index/table ?table]
-                    [?index :datahike.pg.index/method ?method]
-                    [?index :datahike.pg.index/keys ?keys]
-                    [?index :datahike.pg.index/unique? ?unique]
-                    [?index :datahike.pg.index/relation ?relation]
-                    [?relation :datahike.pg.object/oid ?relation-oid]]}
-          db))))
+(defn- explicit-index-descriptors
+  ([db] (explicit-index-descriptors db nil))
+  ([db storage-names]
+   (if-not db
+     []
+     (mapv
+      (fn [[entity oid name table method keys-str unique? relation-oid]]
+        (let [keys (try (edn/read-string keys-str) (catch Exception _ []))
+              keys (mapv (fn [{:keys [attnum] :as key}]
+                           (if-let [column (catalog-objects/column-by-attnum
+                                            db relation-oid attnum)]
+                             (assoc key :name (:datahike.pg.column/name column))
+                             key))
+                         keys)
+              index (d/entity db entity)
+              ident (:db/ident index)
+              legacy-incomplete? (:datahike.pg.index/legacy-incomplete? index)
+              primary? (true? (:datahike.pg.index/primary? index))
+              predicate (some-> (:datahike.pg.index/predicate index) edn/read-string :sql)
+              status (get-in db [:schema ident :db.secondary/status])
+              logical-table (catalog-objects/public-relation-name db table)
+              indexdef (str "CREATE " (when unique? "UNIQUE ")
+                            "INDEX " (fns/quote-identifier name) " ON "
+                            (fns/quote-identifier (storage-schema-name db table)) "."
+                            (fns/quote-identifier logical-table)
+                            " USING " method " ("
+                            (if legacy-incomplete?
+                              "/* legacy key metadata unavailable; DROP and recreate */"
+                              (str/join ", " (map index-key-definition keys))) ")"
+                            (when predicate (str " WHERE " predicate)))]
+          {:oid (long oid) :name name :table table :method method
+           :relation-oid (long relation-oid) :keys keys
+           :unique? (boolean unique?) :primary? primary?
+           :constraint? (true? (:datahike.pg.index/constraint? index))
+           :predicate predicate
+           :expressions (seq (keep (comp :sql :expression) keys))
+           :ready? (not= :building status)
+           :valid? (and (not legacy-incomplete?) (not= :building status))
+           :indexdef indexdef}))
+      (let [query '{:find [?index ?oid ?name ?table ?method ?keys ?unique ?relation-oid]
+                    :where [[?index :datahike.pg.object/kind :index]
+                            [?index :datahike.pg.object/oid ?oid]
+                            [?index :datahike.pg.object/name ?name]
+                            [?index :datahike.pg.index/table ?table]
+                            [?index :datahike.pg.index/method ?method]
+                            [?index :datahike.pg.index/keys ?keys]
+                            [?index :datahike.pg.index/unique? ?unique]
+                            [?index :datahike.pg.index/relation ?relation]
+                            [?relation :datahike.pg.object/oid ?relation-oid]]}]
+        (if storage-names
+          (d/q (assoc query :in '[$ [?table ...]]) db storage-names)
+          (d/q query db)))))))
 
 (defn- explicit-primary-keys [db]
   (into {} (comp (filter :primary?) (map (juxt :table identity)))
@@ -1809,44 +1818,45 @@
    called it `t_id_pkey`, and pg_class had no row for an implicit index
    at all -- so `JOIN pg_class ci ON (ci.oid = i.indexrelid)`, the join
    pgjdbc's getPrimaryKeys makes, matched nothing."
-  [db user-schema hints]
-  (let [tables (pgs/derive-virtual-tables user-schema hints)
-        names (catalog-objects/table-name-overrides db)
-        oid-of (fn [tname] (long (or (pgs/storage-table-oid db tname)
-                                     (Math/abs (.hashCode ^String tname)))))]
-    (vec
-     (for [[tname {:keys [columns]}] (sort-by key tables)
-           [idx col] (map-indexed vector columns)
-           :when (or (:unique col)
-                     (and (:indexed? col) (not (:internal-index? col))))
-           :let [primary? (= :db.unique/identity (:unique col))
-                 unique? (some? (:unique col))
-                 attnum (long (or (pgs/column-attnum user-schema tname (:name col) hints)
-                                  (inc idx)))
-                 tbl-oid (oid-of tname)
-                 table-name (get names tname tname)
+  ([db user-schema hints]
+   (native-index-descriptors db user-schema hints (pgs/derive-virtual-tables user-schema hints)))
+  ([db user-schema hints tables]
+   (let [names (catalog-objects/table-name-overrides db)
+         oid-of (fn [tname] (long (or (pgs/storage-table-oid db tname)
+                                      (Math/abs (.hashCode ^String tname)))))]
+     (vec
+      (for [[tname {:keys [columns]}] (sort-by key tables)
+            [idx col] (map-indexed vector columns)
+            :when (or (:unique col)
+                      (and (:indexed? col) (not (:internal-index? col))))
+            :let [primary? (= :db.unique/identity (:unique col))
+                  unique? (some? (:unique col))
+                  attnum (long (or (pgs/column-attnum user-schema tname (:name col) hints)
+                                   (inc idx)))
+                  tbl-oid (oid-of tname)
+                  table-name (get names tname tname)
                  ;; PostgreSQL names a primary key's index after the
                  ;; TABLE (`uq_pkey`); only a unique or plain index carries
                  ;; the column (`uq_e_key`, `uq_n_idx`). ChooseIndexName /
                  ;; ChooseConstraintName in indexcmds.c.
-                 idx-name (cond primary? (str table-name "_pkey")
-                                unique?  (str table-name "_" (:name col) "_key")
-                                :else    (str table-name "_" (:name col) "_idx"))]]
-       {:table tname
-        :column (:name col)
-        :attnum attnum
-        :relation-oid tbl-oid
+                  idx-name (cond primary? (str table-name "_pkey")
+                                 unique?  (str table-name "_" (:name col) "_key")
+                                 :else    (str table-name "_" (:name col) "_idx"))]]
+        {:table tname
+         :column (:name col)
+         :attnum attnum
+         :relation-oid tbl-oid
         ;; Deterministic from (table, column): it only has to be unique
         ;; within the catalog, not to match PostgreSQL's counter.
-        :oid (bit-or 0x40000000
-                     (bit-xor tbl-oid (Math/abs (.hashCode ^String (:name col)))))
-        :name idx-name
-        :primary? primary?
-        :unique? unique?
-        :indexdef (str "CREATE " (when unique? "UNIQUE ") "INDEX " (fns/quote-identifier idx-name)
-                       " ON " (fns/quote-identifier (storage-schema-name db tname)) "."
-                       (fns/quote-identifier table-name)
-                       " USING btree (" (fns/quote-identifier (:name col)) ")")}))))
+         :oid (bit-or 0x40000000
+                      (bit-xor tbl-oid (Math/abs (.hashCode ^String (:name col)))))
+         :name idx-name
+         :primary? primary?
+         :unique? unique?
+         :indexdef (str "CREATE " (when unique? "UNIQUE ") "INDEX " (fns/quote-identifier idx-name)
+                        " ON " (fns/quote-identifier (storage-schema-name db tname)) "."
+                        (fns/quote-identifier table-name)
+                        " USING btree (" (fns/quote-identifier (:name col)) ")")})))))
 
 (defn- attribute-storage [oid]
   (cond
@@ -1893,33 +1903,34 @@
    Query execution keeps using physical table derivation; catalog projection
    overlays the registered SQL column addresses separately so inherited
    columns do not change Datalog attribute resolution."
-  [db tables]
-  (let [physical-by-ident (into {}
-                                (map (juxt :attr identity))
-                                (mapcat :columns (vals tables)))]
-    (mapv
-     (fn [[table-name {:keys [columns]}]]
-       (let [relation-oid (pgs/storage-table-oid db table-name)
-             registered (when relation-oid
-                          (catalog-objects/columns-by-relation
-                           db relation-oid true))]
-         [table-name
-          (if (seq registered)
-            (into []
-                  (keep (fn [column]
-                          (when-let [physical
-                                     (get physical-by-ident
-                                          (:datahike.pg.column/storage-ident column))]
-                            (assoc physical
-                                   :column-eid (:db/id column)
-                                   :name (:datahike.pg.column/name column)
-                                   :attnum (:datahike.pg.column/attnum column)
-                                   :type-oid (:datahike.pg.column/type-oid column)
-                                   :typmod (:datahike.pg.column/typmod column)
-                                   :local? (get column :datahike.pg.column/local? true)))))
-                  registered)
-            columns)]))
-     (sort-by key tables))))
+  ([db tables] (catalog-table-columns db tables nil))
+  ([db tables storage-names]
+   (let [selected (if storage-names (select-keys tables storage-names) tables)
+         ;; An inherited column's attribute belongs to its declaring table.
+         ;; Build that table's physical lookup when a registered column uses it.
+         physical (memoize (fn [storage]
+                             (into {} (map (juxt :attr identity))
+                                   (:columns (get tables storage)))))]
+     (mapv
+      (fn [[table-name {:keys [columns]}]]
+        (let [registered (when-let [oid (pgs/storage-table-oid db table-name)]
+                           (catalog-objects/columns-by-relation db oid true))]
+          [table-name
+           (if (seq registered)
+             (into []
+                   (keep (fn [column]
+                           (let [attr (:datahike.pg.column/storage-ident column)]
+                             (when-let [col (and attr (get (physical (namespace attr)) attr))]
+                               (assoc col
+                                      :column-eid (:db/id column)
+                                      :name (:datahike.pg.column/name column)
+                                      :attnum (:datahike.pg.column/attnum column)
+                                      :type-oid (:datahike.pg.column/type-oid column)
+                                      :typmod (:datahike.pg.column/typmod column)
+                                      :local? (get column :datahike.pg.column/local? true))))))
+                   registered)
+             columns)]))
+      (sort-by key selected)))))
 
 (defn- default-oid [db column]
   (or (:column-eid column) (:db/id (d/entity db (:attr column)))))
@@ -2141,6 +2152,19 @@
                      row)))
           rows)))
 
+(defn table-class-identity
+  "The pg_class identity of a physical table, including pre-registry databases."
+  [db ^String storage]
+  (let [oid (or (pgs/storage-table-oid db storage) (Math/abs (.hashCode storage)))
+        identity (regoid/registry-relation db {:oid oid})]
+    {:pg_class/oid (long oid)
+     :pg_class/relname (or (:name identity) storage)
+     :pg_class/relnamespace (or (:namespace-oid identity) catalog-objects/public-namespace-oid)
+     :pg_class/db-row-exists true}))
+
+(defn table-relkind [partition-parent? matview?]
+  (cond partition-parent? "p" matview? "m" :else "r"))
+
 (defn relation-rows
   "pg_class identities, shared with relation OID lookup. No lookup allocates."
   [user-schema cte-db]
@@ -2180,29 +2204,20 @@
                                    cte-db))]
            (let [triggered (into #{} (map :table) (trigger-entities cte-db))]
              (mapv (fn [t]
-                     (let [tbl-oid (or (pgs/storage-table-oid cte-db t)
-                                       (Math/abs (.hashCode ^String t)))
-                           identity (regoid/registry-relation cte-db {:oid tbl-oid})
-                           logical-name (or (:name identity) t)
+                     (let [{tbl-oid :pg_class/oid :as identity} (table-class-identity cte-db t)
                            row-type (catalog-objects/object-by-identity
                                      cte-db catalog-objects/pg-type-oid
-                                     (or (:namespace-oid identity) catalog-objects/public-namespace-oid)
-                                     logical-name)]
-                       (cond-> {:pg_class/oid (long tbl-oid)
-                                :pg_class/relname logical-name
-                                :pg_class/relnamespace (or (:namespace-oid identity) 2200)
-                                :pg_class/relispartition (contains? partitions tbl-oid)
-                                :pg_class/relhassubclass (contains? has-children tbl-oid)
-                                :pg_class/relkind (cond
-                                                    (contains? parents tbl-oid) "p"
-                                                    (contains? matviews t) "m"
-                                                    :else "r")
-                                :pg_class/relispopulated (get matviews t true)
-                                :pg_class/reltype
-                                (long (if (= :row-type (:datahike.pg.object/kind row-type))
-                                        (:datahike.pg.object/oid row-type) 0))
-                                :pg_class/relhastriggers (contains? triggered t)
-                                (pgs/row-marker-attr "pg_class") true}
+                                     (:pg_class/relnamespace identity) (:pg_class/relname identity))]
+                       (cond-> (assoc identity
+                                      :pg_class/relispartition (contains? partitions tbl-oid)
+                                      :pg_class/relhassubclass (contains? has-children tbl-oid)
+                                      :pg_class/relkind (table-relkind (contains? parents tbl-oid)
+                                                                       (contains? matviews t))
+                                      :pg_class/relispopulated (get matviews t true)
+                                      :pg_class/reltype
+                                      (long (if (= :row-type (:datahike.pg.object/kind row-type))
+                                              (:datahike.pg.object/oid row-type) 0))
+                                      :pg_class/relhastriggers (contains? triggered t))
                          (contains? bounds tbl-oid) (assoc :pg_class/relpartbound (get bounds tbl-oid)))))
                    (pgs/table-names user-schema cte-db))))
      ;; Composite types get a distinct backing pg_class row (relkind 'c');
@@ -2358,6 +2373,413 @@
         :information_schema_constraint_column_usage/constraint_schema (get namespaces connamespace)
         :information_schema_constraint_column_usage/constraint_name conname
         (pgs/row-marker-attr "information_schema_constraint_column_usage") true}))))
+
+(defn information-schema-column-rows
+  "Project the canonical column metadata for the selected physical relations.
+   A nil selection enumerates every relation."
+  [user-schema cte-db storage-names]
+  (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+        names (if storage-names
+                (into {} (map (fn [storage]
+                                [storage (catalog-objects/public-relation-name cte-db storage)]))
+                      storage-names)
+                (catalog-objects/table-name-overrides cte-db))
+        table-columns (catalog-table-columns cte-db tables storage-names)
+        types-by-oid (into {}
+                           (map (juxt :datahike.pg.object/oid identity))
+                           (mapcat #(catalog-objects/objects-by-kind cte-db %) [:domain :enum :composite-type]))
+        domain-bases (into {}
+                           (map (fn [[name base not-null]]
+                                  [name {:oid (pgs/resolve-type-oid cte-db base) :not-null? not-null}]))
+                           (d/q '{:find [?name ?base ?not-null]
+                                  :where [[?e :datahike.pg.domain/name ?name]
+                                          [?e :datahike.pg.domain/base-type ?base]
+                                          [?e :datahike.pg.domain/not-null ?not-null]]}
+                                cte-db))
+        identity-sequences (identity-sequences-by-column cte-db)
+        ;; udt_name in PG follows the underlying base-type convention from
+        ;; pg_type — `int4` / `int8` / `varchar` / `timestamp`, NOT the
+        ;; SQL-spelled `data_type` ("integer" / "bigint" / …). Metabase
+        ;; routes its column-type inference off `udt_name`, so getting
+        ;; this right matters more than data_type spelling.
+        udt-name (fn [vtype]
+                   (case vtype
+                     :db.type/string  "text"
+                     :db.type/long    "int8"
+                     :db.type/boolean "bool"
+                     :db.type/double  "float8"
+                     :db.type/float   "float4"
+                     :db.type/instant "timestamp"
+                     :db.type/uuid    "uuid"
+                     :db.type/ref     "int8"
+                     :db.type/keyword "text"
+                     :db.type/bigdec  "numeric"
+                     :db.type/bytes   "bytea"
+                     "text"))
+        ;; PG's information_schema fills numeric_precision / _scale only
+        ;; for numeric-categoried types and leaves the rest NULL. We do
+        ;; the same — Metabase reads these to infer fixed-point vs
+        ;; floating-point columns. For NUMERIC(p, s) columns we
+        ;; decode the per-attr typmod (set at DDL time) so users see
+        ;; their declared (10, 2) etc., not unconstrained NULL.
+        q-fn d/q
+        typmods (when cte-db
+                  (into {}
+                        (q-fn '{:find [?ident ?tm]
+                                :where [[?e :db/ident ?ident]
+                                        [?e :pg/typmod ?tm]]}
+                              cte-db)))
+        numeric-precision (fn [vtype attr]
+                            (let [[p _] (when-let [tm (get typmods attr)]
+                                          (types/decode-numeric-typmod tm))]
+                              (case vtype
+                                :db.type/long    64
+                                :db.type/ref     64
+                                :db.type/float   24
+                                :db.type/double  53
+                                :db.type/bigdec  p
+                                :db.type/bigint  64
+                                nil)))
+        numeric-radix     (fn [vtype]
+                            (case vtype
+                              :db.type/long    2
+                              :db.type/ref     2
+                              :db.type/float   2
+                              :db.type/double  2
+                              :db.type/bigdec  10
+                              :db.type/bigint  2
+                              nil))
+        numeric-scale     (fn [vtype attr]
+                            (let [[_ s] (when-let [tm (get typmods attr)]
+                                          (types/decode-numeric-typmod tm))]
+                              (case vtype
+                                :db.type/long    0
+                                :db.type/ref     0
+                                :db.type/bigdec  s
+                                :db.type/bigint  0
+                                nil)))
+        publisher-defaults (when cte-db
+                             (into {}
+                                   (q-fn '{:find [?ident ?value]
+                                           :where [[?e :db/ident ?ident]
+                                                   [?e :pg/default-kind :publisher]
+                                                   [?e :pg/default-value ?value]]}
+                                         cte-db)))
+        ;; Drop nil-valued keys per PG's information_schema convention —
+        ;; columns that don't apply to the type are simply absent (the
+        ;; wire layer surfaces them as SQL NULL).
+        drop-nils (fn [m] (into {} (remove (comp nil? val)) m))]
+    ;; The synthetic `db_id` column is listed here and NOT in
+    ;; pg_attribute, so the two catalogs disagree about a table's
+    ;; columns and every `ordinal_position` is one higher than
+    ;; PostgreSQL's -- `id` reports 2 where PostgreSQL says 1. It is
+    ;; not an accident: `SELECT db_id FROM t` works, and two tests
+    ;; asserting it (including `is_identity = YES` on it) were
+    ;; written deliberately. Which catalog should win is a design
+    ;; question, not a bug to fix in passing; see
+    ;; doc/review-backlog.md.
+    (vec (for [[tname columns] table-columns
+               :let [schema-name (storage-schema-name cte-db tname)]
+               [idx col] (map-indexed vector
+                                      (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
+               :let [vtype     (:valuetype col)
+                     declared-oid (or (:type-oid col) (:oid col))
+                     type-name (:datahike.pg.object/name (get types-by-oid declared-oid))
+                     domain    (get domain-bases type-name)
+                     oid       (or (:oid domain) declared-oid)
+                     user-type (get types-by-oid oid)
+                     typmod    (get typmods (:attr col))
+                     char-length (when (and (#{types/oid-bpchar types/oid-varchar} oid)
+                                            typmod (> typmod types/var-hdr-sz))
+                                   (- typmod types/var-hdr-sz))
+                     datetime-precision (cond
+                                          (= types/oid-date oid) 0
+                                          (#{types/oid-time types/oid-timetz
+                                             types/oid-timestamp types/oid-timestamptz} oid)
+                                          (if (and typmod (>= typmod 0)) typmod 6))
+                     pos       (long (if (zero? idx)
+                                       1
+                                       (inc (or (:attnum col) idx))))
+                     identity-seq (get identity-sequences (:attr col))
+                     identity? (or identity-seq
+                                   (and (= "db_id" (:name col)) (zero? idx)))
+                     identity-generation (or (:__seq__/identity-generation identity-seq)
+                                             (when identity? "BY DEFAULT"))]]
+           (drop-nils
+            {:information_schema_columns/table_catalog          "datahike"
+             :information_schema_columns/table_schema           schema-name
+             :information_schema_columns/table_name             (get names tname tname)
+             :information_schema_columns/column_name            (:name col)
+             :information_schema_columns/ordinal_position       pos
+             :information_schema_columns/column_default         (get publisher-defaults (:attr col))
+             :information_schema_columns/is_nullable            (if (or identity?
+                                                                        (:not-null? col)
+                                                                        (:not-null? domain)
+                                                                        (= :db.unique/identity (:unique col)))
+                                                                  "NO" "YES")
+             ;; From the column's DECLARED OID, not its storage
+             ;; valueType — the same correction pg_attribute.atttypid
+             ;; needed. :db.type/instant carries date, time and
+             ;; timestamp alike, so a `date` column reported
+             ;; `timestamp without time zone` here.
+             :information_schema_columns/data_type
+             (cond
+               user-type "USER-DEFINED"
+               (contains? types/array-oid->element-oid oid) "ARRAY"
+               :else (or (get types/oid->pg-name oid) (pgs/pg-type-name vtype)))
+             :information_schema_columns/character_maximum_length char-length
+             :information_schema_columns/character_octet_length (when char-length (* 4 char-length))
+             :information_schema_columns/numeric_precision      (numeric-precision vtype (:attr col))
+             :information_schema_columns/numeric_precision_radix (numeric-radix vtype)
+             :information_schema_columns/numeric_scale          (numeric-scale vtype (:attr col))
+             :information_schema_columns/datetime_precision     datetime-precision
+             :information_schema_columns/domain_catalog         (when domain "datahike")
+             :information_schema_columns/domain_schema          (when domain "public")
+             :information_schema_columns/domain_name            (when domain type-name)
+             :information_schema_columns/udt_catalog            "datahike"
+             :information_schema_columns/udt_schema             (if user-type "public" "pg_catalog")
+             :information_schema_columns/udt_name               (or (:datahike.pg.object/name user-type)
+                                                                    (:typname (types/catalog-type oid))
+                                                                    (udt-name vtype))
+             :information_schema_columns/dtd_identifier         (str pos)
+             :information_schema_columns/is_self_referencing    "NO"
+             :information_schema_columns/is_identity            (if identity? "YES" "NO")
+             :information_schema_columns/identity_generation    identity-generation
+             :information_schema_columns/identity_start (some-> (:__seq__/start identity-seq) str)
+             :information_schema_columns/identity_increment (some-> (:__seq__/increment identity-seq) str)
+             :information_schema_columns/identity_maximum (some-> (:__seq__/maxvalue identity-seq) str)
+             :information_schema_columns/identity_minimum (some-> (:__seq__/minvalue identity-seq) str)
+             :information_schema_columns/identity_cycle (when identity-seq
+                                                          (if (:__seq__/cycle identity-seq) "YES" "NO"))
+             ;; Hardcoded "NEVER", so information_schema reported a
+             ;; generated column as an ordinary one -- the view every
+             ;; portable tool reads instead of pg_attribute.
+             :information_schema_columns/is_generated
+             (if (:generated col) "ALWAYS" "NEVER")
+             :information_schema_columns/generation_expression
+             (:generated-expr col)
+             :information_schema_columns/is_updatable           "YES"
+             (pgs/row-marker-attr "information_schema_columns") true})))))
+
+(defn- base-constraint-rows
+  "Base pg_constraint rows. A set of physical relation names restricts the
+   scan to their constraints, excluding domain constraints (conrelid = 0).
+   PostgreSQL 18 NOT NULL rows are added separately by catalog-data-for."
+  [user-schema cte-db storage-names]
+  (let [hints (pgs/schema-hints cte-db)
+        tables  (cond-> (pgs/derive-virtual-tables user-schema hints)
+                  storage-names (select-keys storage-names))
+        names (catalog-objects/table-name-overrides cte-db)
+        q-fn    d/q
+        domains (when-not storage-names
+                  (q-fn '{:find [?type ?name ?expr]
+                          :where [[?e :datahike.pg.domain/name ?type]
+                                  [?e :datahike.pg.domain/check-name ?name]
+                                  [?e :datahike.pg.domain/check-expr ?expr]]}
+                        cte-db))
+        ;; CHECK constraints persisted via :pg/check-* attrs.
+        checks  (try
+                  (let [query '{:find  [?n ?t ?x]
+                                :keys  [name table expr]
+                                :where [[?e :pg/check-table ?t]
+                                        [?e :pg/check-expr ?x]
+                                        (or-join [?e ?n] [?e :pg/check-conname ?n] [?e :pg/check-name ?n])]}]
+                    (if storage-names
+                      (q-fn (assoc query :in '[$ [?t ...]]) cte-db storage-names)
+                      (q-fn query cte-db)))
+                  (catch Throwable _ []))
+        ;; FK constraints persisted via :pg/fk-* attrs.
+        fks (try
+              (if storage-names
+                (foreign-keys/for-children cte-db storage-names)
+                (foreign-keys/definitions cte-db))
+              (catch Throwable _ []))
+        ;; Prefer durable PostgreSQL attnums. Positional fallback keeps
+        ;; bare/native databases usable before handler migration.
+        attnum-for (fn [tname col-name]
+                     (pgs/column-attnum user-schema tname col-name hints))
+        ;; A key constraint and its index share a name (`t_pkey`,
+        ;; `t_c_key`), which is how the two descriptors meet.
+        index-oids (into {}
+                         (map (fn [{:keys [table name oid]}] [[table name] oid]))
+                         (native-index-descriptors cte-db user-schema hints tables))
+        ->conkey   (fn [attnums]
+                     ;; PG int2[] text form: "{1,2}" — already PG's
+                     ;; canonical wire encoding for an int2[] column.
+                     (str "{" (str/join "," attnums) "}"))]
+    (vec
+     (concat
+      (for [[type-name cname cexpr] domains]
+        {:pg_constraint/oid (long (constraint-oid "c" cname type-name))
+         :pg_constraint/conname cname
+         :pg_constraint/contype "c"
+         :pg_constraint/conrelid 0
+         :pg_constraint/contypid (long (pgs/resolve-type-oid cte-db type-name))
+         :pg_constraint/connamespace 2200
+         :pg_constraint/confrelid 0
+         :pg_constraint/condeferrable false
+         :pg_constraint/condeferred false
+         :pg_constraint/convalidated true
+         :pg_constraint/condef (str "CHECK (" cexpr ")")
+         (pgs/row-marker-attr "pg_constraint") true})
+      ;; UNIQUE / PRIMARY KEY rows — one per unique column.
+      (for [[tname {:keys [columns]}] (sort-by key tables)
+            col columns
+            :when (:unique col)
+            :let [tbl-oid  (or (pgs/storage-table-oid cte-db tname)
+                               (Math/abs (.hashCode ^String tname)))
+                  primary? (= :db.unique/identity (:unique col))
+                  contype  (if primary? "p" "u")
+                  ;; Same naming as the index that backs it: a primary
+                  ;; key is `<table>_pkey`, a unique constraint
+                  ;; `<table>_<column>_key`.
+                  table-name (get names tname tname)
+                  cname    (if primary?
+                             (str table-name "_pkey")
+                             (str table-name "_" (:name col) "_key"))
+                  condef   (str (if primary? "PRIMARY KEY (" "UNIQUE (")
+                                (:name col) ")")
+                  attnum   (attnum-for tname (:name col))]]
+        {:pg_constraint/oid           (long (constraint-oid contype cname tname))
+         :pg_constraint/conname       cname
+         :pg_constraint/contype       contype
+         :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
+         :pg_constraint/conrelid      (long tbl-oid)
+         :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
+         :pg_constraint/confrelid     0
+         :pg_constraint/condeferrable false
+         :pg_constraint/condeferred   false
+         :pg_constraint/convalidated  true
+         :pg_constraint/conkey        (->conkey (if attnum [attnum] []))
+         :pg_constraint/confkey       "{}"
+         :pg_constraint/condef        condef
+         (pgs/row-marker-attr "pg_constraint") true})
+      ;; COMPOSITE PRIMARY KEY / UNIQUE rows. These live on a derived
+      ;; `pg$pk_tuple` / `pg$unique_tuple_N` attribute, which is
+      ;; deliberately hidden from `columns` -- so the per-column loop
+      ;; above produced no row for them and a composite key was absent
+      ;; from pg_constraint entirely, while a single-column one was
+      ;; there. Older stores have only the derived default name.
+      (for [[a props] (sort-by (comp str key) user-schema)
+            :let [unique (pgs/schema-unique hints a props)]
+            :when (and (qualified-keyword? a)
+                       (seq (:db/tupleAttrs props))
+                       unique
+                       (contains? tables (namespace a)))
+            :let [tname (namespace a)
+                  table-name (get names tname tname)
+                  cols (mapv #(or (get-in hints [% :column]) (name %)) (:db/tupleAttrs props))
+                  primary? (= :db.unique/identity unique)
+                  contype (if primary? "p" "u")
+                  cname (or (:datahike.pg/constraint-name
+                             (d/entity cte-db [:datahike.pg/for-ident a]))
+                            (if primary?
+                              (str table-name "_pkey")
+                              (str table-name "_" (str/join "_" cols) "_key")))
+                  tbl-oid (or (pgs/storage-table-oid cte-db tname)
+                              (Math/abs (.hashCode ^String tname)))
+                  attnums (keep #(attnum-for tname %) cols)]]
+        {:pg_constraint/oid           (long (constraint-oid contype cname tname))
+         :pg_constraint/conname       cname
+         :pg_constraint/contype       contype
+         :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
+         :pg_constraint/conrelid      (long tbl-oid)
+         :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
+         :pg_constraint/confrelid     0
+         :pg_constraint/condeferrable false
+         :pg_constraint/condeferred   false
+         :pg_constraint/convalidated  true
+         :pg_constraint/conkey        (->conkey attnums)
+         :pg_constraint/confkey       "{}"
+         :pg_constraint/condef        (str (if primary? "PRIMARY KEY (" "UNIQUE (")
+                                           (str/join ", " (map fns/quote-identifier cols)) ")")
+         (pgs/row-marker-attr "pg_constraint") true})
+      (for [{:keys [table name oid relation-oid keys valid? primary? constraint?]}
+            (explicit-index-descriptors cte-db storage-names)
+            :when (or primary? constraint?)
+            :let [contype (if primary? "p" "u")]]
+        {:pg_constraint/oid           (long (constraint-oid contype name table))
+         :pg_constraint/conname       name
+         :pg_constraint/contype       contype
+         :pg_constraint/conindid      oid
+         :pg_constraint/conrelid      relation-oid
+         :pg_constraint/connamespace  (storage-schema-oid cte-db table)
+         :pg_constraint/confrelid     0
+         :pg_constraint/condeferrable false
+         :pg_constraint/condeferred   false
+         :pg_constraint/convalidated  valid?
+         :pg_constraint/conkey        (->conkey (map :attnum keys))
+         :pg_constraint/confkey       "{}"
+         :pg_constraint/condef        (str (if primary? "PRIMARY KEY (" "UNIQUE (")
+                                           (str/join ", " (map (comp fns/quote-identifier :name) keys))
+                                           ")")
+         (pgs/row-marker-attr "pg_constraint") true})
+      ;; CHECK constraints — one row per persisted :pg/check-*.
+      (for [{cname :name tname :table cexpr :expr} checks
+            :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
+                              (Math/abs (.hashCode ^String tname)))]]
+        {:pg_constraint/oid           (long (constraint-oid "c" cname tname))
+         :pg_constraint/conname       cname
+         :pg_constraint/contype       "c"
+         :pg_constraint/conindid      0
+         :pg_constraint/conrelid      (long tbl-oid)
+         :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
+         :pg_constraint/confrelid     0
+         :pg_constraint/condeferrable false
+         :pg_constraint/condeferred   false
+         :pg_constraint/convalidated  true
+         ;; CHECK constraints don't have a column-attnum vector at
+         ;; the catalog level — PG synthesises conkey only when the
+         ;; CHECK references a single column. We don't parse the
+         ;; expression that deeply, so leave both keys empty.
+         :pg_constraint/conkey        "{}"
+         :pg_constraint/confkey       "{}"
+         :pg_constraint/condef        (str "CHECK (" cexpr ")")
+         (pgs/row-marker-attr "pg_constraint") true})
+      ;; FK constraints — child-cols / parent-cols are stored as
+      ;; JSON-serialized strings; render them as comma-joined
+      ;; identifiers in the condef (matches PG's pg_get_constraintdef).
+      (for [{cname :name child :child-table child-cols :child-cols
+             parent :parent-table parent-cols :parent-cols
+             :keys [on-update on-delete] :as fk} fks
+            :let [tbl-oid (or (pgs/storage-table-oid cte-db child)
+                              (Math/abs (.hashCode ^String child)))
+                  parent-oid (or (pgs/storage-table-oid cte-db parent)
+                                 (Math/abs (.hashCode ^String parent)))
+                  cs (foreign-keys/column-names child-cols)
+                  ps (foreign-keys/column-names parent-cols)
+                  child-attnums  (vec (keep #(attnum-for child %) cs))
+                  parent-attnums (vec (keep #(attnum-for parent %) ps))]]
+        (assoc (foreign-keys/catalog-fields fk tbl-oid parent-oid child-attnums parent-attnums)
+               :pg_constraint/oid (long (constraint-oid "f" cname child))
+               :pg_constraint/connamespace (storage-schema-oid cte-db child)
+               :pg_constraint/condeferrable false
+               :pg_constraint/condeferred false
+               :pg_constraint/convalidated true
+               :pg_constraint/condef
+               (let [path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
+                     reference (binding [regoid/*db* cte-db
+                                         regoid/*relation-db* cte-db
+                                         regoid/*relation-provider* relation-identity
+                                         regoid/*search-path* path]
+                                 (regoid/output types/oid-regclass parent-oid types/format-type))
+                     action-text (fn [clause action]
+                                   (when (not= :no-action action)
+                                     (str clause (-> action name (str/replace "-" " ") str/upper-case))))]
+                 (str "FOREIGN KEY (" (str/join ", " (map fns/quote-identifier cs))
+                      ") REFERENCES " (if (= reference (str parent-oid))
+                                        (fns/quote-identifier parent)
+                                        reference)
+                      " (" (str/join ", " (map fns/quote-identifier ps)) ")"
+                      (action-text " ON UPDATE " on-update)
+                      (action-text " ON DELETE " on-delete)))))))))
+
+(defn constraint-rows
+  "Canonical pg_constraint rows whose owning table has one of these storage names."
+  [db storage-names]
+  (let [schema (:schema db)
+        rows (base-constraint-rows schema db storage-names)]
+    (complete-constraint-rows rows schema db storage-names)))
 
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
@@ -2971,183 +3393,7 @@
              (pgs/row-marker-attr "pg_views") true})
           (view-entities cte-db))
     "information_schema_columns"
-    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
-          names (catalog-objects/table-name-overrides cte-db)
-          table-columns (catalog-table-columns cte-db tables)
-          types-by-oid (into {}
-                             (map (juxt :datahike.pg.object/oid identity))
-                             (mapcat #(catalog-objects/objects-by-kind cte-db %) [:domain :enum :composite-type]))
-          domain-bases (into {}
-                             (map (fn [[name base not-null]]
-                                    [name {:oid (pgs/resolve-type-oid cte-db base) :not-null? not-null}]))
-                             (d/q '{:find [?name ?base ?not-null]
-                                    :where [[?e :datahike.pg.domain/name ?name]
-                                            [?e :datahike.pg.domain/base-type ?base]
-                                            [?e :datahike.pg.domain/not-null ?not-null]]}
-                                  cte-db))
-          identity-sequences (identity-sequences-by-column cte-db)
-          ;; udt_name in PG follows the underlying base-type convention from
-          ;; pg_type — `int4` / `int8` / `varchar` / `timestamp`, NOT the
-          ;; SQL-spelled `data_type` ("integer" / "bigint" / …). Metabase
-          ;; routes its column-type inference off `udt_name`, so getting
-          ;; this right matters more than data_type spelling.
-          udt-name (fn [vtype]
-                     (case vtype
-                       :db.type/string  "text"
-                       :db.type/long    "int8"
-                       :db.type/boolean "bool"
-                       :db.type/double  "float8"
-                       :db.type/float   "float4"
-                       :db.type/instant "timestamp"
-                       :db.type/uuid    "uuid"
-                       :db.type/ref     "int8"
-                       :db.type/keyword "text"
-                       :db.type/bigdec  "numeric"
-                       :db.type/bytes   "bytea"
-                       "text"))
-          ;; PG's information_schema fills numeric_precision / _scale only
-          ;; for numeric-categoried types and leaves the rest NULL. We do
-          ;; the same — Metabase reads these to infer fixed-point vs
-          ;; floating-point columns. For NUMERIC(p, s) columns we
-          ;; decode the per-attr typmod (set at DDL time) so users see
-          ;; their declared (10, 2) etc., not unconstrained NULL.
-          q-fn d/q
-          typmods (when cte-db
-                    (into {}
-                          (q-fn '{:find [?ident ?tm]
-                                  :where [[?e :db/ident ?ident]
-                                          [?e :pg/typmod ?tm]]}
-                                cte-db)))
-          numeric-precision (fn [vtype attr]
-                              (let [[p _] (when-let [tm (get typmods attr)]
-                                            (types/decode-numeric-typmod tm))]
-                                (case vtype
-                                  :db.type/long    64
-                                  :db.type/ref     64
-                                  :db.type/float   24
-                                  :db.type/double  53
-                                  :db.type/bigdec  p
-                                  :db.type/bigint  64
-                                  nil)))
-          numeric-radix     (fn [vtype]
-                              (case vtype
-                                :db.type/long    2
-                                :db.type/ref     2
-                                :db.type/float   2
-                                :db.type/double  2
-                                :db.type/bigdec  10
-                                :db.type/bigint  2
-                                nil))
-          numeric-scale     (fn [vtype attr]
-                              (let [[_ s] (when-let [tm (get typmods attr)]
-                                            (types/decode-numeric-typmod tm))]
-                                (case vtype
-                                  :db.type/long    0
-                                  :db.type/ref     0
-                                  :db.type/bigdec  s
-                                  :db.type/bigint  0
-                                  nil)))
-          publisher-defaults (when cte-db
-                               (into {}
-                                     (q-fn '{:find [?ident ?value]
-                                             :where [[?e :db/ident ?ident]
-                                                     [?e :pg/default-kind :publisher]
-                                                     [?e :pg/default-value ?value]]}
-                                           cte-db)))
-          ;; Drop nil-valued keys per PG's information_schema convention —
-          ;; columns that don't apply to the type are simply absent (the
-          ;; wire layer surfaces them as SQL NULL).
-          drop-nils (fn [m] (into {} (remove (comp nil? val)) m))]
-      ;; The synthetic `db_id` column is listed here and NOT in
-      ;; pg_attribute, so the two catalogs disagree about a table's
-      ;; columns and every `ordinal_position` is one higher than
-      ;; PostgreSQL's -- `id` reports 2 where PostgreSQL says 1. It is
-      ;; not an accident: `SELECT db_id FROM t` works, and two tests
-      ;; asserting it (including `is_identity = YES` on it) were
-      ;; written deliberately. Which catalog should win is a design
-      ;; question, not a bug to fix in passing; see
-      ;; doc/review-backlog.md.
-      (vec (for [[tname columns] table-columns
-                 [idx col] (map-indexed vector
-                                        (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
-                 :let [vtype     (:valuetype col)
-                       declared-oid (or (:type-oid col) (:oid col))
-                       type-name (:datahike.pg.object/name (get types-by-oid declared-oid))
-                       domain    (get domain-bases type-name)
-                       oid       (or (:oid domain) declared-oid)
-                       user-type (get types-by-oid oid)
-                       typmod    (get typmods (:attr col))
-                       char-length (when (and (#{types/oid-bpchar types/oid-varchar} oid)
-                                              typmod (> typmod types/var-hdr-sz))
-                                     (- typmod types/var-hdr-sz))
-                       datetime-precision (cond
-                                            (= types/oid-date oid) 0
-                                            (#{types/oid-time types/oid-timetz
-                                               types/oid-timestamp types/oid-timestamptz} oid)
-                                            (if (and typmod (>= typmod 0)) typmod 6))
-                       pos       (long (if (zero? idx)
-                                         1
-                                         (inc (or (:attnum col) idx))))
-                       identity-seq (get identity-sequences (:attr col))
-                       identity? (or identity-seq
-                                     (and (= "db_id" (:name col)) (zero? idx)))
-                       identity-generation (or (:__seq__/identity-generation identity-seq)
-                                               (when identity? "BY DEFAULT"))]]
-             (drop-nils
-              {:information_schema_columns/table_catalog          "datahike"
-               :information_schema_columns/table_schema           (storage-schema-name cte-db tname)
-               :information_schema_columns/table_name             (get names tname tname)
-               :information_schema_columns/column_name            (:name col)
-               :information_schema_columns/ordinal_position       pos
-               :information_schema_columns/column_default         (get publisher-defaults (:attr col))
-               :information_schema_columns/is_nullable            (if (or identity?
-                                                                          (:not-null? col)
-                                                                          (:not-null? domain)
-                                                                          (= :db.unique/identity (:unique col)))
-                                                                    "NO" "YES")
-               ;; From the column's DECLARED OID, not its storage
-               ;; valueType — the same correction pg_attribute.atttypid
-               ;; needed. :db.type/instant carries date, time and
-               ;; timestamp alike, so a `date` column reported
-               ;; `timestamp without time zone` here.
-               :information_schema_columns/data_type
-               (cond
-                 user-type "USER-DEFINED"
-                 (contains? types/array-oid->element-oid oid) "ARRAY"
-                 :else (or (get types/oid->pg-name oid) (pgs/pg-type-name vtype)))
-               :information_schema_columns/character_maximum_length char-length
-               :information_schema_columns/character_octet_length (when char-length (* 4 char-length))
-               :information_schema_columns/numeric_precision      (numeric-precision vtype (:attr col))
-               :information_schema_columns/numeric_precision_radix (numeric-radix vtype)
-               :information_schema_columns/numeric_scale          (numeric-scale vtype (:attr col))
-               :information_schema_columns/datetime_precision     datetime-precision
-               :information_schema_columns/domain_catalog         (when domain "datahike")
-               :information_schema_columns/domain_schema          (when domain "public")
-               :information_schema_columns/domain_name            (when domain type-name)
-               :information_schema_columns/udt_catalog            "datahike"
-               :information_schema_columns/udt_schema             (if user-type "public" "pg_catalog")
-               :information_schema_columns/udt_name               (or (:datahike.pg.object/name user-type)
-                                                                      (:typname (types/catalog-type oid))
-                                                                      (udt-name vtype))
-               :information_schema_columns/dtd_identifier         (str pos)
-               :information_schema_columns/is_self_referencing    "NO"
-               :information_schema_columns/is_identity            (if identity? "YES" "NO")
-               :information_schema_columns/identity_generation    identity-generation
-               :information_schema_columns/identity_start (some-> (:__seq__/start identity-seq) str)
-               :information_schema_columns/identity_increment (some-> (:__seq__/increment identity-seq) str)
-               :information_schema_columns/identity_maximum (some-> (:__seq__/maxvalue identity-seq) str)
-               :information_schema_columns/identity_minimum (some-> (:__seq__/minvalue identity-seq) str)
-               :information_schema_columns/identity_cycle (when identity-seq
-                                                            (if (:__seq__/cycle identity-seq) "YES" "NO"))
-               ;; Hardcoded "NEVER", so information_schema reported a
-               ;; generated column as an ordinary one -- the view every
-               ;; portable tool reads instead of pg_attribute.
-               :information_schema_columns/is_generated
-               (if (:generated col) "ALWAYS" "NEVER")
-               :information_schema_columns/generation_expression
-               (:generated-expr col)
-               :information_schema_columns/is_updatable           "YES"
-               (pgs/row-marker-attr "information_schema_columns") true}))))
+    (information-schema-column-rows user-schema cte-db nil)
     "information_schema_tables"
     (let [names (catalog-objects/table-name-overrides cte-db)]
       (mapv (fn [t]
@@ -3485,214 +3731,8 @@
     []
     "pg_publication_rel"
     []
-    ;; pg_constraint — one row per UNIQUE/PK column + per CHECK + per FK.
-    ;; `condef` is the rendered text that pg_get_constraintdef returns.
-    ;; Synthesised OIDs are stable hashes of (kind, name, table) so two
-    ;; runs of the same DB produce the same oids — matching how
-    ;; PG-side oids stay stable for the life of a constraint.
     "pg_constraint"
-    (let [hints (pgs/schema-hints cte-db)
-          tables  (pgs/derive-virtual-tables user-schema hints)
-          names (catalog-objects/table-name-overrides cte-db)
-          q-fn    d/q
-          domains (q-fn '{:find [?type ?name ?expr]
-                          :where [[?e :datahike.pg.domain/name ?type]
-                                  [?e :datahike.pg.domain/check-name ?name]
-                                  [?e :datahike.pg.domain/check-expr ?expr]]}
-                        cte-db)
-          ;; CHECK constraints persisted via :pg/check-* attrs.
-          checks  (try
-                    (q-fn '{:find  [?n ?t ?x]
-                            :keys  [name table expr]
-                            :where [[?e :pg/check-table ?t]
-                                    [?e :pg/check-expr ?x]
-                                    (or-join [?e ?n] [?e :pg/check-conname ?n] [?e :pg/check-name ?n])]}
-                          cte-db)
-                    (catch Throwable _ []))
-          ;; FK constraints persisted via :pg/fk-* attrs.
-          fks (try
-                (foreign-keys/definitions cte-db)
-                (catch Throwable _ []))
-          ;; Prefer durable PostgreSQL attnums. Positional fallback keeps
-          ;; bare/native databases usable before handler migration.
-          attnum-for (fn [tname col-name]
-                       (pgs/column-attnum user-schema tname col-name hints))
-          ;; A key constraint and its index share a name (`t_pkey`,
-          ;; `t_c_key`), which is how the two descriptors meet.
-          index-oids (into {}
-                           (map (fn [{:keys [table name oid]}] [[table name] oid]))
-                           (native-index-descriptors cte-db user-schema hints))
-          ->conkey   (fn [attnums]
-                       ;; PG int2[] text form: "{1,2}" — already PG's
-                       ;; canonical wire encoding for an int2[] column.
-                       (str "{" (str/join "," attnums) "}"))]
-      (vec
-       (concat
-        (for [[type-name cname cexpr] domains]
-          {:pg_constraint/oid (long (constraint-oid "c" cname type-name))
-           :pg_constraint/conname cname
-           :pg_constraint/contype "c"
-           :pg_constraint/conrelid 0
-           :pg_constraint/contypid (long (pgs/resolve-type-oid cte-db type-name))
-           :pg_constraint/connamespace 2200
-           :pg_constraint/confrelid 0
-           :pg_constraint/condeferrable false
-           :pg_constraint/condeferred false
-           :pg_constraint/convalidated true
-           :pg_constraint/condef (str "CHECK (" cexpr ")")
-           (pgs/row-marker-attr "pg_constraint") true})
-        ;; UNIQUE / PRIMARY KEY rows — one per unique column.
-        (for [[tname {:keys [columns]}] (sort-by key tables)
-              col columns
-              :when (:unique col)
-              :let [tbl-oid  (or (pgs/storage-table-oid cte-db tname)
-                                 (Math/abs (.hashCode ^String tname)))
-                    primary? (= :db.unique/identity (:unique col))
-                    contype  (if primary? "p" "u")
-                    ;; Same naming as the index that backs it: a primary
-                    ;; key is `<table>_pkey`, a unique constraint
-                    ;; `<table>_<column>_key`.
-                    table-name (get names tname tname)
-                    cname    (if primary?
-                               (str table-name "_pkey")
-                               (str table-name "_" (:name col) "_key"))
-                    condef   (str (if primary? "PRIMARY KEY (" "UNIQUE (")
-                                  (:name col) ")")
-                    attnum   (attnum-for tname (:name col))]]
-          {:pg_constraint/oid           (long (constraint-oid contype cname tname))
-           :pg_constraint/conname       cname
-           :pg_constraint/contype       contype
-           :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
-           :pg_constraint/conrelid      (long tbl-oid)
-           :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
-           :pg_constraint/confrelid     0
-           :pg_constraint/condeferrable false
-           :pg_constraint/condeferred   false
-           :pg_constraint/convalidated  true
-           :pg_constraint/conkey        (->conkey (if attnum [attnum] []))
-           :pg_constraint/confkey       "{}"
-           :pg_constraint/condef        condef
-           (pgs/row-marker-attr "pg_constraint") true})
-        ;; COMPOSITE PRIMARY KEY / UNIQUE rows. These live on a derived
-        ;; `pg$pk_tuple` / `pg$unique_tuple_N` attribute, which is
-        ;; deliberately hidden from `columns` -- so the per-column loop
-        ;; above produced no row for them and a composite key was absent
-        ;; from pg_constraint entirely, while a single-column one was
-        ;; there. The name is re-derived rather than read back: the
-        ;; lowering computes `<table>_pkey` / `<table>_<cols>_key` and
-        ;; does not persist it, so an EXPLICITLY named composite
-        ;; constraint still reports the default name.
-        (for [[a props] (sort-by (comp str key) user-schema)
-              :let [unique (pgs/schema-unique hints a props)]
-              :when (and (qualified-keyword? a)
-                         (seq (:db/tupleAttrs props))
-                         unique
-                         (contains? tables (namespace a)))
-              :let [tname (namespace a)
-                    table-name (get names tname tname)
-                    cols (mapv #(or (get-in hints [% :column]) (name %)) (:db/tupleAttrs props))
-                    primary? (= :db.unique/identity unique)
-                    contype (if primary? "p" "u")
-                    cname (if primary?
-                            (str table-name "_pkey")
-                            (str table-name "_" (str/join "_" cols) "_key"))
-                    tbl-oid (or (pgs/storage-table-oid cte-db tname)
-                                (Math/abs (.hashCode ^String tname)))
-                    attnums (keep #(attnum-for tname %) cols)]]
-          {:pg_constraint/oid           (long (constraint-oid contype cname tname))
-           :pg_constraint/conname       cname
-           :pg_constraint/contype       contype
-           :pg_constraint/conindid      (long (get index-oids [tname cname] 0))
-           :pg_constraint/conrelid      (long tbl-oid)
-           :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
-           :pg_constraint/confrelid     0
-           :pg_constraint/condeferrable false
-           :pg_constraint/condeferred   false
-           :pg_constraint/convalidated  true
-           :pg_constraint/conkey        (->conkey attnums)
-           :pg_constraint/confkey       "{}"
-           :pg_constraint/condef        (str (if primary? "PRIMARY KEY (" "UNIQUE (")
-                                             (str/join ", " cols) ")")
-           (pgs/row-marker-attr "pg_constraint") true})
-        (for [{:keys [table name oid relation-oid keys valid? primary? constraint?]}
-              (explicit-index-descriptors cte-db)
-              :when (or primary? constraint?)
-              :let [contype (if primary? "p" "u")]]
-          {:pg_constraint/oid           (long (constraint-oid contype name table))
-           :pg_constraint/conname       name
-           :pg_constraint/contype       contype
-           :pg_constraint/conindid      oid
-           :pg_constraint/conrelid      relation-oid
-           :pg_constraint/connamespace  (storage-schema-oid cte-db table)
-           :pg_constraint/confrelid     0
-           :pg_constraint/condeferrable false
-           :pg_constraint/condeferred   false
-           :pg_constraint/convalidated  valid?
-           :pg_constraint/conkey        (->conkey (map :attnum keys))
-           :pg_constraint/confkey       "{}"
-           :pg_constraint/condef        (str (if primary? "PRIMARY KEY (" "UNIQUE (")
-                                             (str/join ", " (map (comp fns/quote-identifier :name) keys))
-                                             ")")
-           (pgs/row-marker-attr "pg_constraint") true})
-        ;; CHECK constraints — one row per persisted :pg/check-*.
-        (for [{cname :name tname :table cexpr :expr} checks
-              :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
-                                (Math/abs (.hashCode ^String tname)))]]
-          {:pg_constraint/oid           (long (constraint-oid "c" cname tname))
-           :pg_constraint/conname       cname
-           :pg_constraint/contype       "c"
-           :pg_constraint/conindid      0
-           :pg_constraint/conrelid      (long tbl-oid)
-           :pg_constraint/connamespace  (storage-schema-oid cte-db tname)
-           :pg_constraint/confrelid     0
-           :pg_constraint/condeferrable false
-           :pg_constraint/condeferred   false
-           :pg_constraint/convalidated  true
-           ;; CHECK constraints don't have a column-attnum vector at
-           ;; the catalog level — PG synthesises conkey only when the
-           ;; CHECK references a single column. We don't parse the
-           ;; expression that deeply, so leave both keys empty.
-           :pg_constraint/conkey        "{}"
-           :pg_constraint/confkey       "{}"
-           :pg_constraint/condef        (str "CHECK (" cexpr ")")
-           (pgs/row-marker-attr "pg_constraint") true})
-        ;; FK constraints — child-cols / parent-cols are stored as
-        ;; JSON-serialized strings; render them as comma-joined
-        ;; identifiers in the condef (matches PG's pg_get_constraintdef).
-        (for [{cname :name child :child-table child-cols :child-cols
-               parent :parent-table parent-cols :parent-cols
-               :keys [on-update on-delete] :as fk} fks
-              :let [tbl-oid (or (pgs/storage-table-oid cte-db child)
-                                (Math/abs (.hashCode ^String child)))
-                    parent-oid (or (pgs/storage-table-oid cte-db parent)
-                                   (Math/abs (.hashCode ^String parent)))
-                    cs (foreign-keys/column-names child-cols)
-                    ps (foreign-keys/column-names parent-cols)
-                    child-attnums  (vec (keep #(attnum-for child %) cs))
-                    parent-attnums (vec (keep #(attnum-for parent %) ps))]]
-          (assoc (foreign-keys/catalog-fields fk tbl-oid parent-oid child-attnums parent-attnums)
-                 :pg_constraint/oid (long (constraint-oid "f" cname child))
-                 :pg_constraint/connamespace (storage-schema-oid cte-db child)
-                 :pg_constraint/condeferrable false
-                 :pg_constraint/condeferred false
-                 :pg_constraint/convalidated true
-                 :pg_constraint/condef
-                 (let [path (or (some-> params/*session-state* deref :search-path) ["$user" "public"])
-                       reference (binding [regoid/*db* cte-db
-                                           regoid/*relation-db* cte-db
-                                           regoid/*relation-provider* relation-identity
-                                           regoid/*search-path* path]
-                                   (regoid/output types/oid-regclass parent-oid types/format-type))
-                       action-text (fn [clause action]
-                                     (when (not= :no-action action)
-                                       (str clause (-> action name (str/replace "-" " ") str/upper-case))))]
-                   (str "FOREIGN KEY (" (str/join ", " (map fns/quote-identifier cs))
-                        ") REFERENCES " (if (= reference (str parent-oid))
-                                          (fns/quote-identifier parent)
-                                          reference)
-                        " (" (str/join ", " (map fns/quote-identifier ps)) ")"
-                        (action-text " ON UPDATE " on-update)
-                        (action-text " ON DELETE " on-delete))))))))
+    (base-constraint-rows user-schema cte-db nil)
     "information_schema_constraint_column_usage"
     (constraint-column-usage-rows user-schema cte-db)
     "information_schema_table_constraints"
