@@ -217,10 +217,13 @@
     (fn [row]
       (let [b params/*bound-params*
             bound (if (sequential? b) (vec b) [])
-            {:keys [plan run]} (or @prepared
-                                   (let [p (compiled-plan asts scs schema db)]
-                                     (when-not (:session-dependent? p) (vreset! prepared p))
-                                     p))
+            context (sql/translation-context)
+            [previous compiled] @prepared
+            {:keys [plan run]} (if (= context previous)
+                                 compiled
+                                 (let [p (compiled-plan asts scs schema db)]
+                                   (vreset! prepared (when-not (:session-dependent? p) [context p]))
+                                   p))
             ;; Values are read only for the placeholders the plan uses.
             fetch (fn [idx]
                     (let [idx (long idx)]
