@@ -9,7 +9,8 @@ All notable changes to pg-datahike.
 A simple query sends its final command tag after its implicit commit succeeds.
 If an explicit COMMIT fails and ends the transaction, ReadyForQuery reports
 the connection as idle. Extended Execute sends row data with metadata supplied
-by Describe.
+by Describe. Extended COPY FROM keeps its rows private until Sync commits the
+group. A later command error in the same group rolls the COPY back.
 
 ### Transactional index creation and sequence reservations
 

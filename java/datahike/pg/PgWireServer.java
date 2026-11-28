@@ -1237,14 +1237,7 @@ public final class PgWireServer {
                 // (which clears the state and sends RFQ) and Terminate.
                 if (inError[0]) {
                     if (msgType == 'S') {
-                        // Drop any held extended-query state. The client
-                        // got no CommandCompletes for the held INSERTs
-                        // and no Parse/Bind/Describe responses for any
-                        // pre-Execute messages still in the cur buffer,
-                        // so dropping them keeps the wire response and
-                        // the persisted state in sync. Also drop the
-                        // handler's running speculative-db so the next
-                        // batch re-anchors on the live committed db.
+                        // Roll back the failed group at its Sync boundary.
                         extBatch.clear();
                         try { handler.discardBatch(); } catch (Exception ignore) {}
                         // The group errored — roll back the implicit
@@ -1314,8 +1307,8 @@ public final class PgWireServer {
                         copyState.simpleQuery = null;
                         if (failed && txStatus[0] == 'T') txStatus[0] = 'E';
                         if (simpleQuery == null) {
-                            handler.endQueryGroup();
-                            sendReadyForQuery(out, txStatus[0]);
+                            // Extended COPY finishes Execute. Sync ends the group.
+                            inError[0] = failed;
                             out.flush();
                         } else if (failed) {
                             finishSimpleQuery(out, txStatus, handler, batch, simpleQuery, true);
@@ -1399,6 +1392,15 @@ public final class PgWireServer {
                                 + " sqlstate=" + sqlstate + ": " + e.getMessage());
                         if (!(e instanceof PgProtocolException)) e.printStackTrace(System.err);
                     }
+                    if (msgType == 'P' || msgType == 'B' || msgType == 'D'
+                            || msgType == 'E' || msgType == 'C') {
+                        // Earlier messages succeeded even when this command fails.
+                        // Sync discards the group's speculative writes.
+                        for (byte[] bytes : extBatch.heldBytes) out.write(bytes);
+                        extBatch.cur.writeTo(out);
+                        extBatch.clear();
+                        inError[0] = true;
+                    }
                     sendError(out, "ERROR", sqlstate,
                             e.getMessage() != null ? e.getMessage() : e.getClass().getName(),
                             fields);
@@ -1409,13 +1411,6 @@ public final class PgWireServer {
                     if (txStatus[0] == 'T') {
                         handler.markTransactionFailed();
                         txStatus[0] = 'E';
-                    }
-                    // Extended-query messages enter error-skip mode; Simple Query
-                    // recovers on its own (handleQuery catches internally and
-                    // sends its own ReadyForQuery).
-                    if (msgType == 'P' || msgType == 'B' || msgType == 'D'
-                            || msgType == 'E' || msgType == 'C') {
-                        inError[0] = true;
                     }
                 }
                 // Statement-boundary cleanup (runs after success or
@@ -2756,17 +2751,6 @@ public final class PgWireServer {
             extBatch.resetCur();
             sendCommandComplete(out, "SELECT 0");
         } else if (result.error != null) {
-            // Implicit-transaction semantics: an error anywhere in an
-            // extended-query message group (every message up to the next
-            // Sync) rolls the WHOLE group back, matching PostgreSQL. So
-            // we must NOT commit the held INSERTs — discard them (and the
-            // running speculative-db) and throw. The connection loop sends
-            // ErrorResponse and enters extended-query error-skip; the
-            // group-terminating Sync clears any remaining state. This is
-            // what makes a client's executemany atomic: one bad row rolls
-            // back every row in the batch.
-            extBatch.clear();
-            try { handler.discardBatch(); } catch (Exception ignore) {}
             throw new PgProtocolException(
                 result.sqlstate != null ? result.sqlstate : "XX000",
                 result.error,

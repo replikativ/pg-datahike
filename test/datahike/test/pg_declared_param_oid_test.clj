@@ -1198,3 +1198,32 @@
               (is (= "40001" (get-in (decode msgs) [:error \C])))
               (is (= \I (ready-status msgs))))))
         (is (= [["0"]] (:rows (decode (query "SELECT count(*) FROM commit_boundary")))))))))
+
+(deftest extended-copy-completion-and-error-resynchronize-at-sync
+  (simple "CREATE TABLE copy_sync (id int PRIMARY KEY)")
+  (with-conn
+    (fn [in out]
+      (let [execute (fn [sql]
+                      (send-msg! out \P (ba (cstr "") (cstr sql) [:i16 0]))
+                      (send-msg! out \B (bind-body "" []))
+                      (send-msg! out \E (ba (cstr "") [:i32 0])))]
+        (doseq [mode [:success :copy-fail :subsequent-error]]
+          (execute "COPY copy_sync FROM STDIN")
+          (send-msg! out \H (byte-array 0))
+          (is (= [\1 \2 \G] (mapv first (read-until-tags in #{\G \Z}))))
+          (if (= mode :copy-fail)
+            (send-msg! out \f (cstr "cancelled"))
+            (do (send-copy-data! out (if (= mode :success) "1\n" "4\n"))
+                (send-msg! out \H (byte-array 0))
+                (is (= [\C] (mapv first (read-until-tags in #{\C \Z}))))
+                (let [peer (simple "SELECT id FROM copy_sync ORDER BY id")]
+                  (is (nil? (:error peer)))
+                  (is (= (if (= mode :success) [] [["1"] ["2"]]) (vec (:rows peer)))))))
+          (execute (if (= mode :copy-fail) "INSERT INTO copy_sync VALUES(3)" "INSERT INTO copy_sync VALUES(2)"))
+          (send-msg! out \S (byte-array 0))
+          (let [msgs (read-until-ready in)]
+            (is (= (case mode :copy-fail [\E \Z] :success [\1 \2 \C \Z] :subsequent-error [\1 \2 \E \Z]) (mapv first msgs)))
+            (is (= (case mode :copy-fail "57014" :subsequent-error "23505" nil)
+                   (get-in (decode msgs) [:error \C])))
+            (is (= \I (ready-status msgs))))
+          (is (= [["1"] ["2"]] (:rows (simple "SELECT id FROM copy_sync ORDER BY id")))))))))

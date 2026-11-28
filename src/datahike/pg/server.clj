@@ -16846,7 +16846,7 @@
                                      (not *snapshot-db*)
                                      (not (:in-tx? @tx-state))
                                      (or (contains? write-parse-types (:type parsed))
-                                         (and (= :simple-multi *implicit-tx-group*)
+                                         (and (#{:simple-multi :extended} *implicit-tx-group*)
                                               (copy-from? parsed))))
                             (open-implicit-tx! ctx))
                           (binding [params/*runtime-db* db
