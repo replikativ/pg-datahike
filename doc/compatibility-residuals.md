@@ -216,6 +216,30 @@ cover preservation of the explicit name on an inline foreign key. The
 adapter gate checks the name in `pg_constraint` and drops the constraint
 by that name.
 
+### Odoo external IDs and registry initialization
+
+Odoo 19 at `007e86391e14` creates the external-ID table, inserts bootstrap rows,
+and creates composite indexes in one SQL transaction. With Datahike 0.8.1958
+a full scan after commit found rows that indexed reads missed. The paired
+`alter_table.sql` gate (2349–2351) checks that an equality lookup sees an
+earlier insert after commit and a duplicate is rejected. The Odoo fixture
+checks both composite lookups and a subsequent upsert.
+
+With the Datahike #1198 index fix, a separate connection saw
+`base.group_user` and `base.module_category_accounting` after bootstrap.
+The module-list update passed. Ten of the eleven base ORM cases passed in
+that run. The remaining case, `test_m2m_store_trigger`, reached a group
+membership query combining five correlated EXISTS predicates. Its captured
+SQL now has a focused PostgreSQL 18.6 comparison, including separate tests
+for NULL and empty membership sets. A full application run with the
+membership change is pending.
+
+The same installation reached the auto-installed web module. Updating
+`res_company.paperformat_id` then failed with SQLSTATE 40001 during
+transaction rebase. The logged transaction numbers were 536870964 and
+536871995. Whether concurrent writes actually overlapped is unverified.
+Stock PostgreSQL 18.6 completed initialization of all 14 modules.
+
 ### asyncpg expected failures by owning ID
 
 | Area | IDs | Observed causes |
