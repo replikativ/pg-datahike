@@ -2781,6 +2781,97 @@
         rows (base-constraint-rows schema db storage-names)]
     (complete-constraint-rows rows schema db storage-names)))
 
+(defn table-attribute-rows
+  "Live table columns using the same durable ordinals and type metadata as pg_attribute.
+   A nil storage selection enumerates all tables."
+  [user-schema cte-db storage-names]
+  (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+        table-columns (catalog-table-columns cte-db tables storage-names)
+        identity-sequences (identity-sequences-by-column cte-db)
+          ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
+          ;; column. Returns {attr-ident → typmod-int}.
+        q-fn d/q
+        typmods (when cte-db
+                  (into {}
+                        (q-fn '{:find [?ident ?typmod]
+                                :where [[?e :db/ident ?ident]
+                                        [?e :pg/typmod ?typmod]]}
+                              cte-db)))
+          ;; `atthasdef` is true for a STORED generated column too --
+          ;; its expression lives in pg_attrdef, which is where pg_dump
+          ;; reads the generation clause from.
+        default-idents (when cte-db
+                         (into (into #{}
+                                     (map first)
+                                     (d/q '{:find [?ident]
+                                            :where [[?e :db/ident ?ident]
+                                                    [?e :pg/default-kind]]}
+                                          cte-db))
+                               (map first)
+                               (d/q '{:find [?ident]
+                                      :where [[?e :db/ident ?ident]
+                                              [?e :pg/generated-expr]]}
+                                    cte-db)))]
+    (for [[tname columns] table-columns
+          :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
+                                   ;; Pre-existing tables from before we
+                                   ;; started tracking :pg/table-oid — fall
+                                   ;; back to the attnum-derived composite
+                                   ;; key convention (name → hash) so stale
+                                   ;; data still has a stable attrelid.
+                            (Math/abs (.hashCode ^String tname)))]
+          [idx col] (map-indexed vector columns)
+          :let [pk? (= :db.unique/identity (:unique col))
+                identity-seq (get identity-sequences (:attr col))
+                identity-code (cond
+                                identity-seq
+                                (if (= "ALWAYS"
+                                       (:__seq__/identity-generation identity-seq))
+                                  "a" "d")
+                                (= "db_id" (:name col)) "d"
+                                :else "")
+                       ;; -1 = unconstrained (real PG's default for
+                       ;; plain NUMERIC / TEXT). Defined NUMERIC(p, s)
+                       ;; columns get a positive value via DDL.
+                typmod (long (or (:typmod col)
+                                 (get typmods (:attr col)) -1))]]
+      {:pg_attribute/attname (:name col)
+              ;; Cardinality-many columns project as PG arrays, so
+              ;; their atttypid must be the array OID — pgjdbc reads
+              ;; this for ResultSetMetaData and the field-metadata
+              ;; cache key. Mirrors the OID inference in
+              ;; oid-infer/column-oid.
+       :pg_attribute/atttypid
+          ;; `(:oid col)`, NOT a fresh derivation from :valuetype. The
+          ;; column map already carries the authoritative OID from
+          ;; `declared-col-oid`, which honours the `:pg/type` recorded at
+          ;; CREATE TABLE. Recomputing from storage type collapsed every
+          ;; declared type back onto its Datahike carrier: a `date`
+          ;; column reported `timestamp without time zone` (1114) and an
+          ;; `int` column reported `bigint` (20). Drivers read this to
+          ;; pick a codec, so it is not cosmetic — and a date column's
+          ;; binary encode then failed and silently shipped text bytes
+          ;; labelled as binary.
+       (long (let [base (or (:type-oid col) (:oid col))]
+               (if (and (= :db.cardinality/many (:cardinality col))
+                           ;; `_int4` already resolved to 1007 via
+                           ;; :pg/type; promoting again would give int[][].
+                        (not (contains? types/array-oid->element-oid base)))
+                 (get types/element-oid->array-oid base types/oid-text-array)
+                 base)))
+       :pg_attribute/attnum (long (or (:attnum col) (inc idx)))
+       :pg_attribute/attrelid (long tbl-oid)
+       :pg_attribute/attnotnull (boolean (or pk? (:not-null? col)))
+       :pg_attribute/attislocal (get col :local? true)
+       :pg_attribute/atthasdef (contains? default-idents (:attr col))
+       :pg_attribute/attidentity identity-code
+       :pg_attribute/attgenerated (or (:generated col) "")
+       :pg_attribute/attstorage (attribute-storage (:oid col))
+       :pg_attribute/attcompression ""
+       :pg_attribute/atttypmod typmod
+       :pg_attribute/attisdropped false
+       (pgs/row-marker-attr "pg_attribute") true})))
+
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
    per-table body; library consumers add more via the registry."
@@ -2875,169 +2966,84 @@
                   cte-db)))]
       (complete-type-rows (concat base composites enums row-types domains)))
     "pg_attribute"
-    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
-          table-columns (catalog-table-columns cte-db tables)
-          identity-sequences (identity-sequences-by-column cte-db)
-          ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
-          ;; column. Returns {attr-ident → typmod-int}.
-          q-fn d/q
-          typmods (when cte-db
-                    (into {}
-                          (q-fn '{:find [?ident ?typmod]
-                                  :where [[?e :db/ident ?ident]
-                                          [?e :pg/typmod ?typmod]]}
-                                cte-db)))
-          ;; `atthasdef` is true for a STORED generated column too --
-          ;; its expression lives in pg_attrdef, which is where pg_dump
-          ;; reads the generation clause from.
-          default-idents (when cte-db
-                           (into (into #{}
-                                       (map first)
-                                       (d/q '{:find [?ident]
-                                              :where [[?e :db/ident ?ident]
-                                                      [?e :pg/default-kind]]}
-                                            cte-db))
-                                 (map first)
-                                 (d/q '{:find [?ident]
-                                        :where [[?e :db/ident ?ident]
-                                                [?e :pg/generated-expr]]}
-                                      cte-db)))]
-      (into
+    (into
        ;; composite-type fields: attrelid = the composite's pg_class oid
        ;; (= its type oid here); atttypid = each field's PG type OID.
-       (vec (for [{:keys [name oid fields]} (pgs/composite-types cte-db)
-                  [idx f] (map-indexed vector fields)]
-              (let [relation (catalog-objects/object-by-identity
-                              cte-db catalog-objects/pg-class-oid
-                              catalog-objects/public-namespace-oid name)
-                    column (when relation
-                             (catalog-objects/column-by-name
-                              cte-db (:datahike.pg.object/oid relation)
-                              (:field-name f)))]
-                {:pg_attribute/attname (:field-name f)
-                 :pg_attribute/atttypid
-                 (long (or (:datahike.pg.column/type-oid column) (:oid f)))
-                 :pg_attribute/attnum
-                 (long (or (:datahike.pg.column/attnum column) (inc idx)))
-                 :pg_attribute/attrelid
-                 (long (or (:datahike.pg.object/oid relation) oid))
-                 :pg_attribute/attnotnull false
-                 :pg_attribute/atthasdef false
-                 :pg_attribute/attidentity ""
-                 :pg_attribute/attgenerated ""
-                 :pg_attribute/attstorage (attribute-storage (:oid f))
-                 :pg_attribute/attcompression ""
-                 :pg_attribute/atttypmod
-                 (long (or (:datahike.pg.column/typmod column) -1))
-                 :pg_attribute/attisdropped false
-                 (pgs/row-marker-attr "pg_attribute") true})))
-       (concat
-        (expression-index-attributes cte-db)
-        (for [[tname columns] table-columns
-              [idx col] (map-indexed vector columns)
-              :let [tbl-oid (or (pgs/storage-table-oid cte-db tname)
-                                   ;; Pre-existing tables from before we
-                                   ;; started tracking :pg/table-oid — fall
-                                   ;; back to the attnum-derived composite
-                                   ;; key convention (name → hash) so stale
-                                   ;; data still has a stable attrelid.
-                                (Math/abs (.hashCode ^String tname)))
-                    pk? (= :db.unique/identity (:unique col))
-                    identity-seq (get identity-sequences (:attr col))
-                    identity-code (cond
-                                    identity-seq
-                                    (if (= "ALWAYS"
-                                           (:__seq__/identity-generation identity-seq))
-                                      "a" "d")
-                                    (= "db_id" (:name col)) "d"
-                                    :else "")
-                       ;; -1 = unconstrained (real PG's default for
-                       ;; plain NUMERIC / TEXT). Defined NUMERIC(p, s)
-                       ;; columns get a positive value via DDL.
-                    typmod (long (or (:typmod col)
-                                     (get typmods (:attr col)) -1))]]
+     (vec (for [{:keys [name oid fields]} (pgs/composite-types cte-db)
+                [idx f] (map-indexed vector fields)]
+            (let [relation (catalog-objects/object-by-identity
+                            cte-db catalog-objects/pg-class-oid
+                            catalog-objects/public-namespace-oid name)
+                  column (when relation
+                           (catalog-objects/column-by-name
+                            cte-db (:datahike.pg.object/oid relation)
+                            (:field-name f)))]
+              {:pg_attribute/attname (:field-name f)
+               :pg_attribute/atttypid
+               (long (or (:datahike.pg.column/type-oid column) (:oid f)))
+               :pg_attribute/attnum
+               (long (or (:datahike.pg.column/attnum column) (inc idx)))
+               :pg_attribute/attrelid
+               (long (or (:datahike.pg.object/oid relation) oid))
+               :pg_attribute/attnotnull false
+               :pg_attribute/atthasdef false
+               :pg_attribute/attidentity ""
+               :pg_attribute/attgenerated ""
+               :pg_attribute/attstorage (attribute-storage (:oid f))
+               :pg_attribute/attcompression ""
+               :pg_attribute/atttypmod
+               (long (or (:datahike.pg.column/typmod column) -1))
+               :pg_attribute/attisdropped false
+               (pgs/row-marker-attr "pg_attribute") true})))
+     (concat
+      (expression-index-attributes cte-db)
+      (table-attribute-rows user-schema cte-db nil)
+      (for [{:keys [name columns]} (view-entities cte-db)
+            [idx col] (map-indexed vector columns)]
+        (let [relation (catalog-objects/object-by-identity
+                        cte-db catalog-objects/pg-class-oid
+                        catalog-objects/public-namespace-oid name)
+              relation-oid (:datahike.pg.object/oid relation)
+              column-address (when relation-oid
+                               (catalog-objects/column-by-name
+                                cte-db relation-oid (:name col)))]
           {:pg_attribute/attname (:name col)
-              ;; Cardinality-many columns project as PG arrays, so
-              ;; their atttypid must be the array OID — pgjdbc reads
-              ;; this for ResultSetMetaData and the field-metadata
-              ;; cache key. Mirrors the OID inference in
-              ;; oid-infer/column-oid.
            :pg_attribute/atttypid
-          ;; `(:oid col)`, NOT a fresh derivation from :valuetype. The
-          ;; column map already carries the authoritative OID from
-          ;; `declared-col-oid`, which honours the `:pg/type` recorded at
-          ;; CREATE TABLE. Recomputing from storage type collapsed every
-          ;; declared type back onto its Datahike carrier: a `date`
-          ;; column reported `timestamp without time zone` (1114) and an
-          ;; `int` column reported `bigint` (20). Drivers read this to
-          ;; pick a codec, so it is not cosmetic — and a date column's
-          ;; binary encode then failed and silently shipped text bytes
-          ;; labelled as binary.
-           (long (let [base (or (:type-oid col) (:oid col))]
-                   (if (and (= :db.cardinality/many (:cardinality col))
-                           ;; `_int4` already resolved to 1007 via
-                           ;; :pg/type; promoting again would give int[][].
-                            (not (contains? types/array-oid->element-oid base)))
-                     (get types/element-oid->array-oid base types/oid-text-array)
-                     base)))
-           :pg_attribute/attnum (long (or (:attnum col) (inc idx)))
-           :pg_attribute/attrelid (long tbl-oid)
-           :pg_attribute/attnotnull (boolean (or pk? (:not-null? col)))
-           :pg_attribute/attislocal (get col :local? true)
-           :pg_attribute/atthasdef (contains? default-idents (:attr col))
-           :pg_attribute/attidentity identity-code
-           :pg_attribute/attgenerated (or (:generated col) "")
-           :pg_attribute/attstorage (attribute-storage (:oid col))
-           :pg_attribute/attcompression ""
-           :pg_attribute/atttypmod typmod
-           :pg_attribute/attisdropped false
-           (pgs/row-marker-attr "pg_attribute") true})
-        (for [{:keys [name columns]} (view-entities cte-db)
-              [idx col] (map-indexed vector columns)]
-          (let [relation (catalog-objects/object-by-identity
-                          cte-db catalog-objects/pg-class-oid
-                          catalog-objects/public-namespace-oid name)
-                relation-oid (:datahike.pg.object/oid relation)
-                column-address (when relation-oid
-                                 (catalog-objects/column-by-name
-                                  cte-db relation-oid (:name col)))]
-            {:pg_attribute/attname (:name col)
-             :pg_attribute/atttypid
-             (long (or (:datahike.pg.column/type-oid column-address) (:oid col)))
-             :pg_attribute/attnum
-             (long (or (:datahike.pg.column/attnum column-address) (inc idx)))
-             :pg_attribute/attrelid
-             (long (or (:datahike.pg.object/oid relation)
-                       (Math/abs (.hashCode ^String name))))
-             :pg_attribute/attnotnull false
-             :pg_attribute/atthasdef false
-             :pg_attribute/attidentity ""
-             :pg_attribute/attstorage (attribute-storage (:oid col))
-             :pg_attribute/attcompression ""
-             :pg_attribute/atttypmod
-             (long (or (:datahike.pg.column/typmod column-address)
-                       (:typmod col) -1))
-             :pg_attribute/attisdropped false
-             (pgs/row-marker-attr "pg_attribute") true}))
-        (for [kind [:table :view :composite-relation]
-              relation (catalog-objects/objects-by-kind cte-db kind)
-              column (catalog-objects/columns-by-relation
-                      cte-db (:datahike.pg.object/oid relation))
-              :when (:datahike.pg.column/dropped? column)]
-          {:pg_attribute/attname
-           (catalog-objects/catalog-column-name column)
-           :pg_attribute/atttypid 0
-           :pg_attribute/attnum (:datahike.pg.column/attnum column)
-           :pg_attribute/attrelid (:datahike.pg.object/oid relation)
-           :pg_attribute/attislocal (get column :datahike.pg.column/local? true)
+           (long (or (:datahike.pg.column/type-oid column-address) (:oid col)))
+           :pg_attribute/attnum
+           (long (or (:datahike.pg.column/attnum column-address) (inc idx)))
+           :pg_attribute/attrelid
+           (long (or (:datahike.pg.object/oid relation)
+                     (Math/abs (.hashCode ^String name))))
            :pg_attribute/attnotnull false
            :pg_attribute/atthasdef false
            :pg_attribute/attidentity ""
-           :pg_attribute/attstorage "p"
+           :pg_attribute/attstorage (attribute-storage (:oid col))
            :pg_attribute/attcompression ""
-           :pg_attribute/atttypmod -1
-           :pg_attribute/attisdropped true
-           (pgs/row-marker-attr "pg_attribute") true}))))
+           :pg_attribute/atttypmod
+           (long (or (:datahike.pg.column/typmod column-address)
+                     (:typmod col) -1))
+           :pg_attribute/attisdropped false
+           (pgs/row-marker-attr "pg_attribute") true}))
+      (for [kind [:table :view :composite-relation]
+            relation (catalog-objects/objects-by-kind cte-db kind)
+            column (catalog-objects/columns-by-relation
+                    cte-db (:datahike.pg.object/oid relation))
+            :when (:datahike.pg.column/dropped? column)]
+        {:pg_attribute/attname
+         (catalog-objects/catalog-column-name column)
+         :pg_attribute/atttypid 0
+         :pg_attribute/attnum (:datahike.pg.column/attnum column)
+         :pg_attribute/attrelid (:datahike.pg.object/oid relation)
+         :pg_attribute/attislocal (get column :datahike.pg.column/local? true)
+         :pg_attribute/attnotnull false
+         :pg_attribute/atthasdef false
+         :pg_attribute/attidentity ""
+         :pg_attribute/attstorage "p"
+         :pg_attribute/attcompression ""
+         :pg_attribute/atttypmod -1
+         :pg_attribute/attisdropped true
+         (pgs/row-marker-attr "pg_attribute") true})))
     "pg_namespace"
     (let [namespaces (catalog-objects/objects-by-kind cte-db :namespace)]
       (if (seq namespaces)

@@ -12,7 +12,7 @@
             [datahike.pg.types :as types])
   (:import [datahike.db DB]
            [net.sf.jsqlparser.schema Column Table]
-           [net.sf.jsqlparser.expression Alias BooleanValue JdbcParameter LongValue NotExpression NullValue SignedExpression]
+           [net.sf.jsqlparser.expression Alias BooleanValue Function JdbcParameter LongValue NotExpression NullValue SignedExpression]
            [net.sf.jsqlparser.expression.operators.conditional AndExpression]
            [net.sf.jsqlparser.expression.operators.relational EqualsTo ExistsExpression InExpression IsNullExpression ParenthesedExpressionList]
            [net.sf.jsqlparser.statement.select PlainSelect ParenthesedSelect LateralSubSelect Join Select SelectItem]))
@@ -76,6 +76,15 @@
        (not (.getMySqlSqlCalcFoundRows select))
        (nil? (.getMySqlSqlCacheFlag select))
        (nil? (.getAlias select))))
+
+(defn plain-call-args [expr names]
+  (when (and (instance? Function expr)
+             (contains? names (str/lower-case (.getName ^Function expr)))
+             ;; Reject DISTINCT, named arguments, filter/order modifiers and
+             ;; other expressions hidden outside the ordinary argument list.
+             (= (str expr)
+                (str (.getName ^Function expr) "(" (.getParameters ^Function expr) ")")))
+    (vec (.getParameters ^Function expr))))
 
 (defn plain-shape?
   "A plain SELECT without sorting, grouping, locking or other modifiers. The
@@ -314,7 +323,9 @@
 ;; conjuncts are local and which belong to an enclosing query level before
 ;; moving them: in particular, an ancestor-only NOT EXISTS is independent
 ;; of the rows supplying the local keys.
-(defn- conjuncts [expression]
+(defn conjuncts
+  "Top-level AND terms, preserving all other predicates as single expressions."
+  [expression]
   (let [e (unwrap expression)]
     (if (and (instance? AndExpression e) (not (.isUseOperator ^AndExpression e)))
       (concat (conjuncts (.getLeftExpression ^AndExpression e))

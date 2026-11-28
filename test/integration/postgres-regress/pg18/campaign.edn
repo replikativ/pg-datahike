@@ -232,7 +232,11 @@
      [{:id :unparenthesized-arithmetic-default
        :source-lines [32 40]
        :gate "test/datahike/test/pg_expression_default_test.clj"
-       :test-var "compound-arithmetic-defaults"}]}
+       :test-var "compound-arithmetic-defaults"}
+      {:id :repeated-set-not-null-catalog
+       :source-lines [639 641]
+       :gate "test/datahike/test/pg_catalog_cache_basis_test.clj"
+       :test-var "named-attribute-reads-follow-nullability-and-dropped-columns"}]}
     {:name "insert", :boundaries #{:constraints :defaults :insert-select :dml}, :mode :unmeasured}
     {:name "insert_conflict", :boundaries #{:constraints :unique-index-inference :dml}, :mode :discovery
      :blockers #{:conflict-operator-class-index :explain-insert}
