@@ -4,6 +4,13 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### PostgreSQL transaction completion
+
+A simple query sends its final command tag after its implicit commit succeeds.
+If an explicit COMMIT fails and ends the transaction, ReadyForQuery reports
+the connection as idle. Extended Execute sends row data with metadata supplied
+by Describe.
+
 ### Transactional index creation and sequence reservations
 
 Rows inserted before an index is created on a new table remain searchable
