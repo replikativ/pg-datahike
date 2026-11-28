@@ -5,7 +5,10 @@
             [datahike.array :as array]
             [datahike.datom]
             [datahike.db.interface :as dbi]
-            [datahike.pg.catalog.objects :as objects]))
+            [datahike.pg.cache :as cache]
+            [datahike.pg.catalog.basis :as basis]
+            [datahike.pg.catalog.objects :as objects])
+  (:import [datahike.java IEntity]))
 
 (def predicate-id ::indexes)
 
@@ -98,7 +101,7 @@
           (recur (into (pop pending) fresh) (into found fresh)))
         (disj found table)))))
 
-(defn index-descriptors [db]
+(defn- read-index-descriptors [db]
   (if-not (get (dbi/-schema db) :datahike.pg.object/kind)
     []
     (let [object-eids (into #{} (map :db/id) (objects/objects-by-kind db :index))
@@ -233,20 +236,48 @@
            (sort-by :oid)
            vec))))
 
+(defonce ^:private descriptor-cache (cache/bounded-cache 8))
+
+(defn index-descriptors [db]
+  ;; Descriptor validation reads schema, registered objects/columns and
+  ;; inheritance edges. All belong to the catalog selector. Ordinary row
+  ;; writes preserve that token; catalog edits, including speculative ones,
+  ;; invalidate it. The cached projection contains no DB or entity handles.
+  (if-let [token (basis/checked-token db)]
+    (or (.get ^java.util.Map descriptor-cache token)
+        (let [descriptors (read-index-descriptors db)]
+          (.put ^java.util.Map descriptor-cache token descriptors)
+          descriptors))
+    (read-index-descriptors db)))
+
+(defn- physical-row? [descriptor entity]
+  (and (true? (get entity (:marker descriptor)))
+       (not-any? #(true? (get entity %)) (:descendant-markers descriptor))))
+
 (defn own-row? [db descriptor eid]
+  (physical-row? descriptor (d/entity db eid)))
+
+(defn- reference-id [db value]
+  (cond
+    (nil? value) nil
+    (instance? IEntity value) (:db/id value)
+    (number? value) value
+    :else (:db/id (d/entity db value))))
+
+(defn- row-key-values [db descriptor eid]
   (let [entity (d/entity db eid)]
-    (and (true? (get entity (:marker descriptor)))
-         (not-any? #(true? (get entity %))
-                   (:descendant-markers descriptor)))))
+    (when (physical-row? descriptor entity)
+      (let [values (mapv (fn [attr]
+                           (let [value (get entity attr)]
+                             (if (instance? IEntity value) (reference-id db value) value)))
+                         (:attrs descriptor))]
+        ;; PostgreSQL UNIQUE indexes use NULLS DISTINCT unless explicitly
+        ;; declared otherwise (that syntax is rejected by the DDL parser).
+        (when (every? some? values) values)))))
 
 (defn row-key [db descriptor eid]
-  (when (own-row? db descriptor eid)
-    (let [entity (d/entity db eid)
-          values (mapv #(get entity %) (:attrs descriptor))]
-      ;; PostgreSQL UNIQUE indexes use NULLS DISTINCT unless explicitly
-      ;; declared otherwise (that syntax is rejected by the DDL parser).
-      (when (every? some? values)
-        (mapv canonical-key-value values)))))
+  (when-let [values (row-key-values db descriptor eid)]
+    (mapv canonical-key-value values)))
 
 (defn- unique-violation! [descriptor key]
   (throw (ex-info "unique violation"
@@ -284,76 +315,88 @@
   (into [] (comp (filter #(= table (:table %))) (map :attrs))
         (index-descriptors db)))
 
-(defn conflicting-eid
-  "Find an existing row of `table` with all `attrs` equal to `values`.
-   Descendant rows are excluded so inheritance does not merge physical index
-   domains that PostgreSQL keeps separate."
-  [db table attrs values]
-  (when (and (seq attrs) (every? some? values))
-    (let [descriptor {:table table
-                      :attrs (vec attrs)
-                      :marker (keyword table "db-row-exists")
-                      :descendant-markers
-                      (into #{} (map #(keyword % "db-row-exists"))
-                            (descendant-tables db table))}
-          expected (mapv canonical-key-value values)]
-      (some (fn [eid]
-              (when (and (own-row? db descriptor eid)
-                         (= expected (row-key db descriptor eid)))
-                eid))
-            (if-let [probe-attr
-                     (some (fn [attr]
-                             (let [entry (get (dbi/-schema db) attr)
-                                   value (nth values
-                                              (.indexOf ^java.util.List
-                                               (vec attrs) attr))]
-                               (when (and (or (:db/index entry)
-                                              (:db/unique entry))
-                                          (index-probe-safe? value))
-                                 attr)))
-                           attrs)]
-              (map first
-                   (d/q '{:find [?entity]
-                          :in [$ ?attr ?value]
-                          :where [[?entity ?attr ?value]]}
-                        db probe-attr
-                        (nth values (.indexOf ^java.util.List (vec attrs)
-                                              probe-attr))))
-              (table-eids db descriptor))))))
+(defn- index-row-keys [db descriptor eids]
+  (reduce
+   (fn [by-key eid]
+     (if-let [k (row-key db descriptor eid)]
+       (let [prior (get by-key k)]
+         ;; One other row suffices when a writer checks uniqueness on the
+         ;; proposed db-after and excludes the candidate itself.
+         (cond
+           (nil? prior) (assoc by-key k eid)
+           (vector? prior) by-key
+           :else (assoc by-key k [prior eid])))
+       by-key))
+   {} eids))
+
+(defn conflict-lookup
+  "Return a key lookup for one physical table on this immutable database.
+   Prefer a point lookup when any key component has zero or one AVET hit.
+   For shared or unindexed values, build a composite-key map over the
+   matching rows once. A new execution or writer basis gets a fresh lookup."
+  ([db table] (conflict-lookup db table nil))
+  ([db table descriptor]
+   (let [schema (dbi/-schema db)
+         reference-attrs (or (dbi/-attrs-by db :db.type/ref) #{})
+         table-descriptor (delay (or descriptor
+                                     {:table table :marker (keyword table "db-row-exists")
+                                      :descendant-markers
+                                      (into #{} (map #(keyword % "db-row-exists"))
+                                            (descendant-tables db table))}))
+         groups (volatile! {})]
+     (fn [attrs values & [except-eid]]
+       (let [values (if (some reference-attrs attrs)
+                      (mapv (fn [attr value]
+                              (if (contains? reference-attrs attr)
+                                (reference-id db value)
+                                value))
+                            attrs values)
+                      values)]
+         (when (and (seq attrs) (every? some? values))
+           (let [descriptor (assoc @table-descriptor :attrs attrs)
+                 key (mapv canonical-key-value values)
+                 probes (keep-indexed
+                         (fn [i attr]
+                           (let [entry (get schema attr)
+                                 value (nth values i)]
+                             (when (and (or (:db/index entry) (:db/unique entry))
+                                        (index-probe-safe? value))
+                               [i (d/datoms db :avet attr value)])))
+                         attrs)]
+             (if-let [[_ hits] (some (fn [[_ hits :as probe]]
+                                       (when-not (next hits) probe))
+                                     probes)]
+               (when-let [hit (first hits)]
+                 (let [eid (.-e ^datahike.datom.Datom hit)]
+                   (when (and (not= except-eid eid) (= key (row-key db descriptor eid))) eid)))
+               (let [[i hits] (first probes)
+                     group (if i [attrs i (nth key i)] [attrs])
+                     by-key
+                     (or (get @groups group)
+                         (let [eids (if i
+                                      (map #(.-e ^datahike.datom.Datom %) hits)
+                                      (table-eids db descriptor))
+                               m (index-row-keys db descriptor eids)]
+                           (vswap! groups assoc group m)
+                           m))
+                     found (get by-key key)]
+                 (if (vector? found)
+                   (if (= except-eid (first found)) (second found) (first found))
+                   (when (not= except-eid found) found)))))))))))
 
 (defn- report-datoms [report]
   (filter #(instance? datahike.datom.Datom %)
           (:tx-data report)))
 
-(defn- candidate-eids [db descriptor eid]
-  (let [probe-attr (some (fn [attr]
-                           (let [entry (get (dbi/-schema db) attr)]
-                             (when (or (:db/index entry) (:db/unique entry))
-                               attr)))
-                         (:attrs descriptor))
-        first-value (when probe-attr (get (d/entity db eid) probe-attr))
-        probe-attr (when (and probe-attr (index-probe-safe? first-value))
-                     probe-attr)]
-    ;; Query using the unwrapped stored value. The first key attribute is
-    ;; monotonically AVET-indexed by CREATE INDEX; Datalog retains Datahike's
-    ;; value equality for arrays while row-key supplies hashable comparison.
-    (if probe-attr
-      (map first
-           (d/q '{:find [?entity]
-                  :in [$ ?attr ?value]
-                  :where [[?entity ?attr ?value]]}
-                db probe-attr first-value))
-      (table-eids db descriptor))))
-
 (defn- validate-eids! [db descriptor eids]
-  (doseq [eid eids
-          :let [key (row-key db descriptor eid)]
-          :when key
-          other (candidate-eids db descriptor eid)
-          :when (and (not= eid other)
-                     (own-row? db descriptor other)
-                     (= key (row-key db descriptor other)))]
-    (unique-violation! descriptor key)))
+  ;; SQL arbitration reads from the pre-write snapshot. Here the same lookup
+  ;; reads from the writer's post-write snapshot and excludes the changed
+  ;; entity itself: uniqueness fails only if another physical row matches it.
+  (let [lookup (conflict-lookup db (:table descriptor) descriptor)]
+    (doseq [eid eids
+            :let [values (row-key-values db descriptor eid)]
+            :when (and values (lookup (:attrs descriptor) values eid))]
+      (unique-violation! descriptor (mapv canonical-key-value values)))))
 
 (defn validate-report!
   "Writer-side invariant gate over a fully resolved Datahike tx report."

@@ -9716,82 +9716,75 @@
                    :columns (mapv clojure.core/name cols)
                    :value values})))
 
-(defn- evaluate-conflict-update
-  [txdb attrs old-map set-params
-   {:keys [table-name ns schema target-alias parse-fn
-           update-where update-assignments]}]
-  (let [logical-columns (remove #(= :db/id (:attr %))
-                                (pgs/column-info schema table-name txdb))
+(defn- conflict-update-evaluator
+  "Prepare the WHERE and SET projections once per execution of the conflict
+   reducer. SET expressions are first prepared after a row passes WHERE."
+  [txdb {:keys [table-name ns schema target-alias update-where update-assignments]}]
+  (let [logical-columns (into [] (comp (remove #(= :db/id (:attr %)))
+                                       (map #(update % :attr ctx/resolve-inherited-attr schema txdb)))
+                              (pgs/column-info schema table-name txdb))
         value-for (fn [row {:keys [name attr]}]
-                    (let [resolved (ctx/resolve-inherited-attr attr schema txdb)
-                          storage (or (when (contains? row resolved) resolved)
-                                      (some #(when (and (keyword? %)
-                                                        (= name (clojure.core/name %))) %)
-                                            (keys row)))]
-                      (when storage (get row storage))))
-        target-logical (into {}
-                             (map (fn [{:keys [name] :as column}]
-                                    [(keyword table-name name)
-                                     (value-for old-map column)]))
-                             logical-columns)
-        excluded-map (merge
-                      (into {}
-                            (map (fn [{:keys [name] :as column}]
-                                   [(keyword "excluded" name)
-                                    (value-for attrs column)]))
-                            logical-columns)
-                      ;; Inherited columns are stored under the parent's
-                      ;; namespace.  Keep those concrete candidate values
-                      ;; authoritative when a child-column lookup above has
-                      ;; no direct value.
-                      (into {} (map (fn [[attr value]]
-                                      [(keyword "excluded" (name attr)) value]))
-                            attrs))
-        combined (merge old-map target-logical excluded-map)
-        ;; The conflicting row and `excluded` are two relations in the
-        ;; translator's scope (ExecOnConflictUpdate binds the existing
-        ;; tuple and the proposed one), so the whole SET list is ONE
-        ;; projection over them -- not an expression at a time through a
-        ;; second evaluator.
-        row-scope (fn [asts]
-                    (binding [params/*bound-params* (or set-params params/*bound-params*)]
-                      ((requiring-resolve 'datahike.pg.sql.row-eval/row-values)
-                       asts combined ns schema txdb
-                       {:alias target-alias :excluded? true})))]
-    (when (or (nil? update-where)
-              (true? (let [v (first (:values (row-scope [update-where])))]
-                       (when (some? v) (boolean v)))))
-      (let [{assignments :assignments programs :programs}
-            (assignment-projections
-             update-assignments
-             (fn [target]
-               (Column. (Table. (or target-alias table-name)) (:column target)))
-             schema txdb {:table table-name})
-            values (binding [params/*assignment-programs* (merge params/*assignment-programs* programs)]
-                     (:values (row-scope (mapv :value-expr assignments))))]
-        (reduce
-         (fn [{:keys [row-after] :as result}
-              [{:keys [attr]} new-val]]
-         ;; PostgreSQL evaluates every SET RHS against the pre-update target
-         ;; row, not against assignments earlier in the same SET list.
-           (let [attr (or (when (contains? old-map attr) attr)
-                          (some #(when (and (keyword? %)
-                                            (= (name attr) (name %))) %)
-                                (keys old-map))
-                          attr)
-                 old-val (get old-map attr)
-                 coerced (when (some? new-val)
-                           (coerce-insert-value new-val attr schema txdb))]
-             (cond-> (if (nil? new-val)
-                       (assoc result :row-after (dissoc row-after attr))
-                       (assoc-in result [:row-after attr] coerced))
-               (and (nil? new-val) (some? old-val))
-               (update :ops conj [:db/retract (:db/id result) attr old-val])
+                    (if (contains? row attr)
+                      (get row attr)
+                      (get row (some #(when (and (keyword? %) (= name (clojure.core/name %))) %)
+                                     (keys row)))))
+        projector (fn [asts]
+                    ((requiring-resolve 'datahike.pg.sql.row-eval/row-projector)
+                     asts ns schema txdb {:alias target-alias :excluded? true}))
+        where-project (when update-where (projector [update-where]))
+        set-projection (delay
+                         (let [{:keys [assignments programs]}
+                               (assignment-projections
+                                update-assignments
+                                #(Column. (Table. (or target-alias table-name)) (:column %))
+                                schema txdb {:table table-name})]
+                           {:assignments assignments :programs programs
+                            :project (projector (mapv :value-expr assignments))}))]
+    (fn [attrs old-map set-params]
+      (let [target-logical (into {}
+                                 (map (fn [{:keys [name] :as column}]
+                                        [(keyword table-name name)
+                                         (value-for old-map column)]))
+                                 logical-columns)
+            excluded-map (merge
+                          (into {}
+                                (map (fn [{:keys [name] :as column}]
+                                       [(keyword "excluded" name)
+                                        (value-for attrs column)]))
+                                logical-columns)
+                          ;; Inherited columns may be stored in the parent namespace.
+                          ;; Preserve the concrete candidate values.
+                          (into {} (map (fn [[attr value]]
+                                          [(keyword "excluded" (name attr)) value]))
+                                attrs))
+            combined (merge old-map target-logical excluded-map)]
+        (binding [params/*bound-params* (or set-params params/*bound-params*)]
+          (when (or (nil? where-project) (first (:values (where-project combined))))
+            (let [{:keys [assignments programs project]} @set-projection
+                  values (binding [params/*assignment-programs* (merge params/*assignment-programs* programs)]
+                           (:values (project combined)))]
+              (reduce
+               (fn [{:keys [row-after] :as result}
+                    [{:keys [attr]} new-val]]
+                 ;; PostgreSQL evaluates every SET RHS against the pre-update row.
+                 (let [attr (or (when (contains? old-map attr) attr)
+                                (some #(when (and (keyword? %)
+                                                  (= (name attr) (name %))) %)
+                                      (keys old-map))
+                                attr)
+                       old-val (get old-map attr)
+                       coerced (when (some? new-val)
+                                 (coerce-insert-value new-val attr schema txdb))]
+                   (cond-> (if (nil? new-val)
+                             (assoc result :row-after (dissoc row-after attr))
+                             (assoc-in result [:row-after attr] coerced))
+                     (and (nil? new-val) (some? old-val))
+                     (update :ops conj [:db/retract (:db/id result) attr old-val])
 
-               (some? new-val)
-               (update :ops conj [:db/add (:db/id result) attr coerced]))))
-         {:db/id (:db/id old-map) :ops [] :row-after old-map}
-         (map vector assignments values))))))
+                     (some? new-val)
+                     (update :ops conj [:db/add (:db/id result) attr coerced]))))
+               {:db/id (:db/id old-map) :ops [] :row-after old-map}
+               (map vector assignments values)))))))))
 
 (defn- materialize-conflict-defaults
   [txdb attrs constraint-plan schema]
@@ -9816,6 +9809,8 @@
    {:keys [table-name conflict-cols do-nothing?] :as plan}
    & [initial]]
   (let [cached-context (::conflict-context initial)
+        lookup (or (:lookup cached-context) (unique-constraints/conflict-lookup txdb table-name))
+        update-evaluator (or (:update-evaluator cached-context) (delay (conflict-update-evaluator txdb plan)))
         unique-specs (or (:unique-specs cached-context)
                          (conflict-unique-specs txdb table-name))
         arbiters (if conflict-cols
@@ -9836,8 +9831,7 @@
         matching-current
         (fn [key->ref effective-rows {:keys [cols values key]}]
           (or (get key->ref key)
-              (when-let [eid (unique-constraints/conflicting-eid
-                              txdb table-name cols values)]
+              (when-let [eid (lookup cols values)]
                 (if-let [effective (get effective-rows eid)]
                   (when (= key (:key (arbiter-entry effective cols))) eid)
                   eid))))]
@@ -9867,7 +9861,7 @@
                                       (conflict-row-map txdb existing))
                                   :db/id existing)]
                (if-let [{:keys [ops row-after]}
-                        (evaluate-conflict-update txdb attrs old-map set-params plan)]
+                        (@update-evaluator attrs old-map set-params)]
                  (let [post-entries (entries-for row-after unique-specs)
                        _ (validate-conflict-row-constraints!
                           txdb table-name row-after constraint-plan
@@ -9877,11 +9871,11 @@
                                               key->ref effective-rows entry)]
                                  :when (and other (not= existing other))]
                            (conflict-unique-violation! table-name entry))
-                       without-old (into {}
-                                         (remove (fn [[_ ref]] (= existing ref)))
-                                         key->ref)
+                       ;; Only previous mutations populate key->ref. The
+                       ;; cardinality check above rules out an earlier
+                       ;; mutation of this target in the same command.
                        with-post (reduce #(assoc %1 (:key %2) existing)
-                                         without-old post-entries)]
+                                         key->ref post-entries)]
                    (-> result
                        (update :tx-data into ops)
                        (update :row-refs conj existing)
@@ -9920,7 +9914,8 @@
                  :key->ref {}
                  :affected-existing #{}
                  :effective-rows {}})
-            ::conflict-context {:unique-specs unique-specs
+            ::conflict-context {:lookup lookup :update-evaluator update-evaluator
+                                :unique-specs unique-specs
                                 :constraint-plan constraint-plan})
      row-attrs)))
 
@@ -9941,7 +9936,7 @@
                   (doseq [row (:mutated-rows result)]
                     (validate-conflict-row-constraints!
                      txdb (:table-name runtime-plan) row
-                     (row-constraints/constraint-plan txdb (:table-name runtime-plan))
+                     (:constraint-plan (::conflict-context result))
                      (:effective-rows result) true))
                   (reset! row-refs (:row-refs result))
                   (reset! affected (:affected result))

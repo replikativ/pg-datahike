@@ -48,7 +48,10 @@
 (def ^:private token-cache-max-bytes 33554432)
 (def ^:private token-cache (atom []))
 
-(defn- checked-token [db]
+(defn checked-token
+  "Opaque certificate for unchanged stored catalog and schema inputs. A nil
+   result cannot authorize reuse. Views and unenrolled databases return nil."
+  [db]
   (tracking/token db ::catalog tracking-selector))
 
 (defn- config-key [db]

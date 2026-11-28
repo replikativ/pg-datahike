@@ -10,6 +10,8 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
+            [datahike.pg.cache :as cache]
+            [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.types :as types]))
 
@@ -330,10 +332,11 @@
 ;; leak even though IdentityHashMap doesn't have weak references.
 
 (def ^:dynamic *catalog-tx-cache*
-  "When non-nil, a map `{:hints ihm :tables ihm}` of two
-   IdentityHashMaps used to memoise `schema-hints` (keyed by db) and
+  "When non-nil, a map of
+   IdentityHashMaps used to memoise `schema-hints` (keyed by db),
    `derive-virtual-tables` (keyed by schema, with inner keyed by
-   hints). Bound at the top of parse-sql's catalog enrichment block
+   hints), and registered columns (keyed by hints). Bound at the top of
+   parse-sql's catalog enrichment block
    so all `catalog-data-for*` calls in one query share the cache."
   nil)
 
@@ -342,7 +345,8 @@
    *catalog-tx-cache* to the result around their unit of work."
   []
   {:hints  (java.util.IdentityHashMap.)
-   :tables (java.util.IdentityHashMap.)})
+   :tables (java.util.IdentityHashMap.)
+   :registered-columns (java.util.IdentityHashMap.)})
 
 (defn derive-ref-targets
   "For each `:db.type/ref` attribute, determine the *target PK attribute*
@@ -1234,40 +1238,54 @@
                         (char (+ (int c) 32)) c))))
       (.toString sb))))
 
+(defn- read-registered-column-index [db hidden-attrs]
+  (let [schema (dbi/-schema db)
+        hidden-by-table (group-by namespace hidden-attrs)]
+    (into {}
+          (for [relation (mapcat #(catalog-objects/objects-by-kind db %)
+                                 [:table :view])
+                :let [table-name (or (:datahike.pg.object/storage-name relation)
+                                     (:datahike.pg.object/name relation))
+                      relation-oid (:datahike.pg.object/oid relation)
+                      columns (catalog-objects/columns-by-relation db relation-oid)
+                      known-storage (into #{} (map :datahike.pg.column/storage-ident) columns)
+                    ;; Hidden native attributes were deliberately omitted
+                    ;; from the migrated visible column registry. Hiding is
+                    ;; a projection hint, not an access-control boundary:
+                    ;; explicit references still work. Never resurrect a
+                    ;; registered (possibly dropped or renamed) column via
+                    ;; its retained storage attribute.
+                      hidden-native (into {}
+                                          (keep (fn [attr]
+                                                  (when (and (get schema attr)
+                                                             (not (contains? known-storage attr)))
+                                                    [(fold-name (name attr)) attr])))
+                                          (get hidden-by-table table-name))]]
+            [table-name
+             (into hidden-native
+                   (map (fn [column]
+                          [(fold-name (:datahike.pg.column/name column))
+                           (:datahike.pg.column/storage-ident column)]))
+                   (remove :datahike.pg.column/dropped? columns))]))))
+
+(defonce ^:private registered-column-cache (cache/bounded-cache 8))
+
 (defn- registered-column-index [hints]
   (when-let [db (::catalog-db hints)]
-    (let [schema (dbi/-schema db)
-          hidden-by-table (group-by (comp namespace key)
-                                    (filter (comp :hidden val)
-                                            (dissoc hints ::catalog-db)))]
-      (into {}
-            (for [relation (mapcat #(catalog-objects/objects-by-kind db %)
-                                   [:table :view])
-                  :let [table-name (or (:datahike.pg.object/storage-name relation)
-                                       (:datahike.pg.object/name relation))
-                        relation-oid (:datahike.pg.object/oid relation)
-                        columns (catalog-objects/columns-by-relation db relation-oid)
-                        known-storage (into #{} (map :datahike.pg.column/storage-ident) columns)
-                      ;; Hidden native attributes were deliberately omitted
-                      ;; from the migrated visible column registry. Hiding is
-                      ;; a projection hint, not an access-control boundary:
-                      ;; explicit references still work. Never resurrect a
-                      ;; registered (possibly dropped or renamed) column via
-                      ;; its retained storage attribute.
-                        hidden-native (into {}
-                                            (keep (fn [[attr hint]]
-                                                    (when (and (:hidden hint)
-                                                               (= table-name (namespace attr))
-                                                               (get schema attr)
-                                                               (not (contains? known-storage attr)))
-                                                      [(fold-name (name attr)) attr])))
-                                            (get hidden-by-table table-name))]]
-              [table-name
-               (into hidden-native
-                     (map (fn [column]
-                            [(fold-name (:datahike.pg.column/name column))
-                             (:datahike.pg.column/storage-ident column)]))
-                     (remove :datahike.pg.column/dropped? columns))])))))
+    (let [^java.util.IdentityHashMap local (:registered-columns *catalog-tx-cache*)]
+      (or (when local (.get local hints))
+          (let [;; Hints may be supplied by the caller. The registry only
+                ;; depends on which native attributes are explicitly hidden.
+                hidden (into #{} (keep (fn [[attr h]] (when (and (map? h) (:hidden h)) attr)))
+                             (dissoc hints ::catalog-db))
+                token (catalog-basis/checked-token db)
+                key (when token [token hidden])
+                registered (or (when key (.get ^java.util.Map registered-column-cache key))
+                               (let [index (read-registered-column-index db hidden)]
+                                 (when key (.put ^java.util.Map registered-column-cache key index))
+                                 index))]
+            (when local (.put local hints registered))
+            registered)))))
 
 (defn- ci-index*
   [tables registered]

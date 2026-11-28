@@ -1277,17 +1277,11 @@
   "Look up the :pg/type string attached to a schema ident entity.
    Datahike's (:schema db) only surfaces schema-governing attrs
    (:db/valueType, :db/cardinality, :db/unique) — custom attrs like
-   :pg/type live on the ident entity itself and need a Datalog query
-   to see. Reads from an explicitly-passed db, or falls back to
+   :pg/type live on the ident entity itself. Reads from an explicitly-passed db, or falls back to
    *parse-db* when nil."
   [db attr]
   (when-let [d (or db *parse-db*)]
-    (ffirst (d/q
-             '{:find [?pt]
-               :in [$ ?ident]
-               :where [[?e :db/ident ?ident]
-                       [?e :pg/type ?pt]]}
-             d attr))))
+    (when (keyword? attr) (:pg/type (d/entity d attr)))))
 
 (defn user-type-of-attr
   "`[:enum name]` or `[:domain name]` when this column was declared with
@@ -1317,12 +1311,7 @@
    copy only ever reached the INSERT translator."
   [db attr]
   (when-let [d (or db *parse-db*)]
-    (ffirst (d/q
-             '{:find [?tm]
-               :in [$ ?ident]
-               :where [[?e :db/ident ?ident]
-                       [?e :pg/typmod ?tm]]}
-             d attr))))
+    (when (keyword? attr) (:pg/typmod (d/entity d attr)))))
 
 (defn infer-param-oid-for-column
   "Given a schema and a (table-namespace, column-name), return the PG

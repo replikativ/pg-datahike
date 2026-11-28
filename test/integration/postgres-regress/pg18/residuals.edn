@@ -107,6 +107,12 @@
   {:id :alter-table-preserves-existing-default-values
    :file "fast_default" :lines [87 98] :state :covered :impact :wrong-result
    :detail "ADD COLUMN with a literal default fills existing rows. SET DEFAULT affects later writes, and short rows in a VALUES list remain separate rows."}
+  {:id :recursive-inherited-column-rename
+   :file "alter_table" :lines [1191 1197] :state :open :impact :unsupported
+   :detail "PostgreSQL 18.6 returns 42P16 for the three disallowed renames, then propagates two valid renames through the descendants. The adapter returns 0A000, 0A000 and 2BP01 for the disallowed forms and rejects the first valid recursive rename with 2BP01."}
+  {:id :independent-conflict-arbiters
+   :file "insert_conflict" :lines [202 212] :state :covered :impact :wrong-result
+   :detail "With independent unique indexes, the nominated key chooses the conflicting row. Its final values must satisfy both indexes; conflicting proposed values that the UPDATE discards are harmless."}
   {:id :composite-index-conflict-inference
    :file "insert_conflict" :lines [133 141] :state :covered :impact :wrong-result
    :detail "A two-column unique index is an ON CONFLICT arbiter in either column order. An incomplete key is rejected."}

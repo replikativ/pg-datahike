@@ -699,3 +699,40 @@
   (run (str "INSERT INTO c (a, b, v) VALUES (1, 2, 'new') "
             "ON CONFLICT (a, b) DO UPDATE SET v = EXCLUDED.v"))
   (is (= [["1" "2" "new"]] (rows "SELECT a, b, v FROM c"))))
+
+(deftest postgres-independent-conflict-arbiters
+  ;; PostgreSQL 18 insert_conflict.sql:202–212, with the two pre-existing rows
+  ;; from earlier statements in the same file.
+  (run "CREATE TABLE insertconflicttest (key int, fruit text)")
+  (run "INSERT INTO insertconflicttest VALUES (25,'Peach'),(26,'Fig')")
+  (run "CREATE UNIQUE INDEX key_index ON insertconflicttest(key)")
+  (run "CREATE UNIQUE INDEX fruit_index ON insertconflicttest(fruit)")
+  (is (= "INSERT 0 1"
+         (tag "INSERT INTO insertconflicttest VALUES (26,'Fig')
+               ON CONFLICT (key) DO UPDATE SET fruit=excluded.fruit")))
+  (is (= "23505"
+         (.sqlstate (run "INSERT INTO insertconflicttest VALUES (26,'Peach')
+                          ON CONFLICT (key) DO UPDATE SET fruit=excluded.fruit"))))
+  (is (= "INSERT 0 1"
+         (tag "INSERT INTO insertconflicttest VALUES (25,'Fig')
+               ON CONFLICT (fruit) DO UPDATE SET fruit=excluded.fruit")))
+  (is (= [["25" "Peach"] ["26" "Fig"]]
+         (rows "SELECT key, fruit FROM insertconflicttest ORDER BY key"))))
+
+(deftest odoo-composite-upsert-returning
+  (run "CREATE TABLE model_data (module text,name text,model text,res_id int)")
+  (run "CREATE UNIQUE INDEX model_name_idx ON model_data (module,name)")
+  (let [upsert (fn [tuples]
+                 (str "INSERT INTO model_data VALUES " tuples
+                      " ON CONFLICT (module,name) DO UPDATE SET (model,res_id) =
+                        (excluded.model,excluded.res_id)
+                        WHERE model_data.res_id != excluded.res_id OR model_data.model != excluded.model
+                        RETURNING module,name,model,res_id"))]
+    (is (= [["base" "a" "state" "1"] ["base" "b" "state" "2"]]
+           (rows (upsert "('base','a','state',1),('base','b','state',2)"))))
+    (is (= [["base" "b" "state" "3"] ["base" "c" "bank" "2"]]
+           (rows (upsert "('base','a','state',1),('base','b','state',3),('base','c','bank',2)"))))
+    (is (= "21000"
+           (.sqlstate (run (upsert "('base','a','state',7),('base','a','state',8)")))))
+    (is (= [["a" "1"] ["b" "3"] ["c" "2"]]
+           (rows "SELECT name,res_id FROM model_data ORDER BY name")))))
